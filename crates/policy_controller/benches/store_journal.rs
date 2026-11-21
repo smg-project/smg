@@ -8,7 +8,11 @@
 //! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
 //!   status flip of a member, published at once; `told` is the journaled
 //!   write on a log with a listener of the watched kinds, as a controller
-//!   with a watch open has: the write's telling is in the cell;
+//!   with a watch open has: the write's telling is in the cell. Under the
+//!   `worker-host` feature `followed` is that write with the worker
+//!   objects following the store: the listener wakes their follower, which
+//!   reads the store's tail on a thread of its own and waits again. The
+//!   wake is in the cell. For a run pinned to two cores; no gate reads it;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
 //! - `policy_store_journal/view_build/<plain|journaled>/<n>`: one
@@ -50,15 +54,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{
+    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
+};
+#[cfg(feature = "worker-host")]
+use smg_policy_controller::worker_host::{Members, Objects};
 use smg_policy_controller::{
-    replication::Log,
+    service::replication::Log,
     store::{
         Ask, GatewayId, Kinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position,
         ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     LoadRow, Role, SignalSource, WorkerId,
 };
+#[cfg(feature = "worker-host")]
+use smg_worker::registry::WorkerRegistry;
+#[cfg(feature = "worker-host")]
+use tokio::{runtime::Builder, sync::Notify, task::JoinSet};
 
 const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
@@ -198,26 +210,67 @@ fn status_write(c: &mut Criterion) {
     ];
     for (kind, build) in pools {
         for n in SIZES {
-            let pool = build(n);
-            let id = pool.ids[n / 2];
-            let mut ready = true;
-            group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
-                b.iter(|| {
-                    ready = !ready;
-                    let status = if ready {
-                        WorkerStatus::Ready
-                    } else {
-                        WorkerStatus::NotReady
-                    };
-                    let revision = WorkersStore::get(&pool.store, id)
-                        .expect("the row")
-                        .revision;
-                    black_box(pool.store.set_status(id, status, revision));
-                });
-            });
+            flips(&mut group, kind, n, &build(n));
         }
     }
+    #[cfg(feature = "worker-host")]
+    followed(&mut group);
     group.finish();
+}
+
+/// One status flip of the pool's middle member, published at once.
+fn flips(group: &mut BenchmarkGroup<'_, WallTime>, kind: &str, n: usize, pool: &Pool) {
+    let id = pool.ids[n / 2];
+    let mut ready = true;
+    group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
+        b.iter(|| {
+            ready = !ready;
+            let status = if ready {
+                WorkerStatus::Ready
+            } else {
+                WorkerStatus::NotReady
+            };
+            let revision = WorkersStore::get(&pool.store, id)
+                .expect("the row")
+                .revision;
+            black_box(pool.store.set_status(id, status, revision));
+        });
+    });
+}
+
+/// The `told` write with the worker objects following the store, as a
+/// controller that hosts them has: the log's listener wakes their follower
+/// on a runtime thread of its own, and each wake reads the store's tail to
+/// its end. A status change builds nothing there, so the cell holds the
+/// wake and what the follower's read takes of the store's lock.
+#[cfg(feature = "worker-host")]
+fn followed(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .expect("a runtime");
+    for n in SIZES {
+        let moved = Arc::new(Notify::new());
+        let told = Arc::clone(&moved);
+        let log = Log::new(WATCHED, LOADS).on_watched(move || told.notify_one());
+        let pool = Arc::new(pool_on(n, Some(log)));
+        let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()));
+        // Ended with the set, at the end of this size.
+        let mut follower = JoinSet::new();
+        follower.spawn_on(
+            {
+                let pool = Arc::clone(&pool);
+                async move {
+                    loop {
+                        objects.follow(&pool.store);
+                        moved.notified().await;
+                    }
+                }
+            },
+            runtime.handle(),
+        );
+        flips(group, "followed", n, &pool);
+    }
 }
 
 fn member_write(c: &mut Criterion) {
@@ -249,6 +302,7 @@ fn view_build(c: &mut Criterion) {
                 now: pool.opened + Duration::from_secs(1),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut out = ViewBuffers::default();
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {

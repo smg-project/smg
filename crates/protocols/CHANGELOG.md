@@ -305,6 +305,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
   its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
   declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- The `/v1/audio/transcriptions` relay forwards the form's text fields the gateway's types do not
+  model: the public API's `include[]`, `chunking_strategy` (and the SDK's bracketed
+  `chunking_strategy[...]` keys), `known_speaker_names[]`, `known_speaker_references[]` and the
+  next field the API adds. The extractor drained them and the HTTP router rebuilt the worker's
+  form from the typed fields alone, so a transcription answered without the logprobs, speaker
+  names or chunking the client asked for. `TranscriptionRequest.other` keeps them in order under
+  the names they came with, and the router appends them to the worker's form; a file part under
+  another name is still drained. The gRPC pipeline builds its request from the typed fields and
+  does not read them. Breaking: `TranscriptionRequest` gains `other`.
 - The preview web search tool takes the public API's dated type, `web_search_preview_2025_03_11`,
   written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
   refused a request declaring either, as an unknown tool type or field. Breaking:
@@ -316,6 +325,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `InteractionsTool` gains `ComputerUse`, `GoogleMaps` and `Retrieval`, `GoogleSearch` gains
   `search_types`, `McpServer.allowed_tools` is a `Vec<AllowedTools>`, and `ToolChoiceType`, which
   the SDK keeps open as it does the tools' other sets, gains `Other` and is `#[non_exhaustive]`.
+- Interactions content keeps the fields the public API added: an audio part's `channels` and
+  `sample_rate` (and an audio delta's), a video part's `processing` and `name`, and a text
+  annotation's `type` and that kind's fields (a URL citation's `url` and `title`, a file
+  citation's `file_name` and `page_number`, ...). Each was dropped on the way to the upstream.
+  Breaking: `Content::Audio`, `Delta::Audio` and `Content::Video` gain the fields, and
+  `Annotation` gains `other`.
 - `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
   an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
   member of another kind than the first is refused by its index), and `EmbeddingRequest` the
@@ -375,6 +390,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
   `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
   Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
+- A Messages image or document whose source is a file uploaded through the Files API
+  (`{"type": "file", "file_id": ...}`) is accepted and forwarded as written, as the public API
+  takes it. The source was an unknown variant, which refused the whole request. The gRPC router,
+  which has no Files API to read the file from, refuses such an image naming the block wherever it
+  appears, and such a document at a message's top level; a document inside a tool result is left
+  out of its prompt, as every document there is today. Breaking: `ImageSource` and
+  `DocumentSource` gain `File`.
 - `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
   `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
   gateway's `/generate` reads its body through the validated extractor and answers a negative

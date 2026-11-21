@@ -6,15 +6,21 @@
 //! - `policy_store_lent/view/<door>/<n>`: one decision's view alone, under
 //!   no veto and no pin. `built` copies the pool's rows and writes them
 //!   (`World::build`); `lent` hands the published rows where they stand
-//!   (`World::view`);
+//!   (`World::view`) and asks the rows of their mask a hold stands on, as
+//!   the door does beside every view it is lent (`World::held`);
 //! - `policy_store_lent/view_veto/<door>/<n>` and `view_pin/<door>/<n>`:
 //!   the same under one standing veto of the asking gateway, and under a
-//!   pin;
+//!   pin. The veto is said through the store's plain door, which tells no
+//!   kind: it holds to its end;
+//! - `policy_store_lent/view_doubt/<door>/<n>`: the same under one veto
+//!   said with no hold, a doubt of the worker's liveness;
 //! - `policy_store_lent/view_local/<door>/<n>`: the same in a pool that
 //!   holds another gateway's host-local row, where both doors copy;
 //! - `policy_store_lent/decide/<preset>/<door>/<n>`: the whole decision,
 //!   the view and the engine's answer over it, under each preset of the
 //!   build that places a request over this fleet.
+//! - `policy_store_lent/decide/least_cost/lent/512`: the sum of running,
+//!   queued and in-flight requests, with the store's counts beside its rows.
 //!
 //! A bench target of its own: the store bench is built on a pull request's
 //! base with the pull request's bench sources, and the base's store has no
@@ -36,8 +42,8 @@ use std::{
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, ViewBuffers,
-        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, VetoWrite,
+        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     Constraints, Engine, LoadRow, PolicySpec, RequestFacts, Role, Scratch, SignalSource, WorkerId,
     PRESETS,
@@ -66,8 +72,12 @@ fn record_of(index: usize) -> LoadRow {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Beside {
     Nothing,
-    /// One standing veto of the asking gateway.
+    /// One standing veto of the asking gateway, said through the plain
+    /// door: it tells no kind and holds to its end.
     Veto,
+    /// One standing veto of the asking gateway with no hold: a doubt of the
+    /// worker's liveness.
+    Doubt,
     /// One more member, host-local to another gateway.
     Local,
 }
@@ -77,7 +87,6 @@ enum Beside {
 /// the instant its last window opened.
 fn pool_of(n: usize, beside: Beside) -> (MemoryStore, Vec<WorkerId>, Instant) {
     let store = MemoryStore::new();
-    let opened = Instant::now();
     let register = |key: String, reachable_from: Reachability| {
         let id = store
             .upsert(WorkerFacts {
@@ -98,22 +107,29 @@ fn pool_of(n: usize, beside: Beside) -> (MemoryStore, Vec<WorkerId>, Instant) {
         id
     };
     let ids: Vec<WorkerId> = (0..n)
-        .map(|index| {
-            let id = register(format!("http://w{index}:8000"), Reachability::Any);
-            store.record(id, 0, record_of(index), opened, LoadSource::Stream);
-            id
-        })
+        .map(|index| register(format!("http://w{index}:8000"), Reachability::Any))
         .collect();
+    if beside == Beside::Local {
+        let theirs = Reachability::Gateway(GatewayId(2));
+        register("unix:///local".to_string(), theirs);
+    }
+    // The store stamps a membership write with its own clock, and the build
+    // those writes leave owed is due from the first of them. The pool's
+    // clock is read behind the last registration: the publication one
+    // window on is then due however long the registrations took.
+    let opened = Instant::now();
+    for (index, &id) in ids.iter().enumerate() {
+        store.record(id, 0, record_of(index), opened, LoadSource::Stream);
+    }
+    let until = Some(opened + Duration::from_secs(3_600));
     match beside {
-        Beside::Nothing => {}
-        Beside::Veto => {
-            let until = Some(opened + Duration::from_secs(3_600));
-            store.gateway_veto(ASKER, ids[1], until);
+        Beside::Veto => store.gateway_veto(ASKER, ids[1], until),
+        // No note stands behind the write, so the store writes it.
+        Beside::Doubt => {
+            let written = store.gateway_veto_noted(ASKER, ids[1], until, None, false, opened);
+            assert_eq!(written, VetoWrite::Written);
         }
-        Beside::Local => {
-            let theirs = Reachability::Gateway(GatewayId(2));
-            register("unix:///local".to_string(), theirs);
-        }
+        Beside::Nothing | Beside::Local => {}
     }
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
@@ -129,6 +145,7 @@ fn ask_at(opened: Instant, pinned: Option<WorkerId>, affinity: bool) -> Ask {
         now: opened + Duration::from_secs(1),
         pinned,
         affinity,
+        signal_cells: false,
     }
 }
 
@@ -139,6 +156,7 @@ fn view_cells(c: &mut Criterion, name: &str, beside: Beside, pin: bool) {
         let (store, ids, opened) = pool_of(n, beside);
         let ask = ask_at(opened, pin.then(|| ids[n / 2]), false);
         let mut out = ViewBuffers::default();
+        let mut holds = Vec::new();
         group.bench_with_input(BenchmarkId::new("built", n), &n, |b, _| {
             b.iter(|| {
                 let built = store.build_view(MODEL, Role::Single, black_box(&ask), &mut out);
@@ -151,8 +169,9 @@ fn view_cells(c: &mut Criterion, name: &str, beside: Beside, pin: bool) {
                 store.with_world(|world| {
                     let view = world.view(MODEL, Role::Single, black_box(&ask), false, &mut out);
                     let view = view.expect("the pool");
+                    let held = world.held(&view, &ask, &mut holds);
                     black_box(view.candidates);
-                    black_box((view.stalled.len(), view.pinned_at, view.built))
+                    black_box((view.stalled.len(), held.len(), view.pinned_at, view.built))
                 })
             });
         });
@@ -187,6 +206,7 @@ fn decide_cells(c: &mut Criterion) {
             let (built_engine, lent_engine) = (engine_of(preset), engine_of(preset));
             let ask = ask_at(opened, None, built_engine.needs().affinity);
             let mut out = ViewBuffers::default();
+            let mut holds = Vec::new();
             let mut scratch = Scratch::new();
             let over_built = |seed: u64, out: &mut ViewBuffers, scratch: &mut Scratch| {
                 let built = store
@@ -199,7 +219,7 @@ fn decide_cells(c: &mut Criterion) {
                 let cx = Constraints::default();
                 built_engine.decide(&facts, &built.pool_facts(), &out.candidates, &cx, scratch)
             };
-            let over_lent = |seed: u64, out: &mut ViewBuffers, scratch: &mut Scratch| {
+            let mut over_lent = |seed: u64, out: &mut ViewBuffers, scratch: &mut Scratch| {
                 store.with_world(|world| {
                     let view = world.view(MODEL, Role::Single, black_box(&ask), false, out);
                     let view = view.expect("the pool");
@@ -210,6 +230,7 @@ fn decide_cells(c: &mut Criterion) {
                     };
                     let cx = Constraints {
                         stalled: view.stalled,
+                        held: world.held(&view, &ask, &mut holds),
                         ..Constraints::default()
                     };
                     let pool = view.built.pool_facts();
@@ -238,12 +259,56 @@ fn decide_cells(c: &mut Criterion) {
     }
 }
 
+fn least_cost_lent(c: &mut Criterion) {
+    const ROWS: usize = 512;
+    let mut spec = PolicySpec::preset("least_load").expect("a preset of this build");
+    let profile = spec.profiles.values_mut().next().expect("one profile");
+    profile.score = serde_yaml::from_str(
+        "- least-cost:\n    terms: {load.running: 0.75, load.queued: 43, candidate.in_flight: 177}\n    unreported: {over-least: {request_cost: 211}}",
+    )
+    .expect("a least-cost scorer");
+    let engine = spec.validate().expect("the profile validates");
+    let (store, _, opened) = pool_of(ROWS, Beside::Nothing);
+    let ask = ask_at(opened, None, false);
+    let cx = Constraints::default();
+    let mut out = ViewBuffers::default();
+    let mut scratch = Scratch::new();
+    let mut seed = 0u64;
+    c.bench_with_input(
+        BenchmarkId::new("policy_store_lent/decide/least_cost/lent", ROWS),
+        &ROWS,
+        |b, _| {
+            b.iter(|| {
+                seed = seed.wrapping_add(1);
+                store.with_world(|world| {
+                    let view = world
+                        .view(MODEL, Role::Single, black_box(&ask), false, &mut out)
+                        .expect("the pool");
+                    let facts = RequestFacts {
+                        lent_in_flight: Some(view.in_flight.as_ref().expect("lent counts")),
+                        ..facts(seed, view.built.now_micros)
+                    };
+                    engine.decide(
+                        &facts,
+                        &view.pool_facts(),
+                        view.candidates,
+                        &cx,
+                        &mut scratch,
+                    )
+                })
+            });
+        },
+    );
+}
+
 fn store_lent(c: &mut Criterion) {
     view_cells(c, "view", Beside::Nothing, false);
     view_cells(c, "view_veto", Beside::Veto, false);
+    view_cells(c, "view_doubt", Beside::Doubt, false);
     view_cells(c, "view_pin", Beside::Nothing, true);
     view_cells(c, "view_local", Beside::Local, false);
     decide_cells(c);
+    least_cost_lent(c);
 }
 
 criterion_group!(benches, store_lent);

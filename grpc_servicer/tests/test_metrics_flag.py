@@ -269,6 +269,79 @@ def test_serve_passes_the_metrics_bind_address_to_the_rust_server(
     assert stopped, "a launch that fails stops the already bound server"
 
 
+def test_serve_draws_the_handshake_port_clear_of_the_grpc_and_metrics_ports(monkeypatch, tmp_path):
+    created: dict = {}
+    excluded: list = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.address = kwargs["bind_address"]
+            self.metrics_address = kwargs["metrics_bind_address"]
+
+        def stop(self, timeout_secs=5.0):
+            pass
+
+    def drawn(exclude=()):
+        excluded.append(set(exclude))
+        return 41234
+
+    monkeypatch.setattr(rust_lifecycle, "free_port", drawn)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    _install(monkeypatch, "smg")
+    _install(
+        monkeypatch,
+        "smg.servicer",
+        TestGrpcServer=FakeServer,
+        init_servicer_tracing=lambda level=None: None,
+    )
+    args = SimpleNamespace(host="127.0.0.1", port=50051, metrics_port=29100)
+    with pytest.raises(RuntimeError, match="the launch is where this test stops"):
+        asyncio.run(_Launcher().serve(args))
+    assert created["handshake_address"] == "tcp://127.0.0.1:41234"
+    assert {50051, 29100} <= excluded[0]
+
+
+def test_serve_excludes_the_metrics_port_the_launcher_resolved(monkeypatch, tmp_path):
+    """A launcher that resolves its own metrics port (TokenSpeed: the flag is
+    the engine's, the servicer's port comes from the variable) has that port
+    kept off the handshake draw."""
+    created: dict = {}
+    excluded: list = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.address = kwargs["bind_address"]
+            self.metrics_address = kwargs["metrics_bind_address"]
+
+        def stop(self, timeout_secs=5.0):
+            pass
+
+    def drawn(exclude=()):
+        excluded.append(set(exclude))
+        return 41234
+
+    class _OwnPortLauncher(_Launcher):
+        def metrics_bind_address(self, args, environ=None):
+            return "127.0.0.1:50072"
+
+    monkeypatch.setattr(rust_lifecycle, "free_port", drawn)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    _install(monkeypatch, "smg")
+    _install(
+        monkeypatch,
+        "smg.servicer",
+        TestGrpcServer=FakeServer,
+        init_servicer_tracing=lambda level=None: None,
+    )
+    args = SimpleNamespace(host="127.0.0.1", port=50051, metrics_port=29100)
+    with pytest.raises(RuntimeError, match="the launch is where this test stops"):
+        asyncio.run(_OwnPortLauncher().serve(args))
+    assert created["metrics_bind_address"] == "127.0.0.1:50072"
+    assert {50051, 50072} <= excluded[0]
+
+
 def test_serve_refuses_a_metrics_port_equal_to_the_grpc_port_before_the_server_binds(
     monkeypatch, tmp_path
 ):

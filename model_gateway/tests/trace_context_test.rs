@@ -11,7 +11,6 @@ use std::{
 
 use axum::{body::Body, extract::Request, http::StatusCode};
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
-use portpicker::pick_unused_port;
 use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, TraceConfig},
@@ -20,6 +19,7 @@ use smg::{
     workflow::Job,
 };
 use smg_test_harness as common;
+use smg_worker::test_support::RefusedAddress;
 use tower::ServiceExt;
 
 /// The trace id the caller chose; the gateway must log and echo this one.
@@ -28,9 +28,11 @@ const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 #[tokio::test]
 async fn request_log_lines_and_the_response_carry_the_trace_id() {
     // Tracing on, exporting towards a port nobody listens on: the spans get
-    // their ids all the same, and the exporter's failures are its own.
-    let otlp_port = pick_unused_port().expect("free port");
-    let otlp_endpoint = format!("127.0.0.1:{otlp_port}");
+    // their ids all the same, and the exporter's failures are its own. The
+    // port is held for the whole test: a port picked and let go could be
+    // another process's listener by the time the exporter dials it.
+    let nobody = RefusedAddress::reserve();
+    let otlp_endpoint = nobody.addr().to_string();
     otel_trace::otel_tracing_init(true, Some(&otlp_endpoint)).expect("otel init");
 
     let log_dir = std::env::temp_dir().join(format!("smg-trace-context-{}", std::process::id()));

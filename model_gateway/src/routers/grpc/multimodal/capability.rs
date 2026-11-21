@@ -15,29 +15,13 @@
 use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
-
-use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
-use crate::{
-    routers::error,
-    worker::{RuntimeType, Worker, WorkerRegistry},
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker},
+    labels::SUPPORTS_VISION_LABEL,
 };
 
-/// Worker label carrying the engine's vision-input capability (the vLLM
-/// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
-/// multimodal architecture means the engine runs `--language-model-only`:
-/// no vision encoder, encoder-cache budget 0, so no pixel payload (image,
-/// video) may reach it. A multimodal model reports `"true"`; a text-only
-/// model also reports `"false"`. The label speaks for the vision encoder
-/// only: the servicer reports `"false"` as well for an engine that still
-/// takes audio or pre-computed embeddings, so it says nothing about those
-/// (the runtime capability matrix below does). The label is tri-state:
-/// only vLLM's `false` becomes a label; for the other runtimes a `false`
-/// cannot be told from a servicer's default and is dropped
-/// (`ModelInfo::to_labels`), and an absent label reads as unknown, never as
-/// a refusal. An SGLang servicer that carries no media to its engine writes
-/// a deliberate `false` into its `server_args`, which is kept
-/// (`ServerInfo::to_labels`).
-pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
+use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
+use crate::routers::{common::snapshot::WorkerRegistry, error};
 
 /// Whether the worker's engine runs without a vision encoder (a vLLM
 /// `--language-model-only` worker), so no pixel payload may reach it. Absent
@@ -105,7 +89,8 @@ fn pixel_modalities(plan: &MediaPlan) -> Vec<Modality> {
 /// ([`worker_accepts_media_refs`]) counts as taking every modality here:
 /// what its engine's own processor takes, audio among them, is the
 /// reference gates' call, not the matrix's. Not where the gateway processes
-/// every item itself (`router_processes`, `--mm-processing router`): no
+/// the items itself (`router_processes`): under `--mm-processing router`,
+/// and for a request another mode placed on the gateway's own pipeline. No
 /// reference travels to a worker there, and the matrix alone answers.
 pub(crate) fn ensure_model_accepts_media(
     registry: &WorkerRegistry,
@@ -178,7 +163,9 @@ fn ensure_pool_takes_modalities(
 
 /// Whether `worker` may take `modality`: its engine does by the matrix, or
 /// it processes media references itself and the reference gates decide,
-/// unless the router processes the media and hands the worker no reference.
+/// unless the gateway processes the media and hands the worker no reference
+/// (`router_processes`: the router mode, or a request another mode placed
+/// on the gateway's own pipeline).
 fn worker_takes_modality(worker: &dyn Worker, modality: Modality, router_processes: bool) -> bool {
     runtime_supports_modality(worker.metadata().spec.runtime_type, modality)
         || (!router_processes && worker_accepts_media_refs(worker))
@@ -474,11 +461,12 @@ mod tests {
 
         use llm_multimodal::MediaContentPart;
         use openai_protocol::model_card::ModelCard;
+        use smg_worker::identity::basic::{ConnectionMode, WorkerType};
 
         use super::*;
-        use crate::worker::{
-            test_support::{grpc_worker, registry_with},
-            BasicWorkerBuilder, ConnectionMode, WorkerType,
+        use crate::routers::{
+            common::snapshot::test_support::{grpc_worker, registry_with},
+            grpc::backend_client::BasicWorkerBuilder,
         };
 
         const MODEL: &str = "pool-test-model";

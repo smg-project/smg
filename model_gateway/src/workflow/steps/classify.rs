@@ -9,21 +9,23 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openai_protocol::worker::ProviderType;
+use openai_protocol::worker::{ProviderType, WorkerSpec};
 use reqwest::Client;
+use smg_worker::{
+    identity::{basic::RuntimeType, endpoint::Endpoint},
+    workflow::{http_base_url, try_grpc_reachable, try_http_reachable, WorkerKind, WorkflowHost},
+};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
     routers::provider_support,
-    worker::identity::{basic::RuntimeType, endpoint::Endpoint},
-    workflow::data::{require_app_context, WorkerKind, WorkerWorkflowData},
+    workflow::data::{require_app_context, WorkerWorkflowData},
 };
 
 /// Quick-probe timeout for classification. Deliberately short — the full
 /// connection timeout is applied later by `DetectConnectionModeStep`.
-const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
+pub(crate) const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
 
 /// Known local backend `owned_by` values returned by `/v1/models`.
 const LOCAL_OWNED_BY: &[&str] = &["sglang", "vllm", "trtllm", "nvidia"];
@@ -65,6 +67,20 @@ async fn probe_models_owned_by(
     }
 }
 
+/// The kind a spec states with no probe: an explicit runtime says it, and a
+/// spec that names no runtime at a known provider's URL is external. `None`
+/// for a spec the probes classify: it ends local whatever they answer.
+pub(crate) fn stated_kind(config: &WorkerSpec) -> Option<WorkerKind> {
+    if config.runtime_type.is_specified() {
+        return Some(if config.runtime_type == RuntimeType::External {
+            WorkerKind::External
+        } else {
+            WorkerKind::Local
+        });
+    }
+    ProviderType::from_url(&config.url).map(|_| WorkerKind::External)
+}
+
 /// Step 0: Classify the worker as Local or External.
 ///
 /// Detection logic:
@@ -104,15 +120,11 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
             });
         }
 
-        // 1. Any explicit runtime → classify immediately, no probing needed
-        if config.runtime_type.is_specified() {
-            let kind = if config.runtime_type == RuntimeType::External {
-                WorkerKind::External
-            } else {
-                WorkerKind::Local
-            };
+        // 1-3. Any explicit runtime, or a known cloud provider's URL →
+        // classify immediately, no probing needed
+        if let Some(kind) = stated_kind(config) {
             debug!(
-                "Worker {} explicitly configured as {} → {:?}",
+                "Worker {} states its kind (runtime {}) → {:?}",
                 Endpoint::redacted_str(&config.url),
                 config.runtime_type,
                 kind
@@ -121,19 +133,8 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
             return Ok(StepResult::Success);
         }
 
-        // 3. URL matches known cloud provider → External (no probing needed)
-        if let Some(provider) = ProviderType::from_url(&config.url) {
-            debug!(
-                "Worker {} URL matches known provider ({}) → External",
-                Endpoint::redacted_str(&config.url),
-                provider
-            );
-            context.data.worker_kind = Some(WorkerKind::External);
-            return Ok(StepResult::Success);
-        }
-
         // Unspecified + unknown URL — probe the endpoint
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let timeout = CLASSIFY_PROBE_TIMEOUT_SECS;
         let client = &app_context.client;
 
@@ -151,7 +152,14 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         }
 
         // 5. gRPC health → Local (external APIs never use gRPC)
-        if try_grpc_reachable(&config.url, timeout).await.is_ok() {
+        if try_grpc_reachable(
+            app_context.engine_connector().as_ref(),
+            &config.url,
+            timeout,
+        )
+        .await
+        .is_ok()
+        {
             debug!(
                 "Worker {} responded to gRPC health → Local",
                 Endpoint::redacted_str(&config.url)

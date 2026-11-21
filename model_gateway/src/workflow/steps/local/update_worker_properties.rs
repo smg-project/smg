@@ -4,19 +4,24 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
+use smg_service_discovery::DISCOVERY_PROVIDER_LABEL;
+use smg_worker::{
+    identity::basic::{merge_labels, BasicWorker, RuntimeType, Worker},
+    workflow::{
+        kv_transfer_value, model_card_for_labels, report_for_rank,
+        validate_constrained_decoding_label, DP_WIDTH_LABELS,
+    },
+};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-#[cfg(test)]
-use super::create_worker::labels_for_rank;
-use super::create_worker::{
-    kv_transfer_value, model_card_for_labels, report_for_rank, validate_parser_overrides,
-    warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
+use super::{
+    check_local_worker::{validate_parser_overrides, warn_on_conflicting_parser_overrides},
+    update_at_door::UpdateAtDoorStep,
 };
 use crate::{
     admin::worker_service::MAX_WORKER_LABELS,
-    service_discovery::DISCOVERY_PROVIDER_LABEL,
-    worker::{identity::basic::merge_labels, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker},
+    routers::grpc::backend_client::BasicWorkerBuilder,
     workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
@@ -34,6 +39,22 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         &self,
         context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
+        Self::update(context, None)
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+impl UpdateWorkerPropertiesStep {
+    /// The update of the workers the find step selected. Where the line
+    /// writes at a door, a worker a row stands for is written there, and
+    /// the holder lays its object: the registry takes every other worker.
+    pub(super) fn update(
+        context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
+        at_door: Option<&UpdateAtDoorStep>,
+    ) -> WorkflowResult<StepResult> {
         let request = &context.data.config;
         // A label refresh replaces what discovery read before with what the
         // engine reports now (an operator's own labels keep their values) and
@@ -41,9 +62,8 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         // merges the request's labels into the existing ones.
         let refresh = context.data.refresh_discovered_labels;
         // The engine's KV transfer metadata travels in its report under label
-        // names and is never a label (registration takes it out the same way,
-        // `create_worker::take_kv_transfer_metadata`): out of the report before
-        // any merge, applied to the worker's dedicated fields below.
+        // names. Take it out before merging labels and apply it to the same
+        // dedicated fields as registration.
         let (fresh_engine_labels, fresh_kv) = match context.data.fresh_engine_labels.clone() {
             Some(mut fresh) => {
                 let kv = EngineKvMetadata::take(&mut fresh);
@@ -72,6 +92,11 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
         let mut updated_workers: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers_to_update.len());
 
+        // The row behind each worker, where the line writes at a door.
+        let rows = at_door
+            .map(|door| door.rows_behind(snapshot.as_deref(), &workers_to_update))
+            .unwrap_or_default();
+
         // The labels each worker ends up with: the request's merged into its
         // own. The admin check held the cap against the labels the worker had
         // when the request arrived; updates queued together each passed it,
@@ -97,7 +122,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // An engine that reports a `constrained_decoding` naming no
                     // policy is refused as at registration: the job fails with
                     // the reason and the worker keeps the labels it had.
-                    super::create_worker::validate_constrained_decoding_label(
+                    validate_constrained_decoding_label(
                         &labels,
                         worker.url(),
                         "update_worker_properties",
@@ -105,7 +130,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     labels
                 } else {
                     // A window set here is the worker's only window, as at
-                    // registration (see `create_worker::merge_labels`).
+                    // registration (see `merge_labels`).
                     let updated_labels = match request.labels {
                         Some(ref new_labels) => {
                             // The admin check refused labels for a discovered
@@ -131,7 +156,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // A `constrained_decoding` label sent in the update must name a
                     // policy, as at registration (`create_worker`): a typo would
                     // otherwise read as `requested` from here on.
-                    super::create_worker::validate_constrained_decoding_label(
+                    validate_constrained_decoding_label(
                         &updated_labels,
                         worker.url(),
                         "update_worker_properties",
@@ -187,6 +212,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         for (index, (worker, (updated_labels, models, card_fields))) in
             workers_to_update.iter().zip(merged).enumerate()
         {
+            let row = at_door.zip(rows.get(index).copied().flatten());
             if refresh {
                 // The engine's id is the worker's live id from here, rebuilt
                 // or not (a rebuilt worker shares the cell): the id a handoff
@@ -315,6 +341,31 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             }
             let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
+            // A row's worker is written at the store's door, and the holder
+            // lays this worker over the one that stands, under its id.
+            if let Some((door, standing)) = row {
+                if refresh {
+                    // A refresh is the engine's word: the door asks no
+                    // maker and takes the labels alone. One it drops is
+                    // left to the next transition into service.
+                    if !door.refresh(standing, &new_worker, worker)? {
+                        debug!(
+                            worker_url = %worker.redacted_url(),
+                            "Worker changed, left or drains during the label refresh; not rebuilt"
+                        );
+                        continue;
+                    }
+                } else {
+                    // The door promotes a row whose checks the update
+                    // turned off, and the holder sets the worker it lays to
+                    // its row's status: no promotion follows here.
+                    door.lay(&context.data.asker, standing, &new_worker, worker)?;
+                }
+                let registry = &app_context.worker_registry;
+                updated_workers.extend(registry.get_by_url(worker.url()));
+                continue;
+            }
+
             // Replace the worker in the registry (overwrite-then-diff),
             // against the id and revision the find step captured: a worker
             // updated or replaced meanwhile (a provider registering its
@@ -378,10 +429,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false
-    }
 }
 
 /// The worker's model cards for the labels it has now. Registration builds a
@@ -407,7 +454,7 @@ fn models_for_labels(
 
 /// The engine's KV transfer metadata, which its report carries under label
 /// names (`kv_connector`, `kv_role`, `kv_engine_id`) and the worker holds in
-/// dedicated fields, as at registration (`create_worker::take_kv_transfer_metadata`).
+/// dedicated fields, as at registration.
 #[derive(Debug, Default)]
 struct EngineKvMetadata {
     connector: Option<String>,

@@ -10,8 +10,8 @@ use super::{
     view, MODEL,
 };
 use crate::{
+    engine::view::{Role, WorkerId},
     store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
-    view::{Role, WorkerId},
 };
 
 const ENGINE: &str = "grpc://e:9000";
@@ -298,6 +298,33 @@ fn a_row_passed_over_for_a_record_ends_no_word_that_no_report_came() {
 }
 
 #[test]
+fn an_answer_passed_over_whole_for_its_stamp_names_its_ranks_again() {
+    let (store, t0, zero, one) = two_ranks();
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(overloaded(&store, t0), [zero], "rank zero takes the mark");
+    // A later answer names both ranks under a stamp older than each sample
+    // on file. Both rows are passed over and the samples stand, and the
+    // answer still names the rank its engine had left out.
+    let t1 = t0 + Duration::from_secs(1);
+    let passed = store.report_sampled(
+        &[(zero, 0, Some(load(7, 0))), (one, 1, Some(load(8, 0)))],
+        t1,
+        t0 - Duration::from_secs(1),
+        LoadSource::Poll,
+    );
+    assert_eq!(passed, [0, 1]);
+    assert_eq!(store.unnamed_ranks(), 0, "the answer names it again");
+    assert_eq!(overloaded(&store, t1), []);
+    let rows = view(&store, &ask(t1)).0;
+    let row = rows.iter().find(|row| row.id == zero).expect("its row");
+    assert_eq!(
+        row.load.map(|load| load.running),
+        Some(1),
+        "the sample stands"
+    );
+}
+
+#[test]
 fn an_answer_that_only_names_an_engine_is_no_word_that_no_report_came() {
     let (store, t0, zero, one) = two_ranks();
     let mut both = [zero, one];
@@ -335,6 +362,34 @@ fn a_mixed_answer_marks_the_rank_left_out_of_each_engine_it_names() {
         t0,
         LoadSource::Poll,
     );
+    let mut left_out = [zero, far_zero];
+    left_out.sort_unstable();
+    assert_eq!(overloaded(&store, t0), left_out);
+    assert_eq!(store.unnamed_ranks(), 2);
+}
+
+#[test]
+fn an_answer_that_passes_a_row_of_two_engines_over_marks_the_rank_each_left_out() {
+    // Two engines, and a rank of each pushes as a poll begins. The poll's
+    // answer brings a row for each rank that pushed and leaves each
+    // engine's other rank out: both rows are passed over, and each names
+    // its own engine.
+    let (store, t0, zero, one) = two_ranks();
+    let [far_zero, far_one] = [0, 1].map(|rank| rank_of(&store, OTHER, rank));
+    names_both(&store, far_zero, far_one, t0);
+    store.record(one, 1, load(2, 0), t0, LoadSource::Stream);
+    store.record(far_one, 1, load(2, 0), t0, LoadSource::Stream);
+    let passed = store.report(
+        &[
+            (zero, 0, None),
+            (one, 1, Some(load(2, 0))),
+            (far_zero, 0, None),
+            (far_one, 1, Some(load(2, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(passed, [1, 3], "both rows are passed over");
     let mut left_out = [zero, far_zero];
     left_out.sort_unstable();
     assert_eq!(overloaded(&store, t0), left_out);

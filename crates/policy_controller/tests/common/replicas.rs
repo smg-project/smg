@@ -22,7 +22,7 @@ use std::{
 
 use parking_lot::Mutex;
 use prost::Message as _;
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     elector::ElectionSettings,
     proto::{
         controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
@@ -182,6 +182,10 @@ pub struct Replica {
     /// The directory of the spec source it was given where its flags named
     /// none, kept as long as the process.
     _spec: Option<tempfile::TempDir>,
+    /// It was given a spec file beside a lease another replica can take:
+    /// its start's document lands a moment behind the start of its first
+    /// lead, and [`Record::agreed`] waits for it.
+    filed: bool,
 }
 
 /// Where a replica listens unless its start names a place: the loopback
@@ -365,6 +369,7 @@ impl Replica {
             replication: unbound(),
             admin: unbound(),
             client: None,
+            filed: spec.is_some() && !alone,
             _spec: spec,
         };
         let started = Instant::now();
@@ -717,7 +722,9 @@ impl Record {
 
     /// Samples until one replica answers as the leader and every replica
     /// names it under its term: the leader's place in `replicas` and the
-    /// term.
+    /// term. A leader this helper gave a file is agreed once its log says
+    /// a document was applied: its start's lands a moment behind the start
+    /// of its lead, and until then it has no decision for a request.
     pub async fn agreed(&mut self, replicas: &mut [Replica]) -> Result<(usize, u64), String> {
         let started = Instant::now();
         loop {
@@ -731,7 +738,10 @@ impl Record {
                 });
                 let place = replicas.iter().position(|r| r.id == leader.replica);
                 if let (true, Some(place)) = (named, place) {
-                    return Ok((place, leader.info.term));
+                    let leads = &replicas[place];
+                    if !leads.filed || leads.logged("policy spec applied") {
+                        return Ok((place, leader.info.term));
+                    }
                 }
             }
             if started.elapsed() > ROOM {

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
-    routers::grpc::regular::processor::ResponseProcessor, worker::WorkerRegistry,
+    routers::{common::snapshot::WorkerRegistry, grpc::regular::processor::ResponseProcessor},
 };
 
 const MODEL: &str = "generate-tokens-test";

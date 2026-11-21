@@ -141,6 +141,10 @@ impl EngineConnector for EchoingConnector {
     async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
         Err(link.base_url)
     }
+
+    async fn dial_grpc(&self, base_url: &str, _timeout: Duration) -> Result<(), String> {
+        Err(base_url.to_string())
+    }
 }
 
 /// The read dials the gRPC base of the worker's address. A data-parallel
@@ -173,21 +177,25 @@ async fn the_engine_id_read_dials_the_base_address_of_a_rank_row() {
     );
 }
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
 
 use super::*;
 use crate::{
-    connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+    connection::engine::{EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
     health::circuit_breaker::CircuitState,
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
         builder,
         error::WorkerError,
     },
+    jobs::WorkerRegistrationMode,
     model_card::ModelCard,
-    test_support::{BasicWorkerBuilder, CountingConnector, RefusedAddress, WorkerRegistry},
-    worker::{HealthCheckConfig, WorkerStatus},
+    test_support::{
+        BasicWorkerBuilder, CountingConnector, RefusedAddress, ScriptedAnswers, WorkerRegistry,
+    },
+    worker::{HealthCheckConfig, WorkerSpec, WorkerStatus},
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -267,10 +275,13 @@ async fn a_passing_probe_run_readmits_a_demoted_worker_with_its_breaker_on_trial
     // The engine is back on the same address: the first passing probe
     // (success threshold 1) promotes the worker.
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, None).await;
+    let applied = apply_probe_completion(&registry, &*registry, completion, None, None).await;
     assert!(matches!(
         applied,
-        ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
+        ProbeAnswer::Moved {
+            old: WorkerStatus::NotReady,
+            new: WorkerStatus::Ready
+        }
     ));
     // The transition is the INFO line an outage is read from.
     assert!(logs_contain("Worker status transition"));
@@ -385,10 +396,14 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
+    let applied =
+        apply_probe_completion(&registry, &*registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
-        ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
+        ProbeAnswer::Moved {
+            old: WorkerStatus::NotReady,
+            new: WorkerStatus::Ready
+        }
     ));
     assert!(
         job_queue.get_status("http://local:7").is_some(),
@@ -414,10 +429,14 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
+    let applied =
+        apply_probe_completion(&registry, &*registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
-        ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
+        ProbeAnswer::Moved {
+            old: WorkerStatus::NotReady,
+            new: WorkerStatus::Ready
+        }
     ));
     assert!(
         job_queue.get_status("http://local:8").is_some(),
@@ -425,9 +444,47 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     );
 }
 
+#[tokio::test]
+async fn the_health_manager_asks_as_health() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let url = "http://worker:8000";
+    let worker = make_worker(url, 1, 1);
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    let revision = worker.revision();
+    let removals = RecordedJobs::default();
+    let refreshes = RecordedQueue::default();
+
+    submit_removal_job(
+        &registry,
+        &id,
+        url,
+        revision,
+        &removals,
+        UnhealthyRemovalScope::AllLocal,
+    )
+    .await;
+    submit_label_refresh(&worker, &refreshes).await;
+
+    assert_eq!(
+        *removals.0.lock(),
+        [(
+            url.to_string(),
+            id.as_str().to_string(),
+            revision,
+            WorkerJobAsker::Health
+        )]
+    );
+    assert_eq!(
+        refreshes.get_status(url).unwrap().asker,
+        Some(WorkerJobAsker::Health)
+    );
+}
+
 /// The job a [`RecordedQueue`] holds for an address.
+#[derive(Clone)]
 struct HeldJob {
     job_type: &'static str,
+    asker: Option<WorkerJobAsker>,
 }
 
 /// A `WorkerJobs` in the job queue's place, for a case that reads what the
@@ -437,55 +494,81 @@ struct HeldJob {
 #[derive(Default)]
 struct RecordedQueue {
     /// The job in flight for each address, by its type.
-    held: parking_lot::Mutex<HashMap<String, &'static str>>,
-    /// The addresses whose refresh waits behind the job in flight.
-    kept: parking_lot::Mutex<Vec<String>>,
+    held: parking_lot::Mutex<HashMap<String, HeldJob>>,
+    /// The refreshes that wait behind the job in flight.
+    kept: parking_lot::Mutex<Vec<(String, WorkerJobAsker)>>,
 }
 
 impl RecordedQueue {
     /// Hold `url` for a job of `job_type`, as a job in flight does.
     fn hold_url_for_tests(&self, url: &str, job_type: &'static str) {
-        self.held.lock().insert(url.to_string(), job_type);
+        self.held.lock().insert(
+            url.to_string(),
+            HeldJob {
+                job_type,
+                asker: None,
+            },
+        );
     }
 
     /// Whether a refresh waits behind the job that holds `url`.
     fn kept_for(&self, url: &str) -> bool {
-        self.kept.lock().iter().any(|kept| kept == url)
+        self.kept.lock().iter().any(|(kept, _)| kept == url)
     }
 
     /// The job that holds `url`.
     fn get_status(&self, url: &str) -> Option<HeldJob> {
-        self.held
-            .lock()
-            .get(url)
-            .map(|&job_type| HeldJob { job_type })
+        self.held.lock().get(url).cloned()
     }
 }
 
 #[async_trait]
 impl WorkerJobs for RecordedQueue {
-    async fn remove_worker(
+    async fn refresh_worker_labels(
+        &self,
+        url: String,
+        asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
+        let mut held = self.held.lock();
+        if held.contains_key(&url) {
+            self.kept.lock().push((url, asker));
+            return Ok(false);
+        }
+        held.insert(
+            url,
+            HeldJob {
+                job_type: "RefreshWorkerLabels",
+                asker: Some(asker),
+            },
+        );
+        Ok(true)
+    }
+
+    async fn add_worker(
+        &self,
+        _spec: WorkerSpec,
+        _mode: WorkerRegistrationMode,
+        _asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn remove_workers_at(
         &self,
         _url: String,
-        _worker_id: &WorkerId,
-        _revision: u64,
+        _guards: Vec<(WorkerId, u64)>,
+        _asker: WorkerJobAsker,
     ) -> Result<(), String> {
         Ok(())
     }
 
-    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
-        let mut held = self.held.lock();
-        if held.contains_key(&url) {
-            self.kept.lock().push(url);
-            return Ok(false);
-        }
-        held.insert(url, "RefreshWorkerLabels");
-        Ok(true)
+    fn job_in_flight(&self, url: &str) -> bool {
+        self.held.lock().contains_key(url)
     }
 }
 
-/// What a recorded removal names: the address, the worker's id and its revision.
-type Removal = (String, String, u64);
+/// A removal's address, worker id, revision and asker.
+type Removal = (String, String, u64, WorkerJobAsker);
 
 /// A `WorkerJobs` that keeps the removals it is asked for.
 #[derive(Default)]
@@ -493,20 +576,43 @@ struct RecordedJobs(parking_lot::Mutex<Vec<Removal>>);
 
 #[async_trait]
 impl WorkerJobs for RecordedJobs {
-    async fn remove_worker(
+    async fn refresh_worker_labels(
+        &self,
+        _url: String,
+        _asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn add_worker(
+        &self,
+        _spec: WorkerSpec,
+        _mode: WorkerRegistrationMode,
+        _asker: WorkerJobAsker,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn remove_workers_at(
         &self,
         url: String,
-        worker_id: &WorkerId,
-        revision: u64,
+        guards: Vec<(WorkerId, u64)>,
+        asker: WorkerJobAsker,
     ) -> Result<(), String> {
-        self.0
-            .lock()
-            .push((url, worker_id.as_str().to_string(), revision));
+        let mut removals = self.0.lock();
+        for (worker_id, revision) in guards {
+            removals.push((
+                url.clone(),
+                worker_id.as_str().to_string(),
+                revision,
+                asker.clone(),
+            ));
+        }
         Ok(())
     }
 
-    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
-        Ok(true)
+    fn job_in_flight(&self, _url: &str) -> bool {
+        false
     }
 }
 
@@ -535,17 +641,22 @@ async fn a_worker_that_fails_under_a_removal_scope_is_handed_over_by_id_and_revi
     // A failure threshold of one: the tenth failed probe of a pending worker
     // fails it.
     for _ in 1..10 {
-        let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
-        assert!(matches!(applied, ProbeApplyResult::Applied(None)));
+        let applied =
+            apply_probe_completion(&registry, &*registry, failed_probe(), removal, None).await;
+        assert!(matches!(applied, ProbeAnswer::Stood(_)));
     }
     assert!(
         recorded.0.lock().is_empty(),
         "a pending worker is not removed"
     );
-    let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
+    let applied =
+        apply_probe_completion(&registry, &*registry, failed_probe(), removal, None).await;
     assert!(matches!(
         applied,
-        ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Failed)))
+        ProbeAnswer::Moved {
+            old: WorkerStatus::Pending,
+            new: WorkerStatus::Failed
+        }
     ));
     assert_eq!(
         *recorded.0.lock(),
@@ -553,6 +664,7 @@ async fn a_worker_that_fails_under_a_removal_scope_is_handed_over_by_id_and_revi
             worker.base_url().to_string(),
             worker_id.as_str().to_string(),
             revision,
+            WorkerJobAsker::Health,
         )]
     );
 }
@@ -784,10 +896,10 @@ async fn manager_loop_promotes_zmq_worker_on_connect_signal() {
 
     registry
         .connect_signal_sender()
-        .send(WorkerConnected {
+        .send(WorkerSignal::Connected(WorkerConnected {
             url: "ipc:///tmp/connect.ipc".to_string(),
             revision,
-        })
+        }))
         .expect("connect signal must reach the manager loop");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -803,7 +915,7 @@ async fn manager_loop_promotes_zmq_worker_on_connect_signal() {
 }
 
 fn make_dp_worker(base: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
-    let spec: crate::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+    let spec: WorkerSpec = serde_json::from_value(serde_json::json!({
         "url": format!("{base}@{rank}"),
         "dp_base_url": base,
         "dp_rank": rank,
@@ -897,6 +1009,7 @@ async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
     let before = tokio::time::Instant::now();
     apply_connect_signal(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "http://remote:1".to_string(),
             revision: worker.revision(),
@@ -930,6 +1043,7 @@ fn apply_connect_signal_promotes_pending_worker() {
     let mut next_check = HashMap::new();
     apply_connect_signal(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "ipc:///tmp/w.ipc".to_string(),
             revision,
@@ -968,6 +1082,7 @@ fn a_contact_from_a_demoted_probed_worker_moves_its_probe_to_now_and_promotes_no
         let before = tokio::time::Instant::now();
         let moved = apply_connect_signal(
             &registry,
+            &*registry,
             WorkerConnected {
                 url: url.to_string(),
                 revision,
@@ -1011,6 +1126,7 @@ fn a_stale_contact_moves_no_probe_of_the_replacement() {
     let mut next_check = HashMap::new();
     apply_connect_signal(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "http://w:1".to_string(),
             revision: stale_revision,
@@ -1043,6 +1159,7 @@ fn a_contact_promotes_a_worker_without_health_checks_outright() {
     let mut next_check = HashMap::new();
     let moved = apply_connect_signal(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "http://u:1".to_string(),
             revision,
@@ -1127,10 +1244,10 @@ async fn a_demoted_worker_stays_out_on_its_contacts_read_and_returns_on_the_sche
     let contact = tokio::time::Instant::now();
     registry
         .connect_signal_sender()
-        .send(WorkerConnected {
+        .send(WorkerSignal::Connected(WorkerConnected {
             url: url.clone(),
             revision,
-        })
+        }))
         .unwrap();
     wait_until(
         contact + Duration::from_secs(5),
@@ -1380,6 +1497,7 @@ fn apply_connect_signal_reschedules_a_promoted_worker() {
     let mut next_check = HashMap::new();
     apply_connect_signal(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "ipc:///tmp/w.ipc".to_string(),
             revision,
@@ -1411,18 +1529,31 @@ fn apply_connect_signal_reports_the_promoted_worker() {
         revision,
     };
 
-    let (promoted_id, promoted) =
-        apply_connect_signal(&registry, signal(), &mut next_check, &test_config())
-            .expect("a NotReady worker without health checks answering a contact is promoted");
+    let (promoted_id, promoted) = apply_connect_signal(
+        &registry,
+        &*registry,
+        signal(),
+        &mut next_check,
+        &test_config(),
+    )
+    .expect("a NotReady worker without health checks answering a contact is promoted");
     assert!(promoted_id == worker_id);
     assert_eq!(promoted.url(), "http://w:1");
     assert!(
-        apply_connect_signal(&registry, signal(), &mut next_check, &test_config()).is_none(),
+        apply_connect_signal(
+            &registry,
+            &*registry,
+            signal(),
+            &mut next_check,
+            &test_config()
+        )
+        .is_none(),
         "a second signal moves nothing: the worker is Ready already"
     );
     assert!(
         apply_connect_signal(
             &registry,
+            &*registry,
             WorkerConnected {
                 url: "http://elsewhere:1".to_string(),
                 revision,
@@ -1455,6 +1586,7 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
     let mut next_check = HashMap::new();
     apply_connect_signal_and_refresh(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "http://local:11".to_string(),
             revision,
@@ -1497,6 +1629,7 @@ async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
 
     apply_connect_signal_and_refresh(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "http://local:12".to_string(),
             revision,
@@ -1539,6 +1672,7 @@ fn apply_connect_signal_ignores_stale_revision() {
 
     apply_connect_signal(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "ipc:///tmp/w.ipc".to_string(),
             revision: stale_revision,
@@ -1561,6 +1695,7 @@ fn apply_connect_signal_ignores_unknown_url() {
     let registry = Arc::new(WorkerRegistry::new());
     apply_connect_signal(
         &registry,
+        &*registry,
         WorkerConnected {
             url: "http://ghost:1".to_string(),
             revision: 0,
@@ -2644,17 +2779,21 @@ async fn a_pending_worker_that_never_passes_fails_at_the_cap_through_its_probes_
 
     // A failure threshold of one: the cap is ten probes.
     for probe in 1..10 {
-        let applied = apply_probe_completion(&registry, failed_probe(), None, None).await;
+        let applied =
+            apply_probe_completion(&registry, &*registry, failed_probe(), None, None).await;
         assert!(
-            matches!(applied, ProbeApplyResult::Applied(None)),
+            matches!(applied, ProbeAnswer::Stood(_)),
             "probe {probe} of ten leaves it pending"
         );
         assert_eq!(worker.status(), WorkerStatus::Pending);
     }
-    let applied = apply_probe_completion(&registry, failed_probe(), None, None).await;
+    let applied = apply_probe_completion(&registry, &*registry, failed_probe(), None, None).await;
     assert!(matches!(
         applied,
-        ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Failed)))
+        ProbeAnswer::Moved {
+            old: WorkerStatus::Pending,
+            new: WorkerStatus::Failed
+        }
     ));
     assert_eq!(worker.status(), WorkerStatus::Failed);
 }
@@ -2685,8 +2824,8 @@ async fn test_apply_probe_completion_discards_stale_probe_after_replace() {
     assert_eq!(current.status(), WorkerStatus::Ready);
     assert_eq!(current.revision(), expected_revision + 1);
 
-    let result = apply_probe_completion(&registry, completion, None, None).await;
-    assert!(matches!(result, ProbeApplyResult::Stale));
+    let result = apply_probe_completion(&registry, &*registry, completion, None, None).await;
+    assert!(matches!(result, ProbeAnswer::Stale));
     assert_eq!(
         registry.get(&worker_id).unwrap().status(),
         WorkerStatus::Ready
@@ -2997,4 +3136,513 @@ async fn test_profile_all_url_filter_without_match() {
     assert!(result.successful.is_empty());
     assert!(result.failed.is_empty());
     assert!(result.message.contains("No worker matching"));
+}
+
+/// A sink that only records: what the collector says is kept, every probe's
+/// outcome gets the same answer and every connect signal no transition, and
+/// nothing is written to a worker object. A host's sink has to write the
+/// status there (the doc of `HealthSink`); this one leaves it, so a case can
+/// tell what the collector itself wrote or read.
+struct RecordingSink {
+    answer: ProbeAnswer,
+    probes: parking_lot::Mutex<Vec<(WorkerId, bool, u64, WorkerStatus)>>,
+    connects: parking_lot::Mutex<Vec<(WorkerId, u64)>>,
+    liveness: parking_lot::Mutex<Vec<(WorkerId, u64)>>,
+}
+
+impl RecordingSink {
+    fn answering(answer: ProbeAnswer) -> Self {
+        Self {
+            answer,
+            probes: parking_lot::Mutex::default(),
+            connects: parking_lot::Mutex::default(),
+            liveness: parking_lot::Mutex::default(),
+        }
+    }
+}
+
+impl HealthSink for RecordingSink {
+    fn probe_outcome(
+        &self,
+        worker_id: &WorkerId,
+        passed: bool,
+        revision: u64,
+        launched: WorkerStatus,
+    ) -> ProbeAnswer {
+        self.probes
+            .lock()
+            .push((worker_id.clone(), passed, revision, launched));
+        self.answer
+    }
+
+    fn connected(
+        &self,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        self.connects.lock().push((worker_id.clone(), revision));
+        None
+    }
+
+    fn liveness_moved(&self, worker_id: &WorkerId, revision: u64) {
+        self.liveness.lock().push((worker_id.clone(), revision));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn maybe_start_with_sink_hands_every_fact_to_the_sink_it_was_given() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let probes = [("grpc://passing:1", true), ("grpc://failing:1", false)].map(|(url, passed)| {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .connection_mode(ConnectionMode::Grpc)
+                .engine_connection(ScriptedAnswers::answering_health(Ok(HealthAnswer {
+                    healthy: passed,
+                    message: String::new(),
+                })))
+                .health_config(HealthCheckConfig {
+                    success_threshold: 1,
+                    check_interval_secs: 3600,
+                    ..HealthCheckConfig::default()
+                })
+                .build(),
+        );
+        let id = registry.register(worker.clone()).expect("a probe worker");
+        let fact = (id, passed, worker.revision(), WorkerStatus::Pending);
+        (worker, fact)
+    });
+    let unprobed = unprobed_worker("http://unprobed:1");
+    unprobed.set_status(WorkerStatus::Pending);
+    let unprobed_id = registry
+        .register(unprobed.clone())
+        .expect("an unprobed worker");
+    let sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stood(
+        WorkerStatus::Pending,
+    )));
+    let mut manager = WorkerManager::maybe_start_with_sink(
+        registry.clone(),
+        sink.clone(),
+        test_config(),
+        None,
+        true,
+        false,
+    )
+    .expect("health checks are on");
+    registry
+        .connect_signal_sender()
+        .send(WorkerSignal::Connected(WorkerConnected {
+            url: unprobed.url().to_string(),
+            revision: unprobed.revision(),
+        }))
+        .expect("the manager takes the connect signal");
+
+    wait_until(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        "the sink did not receive both probe outcomes and the connect signal",
+        || sink.probes.lock().len() >= probes.len() && !sink.connects.lock().is_empty(),
+    )
+    .await;
+    manager.shutdown().await;
+
+    let seen = sink.probes.lock();
+    assert_eq!(seen.len(), probes.len());
+    for (worker, fact) in probes {
+        assert!(seen.contains(&fact), "missing probe outcome {fact:?}");
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        assert_eq!(
+            worker
+                .runtime_state()
+                .expect("the worker's state")
+                .total_pending_probes(),
+            0
+        );
+    }
+    assert_eq!(*sink.connects.lock(), [(unprobed_id, unprobed.revision())]);
+    assert_eq!(unprobed.status(), WorkerStatus::Pending);
+}
+
+/// The plain start hands its job queue and its removal rule on to the loop.
+/// A worker that fails its probe under a removal scope is failed by the
+/// registry, the sink of that start, and handed over for removal once: at
+/// its address, by its id and revision.
+#[tokio::test(start_paused = true)]
+async fn maybe_start_hands_its_job_queue_and_its_removal_rule_to_the_loop() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let url = "grpc://failing:1";
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .connection_mode(ConnectionMode::Grpc)
+            .engine_connection(ScriptedAnswers::answering_health(Ok(HealthAnswer {
+                healthy: false,
+                message: String::new(),
+            })))
+            .health_config(HealthCheckConfig {
+                failure_threshold: 1,
+                check_interval_secs: 1,
+                ..HealthCheckConfig::default()
+            })
+            .build(),
+    );
+    let id = registry.register(worker.clone()).expect("a probe worker");
+    let jobs = Arc::new(RecordedJobs::default());
+    let mut manager = WorkerManager::maybe_start(
+        registry,
+        config_removing(UnhealthyRemovalScope::AllLocal),
+        Some(jobs.clone()),
+        true,
+        false,
+    )
+    .expect("health checks are on");
+    wait_until(
+        tokio::time::Instant::now() + Duration::from_secs(20),
+        "the loop did not ask its queue to remove the failed worker",
+        || !jobs.0.lock().is_empty(),
+    )
+    .await;
+    manager.shutdown().await;
+
+    assert_eq!(worker.status(), WorkerStatus::Failed);
+    let removal = (
+        url.to_owned(),
+        id.as_str().to_owned(),
+        worker.revision(),
+        WorkerJobAsker::Health,
+    );
+    assert_eq!(*jobs.0.lock(), [removal]);
+}
+
+/// The collector says its two facts to the sink it was handed and writes no
+/// status itself. A probe's outcome crosses with the id, pass or fail, the
+/// revision and the status the probe was launched at, and the sink's answer
+/// comes back as given; a connect signal crosses with the id and the
+/// revision, and a sink that moves nothing leaves the worker where it was.
+/// The worker objects, which this sink never writes, keep their status and
+/// their counts.
+#[tokio::test]
+async fn the_collectors_facts_cross_the_port_and_it_writes_no_status_itself() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = RecordingSink::answering(ProbeAnswer::Stood(WorkerStatus::NotReady));
+
+    // The object says ready while the probe was launched at pending: the
+    // launched status is the one that crosses. A failure threshold of one:
+    // this crate's state machine would demote the worker on this outcome.
+    let probed = make_worker("http://probed:1", 1, 1);
+    let probed_id = registry.register(probed.clone()).unwrap();
+    probed.set_status(WorkerStatus::Ready);
+    let completion = ProbeCompletion {
+        worker_id: probed_id.clone(),
+        worker: Arc::clone(&probed),
+        expected_revision: probed.revision(),
+        launched_status: WorkerStatus::Pending,
+        probe_result: Err(WorkerError::HealthCheckFailed {
+            url: probed.url().to_string(),
+            reason: "refused".to_string(),
+        }),
+    };
+    let answer = apply_probe_completion(&registry, &sink, completion, None, None).await;
+    assert_eq!(answer, ProbeAnswer::Stood(WorkerStatus::NotReady));
+    assert_eq!(
+        *sink.probes.lock(),
+        vec![(probed_id, false, probed.revision(), WorkerStatus::Pending)]
+    );
+    assert_eq!(
+        probed.status(),
+        WorkerStatus::Ready,
+        "the status is the sink's to write"
+    );
+    assert_eq!(
+        probed.runtime_state().unwrap().total_pending_probes(),
+        0,
+        "the counts are the sink's to keep"
+    );
+
+    let unprobed = unprobed_worker("http://unprobed:1");
+    let unprobed_id = registry.register(unprobed.clone()).unwrap();
+    let status_before = unprobed.status();
+    let moved = apply_connect_signal(
+        &registry,
+        &sink,
+        WorkerConnected {
+            url: "http://unprobed:1".to_string(),
+            revision: unprobed.revision(),
+        },
+        &mut HashMap::new(),
+        &test_config(),
+    );
+    assert!(moved.is_none(), "the sink moved nothing");
+    assert_eq!(
+        *sink.connects.lock(),
+        vec![(unprobed_id, unprobed.revision())]
+    );
+    assert_eq!(
+        unprobed.status(),
+        status_before,
+        "the status is the sink's to write"
+    );
+}
+
+/// The loop reads a stood worker's status in the sink's answer, where the
+/// outcome was judged, not on the worker object a second time. To tell the
+/// two apart this sink answers "stood, not ready" to every outcome and never
+/// writes the object, which keeps the status it registered with. The
+/// worker's passing probes are then a demoted worker's: each brings the next
+/// read forward to a probe's timeout (one second), and three reads land
+/// within seconds. Read on the object, the status would leave the second
+/// read a whole interval (thirty seconds) away.
+#[tokio::test]
+async fn the_loop_reads_a_stood_status_in_the_sinks_answer_not_on_the_worker_object() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let url = start_health_stub(serving, hits).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stood(
+        WorkerStatus::NotReady,
+    )));
+    let mut manager =
+        WorkerManager::start_with_sink(registry.clone(), sink.clone(), test_config(), None);
+
+    let worker = probed_worker_with_timeout(&url, ConnectionMode::Http, 2, 30, 1);
+    let status_before = worker.status();
+    registry.register(worker.clone()).unwrap();
+    wait_until(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        "the next reads of a worker its sink holds not ready were not brought forward",
+        || sink.probes.lock().len() >= 3,
+    )
+    .await;
+    assert!(
+        sink.probes.lock().iter().all(|(_, passed, _, _)| *passed),
+        "every read passed"
+    );
+    assert_eq!(
+        worker.status(),
+        status_before,
+        "the status is the sink's to write"
+    );
+
+    manager.shutdown().await;
+}
+
+/// The registry answers the status that stands, not the status the probe
+/// was launched at. A probe launched at ready completes after another hand
+/// demoted the worker. Its pass is one short of the success threshold, so
+/// nothing moves, and the answer names the demoted status: the loop lays
+/// the worker's next read by it.
+#[test]
+fn the_registry_answers_the_status_that_stands_not_the_one_at_the_launch() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = make_worker("http://w:1", 2, 3);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    worker.set_status(WorkerStatus::Ready);
+    let launched = worker.status();
+    registry.transition_status(&worker_id, WorkerStatus::NotReady);
+
+    let answer = registry.probe_outcome(&worker_id, true, worker.revision(), launched);
+
+    assert_eq!(answer, ProbeAnswer::Stood(WorkerStatus::NotReady));
+}
+
+/// A sink that answers every connect signal with one transition and writes
+/// no worker object.
+struct PromotingSink {
+    old: WorkerStatus,
+    new: WorkerStatus,
+}
+
+impl HealthSink for PromotingSink {
+    fn probe_outcome(
+        &self,
+        _worker_id: &WorkerId,
+        _passed: bool,
+        _revision: u64,
+        launched: WorkerStatus,
+    ) -> ProbeAnswer {
+        ProbeAnswer::Stood(launched)
+    }
+
+    fn connected(
+        &self,
+        _worker_id: &WorkerId,
+        _revision: u64,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        Some((self.old, self.new))
+    }
+}
+
+/// After a connect signal promotes a worker, its next check sits where the
+/// status it took puts it, not where the status it left would. The sink
+/// answers that a draining worker became ready: a draining worker holds no
+/// deadline, and a ready one is read an interval out.
+#[test]
+fn a_promoted_workers_next_check_follows_the_status_it_took() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = PromotingSink {
+        old: WorkerStatus::Draining,
+        new: WorkerStatus::Ready,
+    };
+    let worker = probed_worker("ipc:///tmp/promoted.ipc", ConnectionMode::Zmq);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let mut next_check = HashMap::new();
+    let before = tokio::time::Instant::now();
+
+    let (promoted_id, _) = apply_connect_signal(
+        &registry,
+        &sink,
+        WorkerConnected {
+            url: worker.url().to_string(),
+            revision: worker.revision(),
+        },
+        &mut next_check,
+        &test_config(),
+    )
+    .expect("the sink answered a promotion");
+
+    assert!(promoted_id == worker_id);
+    let due = next_check
+        .get(&worker_id)
+        .expect("a ready worker holds a deadline");
+    assert!(
+        *due >= before + Duration::from_secs(3600),
+        "an interval out, not at once"
+    );
+}
+
+/// One loop holds the registry's connect-signal receiver, and hands it back
+/// at its end: a loop started behind it is signalled from then on. A host
+/// that runs a loop for each term of its lead starts the next as the last
+/// one ends, so the second loop here starts while the first still runs.
+#[tokio::test]
+async fn a_loop_started_behind_another_is_signalled_once_the_first_ends() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = unprobed_worker("http://unprobed:1");
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let signal = || {
+        registry
+            .connect_signal_sender()
+            .send(WorkerSignal::Connected(WorkerConnected {
+                url: worker.url().to_string(),
+                revision: worker.revision(),
+            }))
+            .expect("the channel has its receiver");
+    };
+    let first_sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let second_sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let first =
+        WorkerManager::start_with_sink(registry.clone(), first_sink.clone(), test_config(), None);
+    let _second =
+        WorkerManager::start_with_sink(registry.clone(), second_sink.clone(), test_config(), None);
+
+    // The first loop holds the receiver: its sink is told, the second's
+    // is not.
+    signal();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(deadline, "the first loop reads the signal", || {
+        first_sink.connects.lock().len() == 1
+    })
+    .await;
+    assert!(second_sink.connects.lock().is_empty());
+
+    // The first loop ends, by the abort at its manager's drop. The second
+    // takes the receiver and reads the next signal.
+    drop(first);
+    signal();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_until(deadline, "the second loop reads the signal", || {
+        second_sink.connects.lock().len() == 1
+    })
+    .await;
+    assert_eq!(
+        *second_sink.connects.lock(),
+        vec![(worker_id, worker.revision())]
+    );
+    assert_eq!(
+        first_sink.connects.lock().len(),
+        1,
+        "the first read no more"
+    );
+}
+
+/// The collector tells its sink of a worker's liveness in three places: for
+/// every worker at the loop's start, at each move of a worker's veto, and
+/// where a worker is laid in another's place. Each tell carries the id and
+/// the revision of the worker that stands there, and no reading.
+#[tokio::test]
+async fn the_collector_tells_its_sink_each_move_of_a_workers_liveness() {
+    use crate::runtime::StallReason;
+
+    let registry = Arc::new(WorkerRegistry::new());
+    let build = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..HealthCheckConfig::default()
+                })
+                .connect_signal_tx(registry.connect_signal_sender())
+                .build(),
+        )
+    };
+    let told = |sink: &RecordingSink, count: usize| sink.liveness.lock().len() == count;
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+    let moved = build("http://moved:1");
+    let quiet = build("http://quiet:1");
+    let moved_id = registry.register(moved.clone()).unwrap();
+    let quiet_id = registry.register(quiet.clone()).unwrap();
+    let sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let _manager =
+        WorkerManager::start_with_sink(registry.clone(), sink.clone(), test_config(), None);
+
+    // The start: every worker, each at its revision.
+    wait_until(deadline(), "the start tells every worker", || {
+        told(&sink, 2)
+    })
+    .await;
+    let at_start = sink.liveness.lock().clone();
+    assert!(at_start.contains(&(moved_id.clone(), moved.revision())));
+    assert!(at_start.contains(&(quiet_id, quiet.revision())));
+
+    // A move of the veto: one tell, of that worker.
+    assert!(moved.set_stall(Some(StallReason::Unreachable)));
+    wait_until(deadline(), "the move is told", || told(&sink, 3)).await;
+    assert_eq!(
+        sink.liveness.lock()[2],
+        (moved_id.clone(), moved.revision())
+    );
+
+    // Two moves before the loop runs again are one signal and one tell:
+    // the sink reads the veto on the object.
+    assert!(moved.set_stall(None));
+    assert!(moved.set_stall(Some(StallReason::Wedged)));
+    wait_until(deadline(), "the two moves are told", || told(&sink, 4)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(told(&sink, 4), "one signal waited for the two moves");
+
+    // A veto that stands is no move.
+    assert!(!moved.set_stall(Some(StallReason::Wedged)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(told(&sink, 4));
+
+    // A worker laid in another's place took its running state, the veto
+    // with it: the sink is told at the replacement's revision.
+    let replacement = build("http://moved:1");
+    assert!(registry.replace(&moved_id, replacement.clone()));
+    wait_until(deadline(), "the replacement is told", || told(&sink, 5)).await;
+    assert_eq!(
+        sink.liveness.lock()[4],
+        (moved_id.clone(), replacement.revision())
+    );
+    assert_eq!(replacement.stall_reason(), Some(StallReason::Wedged));
+
+    // A registered worker starts with no veto, and the signal of a worker
+    // that left is nobody's: neither is told.
+    registry.register(build("http://new:1")).unwrap();
+    registry
+        .connect_signal_sender()
+        .send(WorkerSignal::LivenessMoved {
+            url: "http://gone:1".to_string(),
+        })
+        .expect("the channel has its receiver");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(told(&sink, 5));
 }

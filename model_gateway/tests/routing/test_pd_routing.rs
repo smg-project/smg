@@ -5,9 +5,12 @@ mod pd_routing_unit_tests {
     use smg::{
         app_context::AppContext,
         config::{PolicyConfig, RouterConfig, RoutingMode},
-        routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        routers::{
+            grpc::backend_client::BasicWorkerBuilder, http::pd_types::PDSelectionPolicy,
+            RouterFactory,
+        },
     };
+    use smg_worker::identity::basic::{Worker, WorkerType};
 
     #[derive(Debug)]
     struct PDRequest {
@@ -39,7 +42,8 @@ mod pd_routing_unit_tests {
 
     #[test]
     fn test_worker_types() {
-        use smg::worker::{BasicWorkerBuilder, Worker, WorkerType};
+        use smg::routers::grpc::backend_client::BasicWorkerBuilder;
+        use smg_worker::identity::basic::{Worker, WorkerType};
 
         let prefill_worker: Box<dyn Worker> = Box::new(
             BasicWorkerBuilder::new("http://prefill:8080")
@@ -207,7 +211,7 @@ mod pd_routing_unit_tests {
                 use smg::{
                     middleware::TokenBucket,
                     policies::PolicyRegistry,
-                    worker::{WorkerMonitor, WorkerRegistry},
+                    routers::common::snapshot::{WorkerMonitor, WorkerRegistry},
                 };
                 use smg_data_connector::{
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -670,7 +674,8 @@ mod pd_routing_unit_tests {
 
     #[test]
     fn test_bootstrap_injection_with_benchmark_requests() {
-        use smg::worker::{BasicWorkerBuilder, Worker, WorkerType};
+        use smg::routers::grpc::backend_client::BasicWorkerBuilder;
+        use smg_worker::identity::basic::{Worker, WorkerType};
 
         let mut benchmark_request = json!({
             "input_ids": vec![vec![1, 2, 3, 4]; 16], // Batch size 16

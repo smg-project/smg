@@ -91,6 +91,7 @@ GATEWAY = "smg"
 CRATES = (
     crate("openai-protocol", "crates/protocols", "openai-protocol"),
     crate("smg-worker", "crates/worker", "smg-worker", wire=("crates/worker/proto/",)),
+    crate("smg-service-discovery", "crates/service_discovery", "smg-service-discovery"),
     crate("smg-mm-rdma", "crates/mm_rdma", "smg-mm-rdma"),
     crate("engine-zmq-client", "crates/engine_zmq_client", "engine-zmq-client"),
     crate("reasoning-parser", "crates/reasoning_parser", "reasoning-parser"),
@@ -112,6 +113,7 @@ CRATES = (
     crate("smg-rl", "crates/rl", "smg-rl"),
     crate("engine-zmq-adapter", "crates/engine_zmq_adapter", "engine-zmq-adapter"),
     crate("engine-servicer", "crates/engine_servicer", "engine-servicer"),
+    crate("smg-policy-controller", "crates/policy_controller", "smg-policy-controller"),
     crate("smg-client", "clients/rust"),
     crate("openapi-gen", "clients/openapi-gen"),
     crate(GATEWAY, "model_gateway"),
@@ -561,6 +563,15 @@ def check(
     if carrier is not None and carrier != tag:
         verdict.carried_by = carrier
         verdict.files_changed = files_changed(repo, carrier, component)
+    alone = None
+    if verdict.files_changed == 0 and carrier is None:
+        # A version written by hand over the comparison tag's own files can still sit inside the
+        # caret of a version another line published with other wire files: the files are counted
+        # against that line's copy, and the bumped path below asks for the step. The comparison
+        # tag's own copy is this code, a rename aside, so it is no candidate here.
+        alone = published_inside(repo, tag, component, verdict, own=False)
+        if alone is not None:
+            verdict.files_changed = files_changed(repo, tagged[alone], component)
     if verdict.files_changed == 0:
         # Changed since the comparison tag, at a version another line's tag carries with this very
         # code: nothing to publish, but the workspace pin still has to follow the version (the
@@ -571,27 +582,53 @@ def check(
                 verdict.workspace_version = pinned or ""
         return verdict
     verdict.unbumped = carrier is not None
-    verdict.wire = bool(component.wire) and bool(repo.changed_since(tag, component.wire))
     if verdict.unbumped:
+        # The published copy of this version is the carrier's, the given tag or another line's.
+        verdict.wire = wire_changed(repo, carrier, component)
         verdict.level = bump_level(repo.commits_since(tag, component_paths(repo, component)))
         if verdict.wire:
             verdict.level = LEVELS[
                 max(LEVELS.index(verdict.level), LEVELS.index(breaking_level(verdict.version)))
             ]
-    elif (
-        verdict.wire
-        and verdict.tag_version is not None
-        and caret_accepts(verdict.tag_version, verdict.version)
-    ):
-        # Bumped, to a version the tagged one's caret accepts: a dependent's published copy
+    elif inside := alone or published_inside(repo, tag, component, verdict):
+        # Bumped, to a version a published one's caret accepts: a dependent's published copy
         # resolves to it and builds messages that gained a field.
-        verdict.unbumped, verdict.inside = True, verdict.tag_version
+        verdict.wire = True
+        verdict.unbumped, verdict.inside = True, inside
         verdict.level = breaking_level(verdict.version)
     elif component.dep_key:
         pinned = workspace_dep_version(root_toml, component.dep_key)
         if pinned != verdict.version:
             verdict.workspace_version = pinned or ""
     return verdict
+
+
+def wire_changed(repo: Repo, tag: str, component: Component) -> bool:
+    """Whether the component's wire files differ from the tag's."""
+    return bool(component.wire) and bool(repo.changed_since(tag, component.wire))
+
+
+def published_inside(
+    repo: Repo, tag: str, component: Component, verdict: Verdict, *, own: bool = True
+) -> str | None:
+    """The newest published version whose caret accepts the version written by hand while the
+    wire files differ from that version's own: the given tag's, or the version of a tag another
+    release line made. A dependent's published copy on that line resolves to the new version.
+    With ``own`` false the given tag's version is no candidate."""
+    published = dict(verdict.tagged)
+    if verdict.tag_version is not None:
+        if own:
+            published[verdict.tag_version] = tag
+        else:
+            published.pop(verdict.tag_version, None)
+    for version in sorted(
+        published, key=lambda v: version_key(v) or (-1, 0, 0, 0, 0), reverse=True
+    ):
+        if caret_accepts(version, verdict.version) and wire_changed(
+            repo, published[version], component
+        ):
+            return version
+    return None
 
 
 # --- the report, the proposal, the fixes --------------------------------------

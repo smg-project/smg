@@ -21,16 +21,20 @@ use crate::{
         resilience::ResolvedResilience,
     },
     identity::basic::Worker,
-    metrics::writers::Metrics,
     model_card::ModelCard,
     pd::pairing::PdPairing,
-    registry::event::WorkerConnected,
+    registry::event::WorkerSignal,
     settings::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     worker::{
         ConstrainedDecoding, HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec,
         WorkerStatus,
     },
 };
+
+/// The URL of the rank `rank` of the engine at `base`.
+pub fn rank_url(base: &str, rank: usize) -> String {
+    format!("{base}@{rank}")
+}
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -58,6 +62,9 @@ pub struct BasicWorkerBuilder<D = NoConnector> {
     /// An engine connection that is already made (if not set, the worker
     /// connects on first use).
     engine_connection: Option<Arc<dyn EngineConnection>>,
+    /// The connection slot of the rank workers of one ZMQ engine group (if
+    /// not set, the worker has a slot of its own).
+    shared_engine_connection: Option<Arc<EngineConnectionCache>>,
     /// What makes the worker's engine connection (if not set, the default
     /// `D` names).
     engine_connector: Option<Arc<dyn EngineConnector>>,
@@ -74,8 +81,9 @@ pub struct BasicWorkerBuilder<D = NoConnector> {
     /// Callers replacing an existing worker (e.g. metadata updates) should
     /// pass the old worker's status to avoid kicking it back to Pending.
     initial_status: Option<WorkerStatus>,
-    /// Connect-readiness signal sender (ZMQ registration path only).
-    connect_signal_tx: Option<mpsc::UnboundedSender<WorkerConnected>>,
+    /// The registry's signal sender: the worker's connect signal and the
+    /// moves of its liveness veto ride it to the manager's loop.
+    connect_signal_tx: Option<mpsc::UnboundedSender<WorkerSignal>>,
     /// Gateway-level overload thresholds the spec's `overload` block resolves
     /// against. Default empty: a spec block alone still enables protection
     /// for this worker.
@@ -103,6 +111,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             zmq_request_timeout: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             engine_connection: None,
+            shared_engine_connection: None,
             engine_connector: None,
             default_connector: PhantomData,
             http_client: None,
@@ -278,6 +287,15 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
+    /// Share one connection slot with the other rank workers of a ZMQ engine
+    /// group: the group's engines dial one socket set, so its rank workers
+    /// run one handshake between them and follow its reconnects together.
+    #[cfg(any(feature = "workflow", test))]
+    pub(crate) fn shared_engine_connection(mut self, slot: Arc<EngineConnectionCache>) -> Self {
+        self.shared_engine_connection = Some(slot);
+        self
+    }
+
     /// Set what makes the worker's engine connection, in place of the default
     /// `D` names. A gRPC or ZMQ worker with neither refuses its connect.
     pub fn engine_connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
@@ -285,10 +303,12 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
-    /// Wire the connect-readiness signal sender (from the registry) so a ZMQ
-    /// worker can wake the manager the instant its handshake completes. Only
-    /// meaningful for ZMQ workers; HTTP/gRPC promotion stays poll-driven.
-    pub fn connect_signal_tx(mut self, tx: mpsc::UnboundedSender<WorkerConnected>) -> Self {
+    /// Wire the signal sender (from the registry). The worker says two
+    /// things on it to the manager's loop. Its connection completed: a ZMQ
+    /// worker is promoted the instant its handshake lands, and a demoted
+    /// worker is probed at its first contact. And its liveness veto moved,
+    /// which the loop tells the health sink.
+    pub fn connect_signal_tx(mut self, tx: mpsc::UnboundedSender<WorkerSignal>) -> Self {
         self.connect_signal_tx = Some(tx);
         self
     }
@@ -380,7 +400,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
     /// Captures the current URL as the base URL, then formats it as `{base}@{rank}`.
     pub fn dp_config(mut self, rank: usize, size: usize) -> Self {
         let base_url = self.spec.url.clone();
-        self.spec.url = format!("{base_url}@{rank}");
+        self.spec.url = rank_url(&base_url, rank);
         self.spec.dp_base_url = Some(base_url);
         self.spec.dp_rank = Some(rank);
         self.spec.dp_size = Some(size);
@@ -396,7 +416,11 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
-    /// Build the BasicWorker instance
+    /// Build the BasicWorker instance.
+    ///
+    /// Building writes no metric series: a worker publishes its own where it
+    /// enters a registry ([`Worker::publish_series`]). A worker that is built
+    /// and never enters leaves the series of its address as they stood.
     pub fn build(mut self) -> BasicWorker {
         use std::sync::atomic::AtomicBool;
 
@@ -420,7 +444,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
-            redacted_url: Endpoint::redacted_url(&self.spec.url),
+            redacted_url: self.spec.redacted_url(),
             decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
@@ -435,7 +459,9 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
 
         // OnceCell for lock-free client access after initialization; ArcSwap so
         // the ZMQ health probe can evict a dead client (see BasicWorker docs).
-        let engine_connection = {
+        let engine_connection = if let Some(slot) = self.shared_engine_connection {
+            slot
+        } else {
             let cell = OnceCell::new();
             if let Some(connection) = self.engine_connection {
                 // Pre-set the connection if provided (set on a fresh cell cannot fail)
@@ -456,8 +482,6 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
                 } else {
                     WorkerStatus::Pending
                 });
-        Metrics::set_worker_health(&metadata.spec.url, initial_status == WorkerStatus::Ready);
-        Metrics::set_worker_http2(&metadata.spec.url, metadata.http2);
 
         let http_client = Arc::new(match self.http_client {
             Some(client) => LazyHttpClient::ready(client),
@@ -479,6 +503,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             metadata,
             engine_connection,
             engine_connector: self.engine_connector.or_else(D::default_connector),
+            load_source: Arc::new(OnceCell::new()),
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
             superseded: AtomicBool::new(false),
@@ -578,6 +603,57 @@ mod tests {
             .build();
         assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
         assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
+    }
+
+    /// A rank is read out of an address by its spec's own fields alone. An
+    /// address that ends in an `@` and digits beside no base, or beside a
+    /// base it is not built from, is a userinfo before a host: it is
+    /// rendered with the userinfo masked, never raw.
+    #[test]
+    fn the_rendered_url_reads_no_rank_out_of_an_address_its_spec_does_not_rank() {
+        let alone = BasicWorkerBuilder::new("http://pebble@2130706433").build();
+        assert_eq!(alone.redacted_url(), "http://***@2130706433");
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        spec.dp_base_url = Some("http://other:8000".to_string());
+        let beside = BasicWorkerBuilder::from_spec(spec).build();
+        assert_eq!(beside.redacted_url(), "http://***@2130706433");
+    }
+
+    /// An IPC address holds no userinfo: an `@` and digits at its end are
+    /// bytes of its path. A socket its spec does not rank renders as it
+    /// stands, so two such sockets render apart.
+    #[test]
+    fn the_rendered_url_keeps_a_socket_path_that_ends_like_a_rank() {
+        for url in ["ipc:///tmp/w", "ipc:///tmp/w@0", "ipc:///tmp/w@00"] {
+            let alone = BasicWorkerBuilder::new(url).build();
+            assert_eq!(alone.redacted_url(), url);
+            let mut spec = WorkerSpec::new(url);
+            spec.dp_base_url = Some("ipc:///tmp/g".to_string());
+            let beside = BasicWorkerBuilder::from_spec(spec).build();
+            assert_eq!(beside.redacted_url(), url);
+        }
+        // A socket's rank still renders with its base.
+        let mut spec = WorkerSpec::new("ipc:///tmp/g@1");
+        spec.dp_base_url = Some("ipc:///tmp/g".to_string());
+        let ranked = BasicWorkerBuilder::from_spec(spec).build();
+        assert_eq!(ranked.redacted_url(), "ipc:///tmp/g@1");
+    }
+
+    #[test]
+    fn a_ranks_url_is_formed_in_one_place() {
+        let base = "http://worker:8000";
+        for (rank, url) in [
+            "http://worker:8000@0",
+            "http://worker:8000@1",
+            "http://worker:8000@2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let worker = BasicWorkerBuilder::new(base).dp_config(rank, 3).build();
+            assert_eq!(rank_url(base, rank), url);
+            assert_eq!(worker.url(), url);
+        }
     }
 
     #[test]

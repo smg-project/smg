@@ -4,7 +4,12 @@
 //! enums, and core configuration. These types are shared across API
 //! request/response boundaries and internal runtime state.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 #[cfg(feature = "axum")]
 use axum::{
@@ -18,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
 use serde_json::json;
 
-use super::model_card::ModelCard;
+use super::{identity::endpoint::Endpoint, model_card::ModelCard, value_bounds};
 
 // ── Default value constants ──────────────────────────────────────────
 
@@ -461,7 +466,7 @@ fn default_drain_settle_secs() -> u64 {
 // ── Health check config ─────────────────────────────────────────────
 
 /// Health check configuration shared across protocol and runtime layers.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HealthCheckConfig {
     /// Health check timeout in seconds (default: 30).
     #[serde(default = "default_health_check_timeout")]
@@ -603,7 +608,7 @@ impl<'de> Deserialize<'de> for WorkerModels {
 
 /// JsonSchema: wire format is `Vec<ModelCard>`.
 impl JsonSchema for WorkerModels {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
+    fn schema_name() -> Cow<'static, str> {
         "WorkerModels".into()
     }
 
@@ -757,6 +762,8 @@ impl GrammarStart {
 
 // ── Core identity ────────────────────────────────────────────────────
 
+const REDACTED_API_KEY: &str = "<redacted>";
+
 /// Core worker identity and configuration.
 ///
 /// The single canonical representation of "what is a worker". Used as the
@@ -766,7 +773,7 @@ impl GrammarStart {
 /// Fields use `#[serde(default)]` so the same struct works for both input
 /// (partial config from user) and output (fully resolved state).
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerSpec {
     /// Worker URL.
     pub url: String,
@@ -911,6 +918,90 @@ pub struct WorkerSpec {
     pub overload: OverloadUpdate,
 }
 
+impl std::fmt::Debug for WorkerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // List every field so new fields require a formatting decision.
+        let Self {
+            url,
+            models,
+            worker_type,
+            connection_mode,
+            runtime_type,
+            provider,
+            labels,
+            priority,
+            cost,
+            api_key,
+            bootstrap_port,
+            bootstrap_host,
+            dp_base_url,
+            dp_rank,
+            dp_size,
+            kv_connector,
+            kv_role,
+            kv_engine_id,
+            kv_block_size,
+            pairing_protocol,
+            constrained_decoding,
+            health,
+            http_pool,
+            resilience,
+            max_connection_attempts,
+            load_monitor_interval_secs,
+            multimodal_tensor_transport,
+            multimodal_shm_min_bytes,
+            zmq_handshake_address,
+            overload,
+        } = self;
+
+        // An address prints in its redacted form: its userinfo can carry
+        // a credential. A rank is read out of the address alone that is
+        // its base, an `@` and digits: in any other, an `@` and digits at
+        // the end are a userinfo and a host, and read as a rank they would
+        // print the userinfo. In an IPC address they are bytes of its path.
+        let url = if self.url_is_ranked() {
+            Endpoint::redacted_str(url)
+        } else {
+            Endpoint::redacted_str_unranked(url)
+        };
+        f.debug_struct("WorkerSpec")
+            .field("url", &url)
+            .field("models", models)
+            .field("worker_type", worker_type)
+            .field("connection_mode", connection_mode)
+            .field("runtime_type", runtime_type)
+            .field("provider", provider)
+            .field("labels", labels)
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("bootstrap_port", bootstrap_port)
+            .field("bootstrap_host", bootstrap_host)
+            .field(
+                "dp_base_url",
+                &dp_base_url.as_deref().map(Endpoint::redacted_str_unranked),
+            )
+            .field("dp_rank", dp_rank)
+            .field("dp_size", dp_size)
+            .field("kv_connector", kv_connector)
+            .field("kv_role", kv_role)
+            .field("kv_engine_id", kv_engine_id)
+            .field("kv_block_size", kv_block_size)
+            .field("pairing_protocol", pairing_protocol)
+            .field("constrained_decoding", constrained_decoding)
+            .field("health", health)
+            .field("http_pool", http_pool)
+            .field("resilience", resilience)
+            .field("max_connection_attempts", max_connection_attempts)
+            .field("load_monitor_interval_secs", load_monitor_interval_secs)
+            .field("multimodal_tensor_transport", multimodal_tensor_transport)
+            .field("multimodal_shm_min_bytes", multimodal_shm_min_bytes)
+            .field("zmq_handshake_address", zmq_handshake_address)
+            .field("overload", overload)
+            .finish()
+    }
+}
+
 impl WorkerSpec {
     /// Create a new `WorkerSpec` with the given URL and sensible defaults.
     pub fn new(url: impl Into<String>) -> Self {
@@ -945,6 +1036,36 @@ impl WorkerSpec {
             multimodal_shm_min_bytes: None,
             zmq_handshake_address: None,
             overload: OverloadUpdate::default(),
+        }
+    }
+
+    /// Whether [`Self::url`] carries a rank: it is the spec's base
+    /// ([`Self::dp_base_url`]), an `@` and digits, as a registration writes
+    /// a rank's address beside its base. In any other address an `@` and
+    /// digits at the end are a userinfo and a host, or bytes of an IPC
+    /// path, and no rank is read out of it.
+    pub fn url_is_ranked(&self) -> bool {
+        self.dp_base_url
+            .as_deref()
+            .and_then(|base| self.url.strip_prefix(base))
+            .and_then(|rest| rest.strip_prefix('@'))
+            .is_some_and(|rank| {
+                !rank.is_empty() && rank.bytes().all(|digit| digit.is_ascii_digit())
+            })
+    }
+
+    /// [`Self::url`] as a request's success path shows it: the registered
+    /// string byte for byte where it holds no userinfo, query or fragment,
+    /// and its redacted form otherwise ([`Endpoint::redacted_url`]). A
+    /// rank is read out of the address by the spec's own fields alone
+    /// ([`Self::url_is_ranked`]). In any other address nothing is split
+    /// off the end: an `@` and digits there are a userinfo before a host,
+    /// which is masked, or bytes of an IPC path, which is written whole.
+    pub fn redacted_url(&self) -> String {
+        if self.url_is_ranked() {
+            Endpoint::redacted_url(&self.url)
+        } else {
+            Endpoint::redacted_url_unranked(&self.url)
         }
     }
 }
@@ -1419,7 +1540,7 @@ impl ResilienceUpdate {
 
 /// Worker update request
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerUpdateRequest {
     /// Update priority
     pub priority: Option<u32>,
@@ -1435,6 +1556,26 @@ pub struct WorkerUpdateRequest {
 
     /// Update health check configuration (partial — only specified fields change)
     pub health: Option<HealthCheckUpdate>,
+}
+
+impl std::fmt::Debug for WorkerUpdateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            priority,
+            cost,
+            labels,
+            api_key,
+            health,
+        } = self;
+
+        f.debug_struct("WorkerUpdateRequest")
+            .field("priority", priority)
+            .field("cost", cost)
+            .field("labels", labels)
+            .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
+            .field("health", health)
+            .finish()
+    }
 }
 
 // ── Request types ───────────────────────────────────────────────────
@@ -1565,10 +1706,36 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Per-DP-rank load snapshot from a backend.
-///
-/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
-/// Each snapshot represents one data-parallel rank's scheduler state.
+/// A token count offered by name from the fixed used-token field.
+pub const KV_TOKENS_USED: &str = "kv_tokens_used";
+/// A token count offered by name from the fixed token-capacity field.
+pub const KV_TOKENS_CAPACITY: &str = "kv_tokens_capacity";
+
+/// The two names offered from the fixed token counts and their unit, each
+/// made once.
+static FIXED_COUNT_NAMES: LazyLock<[Arc<str>; 3]> = LazyLock::new(|| {
+    [
+        Arc::from(KV_TOKENS_USED),
+        Arc::from(KV_TOKENS_CAPACITY),
+        Arc::from("tokens"),
+    ]
+});
+
+/// One value an engine reports by name alongside its fixed fields. The name
+/// and the unit are shared strings: a copy of a report, which the load
+/// monitor makes at each publish, allocates none. A connection that knows
+/// a name ahead of its reports makes it once and clones it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NamedValue {
+    pub name: Arc<str>,
+    pub unit: Arc<str>,
+    pub value: f64,
+    /// Age of this value's sample in milliseconds, when the engine reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u32>,
+}
+
+/// The scheduler's load report for one data-parallel rank.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
@@ -1624,6 +1791,102 @@ pub struct SchedulerLoadSnapshot {
     /// "prefill", "decode", or "null" as reported by the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disagg_mode: Option<String>,
+    /// Values the engine reports by name, as the one record or answer this
+    /// snapshot was read from states them. A pushed record's list takes
+    /// the place of the rank's last: a name the record leaves out is not
+    /// in its snapshot, and that says nothing about the value. A reader
+    /// that wants a value across records keeps the last one it read; the
+    /// load sink hears every record.
+    ///
+    /// A report holds a list to bounds ([`Self::bound_values`]). A pushed
+    /// record's snapshot is built under them, and the load monitor puts a
+    /// polled answer's list under them before a sink or a reader sees it.
+    /// Off the wire the key fails no answer: an entry that is no named
+    /// value is read with no name, and a key that is no list as no list.
+    #[serde(
+        default,
+        deserialize_with = "value_bounds::stated",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schemars(
+        description = "Values the engine reports by name, as the one record or answer this \
+                       snapshot was read from states them. A list takes the place of the \
+                       rank's last: a name it leaves out is not in the snapshot, and that says \
+                       nothing about the value. A report keeps the first 64 entries of a list, \
+                       less each one with an empty name, a name over 63 bytes, a unit over 31 \
+                       bytes, a value that is not finite, or a name an entry kept ahead of it \
+                       states."
+    )]
+    pub values: Vec<NamedValue>,
+    /// The parts of this entry that its own source did not carry. A pushed
+    /// record's are the parts it left out ([`LoadRecord::snapshot`]): the
+    /// load monitor kept them from an older record of the rank, or the
+    /// rank has none of them yet. Empty for a polled answer, which has no
+    /// key that says a part was left out. Never serialized: an answer on
+    /// the wire states its figures and no mark.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub kept: LoadTelemetry,
+}
+
+impl SchedulerLoadSnapshot {
+    /// Puts [`Self::values`] under the bounds a report holds named values
+    /// to, in place, and answers how many entries left the list. A report
+    /// considers a list's first 64 entries. Of those it drops each one
+    /// with an empty name, a name over 63 bytes, a unit over 31 bytes, a
+    /// value that is not finite, or a name an entry kept ahead of it
+    /// states: the first of a name stands. The kept entries keep their
+    /// order.
+    ///
+    /// The load monitor passes every polled answer through this and counts
+    /// what it answers. A pushed record's snapshot is built under the same
+    /// bounds. A host that takes an answer by a way of its own calls this
+    /// before it reads the list.
+    pub fn bound_values(&mut self) -> usize {
+        value_bounds::bound(&mut self.values)
+    }
+
+    /// Values the engine reports by name, followed by the two fixed token
+    /// counts, each where this snapshot's own source stated it and its
+    /// name is absent from the list. A stated count is offered at zero
+    /// too: an engine that goes idle states zero tokens held, and a reader
+    /// that keeps the last value it read must hear it.
+    ///
+    /// Two rules say what is stated, and both are read here alone. A count
+    /// the source did not carry ([`Self::kept`]) is not offered: what a
+    /// snapshot offers by name is its own record's, and such a count is
+    /// stored as zero or as the last record's. An entry with no token
+    /// capacity offers neither count, whatever its source: an engine that
+    /// reports its counts reports its capacity
+    /// ([`WorkerLoadResponse::has_absolute_token_data`]), and one that
+    /// keeps no such size fills both with zero on every record. The
+    /// capacity is the entry's, so a record that leaves it out is read by
+    /// the one the entry keeps.
+    pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
+        let [used, capacity, tokens] = &*FIXED_COUNT_NAMES;
+        let sized = self.max_total_num_tokens > 0;
+        let fixed = [
+            (used, self.num_used_tokens, LoadTelemetry::USED_TOKENS),
+            (
+                capacity,
+                self.max_total_num_tokens,
+                LoadTelemetry::TOTAL_TOKENS,
+            ),
+        ]
+        .into_iter()
+        .filter(move |&(name, _, part)| {
+            sized
+                && !self.kept.contains(part)
+                && !self.values.iter().any(|value| value.name == *name)
+        })
+        .map(move |(name, count, _)| NamedValue {
+            name: Arc::clone(name),
+            unit: Arc::clone(tokens),
+            value: f64::from(count),
+            age_ms: None,
+        });
+        self.values.iter().cloned().chain(fixed)
+    }
 }
 
 bitflags! {
@@ -1631,7 +1894,7 @@ bitflags! {
     /// flag for each part of [`SchedulerLoadSnapshot`] whose figure a report
     /// keeps from the last record that carried it. An optional figure
     /// outside these six is published as the record sends it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct LoadTelemetry: u8 {
         /// `cache_hit_rate`.
         const CACHE_HIT_RATE = 1 << 0;
@@ -1661,10 +1924,27 @@ pub trait LoadRecord {
     /// nothing else is kept.
     fn telemetry(&self) -> LoadTelemetry;
 
-    /// The rank's entry a poll would have produced from the record, with
-    /// the telemetry it leaves out at the type's default. The rank is the
+    /// The record's fields in the shape of a rank's entry, with omitted
+    /// telemetry at the type's default and no mark of what was left out.
+    /// What a record type writes. A reader takes [`Self::snapshot`].
+    fn fields(&self) -> SchedulerLoadSnapshot;
+
+    /// The rank's entry from the record: its fields, marked with the parts
+    /// the record did not carry ([`SchedulerLoadSnapshot::kept`]). The
+    /// mark is written here, once, for every record type. The rank is the
     /// caller's to set.
-    fn snapshot(&self) -> SchedulerLoadSnapshot;
+    fn snapshot(&self) -> SchedulerLoadSnapshot {
+        let mut snapshot = self.fields();
+        snapshot.kept = LoadTelemetry::all().difference(self.telemetry());
+        snapshot
+    }
+
+    /// How many values the record names, ahead of the bounds its snapshot
+    /// keeps them under: what the snapshot's list holds fewer was dropped
+    /// at a bound, and the load monitor counts it. Zero for a record that
+    /// names none. Every record type says it: a default would let one that
+    /// carries values count no drop.
+    fn values_sent(&self) -> usize;
 
     /// How long the engine has produced no output while it held requests
     /// it reports on every step. `None` while it holds none, or when the
@@ -2207,6 +2487,207 @@ mod overload_update_tests {
 }
 
 #[cfg(test)]
+mod load_snapshot_tests {
+    use std::{fs, path::Path};
+
+    use super::*;
+
+    #[test]
+    fn named_values_offer_the_fixed_token_counts_independently() {
+        // A record that stated neither count.
+        let mut snapshot = SchedulerLoadSnapshot {
+            kept: LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS,
+            ..Default::default()
+        };
+        assert!(snapshot.named_values().next().is_none());
+
+        // A capacity on file, and a record that carried the held count
+        // alone.
+        snapshot.num_used_tokens = 211;
+        snapshot.max_total_num_tokens = 1_373;
+        snapshot.kept = LoadTelemetry::TOTAL_TOKENS;
+        let used = NamedValue {
+            name: "kv_tokens_used".into(),
+            unit: "tokens".into(),
+            value: 211.0,
+            age_ms: None,
+        };
+        assert_eq!(
+            snapshot.named_values().collect::<Vec<_>>().as_slice(),
+            std::slice::from_ref(&used)
+        );
+
+        snapshot.kept = LoadTelemetry::empty();
+        let capacity = NamedValue {
+            name: "kv_tokens_capacity".into(),
+            unit: "tokens".into(),
+            value: 1_373.0,
+            age_ms: None,
+        };
+        let values: Vec<_> = snapshot.named_values().collect();
+        assert_eq!(values, [used, capacity.clone()]);
+        // The offered names and their unit are made once: two offers share
+        // them.
+        let again: Vec<_> = snapshot.named_values().collect();
+        assert!(values.iter().zip(&again).all(|(first, second)| {
+            Arc::ptr_eq(&first.name, &second.name) && Arc::ptr_eq(&first.unit, &second.unit)
+        }));
+        assert!(Arc::ptr_eq(&values[0].unit, &values[1].unit));
+
+        // A stated count is offered at zero: an idle engine holds none.
+        snapshot.num_used_tokens = 0;
+        let idle = NamedValue {
+            value: 0.0,
+            ..values[0].clone()
+        };
+        assert_eq!(
+            snapshot.named_values().collect::<Vec<_>>(),
+            [idle, capacity]
+        );
+        // An entry with no capacity offers neither count, whatever its
+        // mark says.
+        snapshot.max_total_num_tokens = 0;
+        assert!(snapshot.named_values().next().is_none());
+    }
+
+    #[test]
+    fn the_offer_reads_the_mark_and_the_entrys_capacity() {
+        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<String> {
+            snapshot
+                .named_values()
+                .map(|value| value.name.to_string())
+                .collect()
+        };
+        let entry = |capacity: i32, kept: LoadTelemetry| SchedulerLoadSnapshot {
+            num_used_tokens: 211,
+            max_total_num_tokens: capacity,
+            kept,
+            ..Default::default()
+        };
+        // A capacity: each count the source carried.
+        assert_eq!(
+            names(&entry(1_373, LoadTelemetry::empty())),
+            [KV_TOKENS_USED, KV_TOKENS_CAPACITY]
+        );
+        assert_eq!(
+            names(&entry(1_373, LoadTelemetry::TOTAL_TOKENS)),
+            [KV_TOKENS_USED]
+        );
+        // No capacity, zero or negative: neither count, carried or not.
+        for capacity in [0, -1] {
+            assert!(names(&entry(capacity, LoadTelemetry::empty())).is_empty());
+        }
+        // The bound of a list leaves the mark as it is.
+        let mark = LoadTelemetry::USED_TOKENS | LoadTelemetry::MEMORY;
+        let mut bounded = entry(1_373, mark);
+        assert_eq!(bounded.bound_values(), 0);
+        assert_eq!(bounded.kept, mark);
+    }
+
+    #[test]
+    fn a_polled_rank_with_no_token_capacity_states_neither_fixed_count() {
+        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<(String, f64)> {
+            snapshot
+                .named_values()
+                .map(|value| (value.name.to_string(), value.value))
+                .collect()
+        };
+        // No capacity: the answer's zero, or a count beside it, is no
+        // statement.
+        for used in [0, 211] {
+            let mut polled = SchedulerLoadSnapshot {
+                num_used_tokens: used,
+                ..Default::default()
+            };
+            assert_eq!(polled.bound_values(), 0);
+            assert!(names(&polled).is_empty(), "{used} used");
+        }
+        // A capacity: both counts are the engine's, the zero too.
+        let mut polled = SchedulerLoadSnapshot {
+            max_total_num_tokens: 1_373,
+            ..Default::default()
+        };
+        assert_eq!(polled.bound_values(), 0);
+        assert_eq!(
+            names(&polled),
+            [
+                (KV_TOKENS_USED.to_owned(), 0.0),
+                (KV_TOKENS_CAPACITY.to_owned(), 1_373.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn named_values_offer_no_count_the_entry_kept_from_an_older_record() {
+        let mut snapshot = SchedulerLoadSnapshot {
+            num_used_tokens: 211,
+            max_total_num_tokens: 1_373,
+            ..Default::default()
+        };
+        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<String> {
+            snapshot
+                .named_values()
+                .map(|value| value.name.to_string())
+                .collect()
+        };
+        assert_eq!(names(&snapshot), [KV_TOKENS_USED, KV_TOKENS_CAPACITY]);
+        snapshot.kept = LoadTelemetry::USED_TOKENS;
+        assert_eq!(names(&snapshot), [KV_TOKENS_CAPACITY]);
+        snapshot.kept = LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS;
+        assert!(names(&snapshot).is_empty());
+        // The mark is the process's own: the answer on the wire states both
+        // counts and no mark.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["num_used_tokens"], 211);
+        assert_eq!(json["max_total_num_tokens"], 1_373);
+        assert!(json.get("kept").is_none());
+    }
+
+    #[test]
+    fn explicit_token_values_take_precedence_over_fixed_counts() {
+        for (name, other) in [
+            ("kv_tokens_used", "kv_tokens_capacity"),
+            ("kv_tokens_capacity", "kv_tokens_used"),
+        ] {
+            let value = NamedValue {
+                name: name.into(),
+                unit: "tokens".into(),
+                value: 0.0,
+                age_ms: Some(43),
+            };
+            let snapshot = SchedulerLoadSnapshot {
+                num_used_tokens: 313,
+                max_total_num_tokens: 2_812,
+                values: vec![value.clone()],
+                ..Default::default()
+            };
+            let values: Vec<_> = snapshot.named_values().collect();
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[0], value);
+            assert_eq!(&*values[1].name, other);
+        }
+    }
+
+    #[test]
+    fn the_snapshot_schema_matches_the_snapshot_type() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scheduler-load.schema.json");
+        let schema = schemars::schema_for!(SchedulerLoadSnapshot);
+        let generated = serde_json::to_string_pretty(&schema).unwrap() + "\n";
+        if std::env::var_os("WRITE_SCHEDULER_LOAD_SCHEMA").is_some() {
+            fs::write(path, generated).unwrap();
+        } else {
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                generated,
+                "scheduler-load.schema.json is stale; write it again with \
+                 WRITE_SCHEDULER_LOAD_SCHEMA=1 cargo test -p smg-worker --all-features \
+                 the_snapshot_schema_matches_the_snapshot_type",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod aggregate_rollup_tests {
     use super::{EngineAggregateMetricsSnapshot, SchedulerLoadSnapshot};
 
@@ -2346,5 +2827,196 @@ mod constrained_decoding_tests {
             r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::{WorkerSpec, WorkerUpdateRequest};
+
+    #[test]
+    fn a_spec_prints_no_api_key() {
+        let marker = "pebble";
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.api_key = Some(marker.to_string());
+
+        let compact = format!("{spec:?}");
+        let pretty = format!("{spec:#?}");
+        assert!(!compact.contains(marker), "{compact}");
+        assert!(!pretty.contains(marker), "{pretty}");
+        assert!(
+            compact.contains(r#"api_key: Some("<redacted>")"#),
+            "{compact}"
+        );
+        assert!(
+            pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"),
+            "{pretty}"
+        );
+
+        spec.api_key = None;
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(text.contains("api_key: None"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_prints_no_credential_of_its_addresses() {
+        let mut spec = WorkerSpec::new("http://user:pebble@worker:8000");
+        spec.dp_base_url = Some("http://cedar@worker:8001".to_string());
+
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(text.contains("***@worker:8000"), "{text}");
+            assert!(text.contains("***@worker:8001"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_reads_a_rank_out_of_the_address_beside_a_base_alone() {
+        // With no base, an `@` and digits at the end are a userinfo and a
+        // host.
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+        }
+
+        // A base carries no rank, and the address built from it does: the
+        // base, an `@` and digits.
+        spec.url = "http://cedar@worker:8000@1".to_string();
+        spec.dp_base_url = Some("http://cedar@worker:8000".to_string());
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(
+                text.contains(r#"url: "http://***@worker:8000@1""#),
+                "{text}"
+            );
+            assert!(text.contains(r#""http://***@worker:8000""#), "{text}");
+        }
+
+        // The address built from a base that itself ends in an `@` and
+        // digits keeps its rank. The base alone reads as none: its `@`
+        // parts a userinfo from a host of digits.
+        spec.url = "http://cedar@8001@1".to_string();
+        spec.dp_base_url = Some("http://cedar@8001".to_string());
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("cedar"), "{text}");
+            assert!(text.contains(r#"url: "http://***@8001@1""#), "{text}");
+            assert!(text.contains(r#""http://***@8001""#), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_base_beside_an_address_that_is_not_its_rank_prints_no_userinfo() {
+        // A base is set and the address is not that base with a rank: the
+        // `@` and the digits at its end are a userinfo and a numeric host.
+        let mut spec = WorkerSpec::new("http://pebble@2130706433");
+        spec.dp_base_url = Some("http://other:8000".to_string());
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(!text.contains("pebble"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_prints_a_socket_path_that_ends_like_a_rank_as_it_stands() {
+        // An IPC address holds no userinfo: the `@` and the digits at its
+        // end are bytes of its path, in an address and in a base.
+        let mut spec = WorkerSpec::new("ipc:///tmp/w@0");
+        spec.dp_base_url = Some("ipc:///tmp/g@00".to_string());
+        assert!(!spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "ipc:///tmp/w@0");
+        for text in [format!("{spec:?}"), format!("{spec:#?}")] {
+            assert!(text.contains(r#"url: "ipc:///tmp/w@0""#), "{text}");
+            assert!(text.contains(r#""ipc:///tmp/g@00""#), "{text}");
+            assert!(!text.contains("unparsable"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_spec_ranks_the_address_that_is_its_base_and_digits_alone() {
+        let mut spec = WorkerSpec::new("http://worker:8000@1");
+        // No base: no rank is read, and the `@` parts a userinfo from a
+        // host of digits.
+        assert!(!spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "http://***@1");
+        spec.dp_base_url = Some("http://worker:8000".to_string());
+        assert!(spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "http://worker:8000@1");
+        // The base, an `@` and digits, and nothing else.
+        for url in [
+            "http://worker:8000",
+            "http://worker:8000@",
+            "http://worker:8000@1a",
+            "http://worker:80001@1",
+            "http://other:8000@1",
+        ] {
+            spec.url = url.to_string();
+            assert!(!spec.url_is_ranked(), "{url}");
+        }
+        // A base with a userinfo is masked, and its rank is kept.
+        spec.url = "http://cedar@worker:8000@12".to_string();
+        spec.dp_base_url = Some("http://cedar@worker:8000".to_string());
+        assert!(spec.url_is_ranked());
+        assert_eq!(spec.redacted_url(), "http://***@worker:8000@12");
+        // A plain address is the registered string, byte for byte.
+        let plain = WorkerSpec::new("http://Worker:8080/");
+        assert_eq!(plain.redacted_url(), "http://Worker:8080/");
+        // A userinfo before a host of digits is masked.
+        let token = WorkerSpec::new("http://pebble@2130706433");
+        assert_eq!(token.redacted_url(), "http://***@2130706433");
+    }
+
+    #[test]
+    fn a_key_rotation_request_prints_no_api_key() {
+        let marker = "cedar";
+        let mut request = WorkerUpdateRequest {
+            priority: Some(73),
+            cost: None,
+            labels: None,
+            api_key: Some(marker.to_string()),
+            health: None,
+        };
+
+        let compact = format!("{request:?}");
+        let pretty = format!("{request:#?}");
+        assert!(!compact.contains(marker), "{compact}");
+        assert!(!pretty.contains(marker), "{pretty}");
+        assert!(
+            compact.contains(r#"api_key: Some("<redacted>")"#),
+            "{compact}"
+        );
+        assert!(
+            pretty.contains("api_key: Some(\n        \"<redacted>\",\n    )"),
+            "{pretty}"
+        );
+
+        request.api_key = None;
+        let expected = "WorkerUpdateRequest { priority: Some(73), cost: None, labels: None, api_key: None, health: None }";
+        assert_eq!(format!("{request:?}"), expected);
+        let pretty = format!("{request:#?}");
+        assert!(pretty.contains("api_key: None"), "{pretty}");
+    }
+
+    #[test]
+    fn a_spec_still_prints_its_other_fields() {
+        let spec = WorkerSpec {
+            priority: 73,
+            ..WorkerSpec::new("http://worker:8000")
+        };
+
+        let text = format!("{spec:?}");
+        assert!(
+            text.starts_with(r#"WorkerSpec { url: "http://worker:8000","#),
+            "{text}"
+        );
+        assert!(text.contains("priority: 73"), "{text}");
+
+        let pretty = format!("{spec:#?}");
+        let field_count = pretty
+            .lines()
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|line| line.starts_with(|c: char| c.is_ascii_lowercase()))
+            .count();
+        assert_eq!(field_count, 30);
     }
 }

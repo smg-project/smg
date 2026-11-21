@@ -4,12 +4,12 @@ use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use llm_tokenizer::{registry::TokenizerEntry, LoadOutcome};
+use smg_worker::identity::basic::Worker;
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     app_context::AppContext,
-    worker::Worker,
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
@@ -42,7 +42,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         // The gateway manages no tokenizer when autoload is off: every entry
         // is the operator's, as the registration step leaves them.
         if app_context.router_config.disable_tokenizer_autoload {
@@ -221,6 +221,12 @@ mod tests {
 
     use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, LoadOutcome, TokenizerRegistry};
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, Worker},
+        jobs::WorkerJobAsker,
+        workflow::RemoveFromWorkerRegistryStep,
+    };
     use tokio::sync::Notify;
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
@@ -228,14 +234,13 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        routers::grpc::multimodal::MultimodalModelConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry},
+        routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::{backend_client::BasicWorkerBuilder, multimodal::MultimodalModelConfig},
+        },
         workflow::{
             data::WorkerRemovalWorkflowData,
-            steps::local::{
-                create_worker_removal_workflow_data, RemoveFromPolicyRegistryStep,
-                RemoveFromWorkerRegistryStep,
-            },
+            steps::local::{create_worker_removal_workflow_data, RemoveFromPolicyRegistryStep},
         },
     };
 
@@ -299,8 +304,12 @@ mod tests {
         worker: Arc<dyn Worker>,
     ) -> WorkflowContext<WorkerRemovalWorkflowData> {
         let url = worker.url().to_string();
-        let mut data =
-            create_worker_removal_workflow_data(url.clone(), None, Arc::clone(app_context));
+        let mut data = create_worker_removal_workflow_data(
+            url.clone(),
+            None,
+            Arc::clone(app_context),
+            WorkerJobAsker::Api,
+        );
         data.worker_urls = vec![url];
         data.actual_workers_to_remove = Some(vec![worker]);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);

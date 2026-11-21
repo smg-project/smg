@@ -14,12 +14,19 @@
 //! router-error families count it under one `error_type`, and one WARN names
 //! the worker, the route and the cause.
 
-use std::{error::Error as _, sync::Arc};
+use std::{
+    error::Error as _,
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc,
+    },
+};
 
 use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
 use smg_external_router::retry::{is_request_timeout, REQUEST_TIMEOUT_CODE};
+use smg_worker::identity::basic::Worker;
 use tracing::warn;
 
 use crate::{
@@ -28,7 +35,6 @@ use crate::{
         error_type_from_status, route_to_endpoint,
         stream_failure::{MESSAGES_API_ERROR_TYPE, STREAM_ERROR_TYPE},
     },
-    worker::Worker,
 };
 
 /// The route whose streams end with the Messages API's own error event.
@@ -118,6 +124,9 @@ pub(crate) struct RelaySource {
     worker: Arc<dyn Worker>,
     worker_type: &'static str,
     backend: &'static str,
+    /// Where a reader outside the relay task learns of a cut: the status of
+    /// the cut's class, written before the body's end. Zero while it stands.
+    mark: Option<Arc<AtomicU16>>,
 }
 
 impl RelaySource {
@@ -159,7 +168,14 @@ impl RelaySource {
             worker,
             worker_type,
             backend,
+            mark: None,
         }
+    }
+
+    /// The same source, writing a cut's status on `mark`.
+    pub(crate) fn marking(mut self, mark: Arc<AtomicU16>) -> Self {
+        self.mark = Some(mark);
+        self
     }
 
     /// The worker the response is read from.
@@ -198,6 +214,9 @@ impl RelaySource {
             cut.cause
         );
         self.worker.record_outcome(cut.status.as_u16());
+        if let Some(mark) = &self.mark {
+            mark.store(cut.status.as_u16(), Ordering::Relaxed);
+        }
         Metrics::record_worker_error(
             self.worker_type,
             metrics_labels::CONNECTION_HTTP,
@@ -304,16 +323,13 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::messages::MessageStreamEvent;
     use serde_json::Value;
+    use smg_worker::{
+        health::circuit_breaker::CircuitBreakerConfig,
+        test_support::{no_health_check, RefusedAddress},
+    };
 
     use super::*;
-    use crate::{
-        server::http_client_builder,
-        worker::{
-            health::circuit_breaker::CircuitBreakerConfig,
-            test_support::{no_health_check, RefusedAddress},
-            BasicWorkerBuilder,
-        },
-    };
+    use crate::{routers::grpc::backend_client::BasicWorkerBuilder, server::http_client_builder};
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
                          connection reset";

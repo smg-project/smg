@@ -19,14 +19,15 @@ use axum::{
     response::Response,
 };
 use openai_protocol::{
-    completion::CompletionRequest, rerank::RerankRequest, worker::HealthCheckConfig,
+    completion::CompletionRequest, model_card::ModelCard, rerank::RerankRequest,
+    worker::HealthCheckConfig,
 };
 use serde_json::{json, Value};
 use smg::{
     config::PolicyConfig,
-    routers::{http::pd_router::PDRouter, RouterTrait},
-    worker::{BasicWorkerBuilder, ModelCard, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, http::pd_router::PDRouter, RouterTrait},
 };
+use smg_worker::identity::basic::WorkerType;
 
 use super::tenant_rate_limiting_http_test::{
     body_of, limited_context_with_policy, mock_worker, request, router, tenant, usage, Endpoint,

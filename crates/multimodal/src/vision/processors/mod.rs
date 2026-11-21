@@ -23,7 +23,8 @@
 //! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
-//! - **Nemotron-H Omni** (`nemotron_omni`): C-RADIO dynamic resolution, an even 16px patch grid with CLIP normalization
+//! - **Nemotron VL / Omni** (`nemotron_omni`): C-RADIO tiled or dynamic-resolution images and video frames, geometry
+//!   read from the checkpoint's configs, as packed patch rows (Nemotron-H Omni) or in the reference tensor layout
 //! - **Step3-VL** (`step3_vl`): a 728px global view and 504px sliding-window crops with CLIP normalization
 
 pub mod deepseek_v41;

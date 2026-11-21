@@ -15,6 +15,11 @@ use futures::{
 use smg_grpc_client::{
     is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
 };
+use smg_worker::{
+    health::{liveness, liveness::SideReprieve},
+    identity::basic::{ConnectionModeExt, Worker, WorkerTypeExt},
+    metrics::writers::Metrics as WorkerMetrics,
+};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info_span, warn, Instrument};
 
@@ -34,7 +39,6 @@ use crate::{
             attempt_ledger::{
                 is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
             },
-            pd_admission,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
@@ -45,7 +49,8 @@ use crate::{
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
-                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
+                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, Placement,
+                WorkerSelection,
             },
             multimodal::ec_push::PushCleanup,
             proto_wrapper::{
@@ -59,12 +64,6 @@ use crate::{
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
         },
-    },
-    worker::{
-        health::liveness::{self, SideReprieve},
-        identity::basic::WorkerTypeExt,
-        metrics::Metrics as WorkerMetrics,
-        ConnectionModeExt, Worker,
     },
 };
 
@@ -276,16 +275,10 @@ pub(crate) async fn execute_plan(
     // encode jobs' SHM unclaimed for the duration: under the burst this gate
     // targets, holding it would queue a second scarce resource behind the
     // decode window and throw the finished encode work away on a shed. The
-    // gate abstains when the engine reports no window.
-    let admission = match ctx
-        .workers
-        .as_ref()
-        .and_then(WorkerSelection::decode_worker)
-    {
-        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
-        None => None,
-    };
-
+    // gate abstains when the engine reports no window. A pair the policy
+    // controller placed is committed ahead of the wait, so its bookings
+    // outlast it.
+    let admission = ctx.admit(sub_requests).await?;
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers a rendezvous plan's encode jobs and
     // their SHM Drop guards here: dispatch consumes them, while an early
@@ -306,10 +299,17 @@ pub(crate) async fn execute_plan(
     // request retried on it.
     let ledger = &ctx.ledger;
 
-    ctx.load_guards = Some(LoadGuards::admitted(
-        admission,
-        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
-    ));
+    let guards = LoadGuards::at_dispatch(
+        workers,
+        ctx.sticky_key.as_deref(),
+        sub_requests,
+        ctx.placed.take(),
+        Instant::now(),
+    );
+    ctx.load_guards = Some(LoadGuards::admitted(admission, guards));
+    // A sequential pair the controller placed ends its prefill's side at
+    // the phase's end: the dispatch reads the placement its guards hold.
+    let placement = ctx.load_guards.as_ref().and_then(LoadGuards::placement);
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
     pin_grouped_dp_rank(
@@ -403,6 +403,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
+                    placement,
                 ))
                 .await
             }
@@ -421,6 +422,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
+                    placement,
                 ))
                 .await
                 .map_err(|mut response| {
@@ -442,6 +444,7 @@ pub(crate) async fn execute_plan(
                     prefill_guard,
                     ledger,
                     dispatched_at.into_std(),
+                    placement,
                 )
                 .await
             }
@@ -454,10 +457,22 @@ pub(crate) async fn execute_plan(
     let result = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
             Ok(result) => result,
-            Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
+            Err(_) => {
+                // The timeout is the decode's that was waited on: the one a
+                // second ask moved the pair to, where it moved.
+                let moved = placement.and_then(|placement| placement.moved(workers));
+                let waited_on = moved.as_ref().unwrap_or(workers);
+                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
+            }
         },
         None => dispatch.await,
     };
+    // A pair's decode that was asked again behind its prefill's answer and
+    // moved: the attempt's selection names the decode that was sent, for
+    // the response's stages and for a retry.
+    if let Some(moved) = placement.and_then(|placement| placement.moved(workers)) {
+        ctx.workers = Some(moved);
+    }
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
     // replay would send it again.
@@ -554,6 +569,11 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
+/// `placement` is the placement of a pair the policy controller placed,
+/// committed ahead of the admission gate. A sequential dispatch ends the
+/// prefill's side on it at its last drain ([`Placement::prefill_ended`]).
+/// A parallel dispatch says no prefill end yet: both sides end with the
+/// response.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
@@ -564,6 +584,7 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
+    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -599,6 +620,7 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
+                placement,
             )
             .await
         }
@@ -774,6 +796,7 @@ async fn execute_epd_dispatch(
     encode_watch: &mut Option<EncodeWatch>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
@@ -786,6 +809,7 @@ async fn execute_epd_dispatch(
         ledger,
         None,
         encode_watch.clone(),
+        placement,
     )
     .await;
     if result.is_ok() {
@@ -950,6 +974,7 @@ async fn execute_batch_dispatch(
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
+    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -985,6 +1010,7 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
+                            placement,
                         )
                         .await
                     }
@@ -1243,10 +1269,12 @@ pub(crate) fn start_failure_response(
     // The request's media failed, not the worker (see `TonicStatusExt::media_fault`):
     // the answer is for the media, under the code the worker names (see
     // `TonicStatusExt::media_code`), and another worker fetching the same URL
-    // would meet the same host, so the request is not replayed.
+    // would meet the same host, so the request is not replayed. The client
+    // reads the gateway's sentence for a fetch that failed (see
+    // `TonicStatusExt::media_message`); the worker's own words are on this line.
     if let Some(fault) = e.media_fault() {
         warn!(function = function, error = %e, ?fault, "{}: the request's media failed", description);
-        let mut response = e.to_http_error(e.media_code().as_str(), e.message().to_string());
+        let mut response = e.to_http_error(e.media_code().as_str(), e.media_message(fault));
         mark_non_retryable(&mut response);
         return response;
     }
@@ -1259,6 +1287,18 @@ pub(crate) fn start_failure_response(
             function = function,
             error = %e,
             "{}: the engine could not continue the request under its constraint",
+            description
+        );
+        return response;
+    }
+    // The worker refused the request's constraint as one its engine cannot
+    // enforce (see `TonicStatusExt::constraint_refusal_response`): the
+    // request's 400, in the worker's words, under no side's code.
+    if let Some(response) = e.constraint_refusal_response() {
+        warn!(
+            function = function,
+            error = %e,
+            "{}: the worker refused the request's constraint",
             description
         );
         return response;
@@ -2783,14 +2823,16 @@ pub(crate) mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
+    use smg_worker::{
+        health::{circuit_breaker::CircuitBreakerConfig, resilience::ResolvedResilience},
+        identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
-        worker::{
-            test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
-            ConnectionMode, ResolvedResilience, RuntimeType, Worker, WorkerType,
-        },
+    use crate::routers::{
+        common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     /// A boxed encode send, as the supervisor's tests build them.
@@ -2839,7 +2881,7 @@ pub(crate) mod tests {
     /// the next one opens a breaker set to two.
     #[tokio::test]
     async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let decode: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30002")
                 .worker_type(WorkerType::Decode)
@@ -3077,6 +3119,108 @@ pub(crate) mod tests {
                 .get(error::HEADER_X_SMG_ERROR_CODE)
                 .unwrap(),
             "start_generation_failed"
+        );
+    }
+
+    /// A worker's refusal of a constraint its engine cannot enforce is the
+    /// request's 400 under `unsupported_constraint`, in the worker's words
+    /// alone: on a single worker it is not `start_generation_failed`, on a
+    /// disaggregated pair not the prefill's `prefill_worker_failed_to_start`,
+    /// and no other worker is tried. On `/v1/messages` it leaves in the
+    /// messages envelope, the code in the header alone.
+    #[tokio::test]
+    async fn a_refused_constraint_at_start_is_the_requests_400_under_no_sides_code() {
+        use smg_grpc_client::constraint_refused_status;
+
+        use crate::{
+            middleware::messages_errors::into_messages_envelope,
+            routers::common::retry::NonRetryable,
+        };
+
+        let why = "The structural tag constraint cannot be enforced: xgrammar drops \
+                   `propertyNames` at `/properties/config`";
+        for (function, description, code) in [
+            (
+                "execute_single",
+                "Failed to start generation",
+                "start_generation_failed",
+            ),
+            (
+                "execute_parallel_pd",
+                PdSide::Prefill.description(SidePhase::Start),
+                PdSide::Prefill.code(SidePhase::Start),
+            ),
+        ] {
+            let response = start_failure_response(
+                &constraint_refused_status(why),
+                function,
+                description,
+                code,
+            );
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{code}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .unwrap(),
+                "unsupported_constraint",
+                "{code}"
+            );
+            assert!(
+                response.extensions().get::<NonRetryable>().is_some(),
+                "{code}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(body["error"]["message"], why, "{code}");
+            assert_eq!(body["error"]["code"], "unsupported_constraint", "{code}");
+
+            // The same words without the worker's trailer keep the side's
+            // code.
+            let plain = start_failure_response(
+                &tonic::Status::invalid_argument(why),
+                function,
+                description,
+                code,
+            );
+            assert_eq!(
+                plain.headers().get(error::HEADER_X_SMG_ERROR_CODE).unwrap(),
+                code
+            );
+        }
+
+        // On `/v1/messages` the same answer leaves in the messages envelope:
+        // the request's `invalid_request_error` in the worker's words, the
+        // code in the header alone.
+        let messages = into_messages_envelope(
+            start_failure_response(
+                &constraint_refused_status(why),
+                "execute_parallel_pd",
+                PdSide::Prefill.description(SidePhase::Start),
+                PdSide::Prefill.code(SidePhase::Start),
+            ),
+            "msg_refused".to_string(),
+        )
+        .await;
+        assert_eq!(messages.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            messages
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "unsupported_constraint"
+        );
+        let messages = axum::body::to_bytes(messages.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let messages: serde_json::Value = serde_json::from_slice(&messages).expect("json");
+        assert_eq!(messages["error"]["type"], "invalid_request_error");
+        assert_eq!(messages["error"]["message"], why);
+        assert!(
+            messages["error"].get("code").is_none(),
+            "the messages envelope carries no code: {messages}"
         );
     }
 
@@ -4856,7 +5000,7 @@ pub(crate) mod tests {
     #[test]
     fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
     {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let pair = || {
             let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
                 Arc::new(

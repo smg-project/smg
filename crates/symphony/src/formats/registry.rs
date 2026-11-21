@@ -12,8 +12,8 @@
 //! outside the wire), recorded once by the group's primary. Every group whose table is on main is
 //! here, its primary and its other checkpoints under the primary's organisation, spelled in
 //! `groups.json` beside this module (one group per line; the crate's build script writes the file
-//! as the `GROUPS` constant); `tests/readme.rs` writes the README's models table from the same
-//! groups and checks that the two agree.
+//! as the `GROUPS` constant); `tests/readme.rs` reads the README's models table and checks
+//! that it and these groups agree.
 //!
 //! A lookup matches the repository name, the text after the last path separator (either slash),
 //! exactly and without regard to case, under any organisation or path: `Qwen/Qwen3-8B`,
@@ -536,6 +536,14 @@ mod tests {
         for v4 in ["deepseek-ai/DeepSeek-V4-Pro", "deepseek-v4-pro"] {
             assert_eq!(table_for(v4), Some(Table::DeepSeekV4), "{v4}");
         }
+        // DeepSeek-V4-Flash-0731 is a group of its own, its encoder's effort table differing from
+        // V4-Flash's, but it writes V4-Flash's output: the V4 table, by the bare name as well.
+        for v4 in [
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "deepseek-v4-flash-0731",
+        ] {
+            assert_eq!(table_for(v4), Some(Table::DeepSeekV4), "{v4}");
+        }
         // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
         // architecture through the V3.2 encoder, as its recorded sets say: the family's table.
         for v3_2 in [
@@ -584,6 +592,11 @@ mod tests {
             ("nvidia/DeepSeek-V4.1-Flash-1017-NVFP4", Table::DeepSeekV4_1),
             ("microsoft/UserRepGen-4B", Table::Qwen3Tagged),
             ("nvidia/Qwen3.8-Flash-Next-FP4-Local", Table::Qwen3Tagged),
+            (
+                "autotrust/Qwen3.8-Flash-Next-E384-FP4-Local",
+                Table::Qwen3Tagged,
+            ),
+            ("EssentialAI/eai-distill-0.5b", Table::Qwen2_5),
             ("microsoft/AesCode-8B", Table::Qwen3),
             ("microsoft/AesCode-32B", Table::Qwen3),
             ("internlm/Visual-ERM", Table::Qwen3),

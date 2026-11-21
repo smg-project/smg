@@ -30,11 +30,16 @@
 //! event under `reader_panicked`, charged to no worker, counted under the
 //! table that read the output ([`Panicked::record`]).
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
 
 use axum::http::StatusCode;
 use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
 use smg_grpc_client::{is_constraint_failure, is_request_timeout};
+use smg_policy_controller::tracking::lease::TransportClass;
+use smg_worker::identity::{
+    basic::{ConnectionModeExt, Worker, WorkerTypeExt},
+    endpoint::Endpoint,
+};
 use tracing::{error, warn};
 
 use super::{
@@ -48,11 +53,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         error::error_type_for_status,
-        grpc::context::{DispatchMetadata, WorkerSelection},
-    },
-    worker::{
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        ConnectionModeExt, Worker,
+        grpc::context::{DispatchMetadata, Placement, WorkerSelection},
     },
 };
 
@@ -96,6 +97,9 @@ pub(crate) struct UpstreamClass {
     /// What the worker's circuit breaker samples for the status; `None` for
     /// a failure that says nothing about the worker (the request's media).
     pub(crate) breaker_sample: Option<u16>,
+    /// What the lease of a placed dispatch is told became of the transport
+    /// (see [`TonicStatusExt::transport_class`]).
+    pub(crate) transport: TransportClass,
 }
 
 impl UpstreamClass {
@@ -127,6 +131,7 @@ impl UpstreamClass {
             error_type,
             reason: status.error_reason(),
             breaker_sample: status.breaker_status(),
+            transport: status.transport_class(),
         }
     }
 
@@ -359,7 +364,7 @@ pub(crate) fn choice_mut<T>(choices: &mut [T], index: u32) -> Result<&mut T, Str
 }
 
 /// Where a streaming response is read from, kept by the task that writes it
-/// for the accounting of a failure after the response began.
+/// to account for the response's end.
 #[derive(Clone)]
 pub(crate) struct StreamSource {
     request_id: String,
@@ -373,6 +378,7 @@ pub(crate) struct StreamSource {
     /// The prefill side of a disaggregated pair, whose stream is drained
     /// before the answer's.
     prefill: Option<Arc<dyn Worker>>,
+    placement: Option<Placement>,
 }
 
 impl StreamSource {
@@ -398,6 +404,20 @@ impl StreamSource {
             worker,
             worker_type,
             prefill: workers.and_then(WorkerSelection::prefill_worker).cloned(),
+            placement: None,
+        }
+    }
+
+    /// Keep the lease with the task that reads the answer stream.
+    pub(crate) fn with_placement(mut self, placement: Option<Placement>) -> Self {
+        self.placement = placement;
+        self
+    }
+
+    /// A stream that ended whole calls this with its prompt and completion counts.
+    pub(crate) fn completed(&self, tokens_in: u32, tokens_out: u32) {
+        if let Some(placement) = &self.placement {
+            placement.completed(tokens_in, tokens_out);
         }
     }
 
@@ -462,6 +482,15 @@ impl StreamSource {
             UpstreamStream::Prefill => (self.prefill.as_ref(), metrics_labels::WORKER_PREFILL),
         };
         let class = UpstreamClass::of(status);
+        if let (UpstreamStream::Answer, Some(placement)) = (stream, &self.placement) {
+            placement.ended(
+                class.http.as_u16(),
+                class.transport,
+                0,
+                *completion_tokens,
+                Instant::now(),
+            );
+        }
         let worker_url = worker.map_or("none", |worker| worker.url());
         match rendezvous {
             Some(DeadRendezvous(port)) => warn!(
@@ -558,15 +587,18 @@ mod tests {
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use openai_protocol::worker::WorkerType;
+    use smg_policy_controller::store::{GatewayId, LeasesStore, MemoryStore};
+    use smg_worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        identity::basic::ConnectionMode,
+        test_support::{no_health_check, RefusedAddress},
+    };
 
     use super::*;
-    use crate::{
-        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
-        worker::{
-            health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::{no_health_check, RefusedAddress},
-            BasicWorkerBuilder, ConnectionMode,
-        },
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder,
+        context::test_support::{assert_end, dispatched, place_worker},
+        proto_wrapper::ENGINE_ERROR_MESSAGE,
     };
 
     fn dispatch() -> DispatchMetadata {
@@ -597,6 +629,49 @@ mod tests {
             tonic::Status::internal("h2 protocol error: error reading a body from connection"),
             3_191,
         )
+    }
+
+    async fn placed_source() -> (StreamSource, Placement, Arc<MemoryStore>) {
+        let (placed, store) = place_worker().await;
+        let guards = dispatched(placed, Instant::now());
+        let placement = guards.placement().expect("the stream's placement").clone();
+        let source = StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_CHAT)
+            .with_placement(Some(placement.clone()));
+        (source, placement, store)
+    }
+
+    /// A stream's failure ends the lease under the class its status names,
+    /// as a failed dispatch of the same status does.
+    #[tokio::test]
+    async fn an_accounted_failure_ends_the_lease_under_its_class() {
+        use smg_grpc_client::h2::{Error, Reason};
+
+        for (status, http, class) in [
+            (
+                tonic::Status::internal("worker failed"),
+                500,
+                TransportClass::ServerError,
+            ),
+            (
+                tonic::Status::from_error(Box::new(Error::from(Reason::PROTOCOL_ERROR))),
+                502,
+                TransportClass::ConnectFailed,
+            ),
+        ] {
+            let (source, placement, store) = placed_source().await;
+            source.account(&StreamFailure::upstream(status, 13));
+            assert_end(&placement.ends(), &store, http, class, 0, 13);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefill_sides_failure_says_no_end() {
+        let (source, placement, store) = placed_source().await;
+        source.account(&StreamFailure::prefill(tonic::Status::internal(
+            "prefill failed",
+        )));
+        assert!(placement.ends().lock().is_empty());
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
     }
 
     /// The rendered sample line of `family` with all of `labels`, if any.

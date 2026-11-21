@@ -18,6 +18,8 @@
 //!   session registry) shared by the OpenAI and HTTP routers
 //! - [`overload`] — shed responses for the absolute worker-overload
 //!   guard, shared by the HTTP and gRPC selection paths
+//! - `pair_index` — the prefill and decode workers that may pair, decided
+//!   once for a membership generation and read by every placement
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
 //!   post more bootstrap rooms to a pair than its decode engine can admit
 //! - `pd_failure` — the one vocabulary a prefill or decode side's failure is
@@ -48,6 +50,9 @@
 //!   historical reasons before this extraction.
 //! - [`sglang_fields`] — the engine-specific request fields the HTTP proxy
 //!   strips at their defaults and the provider transformers drop outright
+//! - [`snapshot`] — the gateway's value of a membership generation (the
+//!   routing pools, the pairs, the window floors and the labels kept with
+//!   the members), and the registry and the load monitor named over it
 //! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
 //!   responses to clients and parsing upstream SSE byte streams
 
@@ -58,6 +63,7 @@ pub use smg_external_router::header_utils;
 pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
+pub(crate) mod pair_index;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
@@ -68,8 +74,11 @@ pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
+pub mod snapshot;
 pub mod sse_rechunk;
 pub mod stream;
+#[cfg(test)]
+mod worker_health_tests;
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot
@@ -216,6 +225,8 @@ pub(crate) fn attach_sized_body(
 pub mod bench_support {
     use std::sync::Arc;
 
+    use smg_worker::identity::basic::Worker;
+
     use super::{
         attempt_ledger::AttemptLedger,
         placement::{select_pair, select_single, PlacementInputs},
@@ -223,7 +234,10 @@ pub mod bench_support {
     use crate::{
         observability::cache_trace,
         policies::PolicyRegistry,
-        worker::{PdPairIndex, PdWire, RoutingPool, Worker, WorkerRegistry, WorkerRegistryExt},
+        routers::common::{
+            pair_index::{PdPairIndex, PdWire},
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        },
     };
 
     /// Whether a process switch captures every request's cache trace

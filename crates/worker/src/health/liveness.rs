@@ -636,10 +636,9 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
 
 /// Apply every liveness budget the host hands in: the stall, wedge and
 /// stale thresholds and the warm-up slice. The one place the budgets are
-/// set from outside, for the server's start-up and, as
-/// `worker::configure_liveness`, for a host that builds the context without
-/// the builder (the test harness today); the first call in a process wins,
-/// as for the thresholds' own setter.
+/// set from outside, for the server's start-up and for a host that builds
+/// the context without the builder (the test harness today); the first
+/// call in a process wins, as for the thresholds' own setter.
 pub fn configure_from(budgets: Budgets) {
     configure(budgets.stall, budgets.wedge, budgets.stale);
     configure_warmup(Warmup {
@@ -1225,7 +1224,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        health::circuit_breaker::CircuitBreakerConfig, registry::event::WorkerConnected,
+        health::circuit_breaker::CircuitBreakerConfig,
+        registry::event::{WorkerConnected, WorkerSignal},
         test_support::BasicWorkerBuilder,
     };
 
@@ -2484,7 +2484,77 @@ mod tests {
         );
     }
 
-    fn signalling_worker() -> (Arc<dyn Worker>, mpsc::UnboundedReceiver<WorkerConnected>) {
+    /// The next connect signal on the channel, past the moves of the
+    /// liveness veto that ride it too.
+    fn connected(rx: &mut mpsc::UnboundedReceiver<WorkerSignal>) -> Option<WorkerConnected> {
+        loop {
+            match rx.try_recv().ok()? {
+                WorkerSignal::Connected(connected) => return Some(connected),
+                WorkerSignal::LivenessMoved { .. } => {}
+            }
+        }
+    }
+
+    /// A move of the veto is said once on the worker's signal sender, and
+    /// again only after the loop took the mark: at most one liveness signal
+    /// of a worker waits in the channel, whoever reads it.
+    #[test]
+    fn a_move_of_the_veto_is_signalled_once_until_the_loop_takes_the_mark() {
+        let (w, mut rx) = signalling_worker();
+        let runtime = w.runtime_state().expect("a running state");
+        let moves = |rx: &mut mpsc::UnboundedReceiver<WorkerSignal>| {
+            let mut moves = 0;
+            while let Ok(signal) = rx.try_recv() {
+                assert!(
+                    matches!(&signal, WorkerSignal::LivenessMoved { url } if url == "http://w1:8000"),
+                    "{signal:?}"
+                );
+                moves += 1;
+            }
+            moves
+        };
+
+        set(
+            &w,
+            Some(runtime.as_ref()),
+            Some(StallReason::Unreachable),
+            "test",
+        );
+        set(&w, Some(runtime.as_ref()), None, "test");
+        set(
+            &w,
+            Some(runtime.as_ref()),
+            Some(StallReason::Wedged),
+            "test",
+        );
+        assert_eq!(moves(&mut rx), 1, "three moves, one signal waiting");
+
+        // The loop took the mark. A veto that stands signals nothing, and
+        // the next move signals again.
+        runtime.liveness_signal_taken();
+        set(
+            &w,
+            Some(runtime.as_ref()),
+            Some(StallReason::Wedged),
+            "test",
+        );
+        assert_eq!(moves(&mut rx), 0);
+        set(&w, Some(runtime.as_ref()), None, "test");
+        assert_eq!(moves(&mut rx), 1);
+
+        // A worker built for no registry holds no sender: its veto moves
+        // and nothing is said.
+        let alone = worker();
+        set(
+            &alone,
+            alone.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
+        assert!(alone.stall_reason().is_some());
+    }
+
+    fn signalling_worker() -> (Arc<dyn Worker>, mpsc::UnboundedReceiver<WorkerSignal>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let w: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
@@ -2498,7 +2568,10 @@ mod tests {
     fn contact_asks_for_promotion_only_of_a_worker_that_was_unreachable() {
         let (w, mut rx) = signalling_worker();
         on_contact(&w);
-        assert!(rx.try_recv().is_err(), "a Ready worker needs no promotion");
+        assert!(
+            connected(&mut rx).is_none(),
+            "a Ready worker needs no promotion"
+        );
         // Demoted by its probes while its transport was gone: the first
         // contact is its return, promoted now.
         set(
@@ -2510,9 +2583,8 @@ mod tests {
         w.set_status(WorkerStatus::NotReady);
         on_contact(&w);
         assert!(w.stall_reason().is_none());
-        let signal = rx
-            .try_recv()
-            .expect("a demoted worker back from a transport outage is signalled");
+        let signal =
+            connected(&mut rx).expect("a demoted worker back from a transport outage is signalled");
         assert_eq!(signal.url, "http://w1:8000");
         // Demoted by its probes alone (a draining engine answering 503 on
         // /health while it still relays KV batches and answers GetLoads):
@@ -2521,12 +2593,12 @@ mod tests {
         on_contact(&w);
         on_contact(&w);
         assert!(
-            rx.try_recv().is_err(),
+            connected(&mut rx).is_none(),
             "a reachable transport does not lift a health demotion"
         );
         w.set_status(WorkerStatus::Failed);
         on_contact(&w);
-        assert!(rx.try_recv().is_err(), "nor a Failed one");
+        assert!(connected(&mut rx).is_none(), "nor a Failed one");
     }
 
     #[test]
@@ -2554,7 +2626,7 @@ mod tests {
         assert!(age <= elapsed, "a passing probe is a contact");
         assert!(w.stall_reason().is_none(), "and ends an unreachable veto");
         assert!(
-            rx.try_recv().is_err(),
+            connected(&mut rx).is_none(),
             "the health state machine promotes at its success threshold, not the probe"
         );
     }

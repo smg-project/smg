@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use smg_external_router::{builtin_routers, spec_for_backend};
+use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
     external::ExternalRouterAdapter,
@@ -17,7 +18,7 @@ use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     policies::{DPRankLoadPolicy, MinimumTokensPolicy, PolicyFactory},
-    worker::ConnectionMode,
+    policy_controller,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -145,6 +146,14 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        // The pair router asks the policy engine where this gateway
+        // decides pairs in its own process. Its family refuses by name
+        // elsewhere.
+        if let Some(router) =
+            policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
+        {
+            return Ok(router);
+        }
         Self::set_pd_policies(
             prefill_policy_config,
             decode_policy_config,
@@ -175,19 +184,39 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        // The regular router and the pair router ask the policy engine
+        // in their selection stage. The pair router serves where the
+        // document in force plans pairs, and its family refuses by name
+        // elsewhere. The encode mode places no request through the policy
+        // engine yet.
+        let refusing = match mode {
+            Mode::Regular => None,
+            Mode::PrefillDecode => {
+                policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
+            }
+            Mode::EncodePrefillDecode => policy_controller::undecided(ctx),
+        };
+        if let Some(router) = refusing {
+            return Ok(router);
+        }
         let router = GrpcRouter::new(ctx, mode)?;
 
         Ok(Box::new(router))
     }
 
     /// Register the prefill/decode policies (HTTP PD, gRPC PD and gRPC EPD),
-    /// each from its own config or, when unset, the main policy.
+    /// each from its own config or, when unset, the main policy. Under the
+    /// policy controller none is registered: no classic policy decides for a
+    /// pair there, and one built anyway would start its own tasks.
     fn set_pd_policies(
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
+        if ctx.policy_engine.is_some() {
+            return;
+        }
         let prefill_policy =
             PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
         let decode_policy =
@@ -199,7 +228,8 @@ impl RouterFactory {
 
     /// Register the encode/prefill/decode policies for a gRPC EPD deployment.
     /// Encode defaults to consistent hashing over each item's content hash;
-    /// prefill/decode default to the main policy when unset.
+    /// prefill/decode default to the main policy when unset. Under the policy
+    /// controller none is registered, as in [`Self::set_pd_policies`].
     fn set_epd_policies(
         encode_policy_config: Option<&PolicyConfig>,
         prefill_policy_config: Option<&PolicyConfig>,
@@ -207,6 +237,9 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
+        if ctx.policy_engine.is_some() {
+            return;
+        }
         let default_encode_policy = PolicyConfig::ConsistentHashing;
         let encode_policy = PolicyFactory::create_from_config(
             encode_policy_config.unwrap_or(&default_encode_policy),

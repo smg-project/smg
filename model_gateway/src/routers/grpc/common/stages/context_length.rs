@@ -14,14 +14,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_worker::identity::basic::{ConnectionMode, Worker, WorkerType};
 use tracing::debug;
 
-use crate::{
-    routers::{
-        error,
-        grpc::context::{PreparationOutput, RequestType, WorkerSelection},
-    },
-    worker::{ConnectionMode, ModelWorkerSnapshot, RoutingPool, WindowFloor, Worker, WorkerType},
+use crate::routers::{
+    common::snapshot::{ModelWorkerSnapshot, RoutingPool, WindowFloor},
+    error,
+    grpc::context::{PreparationOutput, RequestType, WorkerSelection},
 };
 
 /// The window that binds `worker` for `model_id`, and whether the worker
@@ -94,6 +93,22 @@ impl ContextRequirements {
             input_tokens,
             scoring_position: false,
             output_tokens: Some(budget),
+        }
+    }
+
+    /// The demand of a request of `input_tokens`, with or without a scoring
+    /// position and a completion budget, for a recorder that prepares no
+    /// request.
+    #[cfg(test)]
+    pub(crate) fn of_demand(
+        input_tokens: usize,
+        scoring_position: bool,
+        output_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            input_tokens,
+            scoring_position,
+            output_tokens,
         }
     }
 
@@ -408,14 +423,13 @@ mod tests {
         chat::ChatCompletionRequest, model_card::ModelCard, validated::Normalizable,
         worker::HealthCheckConfig,
     };
+    use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
     use super::*;
-    use crate::{
-        routers::{error::HEADER_X_SMG_ERROR_CODE, grpc::context::CompletionItem},
-        worker::{
-            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerRegistry,
-            WorkerRegistryExt, WorkerType,
-        },
+    use crate::routers::{
+        common::snapshot::{WorkerRegistry, WorkerRegistryExt},
+        error::HEADER_X_SMG_ERROR_CODE,
+        grpc::{backend_client::BasicWorkerBuilder, context::CompletionItem},
     };
 
     const MODEL: &str = "ctx-test-model";

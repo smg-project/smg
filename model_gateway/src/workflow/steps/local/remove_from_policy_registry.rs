@@ -10,9 +10,10 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::forget_cache_events::forget_cache_events;
 use crate::{
     policies::PolicyRegistry,
-    worker::WorkerRegistry,
+    routers::common::snapshot::WorkerRegistry,
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
@@ -59,7 +60,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let workers_to_remove = context
             .data
             .actual_workers_to_remove
@@ -72,10 +73,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         );
 
         for worker in workers_to_remove {
-            // Remove from KV event monitor (stops subscription, removes from indexer)
-            if let Some(ref monitor) = app_context.kv_event_monitor {
-                monitor.on_worker_removed(worker.url()).await;
-            }
+            forget_cache_events(app_context, worker.url()).await;
 
             // Drop the state the policies keep on the worker (a load-aware
             // policy's dispatch tally) so it does not leak under churn.

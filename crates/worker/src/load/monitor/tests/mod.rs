@@ -1,20 +1,22 @@
 mod prom_scrape;
 mod worker_load_manager;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::mpsc};
 
 use super::*;
 use crate::{
-    health::overload::OverloadThresholds,
+    common_proto as common,
+    health::{manager::WorkerManager, overload::OverloadThresholds},
     identity::basic::{ConnectionMode, WorkerType},
     model_card::ModelCard,
     runtime::StallReason,
     test_support::{
-        ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
-        WorkerRegistry,
+        assert_metric, ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders,
+        ScriptedAnswers, WorkerMonitor, WorkerRegistry,
     },
     worker::{
-        EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, WorkerStatus,
+        EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, NamedValue,
+        WorkerStatus,
     },
 };
 
@@ -44,8 +46,12 @@ impl LoadRecord for Unread {
         panic!("the telemetry of an ignored record was read")
     }
 
-    fn snapshot(&self) -> SchedulerLoadSnapshot {
-        panic!("the snapshot of an ignored record was built")
+    fn fields(&self) -> SchedulerLoadSnapshot {
+        panic!("the fields of an ignored record were read")
+    }
+
+    fn values_sent(&self) -> usize {
+        panic!("the named values of an ignored record were counted")
     }
 
     fn engine_silence(&self) -> Option<Duration> {
@@ -179,8 +185,12 @@ impl LoadRecord for PushedRecord {
         self.telemetry
     }
 
-    fn snapshot(&self) -> SchedulerLoadSnapshot {
+    fn fields(&self) -> SchedulerLoadSnapshot {
         self.snapshot.clone()
+    }
+
+    fn values_sent(&self) -> usize {
+        self.snapshot.values.len()
     }
 
     fn engine_silence(&self) -> Option<Duration> {
@@ -476,7 +486,7 @@ async fn removed_event_evicts_cached_loads() {
     let id = registry.register(Arc::clone(&worker)).unwrap();
     monitor.start_event_loop();
 
-    monitor.load_state.publish_group(
+    let _ = monitor.load_state.publish_group(
         &[],
         vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
     );
@@ -562,7 +572,7 @@ async fn status_changed_away_from_ready_evicts_worker() {
     monitor.start_event_loop();
 
     // Seed the load snapshot + DP cache as if a poll had succeeded.
-    monitor.load_state.publish_group(
+    let _ = monitor.load_state.publish_group(
         &[],
         vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
     );
@@ -730,6 +740,9 @@ async fn the_overload_vetos_edges_are_logged_with_their_figures() {
     assert!(logs_contain("Worker overload veto set"));
     assert!(logs_contain("waiting_requests=8"));
     assert!(logs_contain("pushed record"));
+    assert!(logs_contain(
+        "smg_worker::load::monitor: Worker overload veto set"
+    ));
     assert!(!logs_contain("Worker overload veto cleared"));
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     logs_assert(|lines: &[&str]| {
@@ -879,6 +892,232 @@ async fn a_record_replaces_the_memory_or_queues_section_it_carries() {
     assert_eq!(rank0.queues.map(|q| q.waiting), Some(6));
 }
 
+/// A record's named values are that record's alone. The next record's list
+/// takes their place in the rank's entry, where the fixed telemetry a record
+/// leaves out stays: a reader that wants a value across records keeps it
+/// itself.
+#[tokio::test]
+async fn a_records_named_values_take_the_place_of_the_ranks_last() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let named = |name: &'static str, value: f64| NamedValue {
+        name: name.into(),
+        unit: "items".into(),
+        value,
+        age_ms: None,
+    };
+    let mut heartbeat = pushed(7).used_tokens(2_048);
+    heartbeat.snapshot.values = vec![named("queue_depth", 4.0), named("ready", 1.0)];
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values, heartbeat.snapshot.values);
+
+    // A record that names one of the two: its list stands whole.
+    let mut other = pushed(8);
+    other.snapshot.values = vec![named("ready", 0.0)];
+    monitor.apply_pushed_load(&worker, 0, &other, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values, other.snapshot.values);
+    assert_eq!(rank0.num_used_tokens, 2_048);
+
+    // A core-only record names none: the entry holds none, and the fixed
+    // telemetry of the heartbeat stays.
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert!(rank0.values.is_empty());
+    assert_eq!(rank0.num_used_tokens, 2_048);
+    assert_eq!(rank0.num_running_reqs, 9);
+}
+
+/// The named values a pushed record's snapshot drops at a bound are counted
+/// by the worker: the record's list less the snapshot's. A record whose
+/// values all stand writes no series.
+#[tokio::test]
+async fn a_pushed_record_counts_the_named_values_its_snapshot_drops() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let value = |name: &str, value: f64| common::NamedValue {
+        name: name.to_string(),
+        unit: "items".to_string(),
+        value,
+        age_ms: None,
+    };
+    let whole = common::EngineLoad {
+        running_requests: 7,
+        values: vec![value("queue_depth", 4.0)],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        monitor.apply_pushed_load(&worker, 0, &whole, Instant::now());
+    });
+    assert!(
+        !rendered.contains("smg_engine_load_values_dropped_total{"),
+        "{rendered}"
+    );
+
+    // One stands. An empty name, a value that is not finite and a name the
+    // record states again are dropped: three of each record's four.
+    let dropping = common::EngineLoad {
+        running_requests: 8,
+        values: vec![
+            value("queue_depth", 5.0),
+            value("", 1.0),
+            value("ready", f64::NAN),
+            value("queue_depth", 6.0),
+        ],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        monitor.apply_pushed_load(&worker, 0, &dropping, Instant::now());
+        monitor.apply_pushed_load(&worker, 0, &dropping, Instant::now());
+    });
+    assert_metric(
+        &rendered,
+        "smg_engine_load_values_dropped_total",
+        &["worker=\"grpc://w1:9000\""],
+        "6",
+    );
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values.len(), 1);
+    assert_eq!(
+        (rank0.values[0].name.as_ref(), rank0.values[0].value),
+        ("queue_depth", 5.0)
+    );
+}
+
+/// What a rank's entry offers by name is its own record's. A count the entry
+/// keeps from a heartbeat is not offered under a later record that did not
+/// carry it, and the entry still holds it.
+#[tokio::test]
+async fn a_core_record_offers_no_fixed_count_the_entry_kept() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let names = |rank: &SchedulerLoadSnapshot| -> Vec<String> {
+        rank.named_values()
+            .map(|value| value.name.to_string())
+            .collect()
+    };
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(names(&rank0), ["kv_tokens_used", "kv_tokens_capacity"]);
+
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert!(names(&rank0).is_empty());
+    assert_eq!(
+        (rank0.num_used_tokens, rank0.max_total_num_tokens),
+        (2_048, 8_192)
+    );
+
+    // A record that carries one of the two offers that one.
+    let capacity = pushed(9).total_tokens(4_096);
+    monitor.apply_pushed_load(&worker, 0, &capacity, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(names(&rank0), ["kv_tokens_capacity"]);
+    assert_eq!(
+        (rank0.num_used_tokens, rank0.max_total_num_tokens),
+        (2_048, 4_096)
+    );
+}
+
+/// A count its record states is offered, zero included: an engine that
+/// goes idle states zero tokens held. A record that leaves the count out
+/// offers none, and neither does a rank's first record that states none.
+#[tokio::test]
+async fn a_record_offers_the_count_it_states_at_zero_and_none_it_leaves_out() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let offered = |monitor: &WorkerMonitor| -> Vec<(String, f64)> {
+        published_rank0(monitor, "grpc://w1:9000")
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value))
+            .collect()
+    };
+    let counts = |used: f64| {
+        [
+            ("kv_tokens_used".to_owned(), used),
+            ("kv_tokens_capacity".to_owned(), 8_192.0),
+        ]
+    };
+    // The rank's first record states no count: none is offered as a zero.
+    monitor.apply_pushed_load(&worker, 0, &pushed(6), Instant::now());
+    assert!(offered(&monitor).is_empty());
+
+    let busy = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &busy, Instant::now());
+    assert_eq!(offered(&monitor), counts(2_048.0));
+
+    // Idle: the record states zero held.
+    let idle = pushed(8).used_tokens(0).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &idle, Instant::now());
+    assert_eq!(offered(&monitor), counts(0.0));
+
+    // Left out: none is offered, and the entry keeps the last counts.
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    assert!(offered(&monitor).is_empty());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(
+        (rank0.num_used_tokens, rank0.max_total_num_tokens),
+        (0, 8_192)
+    );
+}
+
+/// A rank with no token capacity states neither fixed count, pushed as
+/// polled. An engine that keeps no such size fills both counts with zero on
+/// every heartbeat: under load its record offers neither, where a zero of
+/// tokens held would read the engine idle. The entry stores what the record
+/// said.
+#[tokio::test]
+async fn a_pushed_heartbeat_with_no_capacity_offers_neither_fixed_count() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let offered = |monitor: &WorkerMonitor| -> Vec<(String, f64)> {
+        published_rank0(monitor, "grpc://w1:9000")
+            .named_values()
+            .map(|value| (value.name.to_string(), value.value))
+            .collect()
+    };
+    let figures = |monitor: &WorkerMonitor| {
+        let rank0 = published_rank0(monitor, "grpc://w1:9000");
+        (rank0.num_used_tokens, rank0.max_total_num_tokens)
+    };
+    // The rank's first record, then the one that replaces it: both arms.
+    for running in [6, 7] {
+        let loaded = pushed(running).used_tokens(0).total_tokens(0);
+        monitor.apply_pushed_load(&worker, 0, &loaded, Instant::now());
+        assert!(offered(&monitor).is_empty(), "{running} running");
+    }
+    // A held count beside a capacity of zero is no statement either.
+    let held = pushed(8).used_tokens(211).total_tokens(0);
+    monitor.apply_pushed_load(&worker, 0, &held, Instant::now());
+    assert!(offered(&monitor).is_empty());
+    assert_eq!(figures(&monitor), (211, 0));
+
+    // A capacity states both counts, the zero held too.
+    let idle = pushed(9).used_tokens(0).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &idle, Instant::now());
+    assert_eq!(
+        offered(&monitor),
+        [
+            ("kv_tokens_used".to_owned(), 0.0),
+            ("kv_tokens_capacity".to_owned(), 8_192.0)
+        ]
+    );
+
+    // A record that carries a held count and leaves its capacity out: the
+    // entry keeps the capacity of the record before, so the rank has one,
+    // and the count the record carried is offered.
+    monitor.apply_pushed_load(&worker, 0, &pushed(10).used_tokens(211), Instant::now());
+    assert_eq!(offered(&monitor), [("kv_tokens_used".to_owned(), 211.0)]);
+    assert_eq!(figures(&monitor), (211, 8_192));
+}
+
 /// The poll decision reads the receipt of the worker's pushed records
 /// against the tick interval: none on file polls as always, a record
 /// within the interval on every pushing rank suppresses the poll, and a
@@ -936,6 +1175,28 @@ async fn the_poll_decision_follows_the_receipt_of_pushed_records() {
     // A worker that leaves takes its records with it.
     monitor.evict_worker_loads(&worker);
     assert_eq!(monitor.poll_mode(url, late, interval), PollMode::Poll);
+}
+
+/// A worker's first record files its receipt under the record's own rank.
+/// Under another rank the receipt would age with no record to renew it,
+/// and one interval later the worker would fall back to the poll with its
+/// stream at work.
+#[tokio::test]
+async fn a_workers_first_record_files_its_receipt_under_its_own_rank() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let url = "grpc://w1:9000";
+    let interval = Duration::from_secs(10);
+    let t0 = Instant::now();
+    monitor.apply_pushed_load(&worker, 1, &pushed(3), t0);
+    assert!(monitor.has_receipt(url, 1));
+    assert!(!monitor.has_receipt(url, 0), "rank 0 pushed nothing");
+    monitor.apply_pushed_load(&worker, 1, &pushed(4), t0 + interval);
+    assert_eq!(
+        monitor.poll_mode(url, t0 + interval, interval),
+        PollMode::Suppressed
+    );
 }
 
 /// Under data parallelism a quiet rank's record stops arriving while
@@ -1083,7 +1344,13 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
         .pushed_reports
         .lock()
         .get(url)
-        .and_then(|report| report.loads.iter().find(|load| load.dp_rank == 0).cloned())
+        .and_then(|file| {
+            file.report
+                .loads
+                .iter()
+                .find(|load| load.dp_rank == 0)
+                .cloned()
+        })
         .expect("rank 0 on file");
     assert_eq!(
         (rank0.num_running_reqs, rank0.cache_hit_rate, rank0.worker),
@@ -1249,4 +1516,2482 @@ async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
         "the worker that stays is swept on the tick after the removal"
     );
     sweep.abort();
+}
+
+/// What a recording sink was told, in order, with whether the monitor's
+/// reports were locked at the call.
+#[derive(Clone, Debug, PartialEq)]
+enum Said {
+    Record {
+        url: String,
+        rank: i32,
+        rows: usize,
+        received_at: Instant,
+        sampled_at: Instant,
+        locked: bool,
+    },
+    PollMode(String),
+    /// Each member's URL, the rows of its answer and the rows on file.
+    Report(Vec<(String, Option<usize>, Option<usize>)>, bool),
+    ReportEmpty(Vec<(String, Option<usize>, Option<usize>)>, bool),
+    FetchFailed(Vec<String>, bool),
+    /// The worker's URL, and whether the lock of the reports was held.
+    Forget(String, bool),
+    Reset,
+    /// The Ready workers of the group, then each report's URL, its rows and
+    /// whether its answer carried rank capacity.
+    Tick(usize, Vec<(String, usize, bool)>),
+}
+
+/// A sink that only records: what the monitor says is kept in order, each
+/// question gets the answer the case set, and nothing is written anywhere.
+/// It reads the lock of the monitor's reports at each call, so a case tells
+/// which calls the monitor makes under it.
+struct RecordingLoadSink {
+    said: Mutex<Vec<Said>>,
+    /// The workers the sink was told to forget, in order.
+    forgotten: Mutex<Vec<Arc<dyn Worker>>>,
+    polled_values: Mutex<Vec<NamedValue>>,
+    /// The instant the last failed fetch was said with.
+    failed_at: Mutex<Option<Instant>>,
+    mode: PollMode,
+    ranks: PolledRanks,
+    needs: bool,
+    monitor: std::sync::OnceLock<Weak<WorkerMonitor>>,
+}
+
+impl RecordingLoadSink {
+    fn locked(&self) -> bool {
+        self.monitor
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|monitor| monitor.pushed_reports.is_locked())
+    }
+
+    fn members(answer: &[PolledMember<'_>]) -> Vec<(String, Option<usize>, Option<usize>)> {
+        answer
+            .iter()
+            .map(|member| {
+                (
+                    member.worker.url().to_string(),
+                    member.answer.map(|load| load.loads.len()),
+                    member.on_file.map(|load| load.loads.len()),
+                )
+            })
+            .collect()
+    }
+}
+
+impl LoadSink for RecordingLoadSink {
+    fn record(
+        &self,
+        worker: &Arc<dyn Worker>,
+        rank: i32,
+        report: &WorkerLoadResponse,
+        received_at: Instant,
+        sampled_at: Instant,
+    ) {
+        let locked = self.locked();
+        self.said.lock().push(Said::Record {
+            url: worker.url().to_string(),
+            rank,
+            rows: report.loads.len(),
+            received_at,
+            sampled_at,
+            locked,
+        });
+    }
+
+    fn poll_mode(&self, worker: &Arc<dyn Worker>, _now: Instant, _interval: Duration) -> PollMode {
+        self.said
+            .lock()
+            .push(Said::PollMode(worker.url().to_string()));
+        self.mode
+    }
+
+    fn report(&self, answer: &[PolledMember<'_>], _polled_at: Instant) -> PolledRanks {
+        let locked = self.locked();
+        self.polled_values.lock().extend(
+            answer
+                .iter()
+                .filter_map(|member| member.answer)
+                .flat_map(|report| &report.loads)
+                .flat_map(|rank| &rank.values)
+                .cloned(),
+        );
+        self.said
+            .lock()
+            .push(Said::Report(Self::members(answer), locked));
+        self.ranks.clone()
+    }
+
+    fn report_empty(&self, answer: &[PolledMember<'_>], _polled_at: Instant) -> Vec<i32> {
+        let locked = self.locked();
+        self.said
+            .lock()
+            .push(Said::ReportEmpty(Self::members(answer), locked));
+        self.ranks.leaving.clone()
+    }
+
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant) {
+        *self.failed_at.lock() = Some(polled_at);
+        let locked = self.locked();
+        let urls = members
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        self.said.lock().push(Said::FetchFailed(urls, locked));
+    }
+
+    fn forget(&self, worker: &Arc<dyn Worker>) {
+        self.said
+            .lock()
+            .push(Said::Forget(worker.url().to_string(), self.locked()));
+        self.forgotten.lock().push(Arc::clone(worker));
+    }
+
+    fn reset(&self) {
+        self.said.lock().push(Said::Reset);
+    }
+
+    fn needs_loads(&self) -> bool {
+        self.needs
+    }
+
+    fn tick(&self, tick: &GroupTick<'_>) {
+        let reports = tick
+            .reports
+            .iter()
+            .map(|polled| {
+                (
+                    polled.worker.url().to_string(),
+                    polled.report.loads.len(),
+                    polled.carries_rank_capacity,
+                )
+            })
+            .collect();
+        self.said
+            .lock()
+            .push(Said::Tick(tick.workers.len(), reports));
+    }
+}
+
+/// A monitor over a recording sink that answers `mode` to the poll question
+/// and `ranks` to a poll's answer, with the sink and the registry.
+fn build_recording(
+    mode: PollMode,
+    ranks: PolledRanks,
+    needs: bool,
+    conditional_polling: bool,
+) -> (
+    Arc<WorkerRegistry>,
+    Arc<WorkerMonitor>,
+    Arc<RecordingLoadSink>,
+) {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = Arc::new(RecordingLoadSink {
+        said: Mutex::new(Vec::new()),
+        forgotten: Mutex::new(Vec::new()),
+        polled_values: Mutex::new(Vec::new()),
+        failed_at: Mutex::new(None),
+        mode,
+        ranks,
+        needs,
+        monitor: std::sync::OnceLock::new(),
+    });
+    let monitor = Arc::new(WorkerMonitor::with_sink(
+        registry.clone(),
+        sink.clone(),
+        5,
+        false,
+        conditional_polling,
+    ));
+    assert!(sink.monitor.set(Arc::downgrade(&monitor)).is_ok());
+    (registry, monitor, sink)
+}
+
+/// The rank and the running requests of each row, in order.
+fn rows(load: &WorkerLoadResponse) -> Vec<(i32, i32)> {
+    load.loads
+        .iter()
+        .map(|row| (row.dp_rank, row.num_running_reqs))
+        .collect()
+}
+
+/// An answer that names `rank` alone, with `running` requests.
+fn answer_of(rank: i32, running: i32) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: rank,
+            num_running_reqs: running,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_connections_named_values_reach_the_load_sink_and_fleet_response() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let expected = vec![
+        NamedValue {
+            name: "blocked_cycles".into(),
+            unit: "cycles".into(),
+            value: 17.0,
+            age_ms: Some(29),
+        },
+        NamedValue {
+            name: "wait_time".into(),
+            unit: "ms".into(),
+            value: 2.75,
+            age_ms: None,
+        },
+    ];
+    let mut answer = answer_of(2, 3);
+    answer.loads[0].values.clone_from(&expected);
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://worker:9132")
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .engine_connection(ScriptedAnswers::answering_loads(answer))
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    registry.register(worker).unwrap();
+    let group = WorkerGroupKey {
+        model_id: "m".into(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Grpc,
+    };
+    poll_group_once(&monitor, &group, Duration::from_secs(5), Instant::now()).await;
+    assert_eq!(*sink.polled_values.lock(), expected);
+
+    let fleet = WorkerManager::fleet_loads(&registry, &monitor.load_snapshot(), None, "test");
+    assert_eq!(fleet.loads[0].values, expected);
+    let json = serde_json::to_value(fleet).unwrap();
+    assert_eq!(
+        json["loads"][0]["values"],
+        serde_json::json!([
+            {"name": "blocked_cycles", "unit": "cycles", "value": 17.0, "age_ms": 29},
+            {"name": "wait_time", "unit": "ms", "value": 2.75},
+        ])
+    );
+    let decoded: WorkerLoadResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.loads[0].values, expected);
+}
+
+/// A pushed record crosses the port once, after the monitor laid it in the
+/// worker's report and under the lock of the reports. The sink is told the
+/// worker, the rank, the report as it stands, the receipt, and a sample
+/// instant that is the receipt less the record's age and the one-way margin.
+#[tokio::test]
+async fn a_pushed_record_crosses_the_port_under_the_lock_of_the_reports() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let received_at = Instant::now();
+    let mut aged = PushedRecord::requests(3, 2);
+    aged.age = Duration::from_millis(30);
+
+    monitor.apply_pushed_load(&worker, 1, &aged, received_at);
+    monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(1, 0), received_at);
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![
+            Said::Record {
+                url: "http://w:1".to_string(),
+                rank: 1,
+                rows: 1,
+                received_at,
+                sampled_at: received_at - Duration::from_millis(30) - PUSHED_ONE_WAY_MARGIN,
+                locked: true,
+            },
+            Said::Record {
+                url: "http://w:1".to_string(),
+                rank: 0,
+                rows: 2,
+                received_at,
+                sampled_at: received_at - PUSHED_ONE_WAY_MARGIN,
+                locked: true,
+            },
+        ]
+    );
+}
+
+/// One engine's answer crosses whole and under the lock of the reports: the
+/// member with its answer's rows and the rows on file. The file is then laid
+/// by the ranks the sink names: the rank whose stream is the newer keeps its
+/// row and hands it to the answer, the rank that leaves loses its row, and
+/// the other takes the answer's entry.
+#[tokio::test]
+async fn an_engines_answer_crosses_whole_and_the_file_is_laid_by_the_sinks_ranks() {
+    let ranks = PolledRanks {
+        newer: vec![1],
+        leaving: vec![2],
+    };
+    let (registry, monitor, sink) = build_recording(PollMode::Fallback, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    for rank in 0..3 {
+        let record = PushedRecord::requests(10 + rank, 0);
+        monitor.apply_pushed_load(&worker, rank, &record, Instant::now());
+    }
+    sink.said.lock().clear();
+
+    let mut engine = vec![(Arc::clone(&worker), Some(answer_of(0, 7)))];
+    let carries_rank_capacity = monitor.reconcile_engine(&mut engine, Instant::now());
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![Said::Report(
+            vec![("http://w:1".to_string(), Some(1), Some(3))],
+            true
+        )]
+    );
+    {
+        let reports = monitor.pushed_reports.lock();
+        let file = &reports["http://w:1"].report;
+        assert_eq!(rows(file), vec![(0, 7), (1, 11)]);
+        assert_eq!(file.dp_rank_count, 2);
+    }
+    let answer = engine[0].1.as_ref().expect("the answer stays");
+    assert_eq!(rows(answer), vec![(0, 7), (1, 11)]);
+    assert_eq!(
+        carries_rank_capacity,
+        vec![false],
+        "an answer with no token capacity lists no ranks for a cache"
+    );
+}
+
+/// An answer that brought no row and a fetch that failed are said apart: the
+/// first under the lock of the reports, with the file laid by the ranks the
+/// sink says leave; the second with no lock held and nothing laid.
+#[tokio::test]
+async fn an_answer_with_no_row_and_a_failed_fetch_are_said_apart() {
+    let ranks = PolledRanks {
+        newer: Vec::new(),
+        leaving: vec![0],
+    };
+    let (registry, monitor, sink) = build_recording(PollMode::Poll, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(1, 0), Instant::now());
+    monitor.apply_pushed_load(&worker, 1, &PushedRecord::requests(2, 0), Instant::now());
+    sink.said.lock().clear();
+
+    let mut failed = vec![(Arc::clone(&worker), None)];
+    let asked = Instant::now();
+    monitor.reconcile_engine(&mut failed, asked);
+    assert_eq!(
+        *sink.failed_at.lock(),
+        Some(asked),
+        "a failed fetch is said with the instant its poll was asked"
+    );
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"].report),
+        vec![(0, 1), (1, 2)],
+        "a failed fetch lays nothing"
+    );
+    let mut empty = vec![(Arc::clone(&worker), Some(WorkerLoadResponse::default()))];
+    monitor.reconcile_engine(&mut empty, Instant::now());
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![
+            Said::FetchFailed(vec!["http://w:1".to_string()], false),
+            Said::ReportEmpty(vec![("http://w:1".to_string(), Some(0), Some(2))], true),
+        ]
+    );
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"].report),
+        vec![(1, 2)],
+        "the rank the sink named left the file"
+    );
+}
+
+/// A tick that polled nobody still ends at the sink, with every Ready worker
+/// of the group and no report: a sink that trims what its readers booked
+/// does it on every tick. Nothing is fetched and nothing is published.
+#[tokio::test]
+async fn a_tick_that_polled_nobody_ends_at_the_sink_with_every_ready_worker() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let key = WorkerGroupKey {
+        model_id: "m".to_string(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Http,
+    };
+
+    poll_group_once(&monitor, &key, Duration::from_secs(5), Instant::now()).await;
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![
+            Said::PollMode("http://w:1".to_string()),
+            Said::Tick(1, Vec::new()),
+        ]
+    );
+    assert!(monitor.load_state.snapshot().is_empty());
+}
+
+/// Under the conditional poll gate the monitor asks its sink whether a
+/// reader wants loads, and takes the answer.
+#[tokio::test]
+async fn the_conditional_gate_asks_the_sink_whether_loads_are_wanted() {
+    let worker = ready_worker("http://w:1", "m");
+    for needs in [false, true] {
+        let (_registry, monitor, _sink) =
+            build_recording(PollMode::Poll, PolledRanks::default(), needs, true);
+        assert_eq!(
+            monitor.loads_wanted(std::slice::from_ref(&worker)),
+            needs,
+            "the sink says {needs}"
+        );
+    }
+}
+
+/// A sink that writes the seven calls with no default and keeps the port's
+/// answer at the two that have one.
+struct BareSink;
+
+impl LoadSink for BareSink {
+    fn record(&self, _: &Arc<dyn Worker>, _: i32, _: &WorkerLoadResponse, _: Instant, _: Instant) {}
+
+    fn poll_mode(&self, _: &Arc<dyn Worker>, _: Instant, _: Duration) -> PollMode {
+        PollMode::Poll
+    }
+
+    fn report(&self, _: &[PolledMember<'_>], _: Instant) -> PolledRanks {
+        PolledRanks::default()
+    }
+
+    fn report_empty(&self, _: &[PolledMember<'_>], _: Instant) -> Vec<i32> {
+        Vec::new()
+    }
+
+    fn fetch_failed(&self, _: &[Arc<dyn Worker>], _: Instant) {}
+
+    fn forget(&self, _: &Arc<dyn Worker>) {}
+
+    fn reset(&self) {}
+}
+
+/// A sink that does not say whether its readers want loads is fed: the
+/// port's own answer is that they do, so a collector told to fetch on
+/// demand alone still polls for it.
+#[test]
+fn a_sink_that_keeps_the_ports_answer_is_fed_under_the_conditional_gate() {
+    let monitor = WorkerMonitor::with_sink(
+        Arc::new(WorkerRegistry::new()),
+        Arc::new(BareSink),
+        5,
+        false,
+        true,
+    );
+    let worker = ready_worker("http://w:1", "m");
+    assert!(monitor.loads_wanted(std::slice::from_ref(&worker)));
+}
+
+/// The monitor running over a recording sink, with one Ready worker
+/// registered and the event loop started.
+fn recording_with_a_worker() -> (
+    Arc<WorkerRegistry>,
+    Arc<WorkerMonitor>,
+    Arc<RecordingLoadSink>,
+    crate::registry::WorkerId,
+) {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let id = registry.register(ready_worker("http://w:1", "m")).unwrap();
+    monitor.start_event_loop();
+    (registry, monitor, sink, id)
+}
+
+/// Whether the sink has been told to forget the worker at `url`.
+fn told_to_forget(sink: &RecordingLoadSink, url: &str) -> bool {
+    sink.said
+        .lock()
+        .iter()
+        .any(|said| matches!(said, Said::Forget(told, _) if told == url))
+}
+
+/// The event loop's turn: it runs on its own task.
+async fn settle() {
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Wait, up to two seconds, until `done` holds: what the event loop does
+/// arrives on its own task.
+async fn within_two_seconds(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    done()
+}
+
+/// A worker's removal forgets its loads at the sink.
+#[tokio::test]
+async fn a_removal_forgets_the_workers_loads_at_the_sink() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    assert!(!told_to_forget(&sink, "http://w:1"));
+    registry.remove(&id);
+    assert!(within_two_seconds(|| told_to_forget(&sink, "http://w:1")).await);
+}
+
+/// A worker's replacement forgets the old worker's loads at the sink.
+#[tokio::test]
+async fn a_replacement_forgets_the_old_workers_loads_at_the_sink() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    assert!(!told_to_forget(&sink, "http://w:1"));
+    assert!(registry.replace(&id, ready_worker("http://w:1", "m")));
+    assert!(within_two_seconds(|| told_to_forget(&sink, "http://w:1")).await);
+}
+
+/// A status that leaves `Ready` forgets the worker's loads at the sink.
+#[tokio::test]
+async fn a_status_that_leaves_ready_forgets_the_workers_loads_at_the_sink() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    assert!(!told_to_forget(&sink, "http://w:1"));
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    assert!(within_two_seconds(|| told_to_forget(&sink, "http://w:1")).await);
+}
+
+/// A Ready worker under overload thresholds: eight waiting requests, or a
+/// token usage of 0.8.
+fn overload_worker(url: &str) -> Arc<dyn Worker> {
+    overload_member(url, None)
+}
+
+/// [`overload_worker`]. With a `rank` it builds that rank worker of a
+/// data-parallel engine of two at `url`.
+fn overload_member(url: &str, rank: Option<usize>) -> Arc<dyn Worker> {
+    let mut builder = BasicWorkerBuilder::new(url)
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Http)
+        .model(ModelCard::new("m"))
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        })
+        .overload_defaults(OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        });
+    if let Some(rank) = rank {
+        builder = builder.dp_config(rank, 2);
+    }
+    let worker = builder.build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
+/// A worker whose status leaves `Ready` has no load feed and so no verdict:
+/// the monitor's own sink clears the overload flag, which nothing else
+/// clears on that path. A record comes before the event loop starts, so the
+/// first tick finds a fresh receipt and polls nobody, and no failed fetch
+/// clears the flag in the eviction's place. The loop's start resets every
+/// flag, so the record that sets this one comes after it.
+#[tokio::test]
+async fn a_status_that_leaves_ready_clears_the_overload_flag_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker = overload_worker("http://w:1");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    let record = pushed(1).with_requests(1, 8);
+    monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+    monitor.start_event_loop();
+    settle().await;
+    monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+    assert!(worker.is_overloaded(), "eight waiting is the threshold");
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    assert!(
+        within_two_seconds(|| !worker.is_overloaded()).await,
+        "no load feed, no verdict"
+    );
+}
+
+/// The collector's reset crosses the port: the sink is told, and the
+/// collector itself clears no overload flag. The flag here was set by
+/// another hand and the recording sink writes nothing, so it still stands.
+#[test]
+fn a_reset_is_said_to_the_sink_and_the_collector_clears_no_flag_itself() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let worker = overload_worker("http://w:1");
+    registry.register(Arc::clone(&worker)).unwrap();
+    registry.set_worker_overloaded(&worker, true);
+
+    monitor.stop_all_groups();
+
+    assert_eq!(*sink.said.lock(), vec![Said::Reset]);
+    assert!(worker.is_overloaded(), "the flag is the sink's to clear");
+}
+
+/// At a reset the monitor's own sink fails every overload veto open and
+/// says so, under the monitor's log target as before the port.
+#[test]
+#[tracing_test::traced_test]
+fn the_monitors_own_sink_fails_the_vetoes_open_at_a_reset_and_says_so() {
+    let (registry, monitor) = build_monitor();
+    let worker = overload_worker("http://w:1");
+    registry.register(Arc::clone(&worker)).unwrap();
+    registry.set_worker_overloaded(&worker, true);
+
+    monitor.stop_all_groups();
+
+    assert!(!worker.is_overloaded());
+    assert!(logs_contain(
+        "smg_worker::load::monitor: Overload vetoes cleared with the load feed"
+    ));
+}
+
+/// The receipts of a pusher that stays outlive a reset, with its pushed
+/// report: the collector stops its polls, not the workers' streams. A
+/// worker whose stream pushed within the interval is still not polled.
+#[tokio::test]
+async fn a_reset_keeps_the_receipts_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let now = Instant::now();
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), now);
+
+    monitor.stop_all_groups();
+
+    assert!(monitor.pushed_reports.lock().contains_key("http://w:1"));
+    assert_eq!(
+        monitor.poll_mode("http://w:1", now, Duration::from_secs(5)),
+        PollMode::Suppressed
+    );
+}
+
+/// A dropped collector says nothing to its sink: its drop aborts its tasks
+/// and makes no call. A sink's code inside a drop would run on whatever
+/// thread lets the last handle go, under the locks that thread holds. The
+/// host that drops a collector owns the sink too: it voids its store when
+/// it chooses, or it starts the next collector over the same sink, whose
+/// start says the reset.
+#[tokio::test]
+async fn a_dropped_collector_says_nothing_to_its_sink() {
+    let (_registry, monitor, sink, _id) = recording_with_a_worker();
+    settle().await;
+    let said_before = sink.said.lock().clone();
+    assert_eq!(
+        said_before.first(),
+        Some(&Said::Reset),
+        "the start says the reset"
+    );
+
+    drop(monitor);
+    settle().await;
+
+    assert!(
+        sink.monitor.get().and_then(Weak::upgrade).is_none(),
+        "the collector is gone"
+    );
+    assert_eq!(*sink.said.lock(), said_before, "the drop says nothing");
+}
+
+/// Dropping a collector stops the lazy pushed-report flusher after it has
+/// published a record and returned to waiting for another notification.
+#[tokio::test(start_paused = true)]
+async fn dropping_a_monitor_stops_its_parked_pushed_flusher() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+    tokio::time::sleep(PUSHED_PUBLISH_WINDOW + PUSHED_PUBLISH_WINDOW).await;
+    assert_eq!(monitor.pending_pushed_len(), 0, "the record was published");
+
+    let flusher = monitor
+        .pushed_flush_task
+        .lock()
+        .as_ref()
+        .expect("the pushed record started its flusher")
+        .abort_handle();
+    assert!(!flusher.is_finished(), "the flusher is parked");
+
+    drop(monitor);
+    tokio::task::yield_now().await;
+
+    assert!(flusher.is_finished(), "drop stopped the pushed flusher");
+}
+
+/// Register `worker` and put it under the overload veto by another hand.
+fn veto(registry: &WorkerRegistry, worker: &Arc<dyn Worker>) {
+    registry.register(Arc::clone(worker)).unwrap();
+    assert!(registry.set_worker_overloaded(worker, true));
+}
+
+/// Absent means no opinion. An engine whose fetch failed for every member
+/// brought none, and the monitor's own sink clears the overload veto: a
+/// worker whose feed went away is not left out of routing.
+#[test]
+fn a_fetch_that_failed_whole_clears_the_veto_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker = overload_worker("http://w:1");
+    veto(&registry, &worker);
+
+    monitor.reconcile_engine(&mut [(Arc::clone(&worker), None)], Instant::now());
+
+    assert!(!worker.is_overloaded());
+}
+
+/// An answer with no row is no opinion either: the veto is cleared.
+#[test]
+fn an_answer_with_no_row_clears_the_veto_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker = overload_worker("http://w:1");
+    veto(&registry, &worker);
+    let no_row = Some(WorkerLoadResponse::default());
+
+    monitor.reconcile_engine(&mut [(Arc::clone(&worker), no_row)], Instant::now());
+
+    assert!(!worker.is_overloaded());
+}
+
+/// A rank worker whose own fetch failed beside one that answered has no
+/// opinion of its own: its veto is cleared, whatever the other's rows say.
+#[test]
+fn a_members_failed_fetch_beside_an_answer_clears_its_veto_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let failed = overload_member("http://w:1", Some(0));
+    let answered = overload_member("http://w:1", Some(1));
+    veto(&registry, &failed);
+    registry.register(Arc::clone(&answered)).unwrap();
+    let mut engine = [
+        (Arc::clone(&failed), None),
+        (answered, Some(answer_of(1, 1))),
+    ];
+
+    monitor.reconcile_engine(&mut engine, Instant::now());
+
+    assert!(!failed.is_overloaded());
+}
+
+/// A registered worker whose stream pushed a record of rank 0 and one of
+/// rank 1, under the monitor's own sink and with no event loop: no registry
+/// event reaches the monitor, as when the events are lost.
+fn a_pusher_no_event_reaches() -> (
+    Arc<WorkerRegistry>,
+    Arc<WorkerMonitor>,
+    crate::registry::WorkerId,
+) {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    for rank in [0, 1] {
+        monitor.apply_pushed_load(&worker, rank, &pushed(1), Instant::now());
+    }
+    (registry, monitor, id)
+}
+
+/// Whether the worker at `http://w:1` has a pushed report on file, and a
+/// receipt of rank 1.
+fn on_file(monitor: &WorkerMonitor) -> (bool, bool) {
+    (
+        monitor.pushed_reports.lock().contains_key("http://w:1"),
+        monitor.has_receipt("http://w:1", 1),
+    )
+}
+
+/// A pusher removed while registry events were lost was never evicted. The
+/// reset evicts it: its pushed report and its receipts go, which nothing
+/// else drops.
+#[tokio::test]
+async fn a_reset_evicts_a_pusher_that_left_while_events_were_lost() {
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    registry.remove(&id);
+    assert_eq!(on_file(&monitor), (true, true), "no event evicted it");
+
+    monitor.stop_all_groups();
+
+    assert_eq!(on_file(&monitor), (false, false));
+}
+
+/// A pusher whose status left `Ready` while registry events were lost is
+/// evicted at the reset, as its event would have.
+#[tokio::test]
+async fn a_reset_evicts_a_pusher_that_left_ready_while_events_were_lost() {
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+
+    monitor.stop_all_groups();
+
+    assert_eq!(on_file(&monitor), (false, false));
+}
+
+/// A pusher replaced while registry events were lost is evicted at the
+/// reset: the replacement is polled until its own stream pushes.
+#[tokio::test]
+async fn a_reset_evicts_a_pusher_that_was_replaced_while_events_were_lost() {
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    assert!(registry.replace(&id, ready_worker("http://w:1", "m")));
+
+    monitor.stop_all_groups();
+
+    assert_eq!(on_file(&monitor), (false, false));
+    assert_eq!(
+        monitor.poll_mode("http://w:1", Instant::now(), Duration::from_secs(5)),
+        PollMode::Poll
+    );
+}
+
+/// A worker registered at the address of a pusher that left while registry
+/// events were lost starts a report of its own after the reset: its first
+/// record publishes no rank of its predecessor.
+#[tokio::test]
+async fn a_worker_at_a_lost_pushers_address_starts_a_report_of_its_own() {
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    registry.remove(&id);
+    let next = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&next)).unwrap();
+
+    monitor.stop_all_groups();
+    monitor.apply_pushed_load(&next, 0, &pushed(3), Instant::now());
+
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"].report),
+        vec![(0, 3)],
+        "the predecessor's rank 1 is gone"
+    );
+    assert!(!monitor.has_receipt("http://w:1", 1));
+}
+
+/// A worker registered at a lost pusher's address that pushes before the
+/// reset starts a report of its own with that record: the predecessor's
+/// rank and receipts are gone at once, and the reset keeps the report.
+#[tokio::test]
+async fn a_record_ahead_of_the_reset_starts_the_successors_own_report() {
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    registry.remove(&id);
+    let next = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&next)).unwrap();
+
+    monitor.apply_pushed_load(&next, 0, &pushed(3), Instant::now());
+
+    assert_eq!(on_file(&monitor), (true, false), "no receipt of rank 1");
+    assert_eq!(published_rows(&monitor), vec![(0, 3)]);
+    monitor.stop_all_groups();
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"].report),
+        vec![(0, 3)],
+        "the reset keeps the report of the registry's worker"
+    );
+}
+
+/// A pusher of ranks 0 and 1 that was replaced, with its event still to
+/// come: the monitor, the replaced worker and its replacement.
+fn a_replaced_pusher_ahead_of_its_event() -> (Arc<WorkerMonitor>, Arc<dyn Worker>, Arc<dyn Worker>)
+{
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    let replaced = registry.get(&id).unwrap();
+    let next = ready_worker("http://w:1", "m");
+    assert!(registry.replace(&id, Arc::clone(&next)));
+    (monitor, replaced, next)
+}
+
+/// A successor's stream can push before the monitor handles its
+/// predecessor's event. Its first record starts a report of its own: it
+/// holds and publishes its own rank alone, and the predecessor's receipts
+/// are gone.
+#[tokio::test]
+async fn a_successors_record_ahead_of_its_predecessors_event_starts_its_own_report() {
+    let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    assert_eq!(on_file(&monitor), (true, false), "no receipt of rank 1");
+    assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+}
+
+/// A record of the replaced worker that lands behind its successor's
+/// report is dropped: a report holds its pusher's records alone.
+#[tokio::test]
+async fn a_replaced_workers_record_behind_its_successors_report_is_dropped() {
+    let (monitor, replaced, next) = a_replaced_pusher_ahead_of_its_event();
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    monitor.apply_pushed_load(&replaced, 1, &pushed(4), Instant::now());
+
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"].report),
+        vec![(0, 9)]
+    );
+    assert!(!monitor.has_receipt("http://w:1", 1));
+}
+
+/// The sink is told to forget the worker whose report a successor's record
+/// replaces: that worker and no other, ahead of that record and under the
+/// same hold of the reports. The replaced worker's own eviction comes
+/// later and says nothing more: the URL holds its successor's report.
+#[tokio::test]
+async fn the_sink_forgets_a_replaced_pusher_ahead_of_its_successors_record() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let first = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&first)).unwrap();
+    monitor.apply_pushed_load(&first, 1, &pushed(1), Instant::now());
+    let next = ready_worker("http://w:1", "m");
+    assert!(registry.replace(&id, Arc::clone(&next)));
+    sink.said.lock().clear();
+
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    let said = sink.said.lock();
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert_eq!(said[0], Said::Forget("http://w:1".to_string(), true));
+    assert!(
+        Arc::ptr_eq(&sink.forgotten.lock()[0], &first),
+        "the replaced pusher, not its successor"
+    );
+    assert!(
+        matches!(
+            said[1],
+            Said::Record {
+                rank: 0,
+                rows: 1,
+                ..
+            }
+        ),
+        "{said:?}"
+    );
+    drop(said);
+
+    monitor.evict_worker_loads(&first);
+
+    assert_eq!(sink.said.lock().len(), 2, "nothing at the late eviction");
+}
+
+/// A replaced worker's event can come behind its successor's first record.
+/// Its eviction takes what is its own: the report at the URL is its
+/// successor's and stays, with its receipt and its published row.
+#[tokio::test]
+async fn a_replaced_workers_late_eviction_leaves_its_successors_report() {
+    let (monitor, replaced, next) = a_replaced_pusher_ahead_of_its_event();
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    monitor.evict_worker_loads(&replaced);
+
+    assert!(monitor.pushed_reports.lock().contains_key("http://w:1"));
+    assert!(monitor.has_receipt("http://w:1", 0), "its receipt");
+    assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+}
+
+/// The monitor's own sink with a stop inside `forget`: a case holds the
+/// collector there while another thread pushes a record.
+struct StoppedAtForget {
+    classic: ClassicLoadSink<crate::test_support::Members>,
+    entered: mpsc::Sender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+}
+
+impl LoadSink for StoppedAtForget {
+    fn record(
+        &self,
+        worker: &Arc<dyn Worker>,
+        rank: i32,
+        report: &WorkerLoadResponse,
+        received_at: Instant,
+        sampled_at: Instant,
+    ) {
+        self.classic
+            .record(worker, rank, report, received_at, sampled_at);
+    }
+
+    fn poll_mode(&self, worker: &Arc<dyn Worker>, now: Instant, interval: Duration) -> PollMode {
+        self.classic.poll_mode(worker, now, interval)
+    }
+
+    fn report(&self, answer: &[PolledMember<'_>], polled_at: Instant) -> PolledRanks {
+        self.classic.report(answer, polled_at)
+    }
+
+    fn report_empty(&self, answer: &[PolledMember<'_>], polled_at: Instant) -> Vec<i32> {
+        self.classic.report_empty(answer, polled_at)
+    }
+
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant) {
+        self.classic.fetch_failed(members, polled_at);
+    }
+
+    fn forget(&self, worker: &Arc<dyn Worker>) {
+        self.entered.send(()).unwrap();
+        self.resume
+            .lock()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        self.classic.forget(worker);
+    }
+
+    fn reset(&self) {
+        self.classic.reset();
+    }
+}
+
+/// A reset's eviction and the first record of the next worker at the URL
+/// can cross. The sink forgets under the lock of the reports, so the
+/// record waits for it and its receipt is kept: no poll runs beside the
+/// next worker's stream.
+#[tokio::test]
+async fn a_record_that_crosses_a_resets_eviction_keeps_its_receipt() {
+    let (entered, in_forget) = mpsc::channel();
+    let (resume, at_resume) = mpsc::channel();
+    let (recorded, record_done) = mpsc::channel();
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = Arc::new(StoppedAtForget {
+        classic: ClassicLoadSink::new(
+            Arc::clone(&registry),
+            Arc::new(LoadReaders::Blind),
+            Arc::new(WorkerLoadManager::new()),
+        ),
+        entered,
+        resume: Mutex::new(at_resume),
+    });
+    let monitor = Arc::new(WorkerMonitor::with_sink(
+        Arc::clone(&registry),
+        sink.clone(),
+        5,
+        false,
+        false,
+    ));
+    let lost = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&lost)).unwrap();
+    monitor.apply_pushed_load(&lost, 1, &pushed(4), Instant::now());
+    registry.remove(&id);
+    let next = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&next)).unwrap();
+    let now = Instant::now();
+    let runtime = tokio::runtime::Handle::current();
+
+    let waited = std::thread::scope(|scope| {
+        scope.spawn(|| monitor.stop_all_groups());
+        in_forget.recv_timeout(Duration::from_secs(5)).unwrap();
+        scope.spawn(|| {
+            let _context = runtime.enter();
+            monitor.apply_pushed_load(&next, 0, &pushed(9), now);
+            recorded.send(()).unwrap();
+        });
+        // A record that does not wait for the sink is done by now.
+        let waited = record_done
+            .recv_timeout(Duration::from_millis(100))
+            .is_err();
+        resume.send(()).unwrap();
+        waited
+    });
+
+    assert!(waited, "the record waits for the sink to forget");
+    assert_eq!(
+        sink.poll_mode(&next, now, Duration::from_secs(5)),
+        PollMode::Suppressed,
+        "the next worker's receipt"
+    );
+}
+
+/// A removed worker's late record that lands behind the next worker's
+/// report is dropped: the next flush still publishes the next worker's
+/// rank, and its predecessor's rank never joins it.
+#[tokio::test]
+async fn a_removed_workers_late_record_behind_the_next_workers_report_is_dropped() {
+    let (registry, monitor, gone) = a_pusher_its_event_evicted();
+    let next = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&next)).unwrap();
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    monitor.apply_pushed_load(&gone, 1, &pushed(4), Instant::now());
+
+    assert_eq!(published_rows(&monitor), vec![(0, 9)], "its own rank");
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+    assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+}
+
+/// A pusher that was removed and that its event evicted: nothing of it is
+/// on file. The removed worker is handed back, as its stream holds it.
+fn a_pusher_its_event_evicted() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>, Arc<dyn Worker>) {
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    monitor.flush_pushed();
+    let gone = registry.remove(&id).unwrap();
+    monitor.evict_worker_loads(&gone);
+    monitor.flush_pending_evictions();
+    (registry, monitor, gone)
+}
+
+/// Whether anything still holds `worker`, which is let go here.
+fn held(worker: Arc<dyn Worker>) -> bool {
+    let weak = Arc::downgrade(&worker);
+    drop(worker);
+    weak.upgrade().is_some()
+}
+
+/// The rows the worker at `http://w:1` publishes at the next flush.
+fn published_rows(monitor: &Arc<WorkerMonitor>) -> Vec<(i32, i32)> {
+    monitor.flush_pushed();
+    rows(monitor.load_state.snapshot().get("http://w:1").unwrap())
+}
+
+/// A host ends a worker's stream after the registry let the worker go, so
+/// a record can land behind the worker's eviction. It starts no report:
+/// nothing holds the worker that is gone, and the next worker at the
+/// address publishes its own rank alone.
+#[tokio::test]
+async fn a_record_behind_its_workers_eviction_starts_no_report() {
+    let (registry, monitor, gone) = a_pusher_its_event_evicted();
+
+    monitor.apply_pushed_load(&gone, 1, &pushed(4), Instant::now());
+
+    assert_eq!(on_file(&monitor), (false, false));
+    assert!(!held(gone), "nothing holds the worker");
+    let next = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&next)).unwrap();
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+    assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+}
+
+/// The start test reads the worker, not its address alone: with the next
+/// worker registered there, a record of the removed worker still starts no
+/// report, nothing holds the removed worker, and the next worker publishes
+/// its own rank alone.
+#[tokio::test]
+async fn a_removed_workers_record_behind_the_next_registration_starts_no_report() {
+    let (registry, monitor, gone) = a_pusher_its_event_evicted();
+    let next = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&next)).unwrap();
+
+    monitor.apply_pushed_load(&gone, 1, &pushed(4), Instant::now());
+
+    assert_eq!(on_file(&monitor), (false, false));
+    assert!(!held(gone), "nothing holds the removed worker");
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+    assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+}
+
+/// A record that is dropped still marks its worker as one whose stream
+/// pushes, as any record does: a worker the registry does not hold starts
+/// no report, and nothing of it reaches the sink.
+#[tokio::test]
+async fn a_dropped_record_still_marks_its_worker_as_one_whose_stream_pushes() {
+    let (_registry, monitor, sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+
+    assert!(monitor.pushed_reports.lock().is_empty());
+    assert!(sink.said.lock().is_empty(), "nothing reaches the sink");
+    assert!(
+        worker
+            .runtime_state()
+            .is_some_and(|runtime| runtime.pushes_load_records()),
+        "its worker is marked as one whose stream pushes"
+    );
+}
+
+/// A report is on file for the registry's worker at its URL, `Ready` or
+/// not: the record of a registered worker that is not `Ready` starts its
+/// report and reaches the sink, and the publish fence holds its rows back.
+/// Its next record once it is `Ready` publishes them.
+#[tokio::test]
+async fn a_record_of_a_worker_that_is_not_ready_is_filed_and_not_published() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+
+    assert!(
+        matches!(sink.said.lock().as_slice(), [Said::Record { rank: 0, .. }]),
+        "the record reaches the sink"
+    );
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"].report),
+        vec![(0, 1)]
+    );
+    monitor.flush_pushed();
+    assert!(
+        monitor.load_state.snapshot().get("http://w:1").is_none(),
+        "nothing is published"
+    );
+
+    registry.transition_status(&id, WorkerStatus::Ready);
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+
+    assert_eq!(published_rows(&monitor), vec![(0, 1)]);
+}
+
+/// A worker the wedged rule vetoed can leave `Ready` and produce again
+/// before health takes it back. Its record is heard while the registry
+/// holds it, whatever its status: the veto is lifted, and nothing keeps
+/// the worker out of routing once it is `Ready`.
+#[tokio::test]
+async fn a_record_of_a_worker_that_is_not_ready_lifts_its_wedge_veto() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    let mut record = pushed(1);
+    record.engine_silence = Some(Duration::from_millis(5_000));
+    record.reports_every_step = true;
+    monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+    assert_eq!(worker.stall_reason(), Some(StallReason::Wedged));
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    monitor.evict_worker_loads(&worker);
+
+    record.engine_silence = None;
+    monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+    registry.transition_status(&id, WorkerStatus::Ready);
+
+    assert!(worker.stall_reason().is_none(), "the engine produces again");
+}
+
+/// A pusher that left `Ready` and came back, with the eviction its leave
+/// queued still to be applied: it reported 7 running before it left and 9
+/// since its return, and published both.
+fn a_pusher_back_ahead_of_its_queued_eviction() -> Arc<WorkerMonitor> {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+    monitor.flush_pushed();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    monitor.evict_worker_loads(&worker);
+    registry.transition_status(&id, WorkerStatus::Ready);
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    monitor.flush_pushed();
+    monitor
+}
+
+/// The running-requests series of rank 0 of the worker at `http://w:1`, as
+/// rendered.
+fn running_series(rendered: &str) -> &str {
+    running_series_of(rendered, 0)
+}
+
+/// The running-requests series of `rank` of the worker at `http://w:1`, as
+/// rendered.
+fn running_series_of(rendered: &str, rank: i32) -> &str {
+    let rank = format!("dp_rank=\"{rank}\"");
+    rendered
+        .lines()
+        .find(|l| {
+            l.starts_with("smg_engine_running_requests{")
+                && l.contains("http://w:1")
+                && l.contains(&rank)
+        })
+        .unwrap_or_else(|| panic!("no running series with {rank}:\n{rendered}"))
+}
+
+/// The flush that applies the queue evicts no worker that is the
+/// registry's `Ready` worker again. The row it published since its return
+/// stands, and no sentinel lands over its series.
+#[tokio::test]
+async fn a_queued_eviction_leaves_the_row_its_worker_published_since() {
+    let rendered = render_with_recorder(|| {
+        let monitor = a_pusher_back_ahead_of_its_queued_eviction();
+
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A reset applies the queue too: a worker that came back keeps the series
+/// of what it reported since, and its receipt.
+#[tokio::test]
+async fn a_reset_leaves_the_series_a_returned_worker_reported_since() {
+    let rendered = render_with_recorder(|| {
+        let monitor = a_pusher_back_ahead_of_its_queued_eviction();
+
+        monitor.stop_all_groups();
+
+        assert!(monitor.has_receipt("http://w:1", 0));
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// The series is held back with the rows. A record of a worker that is not
+/// `Ready` leaves the sentinel its eviction wrote, and so does the flush
+/// behind it: a stream that ends there leaves no load that reads as live.
+#[tokio::test]
+async fn a_record_of_a_worker_that_is_not_ready_leaves_the_sentinel_on_its_series() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+        monitor.flush_pushed();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A worker that left `Ready` and still pushes starts its report again,
+/// and the fence refuses its publish. That publish prunes nothing: the row
+/// from before the leave is the eviction's to remove, and the eviction
+/// writes the sentinel of the series with it.
+#[tokio::test]
+async fn a_refused_publish_leaves_the_old_row_to_the_eviction() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+
+        assert_eq!(published_rows(&monitor), vec![(0, 7)], "the old row");
+        monitor.flush_pending_evictions();
+
+        assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A queued eviction can be applied between a returned worker's first
+/// record and its publish. It evicts nothing and writes no sentinel: the
+/// worker is the registry's `Ready` worker again, and its series reads the
+/// record made since.
+#[tokio::test]
+async fn a_batch_ahead_of_a_returned_workers_publish_writes_no_sentinel() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        registry.transition_status(&id, WorkerStatus::Ready);
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A leave can be handled behind the worker's return. A worker that is the
+/// registry's `Ready` worker again keeps its loads: the sink hears no
+/// `forget`.
+#[tokio::test]
+async fn a_leave_handled_behind_the_workers_return_forgets_nothing() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    registry.transition_status(&id, WorkerStatus::Ready);
+
+    settle().await;
+
+    assert!(!told_to_forget(&sink, "http://w:1"));
+}
+
+/// A worker can leave `Ready`, come back ahead of the batch and leave
+/// again before it reports. The batch evicts no worker that is `Ready`
+/// again, so the row from before the first leave stands for the second
+/// eviction, which removes it and writes the sentinel of the series.
+#[tokio::test]
+async fn a_second_leave_ahead_of_any_report_still_writes_the_sentinel() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        registry.transition_status(&id, WorkerStatus::Ready);
+        monitor.flush_pending_evictions();
+        assert_eq!(published_rows(&monitor), vec![(0, 7)], "not evicted");
+
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+
+        assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A record that comes while its worker is not `Ready` is held: its rank
+/// is on file and its series keeps the sentinel. The mark outlives a flush
+/// that finds the worker not `Ready`. The flush behind the worker's next
+/// record once it is `Ready` writes every held rank's series with the
+/// report's row.
+#[tokio::test]
+async fn a_held_reports_series_is_written_with_its_row() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+        for rank in [0, 1] {
+            monitor.apply_pushed_load(&worker, rank, &pushed(4), Instant::now());
+        }
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::Ready);
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9), (1, 4)]);
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" 4"),
+        "{rendered}"
+    );
+}
+
+/// A worker can come back ahead of the batch with a held record on file.
+/// The eviction wrote the sentinel with the report it removed, and the
+/// flush that publishes the held record writes its series: the series
+/// does not keep the load from before the leave.
+#[tokio::test]
+async fn a_held_series_is_written_for_a_worker_back_ahead_of_the_batch() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+        registry.transition_status(&id, WorkerStatus::Ready);
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A worker can leave `Ready` ahead of its first publish. Its record wrote
+/// its series and no row stands for the batch to remove: the eviction
+/// writes the sentinel with the report it removes.
+#[tokio::test]
+async fn an_eviction_ahead_of_the_first_publish_writes_the_sentinel() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// The same for a worker replaced ahead of its first publish: the series
+/// of the URL read the sentinel until its successor reports, not the
+/// replaced worker's last load.
+#[tokio::test]
+async fn a_replaced_workers_eviction_ahead_of_its_first_publish_writes_the_sentinel() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        assert!(registry.replace(&id, ready_worker("http://w:1", "m")));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A replaced worker's row can still stand when its successor's first
+/// record has written the series. The batch removes the row and writes no
+/// sentinel: the series are its successor's, whose report stands at the
+/// URL.
+#[tokio::test]
+async fn a_replaced_workers_sentinel_leaves_its_successors_series() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+
+        assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A load series carries its worker's registered role. A successor
+/// registered in another role writes other series, so its report keeps no
+/// sentinel from its predecessor's: those end, and the successor's stand.
+#[tokio::test]
+async fn a_successor_registered_in_another_role_keeps_no_sentinel_from_its_predecessors_load_series(
+) {
+    let of_type = |worker_type: WorkerType| -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new("http://w:1")
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Http)
+            .model(ModelCard::new("m"))
+            .build();
+        worker.set_status(WorkerStatus::Ready);
+        Arc::new(worker)
+    };
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = of_type(WorkerType::Prefill);
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        let next = of_type(WorkerType::Decode);
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+        monitor.flush_pushed();
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    let running_under = |role: &str| {
+        let role = format!("role=\"{role}\"");
+        rendered
+            .lines()
+            .find(|l| l.starts_with("smg_engine_running_requests{") && l.contains(&role))
+            .unwrap_or_else(|| panic!("no running series with {role}:\n{rendered}"))
+    };
+    assert!(running_under("prefill").ends_with(" -1"), "{rendered}");
+    assert!(running_under("decode").ends_with(" 9"), "{rendered}");
+}
+
+/// A worker with no data-parallel width can report more than one rank.
+/// The eviction's sentinel covers every rank its report spanned.
+#[tokio::test]
+async fn the_evictions_sentinel_covers_every_rank_of_the_report() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        for rank in [0, 1] {
+            monitor.apply_pushed_load(&worker, rank, &pushed(7), Instant::now());
+        }
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// A leave's eviction can take the lock behind the worker's return. The
+/// report goes, and the series keep what the worker wrote: it is the
+/// registry's `Ready` worker again.
+#[tokio::test]
+async fn an_eviction_behind_the_workers_return_writes_no_sentinel() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" 7"), "{rendered}");
+}
+
+/// A successor inherits its predecessor's status. One that is not `Ready`
+/// has its records held and has written no series: its report on file
+/// does not keep its predecessor's sentinel away.
+#[tokio::test]
+async fn a_held_successor_does_not_keep_its_predecessors_sentinel_away() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        assert!(next.status() != WorkerStatus::Ready, "inherited");
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A successor's first record takes its predecessor's report off the
+/// file, and the predecessor's series go with it. The rank the record
+/// names reads its load, and a rank the successor has not reported reads
+/// the sentinel.
+#[tokio::test]
+async fn a_successors_first_record_clears_the_ranks_its_predecessor_reported() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// A polled worker's row can hold more ranks than its worker's width, as
+/// a pushed report can. The batch that removes the row sets every rank it
+/// held to the sentinel.
+#[tokio::test]
+async fn the_batchs_sentinel_covers_every_rank_of_the_row() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        let mut answer = answer_of(0, 7);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &worker, answer);
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// A tick's poll of the worker at `http://w:1`, by what it leaves: the
+/// file's lay, the answer's series and the published row.
+fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
+    let _ = monitor.apply_polled_load("http://w:1", &answer, Instant::now());
+    Metrics::record_engine_load(
+        "http://w:1",
+        worker.model_id(),
+        registered_engine_role(*worker.worker_type()),
+        &answer,
+    );
+    let reports = monitor.pushed_reports.lock();
+    monitor.publish_rows(
+        &reports,
+        &["http://w:1".to_string()],
+        vec![(Arc::clone(worker), Arc::new(answer))],
+    );
+}
+
+/// A polled row can go under its successor's ahead of its own worker's
+/// eviction: the successor's tick published first. The row ends there,
+/// with the ranks it held past its worker's width, which the eviction can
+/// no longer name. The series the successor writes stay.
+#[tokio::test]
+async fn a_row_that_went_under_its_successors_ends_with_its_far_ranks() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let mut answer = answer_of(0, 7);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 5,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &first, answer);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.publish_polled(
+            "m",
+            &["http://w:1".to_string()],
+            vec![(Arc::clone(&next), answer_of(0, 9), false)],
+        );
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)], "its row");
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 5).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// A tick can prune a row behind its worker's leave and ahead of the
+/// eviction's batch: the worker's answer came late and the fence refused
+/// it. The batch then finds no row at the URL. The row ends at that
+/// publish, and its series with it.
+#[tokio::test]
+async fn a_row_a_tick_prunes_behind_its_workers_leave_ends_its_series() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        polled(&monitor, &worker, answer_of(0, 7));
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.publish_polled("m", &["http://w:1".to_string()], Vec::new());
+
+        monitor.flush_pending_evictions();
+
+        assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A pushed successor's flush takes a polled predecessor's row the same
+/// way. The predecessor holds no file, so the successor's first record
+/// clears nothing of it, and its eviction finds the successor's row. The
+/// row ends at the flush with its far rank, and the rank the successor's
+/// file holds stays.
+#[tokio::test]
+async fn a_row_a_pushed_successor_takes_ends_with_its_far_ranks() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let mut answer = answer_of(0, 7);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 5,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &first, answer);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+        monitor.flush_pushed();
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)], "its row");
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 5).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// A successor can be polled ahead of its predecessor's eviction: the
+/// tick wrote its series and published its row. The predecessor's
+/// eviction writes no sentinel over them.
+#[tokio::test]
+async fn an_eviction_leaves_the_series_a_polled_successor_wrote() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)], "its row");
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// The same where the successor's stream then pushes. Its first record
+/// takes its predecessor's report off the file and clears no series: the
+/// tick wrote every rank's.
+#[tokio::test]
+async fn a_polled_successors_first_record_leaves_the_series_its_poll_wrote() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+        let mut answer = answer_of(0, 9);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &next, answer);
+
+        monitor.apply_pushed_load(&next, 0, &pushed(5), Instant::now());
+    });
+    assert!(running_series(&rendered).ends_with(" 5"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" 8"),
+        "{rendered}"
+    );
+}
+
+/// A polled worker has no report for its successor's record to replace,
+/// so nothing clears its series there. Its successor's held report is no
+/// live owner: the batch that removes the polled row writes the sentinel.
+#[tokio::test]
+async fn a_held_successor_does_not_keep_a_polled_predecessors_sentinel_away() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, answer_of(0, 7));
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// The guard is by rank. A polled successor's row keeps the ranks it
+/// holds, and a rank of the evicted worker's report that the row does not
+/// hold reads the sentinel.
+#[tokio::test]
+async fn an_eviction_clears_the_ranks_a_polled_successor_does_not_hold() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, replaced, next) = a_replaced_pusher_ahead_of_its_event();
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&replaced);
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// The same at the successor's first record: a rank of the replaced
+/// report that the successor's row does not hold reads the sentinel.
+#[tokio::test]
+async fn a_first_record_clears_the_ranks_its_workers_row_does_not_hold() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.apply_pushed_load(&next, 0, &pushed(5), Instant::now());
+    });
+    assert!(running_series(&rendered).ends_with(" 5"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// An answer of a pair engine in the prefill role that names rank 0 alone:
+/// `running` requests, and `queued` in its prefill queue.
+fn a_pair_answer(running: i32, queued: i32) -> WorkerLoadResponse {
+    let mut answer = answer_of(0, running);
+    answer.loads[0].disagg_mode = Some("prefill".to_string());
+    answer.loads[0].prefill_queue_reqs = Some(queued);
+    answer
+}
+
+/// The prefill-queue series of rank 0 of the worker at `http://w:1` under
+/// the prefill role, as rendered.
+fn prefill_queue_series(rendered: &str) -> &str {
+    rendered
+        .lines()
+        .find(|l| {
+            l.starts_with("smg_engine_pd_prefill_queue_reqs{")
+                && l.contains("http://w:1")
+                && l.contains("role=\"prefill\"")
+        })
+        .unwrap_or_else(|| panic!("no prefill-queue series:\n{rendered}"))
+}
+
+/// The running-requests series of rank 0 of the worker at `http://w:1`
+/// under `model`, as rendered.
+fn running_series_under<'a>(rendered: &'a str, model: &str) -> &'a str {
+    let model = format!("model=\"{model}\"");
+    rendered
+        .lines()
+        .find(|l| {
+            l.starts_with("smg_engine_running_requests{")
+                && l.contains("http://w:1")
+                && l.contains(&model)
+                && l.contains("dp_rank=\"0\"")
+        })
+        .unwrap_or_else(|| panic!("no running series with {model}:\n{rendered}"))
+}
+
+/// The guard is by model too. A successor that serves another model has
+/// written none of its predecessor's load series, and its row keeps no
+/// sentinel away from them. The pair series carry no model: the
+/// successor's stand, for its row holds the rank.
+#[tokio::test]
+async fn an_eviction_clears_the_series_of_a_model_its_successor_does_not_serve() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "a");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        let next = ready_worker("http://w:1", "b");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, a_pair_answer(9, 4));
+
+        monitor.evict_worker_loads(&first);
+    });
+    assert!(
+        running_series_under(&rendered, "a").ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        running_series_under(&rendered, "b").ends_with(" 9"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+}
+
+/// Past the cap of model labels two models share the label `other`, and
+/// so one series a worker and rank. A successor of one such model keeps
+/// the series it writes at the eviction of a predecessor of another: the
+/// guard matches a live writer's model by the series' label.
+#[tokio::test]
+async fn an_eviction_leaves_the_series_its_successor_shares_past_the_label_cap() {
+    use crate::metrics::labels_full;
+
+    let rendered = render_with_recorder(|| {
+        let _full = labels_full::hold_on_this_thread();
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "a-model-past-the-cap");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        let next = ready_worker("http://w:1", "another-model-past-the-cap");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&first);
+    });
+    assert!(
+        running_series_under(&rendered, "other").ends_with(" 9"),
+        "{rendered}"
+    );
+}
+
+/// The pair series are a family apart from the load series. An eviction
+/// with no live writer at the URL sets both to the sentinel.
+#[tokio::test]
+async fn an_eviction_clears_the_pair_series_with_the_load_series() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        polled(&monitor, &worker, a_pair_answer(9, 4));
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// An answer of a pair engine in the decode role that names rank 0 alone:
+/// `running` requests, and `queued` in its decode queue.
+fn a_decode_answer(running: i32, queued: i32) -> WorkerLoadResponse {
+    let mut answer = answer_of(0, running);
+    answer.loads[0].disagg_mode = Some("decode".to_string());
+    answer.loads[0].decode_queue_reqs = Some(queued);
+    answer
+}
+
+/// The series `name` of rank 0 of the worker at `http://w:1` whose labels
+/// hold `label`, as rendered.
+fn series_with<'a>(rendered: &'a str, name: &str, label: &str) -> &'a str {
+    rendered
+        .lines()
+        .find(|l| {
+            l.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('{'))
+                && l.contains("http://w:1")
+                && l.contains(label)
+                && l.contains("dp_rank=\"0\"")
+        })
+        .unwrap_or_else(|| panic!("no {name} series with {label}:\n{rendered}"))
+}
+
+/// The decode-queue series of rank 0 of the worker at `http://w:1` under
+/// the decode role, as rendered.
+fn decode_queue_series(rendered: &str) -> &str {
+    series_with(
+        rendered,
+        "smg_engine_pd_decode_queue_reqs",
+        "role=\"decode\"",
+    )
+}
+
+/// The pair series carry the engine's role. A polled successor that
+/// reports another role has written none of its predecessor's: its row
+/// keeps no sentinel away from them, and its own stand. The predecessor
+/// was polled too, so its row went under its successor's: its series end
+/// at the batch all the same.
+#[tokio::test]
+async fn an_eviction_clears_the_pair_series_of_a_role_its_successor_does_not_report() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, a_decode_answer(7, 5));
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, a_pair_answer(9, 4));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        decode_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// The same for a predecessor whose stream pushed: the eviction takes
+/// its report off the file and clears the role its polled successor does
+/// not report.
+#[tokio::test]
+async fn a_pushers_eviction_clears_the_role_its_polled_successor_does_not_report() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let record = pushed(7).disaggregation(3.5, 0.5, 0, 5, "decode");
+        monitor.apply_pushed_load(&first, 0, &record, Instant::now());
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, a_pair_answer(9, 4));
+
+        monitor.evict_worker_loads(&first);
+    });
+    assert!(
+        decode_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A successor with no pair section writes no pair series at all, and
+/// one that serves another model writes none of its predecessor's load
+/// series: the polled predecessor's read the sentinel.
+#[tokio::test]
+async fn an_eviction_clears_the_pair_series_a_successor_without_a_pair_section_leaves() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "a");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, a_pair_answer(7, 4));
+        let next = ready_worker("http://w:1", "b");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        running_series_under(&rendered, "a").ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        running_series_under(&rendered, "b").ends_with(" 9"),
+        "{rendered}"
+    );
+}
+
+/// A series is its writer's where its load carries the figure. A
+/// successor in the same role and under the same model that reports no
+/// transfer latency and no capacity has written neither series: both
+/// read the sentinel, and the series it does write stand.
+#[tokio::test]
+async fn an_eviction_clears_the_series_of_a_figure_its_successor_does_not_report() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let mut answer = a_pair_answer(7, 4);
+        answer.loads[0].kv_transfer_latency_ms = Some(3.0);
+        answer.loads[0].max_total_num_tokens = 1000;
+        polled(&monitor, &first, answer);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, a_pair_answer(9, 6));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    let latency = series_with(
+        &rendered,
+        "smg_engine_pd_kv_transfer_latency_ms",
+        "role=\"prefill\"",
+    );
+    assert!(latency.ends_with(" -1"), "{rendered}");
+    let capacity = series_with(&rendered, "smg_engine_kv_capacity_tokens", "model=\"m\"");
+    assert!(capacity.ends_with(" -1"), "{rendered}");
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 6"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// The guard reads a successor's report as it reads its row. A polled
+/// predecessor in the decode role is replaced by a worker whose stream
+/// pushes in the prefill role, and the batch runs ahead of the
+/// successor's row: the decode series read the sentinel and the
+/// successor's stand.
+#[tokio::test]
+async fn a_pushing_successor_of_another_role_keeps_no_sentinel_from_its_predecessors() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, a_decode_answer(7, 5));
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        let record = pushed(9).disaggregation(3.5, 0.5, 4, 0, "prefill");
+        monitor.apply_pushed_load(&next, 0, &record, Instant::now());
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        decode_queue_series(&rendered).ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A row can name a rank more than once: a rollup's entries keep their
+/// downstream workers' ranks, and a poll writes every one. The guard
+/// reads each entry of the rank: a successor's prefill entry and its
+/// decode entry both keep their series, and the capacity that only the
+/// second carries stands.
+#[tokio::test]
+async fn an_eviction_leaves_every_series_of_a_rank_its_successors_row_names_twice() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, answer_of(0, 7));
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        let mut answer = a_pair_answer(9, 4);
+        answer.loads.extend(a_decode_answer(8, 5).loads);
+        answer.loads[1].max_total_num_tokens = 1000;
+        polled(&monitor, &next, answer);
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(decode_queue_series(&rendered).ends_with(" 5"), "{rendered}");
+    let capacity = series_with(&rendered, "smg_engine_kv_capacity_tokens", "model=\"m\"");
+    assert!(capacity.ends_with(" 1000"), "{rendered}");
+}
+
+/// A rollup's row names a rank once for each downstream worker that holds
+/// it. The sentinel walks a rank once, however often the ended row names
+/// it: a rank past the width is asked about as often as the width's own.
+#[test]
+fn the_sentinel_walks_a_rank_once_however_often_the_ended_row_names_it() {
+    let worker = ready_worker("http://w:1", "m");
+    let ended = WorkerLoadResponse {
+        loads: [0, 1, 2, 2, 1, 2]
+            .into_iter()
+            .map(|dp_rank| SchedulerLoadSnapshot {
+                dp_rank,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let asked = std::cell::RefCell::new(Vec::new());
+    write_sentinel(&worker, Some(&ended), |_, rank, _| {
+        asked.borrow_mut().push(rank);
+        true
+    });
+    let asked = asked.into_inner();
+    let asks = |rank: i32| asked.iter().filter(|&&seen| seen == rank).count();
+    assert!(asks(0) > 0, "the width's own rank is asked about");
+    assert_eq!(asks(1), asks(0), "rank 1, named twice: {asked:?}");
+    assert_eq!(asks(2), asks(0), "rank 2, named three times: {asked:?}");
+}
+
+/// A poll's series and its rows go out under one hold of the lock of the
+/// reports, where a record and the sentinel write theirs: nothing runs
+/// between a tick's series and its row.
+#[test]
+fn a_polls_rows_wait_for_the_lock_of_the_reports() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let reports = monitor.pushed_reports.lock();
+    let tick = std::thread::spawn({
+        let monitor = Arc::clone(&monitor);
+        move || {
+            monitor.publish_polled(
+                "m",
+                &["http://w:1".to_string()],
+                vec![(worker, answer_of(0, 9), false)],
+            );
+        }
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        monitor.load_state.snapshot().get("http://w:1").is_none(),
+        "no row while the lock is held"
+    );
+    drop(reports);
+    tick.join().unwrap();
+    assert_eq!(
+        rows(monitor.load_state.snapshot().get("http://w:1").unwrap()),
+        vec![(0, 9)]
+    );
+}
+
+/// A poll's answer for a worker that left during the fetch writes no
+/// series: the publish's fence holds them back with the row, and the
+/// sentinel of the leave's eviction stands.
+#[test]
+fn a_polls_answer_for_a_worker_that_left_writes_no_series() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+
+    let rendered = render_with_recorder(|| {
+        monitor.publish_polled(
+            "m",
+            &["http://w:1".to_string()],
+            vec![(worker, answer_of(0, 9), false)],
+        );
+    });
+
+    assert!(
+        !rendered.contains("smg_engine_running_requests{"),
+        "{rendered}"
+    );
+    assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+}
+
+/// A report can hold a rank far past its worker's width. The eviction's
+/// sentinel covers that rank by itself: no series is made for a rank
+/// between, and the cost does not grow with the rank.
+#[tokio::test]
+async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        for rank in [0, 1_000] {
+            monitor.apply_pushed_load(&worker, rank, &pushed(7), Instant::now());
+        }
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+    });
+    assert!(
+        running_series_of(&rendered, 1_000).ends_with(" -1"),
+        "the far rank"
+    );
+    assert!(!rendered.contains("dp_rank=\"999\""), "a rank between");
+}
+
+/// A report held through a flush: the worker at `http://w:1` reported 7,
+/// left `Ready`, reported 9 while it was not `Ready`, and the window's
+/// flush came ahead of its return. `applied` says whether the eviction's
+/// batch was applied ahead of the held record.
+fn a_report_held_through_a_flush(applied: bool) -> Arc<WorkerMonitor> {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+    monitor.flush_pushed();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    monitor.evict_worker_loads(&worker);
+    if applied {
+        monitor.flush_pending_evictions();
+    }
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    monitor.flush_pushed();
+    registry.transition_status(&id, WorkerStatus::Ready);
+    monitor
+}
+
+/// A report held through a flush stays queued. The first flush that finds
+/// its worker `Ready` publishes it and writes its series, with no record
+/// since the return and whether or not the eviction's batch was applied.
+#[tokio::test]
+async fn a_report_held_through_a_flush_is_published_once_its_worker_is_ready() {
+    for applied in [true, false] {
+        let rendered = render_with_recorder(|| {
+            let monitor = a_report_held_through_a_flush(applied);
+
+            monitor.flush_pending_evictions();
+
+            assert_eq!(
+                published_rows(&monitor),
+                vec![(0, 9)],
+                "the batch applied first: {applied}"
+            );
+        });
+        assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    }
+}
+
+/// A worker's return wakes the flusher: a report held through a flush is
+/// published a window later, with no record since the return.
+#[tokio::test]
+async fn a_workers_return_publishes_the_report_held_through_a_flush() {
+    let (registry, monitor, _sink, id) = recording_with_a_worker();
+    let worker = registry.get(&id).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    assert!(
+        within_two_seconds(|| !monitor.pushed_reports.lock().contains_key("http://w:1")).await,
+        "the leave's eviction"
+    );
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    settle().await;
+    assert!(
+        monitor.load_state.snapshot().get("http://w:1").is_none(),
+        "held"
+    );
+
+    registry.transition_status(&id, WorkerStatus::Ready);
+
+    assert!(
+        within_two_seconds(|| monitor.load_state.snapshot().get("http://w:1").is_some()).await,
+        "published at the return"
+    );
+    assert_eq!(
+        rows(monitor.load_state.snapshot().get("http://w:1").unwrap()),
+        vec![(0, 9)]
+    );
+}
+
+/// An eviction takes its worker out of the flush's queue with the report:
+/// the queue keeps no worker that is gone, held report or not.
+#[tokio::test]
+async fn an_eviction_takes_a_held_report_out_of_the_queue() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    monitor.flush_pushed();
+    let gone = registry.remove(&id).unwrap();
+    drop(worker);
+
+    monitor.evict_worker_loads(&gone);
+    monitor.flush_pending_evictions();
+
+    assert_eq!(monitor.pending_pushed_len(), 0);
+    assert!(!held(gone), "nothing holds the worker that is gone");
+}
+
+/// A pusher that left `Ready` while registry events were lost stays
+/// registered, so its engine series would read its last load as live. The
+/// reset's eviction writes the series' sentinel, as its event's would.
+#[test]
+fn a_reset_writes_the_sentinel_of_a_lost_pushers_engine_series() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    let rendered = render_with_recorder(|| {
+        runtime.block_on(async {
+            monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+            monitor.flush_pushed();
+            registry.transition_status(&id, WorkerStatus::NotReady);
+            monitor.stop_all_groups();
+        });
+    });
+    let running = rendered
+        .lines()
+        .find(|l| l.starts_with("smg_engine_running_requests{") && l.contains("grpc://w1:9000"))
+        .unwrap_or_else(|| panic!("no running series:\n{rendered}"));
+    assert!(running.ends_with(" -1"), "{rendered}");
+}
+
+/// At a reset the collector says `forget` for a pusher an event it lost
+/// would have evicted, under the lock of the reports, and then the reset.
+#[tokio::test]
+async fn a_reset_says_forget_for_a_lost_pusher_and_then_the_reset() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+    registry.remove(&id);
+    sink.said.lock().clear();
+
+    monitor.stop_all_groups();
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![Said::Forget("http://w:1".to_string(), true), Said::Reset]
+    );
 }

@@ -1,14 +1,18 @@
 //! What a decision allocates, pinned at zero: once a first decision has sized
 //! the per-thread scratch, a decision of every preset over a reporting fleet
-//! of 64 and of 512 rows, a decision over rows with a credit held in the
-//! least-load tally, and a pair decision allocate nothing (design 4.4: a
-//! scorer or picker allocates nothing per decision; the host keeps one scratch
-//! per thread so the framework allocates nothing after the first). The
+//! of 64 and of 512 rows, a least-cost decision over mixed reports and sends, a
+//! decision over rows with a credit held in the least-load tally, a decision
+//! over a pool doubted on every row, and a pair decision allocate nothing
+//! (design 4.4: a scorer or picker allocates nothing per decision; the host
+//! keeps one scratch per thread so the framework allocates nothing after the
+//! first). The
 //! store's pins stand beside them: a build from the store allocates nothing
 //! after the first, and two membership writes are held to each other, a
 //! write that moves an offer to one that moves none and a registration into
-//! 512 workers to one into 8. A separate executable, so it can declare the
-//! counting allocator the pins need.
+//! 512 workers to one into 8. A host in process is pinned too: a request
+//! held from its decision to its completion allocates nothing after the
+//! first ones. A separate executable, so it can declare the counting
+//! allocator the pins need.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
@@ -21,13 +25,15 @@ use std::{
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
+    engine::door::{Door, Request},
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AffinityFacts, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
-    NamedAffinity, NamedHolder, PairPools, PolicySpec, PoolFacts, RequestFacts, Role, Scratch,
-    Side, SignalSource, Target, WireModes, WorkerId, PRESETS,
+    tracking::handle::Handle,
+    AffinityFacts, AppliedSpec, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
+    NamedAffinity, NamedHolder, Outcome, PairPools, PolicySpec, PoolFacts, RequestFacts, Role,
+    Scratch, Side, SignalSource, Target, TransportClass, WireModes, WorkerId, PRESETS,
 };
 
 #[global_allocator]
@@ -112,6 +118,101 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
     }
 }
 
+#[test]
+fn a_least_cost_decision_after_the_first_allocates_nothing() {
+    let profile = serde_yaml::from_str(
+        "filter: [healthy]\nscore: [{least-cost: {terms: {load.running: 7, load.queued: 13, sent.requests: 3, sent.tokens: 1}, unreported: {over-least: {request_cost: 11}}}}]\npick: best",
+    )
+    .expect("a least-cost profile");
+    let engine = PolicySpec::new([("p".to_string(), profile)].into())
+        .validate()
+        .expect("the profile validates");
+    let n = 512;
+    let mut view = fleet(n);
+    for (i, row) in (0u32..).zip(&mut view) {
+        row.health.healthy = true;
+        if i.is_multiple_of(3) {
+            row.load = None;
+        }
+    }
+    // Every row holds a send later than its report.
+    let lease = Lease {
+        issued_micros: 1_000_000,
+        tokens: 512,
+        ..Lease::default()
+    };
+    for row in &view {
+        let target = Target {
+            position: row.position,
+            id: row.id,
+            dp_rank: row.dp_rank,
+            pair: None,
+        };
+        engine.on_dispatched(&lease, &target, Side::Single, 0);
+    }
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let pool = pool(n);
+    assert!(engine
+        .decide(&facts(1), &pool, &view, &cx, &mut scratch)
+        .pick()
+        .is_some());
+    let (decision, allocations) =
+        allocations_during(|| engine.decide(&facts(2), &pool, &view, &cx, &mut scratch));
+    assert!(decision.pick().is_some());
+    assert_eq!(allocations, 0);
+}
+
+/// `has-room` by a rule reads every row's report and its sends. A decision
+/// after the first allocates nothing at 512 rows, under a picker that
+/// reads the whole pool and under one that draws first.
+#[test]
+fn a_decision_under_a_has_room_rule_allocates_nothing_after_the_first() {
+    for picker in ["round-robin", "random"] {
+        let profile = serde_yaml::from_str(&format!(
+            "filter: [healthy, {{has-room: {{used: {{load.running: 1, load.queued: 1, request.prompt_tokens: 1, sent.tokens: 1}}, capacity: 2000, headroom: 0.05}}}}]\npick: {picker}",
+        ))
+        .expect("a profile with the rule");
+        let engine = PolicySpec::new([("p".to_string(), profile)].into())
+            .validate()
+            .expect("the profile validates");
+        let n = 512;
+        let mut view = fleet(n);
+        for (i, row) in (0u32..).zip(&mut view) {
+            row.health.healthy = true;
+            if i.is_multiple_of(3) {
+                row.load = None;
+            }
+        }
+        // Every row holds a send later than its report.
+        let lease = Lease {
+            issued_micros: 1_000_000,
+            tokens: 512,
+            ..Lease::default()
+        };
+        for row in &view {
+            let target = Target {
+                position: row.position,
+                id: row.id,
+                dp_rank: row.dp_rank,
+                pair: None,
+            };
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+        }
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let pool = pool(n);
+        assert!(engine
+            .decide(&facts(1), &pool, &view, &cx, &mut scratch)
+            .pick()
+            .is_some());
+        let (decision, allocations) =
+            allocations_during(|| engine.decide(&facts(2), &pool, &view, &cx, &mut scratch));
+        assert!(decision.pick().is_some());
+        assert_eq!(allocations, 0, "{picker}");
+    }
+}
+
 /// A decision asked by rank allocates nothing after the thread's first of
 /// its size, whatever that first was: by rank where no row holds the
 /// request's prefix, a draw for a request that names rows, or the whole
@@ -124,16 +225,16 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
 /// keeps of the rows in front stands in buffers every first decision
 /// sized: their sums in the stage's, their list in the soft filter's
 /// backup. The preset is read with its soft filters and without them. A
-/// profile without one takes the list's room at its first decision by
-/// rank: behind a whole pass that decision allocates once, and the next
-/// allocates nothing.
+/// whole pass by the profile's one test of a row asks for every buffer's
+/// room, as a draw does: the decision by rank behind it allocates
+/// nothing, with a soft filter or without.
 #[test]
 fn a_decision_by_rank_after_the_first_allocates_nothing() {
     let mut bare = PolicySpec::preset("cache_aware").expect("a preset");
     for profile in bare.profiles.values_mut() {
         profile
             .filter
-            .retain(|name| name != "not-tried" && name != "has-room");
+            .retain(|entry| !matches!(entry.name(), "not-tried" | "has-room"));
     }
     let engines = [
         (true, engine_of("cache_aware")),
@@ -223,12 +324,8 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
                 targets, fastest,
                 "soft {soft} at {n}, order {order}: the fastest holders, in their order"
             );
-            // A whole pass sizes no list of the rows in front: without a
-            // soft filter the first decision by rank takes that room.
-            let lists_late = !soft && !*reported;
             assert_eq!(
-                allocations,
-                usize::from(lists_late),
+                allocations, 0,
                 "soft {soft} at {n}, order {order}: a decision by rank allocated"
             );
             let (_, again) =
@@ -271,6 +368,31 @@ fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
         allocations_during(|| engine.decide(&next, &pool(64), &view, &cx, &mut scratch));
     assert!(decision.pick().is_some());
     assert_eq!(allocations, 0, "the decision after a fallback allocated");
+}
+
+#[test]
+fn a_decision_over_a_doubted_pool_allocates_nothing_after_the_first() {
+    // Every ready row doubted: the pass that lifts the liveness veto reads
+    // the rows with no doubt from one buffer of the scratch. The first such
+    // decision sizes it and the next finds it sized.
+    let engine = engine_of("least_load");
+    let mut view = fleet(64);
+    for row in &mut view {
+        row.health.stalled = true;
+    }
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    engine
+        .decide(&facts(1), &pool(64), &view, &cx, &mut scratch)
+        .pick()
+        .expect("the doubted fleet routes");
+    let (decision, allocations) =
+        allocations_during(|| engine.decide(&facts(2), &pool(64), &view, &cx, &mut scratch));
+    assert!(decision.pick().is_some());
+    assert_eq!(
+        allocations, 0,
+        "the second decision over a doubted pool allocated"
+    );
 }
 
 #[test]
@@ -501,6 +623,7 @@ fn a_build_from_the_store_after_the_first_allocates_nothing() {
                 now: opened + Duration::from_secs(1),
                 pinned: None,
                 affinity,
+                signal_cells: false,
             };
             // The first build sizes the host's buffers.
             store
@@ -558,6 +681,7 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
         now: Instant::now(),
         pinned: None,
         affinity: true,
+        signal_cells: false,
     };
     let mut out = PairBuffers::default();
     // The first build sizes the host's buffers: the rows, the columns and
@@ -722,6 +846,7 @@ fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
                 now: opened + Duration::from_secs(1),
                 pinned: Some(ids[0]),
                 affinity,
+                signal_cells: false,
             };
             // The first view sizes the host's buffers: the mask and the
             // column.
@@ -745,5 +870,52 @@ fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
             );
         }
         assert!(out.candidates.is_empty(), "a lent view copies no row");
+    }
+}
+
+/// A request a host in process holds from its decision to its completion
+/// allocates nothing once the first requests have sized the door's
+/// buffers and the leases' file: the decision with its lease, the take,
+/// the dispatch and the completion, each report applied where it is
+/// handed.
+#[test]
+fn a_request_held_from_its_decision_to_its_completion_allocates_nothing() {
+    for n in [8usize, 64] {
+        let (store, _, opened) = store_of(n);
+        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).expect("the preset validates");
+        store.apply(spec).expect("the first generation");
+        let door = Door::new(Arc::new(store));
+        let now = opened + Duration::from_secs(1);
+        let request = Request {
+            id: b"held",
+            facts: RequestFacts {
+                model: "m",
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        };
+        let serve = || {
+            let decided = Handle::decide(&door, GatewayId(1), &request, now);
+            let mut handle = decided.expect("a decision");
+            let target = handle.take(0).expect("a pick over the pool");
+            handle.dispatched(now);
+            let outcome = Outcome {
+                side: Side::Single,
+                served: target.id,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 8,
+                tokens_out: 8,
+                duration_micros: 1_000,
+            };
+            handle.completed(&outcome, now);
+        };
+        // A rotation's first round names every member once.
+        (0..2 * n).for_each(|_| serve());
+        let ((), allocations) = allocations_during(|| (0..256).for_each(|_| serve()));
+        assert_eq!(allocations, 0, "{n} members: a held request allocated");
     }
 }

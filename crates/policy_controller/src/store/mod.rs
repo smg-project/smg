@@ -13,7 +13,7 @@
 //! | trait | who calls | how often |
 //! |---|---|---|
 //! | [`WorkersStore`] | discovery and the registration handshake, the control scope's register, patch and deregister calls | per membership change; a rollout of 512 workers is under one change per second |
-//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, every gateway's vetoes and completed dispatches | per probe; two frames per request |
+//! | [`HealthSink`] | the prober (one probe per worker per interval, 128 in flight), the connect signal, the leader's own doubt of a worker, every gateway's vetoes and completed dispatches | per probe; two frames per request |
 //! | [`LoadSink`] | the subscription task per record, the poll per engine per tick, the scrape per interval, a relay per frame | up to ten records per rank per second busy, one per second idle |
 //! | [`KvEventSink`] | the subscription task per batch, a relay per frame | one batch per scheduler step that moved blocks |
 //! | [`ReservationStore`] | a commit (a prefill slot, a decode room), a lease's end | two per pair dispatch |
@@ -63,7 +63,7 @@
 //! generation the store holds, which [`MemoryStore::apply`] alone replaces:
 //! a decision reads its rows and its engine in one load.
 //!
-//! [`LoadRow`]: crate::view::LoadRow
+//! [`LoadRow`]: crate::engine::view::LoadRow
 
 pub mod encoding;
 pub mod health;
@@ -72,10 +72,12 @@ pub mod journal;
 pub mod kv_events;
 pub mod leases;
 pub mod loads;
+pub mod membership;
 pub mod memory;
 pub mod pairing;
 pub mod reservations;
 pub mod sessions;
+pub mod signals;
 pub mod workers;
 pub mod world;
 
@@ -83,24 +85,32 @@ pub mod world;
 mod tests;
 
 pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
-pub use health::{HealthSink, HealthWrite, VetoWrite};
+pub use health::{HealthSink, HealthWrite, LeaderBits, VetoWrite};
 pub use index::{
-    ContentHash, KvEvent, LaneCounts, Named, SequenceHash, StoredBlock, INDEX_WORKERS,
+    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, Named, SequenceHash,
+    StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
-pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said};
+pub use leases::{
+    DecodeMark, DecodeRefused, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState,
+    LeasesStore, Picked, Said, Sides,
+};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts};
+pub use membership::{Laid, NotMaker};
+pub(crate) use memory::DecodeIssue;
+pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
+pub use signals::{SignalSink, Taken};
 pub use workers::{
-    identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
-    Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    identity, identity_of, token, HealthPolicy, Maker, MembershipChange, MembershipTail, Overload,
+    ProviderKey, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+    WorkersStore,
 };
 pub use world::{
     Ask, Built, EncodePairBuffers, Naming, OutsideLists, PairBuffers, PoolView, StaleGeneration,

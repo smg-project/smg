@@ -14,6 +14,13 @@ use openai_protocol::{
         WorkerUpdateRequest,
     },
 };
+use smg_worker::{
+    connection::engine::EngineConnection,
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    jobs::WorkerJobAsker,
+    registry::WorkerId,
+};
 use tracing_test::traced_test;
 use wfaas::WorkflowInstanceId;
 
@@ -28,12 +35,6 @@ use crate::{
         },
     },
     server::http_client,
-    worker::{
-        connection::engine::EngineConnection,
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        registry::WorkerId,
-        BasicWorker, ConnectionMode, RuntimeType,
-    },
     workflow::steps::local::test_support::labels_of,
 };
 
@@ -48,7 +49,8 @@ fn make_app_context_with(
     tool_parser_factory: Option<tool_parser::ParserFactory>,
 ) -> Arc<AppContext> {
     use crate::{
-        app_context::testing::app_context_for_tests, config::RouterConfig, worker::WorkerRegistry,
+        app_context::testing::app_context_for_tests, config::RouterConfig,
+        routers::common::snapshot::WorkerRegistry,
     };
 
     let router_config = RouterConfig::builder()
@@ -82,6 +84,7 @@ fn make_context(
 ) -> WorkflowContext<WorkerUpdateWorkflowData> {
     let snapshot = snapshot_of(&app_context, std::slice::from_ref(&worker));
     let data = WorkerUpdateWorkflowData {
+        asker: WorkerJobAsker::Api,
         config: WorkerUpdateRequest {
             priority: None,
             cost: None,
@@ -142,6 +145,7 @@ fn make_refresh_context(
         worker.revision(),
     )];
     let data = WorkerUpdateWorkflowData {
+        asker: WorkerJobAsker::Health,
         config: WorkerUpdateRequest {
             priority: None,
             cost: None,
@@ -505,7 +509,7 @@ async fn a_label_set_by_an_update_stays_the_operators_through_a_refresh() {
 async fn a_rank_workers_window_follows_the_engine_in_rank_space() {
     // The engine runs attention DP over 8 ranks with a window of 256: a
     // rank worker carries the share, 32, and records it in rank space.
-    let discovered = labels_for_rank(
+    let discovered = smg_worker::workflow::labels_for_rank(
         &labels_of(&[("max_running_requests", "256"), ("attn_dp_size", "8")]),
         Some((0, 8)),
         &HashMap::new(),
@@ -1343,19 +1347,25 @@ async fn a_worker_over_the_cap_takes_updates_that_add_no_key() {
 /// ranks refuses the merge, the first keeps its labels too.
 #[tokio::test]
 async fn a_refused_rank_leaves_no_partial_update_behind() {
+    // Each rank is built as a registration builds it: its address beside
+    // the base it is built from.
     let first: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("http://rank:8000@0")
+        BasicWorkerBuilder::new("http://rank:8000")
+            .dp_config(0, 2)
             .status(WorkerStatus::Ready)
             .label("k0", "v")
             .build(),
     );
-    let mut builder = BasicWorkerBuilder::new("http://rank:8000@1").status(WorkerStatus::Ready);
+    let mut builder = BasicWorkerBuilder::new("http://rank:8000")
+        .dp_config(1, 2)
+        .status(WorkerStatus::Ready);
     for i in 0..MAX_WORKER_LABELS {
         builder = builder.label(format!("k{i}"), "v");
     }
     let second: Arc<dyn Worker> = Arc::new(builder.build());
     let app_ctx = make_app_context(&[Arc::clone(&first), Arc::clone(&second)]);
     let data = WorkerUpdateWorkflowData {
+        asker: WorkerJobAsker::Api,
         config: WorkerUpdateRequest {
             priority: None,
             cost: None,
@@ -1409,7 +1419,7 @@ fn registered_worker(
     labels: HashMap<String, String>,
     discovered_labels: HashMap<String, String>,
 ) -> Arc<dyn Worker> {
-    use super::super::create_worker::{build_model_card, resolve_model_id};
+    use smg_worker::workflow::{build_model_card, resolve_model_id};
     let model_id = resolve_model_id(&spec, &labels).to_string();
     let card = build_model_card(&model_id, &spec, &labels, &HashMap::new());
     Arc::new(
@@ -1742,18 +1752,20 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
 #[tokio::test]
 async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
     use openai_protocol::worker::WorkerModels;
+    use smg_worker::workflow::{CreateLocalWorkerStep, WorkerKind};
 
-    use crate::workflow::{
-        data::{WorkerKind, WorkerRegistrationMode},
-        steps::{create_worker_workflow_data, local::CreateLocalWorkerStep},
-    };
+    use crate::workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data};
 
     let app_ctx = make_app_context(&[]);
     let mut spec = WorkerSpec::new("http://worker:8000");
     spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
     spec.labels = labels_of(&[("kv_role", "")]);
-    let mut data =
-        create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, Arc::clone(&app_ctx));
+    let mut data = create_worker_workflow_data(
+        spec,
+        WorkerRegistrationMode::Upsert,
+        Arc::clone(&app_ctx),
+        WorkerJobAsker::Api,
+    );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(ConnectionMode::Http);
     data.http_client_handle = Some(Arc::new(http_client()));

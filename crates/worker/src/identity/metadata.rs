@@ -33,10 +33,12 @@ pub struct WorkerMetadata {
     /// The URL as a request's success path shows it: the routed-worker
     /// response header, the cache-trace header and the request-sent event.
     /// The registered URL byte for byte when it has no userinfo, query or
-    /// fragment; otherwise `endpoint::Endpoint::redacted_str`'s form (see
-    /// `Endpoint::redacted_url`). Computed once at construction (the worker
-    /// builder, the Go binding's worker); nothing on a request path parses
-    /// the URL.
+    /// fragment; otherwise its redacted form. The spec's own rule writes it
+    /// (`WorkerSpec::redacted_url`): a rank is read out of the address its
+    /// spec ranks alone. In any other, an `@` and digits at the end are a
+    /// userinfo before a host, which is masked, or bytes of an IPC path.
+    /// Computed once at construction (the worker builder, the Go binding's
+    /// worker); nothing on a request path parses the URL.
     pub redacted_url: String,
     /// Resolved health check config (router defaults + per-worker overrides).
     /// This is the concrete config used at runtime; `spec.health` only stores
@@ -172,8 +174,9 @@ impl WorkerMetadata {
     /// socket set, N engines dialing in (the connector balances across them
     /// and drives the wave protocol for lockstep groups). `None` for a worker
     /// given no count, which awaits as many engines as the first to dial
-    /// declares (one, from an engine that declares none). Rank-expanded DP
-    /// workers never reach ZMQ connect (rejected at registration).
+    /// declares (one, from an engine that declares none). The rank workers of
+    /// a group expanded under dp-aware routing carry the group's `dp_size`
+    /// too, and await the same engines over the connection they share.
     pub fn zmq_engine_count(&self) -> Option<usize> {
         self.spec.dp_size.map(|count| count.max(1))
     }

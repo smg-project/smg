@@ -3,8 +3,8 @@
 
 use super::{facts, member, MODEL};
 use crate::{
+    engine::view::{Role, Session, WorkerId},
     store::{MemoryStore, WorkerFacts, WorkersStore},
-    view::{Role, Session, WorkerId},
     SessionVerdict,
 };
 
@@ -13,11 +13,12 @@ fn revision(store: &MemoryStore, id: WorkerId) -> u64 {
     WorkersStore::get(store, id).expect("the row").revision
 }
 
-/// A worker that leaves by the store's doors leaves the engine's session
-/// table with it: a removal drops the id's pins, and so does the
-/// replacement of its incarnation.
+/// A worker that leaves by the store's doors keeps its pins in the
+/// engine's session table, and the worker it was takes them back under
+/// its new id: at a registration of its key again, and at a new life in
+/// place. Another worker under the key takes none.
 #[test]
-fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
+fn a_worker_that_leaves_by_the_store_s_doors_takes_its_engine_pins_back() {
     let store = MemoryStore::new();
     let removed = member(&store, "http://a:8000");
     let replaced = member(&store, "http://b:8000");
@@ -27,6 +28,7 @@ fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
             table.pins(Session::from_raw(key))
         })
     };
+    let first = |key: u64| pins(key).map(|pins| pins[0]);
     store.deciding(|world| {
         let table = world.spec().engine().sessions();
         table.dispatched(Session::from_raw(1), SessionVerdict::Pinned, removed);
@@ -36,12 +38,21 @@ fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
     store
         .remove(removed, revision(&store, removed))
         .expect("removed");
-    assert!(pins(1).is_none(), "the removed worker kept its pin");
-    store.upsert(WorkerFacts {
-        incarnation: 2,
-        ..facts("http://b:8000", Role::Single, &[MODEL])
-    });
-    assert!(pins(2).is_none(), "the replaced incarnation kept its pin");
+    assert_eq!(first(1), Some(removed), "the pin stands through the leave");
+    let life = |key: &str, incarnation: u64, role: Role| {
+        let registered = store.upsert(WorkerFacts {
+            incarnation,
+            ..facts(key, role, &[MODEL])
+        });
+        registered.id()
+    };
+    let again = life("http://a:8000", 2, Role::Single);
+    assert_ne!(again, removed);
+    assert_eq!(first(1), Some(again), "the pin follows the key");
+    let next = life("http://b:8000", 2, Role::Single);
+    assert_eq!(first(2), Some(next), "a new life of the same worker");
+    life("http://b:8000", 3, Role::Decode);
+    assert_eq!(pins(2), None, "another worker under the key");
 }
 
 /// The cases that hold a stage of their own: a generation over a host's
@@ -49,25 +60,30 @@ fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
 #[cfg(feature = "controller")]
 mod held {
     use std::{
-        sync::{Arc, Weak},
-        time::Instant,
+        sync::{mpsc, Arc, Weak},
+        thread,
+        time::{Duration, Instant},
     };
 
     use parking_lot::Mutex;
 
     use super::{
-        super::{ask, facts, member, status, MODEL},
+        super::{ask, facts, member, status, ASKER, MODEL},
         revision,
     };
     use crate::{
-        framework::{Scorer, TieBand},
-        lease::{Lifecycle, Membership},
-        spec::{BindingSpec, Needs},
-        store::{
-            world::ViewBuffers, Kinds, LoadSink, MembershipChange, MemoryStore, Position,
-            WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+        document::spec::{BindingSpec, Needs},
+        engine::{
+            framework::{Scorer, TieBand},
+            view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
         },
-        view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
+        store::{
+            tests::{booking, in_flight},
+            world::ViewBuffers,
+            Kinds, LeasesStore, LoadSink, MembershipChange, MemoryStore, Position, WorkerFacts,
+            WorkerPatch, WorkerStatus, WorkersStore,
+        },
+        tracking::lease::{Lifecycle, Membership},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
     };
 
@@ -83,6 +99,9 @@ mod held {
         ring: Arc<ConsistentHash>,
         told: Told,
         store: Weak<MemoryStore>,
+        /// What the case does with a worker the stage is told joined, from
+        /// inside the membership call.
+        joined: fn(&MemoryStore, WorkerId),
     }
 
     impl Lifecycle for HeldRing {
@@ -97,6 +116,9 @@ mod held {
                     "told outside the membership lock"
                 );
                 assert!(store.load_lock_free(), "told under the load lock");
+                if let Membership::Added(id) = change {
+                    (self.joined)(store, *id);
+                }
             }
             let shown = store.map_or(0, |store| store.world().epoch());
             self.told.lock().push((shown, format!("{change:?}")));
@@ -143,6 +165,18 @@ mod held {
         ring: &Arc<ConsistentHash>,
         told: &Told,
     ) -> AppliedSpec {
+        generation_with(number, store, ring, told, |_, _| {})
+    }
+
+    /// [`generation`] with a stage that hands `joined` each worker it is
+    /// told joined, from inside the membership call.
+    fn generation_with(
+        number: u64,
+        store: &Arc<MemoryStore>,
+        ring: &Arc<ConsistentHash>,
+        told: &Told,
+        joined: fn(&MemoryStore, WorkerId),
+    ) -> AppliedSpec {
         let (ring, told, store) = (Arc::clone(ring), Arc::clone(told), Arc::downgrade(store));
         let mut catalog = Catalog::builtin();
         catalog
@@ -151,6 +185,7 @@ mod held {
                     ring: Arc::clone(&ring),
                     told: Arc::clone(&told),
                     store: Weak::clone(&store),
+                    joined,
                 })
             })
             .expect("a free name");
@@ -164,7 +199,8 @@ mod held {
             ..BindingSpec::default()
         }];
         let digest = document.digest().expect("a digest");
-        AppliedSpec::validate_digested(&document, digest, &catalog).expect("the document validates")
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the document validates")
     }
 
     /// The worker a decision keyed `key` goes to at this instant; its view
@@ -451,6 +487,41 @@ mod held {
         let after = owners(&mut out);
         assert_eq!((out.candidates.len(), ring.ring().len()), (5, 5));
         assert!(after.contains(&fifth), "no key of 64 went to the fifth");
+    }
+
+    /// How long a case waits for a write that its stage's own call may hold.
+    const ROOM: Duration = Duration::from_secs(10);
+
+    /// A stage may file a lease on a worker from the call that tells it the
+    /// worker joined. The write filed the worker's slot, and let the slot
+    /// table's lock go, ahead of that call, and the issue door takes no
+    /// lock of the write: the write returns, and the row its build lists
+    /// reads the lease. The write runs on a thread of its own, so a door
+    /// that waits on the write fails the case and hangs no run.
+    #[test]
+    fn a_lease_filed_from_the_membership_call_books_the_joiner() {
+        let store = Arc::new(MemoryStore::new());
+        let (ring, told) = (Arc::new(ConsistentHash::new(None)), Told::default());
+        let lease_the_joiner = |store: &MemoryStore, id| {
+            let filed = LeasesStore::issue(store, booking(ASKER, 1, id, Instant::now()));
+            assert_eq!(filed, Ok(()), "the joiner's lease");
+        };
+        store
+            .apply(generation_with(1, &store, &ring, &told, lease_the_joiner))
+            .expect("applied");
+        store.set_term(1);
+        let (done, returned) = mpsc::channel();
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || done.send(member(&store, "http://a:8000")))
+        };
+        let joined = returned
+            .recv_timeout(ROOM)
+            .expect("the write waits on its stage's lease");
+        writer.join().expect("the write").expect("sent");
+        status(&store, joined, WorkerStatus::Ready);
+        store.publish_now();
+        assert_eq!(in_flight(&store), [(joined, 1)]);
     }
 
     /// A registration that takes a worker off a model under its

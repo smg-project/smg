@@ -91,13 +91,21 @@ impl DecodeStream {
         Ok(chunks)
     }
 
-    /// Force flush any remaining text
+    /// End the stream, returning complete text still held by the decoder.
     pub fn flush(&mut self) -> Result<Option<String>> {
         if self.read_offset < self.all_token_ids.len() {
-            let remaining = self.tokenizer.decode(
-                &self.all_token_ids[self.read_offset..],
-                self.skip_special_tokens,
-            )?;
+            let mut token_ids = self.all_token_ids[self.read_offset..].to_vec();
+            let mut prefix = String::new();
+            let mut prefix_index = 0;
+            let remaining = self
+                .tokenizer
+                .finish_decode(
+                    &mut token_ids,
+                    &mut prefix,
+                    &mut prefix_index,
+                    self.skip_special_tokens,
+                )?
+                .into_text();
 
             self.read_offset = self.all_token_ids.len();
 

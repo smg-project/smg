@@ -24,13 +24,10 @@ use common::{
 };
 use openai_protocol::{completion::CompletionRequest, model_card::ModelCard};
 use smg::{
-    config::GroupedDpSticky,
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, Worker, WorkerType},
+    config::GroupedDpSticky, middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey,
 };
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto::GenerateRequest;
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 use crate::common;
 

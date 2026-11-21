@@ -11,6 +11,15 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 DIGEST = "sha256:" + "f" * 64
+# The interpreter's own library path, for the docker stand-in below: this interpreter runs
+# it inside a step whose environment is built from scratch. A shared-libpython build finds
+# libpython through the loader variable its setup exported, and without it the stand-in
+# exits 127 ("error while loading shared libraries") before its first line of Python.
+INTERPRETER_ENV = {
+    name: os.environ[name]
+    for name in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH")
+    if name in os.environ
+}
 
 
 def workflow(name):
@@ -41,6 +50,7 @@ def run_step(step, tmp_path, **environment):
         ["bash", "-e", "-c", step["run"]],
         cwd=tmp_path,
         env={
+            **INTERPRETER_ENV,
             "PATH": os.environ["PATH"],
             "GITHUB_OUTPUT": str(tmp_path / "output"),
             "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),

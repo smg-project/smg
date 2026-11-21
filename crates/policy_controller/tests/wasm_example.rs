@@ -15,10 +15,12 @@
 use std::sync::Arc;
 
 use smg_policy_controller::{
-    plugins::OpenDecisions,
-    wasm::{
-        EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
-        WasmPicker, WasmScorer, World,
+    plugins::{
+        shared::OpenDecisions,
+        wasm::{
+            EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
+            WasmPicker, WasmScorer, World,
+        },
     },
     Binding, Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, Needs, Outcome,
     Plan, PoolFacts, Profile, ReleaseReason, RequestFacts, Scratch, ShedReason, Side,
@@ -99,6 +101,8 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         }],

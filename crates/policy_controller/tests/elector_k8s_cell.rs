@@ -15,8 +15,8 @@
 //! stack, the HTTP round trips and the precondition cross real process
 //! boundaries.
 //!
-//! With the `controller` feature four more cells run the package's binary
-//! over the same stand-in: two replicas named the `Lease` by flag, one
+//! With both `controller` and `worker-host`, four more cells run the stock
+//! binary over the same stand-in: two replicas named the `Lease` by flag, one
 //! leader, a hand-over at its stop, the stopped process gone only after
 //! its release was stored; a release the stand-in refuses once, written
 //! again a renew period later; a release stored while the stopped leader
@@ -48,7 +48,7 @@ use axum::{
 use k8s_openapi::api::coordination::v1::Lease;
 use kube::{core::Status, Client, Config};
 use parking_lot::Mutex;
-use smg_policy_controller::elector::{
+use smg_policy_controller::service::elector::{
     ElectionSettings, Elector, KubernetesLease, Tick, TERM_ANNOTATION,
 };
 
@@ -456,7 +456,7 @@ fn three_processes_over_one_lease_object_hand_over_once_per_term() {
 
 // The binary over the stand-in.
 
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 #[expect(
     dead_code,
     reason = "this binary starts replicas over the Lease object alone; the lease file's case reads the rest"
@@ -466,7 +466,7 @@ mod replicas;
 
 /// Writes at `kubeconfig` a client configuration that names the stand-in at
 /// `url` and its namespace: no flag names the object's namespace, as in a pod.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 fn client_configuration(kubeconfig: &Path, url: &str) {
     fs::write(
         kubeconfig,
@@ -492,7 +492,7 @@ fn client_configuration(kubeconfig: &Path, url: &str) {
 /// The stand-in stores a release late and the replicas close their
 /// listeners at the signal, so the stopped leader's way out is shorter than
 /// its release: it leaves once the release is stored all the same.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_binaries_elect_over_the_lease_object_and_hand_over_at_a_stop() {
     use replicas::{Lease as Place, Record, Replica, ROOM};
@@ -597,18 +597,18 @@ async fn two_binaries_elect_over_the_lease_object_and_hand_over_at_a_stop() {
 /// so and is made again. No witness passes a run: the last try stands
 /// whatever its witness says, so a leader that fails by itself fails each
 /// try, and the cell.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 const TRIES: u32 = 3;
 
 /// A line that waits on the stand-in's answer inside the leader's own
 /// deadline, and did not hold: the one failure a hold of the stand-in
 /// explains, so the one a try is made again for.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 struct Late(String);
 
 /// `assert!` for such a line: the try unwinds as [`Late`] with no line of
 /// the panic hook's, and the cell says its words.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 macro_rules! bound {
     ($met:expr, $($said:tt)+) => {
         if !$met {
@@ -621,13 +621,13 @@ macro_rules! bound {
 /// A witness of the host's holds beside such a cell: a thread that naps
 /// 5 ms at a time and keeps the longest it overslept. A host that holds
 /// this process, the stand-in with it, holds its witness too.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 struct Witness {
     end: mpsc::Sender<()>,
     naps: thread::JoinHandle<Duration>,
 }
 
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 impl Witness {
     fn start() -> Self {
         let (end, ended) = mpsc::channel();
@@ -677,7 +677,7 @@ impl Witness {
 /// says so and is made again, [`TRIES`] at most. No hold explains any other
 /// failure, and none excuses the election's promise: it is checked over the
 /// answers of every try, made again or not.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 #[test]
 fn a_refused_release_is_written_again_a_renew_period_later() {
     // The renew period the try runs at, read without a second timings line.
@@ -714,7 +714,7 @@ fn a_refused_release_is_written_again_a_renew_period_later() {
 
 /// One try of the cell above. Its answers go to `record`, which the cell
 /// checks.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 async fn a_refused_release(record: &mut replicas::Record) {
     use replicas::{Lease as Place, Replica, ROOM};
 
@@ -860,7 +860,7 @@ async fn a_refused_release(record: &mut replicas::Record) {
 
 /// A settle window longer than the cell below waits for anything: a stop
 /// that waited it out before its release would store none in that time.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 const LONG_SETTLE_SECS: u64 = 2 * replicas::ROOM.as_secs();
 
 /// The release is at the signal, ahead of the settle window (design 5.3):
@@ -868,7 +868,7 @@ const LONG_SETTLE_SECS: u64 = 2 * replicas::ROOM.as_secs();
 /// its release stored, and then still answers `Leader`, as a replica that
 /// does not lead. The cell holds the stop to that order and to no clock: a
 /// slow store delays the cell and no more.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_leader_releases_while_its_listeners_still_answer() {
     use replicas::{Lease as Place, Record, Replica, ROOM};
@@ -925,7 +925,7 @@ async fn a_stopped_leader_releases_while_its_listeners_still_answer() {
 }
 
 /// The line a failed election step logs, once a streak.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 const FAILED_STEP: &str =
     "an election step failed; the fence closes at the renew deadline unless a later step lands";
 
@@ -933,7 +933,7 @@ const FAILED_STEP: &str =
 /// timeouts are the renew deadline, so the replica's look fails there and
 /// its thread goes on to the next, where the client's own would hold the
 /// thread for minutes.
-#[cfg(feature = "controller")]
+#[cfg(all(feature = "controller", feature = "worker-host"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_look_the_lease_store_never_answers_fails_at_the_renew_deadline() {
     use replicas::{Lease as Place, Replica, ROOM};

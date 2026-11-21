@@ -6,6 +6,7 @@ use std::{
 use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
+use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
@@ -14,6 +15,19 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_policy_controller::{store::MemoryStore, Catalog};
+use smg_worker::{
+    connection::{
+        engine::EngineConnector,
+        http_client::{
+            build_client, connect_timeout_secs_below, pool_idle_timeout, WorkerHttpClientCache,
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        },
+    },
+    health::liveness,
+    settings::RegistrationSettings,
+    workflow::WorkflowHost,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
@@ -23,17 +37,28 @@ use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
+    policy_controller::{
+        self,
+        engine::PolicyEngine,
+        feed::Feed,
+        follower::{Follower, Settings},
+        operators::Operators,
+        Started,
+    },
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
         common::{
-            openai_bridge::FormatRegistry, overload, pd_admission,
-            prefill_admission::PrefillAdmission, realtime::RealtimeRegistry,
+            openai_bridge::FormatRegistry,
+            overload, pd_admission,
+            prefill_admission::PrefillAdmission,
+            realtime::RealtimeRegistry,
+            snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry},
         },
         gateway::Gateway,
         grpc::{
-            backend_client::BackendConnector,
+            backend_client::{BackendConnector, Fronting},
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
             utils::{Names, ALIASES},
@@ -41,14 +66,7 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{
-        connection::http_client::{
-            build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
-        },
-        health::liveness,
-        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
-    },
-    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
+    workflow::{data::RegistrationNotes, JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -101,6 +119,7 @@ pub struct AppContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
+    engine_connector: Arc<dyn EngineConnector>,
     pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub gateway: Option<Arc<Gateway>>,
@@ -119,8 +138,24 @@ pub struct AppContext {
     /// Worker-directed HTTP clients, shared across workers with the same
     /// effective connection config.
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
+    /// What the worker crate's registration steps read of the configuration.
+    pub registration_settings: RegistrationSettings,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// The policy controller's store, where the controller was picked to
+    /// decide for this process; `None` under the classic policies.
+    pub policy_store: Option<Arc<MemoryStore>>,
+    /// The operators' door over the policy store: the control plane's
+    /// policy document routes stand on it. `None` under the classic
+    /// policies.
+    pub(crate) policy_operators: Option<Arc<Operators>>,
+    /// The worker watch, owned by the context until server teardown.
+    pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
+    /// The policy engine. Routers ask it for placement wherever
+    /// the policy store is present.
+    pub(crate) policy_engine: Option<Arc<PolicyEngine>>,
+    /// The membership feed over [`Self::policy_store`], present wherever the store is.
+    pub(crate) policy_feed: Option<Feed>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -200,6 +235,7 @@ pub struct AppContextBuilder {
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
+    engine_connector: Arc<dyn EngineConnector>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     gateway: Option<Arc<Gateway>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
@@ -212,13 +248,70 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    policy_store: Option<Arc<MemoryStore>>,
+    /// The operators' door over the store, built with it.
+    policy_operators: Option<Arc<Operators>>,
+    /// The membership feed, built with the policy store.
+    policy_feed: Option<Feed>,
+    /// The policy engine over the feed's holder, built with the feed.
+    policy_engine: Option<Arc<PolicyEngine>>,
+    policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+}
+
+/// The context hosts the worker crate's workflow steps: they read the
+/// registry, the worker clients, the registration's settings and the engine
+/// connector through this and nothing else of the gateway.
+impl WorkflowHost for AppContext {
+    type Generation = ModelWorkerSnapshot;
+    type RegistrationNotes = RegistrationNotes;
+
+    fn worker_registry(&self) -> &Arc<WorkerRegistry> {
+        &self.worker_registry
+    }
+
+    fn worker_client_cache(&self) -> &WorkerHttpClientCache {
+        &self.worker_client_cache
+    }
+
+    fn registration_settings(&self) -> &RegistrationSettings {
+        &self.registration_settings
+    }
+
+    fn engine_connector(&self) -> Arc<dyn EngineConnector> {
+        Arc::clone(&self.engine_connector)
+    }
+}
+
+/// The feed a gateway's worker workflows write at: `feed` where the gateway
+/// decides in its own process, and none where it `follows` a controller.
+/// There the store mirrors that controller's rows, and a write of the
+/// gateway's own would set the mirror apart from the controller: its
+/// workflows stay the classic ones.
+fn workflows_feed(feed: Option<&Feed>, follows: bool) -> Option<&Feed> {
+    feed.filter(|_| !follows)
 }
 
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
+    }
+
+    /// Whether a policy controller supplies this gateway's workers: the
+    /// context was built under a controller's address and holds the
+    /// follower of its watch. The start asks it at each step such a
+    /// gateway leaves to the controller: the startup registration, the
+    /// health checks and the discovery.
+    pub(crate) fn follows_controller(&self) -> bool {
+        self.policy_follower.is_some()
+    }
+
+    /// The feed this gateway's worker workflows write at: its own where it
+    /// decides in its own process, and none where a controller supplies its
+    /// workers ([`workflows_feed`]).
+    pub(crate) fn door_feed(&self) -> Option<&Feed> {
+        workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
     }
 
     /// Create AppContext from config with all components initialized
@@ -229,12 +322,32 @@ impl AppContext {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
+        Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
+        connector: Option<Arc<dyn EngineConnector>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
-            Box::pin(AppContextBuilder::from_config(
+            Box::pin(AppContextBuilder::from_config_with_extensions(
                 router_config,
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
+                stages,
+                connector,
             ))
             .await?
             .build()
@@ -279,6 +392,10 @@ fn has_https_worker(config: &RouterConfig) -> bool {
 
 impl AppContextBuilder {
     pub fn new() -> Self {
+        Self::new_with_connector(None)
+    }
+
+    fn new_with_connector(connector: Option<Arc<dyn EngineConnector>>) -> Self {
         Self {
             client: None,
             router_config: None,
@@ -288,6 +405,9 @@ impl AppContextBuilder {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             worker_registry: None,
+            // A host's connector is wrapped once: the gateway fronts each
+            // gRPC connection it makes.
+            engine_connector: connector.map_or_else(BackendConnector::shared, Fronting::around),
             policy_registry: None,
             gateway: None,
             response_storage: None,
@@ -300,6 +420,11 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            policy_store: None,
+            policy_operators: None,
+            policy_feed: None,
+            policy_engine: None,
+            policy_follower: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -446,7 +571,7 @@ impl AppContextBuilder {
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
         // The configuration's liveness budgets (the stall, wedge and stale
-        // thresholds and the warm-up slice, see `worker::health::liveness`) take
+        // thresholds and the warm-up slice, see `smg_worker::health::liveness`) take
         // effect for every context built from it, the server's and a test's
         // alike. They are process-wide and the first call wins, so a
         // constructor that builds the policy registry itself configures them
@@ -548,23 +673,31 @@ impl AppContextBuilder {
             policy_registry.keep_rings_warm(&worker_registry, &runtime);
         }
 
-        // Create WorkerService from the already-built components
-        let worker_service = Arc::new(WorkerService::new(
+        // Create WorkerService from the already-built components. Where
+        // the workflows write at the door a local worker is a row of the
+        // store.
+        let worker_service = WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
-        ));
+        );
+        let rows = workflows_feed(self.policy_feed.as_ref(), self.policy_follower.is_some());
+        let worker_service = Arc::new(if rows.is_some() {
+            worker_service.with_local_workers_as_rows()
+        } else {
+            worker_service
+        });
 
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
             router_config.worker_http_client_settings(),
         ));
+        let registration_settings = router_config.registration_settings();
         let gateway_auth = AuthConfig::with_tenant_keys(
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
         );
 
         let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
-
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -582,6 +715,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
+            engine_connector: self.engine_connector,
             prefill_admission,
             policy_registry,
             gateway: self.gateway,
@@ -608,8 +742,14 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             worker_client_cache,
+            registration_settings,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            policy_store: self.policy_store,
+            policy_operators: self.policy_operators,
+            policy_follower: self.policy_follower,
+            policy_engine: self.policy_engine,
+            policy_feed: self.policy_feed,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -625,6 +765,25 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        Box::pin(Self::from_config_with_extensions(
+            router_config,
+            request_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            None,
+            None,
+        ))
+        .await
+    }
+
+    async fn from_config_with_extensions(
+        router_config: RouterConfig,
+        request_timeout_secs: u64,
+        webrtc_bind_addr: Option<std::net::IpAddr>,
+        webrtc_stun_server: Option<String>,
+        stages: Option<Catalog>,
+        connector: Option<Arc<dyn EngineConnector>>,
+    ) -> Result<Self, String> {
         // A served model aliased under a vendor name keeps that vendor's
         // contract profile after the alias is resolved into the served name.
         ProviderProfile::register_model_aliases(
@@ -637,7 +796,7 @@ impl AppContextBuilder {
         // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
         liveness::configure_from(router_config.worker_liveness_budgets());
-        Ok(Self::new()
+        Ok(Self::new_with_connector(connector)
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
             .maybe_rate_limit_manager(&router_config)?
@@ -646,6 +805,7 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
+            .with_policy_controller(&router_config, stages)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -682,10 +842,7 @@ impl AppContextBuilder {
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (the engines' default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
-        let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
+        let pool_idle_timeout = pool_idle_timeout(config.upstream_pool_idle_timeout_secs);
         // mTLS client identity and CA certificates for verifying worker TLS
         // (both loaded during config creation), parsed once: the builder
         // closure runs again if the first build fails for want of a root store.
@@ -720,7 +877,7 @@ impl AppContextBuilder {
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
                 // Below the request timeout, as the worker clients keep it
-                // (`worker::connection::http_client::connect_timeout_secs_below`): a dark
+                // (`smg_worker::connection::http_client::connect_timeout_secs_below`): a dark
                 // external host fails as a connect timeout, not as the
                 // request's own (except under a 1 s request timeout, where the
                 // two timers race).
@@ -817,9 +974,47 @@ impl AppContextBuilder {
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
         self.worker_registry = Some(Arc::new(
-            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+            WorkerRegistry::new().with_engine_connector(Arc::clone(&self.engine_connector)),
         ));
         self
+    }
+
+    /// Start the policy store with its operators' door, its membership feed,
+    /// its policy engine with the engine's timer and, under a controller's
+    /// address, the follower of that controller's workers. A start the door
+    /// refuses stops this one, by name.
+    fn with_policy_controller(
+        mut self,
+        config: &RouterConfig,
+        stages: Option<Catalog>,
+    ) -> Result<Self, String> {
+        let started =
+            policy_controller::start_with(config, stages).map_err(|refusal| refusal.to_string())?;
+        if let Some(Started { store, door }) = started {
+            let registry = self.worker_registry.as_ref().ok_or_else(|| {
+                "worker_registry must be set before the policy controller".to_string()
+            })?;
+            let controller = config
+                .policy_controller_address
+                .as_ref()
+                .map(|address| Settings::new(address.clone(), config));
+            let connector = Arc::clone(&self.engine_connector);
+            let (feed, follower) =
+                policy_controller::feeds(&store, registry, connector, controller);
+            let policy_engine = Arc::new(PolicyEngine::new(
+                Arc::clone(&store),
+                Arc::clone(&feed.objects),
+            ));
+            // The door's clock runs from here on. The timer ends behind
+            // the policy engine, so its handle detaches.
+            let _timer = policy_controller::upkeep::start(&policy_engine);
+            self.policy_feed = Some(feed);
+            self.policy_engine = Some(policy_engine);
+            self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
+            self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
+            self.policy_store = Some(store);
+        }
+        Ok(self)
     }
 
     /// Create policy registry
@@ -874,21 +1069,47 @@ impl AppContextBuilder {
 
     /// Create load monitor
     fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
+        if config.policy_controller_address.is_some() {
+            info!("Skipping worker load monitoring because --policy-controller-address is set");
+            return Ok(self);
+        }
         let policy_registry = self
             .policy_registry
             .as_ref()
             .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
             .clone();
-        let monitor = Arc::new(WorkerMonitor::new(
-            self.worker_registry
-                .as_ref()
-                .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
-                .clone(),
-            Arc::clone(&policy_registry),
-            config.load_monitor_interval_secs,
-            config.engine_metrics,
-            config.disable_load_monitoring,
-        ));
+        let registry = self
+            .worker_registry
+            .as_ref()
+            .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
+            .clone();
+        let interval = config.load_monitor_interval_secs;
+        let (engine_metrics, conditional) = (config.engine_metrics, config.disable_load_monitoring);
+        // Where the controller was picked the collector says its facts to
+        // the feed's sink, which writes the store, and no classic policy
+        // reads a load. Else it keeps the classic sink, and its snapshot
+        // feeds every policy that consumes it; the monitor polls every group
+        // by default, conditionally under `--disable-load-monitoring`.
+        let monitor = match &self.policy_feed {
+            Some(feed) => Arc::new(WorkerMonitor::with_sink(
+                registry,
+                feed.load_sink(Duration::from_secs(interval.max(1))),
+                interval,
+                engine_metrics,
+                conditional,
+            )),
+            None => {
+                let monitor = Arc::new(WorkerMonitor::new(
+                    registry,
+                    Arc::clone(&policy_registry),
+                    interval,
+                    engine_metrics,
+                    conditional,
+                ));
+                policy_registry.set_load_receiver(Some(monitor.subscribe()));
+                monitor
+            }
+        };
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
@@ -898,10 +1119,6 @@ impl AppContextBuilder {
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
-        // Wire the backend load-snapshot feed into every policy that consumes
-        // it; the monitor polls every group by default, conditionally under
-        // `--disable-load-monitoring`.
-        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         self.worker_monitor = Some(monitor);
         Ok(self)
     }
@@ -953,7 +1170,7 @@ impl AppContextBuilder {
 
     /// Create the KV event monitor: the streams of the gRPC workers.
     ///
-    /// Every gateway has one, whatever its policies: a worker under a
+    /// A gateway has one whatever its classic policies: a worker under a
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather
@@ -963,7 +1180,16 @@ impl AppContextBuilder {
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
+    ///
+    /// Under the policy controller's feed none is built: the feed's own
+    /// follow reads the workers' cache events into the store's index and
+    /// their load records into the worker monitor, and each reader of this
+    /// monitor takes `None`.
     fn with_kv_event_monitor(mut self) -> Self {
+        // One collector a gateway: under the feed the store's follow is it.
+        if self.policy_feed.is_some() {
+            return self;
+        }
         let monitor = Arc::new(KvEventMonitor::new());
         debug!("Created KV event monitor for the workers' KV-event and load streams");
         // The load records on the streams are polls of the worker.
@@ -1023,21 +1249,41 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
+    use smg_worker::{
+        connection::engine::NO_ENGINE_CONNECTOR,
+        identity::basic::{ConnectionMode, Worker, WorkerType},
+        kv_events::SubscriptionKind,
+        test_support::RefusedAddress,
+    };
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::common::prefill_admission::{
-            test_support::select_worker, PrefillAdmissionAttempt,
-        },
-        worker::{
-            connection::engine::NO_ENGINE_CONNECTOR,
-            test_support::{worker_of, RefusedAddress},
-            BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
+        routers::{
+            common::{
+                prefill_admission::{test_support::select_worker, PrefillAdmissionAttempt},
+                snapshot::test_support::worker_of,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
         },
     };
 
+    #[tokio::test]
+    async fn a_context_without_a_controller_address_has_no_follower() {
+        for policy_controller in [false, true] {
+            let config = RouterConfig {
+                policy_controller,
+                ..Default::default()
+            };
+            let context = AppContext::from_config(config, 10, None, None)
+                .await
+                .unwrap();
+            assert!(context.policy_follower.is_none());
+            assert_eq!(context.policy_store.is_some(), policy_controller);
+            assert!(context.worker_monitor.is_some());
+        }
+    }
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
     async fn spawn_echo_server() -> String {
@@ -1057,11 +1303,11 @@ mod tests {
     }
 
     /// Child-process body of the root-store test below (see
-    /// `worker::connection::http_client::no_root_store`); a no-op unless the case
+    /// `smg_worker::connection::http_client::no_root_store`); a no-op unless the case
     /// variable is set.
     #[test]
     fn child_with_client_without_native_roots() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         if std::env::var(no_root_store::CASE).is_err() {
             return;
@@ -1077,7 +1323,7 @@ mod tests {
         ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
     )]
     fn the_gateway_client_builds_without_a_native_root_store() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),
@@ -1271,6 +1517,76 @@ mod tests {
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
+    /// Under the policy controller the monitor says its facts to the feed's
+    /// sink: a pushed record lands on the store's row, and no classic
+    /// policy is handed the monitor's load feed.
+    #[tokio::test]
+    async fn under_the_feed_the_collectors_sink_is_the_feeds() {
+        use smg_policy_controller::{
+            engine::view::{Role, WireModes},
+            store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
+            worker_host::{Expect, Wrote},
+        };
+        use smg_worker::common_proto::EngineLoad;
+
+        use crate::policies::as_cache_aware;
+
+        const URL: &str = "http://worker:8000";
+        let config = RouterConfig {
+            policy_controller: true,
+            ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
+        };
+        let builder = AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_policy_controller(&config, None)
+            .expect("the policy controller starts")
+            .with_worker_monitor(&config)
+            .expect("worker monitor builds");
+        let feed = builder.policy_feed.as_ref().expect("the store has a feed");
+        let store = builder.policy_store.as_ref().expect("the store started");
+        let monitor = builder.worker_monitor.as_ref().expect("the monitor");
+        let registry = builder.worker_registry.as_ref().expect("the registry");
+
+        let facts = WorkerFacts {
+            key: URL.to_owned(),
+            engine: URL.to_owned(),
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            models: vec!["model-a".to_owned()],
+            dp_size: 1,
+            health: HealthPolicy {
+                probes: false,
+                ..HealthPolicy::default()
+            },
+            ..WorkerFacts::default()
+        };
+        let Ok(Wrote::Registered(row)) =
+            feed.door
+                .found(&Maker::Control, Expect::Nothing, URL, &|_| facts.clone())
+        else {
+            panic!("the worker registers at the feed's door");
+        };
+        let worker = registry.get_by_url(URL).expect("the row's worker stands");
+        let record = EngineLoad {
+            waiting_requests: 6,
+            ..EngineLoad::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record, std::time::Instant::now());
+        let sample = LoadSink::load(&**store, row, 0).expect("the row holds the pushed sample");
+        assert_eq!(sample.row.queued, 6);
+
+        let policy = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set")
+            .get_default_policy();
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
+        assert!(!cache_aware.has_load_receiver_for_test());
+    }
+
     /// Every policy gets the monitor: a cache-aware one for its indexes, any
     /// other for the load stream of its gRPC workers, which the policies'
     /// load feed reads in place of the poll.
@@ -1308,6 +1624,35 @@ mod tests {
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
+    /// Under the policy controller's feed the classic monitor is not built:
+    /// the context holds none, and a cache-aware policy is handed none.
+    #[tokio::test]
+    async fn under_the_feed_the_classic_cache_event_monitor_is_not_built() {
+        use crate::policies::as_cache_aware;
+
+        let config = RouterConfig {
+            policy_controller: true,
+            ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
+        };
+        let builder = AppContextBuilder::new()
+            .with_client(&config, 5)
+            .expect("client builds")
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_policy_controller(&config, None)
+            .expect("the policy controller starts")
+            .with_kv_event_monitor();
+        assert!(builder.policy_feed.is_some());
+        assert!(builder.kv_event_monitor.is_none());
+        let policy = builder
+            .policy_registry
+            .as_ref()
+            .expect("policy registry set")
+            .get_default_policy();
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
+        assert!(!cache_aware.kv_event_monitor_is_set_for_test());
+    }
+
     /// A dropped context lets its worker monitor go: the monitor holds the
     /// policy registry, and nothing the context builds holds the monitor
     /// back.
@@ -1326,6 +1671,45 @@ mod tests {
             monitor.upgrade().is_none(),
             "the worker monitor outlives its context"
         );
+    }
+
+    /// A context built on a runtime starts the task that fills the hash
+    /// rings: the ring of a generation is filled with no request to read it.
+    #[tokio::test]
+    async fn a_context_built_on_a_runtime_fills_the_hash_rings_itself() {
+        use openai_protocol::UNKNOWN_MODEL_ID;
+
+        use crate::routers::common::snapshot::WorkerRegistryExt as _;
+
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://ring:8080")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        context.worker_registry.register(worker).expect("a worker");
+
+        let bound = std::time::Instant::now() + Duration::from_secs(30);
+        while !context
+            .worker_registry
+            .get_routing_snapshot(UNKNOWN_MODEL_ID)
+            .hash_ring_is_filled()
+        {
+            assert!(
+                std::time::Instant::now() < bound,
+                "no task filled the ring of the generation"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     #[test]
@@ -1431,7 +1815,7 @@ policy:
             .expect("the registry");
         let mut spec = WorkerSpec::new(format!("grpc://{}", refused.addr()));
         spec.connection_mode = ConnectionMode::Grpc;
-        registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+        registry.on_remote_worker_state(&smg_worker::registry::RemoteWorkerState {
             worker_id: "peer-w1".to_string(),
             model_id: "m".to_string(),
             url: spec.url.clone(),
@@ -1591,13 +1975,15 @@ mod effective_max_concurrent_requests_tests {
     }
 }
 
-/// The test fixture shared by the modules that drive a workflow step or a
-/// discovery pass against an `AppContext` built by hand.
+/// The test fixture shared by the modules whose cases need an `AppContext`
+/// built by hand.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::Arc;
 
-    use super::{AppContext, ToolParserFactory};
+    use smg_worker::connection::http_client::WorkerHttpClientCache;
+
+    use super::{AppContext, BackendConnector, ToolParserFactory};
     use crate::{
         admin::worker_service::WorkerService,
         config::RouterConfig,
@@ -1605,11 +1991,10 @@ pub(crate) mod testing {
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
         routers::{
-            common::{openai_bridge, realtime::RealtimeRegistry},
+            common::{openai_bridge, realtime::RealtimeRegistry, snapshot::WorkerRegistry},
             grpc::multimodal::MultimodalConfigRegistry,
         },
         server::http_client,
-        worker::{WorkerHttpClientCache, WorkerRegistry},
     };
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory
@@ -1634,6 +2019,7 @@ pub(crate) mod testing {
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
+            engine_connector: BackendConnector::shared(),
             prefill_admission: None,
             policy_registry: Arc::new(
                 PolicyRegistry::with_override(
@@ -1665,6 +2051,7 @@ pub(crate) mod testing {
             worker_client_cache: Arc::new(WorkerHttpClientCache::new(
                 router_config.worker_http_client_settings(),
             )),
+            registration_settings: router_config.registration_settings(),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 job_queue,
@@ -1672,10 +2059,89 @@ pub(crate) mod testing {
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            policy_store: None,
+            policy_operators: None,
+            policy_follower: None,
+            policy_engine: None,
+            policy_feed: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         })
+    }
+
+    /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
+    /// accepted and queued but never processed, so a test observes what is
+    /// *submitted* without spawning workflow background tasks.
+    /// [`live_app_context`] is the one whose jobs run.
+    pub(crate) fn create_test_app_context() -> Arc<AppContext> {
+        let router_config = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
+
+        // Note: Using uninitialized queue for tests to avoid spawning background workers
+        // Jobs submitted during tests will queue but not be processed
+        app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
+    }
+
+    /// An `AppContext` whose jobs run: a live job queue and workflow engines, so
+    /// a test observes what the registry *ends up with* once its jobs run.
+    /// Regular routing with round-robin, a five-second startup window for an
+    /// engine slow to answer its probes, and no drain wait on removal.
+    /// [`create_test_app_context`] is the one whose jobs never run.
+    pub(crate) fn live_app_context() -> Arc<AppContext> {
+        use std::sync::OnceLock;
+
+        use llm_tokenizer::registry::TokenizerRegistry;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            config::{HealthCheckConfig, PolicyConfig, RoutingMode},
+            workflow::{JobQueue, JobQueueConfig, WorkflowEngines},
+        };
+
+        let config = RouterConfig::builder()
+            .mode(RoutingMode::Regular {
+                worker_urls: vec![],
+            })
+            .policy(PolicyConfig::RoundRobin)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .health_check_config(HealthCheckConfig {
+                drain_settle_secs: 0,
+                ..HealthCheckConfig::default()
+            })
+            .build_unchecked();
+        let context = Arc::new(
+            AppContext::builder()
+                .router_config(config.clone())
+                .client(http_client())
+                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                .worker_registry(Arc::new(WorkerRegistry::new()))
+                .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
+                .response_storage(Arc::new(MemoryResponseStorage::new()))
+                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+                .worker_job_queue(Arc::new(OnceLock::new()))
+                .workflow_engines(Arc::new(OnceLock::new()))
+                .mcp_orchestrator(Arc::new(OnceLock::new()))
+                .build()
+                .unwrap(),
+        );
+        context
+            .worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&context),
+            ))
+            .ok();
+        context
+            .workflow_engines
+            .set(WorkflowEngines::new(&context.router_config))
+            .ok();
+        context
     }
 }

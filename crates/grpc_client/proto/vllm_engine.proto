@@ -586,4 +586,10 @@ message SchedulerLoad {
   int32 num_waiting_uncached_tokens = 12;
   // Computed input tokens per active prefill second; absent if unknown or stale.
   optional double prefill_throughput = 13;
+  // Values the engine reports by name, as a pushed record carries them
+  // (smg.grpc.common.EngineLoad.values, under the same field number). An
+  // answer's list is that answer's alone: a name it leaves out says nothing
+  // about that value. A value's age_ms is its sample's age as the answer is
+  // made. An old worker's answer has no list and states no value.
+  repeated smg.grpc.common.NamedValue values = 24;
 }

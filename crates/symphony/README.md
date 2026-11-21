@@ -189,8 +189,9 @@ runs every target for a bounded time.
 Symphony's target is every checkpoint group bellwether has a manifest for; a group is the
 checkpoints that share a tokenizer and a template, recorded once by its primary. The table below
 lists the groups bellwether has recorded, and the groups it listed before bellwether's manifests
-outgrew it; it is written from `tests/readme.rs` and checked by `cargo test`, so it says what this
-branch holds, and a stale table fails the build. It runs newest first: **Released** is the day the
+outgrew it; its rows are edited by hand, and `tests/readme.rs` checks them against the registry on
+`cargo test`, so it says what this branch holds: a row that differs from the registry fails the
+build. It runs newest first: **Released** is the day the
 primary's Hugging Face repository was created. The registry behind `formats::for_model` keeps its
 groups as data, `src/formats/groups.json` (one group per line: the table, the group's own turn
 opener and its own text after the thought's close where its template differs from the table's;
@@ -320,13 +321,14 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-08-27 | [qwen-drive-1.0-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-drive-1.0-4b) | Qwen/Qwen-Drive-1.0-4B |  | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen`, `qwen3` |
 | 2026-08-25 | [glm-5.3](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3) | zai-org/GLM-5.3 | GLM-5.3-BF16 | `glm` | 503,273 | replaying the set | `glm47_moe`, `glm45` |
 | 2026-08-25 | [glm-5.3-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3-flash) | zai-org/GLM-5.3-Flash | GLM-5.3-Flash-BF16 | `glm` | 503,285 | replaying the set | `glm47_moe`, `glm45` |
-| 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next | nvidia/Qwen3.8-Flash-Next-FP4-Local | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
+| 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next | autotrust/Qwen3.8-Flash-Next-E384-FP4-Local, nvidia/Qwen3.8-Flash-Next-FP4-Local | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-09 | [dots3-note-prev](https://github.com/smg-project/bellwether/tree/main/fixtures/dots3-note-prev) | dots-studio/dots3-note-prev |  | `dots3` | 589,308 | replaying the set | none |
 | 2026-08-09 | [muse-glimmer-30b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-glimmer-30b) | meta-models/Muse-Glimmer-30B |  | `muse_spark` | 494,683 | replaying the set | none |
 | 2026-08-08 | [qwen3.8-2.4t-a95b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-2.4t-a95b) | Qwen/Qwen3.8-2.4T-A95B |  | `qwen3`, tagged calls | 474,553 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-05 | [qwen3.8-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-27b) | Qwen/Qwen3.8-27B | JetBrains/Qwen3.8-3.6-27B-blend | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-02 | [ling-3.0-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/ling-3.0-flash) | inclusionAI/Ling-3.0-flash | Ling-3.0-flash-fp4, Ling-3.0-flash-Sante | `ling` | 589,298 | replaying the set | none |
 | 2026-08-01 | [nvidia-nemotron-3.5-lightning-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-lightning-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
+| 2026-07-31 | [deepseek-v4-flash-0731](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash-0731) | deepseek-ai/DeepSeek-V4-Flash-0731 |  | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
 | 2026-07-23 | [arex-base](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-base) | BAAI/AREX-Base |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
 | 2026-07-23 | [arex-turbo](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-turbo) | BAAI/AREX-Turbo |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
 | 2026-07-21 | [nanbeige4.2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.2-3b) | Nanbeige/Nanbeige4.2-3B |  | `qwen3`, tagged calls | 589,310 | replaying the set | none |
@@ -520,7 +522,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2024-11-26 | [llama-3.3-70b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.3-70b-instruct) | meta-llama/Llama-3.3-70B-Instruct |  | `json` | 14 | replaying the set | `json`, none |
 | 2024-09-18 | [llama-3.2-11b-vision-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-11b-vision-instruct) | meta-llama/Llama-3.2-11B-Vision-Instruct | Llama-3.2-90B-Vision-Instruct | `json` | 458,203 | replaying the set | `llama`, none |
 | 2024-09-18 | [llama-3.2-1b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-1b-instruct) | meta-llama/Llama-3.2-1B-Instruct | Llama-3.2-3B-Instruct | `json` | 458,185 | replaying the set | `llama`, none |
-| 2024-09-16 | [qwen2.5-0.5b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-0.5b-instruct) | Qwen/Qwen2.5-0.5B-Instruct | Qwen2.5-1.5B-Instruct, Qwen2.5-3B-Instruct, Qwen2.5-7B-Instruct, Qwen2.5-14B-Instruct, Qwen2.5-32B-Instruct, Qwen2.5-72B-Instruct, Qwen2.5-Coder-0.5B-Instruct, Qwen2.5-Coder-1.5B-Instruct, Qwen2.5-Coder-3B-Instruct, Qwen2.5-Coder-7B-Instruct, Qwen2.5-Coder-14B-Instruct, Qwen2.5-Coder-32B-Instruct | `qwen2.5` | 576,772 | replaying the set | `qwen`, `qwen3` |
+| 2024-09-16 | [qwen2.5-0.5b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-0.5b-instruct) | Qwen/Qwen2.5-0.5B-Instruct | EssentialAI/eai-distill-0.5b, Qwen2.5-1.5B-Instruct, Qwen2.5-3B-Instruct, Qwen2.5-7B-Instruct, Qwen2.5-14B-Instruct, Qwen2.5-32B-Instruct, Qwen2.5-72B-Instruct, Qwen2.5-Coder-0.5B-Instruct, Qwen2.5-Coder-1.5B-Instruct, Qwen2.5-Coder-3B-Instruct, Qwen2.5-Coder-7B-Instruct, Qwen2.5-Coder-14B-Instruct, Qwen2.5-Coder-32B-Instruct | `qwen2.5` | 576,772 | replaying the set | `qwen`, `qwen3` |
 | 2024-07-18 | [llama-3.1-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-8b-instruct) | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-70B-Instruct, Llama-3.1-405B-Instruct, Meta-Llama-3.1-8B-Instruct, Meta-Llama-3.1-70B-Instruct, Meta-Llama-3.1-405B-Instruct | `json` | 458,185 | replaying the set | `json`, none |
 | 2024-05-22 | [mistral-7b-instruct-v0.3](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-7b-instruct-v0.3) | mistralai/Mistral-7B-Instruct-v0.3 |  | `mistral` | — | awaiting fixtures | `mistral`, none |
 | 2023-12-30 | [tinyllama-1.1b-chat-v1.0](https://github.com/smg-project/bellwether/tree/main/fixtures/tinyllama-1.1b-chat-v1.0) | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |  | `plain` | 328,664 | replaying the set | `json`, none |

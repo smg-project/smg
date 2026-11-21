@@ -55,14 +55,11 @@ use std::{
 };
 
 use axum::response::Response;
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tokio::{sync::Notify, time::Instant};
 use tracing::{debug, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    routers::common::overload,
-    worker::{Worker, WorkerType},
-};
+use crate::{observability::metrics::Metrics, routers::common::overload};
 
 /// Default seconds a PD dispatch may wait for decode rooms. Well under the
 /// engines' bootstrap deadline (120 s on one engine), so a request that does
@@ -300,6 +297,42 @@ pub(crate) async fn admit_decode(
     }
 }
 
+/// What one try at a decode's gate came to ([`try_admit_decode`]).
+pub(crate) enum Tried {
+    /// The engine reports no window: the gate abstains, as [`admit_decode`]
+    /// does, and the dispatch holds no claim there.
+    NoWindow,
+    /// The rooms are claimed.
+    Claimed(PdAdmissionGuard),
+    /// The window is full, or an older place is in line for the rooms.
+    /// Nothing is held.
+    Full,
+}
+
+/// One try at `decode`'s gate for `rooms`, with no wait: for a dispatch
+/// that holds its claim at another decode's gate and would move to this
+/// one. The try runs under the gate's own order. It takes a place, claims
+/// while no older place needs as few rooms and the rooms are free, and gives
+/// the place back whatever it came to. So a move passes no request that
+/// waits at `decode`, and a try that fails holds nothing.
+pub(crate) fn try_admit_decode(decode: &Arc<dyn Worker>, rooms: usize) -> Tried {
+    let Some(window) = decode.max_running_requests().map(usize::from) else {
+        return Tried::NoWindow;
+    };
+    let rooms = rooms.max(1);
+    let place = Place::take(decode.as_ref(), rooms);
+    let claimed = place.may_claim() && decode.try_admit_pd(rooms, window);
+    drop(place);
+    if claimed {
+        Tried::Claimed(PdAdmissionGuard {
+            worker: Arc::clone(decode),
+            rooms,
+        })
+    } else {
+        Tried::Full
+    }
+}
+
 /// Whether `decode`'s gate would seat one more room now: its running window
 /// has a room that none of the places already waiting at the gate is in line
 /// for. A worker that reports no window always would, as the gate abstains
@@ -354,11 +387,15 @@ mod tests {
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use futures::future::join_all;
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::{common::retry::is_retryable_response, error::extract_error_code_from_response},
-        worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, WorkerType},
+    use crate::routers::{
+        common::retry::is_retryable_response, error::extract_error_code_from_response,
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn decode_worker(url: &str, window: Option<u16>) -> Arc<dyn Worker> {
@@ -375,6 +412,38 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
+    }
+
+    /// One try with no wait claims a free room and holds nothing where the
+    /// window is full. It yields to an older place that is in line for the
+    /// room, so a dispatch that would move here passes no waiting request.
+    /// Where no window is reported the gate abstains.
+    #[test]
+    fn one_try_claims_now_or_holds_nothing() {
+        let decode = decode_worker("grpc://one-try:9000", Some(1));
+        let Tried::Claimed(claim) = try_admit_decode(&decode, 1) else {
+            panic!("a free room is claimed");
+        };
+        assert_eq!(decode.pd_admitted(), 1);
+        assert!(matches!(try_admit_decode(&decode, 1), Tried::Full));
+        assert_eq!(decode.pd_waiting_rooms(), 0, "the try left its place");
+
+        // A request waits for the room, and the room frees: the try yields.
+        let waiting = decode.pd_enqueue(1);
+        drop(claim);
+        assert_eq!(decode.pd_admitted(), 0);
+        assert!(matches!(try_admit_decode(&decode, 1), Tried::Full));
+        assert_eq!(decode.pd_admitted(), 0);
+        decode.pd_dequeue(waiting);
+        assert!(matches!(try_admit_decode(&decode, 1), Tried::Claimed(_)));
+        assert_eq!(
+            decode.pd_admitted(),
+            0,
+            "a claim dropped gives its room back"
+        );
+
+        let open = decode_worker("grpc://no-window:9000", None);
+        assert!(matches!(try_admit_decode(&open, 1), Tried::NoWindow));
     }
 
     /// The selection's read of the gate: a worker without a window always

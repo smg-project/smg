@@ -6,19 +6,25 @@
 
 use std::sync::Arc;
 
-use openai_protocol::worker::{WorkerSpec, WorkerUpdateRequest};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{WorkerSpec, WorkerUpdateRequest},
+};
+use smg_worker::{
+    identity::basic::Worker, jobs::WorkerJobAsker, workflow::RemoveFromWorkerRegistryStep,
+};
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::{
     create_worker_removal_workflow_data, create_worker_update_workflow_data,
     create_worker_workflow_data, RegisterWorkersStep, RemoveFromPolicyRegistryStep,
-    RemoveFromWorkerRegistryStep, UpdatePoliciesForWorkerStep, UpdatePoliciesStep,
+    UpdatePoliciesForWorkerStep, UpdatePoliciesStep,
 };
 use crate::{
     app_context::{testing::app_context_for_tests, AppContext},
     config::RouterConfig,
     policies::CacheAwarePolicy,
-    worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerRegistry},
+    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
     workflow::data::WorkerRegistrationMode,
 };
 
@@ -65,8 +71,12 @@ async fn register_as(
     policy: &str,
     mode: WorkerRegistrationMode,
 ) {
-    let mut data =
-        create_worker_workflow_data(WorkerSpec::new(worker.url()), mode, Arc::clone(app_context));
+    let mut data = create_worker_workflow_data(
+        WorkerSpec::new(worker.url()),
+        mode,
+        Arc::clone(app_context),
+        WorkerJobAsker::Api,
+    );
     data.final_labels
         .insert("policy".to_string(), policy.to_string());
     data.actual_workers = Some(vec![worker]);
@@ -94,6 +104,7 @@ async fn update(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
         worker.url().to_string(),
         request,
         Arc::clone(app_context),
+        WorkerJobAsker::Api,
     );
     data.updated_workers = Some(vec![worker]);
     let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
@@ -106,7 +117,12 @@ async fn update(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
 /// `DELETE /workers/{id}`: out of the worker registry, then the policies.
 async fn remove(app_context: &Arc<AppContext>, worker: Arc<dyn Worker>) {
     let url = worker.url().to_string();
-    let mut data = create_worker_removal_workflow_data(url.clone(), None, Arc::clone(app_context));
+    let mut data = create_worker_removal_workflow_data(
+        url.clone(),
+        None,
+        Arc::clone(app_context),
+        WorkerJobAsker::Api,
+    );
     data.worker_urls = vec![url];
     data.actual_workers_to_remove = Some(vec![worker]);
     let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
@@ -422,7 +438,7 @@ async fn a_mesh_import_removed_here_leaves_the_local_workers_policy() {
     .await;
     app_context
         .worker_registry
-        .on_remote_worker_state(&crate::worker::RemoteWorkerState {
+        .on_remote_worker_state(&smg_worker::registry::RemoteWorkerState {
             worker_id: "peer-w1".to_string(),
             model_id: "llama".to_string(),
             url: "http://remote:8080".to_string(),

@@ -15,7 +15,11 @@ use std::sync::Arc;
 
 use smg::{
     observability::metrics_server::start_metrics_server,
-    worker::{metrics::Metrics, BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
+};
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    metrics::writers::Metrics,
 };
 
 use crate::{common::test_app::scrape, metrics::recorder};
@@ -104,9 +108,8 @@ async fn removed_worker_series_leave_the_scrape() {
         "series missing after re-registration:\n{body}"
     );
     // The removed registration's count (closed -> open, 1) never returns.
-    // The fresh breaker publishes its transition counters at zero while it is
-    // built: once the removed instance is gone from every handle, the store
-    // has forgotten the address and those zeros stand, as for any new worker.
+    // The registration publishes the fresh breaker's transition counters at
+    // zero, as for any new worker.
     assert!(
         lines
             .iter()

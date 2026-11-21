@@ -98,7 +98,9 @@ mesh:
 
 model-gateway:
   - changed-files:
-      - any-glob-to-any-file: 'model_gateway/**/*'
+      - any-glob-to-any-file:
+          - 'model_gateway/**/*'
+          - 'crates/service_discovery/**/*'
 
 openai:
   - changed-files:

@@ -22,6 +22,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 )]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: &[u8; 100] = observability::metrics::SERVER_MALLOC_CONF;
+use openai_protocol::worker::{ConnectionMode, RuntimeType};
 use smg::*;
 use smg_auth as auth;
 
@@ -98,11 +99,11 @@ impl BackendType {
     /// the wire cannot be probed; a provider or TensorRT-LLM pins none, and
     /// without a backend the detection step decides, as it does for the CLI
     /// without `--backend`.
-    fn startup_worker_runtime(&self) -> Option<worker::RuntimeType> {
+    fn startup_worker_runtime(&self) -> Option<RuntimeType> {
         match self {
-            Self::Vllm => Some(worker::RuntimeType::Vllm),
-            Self::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-            Self::Sglang => Some(worker::RuntimeType::Sglang),
+            Self::Vllm => Some(RuntimeType::Vllm),
+            Self::Tokenspeed => Some(RuntimeType::TokenSpeed),
+            Self::Sglang => Some(RuntimeType::Sglang),
             Self::Openai | Self::Anthropic | Self::Trtllm | Self::Gemini => None,
         }
     }
@@ -518,7 +519,7 @@ impl PyPostgresConfig {
 struct Router {
     // The constructor's positional parameters, in their order.
     worker_urls: Vec<String>,
-    policy: PolicyType,
+    policy: Option<PolicyType>,
     host: String,
     port: u16,
     // The keyword-only parameters, in alphabetical order, as the `#[pyo3(signature)]`
@@ -657,6 +658,14 @@ struct Router {
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
+    policy_controller: String,
+    /// The controller this gateway follows, as `host:port`, and the PEM files
+    /// of the connection to it.
+    policy_controller_address: Option<String>,
+    policy_controller_tls_ca_cert: Option<String>,
+    policy_controller_tls_cert: Option<String>,
+    policy_controller_tls_key: Option<String>,
+    policy_spec: Option<String>,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
     prefill_expected_workers: Option<usize>,
@@ -757,7 +766,7 @@ struct Router {
     /// silent; it alone covers the engine's init between HELLO and READY.
     zmq_startup_timeout_secs: u64,
     // Derived from the URL lists; not a parameter.
-    connection_mode: worker::ConnectionMode,
+    connection_mode: ConnectionMode,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -775,8 +784,7 @@ fn parse_discovery(mapping: &Bound<'_, PyAny>) -> PyResult<Option<config::Discov
 }
 
 impl Router {
-    fn determine_connection_mode(worker_urls: &[String]) -> worker::ConnectionMode {
-        use worker::ConnectionMode;
+    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
         // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
         // host:port fall through to the HTTP default. See ConnectionMode::from_url.
         worker_urls
@@ -1049,6 +1057,18 @@ impl Router {
             })
     }
 
+    fn parse_policy_controller(&self) -> Result<bool, config::ConfigError> {
+        match self.policy_controller.as_str() {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            other => Err(config::ConfigError::invalid_value(
+                "policy_controller",
+                other,
+                "expected 'on' or 'off'",
+            )),
+        }
+    }
+
     fn parse_assignment_mode(
         &self,
         default: config::ManualAssignmentMode,
@@ -1281,7 +1301,11 @@ impl Router {
             }
         };
 
-        let policy = convert_policy(&self.policy)?;
+        let policy = match self.policy.as_ref() {
+            Some(policy) => convert_policy(policy)?,
+            None if self.policy_spec.is_some() => config::RouterConfig::default().policy,
+            None => convert_policy(&PolicyType::CacheAware)?,
+        };
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
@@ -1385,19 +1409,19 @@ impl Router {
         // backend additionally pins the startup workers' runtime. HTTP/gRPC,
         // and ZMQ without a backend, keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/cli/configure.rs.
-        let startup_worker_runtime_type =
-            if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
-                self.backend
-                    .as_ref()
-                    .and_then(BackendType::startup_worker_runtime)
-            } else {
-                None
-            };
+        let startup_worker_runtime_type = if matches!(self.connection_mode, ConnectionMode::Zmq) {
+            self.backend
+                .as_ref()
+                .and_then(BackendType::startup_worker_runtime)
+        } else {
+            None
+        };
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
         let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
+        let policy_controller = self.parse_policy_controller()?;
 
-        config::RouterConfig::builder()
+        let builder = config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
             .cache_boundaries(self.cache_boundaries.clone())
@@ -1526,6 +1550,8 @@ impl Router {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .policy_controller(policy_controller)
+            .maybe_policy_spec_path(self.policy_spec.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
@@ -1582,8 +1608,20 @@ impl Router {
                 self.server_cert_path.as_ref(),
                 self.server_key_path.as_ref(),
             )
-            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
-            .build()
+            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler);
+
+        // The controller's address and its files have no builder step. The
+        // command line sets the same four fields on the built configuration,
+        // and the shared validator reads them there.
+        let config = config::RouterConfig {
+            policy_controller_address: self.policy_controller_address.clone(),
+            policy_controller_tls_ca_cert: self.policy_controller_tls_ca_cert.clone(),
+            policy_controller_tls_cert: self.policy_controller_tls_cert.clone(),
+            policy_controller_tls_key: self.policy_controller_tls_key.clone(),
+            ..builder.build_with_validation(false)?
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -1592,7 +1630,7 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::CacheAware,
+        policy = None,
         host = String::from("0.0.0.0"),
         port = 30000,
         // Every other parameter is keyword-only, in alphabetical order (the struct's
@@ -1722,6 +1760,12 @@ impl Router {
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
+        policy_controller = String::from("off"),
+        policy_controller_address = None,
+        policy_controller_tls_ca_cert = None,
+        policy_controller_tls_cert = None,
+        policy_controller_tls_key = None,
+        policy_spec = None,
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
         prefill_expected_workers = None,
@@ -1821,7 +1865,7 @@ impl Router {
     /// Store launcher settings; configuration validation runs before the server starts.
     fn new(
         worker_urls: Vec<String>,
-        policy: PolicyType,
+        policy: Option<PolicyType>,
         host: String,
         port: u16,
         // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
@@ -1949,6 +1993,12 @@ impl Router {
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
         pd_pairing_mode: String,
+        policy_controller: String,
+        policy_controller_address: Option<String>,
+        policy_controller_tls_ca_cert: Option<String>,
+        policy_controller_tls_cert: Option<String>,
+        policy_controller_tls_key: Option<String>,
+        policy_spec: Option<String>,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
         prefill_expected_workers: Option<usize>,
@@ -2227,6 +2277,12 @@ impl Router {
             pd_admission_wait_secs,
             pd_disaggregation,
             pd_pairing_mode,
+            policy_controller,
+            policy_controller_address,
+            policy_controller_tls_ca_cert,
+            policy_controller_tls_cert,
+            policy_controller_tls_key,
+            policy_spec,
             postgres_config,
             power_of_two_load_metric,
             prefill_expected_workers,
@@ -2336,6 +2392,80 @@ impl Router {
             })?;
         }
 
+        // A policy document replaces the routing settings, and the
+        // configuration would drop most of them in silence. Each one that is
+        // not at the constructor's own default is refused by name, in one
+        // list, as the launcher refuses it. A policy name has no default, so
+        // one that was given is in the list whatever it names.
+        if self.policy_spec.is_some() {
+            let plain: Self = py
+                .get_type::<Self>()
+                .call1((Vec::<String>::new(),))?
+                .extract()?;
+            macro_rules! moved {
+                ($($setting:ident),* $(,)?) => {
+                    [$((stringify!($setting), self.$setting != plain.$setting)),*]
+                };
+            }
+            // The launcher's list of the settings a document replaces, in its
+            // order.
+            let moved: Vec<&str> = moved![
+                policy,
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                balance_prefix_margin_tokens,
+                balance_uncached_credit,
+                bucket_adjust_interval_secs,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
+                worker_overload_protection,
+                worker_overload_waiting_requests,
+                worker_overload_token_usage,
+                worker_overload_shed,
+                overlap_decay,
+                selection_temperature,
+                selection_policy,
+                selection_accounting_ttl_ms,
+                eviction_interval_secs,
+                max_tree_size,
+                block_size,
+                cache_boundaries,
+                cache_index,
+                cache_ttl_secs,
+                max_idle_secs,
+                assignment_mode,
+                prefix_token_count,
+                prefix_hash_load_factor,
+                prefix_hash_balance_abs_threshold,
+                least_load_kv_pressure_weight,
+                least_load_default_throughput,
+                least_load_mean_prefill_tokens,
+                power_of_two_load_metric,
+                routing_key_override,
+                pd_pairing_mode,
+                grouped_dp_sticky,
+                dp_minimum_tokens_scheduler,
+                worker_warmup_secs,
+                worker_warmup_share,
+                worker_warmup_blocks,
+                worker_warmup_thin_ratio,
+                worker_warmup_divert_every,
+                prefill_policy,
+                decode_policy,
+                encode_policy,
+            ]
+            .into_iter()
+            .filter_map(|(name, moved)| moved.then_some(name))
+            .collect();
+            if !moved.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Configuration error: a policy document replaces the routing settings, and these are set beside it: {}",
+                    moved.join(", ")
+                )));
+            }
+        }
+
         // Validated once, by the builder's `build()` inside `to_router_config`;
         // `startup` validates once more for a library caller that never went
         // through the builder.
@@ -2347,9 +2477,9 @@ impl Router {
             .discovery
             .as_ref()
             .map(|discovery| {
-                service_discovery::RuntimeDiscoveryConfig::from_config(
+                smg_service_discovery::RuntimeDiscoveryConfig::from_config(
                     discovery,
-                    &router_config.mode,
+                    router_config.mode.discovery_roles(),
                 )
             })
             .transpose()
@@ -2567,7 +2697,6 @@ fn get_available_reasoning_parsers() -> Vec<String> {
 
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    observability::metrics::register_jemalloc_as_global_allocator();
     // The process-level TLS crypto provider, installed once when the module
     // is imported: every HTTP client a binding builds takes it, whether or
     // not a router is started in this process.
@@ -2643,7 +2772,6 @@ mod tests {
     /// step, as the CLI does without `--backend`.
     #[test]
     fn an_engine_backend_pins_its_wire_and_no_backend_pins_none() {
-        use worker::RuntimeType;
         let pin = |backend: Option<BackendType>| {
             backend
                 .as_ref()

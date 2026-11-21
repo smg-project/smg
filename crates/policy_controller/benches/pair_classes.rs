@@ -58,7 +58,7 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
-    spec::Pairing,
+    document::spec::Pairing,
     store::{
         identity, pairing::Member, Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairClasses, PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
@@ -311,6 +311,7 @@ fn serving(fleet: &[WorkerFacts]) -> (MemoryStore, Ask) {
         now: opened + Duration::from_secs(1),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     (store, ask)
 }
@@ -332,6 +333,7 @@ fn sizes() {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut out = ViewBuffers::default();
             let rows = store_of(&fleet, mode)

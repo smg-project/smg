@@ -1,251 +1,19 @@
-//! Shared URL normalization and network probe utilities for worker steps.
+//! The gateway's connector under the worker crate's registration steps: a
+//! mock gRPC engine for the cases that dial one, and the cases of the reach,
+//! the runtime detection and the metadata read on the gateway's own
+//! connector and a served engine.
 
-use std::{future::Future, time::Duration};
+use std::sync::Arc;
 
-use futures::stream::{FuturesUnordered, StreamExt};
-use reqwest::Client;
-use smg_grpc_client::connect_channel_with_timeout;
+use smg_worker::identity::basic::RuntimeType;
 
-// The gRPC base URL stands beside the address type, where the worker module
-// reads it too; its path here is kept for the steps.
-pub(crate) use crate::worker::identity::endpoint::grpc_base_url;
-use crate::{
-    routers::grpc::client::{GrpcClient, HealthCheckResponse},
-    worker::identity::endpoint::{strip_protocol, strip_scheme, Endpoint},
-};
-
-/// The scheme `url` starts with, lowercased: a word of scheme characters
-/// (RFC 3986's, a digit or a sign first too, and the empty word) before a
-/// `://`, as every scheme the address type knows is.
-/// An address that starts with no such word has no scheme, as the address
-/// type reads it. A `://` further in belongs to its path or its query, and
-/// what stands before it may hold a userinfo, which a refusal would name.
-fn url_scheme(url: &str) -> Option<String> {
-    let (word, _) = url.split_once("://")?;
-    word.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        .then(|| word.to_ascii_lowercase())
-}
-
-/// Ensure URL has an HTTP(S) scheme — handles bare `host:port` and gRPC inputs.
-pub(crate) fn http_base_url(url: &str) -> String {
-    if strip_scheme(url, "http://").is_some() || strip_scheme(url, "https://").is_some() {
-        url.trim_end_matches('/').to_string()
-    } else {
-        format!("http://{}", strip_protocol(url).trim_end_matches('/'))
-    }
-}
-
-fn http_health_url(url: &str) -> Result<String, String> {
-    match url_scheme(url).as_deref() {
-        Some("http") | Some("https") => Ok(format!("{}/health", url.trim_end_matches('/'))),
-        // The refusals name the address masked: on the detection step's
-        // auto-detect arm (a URL whose scheme names no mode) a scheme neither
-        // probe accepts ends in the step's failure message, which a log line
-        // carries.
-        Some("grpc") | Some("grpcs") => Err(format!(
-            "HTTP health check does not accept gRPC URL scheme: {}",
-            Endpoint::redacted_str(url)
-        )),
-        Some(scheme) => Err(format!(
-            "HTTP health check does not accept URL scheme '{scheme}': {}",
-            Endpoint::redacted_str(url)
-        )),
-        None => Ok(format!("http://{}/health", url.trim_end_matches('/'))),
-    }
-}
-
-fn grpc_reachable_url(url: &str) -> Result<String, String> {
-    match url_scheme(url).as_deref() {
-        Some("grpc") | Some("grpcs") => Ok(url.trim_end_matches('/').to_string()),
-        Some("http") | Some("https") => Err(format!(
-            "gRPC health check does not accept HTTP URL scheme: {}",
-            Endpoint::redacted_str(url)
-        )),
-        Some(scheme) => Err(format!(
-            "gRPC health check does not accept URL scheme '{scheme}': {}",
-            Endpoint::redacted_str(url)
-        )),
-        None => Ok(format!("grpc://{}", url.trim_end_matches('/'))),
-    }
-}
-
-/// Try HTTP health check (2xx response required).
-pub(crate) async fn try_http_reachable(
-    url: &str,
-    timeout_secs: u64,
-    client: &Client,
-) -> Result<(), String> {
-    let health_url = http_health_url(url)?;
-
-    client
-        .get(&health_url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("Health check failed: {}", e.without_url()))?;
-
-    Ok(())
-}
-
-/// One gRPC health RPC to the engine at `grpc_url`, spoken to as
-/// `runtime_type`: its answer, healthy or not, or why there was none (the
-/// endpoint unreachable, the RPC failed or timed out, another runtime's
-/// service there). An answer identifies the runtime whatever it says about
-/// the engine; `DetectBackendStep` reads it so.
-pub(crate) async fn grpc_health_answer(
-    grpc_url: &str,
-    timeout_secs: u64,
-    runtime_type: &str,
-) -> Result<HealthCheckResponse, String> {
-    let connect_future = GrpcClient::connect(grpc_url, runtime_type);
-    let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
-        .await
-        .map_err(|_| "gRPC connection timeout".to_string())?
-        .map_err(|e| format!("gRPC connection failed: {e}"))?;
-
-    let health_future = client.health_check();
-    tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
-        .await
-        .map_err(|_| "gRPC health check timeout".to_string())?
-        .map_err(|e| format!("gRPC health check failed: {e}"))
-}
-
-/// Perform a single gRPC health check with a specific runtime type: the
-/// engine answered on that runtime's service and reports itself healthy.
-///
-/// The answer counts, not only the RPC: an engine that reports itself not
-/// healthy (a servicer that bound its port while its engine still loads the
-/// model answers so, as does one that is draining) is not reachable yet, as
-/// an HTTP engine whose health route answers an error status is not. The
-/// startup detection keeps polling until the engine can serve, instead of
-/// admitting a worker whose every request would fail until then.
-pub(crate) async fn do_grpc_health_check(
-    grpc_url: &str,
-    timeout_secs: u64,
-    runtime_type: &str,
-) -> Result<(), String> {
-    let response = grpc_health_answer(grpc_url, timeout_secs, runtime_type).await?;
-    if !response.healthy {
-        return Err(not_healthy_error(&response.message));
-    }
-
-    Ok(())
-}
-
-/// The error for a health answer that says the engine is not healthy, with
-/// the engine's own reason when it gives one.
-fn not_healthy_error(message: &str) -> String {
-    let message = message.trim();
-    if message.is_empty() {
-        "gRPC health check reports the engine not healthy".to_string()
-    } else {
-        format!("gRPC health check reports the engine not healthy: {message}")
-    }
-}
-
-/// Dial the endpoint once to decide whether it is worth probing per-runtime.
-///
-/// All five runtime clients dial the same authority, so an endpoint that
-/// cannot be reached at the transport level fails five identical connects.
-/// One dial answers that question, which matters during a mass worker
-/// registration: an unready pod that black-holes SYN would otherwise hold
-/// five in-flight sockets per attempt instead of one.
-async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(), String> {
-    let timeout = Duration::from_secs(timeout_secs);
-    let connect_future = connect_channel_with_timeout(grpc_url, timeout);
-
-    // tonic's connect timeout is applied to the connector. Keep an outer
-    // deadline as a safety net for the remaining Channel::connect setup.
-    tokio::time::timeout(timeout, connect_future)
-        .await
-        .map_err(|_| "gRPC connection timeout".to_string())?
-        .map_err(|e| format!("gRPC connection failed: {e}"))?;
-    Ok(())
-}
-
-const GRPC_RUNTIME_TYPES: [&str; 5] = ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"];
-
-async fn first_success_or_all_errors<F>(
-    mut checks: FuturesUnordered<F>,
-    runtimes: &[&str],
-) -> Result<(), String>
-where
-    F: Future<Output = (usize, Result<(), String>)>,
-{
-    let mut errors = vec![None; runtimes.len()];
-
-    while let Some((index, result)) = checks.next().await {
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                if let Some(slot) = errors.get_mut(index) {
-                    *slot = Some(error);
-                }
-            }
-        }
-    }
-
-    let details = runtimes
-        .iter()
-        .enumerate()
-        .map(|(index, runtime)| match errors[index].as_deref() {
-            Some(error) => format!("{runtime}={error}"),
-            None => format!("{runtime}=health check did not complete"),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    Err(format!(
-        "gRPC not reachable (tried {}): {details}",
-        runtimes.join(", ")
-    ))
-}
-
-/// Check if gRPC is reachable by trying all known runtime types in parallel.
-///
-/// We don't care which runtime it is here — that's `DetectBackendStep`'s job.
-/// We just need to know: does this endpoint speak gRPC at all?
-///
-/// The per-runtime fan-out is gated behind a single transport probe so an
-/// unreachable endpoint costs one connect rather than five.
-/// The remaining runtime probes are cancelled after the first success.
-/// `timeout_secs` bounds the gate and fan-out together, not each phase.
-pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(), String> {
-    let grpc_url = grpc_reachable_url(url)?;
-    let timeout = Duration::from_secs(timeout_secs);
-
-    let reachability = Box::pin(async {
-        grpc_transport_reachable(&grpc_url, timeout_secs).await?;
-
-        let checks = FuturesUnordered::new();
-        for (index, runtime) in GRPC_RUNTIME_TYPES.iter().copied().enumerate() {
-            let grpc_url = &grpc_url;
-            checks.push(async move {
-                (
-                    index,
-                    do_grpc_health_check(grpc_url, timeout_secs, runtime).await,
-                )
-            });
-        }
-
-        first_success_or_all_errors(checks, &GRPC_RUNTIME_TYPES).await
-    });
-
-    tokio::time::timeout(timeout, reachability)
-        .await
-        .map_err(|_| "gRPC reachability timeout".to_string())?
-}
+use crate::routers::grpc::backend_client::BackendConnector;
 
 /// A mock gRPC engine on an ephemeral loopback port for the probes' tests,
 /// answering its health check as its overrides say (healthy until told
 /// otherwise): its `grpc://` URL and those overrides.
 #[cfg(test)]
-pub(crate) async fn mock_grpc_engine() -> (
-    String,
-    std::sync::Arc<mock_worker::overrides::WorkerOverrides>,
-) {
+pub(crate) async fn mock_grpc_engine() -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
     mock_grpc_engine_on(mock_worker::config::SchedulerWire::TokenSpeed).await
 }
 
@@ -253,16 +21,42 @@ pub(crate) async fn mock_grpc_engine() -> (
 /// client by the runtime's name: the engine's model info and server info
 /// answer as its overrides say (served until told otherwise).
 #[cfg(test)]
+pub(crate) async fn mock_grpc_engine_on(
+    wire: mock_worker::config::SchedulerWire,
+) -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
+    serve_mock(wire, Vec::new()).await
+}
+
+/// [`mock_grpc_engine_on`] whose worker states `value` of `name` under
+/// `unit` in every load report it makes: the engine's `grpc://` URL.
+#[cfg(test)]
+pub(crate) async fn mock_grpc_engine_stating(
+    wire: mock_worker::config::SchedulerWire,
+    name: &str,
+    unit: &str,
+    value: f64,
+) -> String {
+    let stated = smg_grpc_client::common_proto::NamedValue {
+        name: name.to_owned(),
+        unit: unit.to_owned(),
+        value,
+        age_ms: None,
+    };
+    let (url, _) = serve_mock(wire, vec![stated]).await;
+    url
+}
+
+/// A mock gRPC engine on `wire` whose one worker states `values` by name in
+/// every load report it makes.
+#[cfg(test)]
 #[expect(
     clippy::disallowed_methods,
     reason = "test helper: the mock engine's serve task runs for the test process's lifetime"
 )]
-pub(crate) async fn mock_grpc_engine_on(
+async fn serve_mock(
     wire: mock_worker::config::SchedulerWire,
-) -> (
-    String,
-    std::sync::Arc<mock_worker::overrides::WorkerOverrides>,
-) {
+    values: Vec<smg_grpc_client::common_proto::NamedValue>,
+) -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the mock engine");
@@ -270,13 +64,15 @@ pub(crate) async fn mock_grpc_engine_on(
         .local_addr()
         .expect("the mock engine's address")
         .port();
-    let config = std::sync::Arc::new(mock_worker::config::Config {
+    let config = Arc::new(mock_worker::config::Config {
         http_count: 0,
         grpc_base_port: port,
         grpc_count: 1,
         grpc_wire: wire,
         model_id: "probe-model".to_string(),
         tokenizer_path: "probe-model".to_string(),
+        // The mock names a gRPC worker by its port.
+        worker_load_values: [(format!("grpc:{port}"), values)].into(),
         ..mock_worker::config::Config::default()
     });
     // A port an earlier test's engine served on keeps that engine's
@@ -288,167 +84,38 @@ pub(crate) async fn mock_grpc_engine_on(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::pending,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
+    use std::collections::HashMap;
+
+    use smg_worker::{
+        identity::{basic::ConnectionMode, endpoint::Endpoint},
+        jobs::WorkerJobAsker,
+        workflow::{
+            discover_engine_labels, grpc_health_answer, grpc_reachable_url, http_health_url,
+            try_grpc_reachable,
         },
     };
 
     use super::*;
-    use crate::{server::http_client, worker::test_support::RefusedAddress};
+    use crate::server::http_client;
 
-    struct DropFlag(Arc<AtomicBool>);
-
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn http_health_url_accepts_http_https_and_bare_urls() {
-        assert_eq!(
-            http_health_url("http://localhost:30000").unwrap(),
-            "http://localhost:30000/health"
-        );
-        assert_eq!(
-            http_health_url("https://example.com/").unwrap(),
-            "https://example.com/health"
-        );
-        assert_eq!(
-            http_health_url("localhost:30000").unwrap(),
-            "http://localhost:30000/health"
-        );
-    }
-
-    #[test]
-    fn http_health_url_rejects_grpc_schemes() {
-        assert!(http_health_url("grpc://localhost:30001").is_err());
-        assert!(http_health_url("grpcs://localhost:30001").is_err());
-    }
-
-    /// An address registered with a query, at a port nobody listens on: the
-    /// failure does not repeat the query. The HTTP client's own error text
-    /// ends with the request URL, the query kept.
-    #[tokio::test]
-    async fn a_failed_http_probe_goes_without_the_clients_url() {
-        let refused = RefusedAddress::reserve();
-        let url = format!("{}?token=s3cret", refused.http_url());
-
-        let err = try_http_reachable(&url, 1, &http_client())
-            .await
-            .expect_err("nothing listens at the address");
-
-        assert!(!err.contains("s3cret"), "{err}");
-    }
-
-    #[test]
-    fn grpc_reachable_url_accepts_grpc_grpcs_and_bare_urls() {
-        assert_eq!(
-            grpc_reachable_url("grpc://localhost:30001").unwrap(),
-            "grpc://localhost:30001"
-        );
-        assert_eq!(
-            grpc_reachable_url("grpcs://localhost:30001/").unwrap(),
-            "grpcs://localhost:30001"
-        );
-        assert_eq!(
-            grpc_reachable_url("localhost:30001").unwrap(),
-            "grpc://localhost:30001"
-        );
-    }
-
-    /// A scheme refusal names the address masked: a secret in the URL's
-    /// userinfo reaches no failure message through it (the detection step's
-    /// auto-detect arm runs both probes and appends their refusals to its
-    /// failure message).
-    #[test]
-    fn a_scheme_refusal_names_the_address_masked() {
-        for refusal in [
-            grpc_reachable_url("http://user:secret@worker:3000").unwrap_err(),
-            grpc_reachable_url("https://user:secret@worker:3000/").unwrap_err(),
-            http_health_url("grpc://user:secret@worker:3000").unwrap_err(),
-            http_health_url("grpcs://user:secret@worker:3000/").unwrap_err(),
-        ] {
-            assert!(!refusal.contains("secret"), "{refusal}");
-            assert!(refusal.contains("://***@worker:3000"), "{refusal}");
-        }
-        let unknown = grpc_reachable_url("ftp://user:secret@worker:3000").unwrap_err();
-        assert!(!unknown.contains("secret"), "{unknown}");
-        assert!(unknown.contains("'ftp'"), "{unknown}");
-    }
-
-    /// A scheme is read at the start of an address alone. An address with
-    /// none may hold a `://` further in, in a path or a query: both probes
-    /// dial it as they dial any address with no scheme. Read as a scheme,
-    /// what stood before that `://` was refused by name, a userinfo in it,
-    /// in the detection step's failure message, which a log line carries.
-    /// A word of scheme characters is a scheme, known or not, and one the
-    /// probes do not know is still refused by name.
-    #[test]
-    fn a_scheme_is_read_at_the_start_of_a_probed_address_alone() {
-        for url in [
-            "user:secret@10.0.0.11:8000/a://b",
-            "10.0.0.11:8000/a://b",
-            "10.0.0.11:8000/proxy/http://backend:9000",
-            "decode.internal:8000/v1?next=http://x",
-        ] {
-            assert_eq!(
-                http_health_url(url).as_deref(),
-                Ok(format!("http://{url}/health").as_str()),
-                "{url}"
-            );
-            assert_eq!(
-                grpc_reachable_url(url).as_deref(),
-                Ok(format!("grpc://{url}").as_str()),
-                "{url}"
-            );
-        }
-
-        let unknown = http_health_url("X-tls+v1.2://user:secret@worker:3000").unwrap_err();
-        assert!(!unknown.contains("secret"), "{unknown}");
-        assert!(unknown.contains("'x-tls+v1.2'"), "{unknown}");
-    }
-
-    #[test]
-    fn grpc_reachable_url_rejects_http_schemes() {
-        assert!(grpc_reachable_url("http://localhost:30000").is_err());
-        assert!(grpc_reachable_url("https://localhost:30000").is_err());
-    }
-
-    #[tokio::test]
-    async fn runtime_fanout_returns_on_first_success_and_cancels_stalled_checks() {
-        let stalled_started = Arc::new(AtomicBool::new(false));
-        let stalled_cancelled = Arc::new(AtomicBool::new(false));
-        let checks = FuturesUnordered::new();
-
-        for (index, succeeds) in [false, true].into_iter().enumerate() {
-            let stalled_started = Arc::clone(&stalled_started);
-            let stalled_cancelled = Arc::clone(&stalled_cancelled);
-            checks.push(async move {
-                let result = if succeeds {
-                    tokio::task::yield_now().await;
-                    Ok(())
-                } else {
-                    stalled_started.store(true, Ordering::SeqCst);
-                    let _drop_flag = DropFlag(stalled_cancelled);
-                    pending::<Result<(), String>>().await
-                };
-                (index, result)
-            });
-        }
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            first_success_or_all_errors(checks, &["stalled", "healthy"]),
+    /// The worker crate's gRPC metadata read on the gateway's connector.
+    async fn fetch_grpc_metadata(
+        url: &str,
+        runtime_type: &str,
+        strict: bool,
+    ) -> Result<(HashMap<String, String>, String), String> {
+        let connector = BackendConnector::shared();
+        discover_engine_labels(
+            &http_client(),
+            connector.as_ref(),
+            url,
+            ConnectionMode::Grpc,
+            runtime_type,
+            None,
+            strict,
         )
-        .await;
-
-        assert!(matches!(result, Ok(Ok(()))));
-        assert!(stalled_started.load(Ordering::SeqCst));
-        assert!(stalled_cancelled.load(Ordering::SeqCst));
+        .await
+        .map(|(labels, runtime)| (labels, runtime.unwrap_or_default()))
     }
 
     /// An endpoint that cannot be reached at the transport level must
@@ -462,7 +129,8 @@ mod tests {
     /// run, so the transport error proves the gate returned first.
     #[tokio::test]
     async fn unreachable_transport_short_circuits_the_runtime_fanout() {
-        let err = try_grpc_reachable("grpc://127.0.0.1:0", 1)
+        let connector = BackendConnector::shared();
+        let err = try_grpc_reachable(connector.as_ref(), "grpc://127.0.0.1:0", 1)
             .await
             .expect_err("closed local endpoint should not be reachable");
 
@@ -483,30 +151,26 @@ mod tests {
     }
 
     /// An engine that answers its health check but reports itself not healthy
-    /// (its model still loading, say) is not reachable yet: the probe fails
-    /// with the engine's reason, for the runtime it speaks and in the
-    /// fan-out, and passes once the engine reports healthy.
+    /// (its model still loading, say) is not reachable yet: the runtime it
+    /// speaks answers with the engine's reason, the fan-out fails with it,
+    /// and passes once the engine reports healthy. This is the worker crate's
+    /// reach on the gateway's connector and a served engine; the single
+    /// check's own text is that crate's case.
     #[tokio::test]
     async fn an_engine_that_reports_not_healthy_is_not_reachable_yet() {
         let (url, engine) = mock_grpc_engine().await;
         engine.set_serving(false);
+        let connector = BackendConnector::shared();
 
-        let answer = grpc_health_answer(&url, 5, "tokenspeed")
+        let answer = grpc_health_answer(connector.as_ref(), &url, 5, RuntimeType::TokenSpeed)
             .await
             .expect("the runtime answers its health RPC whether or not the engine is healthy");
         assert!(!answer.healthy);
         assert_eq!(answer.message, "not serving");
-        grpc_health_answer(&url, 5, "vllm")
+        grpc_health_answer(connector.as_ref(), &url, 5, RuntimeType::Vllm)
             .await
             .expect_err("another runtime's service does not answer there");
-        let err = do_grpc_health_check(&url, 5, "tokenspeed")
-            .await
-            .expect_err("an engine reporting not healthy must not pass the probe");
-        assert_eq!(
-            err,
-            "gRPC health check reports the engine not healthy: not serving"
-        );
-        let err = try_grpc_reachable(&url, 5)
+        let err = try_grpc_reachable(connector.as_ref(), &url, 5)
             .await
             .expect_err("the fan-out must not count a not-healthy answer as reachable");
         assert!(
@@ -517,24 +181,65 @@ mod tests {
         );
 
         engine.set_serving(true);
-        do_grpc_health_check(&url, 5, "tokenspeed")
-            .await
-            .expect("a healthy engine passes the probe");
-        try_grpc_reachable(&url, 5)
+        try_grpc_reachable(connector.as_ref(), &url, 5)
             .await
             .expect("a healthy engine is reachable");
     }
 
-    #[test]
-    fn the_not_healthy_error_carries_the_engines_reason_when_it_gives_one() {
+    /// A runtime that answers its health RPC with `healthy: false` (its
+    /// engine still loading) is identified all the same, by the worker
+    /// crate's step on the gateway's connector; an endpoint nobody answers
+    /// on names every runtime's reason.
+    #[tokio::test]
+    async fn grpc_detection_identifies_a_runtime_that_reports_not_healthy() {
+        use openai_protocol::worker::WorkerSpec;
+        use smg_worker::{
+            identity::basic::ConnectionMode,
+            jobs::WorkerRegistrationMode,
+            workflow::{DetectRuntimeStep, WorkerKind},
+        };
+        use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
+
+        use crate::{
+            app_context::testing::create_test_app_context,
+            workflow::steps::create_worker_workflow_data,
+        };
+
+        async fn detect(url: &str, timeout_secs: u64) -> Result<Option<String>, String> {
+            let mut spec = WorkerSpec::new(url);
+            spec.health.timeout_secs = Some(timeout_secs);
+            let mut data = create_worker_workflow_data(
+                spec,
+                WorkerRegistrationMode::Upsert,
+                create_test_app_context(),
+                WorkerJobAsker::Api,
+            );
+            data.worker_kind = Some(WorkerKind::Local);
+            data.connection_mode = Some(ConnectionMode::Grpc);
+            let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+            DetectRuntimeStep
+                .execute(&mut context)
+                .await
+                .map(|_| context.data.detected_runtime_type.clone())
+                .map_err(|error| error.to_string())
+        }
+
+        let (url, engine) = mock_grpc_engine().await;
+        engine.set_serving(false);
         assert_eq!(
-            not_healthy_error("Engine is starting"),
-            "gRPC health check reports the engine not healthy: Engine is starting"
+            detect(&url, 5).await.unwrap().as_deref(),
+            Some("tokenspeed")
         );
-        assert_eq!(
-            not_healthy_error("  "),
-            "gRPC health check reports the engine not healthy"
-        );
+
+        let err = detect("grpc://127.0.0.1:0", 1)
+            .await
+            .expect_err("nothing answers on a closed endpoint");
+        for runtime in ["sglang", "vllm", "trtllm", "tokenspeed", "mlx"] {
+            assert!(
+                err.contains(&format!("{runtime}: gRPC connection")),
+                "the error does not carry {runtime}'s reason: {err}"
+            );
+        }
     }
 
     /// For an address the door takes, the host and port the probes dial are
@@ -611,6 +316,199 @@ mod tests {
                 validate_worker_url(address).is_err(),
                 "{address} is refused at the door"
             );
+        }
+    }
+
+    fn label<'a>(labels: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+        labels.get(key).map(String::as_str)
+    }
+
+    /// The crate's mock gRPC engine of each proto, as the probes' tests use
+    /// it: its model id names its model, tokenizer and served name.
+    const MOCK_MODEL: &str = "probe-model";
+    /// The mock engine's context length, as it reports it.
+    const MOCK_CONTEXT: &str = "32768";
+
+    /// The gRPC read of each proto: the model info's fields become labels,
+    /// the server info adds its own (a vLLM engine's KV connector, an SGLang
+    /// engine's version), and the runtime read is the one asked for.
+    #[tokio::test]
+    async fn the_grpc_read_takes_the_model_info_and_the_server_info_of_each_proto() {
+        use mock_worker::config::SchedulerWire;
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let (vllm, engine) = mock_grpc_engine_on(SchedulerWire::Vllm).await;
+        let server_label = with_server_label(&engine, "vllm");
+        let (labels, runtime) = fetch_grpc_metadata(&vllm, "vllm", true)
+            .await
+            .expect("the vLLM read");
+        assert_eq!(runtime, "vllm");
+        assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
+        assert_eq!(label(&labels, server_label), Some("MooncakeConnector"));
+
+        let (sglang, engine) = mock_grpc_engine_on(SchedulerWire::Sglang).await;
+        let server_label = with_server_label(&engine, "sglang");
+        let (labels, runtime) = fetch_grpc_metadata(&sglang, "sglang", true)
+            .await
+            .expect("the SGLang read");
+        assert_eq!(runtime, "sglang");
+        assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
+        assert_eq!(label(&labels, server_label), Some("mock"));
+    }
+
+    /// A server-info label each proto's engine reports when its server info
+    /// is served, so a read without one shows the gap. The vLLM mock sends
+    /// an empty KV connector, which the flattening drops, so the connector
+    /// is patched in first; the SGLang mock sends its version. The served
+    /// read's test takes its label here too, so the gap proofs' label is
+    /// one a served read is shown to carry.
+    fn with_server_label(
+        engine: &mock_worker::overrides::WorkerOverrides,
+        runtime: &str,
+    ) -> &'static str {
+        if runtime == "vllm" {
+            let mut patch = serde_json::Map::new();
+            patch.insert(
+                "kv_connector".to_string(),
+                serde_json::Value::String("MooncakeConnector".to_string()),
+            );
+            engine.patch_info(&patch);
+            "kv_connector"
+        } else {
+            "version"
+        }
+    }
+
+    /// An engine without a server info (an `Unimplemented` answer) keeps its
+    /// model labels on a plain read and on a strict one, and has no server
+    /// label: the call is a gap, not a failure, on both protos.
+    #[tokio::test]
+    async fn an_engine_without_server_info_keeps_its_model_labels_on_a_plain_and_a_strict_read() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            let server_label = with_server_label(&engine, runtime);
+            engine.set_server_info(InfoAnswer::Unimplemented);
+            engines.push((url, runtime, server_label));
+        }
+        for (url, runtime, server_label) in &engines {
+            for strict in [false, true] {
+                let (labels, _) = fetch_grpc_metadata(url, runtime, strict)
+                    .await
+                    .unwrap_or_else(|error| panic!("{runtime} strict={strict}: {error}"));
+                assert_eq!(
+                    label(&labels, "model_path"),
+                    Some(MOCK_MODEL),
+                    "{runtime} strict={strict}"
+                );
+                assert_eq!(
+                    label(&labels, server_label),
+                    None,
+                    "{runtime} strict={strict}: {labels:?}"
+                );
+            }
+        }
+    }
+
+    /// A server info that fails leaves a gap on a plain read (the model
+    /// labels, no server label) and fails a strict read, named, on both
+    /// protos.
+    #[tokio::test]
+    async fn a_failing_server_info_leaves_a_gap_for_registration_and_fails_a_strict_read_by_name() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            let server_label = with_server_label(&engine, runtime);
+            engine.set_server_info(InfoAnswer::Failing);
+            engines.push((url, runtime, server_label));
+        }
+        for (url, runtime, server_label) in &engines {
+            let (labels, _) = fetch_grpc_metadata(url, runtime, false)
+                .await
+                .unwrap_or_else(|error| panic!("{runtime}: {error}"));
+            assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL), "{runtime}");
+            assert_eq!(label(&labels, server_label), None, "{runtime}: {labels:?}");
+
+            let error = fetch_grpc_metadata(url, runtime, true)
+                .await
+                .expect_err("a strict read fails on a failing server info");
+            assert!(
+                error.starts_with("Failed to fetch gRPC server info: "),
+                "{runtime}: {error}"
+            );
+        }
+    }
+
+    /// A model info that fails fails the read, named, strict or not: the
+    /// model's fields are what registration reads, so there is no gap to
+    /// leave, on both protos.
+    #[tokio::test]
+    async fn a_failing_model_info_fails_the_grpc_read_by_name() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            engine.set_model_info(InfoAnswer::Failing);
+            engines.push((url, runtime));
+        }
+        for (url, runtime) in &engines {
+            for strict in [false, true] {
+                let error = fetch_grpc_metadata(url, runtime, strict)
+                    .await
+                    .expect_err("a read of an engine whose model info fails");
+                assert!(
+                    error.starts_with("Failed to fetch gRPC model info: "),
+                    "{runtime} strict={strict}: {error}"
+                );
+            }
+        }
+    }
+
+    /// An engine that refuses the connection fails the read at the dial,
+    /// named, strict or not.
+    #[tokio::test]
+    async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
+        use smg_worker::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let url = format!("grpc://{}", refused.addr());
+        for runtime in ["vllm", "sglang"] {
+            for strict in [false, true] {
+                let error = fetch_grpc_metadata(&url, runtime, strict)
+                    .await
+                    .expect_err("a read of an engine that refuses the connection");
+                assert!(
+                    error.starts_with("Failed to connect to gRPC: "),
+                    "{runtime} strict={strict}: {error}"
+                );
+            }
         }
     }
 }

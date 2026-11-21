@@ -19,8 +19,8 @@ use std::{
 };
 
 use smg_policy_controller::{
-    catalog::Catalog,
-    spec::{BindingSpec, OverloadSpec},
+    document::spec::{BindingSpec, OverloadSpec},
+    stages::catalog::Catalog,
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore, PUBLISH_WINDOW,
@@ -135,12 +135,13 @@ fn engine_of(preset: &str) -> Engine {
 }
 
 /// An engine of one profile that holds the built-in `name` and nothing a
-/// document can leave out: the stage by its name, or by its name and the one
-/// parameter the spec has no default for. A built-in that gains such a
+/// document can leave out: the stage by its name, or by its name and the
+/// parameters the spec has no default for. A built-in that gains such a
 /// parameter is refused here by its path, and takes its line.
 fn alone(kind: &str, name: &str) -> Result<Engine, SpecError> {
     let stage = match name {
         "resident-work" => r#"{"resident-work":{"request_tokens":2048}}"#.to_string(),
+        "least-cost" => r#"{"least-cost":{"terms":{"load.queued":7},"unreported":{"over-least":{"request_cost":23}}}}"#.to_string(),
         "best-with-temperature" => r#"{"best-with-temperature":{"temperature":0.5}}"#.to_string(),
         name => format!(r#""{name}""#),
     };
@@ -208,6 +209,7 @@ fn lent_agrees(
         now: opened + Duration::from_secs(1),
         pinned: pin.then(|| ids[n / 2]),
         affinity: written.needs().affinity,
+        signal_cells: false,
     };
     let (mut copy, mut out) = (ViewBuffers::default(), ViewBuffers::default());
     let (mut one, mut two) = (Scratch::new(), Scratch::new());
@@ -234,6 +236,7 @@ fn lent_agrees(
             let view = world
                 .view(MODEL, Role::Single, &ask, false, &mut out)
                 .expect("the pool");
+            let mut holds = Vec::new();
             read.masked += view.stalled.len() as u64;
             read.pinned += u64::from(view.pinned_at != 0);
             let facts = RequestFacts {
@@ -244,6 +247,7 @@ fn lent_agrees(
             };
             let cx = Constraints {
                 stalled: view.stalled,
+                held: world.held(&view, &ask, &mut holds),
                 ..Constraints::default()
             };
             let pool = view.built.pool_facts();
@@ -280,8 +284,8 @@ fn a_decision_over_lent_rows_answers_as_the_one_over_written_rows() {
 
 #[test]
 fn each_built_in_alone_answers_over_lent_rows_as_over_written_rows() {
-    // The catalog's own lists: a built-in added to the build is held here
-    // with no line of this case moved. Each stands alone in a profile,
+    // The catalog's own lists give one profile per built-in.
+    // Each stands alone in a profile,
     // under a standing veto, a pin and reports of different ages. A
     // built-in that read the stalled bit, the session bit or the report's
     // age off the row, and not what stands beside a lent row, would answer
@@ -329,6 +333,7 @@ fn a_decision_that_straddles_a_write_frees_nothing() {
         now: opened + Duration::from_secs(1),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let until = Some(opened + Duration::from_secs(7_200));
     let write = |kind: usize, turn: u32| match kind {
@@ -470,6 +475,7 @@ fn a_period_told_before_any_window_shows_its_judgment_and_frees_nothing() {
         now: late,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let (mut out, mut after) = (ViewBuffers::default(), ViewBuffers::default());
     let freed = store.with_world(|world| {

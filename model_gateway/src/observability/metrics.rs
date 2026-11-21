@@ -16,22 +16,25 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
+use smg_worker::metrics::{
+    series as worker_series,
+    series::{WorkerSeries, WorkerSeriesRecorder},
+    writers::{
+        describe_series as describe_worker_series, intern_string, KV_EVENT_APPLY_SECONDS,
+        KV_EVENT_LAG_SECONDS,
+    },
+};
 
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
-    worker::metrics::{
-        describe_series as describe_worker_series, intern_string,
-        series::{self as worker_series, WorkerSeries, WorkerSeriesRecorder},
-        KV_EVENT_APPLY_SECONDS, KV_EVENT_LAG_SECONDS,
-    },
 };
 
 /// Per-thread caches of the handles the gateway's per-request records go
 /// through: the HTTP layer's, the stream-timing set's, the selection's, the
 /// cache-aware decision's, the index lookup's, the admission gauges' and the
 /// body path's. The worker's own caches are the worker module's
-/// (`crate::worker::metrics`); the helpers and the installed flag are the
+/// (`smg_worker::metrics::writers`); the helpers and the installed flag are the
 /// worker crate's, so every writer records the same way.
 mod handles {
     use std::{
@@ -46,7 +49,7 @@ mod handles {
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
+        keep_handles, kept, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
 
     /// Handles by the matched path (the only label a request computes: the
@@ -75,6 +78,15 @@ mod handles {
         pub(super) worker_type: &'static str,
         pub(super) connection_mode: &'static str,
         pub(super) policy: &'static str,
+    }
+
+    /// The profile is keyed by the generation and index in the decision.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct DecisionLabels {
+        pub(super) generation: u64,
+        pub(super) profile: Option<u16>,
+        pub(super) outcome: &'static str,
+        pub(super) mode: &'static str,
     }
 
     /// The handles of one label set of the stream-timing set, each built
@@ -148,6 +160,11 @@ mod handles {
         pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(FxHashMap::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
         pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(FxHashMap::default());
+        /// Decision counters for the newest generation seen on this thread,
+        /// by static labels, then by the bounded set of interned models.
+        pub(super) static POLICY_DECISIONS: RefCell<(u64, ByLabels<DecisionLabels, Counter>)> = RefCell::new((0, FxHashMap::default()));
+        /// Decision times by mode and outcome.
+        pub(super) static POLICY_DECISION_SECONDS: RefCell<FxHashMap<(&'static str, &'static str), Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
         pub(super) static CACHE_AWARE_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_manual_policy_branch_total` by branch.
@@ -185,6 +202,8 @@ mod handles {
         HTTP_CONNECTIONS_ACTIVE.set(None);
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
+        POLICY_DECISIONS.set((0, FxHashMap::default()));
+        POLICY_DECISION_SECONDS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
         CONSISTENT_HASHING_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -315,6 +334,11 @@ pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
     &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
+const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
+const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
+const POLICY_SHADOW_DECISIONS_TOTAL: &str = "smg_policy_shadow_decisions_total";
+const POLICY_DECISION_FAULTS_TOTAL: &str = "smg_policy_decision_faults_total";
+
 /// Time to first token on edges that resolve it. The same observation as
 /// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
 /// so the `le` values recording rules were written against).
@@ -346,10 +370,9 @@ pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS: &[f64] = &[
     0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 10.0,
 ];
 
-/// Histogram buckets for `smg_kv_index_lookup_seconds` and
-/// `smg_kv_event_apply_seconds`: a lookup takes microseconds and a batch
-/// apply tens of microseconds, below the request-latency buckets' first
-/// edge, so these double from half a microsecond to a quarter of a second.
+/// Histogram buckets for KV index lookups, KV event applies and policy
+/// decisions. Their times can fall below the request-latency buckets'
+/// first edge, so these start at half a microsecond.
 pub(crate) const KV_INDEX_MICRO_BUCKETS: &[f64] = &[
     0.000_000_5,
     0.000_001,
@@ -415,14 +438,13 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
     }
 }
 
-/// Jemalloc's run-time options for a long-running gateway, for every final
-/// artifact (the `smg` executable, the Python extension, the Go FFI library)
-/// to export as `_rjem_malloc_conf` next to its `#[global_allocator]`. The
+/// Jemalloc's run-time options for a long-running gateway. Binaries that use
+/// [`crate::stock_allocator!`] and the Python and Go bindings export them as
+/// `_rjem_malloc_conf` next to their `#[global_allocator]`. The
 /// multimodal crate's baseline harness (`crates/multimodal/examples/mm_baseline.rs`)
 /// sits below this crate and repeats the bytes by hand; the test
 /// `the_multimodal_harness_repeats_the_malloc_conf` keeps that copy equal. With
-/// the stock
-/// settings a thread's freed pages decay back to the OS only when that thread
+/// the allocator's defaults, a thread's freed pages decay back only when it
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
 /// thread purges on schedule instead; dirty pages are returned after 10 s and
@@ -487,20 +509,40 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 pub const SERVER_MALLOC_CONF: &[u8; 100] =
     b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
-/// Marks jemalloc as the final artifact's Rust global allocator.
+/// The bytes of the one allocation that tells which allocator serves the
+/// process.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+const ALLOCATOR_PROBE_BYTES: usize = 4096;
+
+/// Whether this process's Rust allocations go through the library's
+/// jemalloc.
 ///
-/// Call this before [`start_prometheus`] only from a binary or extension that
-/// declares `tikv_jemallocator::Jemalloc` with `#[global_allocator]`. Keeping
-/// this registration at the artifact boundary prevents `smg` rlib consumers
-/// that use the system allocator from publishing statistics for an unused
-/// linked jemalloc instance.
-pub fn register_jemalloc_as_global_allocator() {
-    #[cfg(all(
-        feature = "jemalloc-stats",
-        not(target_env = "msvc"),
-        not(target_env = "musl")
-    ))]
-    allocator_stats::register_global_allocator();
+/// The gateway finds out and is not told: it makes one allocation and reads
+/// the allocator's own count of this thread's bytes before and after. A
+/// count that did not move means another allocator serves the process, and
+/// the statistics of the linked jemalloc are then not published. The answer
+/// is found once and kept.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+pub(crate) fn jemalloc_is_global() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let Ok(allocated) = tikv_jemalloc_ctl::thread::allocatedp::read() else {
+            return false;
+        };
+        let before = allocated.get();
+        let probe = std::hint::black_box(Vec::<u8>::with_capacity(ALLOCATOR_PROBE_BYTES));
+        let after = allocated.get();
+        drop(probe);
+        after > before
+    })
 }
 
 pub(crate) fn init_metrics() {
@@ -524,7 +566,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         symphony_telemetry::CALLS_FORBIDDEN,
-        "Tool calls a Symphony table read under tool_choice: none and the gateway dropped, by table"
+        "Tool calls a Symphony table read and the gateway dropped under a tool_choice that forbids them (every call under none; a call outside the callable tools under a named function, an allowed list or required), by table"
     );
     describe_counter!(
         symphony_telemetry::FALLBACK,
@@ -743,15 +785,31 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 3: Worker metrics
-    describe_gauge!(
-        "smg_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
-    );
     // The worker's own series, described by the worker's module.
     describe_worker_series();
     describe_counter!(
         "smg_worker_selection_total",
         "Worker selection events by worker_type, connection_mode, model, policy"
+    );
+    describe_counter!(
+        POLICY_DECISIONS_TOTAL,
+        "Policy controller decisions by model, profile, outcome (pick, shed, queue, refused) and mode (embedded)"
+    );
+    describe_histogram!(
+        POLICY_DECISION_SECONDS,
+        "Seconds spent asking the policy controller for one decision, by mode and outcome"
+    );
+    describe_counter!(
+        POLICY_SHADOW_DECISIONS_TOTAL,
+        "Shadow decisions of the policy controller beside a live decision. A row is a \
+         binding's position in the policy document: the last row also counts every binding \
+         behind it, and a document applied later counts on in the same rows. By binding, side \
+         (single) and kind (agreed, other-target, other-outcome, skipped)"
+    );
+    describe_counter!(
+        POLICY_DECISION_FAULTS_TOTAL,
+        "Policy controller decisions that panicked, with the shadow decisions that panicked \
+         beside a live decision that stood"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -858,30 +916,7 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 4: Discovery metrics
-    describe_counter!(
-        "smg_discovery_registrations_total",
-        "Worker registration attempts by source and result"
-    );
-    describe_counter!(
-        "smg_discovery_deregistrations_total",
-        "Worker deregistration events by source and reason"
-    );
-    describe_histogram!(
-        "smg_discovery_sync_duration_seconds",
-        "Discovery sync duration by source"
-    );
-    describe_gauge!(
-        "smg_discovery_workers_discovered",
-        "Workers known via discovery by source"
-    );
-    describe_counter!(
-        "smg_discovery_snapshot_errors_total",
-        "Discovery source observations rejected, by source and reason"
-    );
-    describe_counter!(
-        "smg_discovery_skipped_total",
-        "Discovered workers left out of an otherwise good snapshot, by source and reason"
-    );
+    smg_service_discovery::describe_series();
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -1017,8 +1052,7 @@ pub fn init_startup_series() {
         ENDPOINT_GENERATE, ENDPOINT_MESSAGES, ENDPOINT_RERANK, ENDPOINT_RESPONSES,
         ENDPOINT_SYSTEMONE, WORKER_DECODE, WORKER_PREFILL, WORKER_REGULAR,
     };
-
-    use crate::worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
+    use smg_worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
 
     // Shedding happens at every stage; the two fallbacks only while the
     // candidate pool is assembled.
@@ -1122,7 +1156,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let handle = recorder.handle();
 
     // Series labelled `worker` live in a store of their own so they can be
-    // dropped with their worker (see `worker::metrics::series`); it renders histograms
+    // dropped with their worker (see `smg_worker::metrics::series`); it renders histograms
     // with the exporter's buckets and quantiles.
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
@@ -1234,6 +1268,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
             match_ratio_matcher,
             CACHE_AWARE_MATCH_RATIO_BUCKETS.to_vec(),
         ),
+        (
+            Matcher::Full(POLICY_DECISION_SECONDS.into()),
+            KV_INDEX_MICRO_BUCKETS.to_vec(),
+        ),
         (kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
         (kv_apply_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
         (kv_lag_matcher, KV_EVENT_LAG_BUCKETS.to_vec()),
@@ -1257,22 +1295,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     not(target_env = "musl")
 ))]
 pub(crate) mod allocator_stats {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use metrics::{describe_gauge, gauge};
 
-    static JEMALLOC_IS_GLOBAL: AtomicBool = AtomicBool::new(false);
-
-    pub(super) fn register_global_allocator() {
-        JEMALLOC_IS_GLOBAL.store(true, Ordering::Release);
-    }
-
-    fn is_global_allocator() -> bool {
-        JEMALLOC_IS_GLOBAL.load(Ordering::Acquire)
-    }
+    use super::jemalloc_is_global;
 
     pub(crate) fn describe() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         describe_gauge!(
@@ -1312,10 +1340,10 @@ pub(crate) mod allocator_stats {
         }
     }
 
-    /// Registration at the final-artifact boundary keeps these gauges tied to
-    /// Rust's actual global allocator.
+    /// The gauges are published where this jemalloc serves the process's Rust
+    /// allocations, and nowhere else.
     pub(crate) fn start_reporting() {
-        if !is_global_allocator() {
+        if !jemalloc_is_global() {
             return;
         }
         record();
@@ -1330,6 +1358,13 @@ pub(crate) mod allocator_stats {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn the_allocator_of_the_lib_tests_is_found() {
+            // The lib's tests declare jemalloc as their allocator (lib.rs),
+            // so the one allocation moves its count.
+            assert!(super::jemalloc_is_global());
+        }
+
         #[test]
         fn jemalloc_stats_interface_readable() {
             use tikv_jemalloc_ctl::{epoch, stats};
@@ -1348,6 +1383,19 @@ pub(crate) mod allocator_stats {
 /// - Dynamic labels use string interning (single allocation per unique value)
 /// - Static labels use the metrics crate's internal caching
 pub struct Metrics;
+
+/// A decision of the policy controller as its series label it.
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyDecision {
+    pub generation: u64,
+    /// The profile that decided, `None` where none did: a refused ask, and
+    /// a request the engine declined ahead of every profile.
+    pub profile: Option<u16>,
+    /// `pick`, `shed`, `queue`, or `refused` where the controller made no decision.
+    pub outcome: &'static str,
+    /// `embedded` for decisions made in this process.
+    pub mode: &'static str,
+}
 
 /// A streamed request the gateway aborted at the engine because its own
 /// stop had ended every choice for the client while the engine was still
@@ -2204,23 +2252,6 @@ impl Metrics {
     // Layer 3: Worker metrics
     // ========================================================================
 
-    /// Set worker pool size
-    pub fn set_worker_pool_size(
-        worker_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        size: usize,
-    ) {
-        let model = intern_model_label(model_id);
-        gauge!(
-            "smg_worker_pool_size",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode,
-            "model" => model
-        )
-        .set(size as f64);
-    }
-
     /// Record worker selection
     pub fn record_worker_selection(
         worker_type: &'static str,
@@ -2254,6 +2285,100 @@ impl Metrics {
                 |count| count.increment(1),
             );
         });
+    }
+
+    /// Count and time one policy decision for `model_id`. The counter asks
+    /// `profile_name` only when it needs a handle for a profile. A decision
+    /// no profile made counts under an empty `profile` label and keeps its
+    /// handle under no generation. Where a profile's generation is gone, the
+    /// empty label is used and that handle is discarded after counting.
+    pub fn record_policy_decision(
+        model_id: &str,
+        decision: PolicyDecision,
+        profile_name: impl FnOnce() -> Option<Arc<str>>,
+        seconds: f64,
+    ) {
+        let PolicyDecision {
+            generation,
+            profile,
+            outcome,
+            mode,
+        } = decision;
+        let build = |model: Arc<str>, profile: Option<Arc<str>>| {
+            let profile = profile.map_or_else(|| "".into(), metrics::SharedString::from);
+            counter!(
+                POLICY_DECISIONS_TOTAL,
+                "model" => model,
+                "profile" => profile,
+                "outcome" => outcome,
+                "mode" => mode
+            )
+        };
+        if handles::keep_handles() {
+            // A decision no profile made names nothing a new document can
+            // rename: its handle is kept under no generation.
+            let labels = handles::DecisionLabels {
+                generation: if profile.is_some() { generation } else { 0 },
+                profile,
+                outcome,
+                mode,
+            };
+            handles::POLICY_DECISIONS.with_borrow_mut(|(newest, by_labels)| {
+                if profile.is_some() && generation > *newest {
+                    by_labels.clear();
+                    *newest = generation;
+                }
+                let models = (profile.is_none() || generation == *newest)
+                    .then(|| by_labels.entry(labels).or_default());
+                if let Some(count) = models.as_ref().and_then(|models| models.get(model_id)) {
+                    count.increment(1);
+                    return;
+                }
+                let model = intern_model_label(model_id);
+                let name = match profile {
+                    Some(_) => profile_name(),
+                    None => Some(Arc::from("")),
+                };
+                let models =
+                    models.filter(|map| name.is_some() && handles::kept(map.len(), &model));
+                let count = build(Arc::clone(&model), name);
+                count.increment(1);
+                if let Some(models) = models {
+                    models.insert(model, count);
+                }
+            });
+        } else {
+            let name = profile.and_then(|_| profile_name());
+            build(intern_model_label(model_id), name).increment(1);
+        }
+        handles::with_static(
+            &handles::POLICY_DECISION_SECONDS,
+            (mode, outcome),
+            || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
+            |time| time.record(seconds),
+        );
+    }
+
+    /// The count of the shadow decisions that said `kind` beside a live
+    /// decision of the binding at position `binding`, on `side`. The caller
+    /// keeps the handle and sets it from the policy controller's own count.
+    pub fn policy_shadow_decisions(
+        binding: u32,
+        side: &'static str,
+        kind: &'static str,
+    ) -> metrics::Counter {
+        counter!(
+            POLICY_SHADOW_DECISIONS_TOTAL,
+            "binding" => binding.to_string(),
+            "side" => side,
+            "kind" => kind
+        )
+    }
+
+    /// The count of the policy decisions that panicked. The caller keeps the
+    /// handle and sets it from the policy controller's own count.
+    pub fn policy_decision_faults() -> metrics::Counter {
+        counter!(POLICY_DECISION_FAULTS_TOTAL)
     }
 
     /// Record worker error
@@ -2440,70 +2565,6 @@ impl Metrics {
     // ========================================================================
 
     // ========================================================================
-    // Layer 4: Discovery metrics
-    // ========================================================================
-
-    /// Record worker registration attempt
-    pub fn record_discovery_registration(source: &'static str, result: &'static str) {
-        counter!(
-            "smg_discovery_registrations_total",
-            "source" => source,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record worker deregistration
-    pub fn record_discovery_deregistration(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_deregistrations_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record discovery sync duration
-    pub fn record_discovery_sync_duration(source: &'static str, duration: Duration) {
-        histogram!(
-            "smg_discovery_sync_duration_seconds",
-            "source" => source
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Set workers discovered count
-    pub fn set_discovery_workers_discovered(source: &'static str, count: usize) {
-        gauge!(
-            "smg_discovery_workers_discovered",
-            "source" => source
-        )
-        .set(count as f64);
-    }
-
-    /// Record a discovered worker a provider left out of a snapshot it
-    /// otherwise applied
-    pub fn record_discovery_skip(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_skipped_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record a discovery source observation that was rejected; the provider
-    /// keeps reconciling its last good snapshot meanwhile
-    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_snapshot_errors_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    // ========================================================================
     // Layer 5: MCP metrics
     // ========================================================================
 
@@ -2535,9 +2596,8 @@ pub(crate) mod test_support {
 
     /// The scrape a test renders under its own recorder, with the two
     /// readers of it: the worker's test support owns them.
-    pub(crate) use crate::worker::test_support::{
-        assert_metric, render_with_recorder, sorted_series,
-    };
+    pub(crate) use smg_worker::test_support::assert_metric;
+    pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
 }
 
 #[cfg(test)]

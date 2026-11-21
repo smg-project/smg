@@ -5,8 +5,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use openai_protocol::worker::WorkerStatus;
 use smg::{
     policies::{LoadBalancingPolicy, ManualPolicy, SelectWorkerInfo},
-    worker::{BasicWorkerBuilder, Worker, WorkerType},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 
 // ============================================================================
 // Test Helpers

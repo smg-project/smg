@@ -23,9 +23,9 @@ use openai_protocol::{
 };
 use smg::{
     app_context::AppContext,
-    routers::RouterFactory,
-    worker::{BasicWorkerBuilder, Worker, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tower::ServiceExt;
 
 use crate::common::{

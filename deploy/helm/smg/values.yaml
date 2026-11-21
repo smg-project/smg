@@ -28,10 +28,26 @@ router:
   progressDeadlineSeconds: 1920
 
   # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
-  #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
-  #    choices; values.schema.json lists them). bucket is a prefill-side policy:
-  #    router.disaggregation.prefillPolicy.
-  policy: cache_aware
+  #    least_load, manual, consistent_hashing, prefix_hash or bucket (the launcher's
+  #    --policy choices; values.schema.json lists them).
+  #    Empty renders --policy cache_aware without a document, and no --policy
+  #    beside one: the document names the policy. A value beside a document
+  #    fails the render. An upgrade with --reuse-values from an older chart
+  #    keeps that chart's cache_aware: set router.policy="" with it.
+  policy: ""
+
+  # -- Worker selection inside the gateway. "off" uses the classic policies.
+  #    "on" selects the policy controller. This switch configures only the
+  #    gateway process. Use the top-level policyController.enabled for the
+  #    separate controller service. A bare on or off works too: YAML reads
+  #    it as a boolean, and the chart takes both forms.
+  policyController: "off"
+  # -- Inline policy document. An empty map supplies no document.
+  policySpec: {}
+  # -- Name of your ConfigMap in the release's namespace, with the policy
+  #    document under spec.yaml. An empty name supplies no document. An edit
+  #    of your ConfigMap rolls no pod: restart the router pods to read it.
+  policySpecConfigMap: ""
 
   # -- Disaggregated serving: the roles the gateway's --pd-disaggregation and
   #    --epd-disaggregation take. mode "" (the default) is a regular fleet, "pd"
@@ -164,7 +180,9 @@ router:
   tokenizerPath: ""        # override tokenizer (defaults to model)
   chatTemplate: ""         # custom chat template path
 
-  # -- Cache-aware routing tuning
+  # -- Cache-aware routing tuning. A policy document replaces these: beside one
+  #    the router's line carries none of them, and a value moved from its default
+  #    fails the render.
   cacheThreshold: 0.3
   balanceAbsThreshold: 64
   balanceRelThreshold: 1.5
@@ -417,10 +435,10 @@ policyController:
   #    global.image.repository, and tag "" takes the router's tag with
   #    -policy-controller appended, the tag a release publishes the
   #    controller under (a release publishes one controller image, so the
-  #    router's -slurm suffix is cut first). A repository of your own needs
-  #    its tag, and so does a router image named by a digest or by a release
-  #    older than the first with a controller image. The pull policy and
-  #    the pull secrets are the global ones.
+  #    router's -slurm or -ol9 suffix is cut first). A repository of your own
+  #    needs its tag, and so does a router image named by a digest or by a
+  #    release older than the first with a controller image. The pull policy
+  #    and the pull secrets are the global ones.
   image:
     registry: ""
     repository: ""
@@ -502,8 +520,11 @@ policyController:
   #    runs, and a pod that starts takes it. A pod that starts on a document
   #    that does not run refuses to start: dry-run a document before an
   #    upgrade that moves the pods for another reason. With the election on
-  #    each pod watches its own mount: until the kubelets have turned both,
-  #    two pods hold two documents.
+  #    the leader's mount decides: a standby that follows its leader runs
+  #    the leader's document, and one that follows nobody runs none until
+  #    it leads. A pod that takes the lead applies its own mount's
+  #    document, unless that ran on it since its mount last turned (the
+  #    README says the rest).
   spec: {}
 
   # -- A spec store in place of the document: the name of a
@@ -896,6 +917,15 @@ workers: []
 #       periodSeconds: 10
 #       failureThreshold: 30
 #     progressDeadlineSeconds: 960      # rollout deadline; default: the startup probe's budget + 600 s
+#     # How long the kubelet waits between SIGTERM and SIGKILL (default 90).
+#     # A gRPC worker on the Rust servicer drains in-flight streams first:
+#     # SMG_*_SERVICER_DRAIN_SECS (default 30; the PD linger counts within it)
+#     # + the server stop (5 s) + on vLLM, its process manager's shutdown
+#     # (vLLM's --shutdown-timeout N, 5 s when it is 0) + the engine's
+#     # termination (up to 30 s) = 70 s, plus a margin; Kubernetes' own
+#     # default of 30 s would cut the drain. Raise it with the drain bound and
+#     # with a vLLM --shutdown-timeout above 5.
+#     terminationGracePeriodSeconds: 90
 
 # Engine default ports (used when worker.port is not set)
 engineDefaults:

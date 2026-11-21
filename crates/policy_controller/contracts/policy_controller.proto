@@ -64,8 +64,9 @@
 // the first request under each term the replica leads.
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
-// role does not cover the RPC; FAILED_PRECONDITION a write or a Session
-// off the leader (a NotLeader in the status details, which are a
+// role does not cover the RPC, or a membership write names a row its
+// caller did not make (WorkerRow.maker); FAILED_PRECONDITION a write or a
+// Session off the leader (a NotLeader in the status details, which are a
 // google.rpc.Status that holds it as an Any, its address the leader's
 // gateway listener as Leader tells it; on Session, the NotLeader frame
 // ahead of the status), a first frame that is not Hello or a second
@@ -425,11 +426,15 @@ message SpecPush {
 
 // --- Decide: one stream per gateway runtime thread --------------------------
 
-// Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
-// repeated Decide after a stream reset returns the standing decision. A
-// frame is at most 64 KiB as encoded, and one over it is refused whole: a
-// sender cuts its block hashes at the tail until its frame fits, and
-// counts the cut on its own side.
+// One lease stands for one request. A gateway that sends a request again,
+// because the stream that carried it ended before its answer arrived, says
+// so (`again`): the lease its earlier decision was issued ends there, where
+// no Dispatched named it, and the request is decided anew. The word reaches
+// the asking gateway's own waiting leases alone, and of a pair's lease each
+// side that waits ends. A request sent twice without the word is two
+// requests. A frame is at most 64 KiB as encoded, and one over it is refused
+// whole: a sender cuts its block hashes at the tail until its frame fits,
+// and counts the cut on its own side.
 message DecideRequest {
   // 1 to 256 bytes: the gateway's own key of one request among those it has
   // standing, carried back on every answer. A longer id is sent as a digest
@@ -439,6 +444,47 @@ message DecideRequest {
   // name and is out of its range.
   RequestFacts facts = 2;
   Constraints constraints = 3;
+  // The gateway sent this request before under this id and holds no answer
+  // to it, and the stream that carried it has ended: the gateway reads
+  // nothing more from that stream. The word is not said while that stream
+  // is open: an answer on its way is not held back, and it would carry a
+  // lease the word has ended, which no Dispatched can name. The controller
+  // finds the earlier lease by the id's 64-bit fingerprint, among the
+  // gateway's leases that wait for a dispatch: two ids of one gateway that
+  // share a fingerprint read as one request. A repeat its stream answers
+  // Busy before a decider takes it (no credit, a full queue, a budget of 0)
+  // ends nothing: the earlier lease waits out its dispatch deadline.
+  //
+  // Beside decode_of the word reaches one side. It takes back the issue of
+  // the decode side of the lease that field names, where a call issued it
+  // and no dispatch named it, and nothing else: no search by the id's
+  // fingerprint is run for a frame that carries decode_of, with the word or
+  // without. The side is chosen again and holds the first decision's decode
+  // targets, ahead of the decision and whatever its answer. A pick of the
+  // same frame issues it anew. Where the frame brings no pick, a Dispatched
+  // that names a target of the first decision books the side.
+  //
+  // A gateway that sent a decode call and read no answer asks it again with
+  // this word before it sends a decode. Until then the unread answer's
+  // issue stands, and a Dispatched names a target of that answer's pick: it
+  // would book a worker the decode never reached.
+  bool again = 4;
+  // This pair's decode is sent after its prefill has run. The decision names
+  // the decode targets and issues the prefill side alone: the decode side is
+  // chosen, books nothing and waits under no dispatch deadline. Read on a
+  // request that enters a pair plan at its prefill, and on no other.
+  bool decode_later = 5;
+  // This request asks the decode side of the pair's lease this id names,
+  // issued to this gateway, while its prefill is dispatched and not ended and
+  // its decode side is chosen. The facts and the constraints are the
+  // request's own, as on its first decision. It is read at the decode phase,
+  // whatever its facts' phase says, and its decode_later is not read. The
+  // answer's pick names decode targets, each with the lease's prefill, under
+  // the same lease id. A refusal is a Busy with a reason of its own, and a
+  // decision that sheds is no refusal of the request, whose prefill runs:
+  // behind either the gateway sends the decode the first pick named, and
+  // that Dispatched books the side. An id of 0 is out of range.
+  optional fixed64 decode_of = 6;
 }
 
 message DecideAnswer {
@@ -502,9 +548,9 @@ message WorkerEvent {
   // kinds a watcher can ask for when the rows were read (a standby's
   // snapshot stands at the log's head, at or after it; the rows are the
   // same at both); the tail starts after it. A registration call's answer
-  // carries the position of the call's write, and where the call wrote
-  // nothing the last position of those kinds: a watcher that has passed it
-  // holds the row as answered or a later one.
+  // carries a position at or after the call's write, and where the call
+  // wrote nothing the last position of those kinds: a watcher that has
+  // passed it holds the row as answered or a later one.
   uint64 seq = 1;
   uint64 membership_epoch = 2;
   oneof event {
@@ -520,9 +566,37 @@ message WorkerEvent {
     // retains: the stream ends and the watcher reconnects with resume_seq 0.
     // The event carries no position of its own: seq and term are 0.
     SnapshotRequired snapshot_required = 10;
+    // The answer of a RegisterWorker that states more than one rank
+    // (WorkerSpec.dp_size): what the call made of each rank. No watch tells
+    // it: a watcher is told each row's own event, and a reader that meets
+    // this case on a watch lets the stream go.
+    RankRows ranks = 12;
   }
   // The term `seq` was written under; a watcher hands both back on resume.
   uint64 term = 11;
+}
+
+// What a registration that states more than one rank made of each rank, in
+// rank order, then one entry for each row of the engine that left with it:
+// a rank a narrower worker no longer has, or the plain row of a worker that
+// comes back ranked. Each entry is the event a watcher is told of that row,
+// with no position of its own: the answer's seq, epoch and term are read
+// after the call's last write, so a watcher past them holds every rank as
+// answered or later. A call that wrote nothing answers each rank
+// `relabelled`, the row unmoved. At most 64 ranks (WorkerSpec.dp_size): a
+// replacement tells two rows, and the answer stays within half of a 4 MiB
+// frame.
+message RankRows {
+  repeated RankRow rows = 1;
+}
+
+message RankRow {
+  oneof made {
+    WorkerRow registered = 1;
+    Replaced replaced = 2;
+    Removed removed = 3;
+    WorkerRow relabelled = 4;
+  }
 }
 
 // Paged at 128 rows or at 2 MiB of rows, whichever comes first, every page at
@@ -621,6 +695,27 @@ message WorkerRow {
   // admitted where it is applied; a row an event changes keeps the
   // admission its standby holds.
   uint64 admitted_age_ms = 26;
+  // Who made the row. Absent: a control call. The caller that made a row
+  // alone changes it: an UPSERT or a REPLACE over it, a patch, a drain and
+  // a removal from any other are refused PERMISSION_DENIED, ahead of the
+  // revision's test, and the words name the maker. An ADD over it is
+  // ALREADY_EXISTS whoever made it. A reader that knows no such field
+  // reads every row as a control call's.
+  Maker maker = 27;
+}
+
+// A provider that finds workers by itself, as a row's maker. Neither
+// field is empty: a reader refuses a row whose maker lacks one, by that
+// field.
+message Maker {
+  // The provider's name: one token of visible ASCII (0x21 to 0x7E) with no
+  // comma, at most 128 bytes, the form of a principal's stated name.
+  string provider = 1;
+  // The provider's own key for the worker, at most 2048 bytes. A redacted
+  // snapshot does not tell it verbatim where it may hold a credential: a key
+  // with a scheme loses its userinfo as a URL does, and any other key that
+  // holds an `@` reads as `<unparsable address>`.
+  string key = 2;
 }
 
 // A host-local wire is reachable from one gateway only.
@@ -770,17 +865,22 @@ message RegisterWorkerRequest {
   enum Mode {
     // Reads as MODE_ADD.
     MODE_UNSPECIFIED = 0;
-    // The URL must be absent: ALREADY_EXISTS otherwise.
+    // The URL must be absent: ALREADY_EXISTS otherwise, whoever made the
+    // standing row.
     MODE_ADD = 1;
     // The URL must stand: its next incarnation, NOT_FOUND otherwise, whatever
     // the registration leaves unset. A field past its own rule or bound is
-    // INVALID_ARGUMENT first, whether the URL stands or not.
+    // INVALID_ARGUMENT first, whether the URL stands or not. A caller that
+    // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write nothing
     // and answer the row unmoved, a change of role, wire or models is a new
     // incarnation, any other change is made in place. The models change
     // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order.
+    // place, and the row tells the stated order. Over a draining row every
+    // registration is the URL's next incarnation, whatever its facts: a
+    // drain ends with the registration it named. A caller that did not make
+    // the standing row is PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
@@ -834,8 +934,29 @@ message WorkerSpec {
   // removing the worker and registering it again.
   PairingDescriptor pairing = 10;
   // 0: the data-parallel width is discovered where a handshake runs (always
-  // on) and is one rank where none does. Above 1: INVALID_ARGUMENT where no
-  // call answers a row a rank.
+  // on) and is one rank where none does. Above 1: one row a rank, rank r
+  // under the URL `url@r`, and the call answers a row a rank
+  // (WorkerEvent.ranks). Every rule holds before the first write: a
+  // refusal of a rank or of the group writes nothing. A lead lost between
+  // two ranks is UNAVAILABLE and leaves the ranks written before it: a
+  // MODE_UPSERT lays the rest, and so does the same MODE_ADD called again.
+  // At most 64: INVALID_ARGUMENT above, and above 1 where the controller's
+  // build lays no ranks.
+  //
+  // The modes hold for the engine. MODE_ADD: ALREADY_EXISTS where a row
+  // stands under a rank's URL or the engine stands in another form (its
+  // plain row, or ranks the registration does not state). One standing is
+  // the add's own: where every rank that stands is this caller's with
+  // equal facts and a rank is absent, the call lays the absent ranks and
+  // answers each standing rank `relabelled`, the row unmoved. An engine
+  // whose every rank stands is ALREADY_EXISTS, with equal facts too: an add
+  // whose answer was lost reads the rows (WatchWorkers). MODE_REPLACE:
+  // NOT_FOUND unless every stated rank stands; each is its next
+  // incarnation. MODE_UPSERT lays each rank over what stands. Under REPLACE
+  // and UPSERT the engine's rows that the registration does not state leave
+  // with it. A registration of one rank (0 or 1) for an engine that stands
+  // as ranks is FAILED_PRECONDITION: it states its width, or its ranks are
+  // removed first (DeregisterWorker, a rank at a time).
   uint32 dp_size = 11;
   Signals signals = 12;
   repeated string topology = 13;
@@ -857,6 +978,8 @@ message PatchWorkerRequest {
   repeated string remove_labels = 3;
   OverloadThresholds overload = 4;
   // The row's revision the caller read; FAILED_PRECONDITION when it moved.
+  // A caller that did not make the row is PERMISSION_DENIED first, whatever
+  // revision it read (WorkerRow.maker).
   uint64 revision = 5;
 }
 
@@ -896,7 +1019,9 @@ message SnapshotRequest {
   repeated string models = 2;
   // Admin only in the control scope: identifiers in clear.
   bool plain_identifiers = 3;
-  // Rows per slice at most; `truncated` says when it bit.
+  // Rows per slice at most; 0 sets no limit. A slice's rows are bounded by
+  // the bytes of a page as well, whatever is asked. `truncated` says when
+  // either bound left a row out.
   uint32 limit = 4;
 }
 
@@ -1300,6 +1425,12 @@ message ReplicationSnapshot {
   // Each row's `admitted_age_ms` is its age at the part's send.
   repeated WorkerRow workers = 4;
   repeated LoadSample loads = 5;
+  // The generation that stands at the leader when the part is sent, with its
+  // document, on the snapshot's first part: at the snapshot's place or
+  // after it, never before. Unset where the leader holds no document. A
+  // standby restored from the snapshot runs the document under this number;
+  // the event of the same generation, where it follows, changes nothing.
+  GenerationEvent generation = 6;
 }
 
 message ReplicationEvent {
@@ -1327,6 +1458,11 @@ message TermStart {}
 // A generation as the leader applied it (the status, the document the
 // gateways receive), so a standby serves GetPolicySpec and RollbackPolicySpec
 // and runs it after promotion; a rollback replicates the restored one alike.
+// A leader's log keeps the generation's number alone, and the document is
+// joined at the send: an event with no document states a generation that
+// stood no longer by then. A standby applies nothing for it and journals the
+// position; a later event carries what replaced it. A leader states the
+// generation that stands again behind the start of each term it takes.
 message GenerationEvent {
   SpecStatus status = 1;
   SpecPush document = 2;

@@ -37,7 +37,7 @@ pub struct BatchFacts {
 /// stands in the relay's count is no fact of the port: the collector counts
 /// the chunks of a stream and says a snapshot's start
 /// ([`ResyncReason::Snapshot`]) before the first chunk and a snapshot the
-/// stream ended in the middle of ([`ResyncReason::SnapshotAbandoned`]).
+/// stream did not finish ([`ResyncReason::SnapshotAbandoned`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotChunk {
     /// The snapshot could not cover the engine's whole life: the rank's
@@ -65,8 +65,8 @@ pub enum BatchOutcome {
 /// Why a rank's cursor was reset or its blocks replaced, and the label the
 /// resync is counted under. This crate's collector says four: `OutOfRange`
 /// and `DataLoss`, the server's own status codes, and a snapshot's two ends,
-/// `Snapshot` and `SnapshotAbandoned`. The gateway's sink finds two with its
-/// cursor, `PublisherRestart` and `GapCleared`, and counts a `Snapshot`
+/// `Snapshot` and `SnapshotAbandoned`. A host's sink may find two with its
+/// cursor, `PublisherRestart` and `GapCleared`, and count a `Snapshot`
 /// where it clears for one. The store's statement holds three more, a
 /// relay's frames, which no stream of this crate carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +75,7 @@ pub enum ResyncReason {
     OutOfRange,
     /// The server lost batches it cannot name.
     DataLoss,
-    /// The stream ended with a snapshot still arriving: a partial live set.
+    /// The stream ended or sent a malformed chunk before finishing a snapshot.
     SnapshotAbandoned,
     /// A sequence far below the cursor, or a clear below it: the publisher
     /// started over and its cache is empty.
@@ -135,7 +135,7 @@ pub struct KvCursor {
 /// every call. `rank` is the rank a batch names. What is a stream's the
 /// collector says to the id: a new connection, a snapshot's start (a resync
 /// for `Snapshot`, before the admit of its first chunk) and a snapshot the
-/// stream ended in the middle of.
+/// stream did not finish.
 pub trait KvEventSink: Send + Sync {
     /// The batch as the collector's wire crate defines it; a sink reads of
     /// it what its own index needs.

@@ -128,8 +128,8 @@ A family of a known call syntax costs a table and evidence, and no engine change
 4. Give it a corpus row in `tests/bellwether_parse_fixtures.rs` (the slug of each recorded set and
    how the template ends the generation prompt); the replay reads the table and the opener from the
    registry.
-5. Regenerate the README's models table (`SYMPHONY_WRITE_README=1 cargo test -p smg-symphony
-   --test readme`); a stale table fails the build.
+5. Add or change the group's row in the README's models table by hand; `cargo test -p
+   smg-symphony --test readme` fails when the table and the registry differ.
 
 A new call syntax costs an assembler (under `json`, `tagged`, `pythonic`, or `gemma`), a
 `CallSyntax` variant, an arm in the engine's assembler factory, and a grammar module under
@@ -143,8 +143,9 @@ Three tiers, two of them at run time:
 - **Dropped**: bytes the format consumed on purpose, each with a `DropReason`: a marker that moved
   the engine or a special token (`ControlToken`, `Wrapper`), the template's wrapping between regions
   (`Wrapper`), whitespace the format treats as structural (`Whitespace`), a call after the first
-  where the request takes one call only (`LaterCall`), a call the request forbade with
-  `tool_choice: none` and the model wrote anyway (`ForbiddenCall`, every call of the output), and
+  where the request takes one call only (`LaterCall`), a call the request forbade and the model
+  wrote anyway (`ForbiddenCall`: every call of the output under `tool_choice: none`, a call to a
+  function the choice leaves out under one that narrows the tools), and
   the bytes of a call block a syntax whose block is never prose could not read (`MalformedCall`,
   behind a `Malformed` event of no bytes that counts the failure). Dropped bytes are expected on
   every well-formed output, the last kind excepted.

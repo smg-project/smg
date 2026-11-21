@@ -26,10 +26,10 @@ mod dp_removal_tests {
     use smg::{
         app_context::AppContext,
         config::RouterConfig,
-        routers::http::router::Router as HttpRouter,
-        worker::{BasicWorkerBuilder, Worker},
+        routers::{grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter},
         workflow::create_worker_removal_workflow_data,
     };
+    use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker};
     use wfaas::WorkflowId;
 
     use super::*;
@@ -155,6 +155,7 @@ mod dp_removal_tests {
             url.to_string(),
             expected_revisions,
             Arc::clone(context),
+            WorkerJobAsker::Api,
         );
         let instance = engine
             .start_workflow(WorkflowId::new("worker_removal"), data)
@@ -538,10 +539,9 @@ mod discovery_ownership_tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerType};
     use smg::{
         config::RouterConfig,
-        routers::http::router::Router as HttpRouter,
-        service_discovery::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL},
-        worker::BasicWorkerBuilder,
+        routers::{grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter},
     };
+    use smg_service_discovery::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL};
 
     use super::*;
     use crate::common::{create_test_context, test_app::create_test_app_with_context};
@@ -762,10 +762,8 @@ async fn the_manifest_format_exports_the_registered_fleet() {
 mod pending_registration_tests {
     use std::{sync::Arc, time::Duration};
 
-    use smg::{
-        config::RouterConfig, routers::http::router::Router as HttpRouter,
-        worker::test_support::RefusedAddress,
-    };
+    use smg::{config::RouterConfig, routers::http::router::Router as HttpRouter};
+    use smg_worker::test_support::RefusedAddress;
     use wfaas::{StateStore, StepId, StepStatus};
 
     use super::*;

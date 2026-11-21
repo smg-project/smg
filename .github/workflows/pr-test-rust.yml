@@ -262,11 +262,12 @@ jobs:
           cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           # msgspec and pydantic gate the sidecar-protocol, fake-redis and
           # limit-options tests; numpy gates the Rust servicer's media bridge
-          # tests (it lends tensor buffers as numpy views). Modules gated on
+          # tests (it lends tensor buffers as numpy views); prometheus_client
+          # gates the SGLang scheduler-metrics tests. Modules gated on
           # zmq or vllm still skip here (-rs lists them): the zmq ones import
           # engine servicers that need torch, and the vllm cases run on the
           # vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq prometheus_client
           pytest -q grpc_servicer/tests -rs
 
       # The release tests drive scripts/release/release.sh, which runs `make`; this
@@ -440,6 +441,11 @@ jobs:
           # build.sh adds a missing target by one attempt; added here first,
           # behind the retry helper, it is not missing.
           bash scripts/ci_retry.sh 5 10 timeout 180 rustup target add wasm32-unknown-unknown
+          # The policy crate's `operator` feature builds for a target that has
+          # no spec store: the store's file calls are Linux's and macOS's, and a
+          # host's door elsewhere has no store to bind. This target stands for
+          # every such one, since it is installed here already.
+          cargo check --locked -p smg-policy-controller --no-default-features --features operator --target wasm32-unknown-unknown
           bash examples/wasm/wasm-guest-policy/build.sh
           cd examples/wasm/wasm-guest-policy
           bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 5 10 timeout 180 rustup toolchain install nightly --profile minimal --component rustfmt
@@ -951,6 +957,8 @@ jobs:
               - 'crates/tokenizer/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/kv_index/**'
+              - 'crates/workflow/**'
             rust-multimodal:
               - *rust-infra
               - 'crates/multimodal/**'
@@ -962,6 +970,8 @@ jobs:
               - 'crates/response_template/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/kv_index/**'
+              - 'crates/workflow/**'
             rust-agentic:
               - *rust-infra
               - 'crates/data_connector/**'
@@ -975,7 +985,10 @@ jobs:
               - *rust-infra
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/kv_index/**'
+              - 'crates/workflow/**'
               - 'crates/external_router/**'
+              - 'crates/service_discovery/**'
               - 'crates/auth/**'
               - 'crates/rl/**'
               - 'clients/rust/**'
@@ -992,6 +1005,7 @@ jobs:
               - 'crates/gateway_perf/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/tokenizer/**'
               - 'crates/kv_index/**'
             rust-kv:
@@ -1000,6 +1014,8 @@ jobs:
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
               - 'crates/policy_controller/**'
+              # The controller runs worker discovery behind its `discovery` feature.
+              - 'crates/service_discovery/**'
               # The controller binary's allocator settings are held to the
               # gateway's constant, which the crate's test reads from this file.
               - 'model_gateway/src/observability/metrics.rs'
@@ -1014,6 +1030,7 @@ jobs:
               - 'crates/mock_worker/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/tokenizer/**'
             rust-radix:
               - *rust-infra
@@ -1288,7 +1305,6 @@ jobs:
               ("model_gateway/src/rate_limit/**",                CORE),
               ("model_gateway/src/policies/**",                  CORE_EVERY_ENGINE_GO),
               ("model_gateway/src/mesh/**",                      CORE),
-              ("model_gateway/src/service_discovery/**",         CORE),
               ("model_gateway/src/wasm/**",                      CORE),
               ("model_gateway/src/server/tls.rs",                CORE),
               ("model_gateway/src/version.rs",                   CORE),
@@ -1353,6 +1369,10 @@ jobs:
               ("crates/mesh/**",                                 CORE),
               ("crates/mm_rdma/**",                              CORE),
               ("crates/rl/**",                                   CORE),
+              # worker discovery: the core, as the gateway's module was; its directory
+              # watch every lane, as the gateway's file was
+              ("crates/service_discovery/src/fs_watch.rs",       FULL),
+              ("crates/service_discovery/**",                    CORE),
               ("crates/wasm/**",                                 CORE),
               # the protocol types, the gRPC client with its proto package and the
               # workflow engine of the worker registration: every lane

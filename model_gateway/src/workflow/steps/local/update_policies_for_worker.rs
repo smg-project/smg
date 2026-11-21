@@ -107,8 +107,15 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
 mod tests {
     use std::sync::Arc;
 
-    use openai_protocol::worker::{
-        HealthCheckConfig, RuntimeType, WorkerType, WorkerUpdateRequest,
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, RuntimeType, WorkerType, WorkerUpdateRequest},
+    };
+    use smg_worker::{
+        identity::basic::{ConnectionMode, Worker},
+        jobs::WorkerJobAsker,
+        kv_events::SubscriptionKind,
+        test_support::ready_worker,
     };
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
@@ -117,10 +124,8 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        worker::{
-            test_support::ready_worker, BasicWorkerBuilder, ConnectionMode, KvEventMonitor,
-            ModelCard, SubscriptionKind, Worker, WorkerRegistry,
-        },
+        policies::kv_index::event_monitor::KvEventMonitor,
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::steps::local::create_worker_update_workflow_data,
     };
 
@@ -181,6 +186,7 @@ mod tests {
             "http://w1:8000".to_string(),
             update,
             Arc::clone(&app_context),
+            WorkerJobAsker::Api,
         );
         data.updated_workers = Some(workers);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
@@ -266,6 +272,7 @@ mod tests {
         drop(first);
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -327,6 +334,7 @@ mod tests {
         drop(first);
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -399,6 +407,7 @@ mod tests {
         );
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -465,6 +474,7 @@ mod tests {
         let url = second.url().to_string();
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -558,6 +568,7 @@ mod tests {
         );
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,

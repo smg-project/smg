@@ -6,24 +6,23 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_worker::identity::basic::Worker;
 use tracing::error;
 
-use crate::{
-    routers::{
-        common::overload,
-        error,
-        grpc::{
-            backend_client::{get_backend_client, BackendClient},
-            context::{ClientSelection, WorkerSelection},
-        },
+use crate::routers::{
+    common::overload,
+    error,
+    grpc::{
+        backend_client::{get_backend_client, BackendClient},
+        context::{ClientSelection, WorkerSelection},
     },
-    worker::Worker,
 };
 
-/// Acquire backend clients for the selected workers, with a dispatch-time
-/// overload re-check: one relaxed atomic read per already-chosen worker,
-/// closing the window between selection and dispatch in which a load report
-/// can flip the veto.
+/// Acquire backend clients for the selected workers. Where `shed` is set
+/// the call re-checks overload at dispatch: one relaxed atomic read per
+/// already-chosen worker, closing the window between selection and dispatch
+/// in which a load report can flip the veto. The caller sets `shed` for a
+/// selection the classic policies made, under `--worker-overload-shed`.
 pub(crate) async fn acquire_clients(
     workers: &WorkerSelection,
     model_id: &str,

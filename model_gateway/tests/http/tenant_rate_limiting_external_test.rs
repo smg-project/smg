@@ -17,12 +17,10 @@ use axum::http::{header::RETRY_AFTER, StatusCode};
 use common::test_app::{register_external_worker, register_external_worker_with_card};
 use openai_protocol::{
     chat::ChatCompletionRequest, interactions::InteractionsRequest, messages::CreateMessageRequest,
+    model_card::ModelCard,
 };
 use serde_json::{json, Value};
-use smg::{
-    routers::{external::ExternalRouterAdapter, RouterTrait},
-    worker::ModelCard,
-};
+use smg::routers::{external::ExternalRouterAdapter, RouterTrait};
 use smg_external_router::{known, ExternalRouterSpec};
 
 use super::{

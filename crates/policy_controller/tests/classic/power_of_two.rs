@@ -7,8 +7,9 @@ use std::time::Instant;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    ingest::rows, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PolicySpec,
-    PoolFacts, PowerOfTwoMetric, RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
+    load::load_report, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
+    PolicySpec, PoolFacts, PowerOfTwoMetric, RequestFacts, Role, Scratch, Side, SignalSource,
+    WorkerId,
 };
 
 use crate::{Outcome, Recorded, Replayed};
@@ -97,7 +98,7 @@ fn wire(report: Report) -> WorkerLoadResponse {
 /// the instant it was sampled.
 fn load_row(report: Report) -> LoadRow {
     let now = Instant::now();
-    rows::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
+    load_report::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
 }
 
 /// Each field of a recorded report reaches its field of the row: a report

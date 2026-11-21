@@ -3,10 +3,10 @@
 //! For each model the scorer keeps a partition of the request sizes among
 //! the pool's workers. Each listed worker owns a range of sizes, in the
 //! order the workers were listed, and the last range is open-ended. A
-//! prefill decision scores the owner of its prompt's size first, so
-//! requests of like size meet on one worker. When the owner is no survivor
-//! of the decision, the nearest listed survivor below it in the partition
-//! takes the request, else the nearest above.
+//! prefill decision scores every row of the worker that owns its prompt's
+//! size first, so requests of like size meet on one worker. When the owner
+//! is no survivor of the decision, the nearest listed survivor below it in
+//! the partition takes the request, else the nearest above.
 //!
 //! The partition is learned from a window of bookings. Every issued
 //! decision books its tokens on the worker it names
@@ -71,12 +71,14 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    decision::{Decision, Target},
-    framework::{Scorer, TieBand},
-    lease::{Lease, Lifecycle, Membership, Side},
+    document::spec::BucketParams,
+    engine::{
+        decision::{Decision, Target},
+        framework::{Scorer, TieBand},
+        view::{Candidate, Phase, RequestFacts, WorkerId},
+    },
     ring::Fence,
-    spec::BucketParams,
-    view::{Candidate, Phase, RequestFacts, WorkerId},
+    tracking::lease::{Lease, Lifecycle, Membership, Side},
 };
 
 /// The span of sizes a changed listing splits evenly among its workers, in
@@ -84,14 +86,24 @@ use crate::{
 /// replaces the split with ranges learned from the sizes seen.
 pub const SPAN: u32 = 4096;
 
-/// No member and no survivor: a booking whose worker left the listing, a
-/// member that is no survivor of the decision in progress.
+/// No member: a booking whose worker left the listing.
 const NONE: u32 = u32::MAX;
 
 /// The most bookings a window holds. The host's clock bounds the window; a
 /// clock that stands still would keep every booking, so past this many the
 /// oldest leaves as if its interval had passed.
 const WINDOW_CAP: usize = 1 << 20;
+
+/// The absolute part of the balance rule, in booked tokens, when the
+/// document names none.
+pub const DEFAULT_ABS_THRESHOLD: u32 = 64;
+
+/// The relative part of the balance rule when the document names none.
+pub const DEFAULT_REL_THRESHOLD: f32 = 1.5;
+
+/// The bookings' window and the cut's cadence, in seconds, when the document
+/// names none.
+pub const DEFAULT_ADJUST_INTERVAL_S: u32 = 5;
 
 /// The bucket scorer: the owner of the request's size first and every other
 /// survivor at zero, or the least booked survivor first when the balance
@@ -150,9 +162,9 @@ struct Pool {
     /// entry a decision made and listed nobody in: the decision that still
     /// holds it takes the model's next one.
     left: bool,
-    /// Per member, the place among the kept of the candidate it is in the
-    /// decision in progress, or [`NONE`]. Reused from decision to decision.
-    seats: Vec<u32>,
+    /// Whether each member has a surviving row in the decision in progress.
+    /// Reused from decision to decision.
+    seated: Vec<bool>,
     /// The rows of the view in the decision in progress that the partition
     /// does not list and the fence names, each by its place in the view and
     /// its worker's id, in the view's order. Written where the decision
@@ -185,8 +197,18 @@ struct Booking {
     at_micros: u64,
 }
 
-/// The booked tokens of a decision's survivors: the most, the least, and
-/// the first survivor that holds the least, by its place among the kept.
+/// Whose clock dates a booking.
+#[derive(Clone, Copy, Debug)]
+enum Clock {
+    /// The decider's own, at a decision's issue. It can go back.
+    Issue,
+    /// A gateway's word of a dispatch, told after the fact. A date behind
+    /// the window's is late, and no clock that went back.
+    Dispatch,
+}
+
+/// The booked tokens of a decision's surviving members: the most, the least,
+/// and the first member that holds the least, by its place in the listing.
 #[derive(Clone, Copy, Debug)]
 struct Loads {
     most: u64,
@@ -197,9 +219,13 @@ struct Loads {
 impl Bucket {
     pub fn new(params: &BucketParams) -> Self {
         Self {
-            abs_threshold: u64::from(params.abs_threshold.unwrap_or(64)),
-            rel_threshold: params.rel_threshold.unwrap_or(1.5),
-            interval_micros: u64::from(params.adjust_interval_s.unwrap_or(5)) * 1_000_000,
+            abs_threshold: u64::from(params.abs_threshold.unwrap_or(DEFAULT_ABS_THRESHOLD)),
+            rel_threshold: params.rel_threshold.unwrap_or(DEFAULT_REL_THRESHOLD),
+            interval_micros: u64::from(
+                params
+                    .adjust_interval_s
+                    .unwrap_or(DEFAULT_ADJUST_INTERVAL_S),
+            ) * 1_000_000,
             partitions: ArcSwap::from_pointee(FxHashMap::default()),
             listed: ArcSwap::from_pointee(FxHashMap::default()),
             relisting: Mutex::new(()),
@@ -272,7 +298,7 @@ impl Pool {
             next_cut_micros: 0,
             by_id: FxHashMap::default(),
             left: false,
-            seats: Vec::new(),
+            seated: Vec::new(),
             fenced: Vec::new(),
             sizes: Vec::new(),
         }
@@ -310,12 +336,12 @@ impl Pool {
         candidates: &[Candidate],
         kept: &[u32],
     ) -> Option<Loads> {
-        self.seats.clear();
-        self.seats.resize(self.members.len(), NONE);
+        self.seated.clear();
+        self.seated.resize(self.members.len(), false);
         let mut loads: Option<Loads> = None;
         // How many of the view's fenced rows stand before the row at hand.
         let mut behind = 0;
-        for (place, &row) in kept.iter().enumerate() {
+        for &row in kept {
             let id = candidates[row as usize].id;
             if LISTED {
                 while self.fenced.get(behind).is_some_and(|&(at, _)| at < row) {
@@ -329,19 +355,22 @@ impl Pool {
                 return None;
             };
             let member = member as usize;
-            self.seats[member] = place as u32;
+            if self.seated[member] {
+                continue;
+            }
+            self.seated[member] = true;
             let load = self.members[member].load;
             loads = Some(match loads {
                 None => Loads {
                     most: load,
                     least: load,
-                    lightest: place,
+                    lightest: member,
                 },
                 Some(so_far) => Loads {
                     most: so_far.most.max(load),
                     least: so_far.least.min(load),
                     lightest: if load < so_far.least {
-                        place
+                        member
                     } else {
                         so_far.lightest
                     },
@@ -496,9 +525,11 @@ impl Pool {
     /// booking on file it stands as said.
     ///
     /// `None` where that instant is more than `window_micros` before the
-    /// booking at the window's front, which [`Pool::book`] ages by: the
-    /// dispatch aged before it was told. Booked there, it would read as a
-    /// clock that went back, and end every booking it passed.
+    /// booking at the window's front: the dispatch aged before it was
+    /// told, and its booking would stand behind a window that passed it.
+    /// `None` too where the window is full and that instant is as far
+    /// before the booking behind the front: a full window loses its front
+    /// to the cap, and that one stands at the front next.
     fn dispatched_at(
         &self,
         issued_micros: u64,
@@ -510,24 +541,38 @@ impl Pool {
             return Some(said);
         };
         let at_micros = said.min(newest.at_micros.max(issued_micros));
-        (at_micros.saturating_add(window_micros) >= oldest.at_micros).then_some(at_micros)
+        // The newest date a booking can bear and not be aged by this one.
+        let reach = at_micros.saturating_add(window_micros);
+        let behind = if self.window.len() < WINDOW_CAP {
+            None
+        } else {
+            self.window.get(1)
+        };
+        (reach >= oldest.at_micros && behind.is_none_or(|next| reach >= next.at_micros))
+            .then_some(at_micros)
     }
 
     /// Book `tokens` on a member at `at_micros`. The bookings older than the
-    /// window leave first, each with its tokens off its worker's load, and
-    /// so does one dated more than the window after this one: a clock that
-    /// went back that far ends what it passed. A booking dated a little
-    /// before the window's oldest arrived out of its clock's order, as the
-    /// bookings of two deciders can, and nothing leaves on its account.
-    /// Inlined: the issue's booking ran it in line while it was its one
-    /// caller, and a call there costs every decision.
+    /// window leave first, each with its tokens off its worker's load. At
+    /// an issue so does one dated more than the window after this one: a
+    /// clock that went back that far ends what it passed. A dispatch's date
+    /// is late, and no clock that went back: no booking leaves for being
+    /// newer than it. A booking dated a little before the window's oldest
+    /// arrived out of its clock's order, as the bookings of two deciders
+    /// can, and nothing leaves on its account. Inlined: the issue's booking
+    /// ran it in line while it was its one caller, and a call there costs
+    /// every decision.
     #[inline]
-    fn book(&mut self, member: u32, tokens: u32, at_micros: u64, window_micros: u64) {
+    fn book(&mut self, member: u32, tokens: u32, at_micros: u64, window_micros: u64, clock: Clock) {
         if let Some(booked) = self.members.get_mut(member as usize) {
             booked.load = booked.load.saturating_add(u64::from(tokens));
         }
         while let Some(oldest) = self.window.front() {
-            let aged = at_micros.abs_diff(oldest.at_micros) > window_micros;
+            let passed = match clock {
+                Clock::Issue => at_micros.abs_diff(oldest.at_micros),
+                Clock::Dispatch => at_micros.saturating_sub(oldest.at_micros),
+            };
+            let aged = passed > window_micros;
             if !aged && self.window.len() < WINDOW_CAP {
                 break;
             }
@@ -634,9 +679,9 @@ impl Pool {
         }
     }
 
-    /// The survivor a size goes to among the seated: the owner of the
-    /// size's range, else the nearest seated owner below it in the
-    /// partition, else the nearest above; by its place among the kept.
+    /// The member a size goes to among the seated: the owner of the size's
+    /// range, else the nearest seated owner below it in the partition, else
+    /// the nearest above; by its place in the listing.
     fn owner(&self, tokens: u32) -> Option<usize> {
         let at = self
             .ranges
@@ -653,9 +698,8 @@ impl Pool {
         (0..=at)
             .rev()
             .chain(at + 1..self.ranges.len())
-            .map(|at| self.seats[self.ranges[at].member as usize])
-            .find(|&seat| seat != NONE)
-            .map(|seat| seat as usize)
+            .map(|at| self.ranges[at].member as usize)
+            .find(|&member| self.seated[member])
     }
 }
 
@@ -683,6 +727,7 @@ impl Lifecycle for Bucket {
                     lease.tokens,
                     lease.issued_micros,
                     self.interval_micros,
+                    Clock::Issue,
                 );
             }
         }
@@ -691,15 +736,18 @@ impl Lifecycle for Bucket {
     /// A stage that books at the issue books the worker that serves. A
     /// lease is issued on its pick's first target, and the lease a host
     /// tells at its first dispatch names the target that dispatch took and
-    /// the worker its issue booked ([`Lease::booked`]). Where the dispatch
-    /// took the first target, or another target of that worker (another
-    /// rank of it, or the one prefill of a pair pick), the booking of the
-    /// issue stands and the call returns at once. Under a host that names
-    /// no such worker, the first target alone is read as the issue's. A
-    /// dispatch on another worker books the lease's tokens there too, at
-    /// the dispatch's instant, unless it aged before it was told. The
-    /// booking of the issue ages off the first target with its interval:
-    /// nothing is un-booked. A host tells a lease's first dispatch alone.
+    /// the worker its issue booked ([`Lease::booked`]). A pair's decode
+    /// that no call issued is issued at its dispatch, on the target that
+    /// dispatch took, and its lease names that worker as booked. Where the
+    /// dispatch took the first target, or another target of the worker the
+    /// issue booked (another rank of it, or the one prefill of a pair
+    /// pick), the booking of the issue stands and the call returns at
+    /// once. Under a host that names no such worker, the first target
+    /// alone is read as the issue's. A dispatch on another worker books
+    /// the lease's tokens there too, at the dispatch's instant, unless it
+    /// aged before it was told. The booking of the issue ages off its
+    /// worker with its interval: nothing is un-booked. A host tells a
+    /// lease's first dispatch alone.
     fn on_dispatched(
         &self,
         lease: &Lease,
@@ -731,7 +779,13 @@ impl Lifecycle for Bucket {
                 self.interval_micros,
             );
             if let Some(at_micros) = dated {
-                pool.book(member, lease.tokens, at_micros, self.interval_micros);
+                pool.book(
+                    member,
+                    lease.tokens,
+                    at_micros,
+                    self.interval_micros,
+                    Clock::Dispatch,
+                );
             }
         }
     }
@@ -849,6 +903,11 @@ impl Scorer for Bucket {
         "bucket"
     }
 
+    // Places by its book of issues and dispatches: a late one moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn score(
         &self,
         facts: &RequestFacts<'_>,
@@ -915,14 +974,20 @@ impl Scorer for Bucket {
             };
             pool.cut_if_due(facts.now_micros, self.interval_micros);
             let spills = loads.most - loads.least > self.abs_threshold
-                && loads.most as f32 > self.rel_threshold * loads.least as f32;
+                && loads.most as f64 > f64::from(self.rel_threshold) * loads.least as f64;
             let leads = if spills {
                 Some(loads.lightest)
             } else {
                 pool.owner(facts.prompt_tokens)
             };
-            if let Some(score) = leads.and_then(|place| out.get_mut(place)) {
-                *score = 1.0;
+            if let Some(id) =
+                leads.and_then(|member| pool.members.get(member).map(|member| member.id))
+            {
+                for (&row, score) in kept.iter().zip(out) {
+                    if candidates[row as usize].id == id {
+                        *score = 1.0;
+                    }
+                }
             }
             return TieBand::NORMALIZED;
         }
@@ -933,9 +998,12 @@ impl Scorer for Bucket {
 mod tests {
     use super::*;
     use crate::{
-        decision::{Pair, Pick, Target, Targets},
+        engine::{
+            decision::{Pair, Pick, Target, Targets},
+            view,
+            view::Health,
+        },
         ring::FENCE,
-        view::Health,
         Catalog, Constraints, PolicySpec, PoolFacts, Scratch, SpecError,
     };
 
@@ -981,9 +1049,9 @@ mod tests {
         }
     }
 
-    /// The row the scorer leads with among `kept`; `None` when every
-    /// survivor scores equal. One survivor at most leads, at the top of the
-    /// scale, and every other stands at zero.
+    /// The first row of the worker the scorer leads with among `kept`; `None`
+    /// when every survivor scores equal. Every row of one worker at most
+    /// leads, at the top of the scale, and every other stands at zero.
     fn led_by(
         scorer: &Bucket,
         facts: &RequestFacts<'_>,
@@ -1001,7 +1069,14 @@ mod tests {
             .filter(|&(_, &score)| score > 0.5)
             .map(|(&row, _)| row)
             .collect();
-        assert!(leads.len() <= 1, "{out:?}");
+        if let Some(&first) = leads.first() {
+            assert!(
+                leads
+                    .iter()
+                    .all(|&row| pool[row as usize].id == pool[first as usize].id),
+                "{out:?}"
+            );
+        }
         assert!(
             out.iter().all(
                 |&score| score.to_bits() == 0f32.to_bits() || score.to_bits() == 1f32.to_bits()
@@ -1302,6 +1377,29 @@ mod tests {
         assert_eq!(led_by(&scorer, &facts, &pool, &[0, 2]), Some(0), "20 apart");
         let (scorer, pool) = booked(32, 1.5, &[100, 10, 60]);
         assert_eq!(led_by(&scorer, &facts, &pool, &[0, 2]), Some(2));
+    }
+
+    #[test]
+    fn the_balance_rule_uses_the_stored_relative_threshold_at_an_integer_boundary() {
+        let (scorer, pool) = booked(64, 1.3, &[286, 220]);
+        assert_eq!(led(&scorer, &pool, 0, SECOND), Some(1));
+    }
+
+    #[test]
+    fn large_exact_loads_still_cross_the_balance_gate() {
+        let scorer = scorer(64, 1.0, 5);
+        let pool = pool(2);
+        led(&scorer, &pool, 0, SECOND);
+        for row in 0..2 {
+            for _ in 0..256 {
+                book(&scorer, &pool, row, u32::MAX, SECOND);
+            }
+        }
+        book(&scorer, &pool, 0, 321, SECOND);
+        book(&scorer, &pool, 1, 256, SECOND);
+
+        assert_eq!(loads(&scorer).0, vec![(1 << 40) + 65, 1 << 40]);
+        assert_eq!(led(&scorer, &pool, 0, SECOND), Some(1));
     }
 
     /// Three workers listed at ten seconds, then ten bookings of 100 tokens,
@@ -1679,6 +1777,90 @@ mod tests {
     }
 
     #[test]
+    fn all_rows_of_the_bucket_owner_score_alike() {
+        let pool = pool(2);
+        let mut candidates = [
+            pool[0],
+            Candidate {
+                position: 1,
+                dp_rank: 1,
+                ..pool[0]
+            },
+            Candidate {
+                position: 2,
+                ..pool[1]
+            },
+        ];
+        let scores = |candidates: &[Candidate]| {
+            let scorer = scorer(NEVER, 1.5, 5);
+            let mut out = vec![0.5; candidates.len()];
+            assert_eq!(
+                scorer.score(
+                    &prefill("m", 0, SECOND),
+                    candidates,
+                    &all(candidates),
+                    &mut out,
+                ),
+                TieBand::NORMALIZED
+            );
+            let score = |id, rank| {
+                candidates
+                    .iter()
+                    .zip(&out)
+                    .find(|(candidate, _)| candidate.id == id && candidate.dp_rank == rank)
+                    .map(|(_, &score)| score)
+            };
+            [
+                score(pool[0].id, 0),
+                score(pool[0].id, 1),
+                score(pool[1].id, 0),
+            ]
+        };
+        assert_eq!(scores(&candidates), [Some(1.0), Some(1.0), Some(0.0)]);
+        candidates.swap(0, 1);
+        for (position, candidate) in candidates.iter_mut().enumerate() {
+            candidate.position = position as u32;
+        }
+        assert_eq!(scores(&candidates), [Some(1.0), Some(1.0), Some(0.0)]);
+    }
+
+    #[test]
+    fn the_balance_rule_spills_to_every_row_of_the_least_booked_worker() {
+        let pool = pool(2);
+        let candidates = [
+            pool[0],
+            Candidate {
+                position: 1,
+                dp_rank: 1,
+                ..pool[0]
+            },
+            Candidate {
+                position: 2,
+                ..pool[1]
+            },
+        ];
+        let scorer = scorer(32, 1.5, 5);
+        let mut out = vec![0.5; candidates.len()];
+        scorer.score(
+            &prefill("m", 0, SECOND),
+            &candidates,
+            &all(&candidates),
+            &mut out,
+        );
+        book(&scorer, &candidates, 2, 100, SECOND);
+
+        // 3,000 is worker 101's size in the even split of two: worker 100's
+        // rows lead only because 100 booked against 0 spills.
+        scorer.score(
+            &prefill("m", 3_000, SECOND),
+            &candidates,
+            &all(&candidates),
+            &mut out,
+        );
+        assert_eq!(out, [1.0, 1.0, 0.0]);
+    }
+
+    #[test]
     fn a_replaced_handle_keeps_its_place_and_a_snapshot_keeps_the_workers_it_names() {
         let (scorer, pool) = three_classes();
         led(&scorer, &pool, 0, 15 * SECOND);
@@ -1812,8 +1994,8 @@ mod tests {
         assert_eq!(loads(&scorer), (vec![0, 10, 0], 10));
         // The first lease's dispatch on the third row is told then, dated
         // 250 microseconds behind its decision: more than an interval
-        // before the booking on file. Booked there it would read as a clock
-        // that went back, and end the newer booking.
+        // before the booking on file. It aged before it was told, and books
+        // nothing.
         dispatch(&scorer, pool[2].id, 1, 300, SECOND, 250);
         assert_eq!(loads(&scorer), (vec![0, 10, 0], 10));
         assert_eq!(last_booked_at(&scorer), Some(3 * SECOND));
@@ -1839,6 +2021,125 @@ mod tests {
         // nothing, and the three newer bookings stand.
         dispatch(&scorer, pool[2].id, 1, 16, 89 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![7, 8, 0], 15));
+    }
+
+    #[test]
+    fn a_late_dispatch_into_a_full_window_ends_no_newer_booking() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let tenth = SECOND / 10;
+        led(&scorer, &pool, 0, 10 * SECOND);
+        book(&scorer, &pool, 0, 1, 100 * tenth);
+        for _ in 2..WINDOW_CAP {
+            book(&scorer, &pool, 1, 1, 105 * tenth);
+        }
+        let full = WINDOW_CAP as u64;
+        assert_eq!(loads(&scorer), (vec![1, full - 2, 0], full - 1));
+        // One booking short of its cap the window loses no front unaged,
+        // and the front alone holds the date: a dispatch dated within an
+        // interval of it is booked, and fills the window.
+        dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![1, full - 2, 8], full + 7));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // A full window loses its front to the cap, whatever its age, and
+        // the booking behind it is the first one aged. The same dispatch
+        // now books nothing: more than an interval before that booking, it
+        // aged before it was told.
+        dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![1, full - 2, 8], full + 7));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // One dated exactly an interval before that booking is booked: the
+        // guard admits a date exactly an interval away, and the cap ends
+        // the front alone.
+        dispatch(&scorer, pool[2].id, 1, 8, 95 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![0, full - 2, 16], full + 14));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+    }
+
+    #[test]
+    fn a_late_dispatch_is_held_against_the_front_of_a_full_window_too() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let tenth = SECOND / 10;
+        led(&scorer, &pool, 0, 10 * SECOND);
+        // The second booking arrived out of its clock's order, an interval
+        // before the first, and the window fills behind the two.
+        book(&scorer, &pool, 0, 1, 100 * tenth);
+        book(&scorer, &pool, 1, 1, 90 * tenth);
+        for _ in 2..WINDOW_CAP {
+            book(&scorer, &pool, 1, 1, 105 * tenth);
+        }
+        let full = WINDOW_CAP as u64;
+        assert_eq!(loads(&scorer), (vec![1, full - 1, 0], full));
+        // A dispatch dated within an interval of the booking behind the
+        // front, and more than an interval before the front, aged before it
+        // was told, as it did in a window short of its cap: it books
+        // nothing.
+        dispatch(&scorer, pool[2].id, 1, 8, 85 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![1, full - 1, 0], full));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // One dated within an interval of both is booked, and the cap ends
+        // the front alone: the booking step stops at the one behind it,
+        // and the newer bookings behind that one stand.
+        dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![0, full - 1, 8], full + 7));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+    }
+
+    #[test]
+    fn a_late_dispatch_ends_no_booking_newer_than_its_date() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let tenth = SECOND / 10;
+        led(&scorer, &pool, 0, 10 * SECOND);
+        // Three bookings arrive out of their clocks' order, and the window
+        // fills behind them. The first of the newer ones ends the first of
+        // the three as aged: the full window stands on a front, an older
+        // booking behind it, and newer ones behind that.
+        book(&scorer, &pool, 0, 1, 96 * tenth);
+        book(&scorer, &pool, 0, 1, 105 * tenth);
+        book(&scorer, &pool, 1, 1, 90 * tenth);
+        for _ in 2..WINDOW_CAP {
+            book(&scorer, &pool, 1, 1, 112 * tenth);
+        }
+        let full = WINDOW_CAP as u64;
+        assert_eq!(loads(&scorer), (vec![1, full - 1, 0], full));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // A dispatch dated no more than an interval before the front, and
+        // no more than an interval before the booking behind it, is booked.
+        // The cap ends the front, and the booking behind it leaves as aged,
+        // more than an interval older than the dispatch. The newer ones
+        // stand: the dispatch's date is late, and no clock that went back.
+        dispatch(&scorer, pool[2].id, 1, 8, 101 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![0, full - 2, 8], full + 6));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP - 1);
+    }
+
+    #[test]
+    fn a_late_dispatch_ends_no_newer_booking_short_of_the_cap_either() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let hundredth = SECOND / 100;
+        led(&scorer, &pool, 0, 100 * SECOND);
+        // Two issues an interval apart, and a dispatch dated before both,
+        // within an interval of the front.
+        book(&scorer, &pool, 0, 1, 10_020 * hundredth);
+        book(&scorer, &pool, 0, 2, 10_120 * hundredth);
+        dispatch(&scorer, pool[2].id, 1, 4, 9_920 * hundredth, 100_000);
+        assert_eq!(loads(&scorer), (vec![3, 0, 4], 7));
+        // An issue at 101.9 s ends the front as aged. One at 100.15 s, a
+        // clock that stepped back, ends the next front. The dispatch's
+        // booking stands at the front, the booking of 101.9 s behind it.
+        book(&scorer, &pool, 1, 8, 10_190 * hundredth);
+        book(&scorer, &pool, 1, 16, 10_015 * hundredth);
+        assert_eq!(loads(&scorer), (vec![0, 24, 4], 28));
+        // A dispatch dated 100.5 s: more than an interval after the front,
+        // and more than an interval before the booking behind it. The front
+        // leaves as aged. The newer booking stands, in a window far short
+        // of its cap.
+        dispatch(&scorer, pool[2].id, 1, 32, 10_050 * hundredth, 0);
+        assert_eq!(loads(&scorer), (vec![0, 24, 32], 56));
+        assert_eq!(of(&scorer, "m").lock().window.len(), 3);
     }
 
     #[test]
@@ -1955,6 +2256,136 @@ mod tests {
             250,
         );
         assert_eq!(loads(&scorer), (vec![300, 300, 300], 900));
+    }
+
+    /// A pair's decode that goes out with no decode call is told issued at
+    /// its dispatch, on the target the dispatch took, and then dispatched
+    /// as booked there, as a store tells both words: no position, the
+    /// issue dated when the store is told. One booking stands on the
+    /// worker that serves, whichever target was taken, and a booking made
+    /// since the dispatch stands with it. Dated as the gateway dates the
+    /// dispatch, more than a window behind that booking, the same issue
+    /// would end it: a clock that went back.
+    #[test]
+    fn a_decode_issued_at_its_dispatch_books_once_and_ends_no_newer_booking() {
+        // The pair was decided at one second and its decode sent 250
+        // microseconds later. The store is told at three seconds, behind
+        // a booking of the fourth row made then, under a window of one.
+        let datings = [(3 * SECOND, 1_000_u64), (SECOND + 250, 0)];
+        for taken in [0_u8, 1] {
+            for (issued_micros, stands) in datings {
+                let scorer = scorer(NEVER, 1.5, 1);
+                let pool = pool(4);
+                led(&scorer, &pool, 0, SECOND);
+                book(&scorer, &pool, 3, 1_000, 3 * SECOND);
+                // Each target names the one prefill, the first row, with
+                // another decode: the second row, then the third.
+                let target = |decode: usize| Target {
+                    id: pool[0].id,
+                    pair: Some(Pair {
+                        decode_id: pool[decode].id,
+                        ..Pair::default()
+                    }),
+                    ..Target::default()
+                };
+                let mut targets = Targets::new();
+                targets.push(target(1));
+                targets.push(target(2));
+                let decision = Decision::Pick(Pick {
+                    targets,
+                    ..Pick::default()
+                });
+                let serves = 1 + usize::from(taken);
+                let lease = |issued_micros: u64| Lease {
+                    side: Side::Decode,
+                    target_index: taken,
+                    booked: pool[serves].id,
+                    tokens: 300,
+                    issued_micros,
+                    ..Lease::default()
+                };
+                scorer.on_decision_issued(&lease(issued_micros), &decision);
+                let sent = Target {
+                    id: pool[serves].id,
+                    ..Target::default()
+                };
+                scorer.on_dispatched(&lease(SECOND), &sent, Side::Decode, 250);
+                let mut booked = vec![0, 0, 0, stands];
+                booked[serves] = 300;
+                let read = loads(&scorer);
+                assert_eq!(
+                    read,
+                    (booked, 300 + stands),
+                    "target {taken} at {issued_micros}"
+                );
+            }
+        }
+    }
+
+    /// A pair's decode side as the store files it. The lease the store
+    /// derives for the side names the side's own worker as the one its
+    /// issue booked: a dispatch on another rank of that worker leaves the
+    /// booking of the issue as it stands.
+    #[test]
+    fn a_decode_side_s_dispatch_on_another_rank_of_its_worker_books_nothing() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        // Both targets of the pick name the one prefill, the first row,
+        // and two ranks of one decode, the second row.
+        let mut targets = Targets::new();
+        for rank in [0, 1] {
+            targets.push(Target {
+                position: 0,
+                id: pool[0].id,
+                dp_rank: 0,
+                pair: Some(Pair {
+                    decode_position: 1,
+                    decode_id: pool[1].id,
+                    decode_dp_rank: rank,
+                }),
+            });
+        }
+        let picked = crate::store::Picked::of_decodes(&targets);
+        let decision = Decision::Pick(Pick {
+            targets,
+            ..Pick::default()
+        });
+        // The record's own lease as its decider issues it: it books the
+        // pick's first target, the prefill.
+        let prefill = Lease {
+            side: Side::Prefill,
+            target_index: 0,
+            booked: pool[0].id,
+            tokens: 300,
+            issued_micros: SECOND,
+            ..Lease::default()
+        };
+        let side = crate::store::DecodeSide {
+            target: pool[1].id,
+            picked,
+            session: view::Session::NONE,
+            state: crate::store::LeaseState::ISSUED,
+            tokens: 300,
+            target_index: 0,
+        };
+        let decode = side.lease(&prefill);
+        scorer.on_decision_issued(&decode, &decision);
+        assert_eq!(loads(&scorer), (vec![0, 300, 0], 300));
+        // The side's first dispatch, on the second target, as the store
+        // tells it: the side's lease with the frame's index, on the side's
+        // own worker.
+        let told = Lease {
+            target_index: 1,
+            ..decode
+        };
+        let on = Target {
+            id: pool[1].id,
+            dp_rank: 1,
+            ..Target::default()
+        };
+        scorer.on_dispatched(&told, &on, Side::Decode, 250);
+        assert_eq!(loads(&scorer), (vec![0, 300, 0], 300), "booked once");
     }
 
     #[test]

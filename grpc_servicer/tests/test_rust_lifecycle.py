@@ -1044,6 +1044,38 @@ def test_the_default_publisher_port_is_a_free_one_not_the_engines_fixed_default(
     assert rust_lifecycle.KV_EVENTS_PORT_FLOOR <= base and base + 3 < low
 
 
+def test_free_port_draws_again_on_an_excluded_port_and_gives_up_after_its_attempts(monkeypatch):
+    draws = iter([50071, 50072, 41234])
+
+    class Drawn:
+        def __init__(self, *args):
+            self.port = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def bind(self, address):
+            self.port = next(draws)
+
+        def getsockname(self):
+            return ("127.0.0.1", self.port)
+
+    # The module's own name only: asyncio and other tests keep the real socket class.
+    fake = types.SimpleNamespace(
+        socket=Drawn, AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM
+    )
+    monkeypatch.setattr(rust_lifecycle, "socket", fake)
+    assert rust_lifecycle.free_port(exclude=(50071, 50072, None)) == 41234
+
+    monkeypatch.setattr(rust_lifecycle, "FREE_PORT_ATTEMPTS", 3)
+    draws = iter([50071] * 3)
+    with pytest.raises(OSError, match="50071"):
+        rust_lifecycle.free_port(exclude=(50071,))
+
+
 def test_the_ports_are_drawn_from_below_the_ephemeral_range(tmp_path, monkeypatch, caplog):
     """An outbound connection the engine opens while its model loads draws its
     source port from the OS's ephemeral range, and could take a port picked
@@ -1168,7 +1200,8 @@ def test_drain_deadline_bounds_active_requests_and_older_bindings(count):
         """Measure that pending requests receive their full grace period."""
         start = asyncio.get_running_loop().time()
         assert await rust_lifecycle.drain_server(server, engine, 0.01, 0.002)
-        assert asyncio.get_running_loop().time() - start >= 0.01
+        # 1e-6: a wait timed on a large monotonic clock can come out a rounding step short.
+        assert asyncio.get_running_loop().time() - start >= 0.01 - 1e-6
 
     asyncio.run(run())
 
