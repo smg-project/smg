@@ -46,6 +46,14 @@ fn not_run(at: usize, model: &str, field: &str, because: &str) -> String {
 
 const BY_SETTINGS: &str = "the gateway's placement runs the routing settings' own";
 
+/// A pair document whose binding holds its sides' phases alone, as a
+/// gateway that places single requests asks of it.
+fn pair_sides() -> Result<PolicySpec, Box<dyn Error>> {
+    let mut document = PolicySpec::pair_presets("round_robin", "round_robin")?;
+    document.bindings[0].matcher.phase = vec![Phase::Prefill, Phase::Decode];
+    Ok(document)
+}
+
 /// The gateway's own placement runs a binding's overload thresholds, its
 /// key sources and its sessions rule from the routing settings, and runs no
 /// shadow. A supplied document that states one of them otherwise would
@@ -166,7 +174,7 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
     assert_eq!(words, refusal(&supplied(ruled))?);
 
     // A second pair binding.
-    let mut twice = PolicySpec::pair_presets("round_robin", "round_robin")?;
+    let mut twice = pair_sides()?;
     let again = twice.bindings[0].clone();
     twice.bindings.push(again);
     let words = not_run(2, "*", "plan", "an earlier binding plans the pair");
@@ -200,7 +208,7 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
 /// second pair binding never asked: the start refuses each by name.
 #[test]
 fn a_supplied_pair_binding_names_every_model_and_stands_alone() -> Case {
-    let pair = || PolicySpec::pair_presets("round_robin", "round_robin");
+    let pair = pair_sides;
     assert!(start_in_process(&supplied(pair()?), None)?.is_some());
 
     let mut document = pair()?;
@@ -226,6 +234,65 @@ fn a_supplied_pair_binding_names_every_model_and_stands_alone() -> Case {
     Ok(())
 }
 
+/// A pair binding plans no single request. One that covers the single
+/// phase, by a list that names no phase or by name, takes its models'
+/// single requests from every binding behind it: the classic policy would
+/// place them and no line would say so. In a gateway that places single
+/// requests the start refuses it by `match.phase`, and takes the binding
+/// that holds its sides' phases alone. A pair mode places no single
+/// request, and starts under either.
+#[test]
+fn a_pair_binding_holds_its_sides_phases_in_a_gateway_that_places_single_requests() -> Case {
+    let pair = || PolicySpec::pair_presets("round_robin", "round_robin");
+    let words = not_run(
+        1,
+        "*",
+        "match.phase",
+        "this gateway places single requests and a pair binding plans none: \
+         a pair binding holds its sides' phases alone (`phase: [prefill, decode]`)",
+    );
+    // A regular gateway places single requests alone.
+    assert_eq!(refusal(&supplied(pair()?))?, words);
+    let mut named = pair()?;
+    named.bindings[0].matcher.phase = vec![Phase::Single, Phase::Prefill, Phase::Decode];
+    assert_eq!(refusal(&supplied(named))?, words);
+    assert!(start_in_process(&supplied(pair_sides()?), None)?.is_some());
+
+    // A gateway of many routers places them beside its pairs.
+    let many_routers = |document: PolicySpec| RouterConfig {
+        enable_igw: true,
+        ..supplied(document)
+    };
+    assert_eq!(refusal(&many_routers(pair()?))?, words);
+    assert!(start_in_process(&many_routers(pair_sides()?), None)?.is_some());
+
+    // The encode plan's binding names its three sides.
+    let encode = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin")?;
+    assert_eq!(
+        refusal(&supplied(encode))?,
+        not_run(
+            1,
+            "*",
+            "match.phase",
+            "this gateway places single requests and a pair binding plans none: \
+             a pair binding holds its sides' phases alone (`phase: [encode, prefill, decode]`)",
+        )
+    );
+
+    // A pair mode places no single request.
+    let pair_mode = RouterConfig {
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        ..supplied(pair()?)
+    };
+    assert!(start_in_process(&pair_mode, None)?.is_some());
+    Ok(())
+}
+
 /// The document's own rules, apart from its bindings. The placement pairs
 /// by the routing settings' mode and picks a pair's decode with its
 /// prefill, and no decision is kept for explain: a supplied document that
@@ -233,7 +300,7 @@ fn a_supplied_pair_binding_names_every_model_and_stands_alone() -> Case {
 /// in a document that plans no pair has no request, and states nothing.
 #[test]
 fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
-    let pair = || PolicySpec::pair_presets("round_robin", "round_robin");
+    let pair = pair_sides;
     // Each refusal names the field and says what the operator can do.
     let stated = |field: &str, because: &str, instead: &str| {
         format!(

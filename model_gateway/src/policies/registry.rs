@@ -1008,13 +1008,15 @@ impl PolicyRegistry {
                 }
                 (Place::Unbound, _) if supplied => {
                     warn!(
-                        "Model {model_id}: no binding of the policy document names it, \
-                         the classic policies place it"
+                        "Model {model_id}: no binding of the policy document plans its single requests, \
+                         the classic policies place them"
                     );
                     Metrics::record_policy_unbound_model();
                 }
                 // A binding that plans no single request names the model: a
-                // pair's, whose requests the side policies place.
+                // pair's, whose requests the side policies place. The start
+                // refuses a supplied document under which this gateway
+                // would place a single request of such a model.
                 (Place::Unbound | Place::NoSide | Place::NotAlone { .. }, _) => {}
             }
         }

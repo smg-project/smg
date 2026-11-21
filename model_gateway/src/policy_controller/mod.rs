@@ -378,7 +378,11 @@ fn engine_for(
 /// runs, and the gateway would run the settings' value in silence. So
 /// would a binding of some models that covers a side's phase, in a
 /// gateway that places pairs: the side's policy places those models'
-/// pair requests, whatever that binding says.
+/// pair requests, whatever that binding says. And so would a pair binding
+/// that covers the single phase, in a gateway that places single
+/// requests. It plans none and takes them from every binding behind it,
+/// so the classic policy would place them and no line would say so: it
+/// names its sides' phases alone.
 ///
 /// The document's own rules stand beside its bindings'. The placement
 /// pairs a prefill with a decode by the routing settings' mode and picks a
@@ -402,12 +406,18 @@ fn rule_not_run(
     const ONE_A_SIDE: &str = "one policy places each side of a pair, for every model";
     const SINGLE_ALONE: &str = "one policy places each side of a pair, for every model: \
                                 a binding of some models holds single requests alone (`phase: [single]`)";
+    const PAIR_SIDES: &str = "this gateway places single requests and a pair binding plans none: \
+                              a pair binding holds its sides' phases alone (`phase: [prefill, decode]`)";
+    const EPD_SIDES: &str = "this gateway places single requests and a pair binding plans none: \
+                             a pair binding holds its sides' phases alone (`phase: [encode, prefill, decode]`)";
+    let pair_mode = matches!(
+        config.mode,
+        RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+    );
     // A pair mode, and a gateway of many routers, which mounts every family.
-    let places_pairs = config.enable_igw
-        || matches!(
-            config.mode,
-            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
-        );
+    let places_pairs = config.enable_igw || pair_mode;
+    // Every other mode, and a gateway of many routers.
+    let places_singles = config.enable_igw || !pair_mode;
     // What the routing settings say of a binding's own rules: the one
     // binding of their document.
     let run = settings.bindings.first().cloned().unwrap_or_default();
@@ -439,6 +449,16 @@ fn rule_not_run(
             }
             if pair_planned {
                 return Err(refused("plan", "an earlier binding plans the pair"));
+            }
+            // A list that names no phase covers every phase.
+            let phases = &binding.matcher.phase;
+            if places_singles && (phases.is_empty() || phases.contains(&Phase::Single)) {
+                let sides = if binding.plan == Some(PlanName::Epd) {
+                    EPD_SIDES
+                } else {
+                    PAIR_SIDES
+                };
+                return Err(refused("match.phase", sides));
             }
             pair_planned = true;
         } else if places_pairs
