@@ -157,8 +157,10 @@ is a later step).
   `closed` at the stop and at a cut alike, as it is for the object that closed at its brace. The
   events and their order are what they were, so a driver that does not read the field sees no
   change. One that fails its request on a call the model did not finish reads it there, beside
-  `MalformedReason::loses_a_call` for a call the syntax could not read whole and
-  `Dropped { MalformedCall }` for the bytes of a block it refused. A block that named no call
+  `MalformedReason::loses_a_call` for a call the syntax could not read whole: the reason is the
+  word on that, on every refusal, since the bytes a syntax refuses leave as
+  `Dropped { MalformedCall }` whether a call lost them or not (a closing tag that names nothing
+  open is dropped so, and costs no call anything). A block that named no call
   has no end to carry the word: the output's end that found it open refuses its bytes in that
   last step, before the `Finish`. An invoke of the XML syntax that the output ended in before
   any byte of its name holds no byte to refuse, and says the same reason by a `Malformed` event
@@ -193,7 +195,12 @@ is a later step).
   after the last is held, a terminal the table ignores inside it in its place, and dropped as
   the template's spacing when a row ends the stay or the stream does. So a client reads prose
   between two calls, or after a call's object, as the model wrote it, byte for byte, whole and
-  streamed alike.
+  streamed alike. One syntax reads tags there: between a block's calls of the XML syntax, whose
+  calls are tags, a closing tag names nothing open, since no call is, and is ignored as the
+  syntax ignores one between a call's members (`Engine::wrapping_tags`): one
+  `Malformed { StrayClosingTag }` event of no bytes, the tag's bytes `Dropped { MalformedCall }`
+  and never content. The tag is read across deltas, its bytes held from `</` while they can
+  still spell one; bytes that spell none after all are the stay's text, as before.
 - A call given as data (`CallSyntax::Shaped`) opens only when the header after its terminal
   matches: the engine holds the terminal and every byte after it, and takes no row, until the
   header decides. A header that cannot match gives the terminal back: its first character is the

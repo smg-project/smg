@@ -391,7 +391,11 @@ What this table says beyond the DSML one:
 - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
   (`tagged::xml`); a second invoke before the first closed ends the first,
-  and the block's close ends an invoke still open.
+  and the block's close ends an invoke still open. Either is the model's own end of that call,
+  as the invoke's closing tag is, and closes what the model left open in it; a closing tag
+  between two invokes names nothing open and is ignored (`docs/assemblers.md`,
+  `docs/engine.md`). The end of the output is no such end: an invoke the output ends inside is
+  a call the model did not end (`CallEnd`).
 
 ## Kimi K3 (`kimi_k3`)
 

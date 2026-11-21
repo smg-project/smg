@@ -575,12 +575,13 @@ impl Assembler {
     }
 
     /// A bare `</parameter>` between parameters, where the syntax has the next parameter's tag or
-    /// the function's close: refused and counted like any tag out of its place
-    /// ([`Self::release`]), but the one refusal that costs the call nothing, since the tag carries
-    /// no member the client could lose; the call is as whole after it as before.
+    /// the function's close: its bytes are refused as any the syntax has no place for
+    /// ([`Self::release`]), under the reason that says no call lost them (`StrayClosingTag`),
+    /// the one refusal that costs the call nothing, since the tag carries no member the client
+    /// could lose; the call is as whole after it as before.
     fn release_stray_close(&mut self, bytes: &str, out: &mut Events) {
         let whole = !self.refused;
-        self.release(bytes, MalformedReason::TagOutOfPlace, out);
+        self.release(bytes, MalformedReason::StrayClosingTag, out);
         self.refused = !whole;
     }
 
@@ -1521,7 +1522,7 @@ mod tests {
                 (String::new(), MalformedReason::TextBetweenTags),
                 (String::new(), MalformedReason::TextBetweenTags),
                 (String::new(), MalformedReason::TextBetweenTags),
-                (String::new(), MalformedReason::TagOutOfPlace),
+                (String::new(), MalformedReason::StrayClosingTag),
             ]
         );
         assert_eq!(
@@ -1673,7 +1674,7 @@ mod tests {
             vec![
                 (String::new(), MalformedReason::EmptyName),
                 (String::new(), MalformedReason::TextBetweenTags),
-                (String::new(), MalformedReason::TagOutOfPlace),
+                (String::new(), MalformedReason::StrayClosingTag),
             ]
         );
         assert_eq!(refused(&events), ["<parameter=>", "\nx", "\n</parameter>"]);
@@ -2081,7 +2082,7 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"limit": 5}"#);
         assert_eq!(
             malformed(&events),
-            vec![(String::new(), MalformedReason::TagOutOfPlace)]
+            vec![(String::new(), MalformedReason::StrayClosingTag)]
         );
         assert_eq!(refused(&events), ["</parameter>"]);
         assert_eq!(dropped(&events), vec!["\n"]);

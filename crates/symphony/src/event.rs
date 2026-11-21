@@ -215,8 +215,9 @@ malformed_reasons! {
     UnknownTool => "a call to a function the request did not declare",
     /// Text where the call's syntax has only tags: between a tag and the next, outside a value.
     TextBetweenTags => "text between a call's tags",
-    /// A tag of the syntax where it has no place: a value's close with no value open, a
-    /// parameter tag before the function's.
+    /// A tag of the syntax where it has no place, with a member the call does not get behind
+    /// it: a parameter tag before the function's, a value's tag with no key before it. A
+    /// closing tag that names nothing open is not one: [`Self::StrayClosingTag`].
     TagOutOfPlace => "a tag where the call's syntax has none",
     /// A tag another tag, or the call's end, cut short before it closed.
     TagCutShort => "a tag that another tag or the call's end cut short",
@@ -284,6 +285,23 @@ malformed_reasons! {
     /// JSON. The marker is the model's own end of the call, so the value's bytes are complete, as
     /// at the stop. The event carries no bytes and stands before the closing quote.
     OpenAtTheMarker => "a string value left open at the call's closing marker",
+    /// A closing tag that names nothing open. Where the syntax has the next member's tag, the
+    /// next call or a close (between a call's members, or, for a syntax that reads tags there,
+    /// the XML one, between a block's calls) the tag is ignored: it carries no member, the call
+    /// it stands in or beside is as whole after it as before, and what follows is read where
+    /// it stands; its bytes leave as `Dropped { MalformedCall }`, never content. Inside an
+    /// element of the XML syntax that holds text, behind the template's separator, it stands
+    /// for that element's own close, misnamed, and closes it. The event carries no bytes and
+    /// stands before the tag's own. No call is short of anything either way.
+    StrayClosingTag => "a closing tag that names nothing open",
+    /// An element of the XML syntax that the closing tag of an element around it, or the
+    /// call's own closing marker, found open: the model left the element's own close out, and
+    /// the syntax closes it there with what it holds (its text as its value, nothing as the
+    /// empty value of its declared type, its members as they stand), and the elements between
+    /// it and the one the tag names after it. Nothing is refused and the call stays whole. The
+    /// event carries no bytes and stands before the first fragment that closes an element. A
+    /// streamed string the call's marker found open says [`Self::OpenAtTheMarker`] instead.
+    OpenAtTheParentsClose => "an element left open at the closing tag of the one around it",
 }
 
 impl MalformedReason {
@@ -291,9 +309,8 @@ impl MalformedReason {
     /// whole: bytes written for a call that are in no call the output delivers (refused as a
     /// malformed call's, or returned as text where the syntax has a call, a name, a key, a value
     /// or arguments), or a call that ends without its whole arguments. A driver that fails its
-    /// request on a call it could not read asks this of every `Malformed` event, beside the two
-    /// other words the events carry: [`DropReason::MalformedCall`] on bytes of a call block
-    /// that were refused, and [`CallEnd`] on a call the model did not end.
+    /// request on a call it could not read asks this of every `Malformed` event, beside the word
+    /// a call's end carries on a call the model did not end ([`CallEnd`]).
     ///
     /// The reasons that lose no call, each for its own cause:
     ///
@@ -301,21 +318,23 @@ impl MalformedReason {
     ///   wrote it; only its name is not one the request declares.
     /// - [`MarkerOutOfPlace`](Self::MarkerOutOfPlace): a marker kept as text in a content
     ///   state, where no call is read.
-    /// - [`OpenAtTheStop`](Self::OpenAtTheStop) and [`OpenAtTheMarker`](Self::OpenAtTheMarker):
-    ///   the syntax closed what the model left open, and every byte the model wrote is in the
-    ///   call. Whether the model ended the call itself is [`CallEnd`]'s to say, on the call's
-    ///   end.
+    /// - [`OpenAtTheStop`](Self::OpenAtTheStop), [`OpenAtTheMarker`](Self::OpenAtTheMarker)
+    ///   and [`OpenAtTheParentsClose`](Self::OpenAtTheParentsClose): the syntax closed what the
+    ///   model left open, and every byte the model wrote is in the call. Whether the model
+    ///   ended the call itself is [`CallEnd`]'s to say, on the call's end.
+    /// - [`StrayClosingTag`](Self::StrayClosingTag): a closing tag that names nothing open is
+    ///   ignored; it carries no member, and the call beside it is whole without it.
     /// - [`TextAfterTheArguments`](Self::TextAfterTheArguments) and
     ///   [`TextAfterTheList`](Self::TextAfterTheList): text after a call, or a list of calls,
     ///   that was read whole; the text is returned and no call is short of it.
     ///
-    /// Every other reason loses one. A reason a syntax gives in more than one way is classed by
-    /// the use that loses a call, since the reason alone does not tell them apart:
-    /// [`TagOutOfPlace`](Self::TagOutOfPlace) also names a closing tag that closes nothing open,
-    /// which costs its call nothing; [`TagCutShort`](Self::TagCutShort) also names a declared
-    /// list or object written empty where the tag around it closed first; and
-    /// [`TextBetweenCalls`](Self::TextBetweenCalls) names text where a call should begin and
-    /// prose between two whole calls alike.
+    /// Every other reason loses one. [`TextBetweenCalls`](Self::TextBetweenCalls) is classed by
+    /// the use that loses a call, since the reason alone does not tell its two apart: it names
+    /// text where a call should begin and prose between two whole calls alike.
+    ///
+    /// The bytes a syntax refuses leave as `Dropped { MalformedCall }` behind the `Malformed`
+    /// event of no bytes that gives the reason, so the reason is the word on whether a call was
+    /// lost: the stray closing tag's bytes are dropped so too, and lose none.
     ///
     /// The match names every reason, so a reason added to the crate is classed here before the
     /// crate builds.
@@ -326,6 +345,8 @@ impl MalformedReason {
             | Self::MarkerOutOfPlace
             | Self::OpenAtTheStop
             | Self::OpenAtTheMarker
+            | Self::OpenAtTheParentsClose
+            | Self::StrayClosingTag
             | Self::TextAfterTheArguments
             | Self::TextAfterTheList => false,
             // The stream ended inside a call or a block that named none; arguments that are no
@@ -880,11 +901,11 @@ mod tests {
         assert_eq!(seen.len(), MalformedReason::ALL.len());
     }
 
-    /// The reasons that lose no call are the six the method's doc names; every other reason of
-    /// the crate loses one. Pinned by name, so a reason moved from one side to the other is a
-    /// change made here on purpose.
+    /// The reasons that lose no call are the eight the method's doc names; every other reason
+    /// of the crate loses one. Pinned by name, so a reason moved from one side to the other is
+    /// a change made here on purpose.
     #[test]
-    fn the_reasons_that_lose_no_call_are_the_six_named() {
+    fn the_reasons_that_lose_no_call_are_the_eight_named() {
         let harmless: Vec<MalformedReason> = MalformedReason::ALL
             .iter()
             .copied()
@@ -899,6 +920,8 @@ mod tests {
                 MalformedReason::MarkerOutOfPlace,
                 MalformedReason::OpenAtTheStop,
                 MalformedReason::OpenAtTheMarker,
+                MalformedReason::StrayClosingTag,
+                MalformedReason::OpenAtTheParentsClose,
             ]
         );
         assert_eq!(

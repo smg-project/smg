@@ -167,7 +167,7 @@ const NO_TABLE: &str = "none";
 /// (`MalformedReason`, in its order, each under the crate's own spelling of it), so a dashboard
 /// tells a stray tag from a call written in the wrong syntax without the sampled line, and
 /// `other` for a reason this build does not know (the crate's enum is non-exhaustive).
-const REASONS: [&str; 31] = [
+const REASONS: [&str; 33] = [
     "unterminated_region",
     "invalid_arguments",
     "unknown_tool",
@@ -198,6 +198,8 @@ const REASONS: [&str; 31] = [
     "marker_out_of_place",
     "open_at_the_stop",
     "open_at_the_marker",
+    "stray_closing_tag",
+    "open_at_the_parents_close",
     "other",
 ];
 /// The place of `other` in [`REASONS`]: a reason the match below does not know.
@@ -281,6 +283,8 @@ fn reason_index(why: MalformedReason) -> usize {
         MalformedReason::MarkerOutOfPlace => 27,
         MalformedReason::OpenAtTheStop => 28,
         MalformedReason::OpenAtTheMarker => 29,
+        MalformedReason::StrayClosingTag => 30,
+        MalformedReason::OpenAtTheParentsClose => 31,
         _ => OTHER_REASON,
     }
 }
@@ -1434,8 +1438,8 @@ mod tests {
         assert_eq!(
             tally.first,
             Some(FirstRun {
-                reason: "tag_out_of_place",
-                why: "a tag where the call's syntax has none",
+                reason: "stray_closing_tag",
+                why: "a closing tag that names nothing open",
                 at: "</think>At once:<tool_call>f".len(),
                 bytes: "</arg_key>".len(),
             })

@@ -124,9 +124,11 @@ pub(super) trait TaggedAssembler {
 /// closes the string; the event carries no bytes and stands before the closing quote. The four
 /// assemblers of this module push it from their `close_open_string`; a value held whole for its
 /// close keeps the ending's own path, reported or refused, nothing made up for it. The XML
-/// assembler pushes it once more (`why` = [`MalformedReason::TagCutShort`]): for an element
-/// declared a list or an object that the closing tag of the element around it cut short, before
-/// the fragment that writes the element empty.
+/// assembler pushes it twice more, before the fragment that closes an element whose own close
+/// the model left out: for an element the closing tag of an element around it, or the call's
+/// closing marker, found open (`why` = [`MalformedReason::OpenAtTheParentsClose`]), and for one
+/// a closing tag that names nothing open closed
+/// (`why` = [`MalformedReason::StrayClosingTag`]).
 pub(crate) fn left_open(why: MalformedReason, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(String::new()),

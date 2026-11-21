@@ -624,15 +624,17 @@ mod tests {
         let events = run("", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(names(&events), ["f"]);
-        // The leaf never written is refused, so no close is made up for the call: the open object
-        // stands as the fragments wrote it, and the arguments are no whole value.
-        assert_eq!(arguments_of(&events, 0), r#"{"opts": {"a": 1"#);
-        assert_eq!(ends(&events), 1);
+        // The block's close is the model's own end of the call: the leaf it found open is
+        // written with its text, the object around it and the arguments close, and nothing is
+        // refused.
+        assert_eq!(arguments(&events), value!({"opts": {"a": 1, "b": "tex"}}));
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheParentsClose)]
+        );
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
         assert_eq!(content(&events), "The weather is sunny.");
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Dropped { text, why: DropReason::MalformedCall } if text.text == "<b>tex"
-        )));
+        assert!(refused_bytes(&events).is_empty(), "{events:#?}");
     }
 
     #[test]
@@ -1605,7 +1607,7 @@ mod tests {
         let events = read(&[&output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(arguments(&events), value!({"name": "x", "count": 3}));
-        assert_eq!(reported(&events), [MalformedReason::TagOutOfPlace]);
+        assert_eq!(reported(&events), [MalformedReason::StrayClosingTag]);
         assert_eq!(refused(&events), "</count>");
         assert_eq!(ends(&events), 1);
 
@@ -1682,7 +1684,7 @@ mod tests {
     /// A parameter the tool declares a list or an object, opened, left empty and never closed:
     /// the closing tag of the element directly around it follows. A closing tag is no value of
     /// a list or an object, so the element is written empty, as its own close would write it;
-    /// one `Malformed { TagCutShort }` event of no bytes stands before its fragment, nothing is
+    /// one `Malformed { OpenAtTheParentsClose }` event of no bytes stands before its fragment, nothing is
     /// refused and the call closes whole: at every cut, for an object, with whitespace held in
     /// the element, and in the deepest element the reader takes an empty list in.
     #[test]
@@ -1702,7 +1704,7 @@ mod tests {
         assert_eq!(said.content, "");
         let events = read(&[&output]);
         assert_eq!(bytes(&events), output);
-        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(reported(&events), [MalformedReason::OpenAtTheParentsClose]);
         assert_eq!(refused(&events), "");
         assert_eq!(ends(&events), 1);
         let counted = events
@@ -1732,7 +1734,11 @@ mod tests {
             let events = read(&[&output]);
             assert_eq!(bytes(&events), output, "{body}");
             assert_eq!(arguments(&events), written, "{body}");
-            assert_eq!(reported(&events), [MalformedReason::TagCutShort], "{body}");
+            assert_eq!(
+                reported(&events),
+                [MalformedReason::OpenAtTheParentsClose],
+                "{body}"
+            );
             assert_eq!(refused(&events), "", "{body}");
         }
 
@@ -1742,60 +1748,90 @@ mod tests {
             arguments(&events),
             value!({ "d": wrapped(value!({"e": []}), deepest - 3) })
         );
-        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(reported(&events), [MalformedReason::OpenAtTheParentsClose]);
         assert_eq!(refused(&events), "");
     }
 
-    /// The close of the element around an open element is that element's text everywhere else:
-    /// under a declared string, a declared integer and an element the tool does not declare,
-    /// under a declared list that holds text, when it names an element further out than the one
-    /// directly around the list, and one element deeper than the reader takes an empty list in.
-    /// A string streams it, and the invoke's close closes the string; the others are held for a
-    /// close that never comes and refused at the call's end, as a list the call's own end finds
-    /// open is.
+    /// The closing tag of an element around an open one, behind the template's separator,
+    /// closes the open one with what it holds, then every element up to the one it names: a
+    /// declared string with nothing in it is the empty string, a declared integer and an
+    /// element the tool does not declare likewise, a declared list that holds text is written
+    /// as its own close would write it, and a tag that names an element further out than the
+    /// one directly around closes through all of them. One `Malformed { OpenAtTheParentsClose }`
+    /// event of no bytes counts each slip; nothing is refused, and every call closes whole. The
+    /// call's own closing tag closes an element left open the same way. One element deeper
+    /// than the reader takes an empty list in, the element is refused as at its own close.
     #[test]
-    fn the_close_around_any_other_open_element_is_that_elements_text() {
+    fn the_close_around_an_open_element_closes_it_with_what_it_holds() {
         use crate::json::PartialJson;
         let read = |body: &str| run_with(plan(), "", &[&plan_call(body)]);
 
-        let events = read("<days><item><day></item></days>");
-        assert_eq!(
-            arguments(&events),
-            value!({"days": [{"day": "</item></days>"}]})
-        );
-        assert_eq!(reported(&events), [MalformedReason::OpenAtTheMarker]);
-
-        for (body, written, lost) in [
+        for (body, written) in [
+            (
+                "<days><item><day></item></days>",
+                value!({"days": [{"day": ""}]}),
+            ),
+            (
+                "<days><item><day>Sun</item></days>",
+                value!({"days": [{"day": "Sun"}]}),
+            ),
             (
                 "<days><item><minutes></item></days>",
-                r#"{"days": [{"#,
-                "<minutes></item></days>",
+                value!({"days": [{"minutes": ""}]}),
+            ),
+            (
+                "<days><item><minutes>5</item></days>",
+                value!({"days": [{"minutes": 5}]}),
             ),
             (
                 "<days><item><extra></item></days>",
-                r#"{"days": [{"#,
-                "<extra></item></days>",
+                value!({"days": [{"extra": ""}]}),
             ),
             (
                 "<days><item><blocks>x</item></days>",
-                r#"{"days": [{"#,
-                "<blocks>x</item></days>",
+                value!({"days": [{"blocks": "x"}]}),
             ),
             (
                 "<days><item><blocks><item><marks></blocks></item></days>",
-                r#"{"days": [{"blocks": [{"#,
-                "<marks></blocks></item></days>",
+                value!({"days": [{"blocks": [{"marks": []}]}]}),
             ),
+            (
+                "<days><item><day>Sun</days>",
+                value!({"days": [{"day": "Sun"}]}),
+            ),
+            ("<tags>", value!({"tags": []})),
+            ("<days><item><minutes>5", value!({"days": [{"minutes": 5}]})),
         ] {
             let events = read(body);
-            assert_eq!(arguments_of(&events, 0), written, "{body}");
-            assert_eq!(reported(&events), [MalformedReason::TagCutShort], "{body}");
-            assert_eq!(refused(&events), lost, "{body}");
+            assert_eq!(bytes(&events), plan_call(body), "{body}");
+            assert_eq!(arguments(&events), written, "{body}");
+            assert_eq!(
+                reported(&events),
+                [MalformedReason::OpenAtTheParentsClose],
+                "{body}"
+            );
+            assert_eq!(refused(&events), "", "{body}");
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)], "{body}");
         }
 
-        let events = read("<tags>");
-        assert_eq!(arguments_of(&events, 0), "");
-        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        // The tag's bytes stand behind the first fragment it causes, a streamed string's
+        // closing quote: no quote is written with nothing of the output behind it.
+        let events = read("<days><item><day>Sun</item></days>");
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the slip is counted");
+        assert!(
+            matches!(
+                &events[at..at + 3],
+                [
+                    Event::Malformed { text, why: MalformedReason::OpenAtTheParentsClose },
+                    Event::ToolCallArguments { json: quote, source, .. },
+                    Event::ToolCallArguments { json: brace, .. },
+                ] if text.text.is_empty() && quote == "\"" && source.text == "</item>" && brace == "}"
+            ),
+            "{events:#?}"
+        );
 
         let deepest = PartialJson::DEFAULT_MAX_DEPTH;
         let events = an_empty_list_under(deepest - 1);
@@ -1803,20 +1839,65 @@ mod tests {
             arguments_of(&events, 0),
             format!("{{{}", "\"d\": {".repeat(deepest - 1))
         );
-        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(reported(&events), [MalformedReason::InvalidArguments]);
         assert_eq!(
             refused(&events),
             format!("<e>{}", "</d>".repeat(deepest - 1))
         );
     }
 
-    /// A closing tag that names an open element further out, an inner close left out (`</range>`
-    /// missing), closes it out of order: the members after it would land in the wrong container
-    /// (`limit` inside `range`), so it is refused as any tag out of its place and the call is no
-    /// whole call. A closing tag that names nothing open costs the call nothing inside a
-    /// container as at the top.
+    /// Without the separator a closing tag inside an element that holds text, or nothing yet,
+    /// is that element's text: the template writes the separator before every tag it writes
+    /// and never inside a value. A string streams it, and the invoke's close closes the
+    /// string; a value held for its close takes it, and with the start of a tag in its text
+    /// only its own closing tag closes it, so the call's end refuses it. And a closing tag
+    /// behind a separator stays the value's text when it pairs with an opening tag the value
+    /// took as its text behind one: tags the model writes inside the value.
     #[test]
-    fn a_close_that_skips_an_inner_one_is_refused_and_one_that_names_nothing_open_is_free() {
+    fn without_the_separator_a_closing_tag_inside_an_element_is_its_text() {
+        let unseparated = |body: &str| {
+            format!(
+                "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"plan\">{body}\
+                 ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+            )
+        };
+        let events = run_with(
+            plan(),
+            "",
+            &[&unseparated("<days><item><day></item></days>")],
+        );
+        assert_eq!(
+            arguments(&events),
+            value!({"days": [{"day": "</item></days>"}]})
+        );
+        assert_eq!(reported(&events), [MalformedReason::OpenAtTheMarker]);
+
+        let events = run_with(
+            plan(),
+            "",
+            &[&unseparated("<days><item><minutes>5</item></days>")],
+        );
+        assert_eq!(arguments_of(&events, 0), r#"{"days": [{"#);
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(refused(&events), "<minutes>5</item></days>");
+
+        let nested = plan_call("<days><item><day><b>Sun</b> or <i>Mon</i></day></item></days>");
+        let events = run_with(plan(), "", &[&nested]);
+        assert_eq!(
+            arguments(&events),
+            value!({"days": [{"day": "<b>Sun</b> or <i>Mon</i>"}]})
+        );
+        assert!(reported(&events).is_empty(), "{events:#?}");
+    }
+
+    /// A closing tag that names an open element further out, an inner close left out (`</range>`
+    /// missing), closes the elements inside it first and then the one it names: the tag says
+    /// where the model is, so the members after it land where the model wrote them (`limit` at
+    /// the top, not inside `range`), and the call closes whole behind one
+    /// `Malformed { OpenAtTheParentsClose }` event of no bytes. A closing tag that names
+    /// nothing open is ignored and costs the call nothing, inside a container as at the top.
+    #[test]
+    fn a_close_that_skips_an_inner_one_closes_through_it_and_one_that_names_nothing_open_is_free() {
         use crate::testing::the_same_at_every_cut;
         let search = || {
             declared(
@@ -1843,19 +1924,14 @@ mod tests {
             said.calls,
             [(
                 "search".to_string(),
-                r#"{"filter": {"range": {"gte": 5, "limit": 10"#.to_string()
+                r#"{"filter": {"range": {"gte": 5}}, "limit": 10}"#.to_string()
             )]
         );
         assert_eq!(said.content, "");
         let events = read(&[&misnested]);
         assert_eq!(bytes(&events), misnested);
-        let written = arguments_of(&events, 0);
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&written).is_err(),
-            "{written:?} reads as a whole value"
-        );
-        assert_eq!(reported(&events), [MalformedReason::TagOutOfPlace]);
-        assert_eq!(refused(&events), "</filter>");
+        assert_eq!(reported(&events), [MalformedReason::OpenAtTheParentsClose]);
+        assert_eq!(refused(&events), "");
         assert_eq!(ends(&events), 1);
 
         let stray = invoke("<filter><range><gte>5</gte></range></bogus></filter><limit>10</limit>");
@@ -1873,7 +1949,7 @@ mod tests {
             arguments(&events),
             value!({"filter": {"range": {"gte": 5}}, "limit": 10})
         );
-        assert_eq!(reported(&events), [MalformedReason::TagOutOfPlace]);
+        assert_eq!(reported(&events), [MalformedReason::StrayClosingTag]);
         assert_eq!(refused(&events), "</bogus>");
         assert_eq!(ends(&events), 1);
     }
@@ -1938,5 +2014,356 @@ mod tests {
         let blocks = serde_json::to_value(&message.content).expect("wire");
         assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
         assert_eq!(blocks[0]["input"], serde_json::json!({}), "{blocks}");
+    }
+
+    /// Two functions for the tests of what the table reads past a slip: `get_weather` with a
+    /// string and an integer, and `typed` with an object, a list and scalars.
+    fn weather_and_typed() -> Declared {
+        use crate::testing::tool;
+        Declared::of(&[
+            tool(
+                "get_weather",
+                value!({"type": "object", "properties": {
+                    "city": {"type": "string"}, "days": {"type": "integer"}}}),
+            ),
+            tool(
+                "typed",
+                value!({"type": "object", "properties": {
+                    "i": {"type": "integer"}, "n": {"type": "number"},
+                    "b": {"type": "boolean"},
+                    "o": {"type": "object", "properties": {
+                        "k": {"type": "string"}, "q": {"type": "integer"}}},
+                    "list": {"type": "array", "items": {"type": "string"}}}}),
+            ),
+        ])
+    }
+
+    /// One block with one invoke of `function` whose elements are `body`, the separator before
+    /// every tag.
+    fn block_of(function: &str, body: &str) -> String {
+        separated(&format!(
+            "<tool_call>\n<invoke name=\"{function}\">{body}</invoke>\n</tool_call>"
+        ))
+    }
+
+    /// What the table said of `output`, the same at every cut of it: the events of the output
+    /// in one piece, every byte accounted for.
+    fn read_past_a_slip(output: &str) -> Vec<Event<'static>> {
+        use crate::testing::the_same_at_every_cut;
+        let read = |pieces: &[&str]| run_with(weather_and_typed(), "", pieces);
+        the_same_at_every_cut(|pieces| read(pieces), output);
+        let events = read(&[output]);
+        assert_eq!(bytes(&events), output);
+        events
+    }
+
+    /// A closing tag behind the separator that names nothing open, inside an element that
+    /// holds text: it stands for the element's own close, misnamed, and the value is the text
+    /// before it, typed as the tool declares it. The element's own close after it, and any
+    /// closing tag that names nothing open between elements, is ignored. Each slip is counted
+    /// by one `Malformed { StrayClosingTag }` event of no bytes, no reason says a call was
+    /// lost, and the call closes whole.
+    #[test]
+    fn a_closing_tag_that_names_nothing_open_closes_a_value_and_is_ignored_between_elements() {
+        let stray = MalformedReason::StrayClosingTag;
+        for (function, body, written, slips, ignored) in [
+            (
+                "get_weather",
+                "<city>Paris</town>",
+                value!({"city": "Paris"}),
+                1,
+                "",
+            ),
+            (
+                "get_weather",
+                "<city>Paris</town></city>",
+                value!({"city": "Paris"}),
+                2,
+                "</city>",
+            ),
+            (
+                "get_weather",
+                "<city>Paris</city></town>",
+                value!({"city": "Paris"}),
+                1,
+                "</town>",
+            ),
+            ("get_weather", "<days>3</day>", value!({"days": 3}), 1, ""),
+            (
+                "get_weather",
+                "<days>3</day></days>",
+                value!({"days": 3}),
+                2,
+                "</days>",
+            ),
+            (
+                "get_weather",
+                "<days>3</days></day>",
+                value!({"days": 3}),
+                1,
+                "</day>",
+            ),
+            (
+                "typed",
+                "<o><k>v</key><q>7</q></o>",
+                value!({"o": {"k": "v", "q": 7}}),
+                1,
+                "",
+            ),
+            (
+                "typed",
+                "<o><k>v</k></k></o>",
+                value!({"o": {"k": "v"}}),
+                1,
+                "</k>",
+            ),
+            (
+                "typed",
+                "<list><item>x</item></item><item>y</item></list>",
+                value!({"list": ["x", "y"]}),
+                1,
+                "</item>",
+            ),
+            (
+                "get_weather",
+                "<city>Paris</city></call>\n",
+                value!({"city": "Paris"}),
+                1,
+                "</call>",
+            ),
+        ] {
+            let events = read_past_a_slip(&block_of(function, body));
+            assert_eq!(arguments(&events), written, "{body}");
+            assert_eq!(reported(&events), vec![stray; slips], "{body}");
+            assert!(losses(&events).is_empty(), "{body}");
+            assert_eq!(refused(&events), ignored, "{body}");
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)], "{body}");
+        }
+        // The value's close, misnamed, closes a streamed string where it stands: the closing
+        // quote goes out with the tag as its source, behind the one event.
+        let events = read_past_a_slip(&block_of("get_weather", "<city>Paris</town>"));
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the slip is counted");
+        assert!(
+            matches!(
+                &events[at..at + 2],
+                [
+                    Event::Malformed { text, why: MalformedReason::StrayClosingTag },
+                    Event::ToolCallArguments { json, source, .. }
+                ] if text.text.is_empty() && json == "\"" && source.text == "</town>"
+            ),
+            "{events:#?}"
+        );
+    }
+
+    /// The end of an invoke closes what the model left open in it, whichever end it is: the
+    /// invoke's closing tag, the block's, or the next invoke's opening. A streamed string is
+    /// closed where it stands (`OpenAtTheMarker`); a value held for its close is written with
+    /// its text, an element with nothing in it as the empty value of its type, and the
+    /// elements around them close with the members they have (`OpenAtTheParentsClose`). Every
+    /// call closes whole, and no reason says one was lost.
+    #[test]
+    fn the_end_of_an_invoke_closes_what_the_model_left_open_in_it() {
+        let open_string = MalformedReason::OpenAtTheMarker;
+        let open_element = MalformedReason::OpenAtTheParentsClose;
+        let invoke = "<invoke name=\"get_weather\">";
+        let next = "<invoke name=\"get_weather\"><city>NYC</city></invoke>";
+        for (output, written, slips) in [
+            // The invoke's closing tag.
+            (
+                block_of("get_weather", "<city>Paris"),
+                vec![value!({"city": "Paris"})],
+                vec![open_string],
+            ),
+            (
+                block_of("get_weather", "<days>3"),
+                vec![value!({"days": 3})],
+                vec![open_element],
+            ),
+            (
+                block_of("get_weather", "<meta><text>7</text><flag>on"),
+                vec![value!({"meta": {"text": 7, "flag": "on"}})],
+                vec![open_element],
+            ),
+            (
+                block_of("get_weather", "<meta><text>7</text><flag>"),
+                vec![value!({"meta": {"text": 7, "flag": ""}})],
+                vec![open_element],
+            ),
+            (
+                block_of("get_weather", "<meta><text>7</text><flag></meta>"),
+                vec![value!({"meta": {"text": 7, "flag": ""}})],
+                vec![open_element],
+            ),
+            (
+                block_of("typed", "<i>5</x><b>true</b><n>2.5"),
+                vec![value!({"i": 5, "b": true, "n": 2.5})],
+                vec![MalformedReason::StrayClosingTag, open_element],
+            ),
+            // The block's closing tag.
+            (
+                separated(&format!(
+                    "<tool_call>\n{invoke}<city>Seattle</city></tool_call>"
+                )),
+                vec![value!({"city": "Seattle"})],
+                vec![],
+            ),
+            (
+                separated(&format!("<tool_call>\n{invoke}<city>Seattle</tool_call>")),
+                vec![value!({"city": "Seattle"})],
+                vec![open_string],
+            ),
+            (
+                separated(&format!("<tool_call>\n{invoke}<days>5</tool_call>")),
+                vec![value!({"days": 5})],
+                vec![open_element],
+            ),
+            // The next invoke's opening.
+            (
+                separated(&format!(
+                    "<tool_call>\n{invoke}<city>Seattle</city>\n{next}\n</tool_call>"
+                )),
+                vec![value!({"city": "Seattle"}), value!({"city": "NYC"})],
+                vec![],
+            ),
+            (
+                separated(&format!(
+                    "<tool_call>\n{invoke}<city>Seattle{next}\n</tool_call>"
+                )),
+                vec![value!({"city": "Seattle"}), value!({"city": "NYC"})],
+                vec![open_string],
+            ),
+            (
+                separated(&format!("<tool_call>\n{invoke}<days>5{next}\n</tool_call>")),
+                vec![value!({"days": 5}), value!({"city": "NYC"})],
+                vec![open_element],
+            ),
+        ] {
+            let events = read_past_a_slip(&output);
+            let read: Vec<serde_json::Value> = (0..written.len() as u32)
+                .map(|call| {
+                    serde_json::from_str(&arguments_of(&events, call)).expect("whole arguments")
+                })
+                .collect();
+            assert_eq!(read, written, "{output}");
+            assert_eq!(reported(&events), slips, "{output}");
+            assert!(losses(&events).is_empty(), "{output}");
+            assert_eq!(refused(&events), "", "{output}");
+            assert!(
+                endings(&events)
+                    .iter()
+                    .all(|(_, ended)| *ended == CallEnd::Closed),
+                "{output}"
+            );
+        }
+    }
+
+    /// A closing tag between a block's invokes names nothing open, since no invoke is: it is
+    /// ignored, counted by one `Malformed { StrayClosingTag }` event of no bytes, its bytes
+    /// dropped as a malformed call's and never content. The call before it is whole, and one
+    /// after it is read. Other text between invokes is still text where a call should be.
+    #[test]
+    fn a_closing_tag_between_a_blocks_invokes_is_ignored() {
+        let call = "<invoke name=\"get_weather\"><city>Seattle</city></invoke>";
+        let next = "<invoke name=\"get_weather\"><city>NYC</city></invoke>";
+        for (output, calls, ignored) in [
+            (format!("<tool_call>\n{call}\n</invoke>"), 1, "</invoke>"),
+            (
+                format!("<tool_call>\n{call}\n</invoke></tool_call>"),
+                1,
+                "</invoke>",
+            ),
+            (
+                format!("<tool_call>\n{call}</city>\n</tool_call>"),
+                1,
+                "</city>",
+            ),
+            (
+                format!("<tool_call>\n{call}\n</invoke>\n{next}\n</tool_call>"),
+                2,
+                "</invoke>",
+            ),
+        ] {
+            let events = read_past_a_slip(&separated(&output));
+            assert_eq!(names(&events).len(), calls, "{output}");
+            assert_eq!(arguments(&events), value!({"city": "Seattle"}), "{output}");
+            assert_eq!(
+                reported(&events),
+                [MalformedReason::StrayClosingTag],
+                "{output}"
+            );
+            assert_eq!(refused(&events), ignored, "{output}");
+            assert_eq!(content(&events), "", "{output}");
+            assert!(
+                endings(&events)
+                    .iter()
+                    .all(|(_, ended)| *ended == CallEnd::Closed),
+                "{output}"
+            );
+        }
+        let prose = separated(&format!("<tool_call>\n{call}\nand then\n</tool_call>"));
+        let events = run_with(weather_and_typed(), "", &[&prose]);
+        let lost = losses(&events);
+        assert!(
+            !lost.is_empty()
+                && lost
+                    .iter()
+                    .all(|why| *why == MalformedReason::TextBetweenCalls),
+            "{lost:?}"
+        );
+    }
+
+    /// The end of the output closes nothing for the model. An invoke the output ends inside is
+    /// a call the model did not end, whatever it had closed inside it: its end says so (`stop`
+    /// at the model's stop, `cut` at a cut), where the same bytes before the invoke's closing
+    /// tag are a whole call. And what the syntax has no reading for still costs the call its
+    /// close: text between elements, the start of a tag the separator cut short there, and a
+    /// value held for its close with the start of a tag in its text, which only its own
+    /// closing tag closes.
+    #[test]
+    fn the_end_of_the_output_closes_nothing_for_the_model() {
+        let invoke = "<tool_call>\n<invoke name=\"get_weather\">";
+        for body in [
+            "",
+            "<city>Seattle",
+            "<city>Seattle</ci",
+            "<city>Seattle</city>",
+            "<city>Seattle</city><days>5</days>\n",
+            "<days>5",
+            "<meta><text>7</text>",
+        ] {
+            let open = separated(&format!("{invoke}{body}"));
+            for (finish, ended) in [
+                (EngineFinish::Stop, CallEnd::Stop),
+                (EngineFinish::Length, CallEnd::Cut),
+            ] {
+                let events = drive_to(
+                    &mut Engine::new(minimax_m3(), weather_and_typed()),
+                    "",
+                    &[&open],
+                    finish,
+                );
+                assert_eq!(bytes(&events), open, "{body}");
+                assert_eq!(endings(&events), [(0, ended)], "{body}");
+            }
+        }
+        for (body, lost) in [
+            (
+                "<city>Seattle</city> and <days>5</days>",
+                MalformedReason::TextBetweenTags,
+            ),
+            ("<city>Seattle</city><da", MalformedReason::TextBetweenTags),
+            ("<days>5</da", MalformedReason::TagCutShort),
+            ("<days>5<b</day>", MalformedReason::TagCutShort),
+        ] {
+            let events = run_with(weather_and_typed(), "", &[&block_of("get_weather", body)]);
+            assert_eq!(losses(&events), [lost], "{body}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&arguments_of(&events, 0)).is_err(),
+                "{body}: no close for the call"
+            );
+        }
     }
 }

@@ -135,6 +135,10 @@ struct Pending {
 struct Stay {
     begun: bool,
     held: Vec<Held>,
+    /// A closing tag being read between a block's calls, for a syntax whose calls are tags
+    /// ([`Engine::wrapping_tags`]): the bytes after its `<`, held while they can still spell
+    /// one, wherever the deltas cut them.
+    tag: Option<String>,
 }
 
 /// Bytes a stay holds, in the output's order: a trimmed stay's run after its last text that is not
@@ -964,7 +968,114 @@ impl Engine {
                     self.wrapping(rest, MalformedReason::TextAfterTheArguments, out);
                 }
             }
+            Emits::Wrapper if self.reads_tags_between_calls() => self.wrapping_tags(text, out),
             Emits::Wrapper => self.wrapping(text, MalformedReason::TextBetweenCalls, out),
+        }
+    }
+
+    /// Whether the syntax's calls are tags, so that a closing tag between a block's calls is
+    /// read as one ([`Self::wrapping_tags`]): the XML syntax's.
+    fn reads_tags_between_calls(&self) -> bool {
+        matches!(self.format.call_syntax(), Some(CallSyntax::Xml))
+    }
+
+    /// Text between a block's calls of a syntax whose calls are tags. A closing tag there names
+    /// nothing open, since no call is, and is ignored ([`Self::stray_close`]); everything else
+    /// is text where the template only wraps ([`Self::wrapping`]), as under any syntax. A tag is
+    /// read across pieces: from its `</` the bytes are held while they can still spell one, so
+    /// where the deltas cut it changes nothing, and bytes that spell none after all are the
+    /// stay's text, in the run they stand in.
+    fn wrapping_tags<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
+        let why = MalformedReason::TextBetweenCalls;
+        // Where the text of this piece not yet handed on starts, and where the tag being read
+        // began in it: a tag begun in an earlier piece has every byte so far held.
+        let mut plain = 0;
+        let mut began: Option<usize> = None;
+        for (at, c) in text.char_indices() {
+            let spells = match self.stay.tag.as_mut() {
+                None => {
+                    if c == '<' {
+                        self.stay.tag = Some(String::new());
+                        began = Some(at);
+                    }
+                    continue;
+                }
+                Some(tag) => {
+                    let spells = if tag.is_empty() {
+                        c == '/'
+                    } else {
+                        tagged::xml::is_tag_byte(c)
+                    };
+                    if spells {
+                        tag.push(c);
+                    }
+                    spells
+                }
+            };
+            if spells {
+                continue;
+            }
+            let tag = self.stay.tag.take().unwrap_or_default();
+            let here = began.take();
+            let name = tag.strip_prefix('/').unwrap_or_default();
+            if c == '>' && !name.is_empty() && !name.contains('/') {
+                // A whole closing tag: the text before it goes on, the tag is ignored.
+                let before = here.unwrap_or(plain);
+                if plain < before {
+                    self.wrapping(part(&text, plain..before), why, out);
+                }
+                self.stray_close(format!("<{tag}>"), out);
+                plain = at + c.len_utf8();
+                continue;
+            }
+            // No closing tag after all. Begun in this piece, its bytes stay in the run they
+            // stand in; begun in an earlier one, the bytes held are the stay's text.
+            if here.is_none() {
+                self.wrapping(Cow::Owned(format!("<{tag}")), why, out);
+                plain = at;
+            }
+            if c == '<' {
+                self.stay.tag = Some(String::new());
+                began = Some(at);
+            }
+        }
+        // What the piece ends on: text, or a tag still being read, whose bytes are held.
+        let end = match (&self.stay.tag, began) {
+            (Some(_), Some(began)) => began,
+            (Some(_), None) => plain,
+            (None, _) => text.len(),
+        };
+        if plain < end {
+            self.wrapping(part(&text, plain..end), why, out);
+        }
+    }
+
+    /// A closing tag between a block's calls: it names nothing open, since no call is, and is
+    /// ignored as a syntax ignores one between a call's members. It is counted by a
+    /// `Malformed { StrayClosingTag }` event of no bytes, and its own bytes leave as a malformed
+    /// call's, never content. The run the stay held before it is the template's spacing around
+    /// a tag, dropped as at any tag.
+    fn stray_close(&mut self, tag: String, out: &mut Events) {
+        self.end_stay(out);
+        out.push(Event::Malformed {
+            text: self.tokens.text(""),
+            why: MalformedReason::StrayClosingTag,
+        });
+        out.push(Event::Dropped {
+            text: self.tokens.text(tag),
+            why: DropReason::MalformedCall,
+        });
+    }
+
+    /// The bytes of a tag a wrapping stay was still reading when the stay ends or a marker the
+    /// table ignores arrives: they spelled no closing tag, and are the stay's text.
+    fn release_held_tag(&mut self, out: &mut Events) {
+        if let Some(tag) = self.stay.tag.take() {
+            self.wrapping(
+                Cow::Owned(format!("<{tag}")),
+                MalformedReason::TextBetweenCalls,
+                out,
+            );
         }
     }
 
@@ -1041,6 +1152,7 @@ impl Engine {
     /// The run the stay held is the state's text: the whitespace is shown, and an ignored
     /// terminal among it is dropped in its place.
     fn release_stay(&mut self, out: &mut Events) {
+        self.release_held_tag(out);
         if self.stay.held.is_empty() {
             return;
         }
@@ -1059,6 +1171,7 @@ impl Engine {
     /// after its last text as much as a lead no text followed, and the run a wrapping stay held
     /// after its last text, the template's spacing before the terminal that ended the stay.
     fn end_stay(&mut self, out: &mut Events) {
+        self.release_held_tag(out);
         // A content or reasoning stay's run is whitespace the format treats as structural; a
         // wrapping stay's is the template's wrapping, as it is before the stay's first text.
         let spacing = match self.emits() {
@@ -1161,6 +1274,8 @@ impl Engine {
             return;
         }
         if self.format.ignored(index) {
+            // A tag a wrapping stay was reading ends at the marker: its bytes came before.
+            self.release_held_tag(out);
             let text = self.format.terminal_text(index).to_string();
             if self.call_holds_markers() {
                 self.text(Cow::Owned(text), out);

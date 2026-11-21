@@ -888,7 +888,7 @@ mod tests {
                 output: RECORDED_STRAY_CLOSE,
                 content: "I'll perform a t-test to check if there's a statistically significant difference between these two datasets.",
                 calls: vec![("t_test", Arguments::Whole(value!({"dataset_A": [12, 24, 36], "dataset_B": [15, 30, 45]})))],
-                first: MalformedReason::TagOutOfPlace,
+                first: MalformedReason::StrayClosingTag,
                 refused: "</arg_value>",
             },
             Case {
@@ -900,7 +900,7 @@ mod tests {
                     ("get_president_and_vp_for_year", Arguments::None),
                     ("get_president_and_vp_for_year", Arguments::None),
                 ],
-                first: MalformedReason::TagOutOfPlace,
+                first: MalformedReason::StrayClosingTag,
                 refused: "</arg_key><arg_value>1975</arg_value></arg_key><arg_value>2011</arg_value>",
             },
             Case {
@@ -1017,7 +1017,7 @@ mod tests {
             .collect();
         assert!(
             reasons.contains(&MalformedReason::TextBetweenTags)
-                && reasons.contains(&MalformedReason::TagOutOfPlace),
+                && reasons.contains(&MalformedReason::StrayClosingTag),
             "{reasons:?}"
         );
         let refused: String = events

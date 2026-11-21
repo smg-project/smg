@@ -68,6 +68,11 @@ pub struct Assembler {
     written: u32,
     /// A tag being read: the bytes after its `<`, while they still spell a tag.
     tag: Option<String>,
+    /// Opening tags the open leaf took as its text right after the template's separator, each
+    /// until a closing tag after a separator pairs with it: the model is writing tags of its
+    /// own inside the value, and their closing tags are the value's text as they are
+    /// ([`Self::close_tag`]).
+    nested: u32,
     /// Whether the last bytes taken were the table's ignored terminal: the separator the
     /// template writes before every tag, and never inside a value.
     after_separator: bool,
@@ -87,8 +92,9 @@ pub struct Assembler {
     too_deep: bool,
     /// Whether the syntax refused bytes inside the started call (a tail after the name's quote, a
     /// word between tags, a tag out of its place or cut short between elements, an element the
-    /// call's end found open before its first child or its text's close, the nesting past the
-    /// bound; not a closing tag that closes nothing open, [`Self::refuse_stray_close`]): the
+    /// stream's stop found open before its first child or its text's close, a value the call's
+    /// end found held with the start of a tag in its text, the nesting past the bound; not a
+    /// closing tag that closes nothing open, [`Self::refuse_stray_close`]): the
     /// model's call had something in it the client will not get, so it is no whole call, and
     /// nothing is made up for its close, the containers still open included ([`Self::close`]).
     refused: bool,
@@ -108,6 +114,8 @@ enum Stage {
 #[derive(Clone, Debug)]
 struct Element {
     key: String,
+    /// What the tools declare at the element's path, asked once, when its tag opened it.
+    kind: Option<Kind>,
     shape: Shape,
     /// Children written so far, once the element is a container.
     written: u32,
@@ -141,7 +149,7 @@ enum Mode {
 /// The characters a tag's name is made of: anything but whitespace and the angle brackets, since
 /// the template writes any key (BFCL's hold `ñ`, OData's `$filter`, MongoDB's `$gt`); `/` is
 /// allowed anywhere here and judged when the tag is whole.
-fn is_tag_byte(c: char) -> bool {
+pub(crate) fn is_tag_byte(c: char) -> bool {
     !c.is_whitespace() && !matches!(c, '<' | '>')
 }
 
@@ -160,6 +168,7 @@ impl Assembler {
             open: Vec::new(),
             written: 0,
             tag: None,
+            nested: 0,
             after_separator: false,
             released: false,
             too_deep: false,
@@ -188,22 +197,25 @@ impl Assembler {
     /// The table's ignored terminal arrived inside the call: a tag held before it is released, as
     /// the separator ends it, and what follows stands after a separator. Its own bytes are the
     /// engine's to place, in their order among the bytes this assembler holds.
-    pub fn ignored(&mut self, declared: &Declared, out: &mut Events) {
+    pub fn ignored(&mut self, out: &mut Events) {
         if self.done {
             return;
         }
-        self.release_tag(declared, out);
+        self.release_tag(out);
         self.after_separator = true;
     }
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. Every open container is
-    /// closed and the object is closed, when the syntax read the call whole; a leaf never
-    /// written, an element without a child and a tag the end cut short between elements (the
-    /// member the model had begun) are refused; inside a streamed string the string
+    /// closed and the object is closed, when the syntax read the call whole; a tag the end cut
+    /// short (the member, or the closing tag, the model had begun) is refused, with the element
+    /// it stands in; inside a streamed string the string
     /// is closed first ([`Self::close_open_string`]), since the model ended the call and its
     /// bytes are the value whole, under one `Malformed { OpenAtTheMarker }` event of no bytes,
-    /// and the containers above it close as after any leaf; an invoke whose name never closed,
+    /// and the containers above it close as after any leaf; an element held whole for its
+    /// close, or one with no child and no text yet, is closed there too with what it holds
+    /// ([`Self::close_left_open`]), under one `Malformed { OpenAtTheParentsClose }` event of no
+    /// bytes; an invoke whose name never closed,
     /// or that had none, has its bytes refused. After a tag or a value that would have nested
     /// the arguments past [`DEEPEST`], the bytes held from the element that would cross the
     /// bound are refused first ([`refuse`](super::refuse): one counted `Malformed {
@@ -213,7 +225,17 @@ impl Assembler {
     /// something in the call that the client will not get, so its arguments stay the strict JSON
     /// prefix the fragments wrote and no whole value, which is how a client that reads them as
     /// JSON is told, as a cut call tells it.
-    pub fn close(mut self, terminal: &str, out: &mut Events) {
+    pub fn close(self, terminal: &str, out: &mut Events) {
+        self.end(terminal, false, out);
+    }
+
+    /// The call's end, by a marker ([`Self::close`]) or `at_stop` ([`Self::stop`]). The two end
+    /// alike but for an element the end finds open holding text, or nothing: a marker is the
+    /// model's own end of the call, so the element is closed there with what it holds, as the
+    /// closing tag of an element around it closes it ([`Self::close_left_open`]), unless its
+    /// text has the start of a tag in it ([`Self::holds_text_alone`]); the stop refuses it,
+    /// since output that ends inside a value says nothing of the value's end.
+    fn end(mut self, terminal: &str, at_stop: bool, out: &mut Events) {
         if self.done {
             return;
         }
@@ -233,10 +255,21 @@ impl Assembler {
                 self.refuse_between(&format!("<{tag}"), MalformedReason::TagCutShort, out);
             }
         }
+        // A tag the end cut short inside an element is no text the element's close could
+        // take: the element is refused with it, below.
+        let whole = !at_stop && !self.refused && !self.too_deep && self.tag.is_none();
         self.hold_tag();
         if self.too_deep {
             self.value.clear();
             self.report(MalformedReason::InvalidArguments, out);
+        }
+        if whole && !self.between_elements() && self.holds_text_alone() {
+            self.close_left_open(MalformedReason::OpenAtTheParentsClose, "", out);
+            if self.too_deep {
+                // The value would nest past the bound: refused, as at the element's own close.
+                self.value.clear();
+                self.report(MalformedReason::InvalidArguments, out);
+            }
         }
         while let Some(element) = self.open.last() {
             match element.shape {
@@ -298,7 +331,8 @@ impl Assembler {
     }
 
     /// The stream's stop inside the invoke: the model's own end of output, not a cut. The call
-    /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): every
+    /// ends as its closing tag would end it, with no bytes for the end ([`Self::end`]), but for
+    /// what the stop finds open holding text: every
     /// open container and the object are closed, when the syntax read the call whole; a leaf
     /// never written, an element without a child and a tag the stop found open between elements
     /// are refused, and the call then gets no
@@ -328,7 +362,7 @@ impl Assembler {
         if !string_closed && self.started() && !as_marker && whole {
             super::open_at_the_stop(out);
         }
-        self.close("", out);
+        self.end("", true, out);
     }
 
     /// A streamed string still open when the call ends, at its closing marker or at the stream's
@@ -445,28 +479,28 @@ impl Assembler {
             }
             // Not a tag after all: the `<` and what followed it are text, and this byte is read
             // again as text or as the start of a tag.
-            self.release_tag(declared, out);
+            self.release_tag(out);
             return &text[at..];
         }
         match text.find('<') {
             Some(at) => {
                 if at > 0 {
-                    self.text(Cow::Borrowed(&text[..at]), declared, out);
+                    self.text(Cow::Borrowed(&text[..at]), out);
                 }
                 self.tag = Some(String::new());
                 &text[at + 1..]
             }
             None => {
-                self.text(Cow::Borrowed(text), declared, out);
+                self.text(Cow::Borrowed(text), out);
                 ""
             }
         }
     }
 
     /// A `<` and the bytes after it were not a tag: they are text where they stand.
-    fn release_tag(&mut self, declared: &Declared, out: &mut Events) {
+    fn release_tag(&mut self, out: &mut Events) {
         if let Some(tag) = self.tag.take() {
-            self.text(Cow::Owned(format!("<{tag}")), declared, out);
+            self.text(Cow::Owned(format!("<{tag}")), out);
         }
     }
 
@@ -486,7 +520,7 @@ impl Assembler {
             None => (false, tag),
         };
         if name.is_empty() || name.contains('/') {
-            self.text(Cow::Owned(bytes), declared, out);
+            self.text(Cow::Owned(bytes), out);
             return;
         }
         if !self.started() {
@@ -494,7 +528,7 @@ impl Assembler {
             return;
         }
         if closing {
-            self.close_tag(name, bytes, declared, out);
+            self.close_tag(name, bytes, out);
         } else {
             self.open_tag(name, bytes, declared, out);
         }
@@ -505,26 +539,37 @@ impl Assembler {
     /// it makes that element a container or a leaf, by what the tool declares there, or, with no
     /// declaration, by whether the template's separator came before it (the template writes the
     /// separator before every tag it writes and never inside a value); then it opens an element
-    /// of its own. An element that would become the container past [`DEEPEST`] (the arguments
+    /// of its own, and asks the tools once what they declare at its path. An element that would
+    /// become the container past [`DEEPEST`] (the arguments
     /// object and the containers open above it counted) is refused instead, with every byte
     /// from its own tag to the call's end ([`Self::close`]): the prefix parser would refuse the
     /// nesting, so the fragments stop where they are still a prefix it takes, as the JSON syntax
     /// stops at the bracket it cannot take; nothing of the element's member is written, so the
     /// containers above it close whole at the end without it.
+    ///
+    /// A tag a leaf takes as its text right after the separator is counted (`nested`): the
+    /// model is writing tags of its own inside the value, and the closing tag that pairs with
+    /// it is the value's text too ([`Self::close_tag`]).
     fn open_tag(&mut self, key: &str, bytes: String, declared: &Declared, out: &mut Events) {
-        match self.open.last().map(|element| element.shape) {
-            Some(Shape::Leaf(_)) => {
+        match self
+            .open
+            .last()
+            .map(|element| (element.shape, element.kind))
+        {
+            Some((Shape::Leaf(_), _)) => {
+                self.nested = self.nested.saturating_add(u32::from(self.after_separator));
                 self.leaf_text(Cow::Owned(bytes), out);
                 return;
             }
-            Some(Shape::Open) => {
-                let leaf = match self.kind_here(declared) {
+            Some((Shape::Open, kind)) => {
+                let leaf = match kind {
                     Some(Kind::String | Kind::NullableString | Kind::Integer) => true,
                     Some(Kind::Array | Kind::Object) => false,
                     None => !self.after_separator,
                 };
                 if leaf {
-                    self.become_leaf(declared, out);
+                    self.become_leaf(out);
+                    self.nested = self.nested.saturating_add(u32::from(self.after_separator));
                     self.leaf_text(Cow::Owned(bytes), out);
                     return;
                 }
@@ -534,71 +579,170 @@ impl Assembler {
                     self.too_deep = true;
                     return;
                 }
-                self.decide_container(key == ITEM, declared, out);
+                self.decide_container(key == ITEM, out);
             }
-            Some(Shape::Object | Shape::List) | None => {}
+            Some((Shape::Object | Shape::List, _)) | None => {}
         }
+        let kind = self.kind_of(key, declared);
         self.carried.push_str(&bytes);
         self.value.clear();
+        self.nested = 0;
         self.open.push(Element {
             key: key.to_string(),
+            kind,
             shape: Shape::Open,
             written: 0,
         });
         self.released = false;
     }
 
-    /// A closing tag: it closes the innermost element when it names it; inside a leaf, or under
-    /// an element with no child yet, any other closing tag is text; one that names an open element
-    /// further out, an inner close left out, closes it out of order and is refused as any tag out
-    /// of its place, since what follows it would land in the wrong container; one that names
-    /// nothing open is refused at no cost to the call ([`Self::refuse_stray_close`]).
+    /// A closing tag. It closes the innermost element when it names it. Any other closing tag
+    /// is read by where it stands.
     ///
-    /// One element with no child yet is closed by the tag, not fed it as text: an element the
-    /// tool declares an array or an object, holding nothing but whitespace, when the tag names
-    /// the element directly around it. A closing tag is no value of a list or an object, so the
-    /// model left the element's own close out: the element is written empty (`[]` or `{}`)
-    /// through [`Self::close_element`], behind one `Malformed { TagCutShort }` event of no
-    /// bytes, and the tag closes the element it names. Whitespace the element held is dropped
-    /// here; its own close would have written it as the element's text. Nothing is refused, so
-    /// the call stays whole. Where the empty container would nest past [`DEEPEST`], the tag
-    /// stays text.
-    fn close_tag(&mut self, name: &str, bytes: String, declared: &Declared, out: &mut Events) {
-        match self.open.last() {
-            Some(element) if element.key == name => self.close_element(&bytes, declared, out),
-            Some(Element {
-                shape: Shape::Open, ..
-            }) if self.open.len() < DEEPEST
-                && self
-                    .open
-                    .iter()
-                    .rev()
-                    .nth(1)
-                    .is_some_and(|around| around.key == name)
-                && matches!(self.kind_here(declared), Some(Kind::Array | Kind::Object)) =>
-            {
-                super::left_open(MalformedReason::TagCutShort, out);
-                // Whitespace held is no value here: its bytes leave as the fragment's source.
-                self.value.clear();
-                self.close_element("", declared, out);
-                self.close_element(&bytes, declared, out);
-            }
-            Some(Element {
-                shape: Shape::Leaf(_) | Shape::Open,
-                ..
-            }) => self.text(Cow::Owned(bytes), declared, out),
-            Some(_) if self.open.iter().any(|element| element.key == name) => {
-                self.refuse_between(&bytes, MalformedReason::TagOutOfPlace, out);
-            }
-            Some(_) | None => self.refuse_stray_close(&bytes, out),
+    /// Between elements (at the top of the invoke, or under a container after a child of it),
+    /// where the syntax has only tags: one that names an open element further out closes it,
+    /// and everything opened inside it first ([`Self::close_through`]), since the model left
+    /// those closes out and the tag says where it is; one that names nothing open closes
+    /// nothing and is ignored at no cost to the call ([`Self::refuse_stray_close`]).
+    ///
+    /// Inside an element that holds text, or nothing yet, a closing tag is the element's text
+    /// unless the template's separator stands right before it: the template writes the
+    /// separator before every tag it writes and never inside a value, so a tag behind one is
+    /// structure the model meant. Such a tag that names an open element further out closes
+    /// through to it, as between elements; one that names nothing open stands for the
+    /// element's own close, misnamed ([`Self::close_left_open`]). One closing tag behind a
+    /// separator stays text: the one that pairs with an opening tag the value took as its text
+    /// behind a separator (`nested`), tags the model is writing inside the value. And a value
+    /// held for its close that has the start of a tag in its text is closed by its own closing
+    /// tag alone ([`Self::holds_text_alone`]).
+    ///
+    /// Without the separator one closing tag still closes: under an element the tool declares
+    /// an array or an object, with no child and nothing but whitespace, the tag that names the
+    /// element directly around it. A closing tag is no value of a list or an object, so the
+    /// model left the element's own close out, and the element is written empty (`[]` or `{}`)
+    /// as the tag closes through it. Where the empty container would nest past [`DEEPEST`],
+    /// that tag stays text.
+    fn close_tag(&mut self, name: &str, bytes: String, out: &mut Events) {
+        if self.open.last().is_some_and(|element| element.key == name) {
+            self.close_element(&bytes, out);
+            return;
         }
+        let around = self.open.iter().rposition(|element| element.key == name);
+        if !self.between_elements() {
+            if self.after_separator && self.nested > 0 {
+                self.nested -= 1;
+                self.text(Cow::Owned(bytes), out);
+                return;
+            }
+            if !self.after_separator && !self.is_empty_container_under(around) {
+                self.text(Cow::Owned(bytes), out);
+                return;
+            }
+            if !self.holds_text_alone() {
+                self.text(Cow::Owned(bytes), out);
+                return;
+            }
+        }
+        match around {
+            Some(at) => self.close_through(at, &bytes, out),
+            None if self.between_elements() => self.refuse_stray_close(&bytes, out),
+            None => self.close_left_open(MalformedReason::StrayClosingTag, &bytes, out),
+        }
+    }
+
+    /// Whether the text the innermost element holds for its close has no start of a tag in it:
+    /// a `<` there is a tag the syntax did not read (one cut short, or one that is text by the
+    /// separator's rule), so what the model meant after it is not known, and only the
+    /// element's own closing tag closes it. A streamed string has no text held: its bytes went
+    /// out as its value, whatever they were.
+    fn holds_text_alone(&self) -> bool {
+        !self.value.contains('<')
+    }
+
+    /// Whether the innermost element is one the tool declares an array or an object, with no
+    /// child yet, directly under the open element at `around`, where an empty container still
+    /// fits under [`DEEPEST`]: the one element a closing tag without the separator closes
+    /// through ([`Self::close_tag`]).
+    fn is_empty_container_under(&self, around: Option<usize>) -> bool {
+        self.open.len() < DEEPEST
+            && around.is_some_and(|at| at + 2 == self.open.len())
+            && matches!(
+                self.open.last(),
+                Some(Element {
+                    shape: Shape::Open,
+                    kind: Some(Kind::Array | Kind::Object),
+                    ..
+                })
+            )
+    }
+
+    /// A closing tag that names the open element at `at`, further out than the innermost: the
+    /// model left out the close of everything it opened inside that element, and the tag says
+    /// where the model is, so it closes them all, innermost first, and then the element it
+    /// names. An element that holds text, or nothing yet, is written as its own close would
+    /// write it ([`Self::close_left_open`]); a container closes with the members it has. One
+    /// `Malformed { OpenAtTheParentsClose }` event of no bytes stands before the first
+    /// fragment; nothing is refused, every byte the model wrote is in the call, and what
+    /// follows the tag is read in the container the model went back to. A value that would
+    /// nest past [`DEEPEST`] is refused with the tag and the rest of the call, as at its own
+    /// close.
+    fn close_through(&mut self, at: usize, bytes: &str, out: &mut Events) {
+        // The tag's bytes are the source of the first fragment, the close of what the tag found
+        // open: a string's closing quote has the bytes that closed it behind it.
+        if self.between_elements() {
+            super::left_open(MalformedReason::OpenAtTheParentsClose, out);
+            self.close_element(bytes, out);
+        } else {
+            self.close_left_open(MalformedReason::OpenAtTheParentsClose, bytes, out);
+            if self.too_deep {
+                return;
+            }
+        }
+        while self.open.len() > at {
+            self.close_element("", out);
+        }
+    }
+
+    /// The innermost element, which holds text or nothing yet, closed where the model wrote no
+    /// close of its own for it: by a closing tag that names nothing open (`why` is
+    /// `StrayClosingTag`, and the tag's `bytes` stand for the element's own close), by the
+    /// closing tag of an element around it, or by the call's closing marker
+    /// (`OpenAtTheParentsClose`, no bytes). The element is written as its own closing tag
+    /// would write it ([`Self::close_element`]): its text as its value, by its declared type,
+    /// or the empty value of that type. Whitespace alone in an element declared a list or an
+    /// object is no value of one, and is dropped. One `Malformed` event of no bytes with `why`
+    /// stands before the fragment; nothing is refused, so the call stays whole. A value that
+    /// would nest the arguments past [`DEEPEST`] is refused as at the element's own close, and
+    /// then no event says the element was closed.
+    fn close_left_open(&mut self, why: MalformedReason, bytes: &str, out: &mut Events) {
+        let Some(element) = self.open.last() else {
+            return;
+        };
+        let shape = element.shape;
+        if matches!(
+            (shape, element.kind),
+            (Shape::Open, Some(Kind::Array | Kind::Object))
+        ) {
+            self.value.clear();
+        }
+        let held = !matches!(
+            shape,
+            Shape::Leaf(Leaf {
+                mode: Mode::Streaming,
+                ..
+            })
+        );
+        if !(held && self.past_the_bound(&self.value_at_close(shape))) {
+            super::left_open(why, out);
+        }
+        self.close_element(bytes, out);
     }
 
     /// The element's first child tag says what it is: a list when the tool declares an array there
     /// or, failing that, when the child is an `<item>`; else an object. Its opening fragment goes
     /// out with the bytes held since its own tag.
-    fn decide_container(&mut self, item: bool, declared: &Declared, out: &mut Events) {
-        let list = match self.kind_here(declared) {
+    fn decide_container(&mut self, item: bool, out: &mut Events) {
+        let list = match self.kind_here() {
             Some(Kind::Array) => true,
             Some(Kind::Object) => false,
             _ => item,
@@ -646,7 +790,7 @@ impl Assembler {
     /// Text where it stands: the delta's (`Cow::Borrowed`, which a streamed leaf's fragment
     /// keeps) or the assembler's own (`Cow::Owned`: a tag that turned out to be text, bytes it
     /// held).
-    fn text<'d>(&mut self, text: Cow<'d, str>, declared: &Declared, out: &mut Events<'d>) {
+    fn text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         self.after_separator = false;
         match self.open.last().map(|element| element.shape) {
             Some(Shape::Leaf(_)) => self.leaf_text(text, out),
@@ -656,7 +800,7 @@ impl Assembler {
                 self.value.push_str(&text);
                 self.carried.push_str(&text);
                 if !self.value.trim().is_empty() {
-                    self.become_leaf(declared, out);
+                    self.become_leaf(out);
                 }
             }
             Some(Shape::Object | Shape::List) | None => self.text_between(&text, out),
@@ -677,8 +821,8 @@ impl Assembler {
     }
 
     /// The element holds text: it is a leaf, typed by what the tool declares at its path.
-    fn become_leaf(&mut self, declared: &Declared, out: &mut Events) {
-        let kind = self.kind_here(declared);
+    fn become_leaf(&mut self, out: &mut Events) {
+        let kind = self.kind_here();
         let mode = match kind {
             Some(Kind::String) => Mode::Streaming,
             Some(Kind::NullableString) => Mode::Undecided,
@@ -694,14 +838,21 @@ impl Assembler {
         }
     }
 
-    /// The kind the tools declare for the innermost open element.
-    fn kind_here(&self, declared: &Declared) -> Option<Kind> {
+    /// The kind the tools declare for the innermost open element, asked when its tag opened it
+    /// ([`Self::open_tag`]).
+    fn kind_here(&self) -> Option<Kind> {
+        self.open.last().and_then(|element| element.kind)
+    }
+
+    /// The kind the tools declare for an element `key` opened under the open ones.
+    fn kind_of(&self, key: &str, declared: &Declared) -> Option<Kind> {
         let function = self.function.as_deref()?;
-        let path: Vec<&str> = self
+        let mut path: Vec<&str> = self
             .open
             .iter()
             .map(|element| element.key.as_str())
             .collect();
+        path.push(key);
         declared.kind_at(function, &path)
     }
 
@@ -778,44 +929,16 @@ impl Assembler {
 
     /// The innermost element's closing tag: a streamed string gets its quote, a held leaf is
     /// written through [`json`], a container closes, an element with no child is empty by its
-    /// declared type. A leaf whose own JSON would nest the arguments past [`DEEPEST`], and an
-    /// empty element declared a container at the bound, are refused instead, with every byte
-    /// from the element's own tag to the call's end ([`Self::close`]), as a tag that would nest
-    /// past the bound is ([`Self::open_tag`]): nothing of the member is written.
-    fn close_element(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    /// declared type ([`Self::value_at_close`]). A leaf whose own JSON would nest the arguments
+    /// past [`DEEPEST`], and an empty element declared a container at the bound, are refused
+    /// instead, with every byte from the element's own tag to the call's end ([`Self::close`]),
+    /// as a tag that would nest past the bound is ([`Self::open_tag`]): nothing of the member
+    /// is written.
+    fn close_element(&mut self, bytes: &str, out: &mut Events) {
         let Some(shape) = self.open.last().map(|element| element.shape) else {
             return;
         };
-        let written = match shape {
-            Shape::Leaf(Leaf {
-                mode: Mode::Streaming,
-                ..
-            }) => "\"".to_string(),
-            Shape::Leaf(Leaf { kind, .. }) => json(&self.value, kind),
-            Shape::Object => "}".to_string(),
-            Shape::List => "]".to_string(),
-            // Whitespace alone between the tags: a leaf after all.
-            Shape::Open if !self.value.is_empty() => json(&self.value, self.kind_here(declared)),
-            Shape::Open => {
-                // The template writes `None` as an empty element only inside a list; a mapping
-                // skips a `None` member, so an empty element anywhere else is an empty string.
-                let in_list = matches!(
-                    self.open.iter().rev().nth(1),
-                    Some(Element {
-                        shape: Shape::List,
-                        ..
-                    })
-                );
-                match self.kind_here(declared) {
-                    Some(Kind::Array) => "[]",
-                    Some(Kind::Object) => "{}",
-                    Some(_) => "\"\"",
-                    None if in_list => "null",
-                    None => "\"\"",
-                }
-                .to_string()
-            }
-        };
+        let written = self.value_at_close(shape);
         let fragment = match shape {
             Shape::Leaf(Leaf {
                 mode: Mode::Streaming,
@@ -837,10 +960,47 @@ impl Assembler {
         };
         self.open.pop();
         self.value.clear();
+        self.nested = 0;
         let mut source = std::mem::take(&mut self.carried);
         source.push_str(bytes);
         self.push_fragment(fragment, Text::uncounted(source), out);
         self.released = false;
+    }
+
+    /// What the close of the innermost element, of `shape`, writes for it: a streamed string's
+    /// quote, a held leaf's text through [`json`], a container's bracket, and for an element
+    /// with no child the empty value of its declared type.
+    fn value_at_close(&self, shape: Shape) -> String {
+        match shape {
+            Shape::Leaf(Leaf {
+                mode: Mode::Streaming,
+                ..
+            }) => "\"".to_string(),
+            Shape::Leaf(Leaf { kind, .. }) => json(&self.value, kind),
+            Shape::Object => "}".to_string(),
+            Shape::List => "]".to_string(),
+            // Whitespace alone between the tags: a leaf after all.
+            Shape::Open if !self.value.is_empty() => json(&self.value, self.kind_here()),
+            Shape::Open => {
+                // The template writes `None` as an empty element only inside a list; a mapping
+                // skips a `None` member, so an empty element anywhere else is an empty string.
+                let in_list = matches!(
+                    self.open.iter().rev().nth(1),
+                    Some(Element {
+                        shape: Shape::List,
+                        ..
+                    })
+                );
+                match self.kind_here() {
+                    Some(Kind::Array) => "[]",
+                    Some(Kind::Object) => "{}",
+                    Some(_) => "\"\"",
+                    None if in_list => "null",
+                    None => "\"\"",
+                }
+                .to_string()
+            }
+        }
     }
 
     /// Whether `written`, the value of the innermost element, would nest the arguments past
@@ -906,14 +1066,14 @@ impl Assembler {
         self.report(why, out);
     }
 
-    /// A closing tag that names nothing open, between elements: refused and counted like any
-    /// tag out of its place ([`Self::refuse_between`]), but the one refusal that costs the call
-    /// nothing, since such a tag carries no member the client could lose; the call is as whole
-    /// after it as before. (One that names an open element further out is no such tag: the
-    /// members after it would land in the wrong container, [`Self::close_tag`].)
+    /// A closing tag that names nothing open, between elements: ignored. Its bytes are refused
+    /// as any bytes the syntax has no place for ([`Self::refuse_between`]), under the one
+    /// reason that says no call lost them (`StrayClosingTag`), and it is the one refusal that
+    /// costs the call nothing, since such a tag carries no member the client could lose; the
+    /// call is as whole after it as before.
     fn refuse_stray_close(&mut self, bytes: &str, out: &mut Events) {
         let whole = !self.refused;
-        self.refuse_between(bytes, MalformedReason::TagOutOfPlace, out);
+        self.refuse_between(bytes, MalformedReason::StrayClosingTag, out);
         self.refused = !whole;
     }
 
@@ -952,8 +1112,8 @@ impl crate::engine::CallAssembler for Assembler {
         text.len()
     }
 
-    fn ignored(&mut self, _text: &str, declared: &Declared, out: &mut Events) {
-        self.ignored(declared, out);
+    fn ignored(&mut self, _text: &str, _declared: &Declared, out: &mut Events) {
+        self.ignored(out);
     }
 
     /// Only the invoke's closing tag is a started call's end; the next invoke's opening and the

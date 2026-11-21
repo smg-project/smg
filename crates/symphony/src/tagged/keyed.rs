@@ -612,13 +612,14 @@ impl Assembler {
     }
 
     /// A bare closing tag between pairs, `</arg_key>` or `</arg_value>` where the syntax has the
-    /// next key's tag or the call's close: refused and counted like any tag out of its place
-    /// ([`Self::release`]), but the one refusal that costs the call nothing, since the tag carries
+    /// next key's tag or the call's close: its bytes are refused as any the syntax has no place
+    /// for ([`Self::release`]), under the reason that says no call lost them
+    /// (`StrayClosingTag`), the one refusal that costs the call nothing, since the tag carries
     /// no member the client could lose; the call is as whole after it as before (a recorded
     /// output writes the last value's close twice).
     fn release_stray_close(&mut self, bytes: &str, out: &mut Events) {
         self.object.drop_carried(out);
-        refuse(bytes.to_string(), MalformedReason::TagOutOfPlace, out);
+        refuse(bytes.to_string(), MalformedReason::StrayClosingTag, out);
     }
 
     /// The carried bytes refused with `why` ([`Object::refuse`]: the counted event of no bytes,
@@ -1609,7 +1610,7 @@ mod tests {
             assert_eq!(arguments(&events), r#"{"n": 1}"#, "{stray}");
             assert_eq!(
                 malformed(&events),
-                [("", MalformedReason::TagOutOfPlace)],
+                [("", MalformedReason::StrayClosingTag)],
                 "{stray}"
             );
             assert_eq!(refused(&events), [stray], "{stray}");
