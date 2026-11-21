@@ -577,6 +577,11 @@ fn gpt_oss_template() -> Box<dyn Parser> {
     ))
 }
 
+/// The crate's own gpt-oss table, which no registry row lists yet.
+fn gpt_oss_table() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::gpt_oss(), Declared::default()))
+}
+
 fn space() -> Class {
     Class::new([('\t', '\r'), (' ', ' ')], false)
 }
@@ -1115,6 +1120,12 @@ const FORMATS: &[Subject] = &[
         table: None,
     },
     Subject {
+        name: "gpt-oss table, not listed yet",
+        new: gpt_oss_table,
+        outputs: GPT_OSS_TABLE_OUTPUTS,
+        table: None,
+    },
+    Subject {
         name: "shaped calls on abstract tags",
         new: shaped_tags,
         outputs: SHAPED_TAGS_OUTPUTS,
@@ -1221,6 +1232,29 @@ const GPT_OSS_OUTPUTS: &[&str] = &[
     "<|channel|>commentary to=functions.f<|message|>{} trailing",
     "",
     "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Paris\", \"days\": ,}",
+];
+
+/// The gpt-oss table: a call under either order of its header and on the analysis channel, a
+/// preamble, the model's own tools under either order, a recipient that is no function, a header
+/// with no channel, a marker that names no tool, a header the end leaves unfinished, a call a
+/// start marker ends, and nothing.
+const GPT_OSS_TABLE_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>User asks for the weather.<|end|><|start|>assistant\
+     <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+     {\"city\": \"Paris\", \"days\": 3}",
+    " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Par",
+    "<|channel|>analysis to=functions.get-weather.v2 <|constrain|>json<|message|>{}",
+    "<|channel|>commentary<|message|>Looking it up.<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    " to=python<|channel|>analysis<|message|>print(1)<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    "<|channel|>analysis to=browser.search code<|message|>{\"query\": \"x\"}",
+    "<|channel|>commentary to=repo_browser.print_tree <|constrain|>json<|message|>{\"path\": \".\"}",
+    "<|message|>Plain.<|end|> after",
+    "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+    "<|channel|>commentary to=functions.get_weather json",
+    "<|channel|>commentary to=functions.get_weather json<|message|><|start|>assistant",
+    "",
 ];
 
 /// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
