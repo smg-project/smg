@@ -2,8 +2,9 @@
 //!
 //! A host applies its start's document through [`DocumentManager::apply`]. It
 //! can read the running document and status and check another document with a
-//! dry run. Without a spec store, an enforce and a rollback are refused. The
-//! calls run on the caller's thread.
+//! dry run. Without a spec store, an enforce and a rollback are refused. A host
+//! that runs a document and keeps no store for it checks another against the
+//! one it runs with [`dry_run_against`]. The calls run on the caller's thread.
 
 mod answers;
 mod document_manager;
@@ -24,11 +25,11 @@ pub use answers::{
 };
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use document_manager::needs_rows;
-pub use document_manager::DocumentManager;
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use document_manager::Validate;
 #[cfg(feature = "controller")]
 pub(crate) use document_manager::{above, over_bound, Checked, Held, Line};
+pub use document_manager::{dry_run_against, DocumentManager};
 #[cfg(feature = "controller")]
 pub(crate) use document_manager::{DRY_RUNS_WAITING, WRITES_WAITING};
 pub use reader::{Format, MAX_DOCUMENT_BYTES};

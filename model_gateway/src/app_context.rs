@@ -145,9 +145,10 @@ pub struct AppContext {
     /// The policy controller's store, where the controller was picked to
     /// decide for this process; `None` under the classic policies.
     pub policy_store: Option<Arc<MemoryStore>>,
-    /// The operators' door over the policy store: the control plane's
-    /// policy document routes stand on it. `None` under the classic
-    /// policies.
+    /// What the control plane's policy routes read: the engine's document
+    /// and the worker registry where the gateway decides in its own
+    /// process, the operators' door over the policy store where it follows
+    /// a controller. `None` under the classic policies.
     pub(crate) policy_operators: Option<Arc<Operators>>,
     /// The worker watch, owned by the context until server teardown.
     pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
@@ -155,6 +156,13 @@ pub struct AppContext {
     /// the policy store is present.
     pub(crate) policy_engine: Option<Arc<PolicyEngine>>,
     /// The membership feed over [`Self::policy_store`], present wherever the store is.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the follower and the policy engine each took what they read at the build"
+        )
+    )]
     pub(crate) policy_feed: Option<Feed>,
     /// What the start left a gateway that decides in its own process (the
     /// setting on and no controller's address): the policy engine the
@@ -167,7 +175,7 @@ pub struct AppContext {
         not(test),
         expect(
             dead_code,
-            reason = "the control plane's policy routes read what the start left"
+            reason = "the policy registry and the policy routes each took what they read at the build"
         )
     )]
     pub(crate) in_process: Option<InProcess>,
@@ -302,15 +310,6 @@ impl WorkflowHost for AppContext {
     }
 }
 
-/// The feed a gateway's worker workflows write at: `feed` where the gateway
-/// decides in its own process, and none where it `follows` a controller.
-/// There the store mirrors that controller's rows, and a write of the
-/// gateway's own would set the mirror apart from the controller: its
-/// workflows stay the classic ones.
-fn workflows_feed(feed: Option<&Feed>, follows: bool) -> Option<&Feed> {
-    feed.filter(|_| !follows)
-}
-
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
@@ -323,13 +322,6 @@ impl AppContext {
     /// health checks and the discovery.
     pub(crate) fn follows_controller(&self) -> bool {
         self.policy_follower.is_some()
-    }
-
-    /// The feed this gateway's worker workflows write at: its own where it
-    /// decides in its own process, and none where a controller supplies its
-    /// workers ([`workflows_feed`]).
-    pub(crate) fn door_feed(&self) -> Option<&Feed> {
-        workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
     }
 
     /// Create AppContext from config with all components initialized
@@ -692,20 +684,12 @@ impl AppContextBuilder {
             policy_registry.keep_rings_warm(&worker_registry, &runtime);
         }
 
-        // Create WorkerService from the already-built components. Where
-        // the workflows write at the door a local worker is a row of the
-        // store.
-        let worker_service = WorkerService::new(
+        // Create WorkerService from the already-built components
+        let worker_service = Arc::new(WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
-        );
-        let rows = workflows_feed(self.policy_feed.as_ref(), self.policy_follower.is_some());
-        let worker_service = Arc::new(if rows.is_some() {
-            worker_service.with_local_workers_as_rows()
-        } else {
-            worker_service
-        });
+        ));
 
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
             router_config.worker_http_client_settings(),
@@ -1022,6 +1006,16 @@ impl AppContextBuilder {
         if config.policy_controller_address.is_none() {
             self.in_process = policy_controller::start_in_process(config, stages)
                 .map_err(|refusal| refusal.to_string())?;
+            // The control plane's policy routes read the engine's document
+            // and the worker registry.
+            if let Some(started) = &self.in_process {
+                let registry = self.worker_registry.as_ref().ok_or_else(|| {
+                    "worker_registry must be set before the policy controller".to_string()
+                })?;
+                let operators =
+                    Operators::in_process(started.clone(), config, Arc::clone(registry));
+                self.policy_operators = Some(Arc::new(operators));
+            }
             return Ok(self);
         }
         let started =
@@ -1030,11 +1024,10 @@ impl AppContextBuilder {
             let registry = self.worker_registry.as_ref().ok_or_else(|| {
                 "worker_registry must be set before the policy controller".to_string()
             })?;
-            let controller = config
-                .policy_controller_address
-                .as_ref()
-                .map(|address| Settings::new(address.clone(), config))
-                .transpose()?;
+            let address = config.policy_controller_address.clone().ok_or_else(|| {
+                "the policy store is started under a controller's address alone".to_string()
+            })?;
+            let controller = Settings::new(address, config)?;
             let connector = Arc::clone(&self.engine_connector);
             let (feed, follower) =
                 policy_controller::feeds(&store, registry, connector, controller);
@@ -1047,7 +1040,7 @@ impl AppContextBuilder {
             let _timer = policy_controller::upkeep::start(&policy_engine);
             self.policy_feed = Some(feed);
             self.policy_engine = Some(policy_engine);
-            self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
+            self.policy_follower = Some(Arc::new(Mutex::new(Some(follower))));
             self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
             self.policy_store = Some(store);
         }
@@ -1134,31 +1127,17 @@ impl AppContextBuilder {
             .clone();
         let interval = config.load_monitor_interval_secs;
         let (engine_metrics, conditional) = (config.engine_metrics, config.disable_load_monitoring);
-        // Where the controller was picked the collector says its facts to
-        // the feed's sink, which writes the store, and no classic policy
-        // reads a load. Else it keeps the classic sink, and its snapshot
-        // feeds every policy that consumes it; the monitor polls every group
-        // by default, conditionally under `--disable-load-monitoring`.
-        let monitor = match &self.policy_feed {
-            Some(feed) => Arc::new(WorkerMonitor::with_sink(
-                registry,
-                feed.load_sink(Duration::from_secs(interval.max(1))),
-                interval,
-                engine_metrics,
-                conditional,
-            )),
-            None => {
-                let monitor = Arc::new(WorkerMonitor::new(
-                    registry,
-                    Arc::clone(&policy_registry),
-                    interval,
-                    engine_metrics,
-                    conditional,
-                ));
-                policy_registry.set_load_receiver(Some(monitor.subscribe()));
-                monitor
-            }
-        };
+        // The monitor's snapshot feeds every policy that consumes it; the
+        // monitor polls every group by default, conditionally under
+        // `--disable-load-monitoring`.
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry,
+            Arc::clone(&policy_registry),
+            interval,
+            engine_metrics,
+            conditional,
+        ));
+        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
@@ -1230,12 +1209,12 @@ impl AppContextBuilder {
     /// model without an events subscription has no index and no index
     /// gauges.
     ///
-    /// Under the policy controller's feed none is built: the feed's own
-    /// follow reads the workers' cache events into the store's index and
-    /// their load records into the worker monitor, and each reader of this
-    /// monitor takes `None`.
+    /// A gateway that follows a controller builds none: the controller
+    /// reads its workers' cache events and load records, and each reader
+    /// of this monitor takes `None`.
     fn with_kv_event_monitor(mut self) -> Self {
-        // One collector a gateway: under the feed the store's follow is it.
+        // The feed stands where the gateway follows a controller, and such
+        // a gateway reads no worker's stream itself.
         if self.policy_feed.is_some() {
             return self;
         }
@@ -1339,7 +1318,7 @@ mod tests {
                 .unwrap();
             assert!(context.policy_follower.is_none());
             assert!(context.policy_store.is_none());
-            assert!(context.policy_operators.is_none());
+            assert_eq!(context.policy_operators.is_some(), policy_controller);
             assert!(context.policy_feed.is_none());
             assert!(context.policy_engine.is_none());
             assert!(!context.follows_controller());
@@ -1445,7 +1424,6 @@ mod tests {
             ("wasm_manager", context.wasm_manager.is_some()),
             ("kv_event_monitor", context.kv_event_monitor.is_some()),
             ("policy_store", context.policy_store.is_some()),
-            ("policy_operators", context.policy_operators.is_some()),
             ("policy_follower", context.policy_follower.is_some()),
             ("policy_engine", context.policy_engine.is_some()),
             ("policy_feed", context.policy_feed.is_some()),
@@ -1453,45 +1431,18 @@ mod tests {
         ]
     }
 
-    /// The steps of a worker workflow, by id and in order.
-    fn step_ids<D: wfaas::WorkflowData>(line: &wfaas::WorkflowDefinition<D>) -> Vec<String> {
-        line.steps.iter().map(|step| step.id.to_string()).collect()
-    }
-
-    /// The three worker workflows as the server builds them from `context`
-    /// (registration, removal, update), each by its steps.
-    fn worker_lines(context: &AppContext) -> [Vec<String>; 3] {
-        use crate::workflow::steps::{
-            worker_registration_line, worker_removal_line, worker_update_line,
-        };
-
-        let config = &context.router_config;
-        let feed = context.door_feed();
-        let door = feed.map(|feed| (feed, config.unhealthy_removal_scope()));
-        [
-            step_ids(&worker_registration_line(config, feed)),
-            step_ids(&worker_removal_line(door)),
-            step_ids(&worker_update_line(feed)),
-        ]
-    }
-
     /// A gateway that decides in its own process is built as a gateway with
     /// the setting off is: the same storage, and the same objects handed to
     /// the same places. Under one configuration, the setting off against
     /// on: the context holds and leaves out the same parts, but for what
-    /// the start left (the policy engine); a classic policy is handed the
-    /// load feed and the cache-event monitor under both; and the worker
-    /// workflows the server builds from the context run the same steps, by
-    /// name and in order.
+    /// the start left (the policy engine, and what the control plane's
+    /// policy routes read of its document); and a classic policy is handed
+    /// the load feed and the cache-event monitor under both. The worker
+    /// workflows read nothing of the context: the server builds the one
+    /// line of each under both.
     #[tokio::test]
     async fn a_context_in_process_is_built_as_with_the_setting_off() {
-        use crate::{
-            policies::as_cache_aware,
-            workflow::{
-                create_worker_registration_workflow, create_worker_removal_workflow,
-                create_worker_update_workflow,
-            },
-        };
+        use crate::policies::as_cache_aware;
 
         // Cache-aware is a policy the engine does not pick by itself yet:
         // the classic policy of the setting decides under both, with what
@@ -1510,6 +1461,8 @@ mod tests {
         assert_eq!(parts(&off), parts(&on));
         assert!(off.in_process.is_none());
         assert!(on.in_process.is_some());
+        assert!(off.policy_operators.is_none());
+        assert!(on.policy_operators.is_some());
 
         for context in [&off, &on] {
             let policy = context.policy_registry.get_default_policy();
@@ -1518,14 +1471,6 @@ mod tests {
             assert!(cache_aware.has_load_receiver_for_test());
             assert!(cache_aware.kv_event_monitor_is_set_for_test());
         }
-
-        let classic = [
-            step_ids(&create_worker_registration_workflow(&off.router_config)),
-            step_ids(&create_worker_removal_workflow()),
-            step_ids(&create_worker_update_workflow()),
-        ];
-        assert_eq!(worker_lines(&off), classic);
-        assert_eq!(worker_lines(&on), classic);
     }
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
@@ -1761,78 +1706,6 @@ mod tests {
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
-    /// Under the policy controller the monitor says its facts to the feed's
-    /// sink: a pushed record lands on the store's row, and no classic
-    /// policy is handed the monitor's load feed.
-    #[tokio::test]
-    async fn under_the_feed_the_collectors_sink_is_the_feeds() {
-        use smg_policy_controller::{
-            engine::{Role, WireModes},
-            store::{HealthPolicy, LoadSink, Registrant, WorkerFacts},
-            worker_host::{MembershipWriteOutcome, Precondition},
-        };
-        use smg_worker::common_proto::EngineLoad;
-
-        use crate::policies::as_cache_aware;
-
-        const URL: &str = "http://worker:8000";
-        let config = RouterConfig {
-            policy_controller: true,
-            ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
-        };
-        let builder = AppContextBuilder::new()
-            .with_client(&config, 5)
-            .expect("client builds")
-            .with_worker_registry()
-            .with_policy_registry(&config)
-            .with_policy_controller(&config, None)
-            .expect("the policy controller starts")
-            .with_worker_monitor(&config)
-            .expect("worker monitor builds");
-        let feed = builder.policy_feed.as_ref().expect("the store has a feed");
-        let store = builder.policy_store.as_ref().expect("the store started");
-        let monitor = builder.worker_monitor.as_ref().expect("the monitor");
-        let registry = builder.worker_registry.as_ref().expect("the registry");
-
-        let facts = WorkerFacts {
-            key: URL.to_owned(),
-            engine: URL.to_owned(),
-            role: Role::Single,
-            wire_modes: WireModes::HTTP,
-            models: vec!["model-a".to_owned()],
-            dp_size: 1,
-            health: HealthPolicy {
-                probes: false,
-                ..HealthPolicy::default()
-            },
-            ..WorkerFacts::default()
-        };
-        let Ok(MembershipWriteOutcome::Registered(row)) =
-            feed.door
-                .found(&Registrant::Control, Precondition::Absent, URL, &|_| {
-                    facts.clone()
-                })
-        else {
-            panic!("the worker registers at the feed's door");
-        };
-        let worker = registry.get_by_url(URL).expect("the row's worker stands");
-        let record = EngineLoad {
-            waiting_requests: 6,
-            ..EngineLoad::default()
-        };
-        monitor.apply_pushed_load(&worker, 0, &record, std::time::Instant::now());
-        let sample = LoadSink::load(&**store, row, 0).expect("the row holds the pushed sample");
-        assert_eq!(sample.row.queued, 6);
-
-        let policy = builder
-            .policy_registry
-            .as_ref()
-            .expect("policy registry set")
-            .get_default_policy();
-        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
-        assert!(!cache_aware.has_load_receiver_for_test());
-    }
-
     /// Every policy gets the monitor: a cache-aware one for its indexes, any
     /// other for the load stream of its gRPC workers, which the policies'
     /// load feed reads in place of the poll.
@@ -1870,14 +1743,24 @@ mod tests {
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
-    /// Under the policy controller's feed the classic monitor is not built:
-    /// the context holds none, and a cache-aware policy is handed none.
+    /// A gateway that follows a controller builds no classic monitor: the
+    /// context holds none, and a cache-aware policy is handed none.
     #[tokio::test]
-    async fn under_the_feed_the_classic_cache_event_monitor_is_not_built() {
+    async fn a_gateway_that_follows_a_controller_builds_no_cache_event_monitor() {
+        use std::net::{Ipv4Addr, SocketAddr};
+
         use crate::policies::as_cache_aware;
 
+        // A socket that never listens: the follower dials it and tells
+        // nothing.
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("a free port");
+        let address = socket.local_addr().expect("the socket's address");
         let config = RouterConfig {
             policy_controller: true,
+            policy_controller_address: Some(address.to_string()),
             ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
         };
         let builder = AppContextBuilder::new()
@@ -1897,6 +1780,10 @@ mod tests {
             .get_default_policy();
         let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
         assert!(!cache_aware.kv_event_monitor_is_set_for_test());
+
+        let follower = builder.policy_follower.as_ref().expect("a follower");
+        let follower = follower.lock().take().expect("the follower stands");
+        follower.stop().await;
     }
 
     /// A dropped context lets its worker monitor go: the monitor holds the

@@ -13,18 +13,14 @@
 //! ([`upkeep`]). A regular HTTP router with that policy engine asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
-//! gRPC router and a gRPC pair router ask it in their selection stage. An
-//! HTTP pair router asks it for each attempt's pair, through prefill
-//! admission. A pair router does where this gateway decides pairs in its
-//! own process: the document in force plans pairs and the gateway follows
-//! no controller. It mounts a refusing router elsewhere
-//! ([`undecided_without()`]). A gRPC encode pair router mounts a refusing
-//! router under its usual id ([`undecided()`]) whenever the store started,
-//! with or without a controller's address. The routes that pick a
+//! gRPC router asks it in its selection stage. A pair router mounts a
+//! refusing router under its family's usual id ([`undecided()`]): where
+//! the store started, a pair is the controller's to decide, and no ask
+//! reaches it for a pair yet. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
-//! provider's router, a realtime session and a proxied GET. A local worker's
-//! registration writes its row at the feed's door. With the setting off, the
-//! context holds neither the store, its feed nor its policy engine.
+//! provider's router, a realtime session and a proxied GET. With the
+//! setting off, the context holds neither the store, its feed nor its
+//! policy engine.
 //!
 //! The document in force reaches the store through the policy crate's
 //! operators' door as YAML: the bytes `--print-policy-spec` prints where
@@ -43,8 +39,11 @@
 //! gateway's worker registry, its health checks, its load monitor and its
 //! worker workflows are the classic ones, and the classic policy registry
 //! asks the engine where it asks a classic policy
-//! ([`crate::policies::EnginePolicy`]). The store and what stands on it
-//! are a gateway's that follows a controller ([`start_with`]).
+//! ([`crate::policies::EnginePolicy`]). The control plane's policy routes
+//! answer there from the engine's document, whose YAML the start holds to
+//! it ([`checked`]), and from the worker registry ([`operators`]). The
+//! store and what stands on it are a gateway's that follows a controller
+//! ([`start_with`]).
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
@@ -55,10 +54,9 @@
 
 use std::{sync::Arc, time::SystemTime};
 
-pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
     document::{
-        operator::{DocumentManager, Format, SpecRejected, MAX_DOCUMENT_BYTES},
+        operator::{dry_run_against, DocumentManager, Format, SpecRejected},
         AppliedSpec, PolicySpec, RoutingSettingsError,
     },
     stages::StageRegistry,
@@ -92,8 +90,11 @@ pub(crate) mod follower;
 )]
 pub(crate) mod engine;
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the gateway holds the feed for membership writes")
+    not(any(target_os = "linux", target_os = "macos")),
+    expect(
+        dead_code,
+        reason = "the follower reads the feed, and none runs on this target"
+    )
 )]
 pub(crate) mod feed;
 pub(crate) mod operators;
@@ -124,6 +125,11 @@ pub(crate) enum StartError {
     /// it, or its view reads a header the gateway keeps to itself.
     #[error(transparent)]
     Spec(#[from] SpecRejected),
+    /// The document's YAML does not read back as the document it was
+    /// written from, so the control plane would tell another text than the
+    /// one that decides.
+    #[error("the policy document's YAML does not read back as the document it writes: {0}")]
+    NotReadBack(String),
     /// The document its operator supplied holds a place the engine does
     /// not decide in this process yet. Nothing else would decide that
     /// place, so the start names it: the profile, the stage of it that
@@ -168,13 +174,6 @@ pub(crate) enum StartError {
 /// policy engine of the document in force, which the classic policy
 /// registry's policies ask, and what the control plane's policy routes
 /// read of the document where no store holds it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the control plane's policy routes read the written document, its time and the stages"
-    )
-)]
 #[derive(Clone)]
 pub(crate) struct InProcess {
     /// The engine of the document in force, under the number the
@@ -224,8 +223,7 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// none, and the door then checks over the stock stages alone.
 ///
 /// The start returns the store with the door that applied the document
-/// ([`Started`]). The door is handed the document as YAML by the one
-/// function `--print-policy-spec` checks its own through ([`hosted`]), and
+/// ([`Started`]). The door is handed the document as YAML ([`hosted`]), and
 /// it checks a later dry run over the same stages. A configuration the
 /// document cannot say, a routing setting that disagrees with a given
 /// document, and a document that check refuses, stop the start by name.
@@ -327,14 +325,8 @@ fn engine_for(
         return Ok(None);
     };
     let stages = stages.unwrap_or_else(|| Arc::new(StageRegistry::builtin()));
-    // The bound the operators' door holds a written document to.
     let written = serde_yaml::to_string(&document)?;
-    let bytes = u64::try_from(written.len()).unwrap_or(u64::MAX);
-    if bytes > MAX_DOCUMENT_BYTES {
-        return Err(SpecRejected::TooLarge(bytes).into());
-    }
-    let spec = AppliedSpec::validate_in(&document, &stages, &config.denied_view_headers())
-        .map_err(SpecRejected::Invalid)?;
+    let spec = checked(config, &stages, &document, &written)?;
     let engine = Arc::new(smg_policy_controller::engine::PolicyEngine::new(spec));
     let origin = if config.policy_spec.is_some() {
         DocumentOrigin::Supplied
@@ -467,6 +459,36 @@ fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), Star
     Ok(())
 }
 
+/// `document` as a gateway that decides in its own process runs it, with
+/// its YAML `written` held to it. The document is validated over `stages`
+/// with the gateway's own headers denied to its view. A dry run of the text
+/// against the validated document must then answer that document's own
+/// number and digest ([`dry_run_against`]). So the text is inside the bound
+/// a dry run's body is held to, the policy crate's reader reads it, and the
+/// control plane's read tells the document that decides: a dry run of that
+/// text under its own `ETag` answers no change.
+///
+/// `--print-policy-spec` checks its document here too, so the print and
+/// this start never part.
+pub(crate) fn checked(
+    config: &RouterConfig,
+    stages: &StageRegistry,
+    document: &PolicySpec,
+    written: &str,
+) -> Result<AppliedSpec, StartError> {
+    let denied = config.denied_view_headers();
+    let spec =
+        AppliedSpec::validate_in(document, stages, &denied).map_err(SpecRejected::Invalid)?;
+    let read = dry_run_against(&spec, stages, &denied, "", written.as_bytes(), Format::Yaml)
+        .map_err(|unanswered| StartError::NotReadBack(unanswered.to_string()))?;
+    match read.would_run? {
+        (generation, digest) if (generation, Some(digest)) == read.standing => Ok(spec),
+        (generation, digest) => Err(StartError::NotReadBack(format!(
+            "it reads as generation {generation} with digest {digest}"
+        ))),
+    }
+}
+
 /// The document a start runs. `None` where the setting is off, and where
 /// it is on and moves nothing. The one site that reads the setting.
 fn document_in_force(config: &RouterConfig) -> Result<Option<PolicySpec>, StartError> {
@@ -496,8 +518,7 @@ fn document_in_force(config: &RouterConfig) -> Result<Option<PolicySpec>, StartE
 /// gateway hosts. The door bounds the YAML's size, reads it back and
 /// validates it over `stages`, the stock ones where a host hands none, with
 /// the gateway's own headers denied to the view. The start keeps what this
-/// returns. `--print-policy-spec` calls it for its refusal alone, so the
-/// print and the start never part.
+/// returns.
 pub(crate) fn hosted(
     config: &RouterConfig,
     stages: Option<StageRegistry>,
@@ -514,72 +535,35 @@ pub(crate) fn hosted(
     })
 }
 
-/// The store's membership feed and, under a controller's address, the
-/// follower that writes the store in the door's place.
+/// The store's membership feed, and the follower that writes the store as
+/// the controller at `controller` tells it.
 ///
 /// The two are made together because they are one rule. A gateway that
 /// follows a controller probes no worker, so its holder copies each row's
 /// status onto the row's object ([`feed::following`]), and its follower
-/// settles the feed after each event. Elsewhere the door is the store's
-/// writer, and it settles the feed itself.
+/// settles the feed after each event.
 pub(crate) fn feeds(
     store: &Arc<MemoryStore>,
     registry: &Arc<WorkerRegistry>,
     connector: Arc<dyn EngineConnector>,
-    controller: Option<Settings>,
-) -> (Feed, Option<Follower>) {
-    match controller {
-        Some(settings) => {
-            let feed = feed::following(store, registry, connector);
-            let follower = Follower::start(settings, feed.clone());
-            (feed, Some(follower))
-        }
-        None => (feed::feed(store, registry, connector), None),
-    }
+    controller: Settings,
+) -> (Feed, Follower) {
+    let feed = feed::following(store, registry, connector);
+    let follower = Follower::start(controller, feed.clone());
+    (feed, follower)
 }
 
-/// The refusing router for a family the controller does not decide yet:
-/// the gRPC encode pair router. It mounts under
-/// the family's usual id so the gateway can select it. Returns `None` under
-/// the classic policies.
+/// The refusing router of a pair family where the gateway follows a
+/// controller. A pair is the controller's to decide there, and no ask
+/// reaches it for a pair yet, so the family refuses by name. The router
+/// mounts under the family's usual id so the gateway can select it. `None`
+/// elsewhere: with the setting off, and where the gateway decides in its
+/// own process, a pair family is its classic router.
 pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
         .policy_engine
         .is_some()
         .then(|| Box::new(Undecided) as Box<dyn RouterTrait>)
-}
-
-/// The refusing router for a family this gateway does not decide in its
-/// own process. `None` under the classic policies, and where the gateway
-/// decides the family.
-///
-/// A family is not decided where no binding of the document in force names
-/// its `plan`. A request of it is then decided under another plan, and none
-/// of its targets commits as the family's: a pair asked under a single's
-/// plan answers that no target holds. A gateway of many routers mounts
-/// every family over its one document, so a family reaches this where that
-/// document binds no plan of it: a document a user supplies, or the routing
-/// settings' own where it plans one family.
-///
-/// Nor is it decided where the gateway follows a controller. Such a request
-/// is the controller's to decide, and no ask reaches it for these families
-/// yet, so the family refuses by name there as it did.
-pub(crate) fn undecided_without(
-    context: &AppContext,
-    plan: PlanName,
-) -> Option<Box<dyn RouterTrait>> {
-    let planned = || {
-        context
-            .router_config
-            .policy_document_in_force()
-            .is_ok_and(|document| {
-                document
-                    .bindings
-                    .iter()
-                    .any(|binding| binding.plan.as_ref() == Some(&plan))
-            })
-    };
-    undecided(context).filter(|_| context.follows_controller() || !planned())
 }
 
 #[cfg(test)]
