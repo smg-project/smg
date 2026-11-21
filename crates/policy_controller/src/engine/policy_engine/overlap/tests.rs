@@ -202,7 +202,7 @@ impl Bed {
             &self.spec,
             &self.workers,
             &self.ids,
-            facts,
+            &mut { *facts },
             |facts| {
                 named = facts.named.map(|rows| Named {
                     holders: rows
@@ -541,14 +541,14 @@ fn the_engine_decides_by_the_rows_named() {
         };
         let mut scratch = Scratch::new();
         let mut place = |seed| {
-            let request = request(&asked, seed, NOW);
+            let mut request = request(&asked, seed, NOW);
             let decision = decide(
                 &bed.affinity,
                 &bed.pool,
                 &bed.spec,
                 &bed.workers,
                 &bed.ids,
-                &request,
+                &mut request,
                 |request| {
                     let engine = bed.spec.engine();
                     engine.decide(
@@ -711,7 +711,7 @@ fn a_profile_named_no_row_is_handed_the_column() {
         &bed.spec,
         &bed.workers,
         &bed.ids,
-        &request(&asked, 7, NOW),
+        &mut request(&asked, 7, NOW),
         |facts| {
             assert!(facts.named.is_none());
             seen = Some(held(facts.affinity));

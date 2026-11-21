@@ -7,8 +7,8 @@
 
 use std::fmt;
 
-use super::{profile_index, Engine, Marks, Plan, Profile};
-use crate::{engine::view::Phase, stages::filters::RowTests};
+use super::{profile_index, Binding, Engine, Marks, Plan, Profile};
+use crate::{document::spec::Needs, engine::view::Phase, stages::filters::RowTests};
 
 /// A profile whose whole decision is one pick of its picker
 /// ([`Engine::place_for`]), by its place in the document.
@@ -129,36 +129,71 @@ impl Engine {
     /// holds such a place, by what this names.
     #[must_use]
     pub fn not_alone(&self) -> Option<NotAlone<'_>> {
+        self.places().find_map(|(binding, phase, index, profile)| {
+            let stage = self.in_the_way(index, profile, phase)?;
+            Some(NotAlone {
+                model: &binding.model,
+                phase,
+                profile: &profile.name,
+                stage,
+            })
+        })
+    }
+
+    /// Every place a binding of the document names, with its profile and
+    /// the profile's place in the document: each binding in the document's
+    /// order, at each phase it covers and its plan has a side for.
+    fn places(&self) -> impl Iterator<Item = (&Binding, Phase, u16, &Profile)> {
         const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
-        self.bindings.iter().find_map(|entry| {
+        self.bindings.iter().flat_map(move |entry| {
             let binding = &entry.binding;
-            PHASES.into_iter().find_map(|phase| {
+            PHASES.into_iter().filter_map(move |phase| {
                 if !binding.covers(phase) {
                     return None;
                 }
                 let index = profile_index(binding, phase)?;
                 let profile = self.profiles.get(usize::from(index))?;
-                let stage = self.in_the_way(index, profile, phase)?;
-                Some(NotAlone {
-                    model: &binding.model,
-                    phase,
-                    profile: &profile.name,
-                    stage,
-                })
+                Some((binding, phase, index, profile))
             })
         })
     }
 
-    /// Whether every request of the document is a single request that one
-    /// pick of a picker decides: each binding plans single requests alone
-    /// and states no sessions rule, and no place of it asks more than that
-    /// pick ([`Self::not_alone`]).
+    /// Whether every request of the document is a single request that a
+    /// host which feeds `fed` has decided whole in its own process. Each
+    /// binding plans single requests alone and states no sessions rule,
+    /// and each place of it is one of two:
+    ///
+    /// - one pick of its picker decides it ([`Self::not_alone`]), which
+    ///   asks nothing of the host;
+    /// - its stages read who holds the request's prompt
+    ///   ([`Needs::affinity`]) and declare nothing a host must feed outside
+    ///   `fed` ([`Needs::within`]): the whole pass of a gateway's own
+    ///   process names that profile its rows from the gateway's own data.
+    ///
+    /// A host that feeds nothing has every place of such a document picked
+    /// alone. The set of places grows with what a whole pass is proven to
+    /// decide from a host's own data.
     #[must_use]
-    pub fn single_and_alone(&self) -> bool {
+    pub fn single_and_fed(&self, fed: Needs) -> bool {
         let single = |entry: &super::Entry| {
             entry.binding.plan == Plan::Single && entry.binding.sessions.is_none()
         };
-        self.bindings.iter().all(single) && self.not_alone().is_none()
+        let decided = |(_, phase, index, profile): (&Binding, Phase, u16, &Profile)| {
+            if self.in_the_way(index, profile, phase).is_none() {
+                return true;
+            }
+            let needs = self.profile_needs.get(usize::from(index));
+            needs.is_some_and(|needs| needs.affinity && needs.within(fed))
+        };
+        self.bindings.iter().all(single) && self.places().all(decided)
+    }
+
+    /// Whether every request of the document is a single request that one
+    /// pick of a picker decides: [`Self::single_and_fed`] for a host that
+    /// feeds nothing.
+    #[must_use]
+    pub fn single_and_alone(&self) -> bool {
+        self.single_and_fed(Needs::default())
     }
 
     /// The first stage of `profile`, which stands at `index`, that asks

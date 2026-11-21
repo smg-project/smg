@@ -284,6 +284,28 @@ impl Needs {
         self.token_hashes || self.text_hashes
     }
 
+    /// Whether a host that feeds `fed` feeds everything these declare. The
+    /// sample is no feed: a host that names no rows fills the column.
+    #[must_use]
+    pub fn within(self, fed: Self) -> bool {
+        let declared = [
+            (self.text, fed.text),
+            (self.token_hashes, fed.token_hashes),
+            (self.text_hashes, fed.text_hashes),
+            (self.loads, fed.loads),
+            (self.events, fed.events),
+            (self.sent_prefixes, fed.sent_prefixes),
+            (self.ring, fed.ring),
+            (self.headers, fed.headers),
+            (self.media, fed.media),
+            (self.active_sessions, fed.active_sessions),
+            (self.session_in_flight, fed.session_in_flight),
+            (self.affinity, fed.affinity),
+            (self.signal_cells, fed.signal_cells),
+        ];
+        declared.iter().all(|&(need, feed)| feed || !need)
+    }
+
     /// Both sides' needs: what a host feeding either of two stage sets must
     /// feed.
     pub(crate) fn or(self, other: Self) -> Self {

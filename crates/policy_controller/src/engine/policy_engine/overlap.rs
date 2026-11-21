@@ -1027,8 +1027,8 @@ pub fn decide(
     spec: &AppliedSpec,
     workers: &[Arc<dyn Worker>],
     ids: &[WorkerId],
-    facts: &RequestFacts<'_>,
-    decide: impl FnOnce(&RequestFacts<'_>) -> Decision,
+    facts: &mut RequestFacts<'_>,
+    decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
     if !facts.affinity.is_empty() || facts.named.is_some() {
         return decide(facts);
@@ -1168,9 +1168,9 @@ impl Table {
     /// record's write behind a pick.
     fn decide(
         &self,
-        facts: &RequestFacts<'_>,
+        facts: &mut RequestFacts<'_>,
         buffers: &mut Buffers,
-        decide: impl FnOnce(&RequestFacts<'_>) -> Decision,
+        decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         if !self.reads {
             return decide(facts);
@@ -1179,7 +1179,7 @@ impl Table {
             return self.decide_by_column(facts, buffers, decide);
         }
         let read = self.name(facts, buffers);
-        let decision = decide(&RequestFacts {
+        let decision = decide(&mut RequestFacts {
             named: Some(AffinityRows {
                 holders: &buffers.holders,
                 warming: &buffers.warming,
@@ -1210,12 +1210,12 @@ impl Table {
         &self,
         facts: &RequestFacts<'_>,
         buffers: &mut Buffers,
-        decide: impl FnOnce(&RequestFacts<'_>) -> Decision,
+        decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
     ) -> Decision {
         // The column leaves the buffers while the fill writes the others.
         let mut column = mem::take(&mut buffers.column);
         let read = self.fill(facts, buffers, &mut column);
-        let decision = decide(&RequestFacts {
+        let decision = decide(&mut RequestFacts {
             affinity: &column,
             ..*facts
         });
