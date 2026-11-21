@@ -640,7 +640,8 @@ mod tests {
         let tokenizer = TestTokenizer::new(&[]);
         let registry = ModelRegistry::new();
         let served: Vec<String> = [
-            // The model type, its vision config, the preprocessor config.
+            // The model type, its vision config, the preprocessor config and
+            // the text the refusal must contain.
             ("qwen2_vl", "{}", r#"{"patch_size":0}"#, "patch_size"),
             ("qwen3_vl", "{}", r#"{"merge_size":0}"#, "merge_size"),
             (

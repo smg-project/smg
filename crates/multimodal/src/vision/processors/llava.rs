@@ -454,11 +454,7 @@ impl LlavaNextProcessor {
     /// crops divide by.
     pub(crate) fn validate(&self) -> Result<(), TransformError> {
         self.base.validate()?;
-        let transforms = &self.base.transforms;
-        let target = transforms
-            .target_size
-            .map_or(self.base.image_size, |(h, _w)| h);
-        let crop = transforms.crop_size.unwrap_or((target, target));
+        let crop = self.sample_crop();
         let zero = if self.base.image_size == 0 {
             "image_size"
         } else if crop.0 == 0 || crop.1 == 0 {
@@ -469,6 +465,16 @@ impl LlavaNextProcessor {
         Err(TransformError::ShapeError(format!(
             "LLaVA-NeXT {zero} must be positive"
         )))
+    }
+
+    /// The crop `divide_to_samples` steps by: `crop_size`, else the square
+    /// target.
+    fn sample_crop(&self) -> (u32, u32) {
+        let transforms = &self.base.transforms;
+        let target = transforms
+            .target_size
+            .map_or(self.base.image_size, |(h, _w)| h);
+        transforms.crop_size.unwrap_or((target, target))
     }
 
     /// Create a new LLaVA-NeXT processor with default settings.
@@ -617,11 +623,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
             .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
-        let crop_size = self
-            .base
-            .transforms
-            .crop_size
-            .unwrap_or((target_size, target_size));
+        let crop_size = self.sample_crop();
 
         for image in images {
             let original_size = image.dimensions();
