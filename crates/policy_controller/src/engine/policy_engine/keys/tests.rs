@@ -132,14 +132,19 @@ fn served(worker: WorkerId) -> Outcome {
 /// members behind it with no pass over the list: the workers the whole
 /// decision of a twin engine names over every worker's record, in its
 /// order, while every worker is ready and with one worker in four not
-/// ready. The list's ring is built by the first such decision and stands
-/// from there. A request with no key is the whole pass's.
+/// ready. The list's ring is the one the gateway filled, off the path of a
+/// request. A request with no key is the whole pass's.
 #[test]
 fn a_rings_keyed_request_goes_to_its_keys_owner_with_no_pass_over_the_list() {
     let (engine, twin) = (preset("consistent_hashing"), preset("consistent_hashing"));
     let list = pool(64);
     let members = engine.pool_members(&list);
-    assert!(members.ring().get().is_none(), "no ring before a decision");
+    assert!(
+        engine.fill_ring(MODEL, &members),
+        "the stock ring reads one"
+    );
+    let ring = members.ring().get().expect("the list's ring");
+    assert_eq!(ring.len(), 64);
     for round in 0..2 {
         let mut by_walk = 0;
         for key in 1..=200 {
@@ -164,11 +169,49 @@ fn a_rings_keyed_request_goes_to_its_keys_owner_with_no_pass_over_the_list() {
             worker.set_status(WorkerStatus::NotReady);
         }
     }
-    let ring = members.ring().get().expect("the list's ring");
-    assert_eq!(ring.len(), 64);
     let keyless = decided(&engine, &keyed(0, &members)).decision;
     let trace = &keyless.pick().expect("a pick").trace;
     assert!(!trace.drew_first(), "a pass over the list ran");
+}
+
+/// No decision builds a list's ring and none waits for one. Until the
+/// gateway has filled it, a keyed request under the stock ring is placed as
+/// one that carries no key: by the profile's draw over the whole list, so
+/// one key is handed more workers than one. Once the ring is filled the key
+/// keeps its owner. Under a document that reads no ring a list takes none.
+#[test]
+fn a_keyed_request_ahead_of_its_lists_ring_is_drawn_and_builds_none() {
+    let engine = preset("consistent_hashing");
+    let list = pool(64);
+    let members = engine.pool_members(&list);
+    let mut asks = keyed(7, &members);
+    let first = |decision: &Decision| targets(decision)[0];
+    let mut drawn = Vec::new();
+    // Each request draws by a seed of its own, as a gateway's requests do.
+    for seed in 0..24 {
+        asks.request.facts.seed = seed;
+        let decision = decided(&engine, &asks).decision;
+        assert_eq!(targets(&decision).len(), MAX_TARGETS, "placed, not refused");
+        let trace = &decision.pick().expect("a pick").trace;
+        assert!(!trace.drew_first(), "a pass over the list placed it");
+        if !drawn.contains(&first(&decision)) {
+            drawn.push(first(&decision));
+        }
+    }
+    assert!(drawn.len() > 1, "one key, one worker: no draw ran");
+    assert!(members.ring().get().is_none(), "a decision built the ring");
+
+    assert!(engine.fill_ring(MODEL, &members));
+    let owner = first(&decided(&engine, &asks).decision);
+    for seed in 24..48 {
+        asks.request.facts.seed = seed;
+        assert_eq!(first(&decided(&engine, &asks).decision), owner);
+    }
+
+    let plain = preset("round_robin");
+    let members = plain.pool_members(&list);
+    assert!(!plain.fill_ring(MODEL, &members));
+    assert!(members.ring().get().is_none(), "no ring is built");
 }
 
 /// Under the stock sessions rule a key's first request is placed by the

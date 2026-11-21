@@ -128,8 +128,8 @@ pub struct PoolMembers {
     /// engine picks alone for it, where the document holds one
     /// ([`Self::alone`]).
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
-    /// The list's hash ring ([`Self::ring`]): built at the first decision
-    /// that reads a ring over the list, and by no other.
+    /// The list's hash ring ([`Self::ring`]): built off the path of a
+    /// request, and by no decision ([`PolicyEngine::fill_ring`]).
     ring: OnceLock<PoolRing>,
     /// Whether the list is a part of a pool, one ask's value
     /// ([`Self::part`]). Its turns are then its workers' set's own, kept
@@ -164,7 +164,9 @@ impl PoolMembers {
             records: OnceLock::new(),
             wires: OnceLock::new(),
             alone: OnceLock::new(),
-            // A part's ring is the one decision's that reads it.
+            // A part takes no ring: nothing fills one ask's value, and a
+            // request that reads a ring over it is placed as one that
+            // carries no key ([`RequestFacts::ring_awaited`]).
             ring: OnceLock::new(),
             part: true,
         }
@@ -203,12 +205,12 @@ impl PoolMembers {
     }
 
     /// The cell of the list's hash ring: each worker of the list at its
-    /// positions, by its id and its stable key. Empty until a decision
-    /// whose binding places by a ring is made over the list, which builds
-    /// the ring once from the list's records and lends it to that decision
-    /// and to every later one. A list no ring policy decides builds none.
-    /// The ring is never changed: a membership change publishes another
-    /// list, which takes a ring of its own.
+    /// positions, by its id and its stable key. Empty until the gateway
+    /// fills it, off the path of a request ([`PolicyEngine::fill_ring`]):
+    /// a decision reads the cell, lends the ring where it stands, and
+    /// neither builds one nor waits for one. A list no ring policy decides
+    /// builds none. The ring is never changed: a membership change
+    /// publishes another list, which takes a ring of its own.
     #[must_use]
     pub fn ring(&self) -> &OnceLock<PoolRing> {
         &self.ring
@@ -302,6 +304,35 @@ impl PolicyEngine {
             ring: OnceLock::new(),
             part: false,
         }
+    }
+
+    /// Whether the document places a single request of `model` by a hash
+    /// ring: a stage that may decide such a request reads one. The gateway
+    /// keeps a ring for each list of such a model's workers
+    /// ([`Self::fill_ring`]), and none for another model's.
+    #[must_use]
+    pub fn reads_ring(&self, model: &str) -> bool {
+        let engine = self.spec.engine();
+        engine.needs_for(model, Phase::Single).ring
+    }
+
+    /// Builds the hash ring of `members`, a list of `model`'s workers,
+    /// where the document places a single request of the model by a ring
+    /// ([`Self::reads_ring`]), and says whether the list's ring stands.
+    /// `false` where it places such a request by none: the list takes none.
+    ///
+    /// For the gateway, off the path of a request, where it hears of a list:
+    /// the build hashes every worker's positions and sorts them, and no
+    /// decision does it ([`PoolMembers::ring`]). It makes the list's
+    /// records where no decision has yet. A second call is one read.
+    pub fn fill_ring(&self, model: &str, members: &PoolMembers) -> bool {
+        if !self.reads_ring(model) {
+            return false;
+        }
+        members
+            .ring
+            .get_or_init(|| keys::ring_of(members.records(&self.spec, &self.clock)));
+        true
     }
 
     /// What the document holds for one place the gateway builds a policy

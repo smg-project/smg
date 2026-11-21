@@ -1039,7 +1039,7 @@ impl Scorer for ConsistentHash {
         kept: &mut Vec<u32>,
     ) -> bool {
         let key = self.own_key(facts);
-        if key == 0 || !self.owns() {
+        if key == 0 || !self.owns() || facts.ring_awaited {
             return false;
         }
         // The ring of the list the candidates are, where their host lent
@@ -1108,6 +1108,13 @@ impl Scorer for ConsistentHash {
         out: &mut [f32],
     ) -> TieBand {
         out.fill(0.0);
+        // The host keeps a ring for the candidates' list and has not built
+        // it yet ([`RequestFacts::ring_awaited`]): the request is placed as
+        // one with no key, every row alike, and this stage's own ring is
+        // neither read nor taught.
+        if facts.ring_awaited {
+            return TieBand::NORMALIZED;
+        }
         // A ring that names no prefix form has one key, the session's or
         // else the client's: it is read here, and the walk is built for the
         // prefix form alone.
@@ -2548,6 +2555,44 @@ mod tests {
             scorer.ring().is_empty(),
             "no member learned, none taken away"
         );
+    }
+
+    /// A request whose host keeps a ring for the rows' list and has not
+    /// built it yet is placed as one that carries no key, under every form
+    /// of the scorer: each row scores alike, no walk hands a row out, and
+    /// the scorer's own ring is neither read nor taught. The same request
+    /// with no such word is the scorer's own ring's, which learns the rows.
+    #[test]
+    fn a_request_whose_lists_ring_is_awaited_is_scored_as_one_with_no_key() {
+        let rows = listed(64, 9);
+        let kept: Vec<u32> = (0..64).collect();
+        let awaited = RequestFacts {
+            ring_awaited: true,
+            ..keyed(77)
+        };
+        for form in forms() {
+            let scorer = form();
+            let scores = scored_among(&scorer, &awaited, &rows, &kept);
+            assert!(scores.iter().all(|&score| score == 0.0), "{scores:?}");
+            let pool = PoolFacts::default();
+            let mut walked = Vec::new();
+            assert!(!scorer.own(
+                &awaited,
+                &pool,
+                &rows,
+                &mut |_: &Candidate| true,
+                &mut walked
+            ));
+            let mut places = [0; MAX_TARGETS];
+            assert_eq!(
+                scorer.own_by_place(&awaited, 64, &mut |_| true, &mut places),
+                0
+            );
+            assert!(scorer.ring().is_empty(), "no member learned");
+            let own = scored_among(&scorer, &keyed(77), &rows, &kept);
+            assert!(own.iter().any(|&score| score != 0.0), "{own:?}");
+            assert_eq!(scorer.ring().len(), 64);
+        }
     }
 
     /// A ring of another list than the rows is no ring of theirs, by its

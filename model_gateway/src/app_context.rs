@@ -1083,8 +1083,16 @@ impl AppContextBuilder {
             ),
             None => PolicyRegistry::with_override(policy, routing_key_override),
         };
+        // Where the engine of this process places the gateway's requests,
+        // the task that fills the hash rings fills the engine's.
+        let placing = self
+            .policy_engine
+            .clone()
+            .filter(|_| self.in_process.is_some());
         self.policy_registry = Some(Arc::new(
-            registry.with_pd_pairing_mode(config.pd_pairing_mode),
+            registry
+                .with_pd_pairing_mode(config.pd_pairing_mode)
+                .with_rings_of(placing),
         ));
         self
     }

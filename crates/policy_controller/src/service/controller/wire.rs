@@ -435,6 +435,7 @@ impl Checked {
                 // No frame carries a ring: the ring stage places by its
                 // own, as it learns it from the rows.
                 ring: None,
+                ring_awaited: false,
             },
             Constraints {
                 excluded: &lists.excluded,

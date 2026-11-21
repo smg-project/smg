@@ -41,6 +41,7 @@ use crate::{
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     policies::kv_index::event_monitor::KvEventMonitor,
+    policy_controller::engine::PolicyEngine as GatewayEngine,
     routers::common::{
         header_utils::{
             extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
@@ -440,6 +441,18 @@ impl PolicyRegistry {
     #[cfg(any(test, feature = "test-util"))]
     pub fn hash_rings_are_current(&self, registry: &WorkerRegistry) -> bool {
         self.rings.are_current(registry)
+    }
+
+    /// The registry of a gateway where `policy_engine`, the gateway's object
+    /// over the policy engine of this process, places the requests: the
+    /// task that fills the hash rings fills the engine's
+    /// ([`KeptRings::filling`]). `None` leaves the rings as they are.
+    #[must_use]
+    pub(crate) fn with_rings_of(mut self, policy_engine: Option<Arc<GatewayEngine>>) -> Self {
+        if policy_engine.is_some() {
+            self.rings = Arc::new(KeptRings::filling(policy_engine));
+        }
+        self
     }
 
     /// Starts the task that fills the hash rings off the request path

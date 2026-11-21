@@ -1075,6 +1075,14 @@ pub struct RequestFacts<'a> {
     /// build passes over, placing by the stage's own ring. A pair takes
     /// none: each side is a list of its own. In-process only.
     pub ring: Option<&'a PoolRing>,
+    /// The host keeps a ring for the candidates' list and that ring is not
+    /// built yet, so [`Self::ring`] is `None`. Such a host builds a list's
+    /// ring off the path of a request, and a request that comes first
+    /// neither builds it nor waits for it. A stage that places by a ring
+    /// places such a request as one that carries no key, by its profile's
+    /// draw, and neither reads its own ring nor teaches it. In-process
+    /// only.
+    pub ring_awaited: bool,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.

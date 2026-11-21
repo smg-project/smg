@@ -62,11 +62,22 @@ pub trait PoolRows<'p> {
 
     /// The hash ring of the pool's list, where the host keeps one a list:
     /// asked for a request whose binding places by a ring, and for no
-    /// other, so a host builds it at the first call and keeps it with the
-    /// list. It is the ring of this pool's rows and of no other list
-    /// ([`RequestFacts::ring`]). `None` where the host keeps none: the
-    /// ring stage then places by its own ring, over every row.
+    /// other. It is the ring of this pool's rows and of no other list
+    /// ([`RequestFacts::ring`]). `None` where the host keeps none, and the
+    /// ring stage then places by its own ring, over every row; `None` too
+    /// where the host keeps one a list and this list's is not built yet
+    /// ([`Self::keeps_a_ring`]).
     fn ring(&self) -> Option<&'p PoolRing>;
+
+    /// Whether the host keeps a ring for each of its lists, built off the
+    /// path of a request. Under such a host a list whose ring is not built
+    /// yet hands none ([`Self::ring`]), and a request that reads a ring
+    /// there is placed as one that carries no key
+    /// ([`RequestFacts::ring_awaited`]): no decision builds a ring, and
+    /// none waits for one.
+    fn keeps_a_ring(&self) -> bool {
+        false
+    }
 }
 
 impl Engine {
@@ -142,6 +153,10 @@ impl Engine {
         };
         if facts.ring.is_none() && (reads_ring(index) || shadow.is_some_and(reads_ring)) {
             facts.ring = rows.ring();
+            // A host that keeps a ring a list and hands none has not built
+            // this list's yet: the ring stage draws, here and in the whole
+            // decision that follows.
+            facts.ring_awaited = facts.ring.is_none() && rows.keeps_a_ring();
         }
         let at = usize::from(index);
         let marks = self.marks[at];
