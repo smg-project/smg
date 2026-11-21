@@ -310,6 +310,19 @@ struct ReasoningStreamItem {
     text: String,
 }
 
+/// Whether `item` is a server-executed call (`mcp_call`, `web_search_call`,
+/// `code_interpreter_call`, `file_search_call`, `image_generation_call`) as
+/// the stream announced it, before `update_mcp_call_outputs` replaced it with
+/// the call's result. The announced item carries the `call_id` the result is
+/// matched by; a result item of these types has none.
+fn awaits_its_result(item: &serde_json::Value) -> bool {
+    item.get("call_id").is_some()
+        && item["type"]
+            .as_str()
+            .and_then(openai_bridge::format_from_type_str)
+            .is_some()
+}
+
 /// The kind of a serde error the stored object's typed read met, for its log
 /// line: serde's invalid-type and unknown-variant texts quote the offending
 /// value, which may be model output, so the text itself is never logged.
@@ -1225,6 +1238,12 @@ impl ResponseStreamEventEmitter {
             .iter()
             .filter_map(|item| {
                 let data = item.item_data.as_ref()?;
+                // The stored object lists a server-executed call once the loop sets its
+                // result, not from the item the stream announced it with, whether or not
+                // that item reads as a typed one (an `mcp_call` without `output` does).
+                if awaits_its_result(data) {
+                    return None;
+                }
                 match ResponseOutputItem::deserialize(data) {
                     Ok(typed) => Some(typed),
                     Err(error) => {
@@ -2669,6 +2688,80 @@ mod tests {
         assert_eq!(event["response"]["output"], json!([item]));
         assert_eq!(event["response"]["usage"], usage);
         assert_eq!(event["type"], ResponseEvent::COMPLETED);
+    }
+
+    /// The stored object lists a server-executed call once the loop sets its
+    /// result: the item the stream announced an `mcp_call` or an
+    /// `image_generation_call` with reads as a typed item (its `output` or
+    /// `result` may be none), and is left out until the result replaces it.
+    /// A failed call's result, which has no output, is listed with `null`.
+    #[tokio::test]
+    async fn the_stored_object_lists_a_server_call_once_its_result_is_set() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter.set_original_request(
+            serde_json::from_value(json!({"model": "test-model", "input": "hi"})).unwrap(),
+        );
+        let (tx, _rx) = sse_channel();
+        let announced = [
+            (ResponseFormat::Passthrough, "call_mcp"),
+            (ResponseFormat::ImageGenerationCall, "call_image"),
+        ];
+        let mut ids = Vec::new();
+        for (format, call_id) in announced {
+            let (index, id) = emitter.allocate_output_index_for_format(Some(format));
+            let item = json!({
+                "id": id,
+                "type": descriptor(format).type_str,
+                "name": "get_weather",
+                "call_id": call_id,
+                "arguments": "{}",
+                "status": "completed",
+                "server_label": "weather"
+            });
+            assert!(
+                serde_json::from_value::<ResponseOutputItem>(item.clone()).is_ok(),
+                "the announced item reads as a typed one: {item}"
+            );
+            emitter
+                .send_output_item_done(index, item, &tx)
+                .await
+                .unwrap();
+            emitter.complete_output_item(index);
+            ids.push(id);
+        }
+        let stored = |emitter: &ResponseStreamEventEmitter| {
+            serde_json::to_value(emitter.finalize(None)).unwrap()["output"].clone()
+        };
+        assert_eq!(stored(&emitter), json!([]));
+
+        emitter.update_mcp_call_outputs(&[ToolResult {
+            call_id: "call_mcp".to_string(),
+            output: json!("no such city"),
+            is_error: true,
+            output_item: ResponseOutputItem::McpCall {
+                id: ids[0].clone(),
+                status: "failed".to_string(),
+                approval_request_id: None,
+                arguments: "{}".to_string(),
+                error: None,
+                name: "get_weather".to_string(),
+                output: None,
+                server_label: "weather".to_string(),
+            },
+        }]);
+
+        // The failed call is listed, its missing output written as `null`; the
+        // image call, still unanswered, is not.
+        let output = stored(&emitter);
+        assert_eq!(output.as_array().map(Vec::len), Some(1), "{output}");
+        assert_eq!(output[0]["id"], ids[0].as_str());
+        assert_eq!(output[0]["status"], "failed");
+        assert!(output[0]["output"].is_null(), "{output}");
+        assert!(
+            output[0].as_object().unwrap().contains_key("output"),
+            "{output}"
+        );
     }
 
     /// The two typed output item events write the frames the `json!` events
