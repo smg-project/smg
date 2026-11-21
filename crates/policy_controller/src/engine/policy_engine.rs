@@ -28,6 +28,8 @@
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation.
 
+pub(super) mod pair;
+
 use std::{
     cell::RefCell,
     hash::Hasher,

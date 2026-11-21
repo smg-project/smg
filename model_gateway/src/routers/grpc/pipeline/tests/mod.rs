@@ -3072,6 +3072,103 @@ async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }
 
+/// The router the factory builds for a pair gateway under the policy
+/// controller serves a pair. The factory mounts the pair router over the
+/// context's policy engine, the router's selection stage asks it, and each side
+/// ends whole on its own worker.
+///
+/// The router also tells that stage what the pair's settings keep. Here the
+/// role policies keep an explicit target and the main policy does not, so a
+/// request that names its worker is refused by name.
+#[tokio::test]
+async fn the_factory_builds_a_pair_router_that_serves_under_the_policy_controller() {
+    use crate::{
+        config::{test_support::pd_routing_mode, RoutingMode},
+        routers::{
+            grpc::testing::{grpc_config, grpc_ctx_from, mcp_orchestrator},
+            RouterFactory,
+        },
+    };
+
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let mut config = grpc_config(pd_routing_mode()).build_unchecked();
+    config.policy_controller = true;
+    config.policy = PolicyConfig::RoundRobin;
+    if let RoutingMode::PrefillDecode {
+        prefill_policy,
+        decode_policy,
+        ..
+    } = &mut config.mode
+    {
+        *prefill_policy = Some(PolicyConfig::ConsistentHashing);
+        *decode_policy = Some(PolicyConfig::ConsistentHashing);
+    }
+    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
+    let prefill = register_worker(&ctx.worker_registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&ctx.worker_registry, decode_port, WorkerType::Decode);
+    let (_, store, _) = engine_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&ctx.worker_registry));
+    let context = Arc::get_mut(&mut ctx).expect("the context's one hold");
+    context.policy_store = Some(Arc::clone(&store));
+    context.policy_engine = Some(Arc::new(policy_engine));
+    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    ctx.tokenizer_registry
+        .load(
+            "tokenizer-id",
+            MODEL,
+            "test",
+            || async move { Ok(tokenizer) },
+        )
+        .await
+        .expect("load mock tokenizer");
+
+    let router = RouterFactory::create_router(&ctx)
+        .await
+        .expect("the pair router");
+    assert_eq!(router.router_type(), "grpc_pd");
+    let request = || -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "prompt": "Hello world",
+            "stream": false,
+        }))
+        .expect("completion request")
+    };
+    let started = Instant::now();
+    let response = router
+        .route_completion(None, &anonymous(), request(), MODEL)
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    drop(response);
+    for url in [prefill.url(), decode.url()] {
+        let row = store.by_key(url).expect("the side's row").id;
+        assert!(
+            store.completed_ok_since(GatewayId::LOCAL, row, started),
+            "{url}"
+        );
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-smg-target-worker", http::HeaderValue::from_static("0"));
+    let refused = router
+        .route_completion(Some(&headers), &anonymous(), request(), MODEL)
+        .await;
+    assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
+    let body = axum::body::to_bytes(refused.into_body(), 4096)
+        .await
+        .expect("the refusal's body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("not_decided_by_policy_controller")
+            && body.contains("an explicit target worker"),
+        "{body}"
+    );
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
 /// A harmony responses context whose requests the controller places: the
 /// store, the row of its one worker, the registry and the worker's object.
 struct PlacedRig {
