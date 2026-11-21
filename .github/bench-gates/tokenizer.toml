@@ -35,9 +35,10 @@
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted
 # runner's own spread can be read from those and the thresholds tightened once it is known.
 #
-# The table was recorded while this gate's command carried `--features tokenizers-v1`. Under that
-# feature the opt-in pipeline serves this bench's encodes, so whether the spreads of the two encode
-# rows hold for the native encoder the gate builds now is still to be read from results.json.
+# The table and the placement reads below (the null read, the inserted regression) were recorded
+# while this gate's command carried `--features tokenizers-v1`. Under that feature the opt-in
+# pipeline serves this bench's encodes, so for the native encoder the gate builds now the encode
+# rows' spreads are still to be read from results.json, and their catch to be measured again.
 
 #
 # Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
