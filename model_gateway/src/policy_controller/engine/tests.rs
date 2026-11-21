@@ -1894,6 +1894,9 @@ fn an_asks_own_token_count_wins_over_its_hashes_count() {
         ..Prompt::default()
     }
     .hashes(&store, MODEL);
+    let mut counted = RequestFacts::default();
+    tokens.write_to(&mut counted);
+    assert_eq!(counted.prompt_tokens, 88, "the hashes count the prompt");
     let ask = Ask {
         hashes: Some(&tokens),
         ..pair_ask()

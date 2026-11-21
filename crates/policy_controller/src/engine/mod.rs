@@ -2,6 +2,9 @@
 //! what a decision reads (the view) and what it returns, and the engine that
 //! decides over the policy store.
 //!
+//! `prompt_hashes` makes the block hashes of a request's prompt, which a
+//! caller writes into the request facts of the view.
+//!
 //! The session table that a `sessions` rule reads lives in this folder too.
 
 pub(crate) mod decider;

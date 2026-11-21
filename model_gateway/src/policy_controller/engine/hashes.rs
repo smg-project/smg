@@ -32,8 +32,8 @@ impl<'a> Prompt<'a> {
     }
 
     /// The prompt's hashes for `model`, under the generation in force
-    /// ([`PromptHashes`]): its token ids' where the router tokenized it,
-    /// else its text's, else none.
+    /// ([`MemoryStore::prompt_hashes`]): its token ids' where the router
+    /// tokenized it, else its text's, else none.
     ///
     /// The seeds are the cache partition's. A request with no partition is
     /// hashed under the plain seeds, less the leading ids that carry a
@@ -52,18 +52,11 @@ impl<'a> Prompt<'a> {
                 // engine's cache does.
                 partition: namespace.partition_seed(),
             });
-        let Some(tokens) = self.tokens else {
-            // No engine hashes text: its seed is the whole partition's.
-            return self.text.map_or_else(PromptHashes::default, |text| {
-                PromptHashes::of_text(store, model, text, seeds.partition)
-            });
+        let tokens = match self.namespace {
+            Some(_) => self.tokens,
+            None => self.tokens.map(CacheNamespace::unpartitioned_tokens),
         };
-        let tokens = if self.namespace.is_some() {
-            tokens
-        } else {
-            CacheNamespace::unpartitioned_tokens(tokens)
-        };
-        PromptHashes::of_tokens(store, model, tokens, seeds)
+        store.prompt_hashes(model, tokens, self.text, seeds)
     }
 }
 
