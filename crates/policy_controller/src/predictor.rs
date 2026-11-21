@@ -1,9 +1,20 @@
 //! The sent-prefix predictor (design 4.4): which workers each prefix of a
-//! model's requests was sent to. A worker that publishes no cache events is
-//! remembered by what it was sent, and a decision reads that as it reads
+//! model's requests was sent to. A worker the store hears no cache events
+//! from is remembered by what it was sent, and a decision reads that as it reads
 //! the holders of the event-fed index ([`crate::store::index`]): the
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
+//!
+//! An entry is a prediction made at the decision. The door and the stock
+//! controller write it where a single's lease is issued, so it says where
+//! a prefix was decided to go, whether or not the request then left. A
+//! decision turned back behind its issue keeps its entry, and the next
+//! request of the prefix follows it: a false entry costs one miss on its
+//! worker, where no entry costs one miss on some worker, and it is true
+//! once followed. An entry stops speaking for a worker whose cache events
+//! are heard, and leaves with its worker or by the bound. The keys hold no
+//! hash kind: a host that makes its own hashes keeps a text request's
+//! apart from a token request's.
 //!
 //! This is the `tree` kind of the document's index settings
 //! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.
@@ -160,7 +171,7 @@ enum Ask<'a> {
 }
 
 /// The prefixes sent to a model's workers: what a decision reads for the
-/// workers that publish no cache events, and what its issue writes.
+/// workers the store hears no cache events from, and what its issue writes.
 #[derive(Debug)]
 pub struct Predictor {
     /// The blocks, in pieces that never move.

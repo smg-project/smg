@@ -129,6 +129,7 @@ fn pair(c: &mut Criterion) {
             now: opened + Duration::from_secs(1),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         for threads in [1_usize, 8] {
             for door in ["owned", "guard"] {

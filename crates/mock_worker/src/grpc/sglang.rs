@@ -316,6 +316,7 @@ impl SglangScheduler for MockScheduler {
                 lora: None,
                 disaggregation: None,
                 queues: None,
+                values: self.load_values(dp_rank),
             })
             .collect();
         Ok(Response::new(sg::GetLoadsResponse {

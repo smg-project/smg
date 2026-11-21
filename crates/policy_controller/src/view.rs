@@ -50,9 +50,14 @@ pub enum HashKind {
     /// Token blocks of the model's block size of record.
     #[default]
     Token,
-    /// Fixed character windows over the text, for a host without a tokenizer.
+    /// Fixed windows of bytes over the text, for a host without a tokenizer.
     Text,
 }
+
+/// Bytes of a request's text a token, for a host with no tokenizer. A text
+/// window is this many times the model's block size in bytes, and a text's
+/// size in tokens is its bytes over this.
+pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
 
 /// Where a candidate's load row came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -713,9 +718,11 @@ pub struct Candidate {
     /// with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
+    /// The store knows no window, so a row it builds reads the bit open.
     pub has_capacity: bool,
     /// Host-supplied admission bit: the decode's running window has a room
-    /// nobody waiting at its gate is in line for.
+    /// nobody waiting at its gate is in line for. Open on a row the store
+    /// builds, as [`Self::has_capacity`] is.
     pub has_room: bool,
     /// The zone, as a position into the spec's declared list; `0` when
     /// unzoned.
@@ -780,6 +787,16 @@ pub struct MediaCounts {
     pub audio: u16,
     pub video: u16,
     pub bytes: u32,
+}
+
+impl MediaCounts {
+    /// No media: every count at zero, and no bytes.
+    pub const NONE: Self = Self {
+        images: 0,
+        audio: 0,
+        video: 0,
+        bytes: 0,
+    };
 }
 
 /// An allow-listed header: its name as a position into the spec's declared
@@ -892,10 +909,13 @@ pub struct RequestFacts<'a> {
     /// The per-decision seed, recorded in the trace: the only randomness a
     /// stage gets.
     pub seed: u64,
-    /// The size in tokens of one of the request's blocks as the host
-    /// counted them: an index's learned block size on an event-fed request,
-    /// the configured one on a tree-fed request; `0` reads the view's. Last
-    /// on the wire (the numbering follows the record's order).
+    /// The size of one of the request's blocks as the host counted them.
+    /// Under the token kind it is in tokens: an index's learned block size
+    /// on an event-fed request, the configured one on a tree-fed request;
+    /// `0` reads the view's. Under the text kind it is the window's size in
+    /// bytes, and a text request always states it: the wire refuses one
+    /// that carries hashes and states none. Last on the wire (the
+    /// numbering follows the record's order).
     pub block_size: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
@@ -987,7 +1007,8 @@ pub struct RequestFacts<'a> {
     /// ([`KeySources::derive_client`](crate::KeySources::derive_client)):
     /// what a ring places by where the request carries no session key. It
     /// lifts no overload veto, pins no session and is counted under no key.
-    /// In-process only: the wire carries no client key yet.
+    /// The wire's request facts carry it to a controller, and a plugin's
+    /// frame keeps `0` under every exposure.
     pub client_key: u64,
 }
 
@@ -1188,6 +1209,10 @@ pub struct Constraints<'a> {
     /// not: its host says so here.
     pub overload_lifted: bool,
     /// This pair's decode is sent after its prefill has run. Default: false.
+    /// A door in process reads it. A link does not carry it yet: it sends
+    /// the field as false, the controller issues both sides at the first
+    /// ask, and a decode call over the link answers that the side was not
+    /// chosen.
     pub decode_later: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
@@ -1837,6 +1862,11 @@ mod tests {
         assert!(!WireModes::ZMQ.intersects(both));
         assert_eq!(WireModes::from_bits(0xff).bits(), 0b111);
         assert!(WireModes::NONE.is_empty());
+    }
+
+    #[test]
+    fn no_media_is_the_default_of_the_counts() {
+        assert_eq!(MediaCounts::NONE, MediaCounts::default());
     }
 
     #[test]

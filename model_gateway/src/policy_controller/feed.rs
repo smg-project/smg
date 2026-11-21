@@ -1,10 +1,16 @@
 //! The membership door writes the store. Its listener brings the worker
 //! registry up to date and publishes membership for decisions in that order.
-//! Each membership write asks for publication before it returns. A row
-//! holds no credential, so its worker object carries none.
+//! Each membership write asks for publication before it returns.
+//!
+//! A registration of this process hands the door the workers it built, and
+//! the holder keeps each as its row's object ([`FeedDoor`]). An object
+//! holds what no row states: the worker's credential, its connection
+//! settings and its model cards.
 //!
 //! Under a controller's address the follower writes the store in the door's
 //! place, and settles the feed after each event it takes ([`following`]).
+//! No registration runs there, so the holder builds each object from its
+//! row, and such an object holds no credential.
 //!
 //! The load collector writes the store through the feed's sink. Those
 //! writes come from the collector's tasks and name no instant to a host, so
@@ -12,6 +18,13 @@
 //! when the store's instant comes. The loop is the gateway's one hand on
 //! the store's wake. It keeps the listener's order: the registry is brought
 //! up to date, then the store publishes.
+//!
+//! The store's index is fed by the workers' cache events. The feed runs
+//! the crate's follow of them for as long as its answer is kept. It is the
+//! gateway's one collector of cache events: the classic one is not built
+//! beside it. So the follow also carries what the classic one carried
+//! beside the events: each worker's pushed load records, to the worker
+//! monitor, which says them to the feed's load sink.
 
 use std::{
     sync::Arc,
@@ -22,8 +35,8 @@ use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
     worker_host::{
-        Expect, HealthAdapter, LoadAdapter, Membership, Objects, Refused, Remover, SoleLead,
-        Standing, StoreDoor, Wrote,
+        Expect, HealthAdapter, KvFeed, LoadAdapter, Membership, Objects, Over, Refused, Remover,
+        SoleLead, Standing, StoreDoor, Wrote,
     },
 };
 use smg_worker::{
@@ -34,11 +47,14 @@ use smg_worker::{
     registry::WorkerId,
     worker::{WorkerLoadResponse, WorkerStatus},
 };
-use tokio::{sync::Notify, time::sleep_until};
+use tokio::{
+    sync::{watch, Notify},
+    time::sleep_until,
+};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 
-use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry};
+use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry};
 
 /// The feed of a gateway that decides in its own process: the door its
 /// worker workflows write at, and the holder that keeps the registry as
@@ -74,11 +90,12 @@ impl Feed {
         })
     }
 
-    /// Bring the registry to the store's rows, then publish them: the two
-    /// calls the door's listener makes after each write. A follower that
-    /// applies a served controller's events calls this after each event.
-    /// It takes the feed's turn, so it never runs between a write at the
-    /// door and that write's listener.
+    /// Bring the registry to the store's rows, publish them, then write the
+    /// published overload verdicts on the objects: the three calls the
+    /// door's listener makes after each write. A follower that applies a
+    /// served controller's events calls this after each event. It takes the
+    /// feed's turn, so it never runs between a write at the door and that
+    /// write's listener.
     pub(crate) fn settle(&self) {
         let _turn = self.turn.lock();
         settle(&self.objects, &self.store, None);
@@ -133,9 +150,16 @@ impl Feed {
     /// With no instant in hand the loop waits for a wake. With one in hand
     /// it sleeps to it and settles at it. A wake that comes while it sleeps
     /// is kept, and costs one more read of the instant.
+    ///
+    /// A write the store showed by itself names no instant, and no settle
+    /// follows it. The loop writes the overload verdicts of the world that
+    /// stands before it waits, so a wake with nothing due still mirrors.
+    /// The holder mirrors one call at a time and reads the world of its
+    /// instant, so the call takes no turn of the feed.
     async fn publish_as_due(self) {
         loop {
             let Some(due) = self.store.publish_due() else {
+                self.objects.mirror_overload(&self.store);
                 self.woken.notified().await;
                 continue;
             };
@@ -153,6 +177,36 @@ impl Feed {
         // The store shows nothing before its instant, so the loop never
         // hands it an earlier one.
         settle(&self.objects, &self.store, Some(Instant::now().max(due)));
+    }
+
+    /// Read the cache events of the store's workers into its index, and
+    /// their pushed load records into `loads`, for as long as the answer is
+    /// kept. The follow is the crate's own: as the registry changes it asks
+    /// a stream of each gRPC worker, for its cache events where its row asks
+    /// for them and for its load records alone where `loads` wants them.
+    pub(crate) fn cache_events(&self, loads: Option<&Arc<WorkerMonitor>>) -> CacheEvents {
+        let follow = KvFeed::new(Arc::clone(&self.store), Arc::clone(&self.objects));
+        if let Some(monitor) = loads {
+            follow.set_load_sink(monitor);
+        }
+        let (stop, stopped) = watch::channel(false);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the follow holds no request; its answer's drop stops it, and a shutdown need not wait for it"
+        )]
+        tokio::spawn(async move { follow.run(stopped).await });
+        CacheEvents(stop)
+    }
+}
+
+/// The feed's cache events, for as long as this is kept. Its drop tells the
+/// follow to stop. The follow then ends every stream itself, so its task is
+/// not aborted.
+pub(crate) struct CacheEvents(watch::Sender<bool>);
+
+impl Drop for CacheEvents {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
     }
 }
 
@@ -220,6 +274,7 @@ impl LoadSink for FeedLoads {
 }
 
 /// The adapter writes a row's health and mirrors its status on the worker.
+/// It writes a move of the worker's liveness veto as the row's stalled bit.
 /// The registry writes the health of workers without a row.
 /// The adapter answers stale for those workers, so it cannot promote them.
 struct FeedHealth {
@@ -257,28 +312,36 @@ impl HealthSink for FeedHealth {
     ) -> Option<(WorkerStatus, WorkerStatus)> {
         self.sink(worker_id).connected(worker_id, revision)
     }
+
+    fn liveness_moved(&self, worker_id: &WorkerId, revision: u64) {
+        self.sink(worker_id).liveness_moved(worker_id, revision);
+    }
 }
 
 /// The order is the rule: the registry holds a row's object before a
 /// decision can read the row. With an instant the store shows what is due
 /// at it. With none it pays the build the membership writes left owed, at
-/// once.
+/// once. The objects then take the overload verdicts of the world that
+/// stands.
 fn settle(objects: &Objects<ModelWorkerSnapshot>, store: &MemoryStore, at: Option<Instant>) {
     objects.follow(store);
     match at {
         Some(now) => store.publish(now),
         None => store.publish_now(),
     }
+    objects.mirror_overload(store);
 }
 
-/// The feed over `store`, for the workers of `registry`. The holder lays
-/// each object with `connector`, the one the gateway was started with.
+/// The feed over `store`, for the workers of `registry`. The holder keeps
+/// the object each registration hands the door. A row laid with no object
+/// handed in gets one built from it with `connector`, the one the gateway
+/// was started with, and the holder warns.
 pub(crate) fn feed(
     store: &Arc<MemoryStore>,
     registry: &Arc<WorkerRegistry>,
     connector: Arc<dyn EngineConnector>,
 ) -> Feed {
-    over(store, holder(registry, connector))
+    over(store, holder(registry, connector).with_built_kept())
 }
 
 /// The feed of a gateway that follows a controller at an address.
@@ -315,6 +378,8 @@ fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed
         door: Arc::new(FeedDoor {
             door,
             turn: Arc::clone(&turn),
+            objects: Arc::clone(&objects),
+            store: Arc::clone(store),
         }),
         objects,
         store: Arc::clone(store),
@@ -326,16 +391,22 @@ fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed
 /// The store door releases its turn before calling the listener. Hold the
 /// feed's turn through that call, so neither a later write nor a settle
 /// can publish a row the holder has yet to read.
+///
+/// A registration's built workers are on offer at the holder through its
+/// write, inside the same turn: the listener's read lays each row with its
+/// own, and a row the write left unmoved has the holder lay it too. The
+/// offer ends whole with the turn.
+/// A guarded write names the object it replaces, and the holder refuses it
+/// in that turn where another object stands.
 struct FeedDoor {
     door: StoreDoor,
     turn: Arc<Mutex<()>>,
+    objects: Arc<Objects<ModelWorkerSnapshot>>,
+    store: Arc<MemoryStore>,
 }
 
 impl FeedDoor {
-    fn write(
-        &self,
-        write: impl FnOnce(&StoreDoor) -> Result<Wrote, Refused>,
-    ) -> Result<Wrote, Refused> {
+    fn write<T>(&self, write: impl FnOnce(&StoreDoor) -> Result<T, Refused>) -> Result<T, Refused> {
         let _turn = self.turn.lock();
         write(&self.door)
     }
@@ -352,6 +423,21 @@ impl Membership for FeedDoor {
         self.write(|door| door.found(maker, expect, url, state))
     }
 
+    fn found_rows(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        built: &[Arc<dyn Worker>],
+        over: Option<Over<'_>>,
+    ) -> Result<Vec<Wrote>, Refused> {
+        self.write(|door| {
+            let seen = over.map(Over::object);
+            self.objects.handing(self.store.as_ref(), built, seen, || {
+                door.found_rows(maker, expect, built, over)
+            })
+        })
+    }
+
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
         self.write(|door| door.drained(by, url, seen))
     }
@@ -359,7 +445,25 @@ impl Membership for FeedDoor {
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
         self.write(|door| door.gone(by, url, seen))
     }
+
+    fn refreshed(
+        &self,
+        seen: Standing,
+        built: &Arc<dyn Worker>,
+        over: &Arc<dyn Worker>,
+    ) -> Result<Wrote, Refused> {
+        self.write(|door| {
+            self.objects
+                .handing_one(self.store.as_ref(), built, Some(over), || {
+                    door.refreshed(seen, built, over)
+                })
+        })
+    }
 }
 
+#[cfg(test)]
+mod cache_events_tests;
+#[cfg(test)]
+pub(crate) mod signal_tests;
 #[cfg(test)]
 mod tests;

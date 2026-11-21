@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use smg_policy_controller::{
     spec::MAX_SIGNALS, AppliedSpec, Candidate, Catalog, Constraints, Decision, Engine, Filter,
-    Lifecycle, Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch,
-    SignalCell, SignalCells, SignalColumn, StageBuild, TieBand, WorkerId,
+    Lifecycle, Needs, PairPools, Phase, Picker, PolicySpec, PoolFacts, RequestFacts, Scorer,
+    Scratch, SignalCell, SignalCells, SignalColumn, StageBuild, Targets, TieBand, WorkerId,
 };
 
 /// The decisions' instant on the host's clock.
@@ -522,6 +522,136 @@ fn a_stage_whose_needs_and_build_disagree_on_the_signal_cells_is_refused() {
     );
 }
 
+/// A filter and a picker whose needs say `declares`. Neither is built
+/// under a context, so neither resolves a column.
+#[derive(Debug)]
+struct Declares {
+    declares: bool,
+}
+
+impl Lifecycle for Declares {}
+
+impl Filter for Declares {
+    fn name(&self) -> &'static str {
+        "declares"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            signal_cells: self.declares,
+            ..Needs::default()
+        }
+    }
+}
+
+impl Picker for Declares {
+    fn name(&self) -> &'static str {
+        "declares"
+    }
+
+    fn pick(
+        &self,
+        _: &RequestFacts<'_>,
+        _: &[Candidate],
+        _: &[u32],
+        _: &[f32],
+        _: TieBand,
+        _: &mut Targets,
+    ) {
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            signal_cells: self.declares,
+            ..Needs::default()
+        }
+    }
+}
+
+/// A stage the catalog builds with no context resolves no signal, so one
+/// that declares the cells would have a host hand cells nothing reads. It
+/// is refused as a stage a factory built is, and the refusal ends with
+/// what its author can do: a scorer bare and under a weight, a filter and
+/// a picker.
+#[test]
+fn a_stage_built_with_no_context_that_declares_the_signal_cells_is_refused() {
+    // Whether the validated engine declares the cells, or the refusal.
+    let validated = |catalog: &Catalog, text: &str| {
+        document(text)
+            .validate_in(catalog, &[])
+            .map(|engine| engine.needs().signal_cells)
+            .map_err(|refused| refused.to_string())
+    };
+    let held = |declares: bool, path: &str, remedy: &str| {
+        if declares {
+            Err(format!(
+                "{path}: the stage's needs set signal_cells and its build resolved no signal: \
+                 {remedy}"
+            ))
+        } else {
+            Ok(false)
+        }
+    };
+    for declares in [true, false] {
+        let mut scorers = Catalog::builtin();
+        scorers
+            .scorer("mismatched", move || Box::new(Mismatched { declares }))
+            .expect("a free name");
+        for entry in ["- mismatched", "- mismatched: { weight: 2 }"] {
+            let text = DOCUMENT.replace("- reads-two: { first: pending, second: free }", entry);
+            assert_eq!(
+                validated(&scorers, &text),
+                held(
+                    declares,
+                    "profiles.default.score[0].mismatched",
+                    "register it by scorer_with to resolve one, or leave the need unset"
+                ),
+                "{entry}"
+            );
+        }
+
+        let mut filters = Catalog::builtin();
+        filters
+            .filter("declares", move || Box::new(Declares { declares }))
+            .expect("a free name");
+        let text = DOCUMENT.replace(
+            "    score:\n      - reads-two: { first: pending, second: free }\n    pick: best",
+            "    filter:\n      - declares\n    pick: random",
+        );
+        assert_eq!(
+            validated(&filters, &text),
+            held(
+                declares,
+                "profiles.default.filter[0].declares",
+                "register it by filter_with to resolve one, or leave the need unset"
+            )
+        );
+
+        let mut pickers = Catalog::builtin();
+        pickers
+            .picker("declares", move || Box::new(Declares { declares }))
+            .expect("a free name");
+        let text = DOCUMENT
+            .replace(
+                "- reads-two: { first: pending, second: free }",
+                "- least-requests",
+            )
+            .replace("pick: best", "pick: declares");
+        assert_eq!(
+            validated(&pickers, &text),
+            held(
+                declares,
+                "profiles.default.pick.declares",
+                "register it by picker_with to resolve one, or leave the need unset"
+            )
+        );
+    }
+}
+
 /// Keeps the rows whose pending tokens stand at or under its limit, and a
 /// row of no value.
 #[derive(Debug)]
@@ -614,6 +744,46 @@ profiles:
 }
 
 #[test]
+fn a_signal_declares_how_several_ranks_make_one_value_and_the_sum_is_left_unwritten() {
+    use smg_policy_controller::spec::AcrossRanks;
+
+    let declaring = |across: &str| {
+        document(&format!(
+            "apiVersion: smg.policy/v1\nsignals:\n  depth: {{ unit: items{across} }}\nprofiles: {{ p: {{ pick: random }} }}\n"
+        ))
+    };
+    let across = |document: &PolicySpec| {
+        let applied = AppliedSpec::validate(document).expect("validates");
+        applied.signal_columns()[0].across_ranks()
+    };
+    // Left out, a report of several ranks is summed.
+    let plain = declaring("");
+    assert_eq!(across(&plain), AcrossRanks::Sum);
+    for (word, declared) in [
+        ("sum", AcrossRanks::Sum),
+        ("max", AcrossRanks::Max),
+        ("min", AcrossRanks::Min),
+        ("mean", AcrossRanks::Mean),
+    ] {
+        let written = declaring(&format!(", across_ranks: {word}"));
+        assert_eq!(across(&written), declared, "{word}");
+        let read: PolicySpec =
+            serde_json::from_str(&serde_json::to_string(&written).expect("JSON"))
+                .expect("its own JSON");
+        assert_eq!(read, written, "{word}");
+        // The sum written out is the document that leaves it out: one
+        // canonical form and one digest. Any other word moves both.
+        let same = written.digest().expect("a digest").to_string()
+            == plain.digest().expect("a digest").to_string();
+        assert_eq!(same, declared == AcrossRanks::Sum, "{word}");
+    }
+    let unknown = serde_yaml::from_str::<PolicySpec>(
+        "apiVersion: smg.policy/v1\nsignals:\n  depth: { unit: items, across_ranks: median }\nprofiles: { p: { pick: random } }\n",
+    );
+    assert!(unknown.is_err(), "a word that is no reduction");
+}
+
+#[test]
 fn a_host_refills_its_cells_in_place_and_the_next_decision_reads_them() {
     let rows = rows(&[31, 32]);
     // A row's cells in the order of the names: `free`, then `pending`.
@@ -644,5 +814,50 @@ fn the_default_cells_read_no_value() {
     assert_eq!(
         reads(&rows, Some(&SignalCells::default())),
         [(31, None, None), (32, None, None)]
+    );
+}
+
+/// A picker built under a context is held to its word on the signal cells
+/// as a scorer is: the one maker of a context holds every kind of stage.
+#[test]
+fn a_picker_built_under_a_context_is_held_to_its_word_on_the_cells() {
+    let refusal = |declares: bool, resolves: bool| {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker_with("declares", move |build: &mut StageBuild<'_>| {
+                if resolves {
+                    build.signal_column("free")?;
+                }
+                Ok(Box::new(Declares { declares }))
+            })
+            .expect("a free name");
+        let text = DOCUMENT
+            .replace(
+                "- reads-two: { first: pending, second: free }",
+                "- least-requests",
+            )
+            .replace("pick: best", "pick: declares");
+        document(&text)
+            .validate_in(&catalog, &[])
+            .map(|_| ())
+            .map_err(|refused| refused.to_string())
+    };
+    assert_eq!(refusal(true, true), Ok(()));
+    assert_eq!(refusal(false, false), Ok(()));
+    assert_eq!(
+        refusal(false, true),
+        Err(
+            "profiles.default.pick.declares: the stage keeps a signal's column: its needs must \
+             set signal_cells"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        refusal(true, false),
+        Err(
+            "profiles.default.pick.declares: the stage's needs set signal_cells and its build \
+             resolved no signal: resolve one or leave the need unset"
+                .to_owned()
+        )
     );
 }

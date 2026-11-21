@@ -142,6 +142,34 @@ const RESYNCS: [ResyncReason; 9] = [
     ResyncReason::Snapshot,
 ];
 
+/// A reason's place in [`RESYNCS`]. The match names every reason, so a new
+/// one fails to build here, beside the list that must name it.
+const fn place(reason: ResyncReason) -> usize {
+    match reason {
+        ResyncReason::OutOfRange => 0,
+        ResyncReason::DataLoss => 1,
+        ResyncReason::StreamEnded => 2,
+        ResyncReason::SnapshotAbandoned => 3,
+        ResyncReason::RelayRestart => 4,
+        ResyncReason::EngineReplaced => 5,
+        ResyncReason::PublisherRestart => 6,
+        ResyncReason::GapCleared => 7,
+        ResyncReason::Snapshot => 8,
+    }
+}
+
+// Every place of the list holds its reason, read at the build.
+const _: () = {
+    let mut at = 0;
+    while at < RESYNCS.len() {
+        assert!(
+            place(RESYNCS[at]) == at,
+            "a resync reason is out of its place"
+        );
+        at += 1;
+    }
+};
+
 /// The metadata entry a caller states its name in.
 const PRINCIPAL: &str = "x-smg-principal";
 
@@ -1635,6 +1663,7 @@ impl Harness {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         if self
             .store
@@ -1845,15 +1874,21 @@ impl Harness {
         )
         .await?
         .map_err(|error| error.to_string())?;
-        let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
-        let store = self.store.as_ref();
         within("the store reads the lease dispatched", ROOM, || {
-            // By the trait's path, as `leases` reads the file.
-            smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
-                .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
+            self.dispatched(GATEWAY, lease)
         })
         .await
         .map(|_| ())
+    }
+
+    /// Whether the store reads the lease `lease` of the gateway named
+    /// `gateway` dispatched: no dispatch deadline ends it then.
+    pub fn dispatched(&self, gateway: &str, lease: u64) -> bool {
+        let gateway = GatewayId(fingerprint(gateway.as_bytes()));
+        let store = self.store.as_ref();
+        // By the trait's path, as `leases` reads the file.
+        smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
+            .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
     }
 
     /// The row the store's pin of record names for `session`, the value a
@@ -2122,6 +2157,7 @@ impl Embedded {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut out = ViewBuffers::default();
         self.store.deciding(|world| {

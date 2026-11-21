@@ -329,6 +329,7 @@ impl Bed {
             now,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let now_micros = self.store.micros(now);
         let (engine, out, scratch) = (&self.engine, &mut self.out, &mut self.scratch);

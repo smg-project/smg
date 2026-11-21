@@ -69,10 +69,7 @@ pub use smg_worker::connection::client_factory::{
 };
 use smg_worker::{
     connection::engine::EngineConnector,
-    health::{
-        manager::{WorkerManager, WorkerManagerConfig},
-        port::HealthSink,
-    },
+    health::manager::{WorkerManager, WorkerManagerConfig},
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
 };
@@ -102,7 +99,7 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
-    policy_controller::follower::Follower,
+    policy_controller::{follower::Follower, operators},
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -845,7 +842,12 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
+pub const ADMIN_ONLY_READS: &[&str] = &[
+    "/config",
+    "/rate-limits/tenants",
+    "/policy/spec",
+    "/policy/snapshot",
+];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -897,7 +899,8 @@ async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
 
 /// The control-plane routes that exist only behind control-plane
 /// authentication, mounted by `build_apps` when it is configured: the
-/// routes that expose addresses or change the configuration. A route
+/// routes that expose addresses, tell or check a document in force, or
+/// change the configuration. A route
 /// that joins this group is listed in [`GATED_ROUTES`] too, which the
 /// start-up record prints and the role matrix test reads.
 fn gated_control_plane_routes() -> Router<Arc<AppState>> {
@@ -908,6 +911,16 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
             "/rate-limits/tenants",
             get(rate_limit_document::get).put(rate_limit_document::put),
         )
+        .route("/policy/spec", get(operators::spec))
+        // The door's bound at the edge: a body that declares a longer length
+        // is refused unread, and one that declares none is read to the bound.
+        .route(
+            "/policy/spec:validate",
+            post(operators::validate).layer(middleware::RequestBodyLimitLayer::new(
+                operators::document_bytes(),
+            )),
+        )
+        .route("/policy/snapshot", get(operators::snapshot))
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
@@ -916,6 +929,9 @@ pub const GATED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/secrets/reload"),
     ("GET", "/rate-limits/tenants"),
     ("PUT", "/rate-limits/tenants"),
+    ("GET", "/policy/spec"),
+    ("POST", "/policy/spec:validate"),
+    ("GET", "/policy/snapshot"),
 ];
 
 async fn list_workers_rest(
@@ -1008,7 +1024,7 @@ async fn refuse_worker_write(_: Request, _: axum::middleware::Next) -> impl Into
             error:
                 "With --policy-controller-address, add, change and remove workers at the controller"
                     .to_owned(),
-            code: "CONFLICT".to_owned(),
+            code: "WORKER_CONTROLLER_OWNED".to_owned(),
         }),
     )
 }
@@ -1169,14 +1185,32 @@ impl Extensions {
     /// to their engines. Delegate to [`BackendConnector::shared`] for engines
     /// you want the gateway to connect to as usual.
     ///
-    /// For gRPC or ZMQ inference, and for a ZMQ worker's label refresh, the
-    /// gateway requires a [`BackendClient`]. It refuses other connections with
-    /// `its engine connection is not the gateway's backend client`.
+    /// A gRPC connection of your own carries a worker's health, loads and
+    /// events. The gateway puts it behind a front ([`Fronted`]) and sends
+    /// requests through its own client, which it connects to the worker's
+    /// address and runtime at the first request. So an engine the gateway's
+    /// client speaks to must listen there. The worker's connection is the
+    /// front: read your own type back through [`Fronted::front`]. If you
+    /// hold the gateway's client already, return [`Fronted::over`] of yours
+    /// and it, and the two share one channel.
+    ///
+    /// For ZMQ inference, and for a ZMQ worker's label refresh, the gateway
+    /// requires a [`BackendClient`] as the worker's connection. It refuses
+    /// another with `its engine connection is not the gateway's backend
+    /// client`.
     /// If the connection supplies load reports, let the worker runtime be
     /// the only poller of that engine's load.
     ///
+    /// An HTTP worker connects no engine, and its load is polled over HTTP.
+    /// A connector that keeps such a worker's load on a service of its own
+    /// answers [`EngineConnector::http_load_source`]: the worker runtime
+    /// then polls that source alone and sends the worker no load request.
+    ///
     /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
     /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
+    /// [`Fronted`]: crate::routers::grpc::backend_client::Fronted
+    /// [`Fronted::front`]: crate::routers::grpc::backend_client::Fronted::front
+    /// [`Fronted::over`]: crate::routers::grpc::backend_client::Fronted::over
     #[must_use]
     pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
         self.connector = Some(connector);
@@ -1905,8 +1939,9 @@ async fn start_workflow_engines(
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize typed workflow engines
-    let engines = WorkflowEngines::new(&config.router_config);
+    // Initialize typed workflow engines. Where the gateway decides in its
+    // own process, the worker workflows write at its store's door.
+    let engines = WorkflowEngines::with_feed(&config.router_config, app_context.door_feed());
 
     // Subscribe logging to all workflow engines
     engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
@@ -2282,23 +2317,31 @@ fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager>
         return None;
     }
     let config = &app_context.router_config;
-    // With a feed the loop writes through the feed's sink, so each worker's
-    // health keeps one writer.
-    let health_sink: Arc<dyn HealthSink> = match &app_context.policy_feed {
-        Some(feed) => feed.health_sink(),
-        None => app_context.worker_registry.clone(),
+    let registry = app_context.worker_registry.clone();
+    let manager = WorkerManagerConfig {
+        default_check_interval_secs: config.health_check.check_interval_secs,
+        remove_unhealthy: config.unhealthy_removal_scope(),
     };
-    WorkerManager::maybe_start_with_sink(
-        app_context.worker_registry.clone(),
-        health_sink,
-        WorkerManagerConfig {
-            default_check_interval_secs: config.health_check.check_interval_secs,
-            remove_unhealthy: config.unhealthy_removal_scope(),
-        },
-        app_context
-            .worker_job_queue
-            .get()
-            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
+    let jobs = app_context
+        .worker_job_queue
+        .get()
+        .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>);
+    // With a feed the loop writes through the feed's sink, so each worker's
+    // health keeps one writer. The feed's rows take each move of a worker's
+    // liveness veto from the loop as well, so a feed keeps the loop with the
+    // checks off: it then probes no worker whose own checks are off.
+    if let Some(feed) = &app_context.policy_feed {
+        return Some(WorkerManager::start_with_sink(
+            registry,
+            feed.health_sink(),
+            manager,
+            jobs,
+        ));
+    }
+    WorkerManager::maybe_start(
+        registry,
+        manager,
+        jobs,
         !config.health_check.disable_health_check,
         config.connection_mode == ConnectionMode::Zmq,
     )
@@ -2612,6 +2655,15 @@ pub async fn startup_with(
         .as_ref()
         .filter(|_| app_context.worker_monitor.is_some())
         .map(|feed| feed.publications());
+    // Under the feed the workers' cache events reach the store's index, and
+    // their pushed load records the worker monitor, by the feed's follow,
+    // for the server's life. Under a controller's address the controller
+    // reads them, and this gateway reads none.
+    let _cache_events = app_context
+        .policy_feed
+        .as_ref()
+        .filter(|_| app_context.policy_follower.is_none())
+        .map(|feed| feed.cache_events(app_context.worker_monitor.as_ref()));
 
     let admission_queue =
         if app_context.rate_limiter.is_some() && config.router_config.queue_size > 0 {
@@ -3769,6 +3821,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 #[cfg(test)]
 mod tests {
     mod connector;
+    mod load_source;
 
     use std::convert::Infallible;
 
@@ -3815,6 +3868,7 @@ mod tests {
 
         use crate::{
             app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+            workflow::job_queue::recording_for_tests,
         };
 
         let missing = "/workers/00000000-0000-0000-0000-000000000001";
@@ -3825,8 +3879,21 @@ mod tests {
                 ..Default::default()
             };
             let context = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+            // A following gateway has a queue to refuse ahead of.
+            let _jobs = following.then(|| {
+                let (queue, jobs) = recording_for_tests(&context);
+                assert!(context.worker_job_queue.set(queue).is_ok());
+                jobs
+            });
             let probes = ProbeState::new(context.inflight_tracker.clone());
-            let app = worker_test_app(context, probes);
+            let app = worker_test_app(Arc::clone(&context), probes);
+            // A GET by id asks the queue: not found where one stands, an
+            // error where none does.
+            let by_id = if following {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
             for (method, path, body, classic) in [
                 (
                     "POST",
@@ -3843,7 +3910,7 @@ mod tests {
                 ("PATCH", missing, "{}", StatusCode::NOT_FOUND),
                 ("DELETE", missing, "", StatusCode::NOT_FOUND),
                 ("GET", "/workers", "", StatusCode::OK),
-                ("GET", missing, "", StatusCode::INTERNAL_SERVER_ERROR),
+                ("GET", missing, "", by_id),
             ] {
                 let response = app
                     .clone()
@@ -3861,6 +3928,7 @@ mod tests {
                     assert_eq!(response.status(), StatusCode::CONFLICT, "{method} {path}");
                     let body = to_bytes(response.into_body(), 4096).await.unwrap();
                     let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["code"], "WORKER_CONTROLLER_OWNED", "{method} {path}");
                     assert!(
                         body["error"]
                             .as_str()
@@ -3871,6 +3939,15 @@ mod tests {
                 } else {
                     assert_eq!(response.status(), classic, "{method} {path}");
                 }
+            }
+            if following {
+                // The refusal stands ahead of the worker API: no job was
+                // queued and no id reserved.
+                let url = "http://worker:8000";
+                let queue = context.worker_job_queue.get().unwrap();
+                assert!(queue.get_status(url).is_none());
+                let registry = &context.worker_registry;
+                assert!(registry.get_id_by_url_or_reservation(url).is_none());
             }
         }
     }
@@ -3995,6 +4072,93 @@ mod tests {
                 && error.contains("service_discovery_config"),
             "{error}"
         );
+    }
+
+    /// A gateway that decides in its own process keeps the health loop with
+    /// the checks off. The loop then probes no worker, and it carries each
+    /// move of a worker's liveness veto to the feed's rows, where a decision
+    /// reads it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_feed_takes_a_liveness_move_with_the_checks_off() {
+        use std::time::Instant;
+
+        use smg_policy_controller::{
+            store::{Ask, GatewayId, HealthPolicy, Maker, ViewBuffers, WorkerFacts},
+            view::{Role, WireModes},
+            worker_host::Expect,
+        };
+        use smg_worker::runtime::StallReason;
+
+        const URL: &str = "http://worker:8000";
+        const MODEL: &str = "model-a";
+
+        /// Whether `holds` comes true within five seconds.
+        async fn comes(holds: impl Fn() -> bool) -> bool {
+            for _ in 0..500 {
+                if holds() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            holds()
+        }
+
+        let mut router = RouterConfig {
+            policy_controller: true,
+            ..Default::default()
+        };
+        router.health_check.disable_health_check = true;
+        let context = Arc::new(
+            AppContext::from_config(router, 10, None, None)
+                .await
+                .unwrap(),
+        );
+        let feed = context.policy_feed.as_ref().expect("the store has a feed");
+        let _health = start_worker_health_checks(&context).expect("a feed keeps the loop");
+
+        let stated = WorkerFacts {
+            key: URL.to_owned(),
+            engine: URL.to_owned(),
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(64),
+            health: HealthPolicy {
+                probes: false,
+                ..HealthPolicy::default()
+            },
+            ..WorkerFacts::default()
+        };
+        feed.door
+            .found(&Maker::Control, Expect::Nothing, URL, &|_| stated.clone())
+            .expect("the worker registers");
+        let worker = context
+            .worker_registry
+            .get_by_url(URL)
+            .expect("the row's object stands");
+        // Whether the next decision reads the pool's worker as stalled.
+        let stalled = || {
+            let ask = Ask {
+                gateway: GatewayId::LOCAL,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+                signal_cells: false,
+            };
+            feed.store().deciding(|world| {
+                let mut view = ViewBuffers::default();
+                let built = world.build(MODEL, Role::Single, &ask, &mut view).is_some();
+                built && view.candidates.iter().any(|row| row.health.stalled)
+            })
+        };
+        assert!(!stalled());
+
+        assert!(worker.set_stall(Some(StallReason::Unreachable)));
+        assert!(comes(&stalled).await, "the row takes the doubt");
+        assert!(worker.set_stall(None));
+        assert!(comes(|| !stalled()).await, "and its clearing");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

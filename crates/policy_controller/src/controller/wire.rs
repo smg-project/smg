@@ -58,13 +58,14 @@ use crate::{
     decision::{Decision, ShedReason, Target},
     demands::Demands,
     door::Asked,
-    lease::{Lease, Side},
+    lease::{Lease, LeaseId, ReleaseReason, Side},
     operator::{Document, NeedsRow, Status},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
+    store::{DecodeIssue, Hand, MemoryStore, Said},
     view::{
         fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
-        ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
+        ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
     },
 };
 
@@ -103,6 +104,26 @@ const TEXT: u8 = 1;
 /// (`DecideRequest.again`).
 const AGAIN: u8 = 1 << 1;
 
+/// The bit for a pair's frame whose decode is sent after its prefill has
+/// run (`DecideRequest.decode_later`).
+const DECODE_LATER: u8 = 1 << 2;
+
+/// The bit for a frame that asks the decode side of a lease
+/// (`DecideRequest.decode_of`).
+const DECODE_OF: u8 = 1 << 3;
+
+/// The lease a frame asks the decode side of (`DecideRequest.decode_of`),
+/// `0` where it asks none. An id of 0 is no lease's and out of the field's
+/// range. The check of a frame received reads the field here, and so does
+/// a sender whose callers share one stream, as both read [`ranges`].
+#[inline(always)]
+pub(crate) fn asked_decode(decode_of: Option<u64>) -> Result<u64, Refusal> {
+    match decode_of {
+        Some(0) => Err(Refusal::OutOfRange("decode_of")),
+        asked => Ok(asked.unwrap_or(0)),
+    }
+}
+
 /// What the ranges of a frame's facts read as: its phase, the kind of its
 /// block hashes and its session key's fingerprint (`0` for a key carried
 /// plain, and for none). Refuses by the first field the record cannot
@@ -121,6 +142,13 @@ pub(crate) fn ranges(facts: &proto::RequestFacts) -> Result<(Phase, HashKind, u6
     };
     let hash_kind = match proto::HashKind::try_from(facts.hash_kind) {
         Ok(proto::HashKind::Unspecified | proto::HashKind::Token) => HashKind::Token,
+        // A text request states its window: the window is its host's
+        // choice, and the view's block size is in tokens. One that carries
+        // hashes and states none cannot be priced. One with no hash prices
+        // nothing and is taken.
+        Ok(proto::HashKind::Text) if facts.block_size == 0 && !facts.block_hashes.is_empty() => {
+            return Err(Refusal::OutOfRange("facts.block_size"));
+        }
         Ok(proto::HashKind::Text) => HashKind::Text,
         Err(_) => return Err(Refusal::OutOfRange("facts.hash_kind")),
     };
@@ -168,9 +196,12 @@ pub(crate) struct Checked {
     /// none.
     session_key: u64,
     /// What the frame says that few frames say, a bit a word ([`TEXT`],
-    /// [`AGAIN`]): `0` for a frame that says neither, so a decider reads
-    /// both by one test.
+    /// [`AGAIN`], [`DECODE_LATER`], [`DECODE_OF`]): `0` for a frame that
+    /// says none, so a decider reads them by one test.
     rare: u8,
+    /// The lease whose decode side the frame asks; `0` for a frame that
+    /// asks none.
+    decode_of: u64,
 }
 
 impl Checked {
@@ -187,7 +218,16 @@ impl Checked {
         // The prompt as text is said and not kept: no step reads it yet.
         let text = !mem::take(&mut facts.prompt_text).is_empty();
         let (phase, hash_kind, session_key) = ranges(&facts)?;
-        let rare = (u8::from(text) * TEXT) | (u8::from(request.again) * AGAIN);
+        let decode_of = asked_decode(request.decode_of)?;
+        // A frame that asks a lease's decode side is read at the decode
+        // phase, whatever its facts say, and is no pair's first request:
+        // its `decode_later` is not read.
+        let phase = if decode_of == 0 { phase } else { Phase::Decode };
+        let later = request.decode_later && decode_of == 0;
+        let rare = (u8::from(text) * TEXT)
+            | (u8::from(request.again) * AGAIN)
+            | (u8::from(later) * DECODE_LATER)
+            | (u8::from(decode_of != 0) * DECODE_OF);
         Ok(Self {
             id: request.request_id,
             facts,
@@ -196,6 +236,7 @@ impl Checked {
             hash_kind,
             session_key,
             rare,
+            decode_of,
         })
     }
 
@@ -220,8 +261,9 @@ impl Checked {
     }
 
     /// Whether the frame says a word few frames say: it carried its prompt
-    /// as text, or its gateway asks its request again. A decider asks this
-    /// of every request, once, and which word it is of those that say one.
+    /// as text, its gateway asks its request again, its pair's decode comes
+    /// later, or it asks a lease's decode side. A decider asks this of
+    /// every request, once, and which word it is of those that say one.
     pub(crate) const fn says_more(&self) -> bool {
         self.rare != 0
     }
@@ -236,6 +278,19 @@ impl Checked {
     /// holds no answer to it (`DecideRequest.again`).
     pub(crate) const fn again(&self) -> bool {
         self.rare & AGAIN != 0
+    }
+
+    /// Whether the pair's decode is sent after its prefill has run
+    /// (`DecideRequest.decode_later`): its first decision files the decode
+    /// side chosen.
+    pub(crate) const fn decode_later(&self) -> bool {
+        self.rare & DECODE_LATER != 0
+    }
+
+    /// The lease whose decode side the frame asks
+    /// (`DecideRequest.decode_of`); `None` for a frame that asks none.
+    pub(crate) fn decode_of(&self) -> Option<LeaseId> {
+        (self.rare & DECODE_OF != 0).then_some(LeaseId(self.decode_of))
     }
 
     /// How many block hashes the frame carries: a read hands the engine
@@ -286,10 +341,13 @@ impl Checked {
     /// Hands `decide` the request as the engine reads it, with what the
     /// decision's `view` adds to the frame, and returns its answer. The
     /// request borrows the frame and `lists`, for the time of `decide`.
-    pub(crate) fn read<R>(
+    /// `name` is asked first, over that request with no row named: what it
+    /// answers stands as the request's named rows for `decide`.
+    pub(crate) fn read<'n, R>(
         &self,
         lists: &mut Lists,
         view: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let (facts, constraints) = (&self.facts, &self.constraints);
@@ -317,8 +375,10 @@ impl Checked {
                 bytes: media.bytes,
             })
             .unwrap_or_default();
-        let answer = decide(
-            &RequestFacts {
+        // The request and the constraints in the engine's form, built once:
+        // the naming's answer is written into the request below.
+        let (mut request, cx) = (
+            RequestFacts {
                 model: &facts.model,
                 namespace_seed: facts.namespace_seed,
                 tenant: identity(facts.tenant.as_ref()),
@@ -347,8 +407,9 @@ impl Checked {
                 block_size: facts.block_size,
                 now_micros: view.now_micros,
                 affinity: view.affinity,
-                // In-process only: the rows the deciding host named.
-                named: view.named,
+                // In-process only: the rows the deciding host names,
+                // written below by the naming's answer.
+                named: None,
                 // The wire carries the name: each read of the request's
                 // session fingerprints it.
                 model_fingerprint: ModelFingerprint::NONE,
@@ -362,13 +423,11 @@ impl Checked {
                 lent_session_in_flight: None,
                 session_counted: false,
                 // The frame carries no signal cells: they stand beside
-                // the rows of the host that decides.
-                signal_cells: None,
-                // The wire carries no client key yet: a request with no
-                // session key is placed as one with no key.
-                client_key: 0,
+                // the rows of the host that decides, whose view hands them.
+                signal_cells: view.signal_cells,
+                client_key: facts.client_key,
             },
-            &Constraints {
+            Constraints {
                 excluded: &lists.excluded,
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
@@ -382,6 +441,8 @@ impl Checked {
                 pins: view.pins,
             },
         );
+        request.named = name(&request, &cx);
+        let answer = decide(&request, &cx);
         lists.headers = emptied(headers);
         answer
     }
@@ -417,7 +478,11 @@ impl Asked for Checked {
     }
 
     fn decode_later(&self) -> bool {
-        false
+        Self::decode_later(self)
+    }
+
+    fn asks_decode(&self) -> bool {
+        self.rare & DECODE_OF != 0
     }
 
     fn hashes(&self) -> usize {
@@ -440,13 +505,14 @@ impl Asked for Checked {
         Self::seed(self)
     }
 
-    fn read<R>(
+    fn read<'n, R>(
         &self,
         lists: &mut Lists,
         viewed: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
-        Self::read(self, lists, viewed, decide)
+        Self::read(self, lists, viewed, name, decide)
     }
 }
 
@@ -490,6 +556,22 @@ fn narrowed(count: u32) -> u16 {
     u16::try_from(count).unwrap_or(u16::MAX)
 }
 
+/// What a pick's lease is handed over with, beside the lease. One word of
+/// the three: the queue's entry stays the size it was.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Beside {
+    /// A single's lease: nothing.
+    Alone,
+    /// The session key of the decode side's lease of a pair's pick. That
+    /// lease is the prefill side's under this key: one id, one record, and
+    /// at the answer one index and one count of tokens.
+    Decode(Session),
+    /// The issue of a decode call's pick. Where the answer does not leave,
+    /// its sender takes this one issue back: the prefill that runs under
+    /// the same lease keeps its booking ([`Leased::given_up`]).
+    Issue(DecodeIssue),
+}
+
 /// A pick's lease as its decider hands it over: the lease the store filed,
 /// what its decision left of the lease's dispatch span, and when that span
 /// ends.
@@ -497,11 +579,8 @@ fn narrowed(count: u32) -> u16 {
 pub(crate) struct Leased {
     /// The lease as the store filed it.
     pub(crate) lease: Lease,
-    /// The session key of the decode side's lease of a pair's pick; none
-    /// for a single's. That lease is the prefill side's under this key:
-    /// one id, one record, and at the answer one index and one count of
-    /// tokens. The key alone keeps the queue's entry small.
-    pub(crate) decode: Option<Session>,
+    /// What the lease is handed over with.
+    pub(crate) beside: Beside,
     /// What is left of its dispatch span: at the decision's last read as
     /// its decider hands it over, at the send as its stream sends it.
     pub(crate) left: Duration,
@@ -520,6 +599,25 @@ impl Leased {
         Self {
             left: self.due.saturating_duration_since(now),
             ..self
+        }
+    }
+
+    /// Gives the lease up for an answer that does not leave, under
+    /// `reason`, by a word handed to its file through `hand`, as a
+    /// `Released` frame's word is: whoever may act at the file next applies
+    /// it and tells its engine, so no stage hears it beside its decider at
+    /// work. A decode call's answer takes its one issue back, and the side
+    /// stands chosen for the first pick's dispatch
+    /// ([`MemoryStore::hand_taken_back`]).
+    /// Any other lease is released whole.
+    pub(crate) fn given_up(&self, store: &MemoryStore, hand: &Hand, reason: ReleaseReason) {
+        match self.beside {
+            Beside::Issue(issue) => {
+                store.hand_taken_back(hand, self.lease.id, issue, reason);
+            }
+            Beside::Alone | Beside::Decode(_) => {
+                store.hand(hand, self.lease.id, Said::Released(None, reason));
+            }
         }
     }
 
@@ -578,15 +676,19 @@ pub(crate) fn decided(
 ) -> proto::DecideAnswer {
     let mut decision = self::decision(decision);
     if let Some(leased) = lease {
-        let mut leases = Vec::with_capacity(1 + usize::from(leased.decode.is_some()));
-        leases.push(self::lease(&leased.lease, term, leased.left));
-        if let Some(session) = leased.decode {
+        let decode = match leased.beside {
+            Beside::Decode(session) => Some(session),
+            Beside::Alone | Beside::Issue(_) => None,
+        };
+        let mut leases = Vec::with_capacity(1 + usize::from(decode.is_some()));
+        leases.push(self::lease(&leased.lease, leased.left));
+        if let Some(session) = decode {
             let decode = Lease {
                 side: Side::Decode,
                 session,
                 ..leased.lease
             };
-            leases.push(self::lease(&decode, term, leased.left));
+            leases.push(self::lease(&decode, leased.left));
         }
         decision.leases = leases;
     }
@@ -603,12 +705,18 @@ pub(super) fn millis(duration: Duration) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
+/// Where a controller's lease id holds the term that minted it: the bits
+/// from this one up, over the term's counter.
+const MINTED_UNDER: u32 = 32;
+
 /// A lease this controller minted, as the wire carries it under the term
 /// that minted it, with `left`: what is left, where it is sent, of the time
-/// its gateway has to name the dispatch. The decide call issues one kind of
+/// its gateway has to name the dispatch. The term is the one in the id's
+/// own bits ([`MINTED_UNDER`]): a decode call answered under a later term
+/// names a lease an earlier one minted. The decide call issues one kind of
 /// lease, a credit: on a single request's target, or on each side of a
 /// pair under one id.
-fn lease(lease: &Lease, term: u64, left: Duration) -> proto::Lease {
+fn lease(lease: &Lease, left: Duration) -> proto::Lease {
     let side = match lease.side {
         Side::Single => proto::Side::Single,
         Side::Prefill => proto::Side::Prefill,
@@ -623,7 +731,7 @@ fn lease(lease: &Lease, term: u64, left: Duration) -> proto::Lease {
         generation: lease.generation,
         session_key: lease.session.get(),
         tokens: lease.tokens,
-        term,
+        term: lease.id.0 >> MINTED_UNDER,
         dispatch_ttl_ms: millis(left),
         origin: proto::LeaseOrigin::Controller.into(),
     }
@@ -833,6 +941,7 @@ mod tests {
             Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
             Trace,
         },
+        door::unnamed,
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         spec::MAX_BLOCK_HASHES,
         view::{
@@ -1174,6 +1283,7 @@ mod tests {
                 seed: 24,
                 prompt_text: Vec::new(),
                 block_size: 25,
+                client_key: 29,
             }),
             constraints: Some(proto::Constraints {
                 excluded: vec![26, 27, 28],
@@ -1182,6 +1292,7 @@ mod tests {
                 subset_hint: Some(0),
             }),
             again: false,
+            ..Default::default()
         }
     }
 
@@ -1210,10 +1321,10 @@ mod tests {
             held: &[],
             in_flight: None,
             max_block_hashes: 256,
-            named: None,
             pins: None,
+            signal_cells: None,
         };
-        checked.read(lists, view, check)
+        checked.read(lists, view, unnamed, check)
     }
 
     #[test]
@@ -1264,6 +1375,7 @@ mod tests {
                 }
             );
             assert_eq!((facts.seed, facts.block_size), (24, 25));
+            assert_eq!(facts.client_key, 29);
             // The view's three facts are the decision's own, not the
             // frame's: the frame's budget of 2,000 is not what the engine
             // is told is left.
@@ -1352,6 +1464,44 @@ mod tests {
             refused(with(|facts| facts.phase = 5)).to_string(),
             "facts.phase is out of its range in this protocol version"
         );
+    }
+
+    /// A text request states its window, in bytes. One that carries
+    /// hashes and states none is refused by its field: the view's block
+    /// size is in tokens, and read as a window it would count the
+    /// request's blocks at another size than its host hashed them. A text
+    /// request with no hash prices nothing and is taken, and a token
+    /// request that states none reads the view's.
+    #[test]
+    fn a_text_request_that_states_no_window_is_refused_by_its_field() {
+        let refused = |frame| Checked::new(frame).expect_err("refused");
+        assert_eq!(
+            refused(with(|facts| facts.block_size = 0)),
+            Refusal::OutOfRange("facts.block_size")
+        );
+        let bare = with(|facts| {
+            facts.block_size = 0;
+            facts.block_hashes.clear();
+        });
+        let read = reading(bare, &mut Lists::default(), |facts, _| {
+            (facts.hash_kind, facts.block_size, facts.block_hashes.len())
+        });
+        assert_eq!(read, (HashKind::Text, 0, 0), "no hash to price");
+        for kind in [proto::HashKind::Token, proto::HashKind::Unspecified] {
+            let frame = with(|facts| {
+                facts.hash_kind = kind.into();
+                facts.block_size = 0;
+            });
+            let read = reading(frame, &mut Lists::default(), |facts, _| {
+                (facts.hash_kind, facts.block_size)
+            });
+            assert_eq!(read, (HashKind::Token, 0), "{kind:?}");
+        }
+        let stated = with(|facts| facts.block_size = 64);
+        let read = reading(stated, &mut Lists::default(), |facts, _| {
+            (facts.hash_kind, facts.block_size)
+        });
+        assert_eq!(read, (HashKind::Text, 64));
     }
 
     #[test]
@@ -1542,6 +1692,42 @@ mod tests {
         assert_eq!(said(texted(b"hello", true)), (true, true, true));
     }
 
+    /// A pair's two words of its decode ride the same byte. A frame keeps
+    /// its `decode_later` bit, and its `decode_of` id as it came. A frame
+    /// that asks a lease's decode side is read at the decode phase, whatever
+    /// its facts say, and is no pair's first request: its bit is not read.
+    #[test]
+    fn a_frame_keeps_its_decode_later_bit_and_its_decode_of_id() {
+        use crate::{door::Asked, view::Phase};
+        let said = |later: bool, of: Option<u64>| {
+            let mut frame = with(|facts| facts.phase = proto::Phase::Prefill.into());
+            (frame.decode_later, frame.decode_of) = (later, of);
+            let frame = Checked::new(frame).expect("no word is a field out of its range");
+            assert_eq!(Asked::decode_later(&frame), frame.decode_later());
+            let of = frame.decode_of().map(|lease| lease.0);
+            assert_eq!(frame.asks_decode(), of.is_some());
+            (frame.says_more(), frame.decode_later(), of, frame.phase())
+        };
+        let lease = 1 << 32 | 7;
+        assert_eq!(said(false, None), (false, false, None, Phase::Prefill));
+        assert_eq!(said(true, None), (true, true, None, Phase::Prefill));
+        let call = (true, false, Some(lease), Phase::Decode);
+        assert_eq!(said(false, Some(lease)), call);
+        assert_eq!(said(true, Some(lease)), call);
+        let last = Some(u64::MAX);
+        assert_eq!(said(false, last), (true, false, last, Phase::Decode));
+    }
+
+    /// No lease has the id 0: a frame that names it is refused by its
+    /// field, as any field out of its range is.
+    #[test]
+    fn a_decode_of_zero_is_refused_by_its_field() {
+        let mut frame = full();
+        frame.decode_of = Some(0);
+        let refused = Checked::new(frame).err();
+        assert_eq!(refused, Some(Refusal::OutOfRange("decode_of")));
+    }
+
     #[test]
     fn the_hashes_past_what_the_generation_reads_are_cut_at_the_read_and_the_first_ones_kept() {
         let frame = with(|facts| facts.block_hashes = (1..=6).collect());
@@ -1556,10 +1742,10 @@ mod tests {
                 held: &[],
                 in_flight: None,
                 max_block_hashes,
-                named: None,
                 pins: None,
+                signal_cells: None,
             };
-            checked.read(&mut Lists::default(), view, |facts, _| {
+            checked.read(&mut Lists::default(), view, unnamed, |facts, _| {
                 facts.block_hashes.to_vec()
             })
         };
@@ -1581,6 +1767,7 @@ mod tests {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         };
         let at = frame(MAX_BLOCK_HASHES);
         assert_eq!(prost::Message::encoded_len(&at), MAX_FRAME - 5);

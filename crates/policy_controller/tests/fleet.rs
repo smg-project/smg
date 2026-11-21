@@ -140,8 +140,8 @@ use smg_policy_controller::{
     controller::{State, PROTOCOL_VERSION},
     proto::{
         busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
-        released, worker_event, Completed, DecideRequest, Decision, Hello, Identity, Lease,
-        OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
+        released, worker_event, Completed, DecideRequest, Decision, Dispatched, Hello, Identity,
+        Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
     },
     spec::{BindingSpec, Match},
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
@@ -249,6 +249,7 @@ fn ask(id: &[u8]) -> DecideRequest {
         }),
         constraints: None,
         again: false,
+        ..Default::default()
     }
 }
 
@@ -2611,8 +2612,7 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
                 what: Some(released::What::LeaseId(lease_id)),
                 reason: released::Reason::ClientGone.into(),
                 side,
-            }))
-            .expect("the link takes the report");
+            }));
         }
         leases_before_expiry(&harness, &link, GATEWAY, 0, before)
             .await
@@ -2622,6 +2622,104 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A request can outlast the session its decision came over. The gateway
+/// dials its link again, and what the request reports then reaches the
+/// controller on the link's next session: a dispatched lease, which no
+/// deadline ends, ends at that report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
+    const GATEWAY: &str = "fleet-redial";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let endpoint =
+            Endpoint::from_shared(format!("http://{}", harness.gateway())).expect("a URI");
+        // A request in flight holds a clone of the link.
+        let held = link.clone();
+        let sent = |lease: Lease| {
+            gateway_frame::Frame::Dispatched(Dispatched {
+                lease_id: lease.id,
+                target_index: 0,
+                side: lease.side,
+                since_decision_micros: 0,
+            })
+        };
+        let ended = |lease: Lease| {
+            gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(lease.id)),
+                reason: released::Reason::ClientGone.into(),
+                side: lease.side,
+            })
+        };
+
+        // The controller ends the session under a dispatched request: a
+        // second hello on one stream is refused.
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        held.report(sent(first));
+        within("the store reads the first lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, first.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        tokio::time::timeout(ROOM, link.closed())
+            .await
+            .expect("the session ends");
+        assert!(!held.stands());
+
+        // The request ends with no session standing. Its report waits, and
+        // the link's next session says it.
+        held.report(ended(first));
+        assert_eq!(harness.leases(GATEWAY), 1, "no session said the end");
+        Box::pin(link.redial(endpoint.clone(), GATEWAY))
+            .await
+            .expect("the link's next session");
+        within("the report that waited ends the lease", ROOM, || {
+            harness.leases(GATEWAY) == 0
+        })
+        .await
+        .expect("the next session said the report");
+
+        // A redial over a session that stands: the next session takes its
+        // place, and the gateway's lease with it.
+        let second = linked_pick(&held, ask(b"second"))
+            .await
+            .expect("a pick on the next session");
+        held.report(sent(second));
+        within("the store reads the second lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, second.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        Box::pin(link.redial(endpoint, GATEWAY))
+            .await
+            .expect("the link's third session");
+        assert_eq!(
+            harness.leases(GATEWAY),
+            1,
+            "the lease stands through the redial"
+        );
+        held.report(ended(second));
+        within(
+            "the report on the third session ends the lease",
+            ROOM,
+            || harness.leases(GATEWAY) == 0,
+        )
+        .await
+        .expect("the third session said the report");
+        assert!(held.stands());
+        assert_eq!(held.reports_dropped(), 0);
+        drop((link, held));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }
@@ -3036,8 +3134,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
             .open_on(&link)
             .await
             .expect("the link resumes the watch");
-        link.report(gateway_frame::Frame::Hello(Hello::default()))
-            .expect("the session takes the frame");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
         tokio::time::timeout(ROOM, link.closed())
             .await
             .expect("the second hello ends the link");

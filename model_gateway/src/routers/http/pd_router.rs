@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -35,9 +35,10 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
+use smg_policy_controller::view::{Phase, WireModes, WorkerId};
 use smg_worker::{
     identity::{
-        basic::{RuntimeType, Worker, WorkerLoadGuard},
+        basic::{RuntimeType, Worker, WorkerLoadGuard, WorkerType},
         endpoint::Endpoint,
     },
     metrics::writers::Metrics as WorkerMetrics,
@@ -60,12 +61,14 @@ use crate::{
         otel_trace::with_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
+    policy_controller::host::{self, Ask, Hashes, Host, Prompt, Sent, Unplaced},
     rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
             attempt_ledger::{
-                is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+                failed_side_type, is_definitive_failure, mark_failed_side, mark_upstream_answer,
+                AttemptLedger,
             },
             header_utils,
             kv_transfer::{
@@ -141,6 +144,64 @@ fn own_failure(response: &Response) -> Option<PdSide> {
 struct PdLoadGuards {
     prefill: PrefillLoadGuard,
     decode: WorkerLoadGuard,
+}
+
+/// A pair's ask as its attempt states it under the policy controller: the
+/// facts the request's context does not hold. The attempt's first ask and
+/// the second ask of its decode are made from this one value, so the two
+/// state the same request.
+struct PairAsked<'a> {
+    id: [u8; 8],
+    model: Cow<'a, str>,
+    /// The prompt's hashes, made once an attempt for the model the ask
+    /// names. The ask states no count beside them: the host takes the
+    /// request's size from them, by one rule for token ids and for text.
+    hashes: Hashes,
+    /// The attempt's number. The tried rows do not count the attempts: a
+    /// failed pair names up to two of them.
+    attempt: u8,
+    tried: Vec<WorkerId>,
+}
+
+impl PairAsked<'_> {
+    /// The ask of the request `context` describes. It states the route's
+    /// wire, so the controller places among the rows that serve HTTP. Its
+    /// route can ask the decode again: the sequential dispatch does, behind
+    /// its prefill's answer.
+    fn ask<'s>(&'s self, context: &'s PDRequestContext<'_>) -> Ask<'s> {
+        Ask {
+            streaming: context.is_stream,
+            headers: context.headers.as_ref(),
+            rid: context.rid,
+            phase: Phase::Prefill,
+            decode_again: true,
+            wires: WireModes::HTTP,
+            tried: &self.tried,
+            attempt: Some(self.attempt),
+            hashes: Some(&self.hashes),
+            ..Ask::of(&self.id, &self.model)
+        }
+    }
+}
+
+/// What the sequential dispatch asks a pair's decode again with: the host,
+/// the attempt's ask, and the key the decode's load guard is taken under.
+struct DecodeAgain<'a> {
+    host: &'a Host,
+    asked: &'a PairAsked<'a>,
+    sticky_key: Option<&'a str>,
+}
+
+/// The pair route's own rule at a commit of the policy controller's pick.
+/// A row can state more wires than the one its worker dials, and the
+/// controller does not read the ledger. A target either part refuses is
+/// passed over like one the gateway cannot send to.
+fn on_pair_route(ledger: &AttemptLedger) -> impl Fn(&dyn Worker) -> bool + Send + Sync + '_ {
+    move |worker| {
+        let pooled =
+            RoutingPool::HttpPrefill.matches(worker) || RoutingPool::HttpDecode.matches(worker);
+        pooled && ledger.admits(worker)
+    }
 }
 
 /// What every dispatch body sets up before its first side goes out: the two
@@ -224,6 +285,13 @@ pub struct PDRouter {
     /// tenant reserves through it before its first dispatch
     /// (`tenant_rate_limit::reserve`).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// The policy controller's host, when it places this router's pairs.
+    host: Option<Arc<Host>>,
+    /// Whether the pair's policy settings keep a request to the worker it
+    /// names ([`placement::pair_keeps_target`]). No role policy is built
+    /// under the policy controller, so the router keeps what its settings
+    /// say.
+    keeps_target: bool,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -254,6 +322,9 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
+    /// The request's own id, the `rid` of its body, where the policy
+    /// controller's host places the request: a source of its routing key.
+    rid: Option<&'a str>,
 }
 
 /// What the PD dispatch needs to know about a request beyond what every
@@ -526,6 +597,11 @@ impl PDRouter {
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
+            host: ctx.policy_host.clone(),
+            keeps_target: placement::pair_keeps_target(
+                &ctx.router_config.mode,
+                &ctx.router_config.policy,
+            ),
         })
     }
 
@@ -689,7 +765,9 @@ impl PDRouter {
         body: R,
         model_id: &str,
     ) -> Response {
-        let (text, tokens) = if self.policies_need_request_text() {
+        // The host hashes the prompt for the document in force, whatever
+        // the classic policies read.
+        let (text, tokens) = if self.host.is_some() || self.policies_need_request_text() {
             body.routing_inputs()
         } else {
             (None, None)
@@ -703,6 +781,12 @@ impl PDRouter {
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
+        // The host's ask reads the body's own id after the dispatch took the
+        // body. The classic path copies nothing.
+        let rid = self
+            .host
+            .as_ref()
+            .and_then(|_| body.rid().map(str::to_owned));
         let context = PDRequestContext {
             route: R::ROUTE,
             batch_size: body.batch_size(),
@@ -710,6 +794,7 @@ impl PDRouter {
             return_logprob: body.returns_logprob(),
             model_id,
             headers: headers.cloned(),
+            rid: rid.as_deref(),
         };
         self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
             .await
@@ -781,7 +866,10 @@ impl PDRouter {
 
         // What the request's attempts tell the worker pool: a retry selects
         // around a worker whose answer was definitive (`attempt_ledger`).
-        let ledger = AttemptLedger::default();
+        let ledger = AttemptLedger::of(self.host.is_some());
+        // The rows of the pairs the request's failed attempts were sent to,
+        // for the policy controller's host. The classic path leaves it empty.
+        let tried_rows = parking_lot::Mutex::new(Vec::new());
 
         let response = if let Some(denied) = denial {
             denied
@@ -789,7 +877,15 @@ impl PDRouter {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
-                .execute_dual_dispatch_attempt(0, headers, &lease, context, &ledger, false)
+                .execute_dual_dispatch_attempt(
+                    0,
+                    headers,
+                    &lease,
+                    context,
+                    &ledger,
+                    &tried_rows,
+                    false,
+                )
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
@@ -801,7 +897,7 @@ impl PDRouter {
         } else {
             // The lease keeps the request alive for replay until the retry
             // window closes (first non-retryable response).
-            let (lease, ledger) = (&lease, &ledger);
+            let (lease, ledger, tried_rows) = (&lease, &ledger, &tried_rows);
             RetryExecutor::execute_response_with_retry(
                 retry_config,
                 {
@@ -809,7 +905,7 @@ impl PDRouter {
                         let context = context.clone();
                         async move {
                             self.execute_dual_dispatch_attempt(
-                                attempt, headers, lease, context, ledger, false,
+                                attempt, headers, lease, context, ledger, tried_rows, false,
                             )
                             .await
                         }
@@ -882,6 +978,10 @@ impl PDRouter {
     /// n=1 PD dispatch per choice. Serial execution bounds active handoffs to
     /// one and dropping this future cancels the current dispatch, not siblings
     /// that have already returned or have not yet been submitted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent choices keep the original request and the hosted retry rows"
+    )]
     async fn execute_moriio_choices(
         &self,
         attempt: u32,
@@ -890,6 +990,7 @@ impl PDRouter {
         routing: RoutingDerivatives,
         mut context: PDRequestContext<'_>,
         ledger: &AttemptLedger,
+        tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
     ) -> Response {
         // Chat's PdRoute uses batch_size for its sampling fanout n, not a
         // batch of prompts. Each independent chat child is one conversation.
@@ -948,7 +1049,7 @@ impl PDRouter {
             };
             child_headers.insert("x-request-id", child_header);
             let mut child = body.clone();
-            child["request_id"] = Value::String(child_id);
+            child["request_id"] = Value::String(child_id.clone());
             let child_lease = RequestLease::new(
                 child,
                 RoutingDerivatives {
@@ -961,6 +1062,7 @@ impl PDRouter {
             );
             let mut child_context = context.clone();
             child_context.headers = Some(child_headers.clone());
+            child_context.rid = Some(&child_id);
             // Keep the request's exclusions from attempts before this fanout.
             // A successful child does not close a worker's retry window; a
             // failed child ends the fanout before any sibling is selected.
@@ -971,6 +1073,7 @@ impl PDRouter {
                     &child_lease,
                     child_context,
                     ledger,
+                    tried_rows,
                     true,
                 )
                 .await;
@@ -1210,6 +1313,10 @@ impl PDRouter {
     /// A retry selects around the workers the request's `ledger` closed the
     /// retry window on, and the attempt's answer is settled on that ledger
     /// ([`Self::settle_attempt`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the attempt keeps both hosted retry rows and independent MoRI-IO child identity"
+    )]
     async fn execute_dual_dispatch_attempt<T: Serialize>(
         &self,
         attempt: u32,
@@ -1217,15 +1324,23 @@ impl PDRouter {
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
         ledger: &AttemptLedger,
+        tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
         moriio_child: bool,
     ) -> Response {
         let attempt_started = tokio::time::Instant::now();
-        // Admission may queue the request, so the selection inputs are copied
-        // out of the lease's synchronous view first.
+        // Admission may queue the request, so the classic selection's inputs
+        // are copied out of the lease's synchronous view first. The hosted
+        // arm hashes its prompt under the view and copies none of it.
+        let hosted = self.host.is_some();
         let (text, tokens, rid_key, cache_namespace) = lease.with_view(|view| {
+            let (text, tokens) = if hosted {
+                (None, None)
+            } else {
+                (view.text.map(str::to_string), view.tokens.map(Vec::from))
+            };
             (
-                view.text.map(str::to_string),
-                view.tokens.map(Vec::from),
+                text,
+                tokens,
                 view.rid_key.map(str::to_string),
                 view.cache_namespace,
             )
@@ -1241,53 +1356,103 @@ impl PDRouter {
             if attempt == 0 { None } else { Some(&admits) };
         // The dispatch takes the context; the settle reads the model after it.
         let model_id = context.model_id;
-        let selected = self
-            .select_pd_pair_with_admission(
-                model_id,
-                PlacementInputs {
-                    text: text.as_deref(),
-                    tokens: tokens.as_deref(),
-                    headers: context.headers.as_ref(),
-                    rid_key: rid_key.as_deref(),
-                    cache_namespace,
-                    candidate_filter,
-                    tried: &[],
-                },
-                sticky_key,
-            )
-            .await;
-        let ((prefill, decode), guards) = match selected {
-            Ok(admitted) => admitted,
-            Err(e) => {
-                return self
-                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
+        let (prefill, decode, guards, mut placed, asked) = match &self.host {
+            None => {
+                let selected = self
+                    .select_pd_pair_with_admission(
+                        model_id,
+                        PlacementInputs {
+                            text: text.as_deref(),
+                            tokens: tokens.as_deref(),
+                            headers: context.headers.as_ref(),
+                            rid_key: rid_key.as_deref(),
+                            cache_namespace,
+                            candidate_filter,
+                            tried: &[],
+                        },
+                        sticky_key,
+                    )
+                    .await;
+                let ((prefill, decode), guards) = match selected {
+                    Ok(admitted) => admitted,
+                    Err(e) => {
+                        return self.report_refusal(
+                            context.model_id,
+                            Self::handle_server_selection_error(*e),
+                        );
+                    }
+                };
+
+                debug!(
+                    "PD retry attempt {} using prefill={} decode={}",
+                    attempt,
+                    prefill.redacted_url(),
+                    decode.redacted_url()
+                );
+
+                if moriio_child && !is_moriio_worker(decode.as_ref()) {
+                    return error::service_unavailable(
+                        "moriio_choice_pair_changed",
+                        "an independent MoRI-IO choice requires a MoRI-IO pair",
+                    );
+                }
+
+                // Dispatch-time re-check of both sides, the same one the regular HTTP
+                // and gRPC paths take just before their load guards.
+                let shedding = self.worker_registry.overload_shed_enabled();
+                if let Some(shed) = overload::shed_if_worker_overloaded(
+                    prefill.as_ref(),
+                    context.model_id,
+                    shedding,
+                )
+                .or_else(|| {
+                    overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id, shedding)
+                }) {
+                    return shed;
+                }
+                (prefill, decode, guards, None, None)
+            }
+            // The host places the pair. The controller's own overload verdict,
+            // from its document's thresholds, stands in for the gateway's
+            // dispatch-time re-check, as on the regular router's hosted path.
+            Some(host) => {
+                // The prompt the classic selection routes by, hashed under
+                // the lease's view as the regular route hashes it: the
+                // request's token ids where it has them, else its text.
+                let hashed = |model: &str| {
+                    lease.with_view(|view| {
+                        let prompt = Prompt {
+                            text: view.text,
+                            ..Prompt::of(view.tokens, view.cache_namespace)
+                        };
+                        host.hashes(model, &prompt)
+                    })
+                };
+                let placed = self
+                    .place_pair_attempt(
+                        host, &context, attempt, hashed, sticky_key, tried_rows, ledger,
+                    )
+                    .await;
+                match placed {
+                    Ok((placed, (prefill, decode), guards, asked)) => {
+                        debug!(
+                            "PD attempt {} placed by the policy controller: prefill={} decode={}",
+                            attempt,
+                            prefill.redacted_url(),
+                            decode.redacted_url()
+                        );
+                        (prefill, decode, guards, Some(placed), Some(asked))
+                    }
+                    Err(refusal) => return refusal,
+                }
             }
         };
 
-        debug!(
-            "PD retry attempt {} using prefill={} decode={}",
-            attempt,
-            prefill.redacted_url(),
-            decode.redacted_url()
-        );
-
-        if moriio_child && !is_moriio_worker(decode.as_ref()) {
+        if moriio_child && self.host.is_some() && !is_moriio_worker(decode.as_ref()) {
             return error::service_unavailable(
                 "moriio_choice_pair_changed",
                 "an independent MoRI-IO choice requires a MoRI-IO pair",
             );
-        }
-
-        // Dispatch-time re-check of both sides, the same one the regular HTTP
-        // and gRPC paths take just before their load guards.
-        let shedding = self.worker_registry.overload_shed_enabled();
-        if let Some(shed) =
-            overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id, shedding)
-                .or_else(|| {
-                    overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id, shedding)
-                })
-        {
-            return shed;
         }
 
         let raw_body_len = header_utils::content_length(headers);
@@ -1350,11 +1515,13 @@ impl PDRouter {
                         .chain(decode.metadata().zmq_request_timeout)
                         .min();
                     drop(guards);
+                    // The hosted provisional pair is unsent too: release its
+                    // reservation before a child asks for its own pair.
+                    drop(placed);
                     lease.release_dispatch();
-                    let fanout =
-                        Box::pin(self.execute_moriio_choices(
-                            attempt, headers, body, routing, context, ledger,
-                        ));
+                    let fanout = Box::pin(self.execute_moriio_choices(
+                        attempt, headers, body, routing, context, ledger, tried_rows,
+                    ));
                     let mut response = if let Some(timeout) = timeout {
                         match attempt_started.checked_add(timeout) {
                             Some(deadline) => match tokio::time::timeout_at(deadline, fanout).await
@@ -1516,11 +1683,24 @@ impl PDRouter {
                         Arc::clone(&decode),
                         guards,
                         ledger,
+                        placed.as_mut(),
                     )
                     .await;
-                return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+                let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+                return Self::end_placed(placed, tried_rows, response);
             }
 
+            // Under the policy controller the sequential dispatch can ask
+            // the decode again behind its prefill's answer.
+            let again = self
+                .host
+                .as_deref()
+                .zip(asked.as_ref())
+                .map(|(host, asked)| DecodeAgain {
+                    host,
+                    asked,
+                    sticky_key,
+                });
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
             // circuit breaker (the decode side was never contacted).
@@ -1536,11 +1716,24 @@ impl PDRouter {
                     Arc::clone(&decode),
                     guards,
                     ledger,
+                    placed.as_mut(),
+                    again,
                 )
                 .await;
-            return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+            // The decode the dispatch sent to is the placement's: the
+            // second ask's, where it moved.
+            let decode = placed
+                .as_ref()
+                .and_then(|placed| placed.decode())
+                .map_or(decode, Arc::clone);
+            let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+            return Self::end_placed(placed, tried_rows, response);
         }
 
+        let placed_ranks = placed.as_ref().map(|placed| {
+            let decode = placed.decode_rank().map(|rank| rank as isize);
+            (placed.rank() as isize, decode)
+        });
         let sides =
             lease.serialize_sides_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
                 let serialization_error =
@@ -1559,8 +1752,17 @@ impl PDRouter {
 
                 let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
                 let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
+                // Under the policy controller a side that carries a rank
+                // sends its target's, and no rank policy is asked.
+                if let Some((placed_prefill, placed_decode)) = placed_ranks {
+                    prefill_rank = prefill_rank.map(|_| placed_prefill);
+                    decode_rank = decode_rank.and(placed_decode);
+                }
 
-                let dp_rank_policy_opt = self.policy_registry.get_dp_rank_policy();
+                let dp_rank_policy_opt = match placed_ranks {
+                    Some(_) => None,
+                    None => self.policy_registry.get_dp_rank_policy(),
+                };
                 if let Some(dp_rank_policy) = dp_rank_policy_opt.as_ref() {
                     let estimated_cost: isize = match (view.tokens, view.text) {
                         (Some(tokens), _) => (tokens.len() as isize).max(1),
@@ -1639,6 +1841,7 @@ impl PDRouter {
                 Arc::clone(&prefill),
                 Arc::clone(&decode),
                 guards,
+                placed.as_mut(),
                 &mut prefill_outcome,
             )
             .await;
@@ -1650,7 +1853,159 @@ impl PDRouter {
             head_success_recorded(&response),
             own_failure(&response),
         );
-        self.settle_attempt(ledger, model_id, [&prefill, &decode], response)
+        let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+        Self::end_placed(placed, tried_rows, response)
+    }
+
+    /// The one primary model this router's prefill workers serve: the model
+    /// an unnamed request is placed under. The no-model id where no worker
+    /// has a model, and `None` where their primary models differ.
+    fn model_of_an_unnamed_request(&self) -> Option<String> {
+        let pool = self
+            .worker_registry
+            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpPrefill);
+        let mut models = pool
+            .iter()
+            .map(|worker| worker.model_id())
+            .filter(|&model| model != UNKNOWN_MODEL_ID);
+        let model = models.next().unwrap_or(UNKNOWN_MODEL_ID);
+        models.all(|other| other == model).then(|| model.to_owned())
+    }
+
+    /// The refusal of a request that names its worker, where a role's
+    /// classic policy holds it to that worker ([`placement::strict_target`]).
+    /// The host reads no explicit target yet and would place the pair on
+    /// other workers, so the shape is refused by name.
+    fn explicit_target_refusal(&self, headers: Option<&HeaderMap>) -> Option<Response> {
+        // A request that names no worker pays the header's probe alone.
+        header_utils::extract_target_worker(headers)?;
+        self.keeps_target
+            .then(|| crate::policy_controller::refused("an explicit target worker"))
+    }
+
+    /// The attempt's pair as the policy controller placed it, with the load
+    /// both sides hold, or the answer of a request it did not place. The
+    /// prefill's guard is the admission's and the decode's is taken here, as
+    /// on the classic path. The ask states the route's wire, so the
+    /// controller places among the rows that serve HTTP. It states the
+    /// attempt's number too: a failed pair names up to two tried rows, which
+    /// the controller reads softly, so the rows do not count the attempts.
+    /// It states the prompt's hashes, which `hashed` makes once for the model
+    /// the attempt resolved, and the request's size comes from them, as on
+    /// the regular route.
+    /// The commit asks the route's rule of both workers, made of the classic
+    /// selection's own: a worker of the HTTP pair pools, and one `ledger`
+    /// admits. A worker that answered the request definitively takes no
+    /// further attempt of it, at any of its ranks.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt's ask: its request, its number and hashes, and what the attempts before it closed"
+    )]
+    async fn place_pair_attempt<'a>(
+        &self,
+        host: &Host,
+        context: &PDRequestContext<'a>,
+        attempt: u32,
+        hashed: impl FnOnce(&str) -> Hashes,
+        sticky_key: Option<&str>,
+        tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
+        ledger: &AttemptLedger,
+    ) -> Result<(Sent, PdPair, PdLoadGuards, PairAsked<'a>), Response> {
+        let model = if context.model_id == UNKNOWN_MODEL_ID {
+            let Some(model) = self.model_of_an_unnamed_request() else {
+                let refusal = error::model_not_found(UNKNOWN_MODEL_ID);
+                return Err(self.report_refusal(context.model_id, refusal));
+            };
+            Cow::Owned(model)
+        } else {
+            Cow::Borrowed(context.model_id)
+        };
+        if let Some(refusal) = self.explicit_target_refusal(context.headers.as_ref()) {
+            return Err(refusal);
+        }
+        let id = host::mark();
+        let tried = tried_rows.lock().clone();
+        let hashes = hashed(&model);
+        let asked = PairAsked {
+            id,
+            model,
+            hashes,
+            attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
+            tried,
+        };
+        let placed = host
+            .place_pair_where(
+                &asked.ask(context),
+                on_pair_route(ledger),
+                self.prefill_admission.as_deref(),
+                sticky_key,
+            )
+            .await;
+        let (placed, prefill_guard) = match placed {
+            Ok(placed) => placed,
+            Err(unplaced) => {
+                return Err(self.report_refusal(context.model_id, unplaced.answer(&asked.model)));
+            }
+        };
+        let prefill = Arc::clone(placed.worker());
+        let Some(decode) = placed.decode().map(Arc::clone) else {
+            // A placement with no decode side is no pair. Its drop gives the
+            // lease up.
+            let refusal = Unplaced::NoTargetHolds.answer(&asked.model);
+            return Err(self.report_refusal(context.model_id, refusal));
+        };
+        let guards = PdLoadGuards {
+            prefill: prefill_guard,
+            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
+        };
+        Ok((Sent::from(placed), (prefill, decode), guards, asked))
+    }
+
+    /// The mark the relay of a streamed answer writes a cut's status on,
+    /// where the policy controller placed the attempt.
+    fn cut_mark_of(placed: Option<&mut Sent>, is_stream: bool) -> Option<Arc<AtomicU16>> {
+        placed.filter(|_| is_stream).map(Sent::cut_mark)
+    }
+
+    /// The end of an attempt the policy controller placed. The rows of a
+    /// pair whose answer a retry may replace join the request's tried rows:
+    /// the row of the side the request's ledger closed, else both.
+    /// A success ends the decode at the end of the body it writes. Its
+    /// prefill ends ahead of that: where it was read whole, or where its
+    /// drain marks its end. A failed attempt names no side here: the
+    /// placement's drop completes a side that was sent and not ended as
+    /// cancelled, and releases one that was not sent.
+    fn end_placed(
+        placed: Option<Sent>,
+        tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
+        response: Response,
+    ) -> Response {
+        let Some(placed) = placed else {
+            return response;
+        };
+        if is_retryable_response(&response) {
+            // The ledger gave the failure to one side, which is not always
+            // the side that answered. That row alone is tried: its partner
+            // stays as selectable as it was.
+            let named = failed_side_type(&response);
+            let mut tried = tried_rows.lock();
+            if named != Some(WorkerType::Decode) {
+                tried.push(placed.id());
+            }
+            if named != Some(WorkerType::Prefill) {
+                tried.extend(placed.decode_id());
+            }
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return response;
+        }
+        if head_success_recorded(&response) {
+            placed.held_to_the_end_of(response)
+        } else {
+            placed.ended_by(&response, Instant::now());
+            response
+        }
     }
 
     /// Record an attempt's outcome on both sides, or on one. A status one
@@ -1777,7 +2132,7 @@ impl PDRouter {
         let pairs_without = |gone: &Arc<dyn Worker>| {
             let free = |worker: &Arc<dyn Worker>| {
                 worker.base_url() != gone.base_url()
-                    && worker.is_available()
+                    && ledger.takes(worker.as_ref())
                     && ledger.admits(worker.as_ref())
             };
             pairs
@@ -1806,7 +2161,7 @@ impl PDRouter {
     /// forwarded.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the sequential decode handoff carries its request ledger"
+        reason = "the sequential decode handoff carries its request ledger and the placement's mark"
     )]
     async fn forward_decode_head(
         &self,
@@ -1817,6 +2172,7 @@ impl PDRouter {
         runtime: &'static str,
         dispatch_start: Instant,
         ledger: &AttemptLedger,
+        cut: Option<Arc<AtomicU16>>,
     ) -> Response {
         events::RequestReceivedEvent {}.emit();
         let status = decode_response.status();
@@ -1842,6 +2198,7 @@ impl PDRouter {
             decode_guard,
             None,
             Some(ledger),
+            cut,
         )
         .await
     }
@@ -1956,6 +2313,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
+        mut placed: Option<&mut Sent>,
         prefill_outcome: &mut PrefillOutcome,
     ) -> Response {
         let PdSetup {
@@ -2008,6 +2366,12 @@ impl PDRouter {
             Draining(tokio_util::task::AbortOnDropHandle<()>),
         }
         let dispatch_start = Instant::now();
+        // Both sides go out together.
+        if let Some(placed) = placed.as_deref_mut() {
+            placed.dispatched(dispatch_start);
+            placed.decode_dispatched(dispatch_start);
+        }
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
@@ -2018,6 +2382,10 @@ impl PDRouter {
                 // The drain owns both the permit and the outcome. It may finish
                 // before Decode sends headers; neither waits for the other.
                 *prefill_outcome = PrefillOutcome::Drained;
+                // The drain outlives this attempt, and it can outlive the
+                // answer's body. It tells its end to the placement through
+                // the end the two share.
+                let drain_end = placed.as_deref_mut().map(Sent::drain_end);
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
@@ -2038,6 +2406,9 @@ impl PDRouter {
                         }
                     }
                     prefill.record_outcome(drained.as_u16());
+                    if let Some(end) = drain_end {
+                        end.tell(drained);
+                    }
                     if drained.is_server_error() {
                         Metrics::record_worker_error(
                             metrics_labels::WORKER_PREFILL,
@@ -2062,7 +2433,11 @@ impl PDRouter {
                 .process_prefill_response(resp, prefill.url(), context.return_logprob)
                 .await;
             drop(prefill_guard);
-            let (_, body) = result.map_err(DispatchError::Prefill)?;
+            let (status, body) = result.map_err(DispatchError::Prefill)?;
+            // The prefill is done with ahead of the answer its decode writes.
+            if let Some(placed) = placed.as_deref_mut() {
+                placed.prefill_ended(status, Instant::now());
+            }
             Metrics::record_pd_prefill_duration(
                 metrics_labels::BACKEND_PD,
                 context.model_id,
@@ -2153,6 +2528,7 @@ impl PDRouter {
             decode_guard,
             prefill_body,
             None,
+            cut,
         )
         .await
     }
@@ -2316,15 +2692,18 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         ledger: &AttemptLedger,
+        mut placed: Option<&mut Sent>,
+        again: Option<DecodeAgain<'_>>,
     ) -> Response {
         let PdSetup {
             prefill_body,
             decode_body,
             prefill_guard,
-            decode_guard,
+            mut decode_guard,
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
+        let mut decode = decode;
         let headers = Some(&*headers_with_trace);
 
         let decode_side = match RawBody::parse(&decode_body) {
@@ -2338,12 +2717,26 @@ impl PDRouter {
         Metrics::record_pd_kv_connector_mode(mode.metrics_label());
 
         let dispatch_start = Instant::now();
+        // A decode that stands chosen is asked again behind its prefill's
+        // answer where the send can follow another decode: a relayed send
+        // of no MoRI-IO connector. A MoRI-IO prefill is told its decode at
+        // its own send, and a decode sent alone has no prefill to follow.
+        // Each of those keeps the first pick, so it is booked and named as
+        // a decode decided with its prefill is.
+        let waits = placed
+            .as_deref()
+            .is_some_and(|placed| placed.decode_waits());
+        let again = again.filter(|_| waits && relay && mode != KvConnectorMode::MoriIo);
         let harvested = if relay {
-            events::RequestPDSentEvent {
-                prefill_url: prefill.redacted_url(),
-                decode_url: decode.redacted_url(),
+            // The sent event names the decode the request goes to: one
+            // asked again is named behind that ask.
+            if again.is_none() {
+                events::RequestPDSentEvent {
+                    prefill_url: prefill.redacted_url(),
+                    decode_url: decode.redacted_url(),
+                }
+                .emit();
             }
-            .emit();
 
             let prefill_request = self.build_post_with_headers(
                 prefill.as_ref(),
@@ -2352,6 +2745,17 @@ impl PDRouter {
                 headers,
                 dp_rank,
             );
+            // The decode waits on its prefill for longer than an unsent
+            // side's lease may live, so both dispatches are said here. A
+            // decode that is asked again holds no lease to outlive: its
+            // dispatch is said at its own send, behind the prefill's answer.
+            if let Some(placed) = placed.as_deref_mut() {
+                let now = Instant::now();
+                placed.dispatched(now);
+                if again.is_none() {
+                    placed.decode_dispatched(now);
+                }
+            }
             let prefill_bytes =
                 match Self::prefill_side_bytes(ledger, prefill.as_ref(), prefill_request).await {
                     Ok(bytes) => bytes,
@@ -2375,6 +2779,35 @@ impl PDRouter {
             None
         };
         drop(prefill_guard);
+        let prefill_answered = Instant::now();
+        if let Some(placed) = placed.as_deref_mut() {
+            if let Some(again) = again {
+                // The document picks the decode after the prefill, and the
+                // prefill has answered: the decode is asked again here, on
+                // the loads of this instant.
+                let ask = again.asked.ask(&context);
+                // The connector's mode was settled by the first decode, and
+                // a MoRI-IO decode takes the checked MoRI-IO path alone:
+                // the second commit passes one over.
+                let on_route = on_pair_route(ledger);
+                let rule = |worker: &dyn Worker| on_route(worker) && !is_moriio_worker(worker);
+                if let Some(moved) = placed.decode_again(again.host, &ask, rule, Instant::now()) {
+                    decode = Arc::clone(moved);
+                    decode_guard = WorkerLoadGuard::with_key(Arc::clone(moved), again.sticky_key);
+                }
+                events::RequestPDSentEvent {
+                    prefill_url: prefill.redacted_url(),
+                    decode_url: decode.redacted_url(),
+                }
+                .emit();
+                // A decode still chosen leaves with its prefill's end, so
+                // its dispatch is said ahead of that end.
+                placed.decode_dispatched(Instant::now());
+            }
+            // A prefill that was sent is done with here. One that was not
+            // is said no end.
+            placed.prefill_ended(StatusCode::OK, prefill_answered);
+        }
         if mode == KvConnectorMode::MoriIo {
             let checked = match (&harvested, transfer_id.as_deref()) {
                 (Some(handoff), Some(id)) => validate_moriio_handoff(handoff, id, dp_rank),
@@ -2460,6 +2893,13 @@ impl PDRouter {
             headers,
             dp_rank,
         );
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
+        // A decode sent behind its prefill said its dispatch at that send,
+        // or behind that prefill's answer where it was asked again, and a
+        // second say tells nothing. A decode sent alone says it here.
+        if let Some(placed) = placed {
+            placed.decode_dispatched(Instant::now());
+        }
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
             Err(e) => return Self::decode_transport_failed(ledger, decode.as_ref(), &e),
@@ -2473,6 +2913,7 @@ impl PDRouter {
             runtime,
             dispatch_start,
             ledger,
+            cut,
         )
         .await
     }
@@ -2501,6 +2942,7 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         ledger: &AttemptLedger,
+        mut placed: Option<&mut Sent>,
     ) -> Response {
         let PdSetup {
             prefill_body,
@@ -2519,6 +2961,12 @@ impl PDRouter {
         .emit();
 
         let dispatch_start = Instant::now();
+        // Both sides go out together.
+        if let Some(placed) = placed.as_deref_mut() {
+            placed.dispatched(dispatch_start);
+            placed.decode_dispatched(dispatch_start);
+        }
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
         let prefill_request = self.build_post_with_headers(
             prefill.as_ref(),
             context.route,
@@ -2566,6 +3014,9 @@ impl PDRouter {
                     Err(response) => return response,
                 };
                 drop(prefill_guard);
+                if let Some(placed) = placed {
+                    placed.prefill_ended(StatusCode::OK, Instant::now());
+                }
                 Metrics::record_pd_prefill_duration(
                     metrics_labels::BACKEND_PD,
                     context.model_id,
@@ -2613,6 +3064,7 @@ impl PDRouter {
             runtime,
             dispatch_start,
             ledger,
+            cut,
         )
         .await
     }
@@ -2676,6 +3128,10 @@ impl PDRouter {
     /// sequential PD dispatch paths.
     /// `outcome_ledger` records an unstreamed answer's status on the decode
     /// worker here when the caller does not record the attempt itself.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the decode side as its dispatch body holds it, and the placement's mark"
+    )]
     async fn forward_decode_body(
         &self,
         decode_response: reqwest::Response,
@@ -2684,6 +3140,7 @@ impl PDRouter {
         decode_guard: WorkerLoadGuard,
         prefill_body: Option<Bytes>,
         outcome_ledger: Option<&AttemptLedger>,
+        cut: Option<Arc<AtomicU16>>,
     ) -> Response {
         let status = decode_response.status();
         if context.is_stream {
@@ -2701,12 +3158,19 @@ impl PDRouter {
                 header_utils::preserve_response_headers(decode_response.headers());
             header_utils::insert_routed_worker_id(&mut response_headers, decode.redacted_url());
 
+            // The relay answers a cut body with an error frame and a clean
+            // end. It writes the cut on the placement's mark, so the body's
+            // end is told as the cut it was.
+            let mut source = RelaySource::decode_side(context.model_id, context.route, decode);
+            if let Some(cut) = cut {
+                source = source.marking(cut);
+            }
             self.create_streaming_response(
                 decode_response.bytes_stream(),
                 status,
                 prefill_logprobs,
                 context.return_logprob,
-                RelaySource::decode_side(context.model_id, context.route, decode),
+                source,
                 Some(response_headers),
                 decode_guard,
             )
@@ -3729,13 +4193,15 @@ fn upstream_error_message(body: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod placed_tests;
+
+#[cfg(test)]
 mod tests {
     use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use openai_protocol::model_card::ModelCard;
     use serde_json::json;
     use smg_worker::{
         health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        identity::basic::WorkerType,
         test_support::RefusedAddress,
     };
     use tokio::sync::{mpsc, oneshot};
@@ -3938,7 +4404,7 @@ mod tests {
     /// hang, not a budget, since a loaded machine can take seconds.
     const ROUND_TRIP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
-    fn create_test_pd_router() -> PDRouter {
+    pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
@@ -3950,6 +4416,8 @@ mod tests {
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: None,
+            host: None,
+            keeps_target: false,
         }
     }
 
@@ -4682,7 +5150,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_recording_stub(
+    pub(super) async fn spawn_recording_stub(
         reply: &'static str,
     ) -> (String, Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
         let seen: Arc<std::sync::Mutex<Vec<(String, Value)>>> =
@@ -4887,7 +5355,7 @@ mod tests {
     /// A server whose answer's head and first bytes leave at once and whose
     /// body then breaks off, on every path and method: a worker that dies
     /// mid-answer.
-    async fn spawn_cut_body_stub() -> String {
+    pub(super) async fn spawn_cut_body_stub() -> String {
         let app = axum::Router::new().fallback(axum::routing::any(|| async {
             let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
                 b"{\"partial\":",
@@ -5591,7 +6059,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_stub(app: axum::Router) -> String {
+    pub(super) async fn spawn_stub(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -7580,11 +8048,11 @@ mod tests {
         );
     }
 
-    type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
+    pub(super) type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
 
     /// A stub that records each request body, then answers `reply` with
     /// `status` after `delay`.
-    async fn spawn_delayed_stub(
+    pub(super) async fn spawn_delayed_stub(
         status: StatusCode,
         reply: Value,
         delay: std::time::Duration,
@@ -8200,6 +8668,7 @@ mod tests {
             return_logprob: false,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
+            rid: None,
         };
         let request = DropProbeRequest {
             text: "hello".to_string(),
@@ -8292,6 +8761,7 @@ mod tests {
                     return_logprob,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    rid: None,
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
                 let dispatch = router.execute_dual_dispatch_internal(
@@ -8301,6 +8771,7 @@ mod tests {
                     Arc::clone(&prefill),
                     Arc::clone(&decode),
                     guards,
+                    None,
                     &mut outcome,
                 );
                 tokio::pin!(dispatch);
@@ -8388,10 +8859,12 @@ mod tests {
                             return_logprob,
                             model_id: UNKNOWN_MODEL_ID,
                             headers: None,
+                            rid: None,
                         },
                         prefill,
                         decode,
                         guards,
+                        None,
                         &mut outcome,
                     )
                     .await;
@@ -8469,6 +8942,7 @@ mod tests {
                     return_logprob: false,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    rid: None,
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
@@ -8479,6 +8953,7 @@ mod tests {
                         Arc::clone(&prefill),
                         Arc::clone(&decode),
                         guards,
+                        None,
                         &mut outcome,
                     );
                     tokio::pin!(dispatch);

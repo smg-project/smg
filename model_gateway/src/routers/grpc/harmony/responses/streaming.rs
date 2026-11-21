@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::response::Response;
-use openai_protocol::responses::{ResponseUsage, ResponsesRequest, ResponsesUsage};
+use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
 use serde_json::json;
 use smg_mcp::McpServerBinding;
 use tracing::{debug, warn};
@@ -440,8 +440,8 @@ async fn execute_mcp_tool_loop_streaming(
                             "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
                         ),
                     });
-                    let mut final_response = emitter.finalize_failed(None, error.clone());
-                    final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
+                    let final_response =
+                        emitter.finalize_failed(usage_total.clone(), error.clone());
                     // A foreground record that could not be written is already
                     // logged and counted by persist; the terminal keeps the
                     // run's own error, as the regular stream does, and the
@@ -522,8 +522,7 @@ async fn execute_mcp_tool_loop_streaming(
                     // `previous_response_id`, and a background response is
                     // polled from this record. Then response.completed with the
                     // usage the non-streamed response carries.
-                    let mut final_response = emitter.finalize(None);
-                    final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
+                    let final_response = emitter.finalize(usage_total.clone());
                     // As the completed exit: a foreground response the client
                     // expects stored ends with response.failed when its
                     // record could not be written.
@@ -574,8 +573,7 @@ async fn execute_mcp_tool_loop_streaming(
                 add_model_call_usage(&mut usage_total, Some(&usage));
 
                 // Finalize response from emitter's accumulated data
-                let mut final_response = emitter.finalize(None);
-                final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
+                let final_response = emitter.finalize(usage_total.clone());
 
                 // Persist response to storage if store=true; a foreground
                 // response the client expects stored ends with
@@ -686,7 +684,9 @@ async fn execute_without_mcp_streaming(
         ResponsesIterationResult::Completed { usage, .. } => usage,
     };
 
-    // Finalize response from emitter's accumulated data
+    // The response-level usage of this model call is shared by the stored
+    // object and its terminal event.
+    let usage = ResponseUsage::from(&usage);
     let final_response = emitter.finalize(Some(usage.clone()));
 
     // Persist response to storage if store=true; a foreground response the
@@ -708,6 +708,6 @@ async fn execute_without_mcp_streaming(
     // The terminal with the usage the non-streamed response (and the stored
     // final response) carries
     emitter
-        .finish_stream(Some(&ResponseUsage::from(&usage)), not_stored.as_ref(), tx)
+        .finish_stream(Some(&usage), not_stored.as_ref(), tx)
         .await;
 }

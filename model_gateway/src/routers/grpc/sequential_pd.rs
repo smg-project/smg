@@ -41,7 +41,7 @@ use crate::{
                 retire_pd_side, PdSides, PrefillBound, PrefillWait, Retirement, SideDispatch,
                 StreamResult,
             },
-            context::{ClientSelection, ExecutionResult, PdTiming, WorkerSelection},
+            context::{ClientSelection, ExecutionResult, PdTiming, Placement, WorkerSelection},
             multimodal::worker_language_model_only,
             proto_wrapper::{
                 FirstItem, PrefillCachedTokens, PrefillTicket, ProtoGenerateRequest,
@@ -596,6 +596,7 @@ pub(crate) async fn execute_sequential_pd(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -624,6 +625,7 @@ pub(crate) async fn execute_sequential_pd(
         prefill_request,
         prefill_client.clone(),
         prefill_guard,
+        placement,
     )
     .await?;
 
@@ -694,6 +696,7 @@ async fn sequential_prefill_side(
     prefill_request: ProtoGenerateRequest,
     mut prefill_client: BackendClient,
     prefill_guard: PrefillLoadGuard,
+    placement: Option<&Placement>,
 ) -> Result<PrefillHarvest, Response> {
     let workers = sides.workers;
     debug!(
@@ -816,6 +819,13 @@ async fn sequential_prefill_side(
     // The prefill phase ends at the drain; recorded by the executor only once
     // decode is established.
     let done = Instant::now();
+    // One prefill phase of a placed pair ends here for the controller too.
+    // The side ends with the dispatch's last phase, and the controller then
+    // reads the prefill worker free while the decode runs.
+    if let Some(placement) = placement {
+        let prompt_tokens = u32::try_from(sides.prompt_tokens).unwrap_or(u32::MAX);
+        placement.prefill_ended(prompt_tokens, done);
+    }
     Ok(PrefillHarvest {
         stream: prefill_stream,
         kv_params,

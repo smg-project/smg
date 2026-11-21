@@ -238,6 +238,30 @@ fn a_report_past_the_views_limit_reads_as_no_report() {
 }
 
 #[test]
+fn a_count_that_holds_no_send_leaves_the_other_terms_of_the_rule() {
+    let policy = policy(
+        r#"{"has-room":{"used":{"load.resident_tokens":1,"sent.tokens":1},"capacity":1000}}"#,
+    );
+    let rows = [row(0, 999), row(1, 1_001)];
+    // No row holds an entry: the pass reads no count, and the report's
+    // term still drops the second row.
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [0]);
+    // A send behind the first row's sample enters the count, and the pass
+    // reads it.
+    let lease = Lease {
+        issued_micros: NOW + 1,
+        tokens: 2,
+        ..Lease::default()
+    };
+    let target = Target {
+        id: rows[0].id,
+        ..Target::default()
+    };
+    policy.on_dispatched(&lease, &target, Side::Single, 0);
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [0u32; 0]);
+}
+
+#[test]
 fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
     const START: u64 = 91_300;
     const DELAY: u32 = 47;
@@ -291,6 +315,33 @@ fn a_send_takes_room_until_a_report_or_the_profiles_limit_ends_it() {
 }
 
 #[test]
+fn a_sends_request_and_its_tokens_each_take_room_by_their_own_coefficient() {
+    let policy =
+        policy(r#"{"has-room":{"used":{"sent.requests":100,"sent.tokens":1},"capacity":250}}"#);
+    let rows = [row(0, 0), row(1, 0)];
+    let send = || {
+        let lease = Lease {
+            issued_micros: NOW + 1,
+            tokens: 50,
+            ..Lease::default()
+        };
+        let target = Target {
+            id: rows[0].id,
+            ..Target::default()
+        };
+        policy.on_dispatched(&lease, &target, Side::Single, 0);
+    };
+    // One send of 50 tokens holds 100 and 50 of the 250. Under the
+    // request's coefficient its tokens alone would hold 5,000.
+    send();
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [0, 1]);
+    // Two hold 200 and 100. Under the tokens' coefficient the two requests
+    // would hold 2, and the row would stay.
+    send();
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [1]);
+}
+
+#[test]
 fn the_rule_ahead_of_a_hard_filter_decides_as_the_rule_behind_it() {
     let ahead = policy(&format!(r#"{RESIDENT},"healthy""#));
     let behind = policy(&format!(r#""healthy",{RESIDENT}"#));
@@ -329,6 +380,22 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
             "{}",
             "at least one field with its coefficient",
         ),
+        // Under a capacity that is a number, the request's size alone
+        // asks nothing of a worker.
+        (
+            r#"{"used":{"request.prompt_tokens":1},"capacity":10}"#,
+            "used",
+            "request.prompt_tokens",
+            "at least one field or signal of the worker beside the request's size",
+        ),
+        // The capacity is settled first: under a name that is no signal's
+        // the refusal is the capacity's.
+        (
+            r#"{"used":{"request.prompt_tokens":1},"capacity":"load.capacity"}"#,
+            "capacity",
+            "load.capacity",
+            "a declared signal, written signal.<name>",
+        ),
         (
             r#"{"used":{"load.nothing":1},"capacity":10}"#,
             "used",
@@ -359,12 +426,12 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
             "-3",
             "a finite number above zero",
         ),
-        // No field of this build holds a capacity.
+        // No field of this build holds a capacity: a name is a signal's.
         (
             r#"{"used":{"load.running":1},"capacity":"load.capacity"}"#,
             "capacity",
             "load.capacity",
-            "a field this build reads",
+            "a declared signal, written signal.<name>",
         ),
         (
             r#"{"used":{"load.running":1},"capacity":10,"headroom":1}"#,
@@ -389,11 +456,27 @@ fn each_part_of_the_rule_is_refused_at_its_path() {
     }
 }
 
-/// An empty map is no rule: only the bare name is the host's bit.
+/// An empty map is no rule: only the bare name is the host's bit. A null
+/// under the name is the slip of a bare name written with a colon, and its
+/// author is told both forms at the rule's path. YAML's own typed read
+/// would take that null for an empty map: the entry catches it first.
 #[test]
 fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
+    let slip = "expected a rule with `used` and `capacity`, or the bare name `has-room`";
+    let yaml = format!(
+        "apiVersion: {API_VERSION}\nprofiles:\n  p:\n    filter:\n      - has-room:\n    pick: random\n"
+    );
+    let slipped = serde_yaml::from_str::<PolicySpec>(&yaml)
+        .expect_err("an empty rule")
+        .to_string();
+    assert!(
+        slipped.starts_with("profiles.p.filter[0].has-room: ") && slipped.contains(slip),
+        "{slipped}"
+    );
     for (rule, message) in [
+        ("null", slip),
         ("{}", "missing field `used`"),
+        (r#"{"capacity":10}"#, "missing field `used`"),
         (r#"{"used":{"load.running":1}}"#, "missing field `capacity`"),
         (
             r#"{"used":{"load.running":1},"capacity":10,"room":2}"#,
@@ -405,7 +488,7 @@ fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
         ),
         (
             r#"{"used":{"load.running":1},"capacity":true}"#,
-            "a number, or the name of a field that holds one",
+            "a number, or a declared signal written signal.<name>",
         ),
     ] {
         let error = serde_json::from_str::<PolicySpec>(&format!(
@@ -415,6 +498,17 @@ fn a_rule_that_leaves_a_part_out_is_refused_at_the_parse() {
         .to_string();
         assert!(error.contains(message), "{rule}: {error}");
     }
+}
+
+/// The rule's read is its type's own, whole: its parts written as a list,
+/// in the type's order, read as the map does.
+#[test]
+fn a_rule_written_as_a_list_reads_as_its_map() {
+    let listed = document(r#"{"has-room":[{"load.running":1},10,0.25]}"#);
+    let mapped =
+        document(r#"{"has-room":{"used":{"load.running":1},"capacity":10,"headroom":0.25}}"#);
+    assert_eq!(listed, mapped);
+    listed.validate().expect("the listed rule builds");
 }
 
 #[test]

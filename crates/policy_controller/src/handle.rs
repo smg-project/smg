@@ -58,6 +58,9 @@
 //! After reporting the prefill dispatch and before reporting its end,
 //! the host can call [`Handle::decide_decode`] for a fresh pick or send a
 //! decode from the first pick. A decode still chosen leaves with its prefill.
+//! That holds for a handle over a door in process. A handle over a link
+//! sends the field as false: the controller issues both sides at the first
+//! ask, and [`Handle::decide_decode`] answers that the side was not chosen.
 
 use std::{
     fmt,
@@ -281,6 +284,31 @@ impl<D: Deref<Target = Door>> Handle<D> {
         request: &Request<'_>,
         now: Instant,
     ) -> Result<&Decision, Refused> {
+        self.decode_decided(|door, gateway, lease| door.decide_decode(gateway, request, lease, now))
+    }
+
+    /// [`Self::decide_decode`] for a request its host makes from the world
+    /// the call decides under ([`Door::decide_decode_under`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decide_decode`].
+    pub fn decide_decode_under(
+        &mut self,
+        maker: &impl Maker,
+        now: Instant,
+    ) -> Result<&Decision, Refused> {
+        self.decode_decided(|door, gateway, lease| {
+            door.decide_decode_under(gateway, maker, lease, now)
+        })
+    }
+
+    /// Takes the answer `call` gets of the handle's door for the decode
+    /// side of its pair's lease.
+    fn decode_decided(
+        &mut self,
+        call: impl FnOnce(&Door, GatewayId, LeaseId) -> Result<Decided, Refused>,
+    ) -> Result<&Decision, Refused> {
         let lease = self
             .lease()
             .ok_or(Refused::Decode(DecodeRefused::NoLease))?
@@ -302,7 +330,7 @@ impl<D: Deref<Target = Door>> Handle<D> {
             _ => {}
         }
         let answer = match &self.arm {
-            Arm::Door { door, gateway } => door.decide_decode(*gateway, request, lease, now)?,
+            Arm::Door { door, gateway } => call(door, *gateway, lease)?,
             // A controller over a link issued both sides at the first ask.
             #[cfg(feature = "client")]
             Arm::Link(_) => return Err(Refused::Decode(DecodeRefused::NotChosen)),
@@ -317,6 +345,17 @@ impl<D: Deref<Target = Door>> Handle<D> {
             }
         }
         Ok(self.decision())
+    }
+
+    /// Whether the pair's decode side stands chosen: its request stated a
+    /// later decode ([`Constraints::decode_later`](crate::view::Constraints::decode_later)),
+    /// the first pick named the side and booked nothing for it, and
+    /// [`Self::decide_decode`] may pick it again. `false` from that call's
+    /// pick, from the side's dispatch, from the end of its prefill, and
+    /// for every other handle.
+    #[must_use]
+    pub fn decode_chosen(&self) -> bool {
+        matches!(self.decode, Owed::Later { .. })
     }
 
     /// The lease filed for a pick, the prefill side for a pair.
@@ -393,12 +432,14 @@ impl<D: Deref<Target = Door>> Handle<D> {
                         door.report(*gateway, lease, said);
                     });
                 }
-                Said::Dispatched(..) | Said::Released(..) => door.report(*gateway, lease, said),
+                Said::Dispatched(..) | Said::Released(..) => {
+                    door.report(*gateway, lease, said);
+                }
             },
             #[cfg(feature = "client")]
             Arm::Link(link) => {
-                // A full queue ends the link. Session cleanup covers the leases.
-                let _ = link.report(wire::frame(lease, side, said));
+                // With no session standing the report waits in the link's line.
+                link.report(wire::frame(lease, side, said));
             }
         }
     }
@@ -1350,6 +1391,7 @@ mod tests {
             Some([LeaseState::ISSUED, LeaseState::Chosen])
         );
         assert_eq!(pair_counts(store, workers), [1, 0, 0]);
+        assert!(handle.decode_chosen());
         let original = *handle.decision();
         assert_eq!(
             handle.decide_decode(&asked, now).err(),
@@ -1357,6 +1399,10 @@ mod tests {
         );
         assert_eq!(*handle.decision(), original);
         assert_eq!(handle.index, 1);
+        assert!(
+            handle.decode_chosen(),
+            "a refused call leaves the side chosen"
+        );
 
         let sent = now + Duration::from_micros(100);
         handle.dispatched(sent);
@@ -1373,6 +1419,7 @@ mod tests {
             .expect("the new first target");
         assert_eq!(new.pair, other.pair);
         assert_eq!((handle.index, handle.target), (0, other));
+        assert!(!handle.decode_chosen(), "the call's pick issued the side");
         assert_eq!(
             handle
                 .lease()
@@ -1454,7 +1501,9 @@ mod tests {
         assert_eq!(*handle.decision(), original);
         assert_eq!((handle.index, handle.target), (1, picked));
         assert_eq!(store.sides(GATEWAY, lease), Some(before));
+        assert!(handle.decode_chosen(), "a shed leaves the side chosen");
         handle.dispatched_decode(now);
+        assert!(!handle.decode_chosen(), "the dispatch booked the side");
         let worker = picked.pair.expect("the alternate decode").decode_id;
         let decode = store
             .sides(GATEWAY, lease)
@@ -1468,18 +1517,43 @@ mod tests {
         let _ = words();
     }
 
+    /// A host that makes a pair's request with a later decode.
+    struct Later;
+
+    impl Maker for Later {
+        fn model(&self) -> &str {
+            later_request(b"pair").facts.model
+        }
+
+        fn make<'w>(&'w self, _: &'w World) -> Request<'w> {
+            later_request(b"pair")
+        }
+    }
+
+    /// A handle asks its decode again for a request its host makes, as for
+    /// one it stated: the call's pick issues the side.
+    #[test]
+    fn a_handle_asks_its_decode_again_for_a_request_its_host_makes() {
+        let door = pair_door(1, 1).expect("a pair door");
+        let now = Instant::now();
+        let mut handle =
+            Handle::decide_under(&door, GATEWAY, &Later, now).expect("a pair's handle");
+        handle.dispatched(now);
+        assert!(handle.decode_chosen());
+        let decided = handle.decide_decode_under(&Later, now);
+        assert!(decided.is_ok_and(|decision| decision.pick().is_some()));
+        assert!(!handle.decode_chosen(), "the call's pick issued the side");
+        // An issued side takes no second call.
+        assert_eq!(
+            handle.decide_decode_under(&Later, now).err(),
+            Some(Refused::Decode(DecodeRefused::DecodeStands))
+        );
+        drop(handle);
+        let _ = words();
+    }
+
     #[test]
     fn a_handle_decided_under_a_maker_holds_the_decode_as_the_made_request_said() {
-        struct Later;
-        impl Maker for Later {
-            fn model(&self) -> &str {
-                later_request(b"pair").facts.model
-            }
-
-            fn make<'w>(&'w self, _: &'w World) -> Request<'w> {
-                later_request(b"pair")
-            }
-        }
         let door = pair_door(1, 1).expect("a pair door");
         let handle =
             Handle::decide_under(&door, GATEWAY, &Later, Instant::now()).expect("a pair's handle");
@@ -1766,6 +1840,7 @@ mod tests {
         let store = door.store();
         let now = Instant::now();
         let mut handle = paired(&door, now).expect("a pair's handle");
+        assert!(!handle.decode_chosen(), "a pair decided whole issues both");
         let first = handle.take(0).expect("the first target");
         let decode = first.pair.expect("the first decode").decode_id;
         let reason = ReleaseReason::CommitFailed;
@@ -2102,6 +2177,46 @@ mod tests {
             handle.dispatched(now);
             handle.completed(&complete, now);
             handle.released(ReleaseReason::CommitFailed, now);
+            drop(handle);
+            reports(
+                &mut peer,
+                [
+                    dispatch(1, 250),
+                    Frame::Completed(proto::Completed {
+                        lease_id: 73,
+                        side: proto::Side::Single.into(),
+                        served: 28,
+                        status: 200,
+                        class: Class::Ok.into(),
+                        ttft_micros: 1_000,
+                        tokens_in: 12,
+                        tokens_out: 34,
+                        duration_micros: 5_000,
+                    }),
+                ],
+            )
+            .await;
+        }
+
+        /// A request can outlast the session its decision came over. Its
+        /// handle holds the gateway's link, so what it reports then waits
+        /// for the next session and rides it.
+        #[tokio::test(start_paused = true)]
+        async fn a_request_that_outlasts_its_session_reports_on_the_next_one() {
+            let mut peer = Peer::patient(1);
+            let now = Instant::now();
+            let mut handle = answered(&mut peer, picked(), now)
+                .await
+                .expect("the pick is held");
+            let target = handle.take(1).expect("the pick's second target");
+            assert_eq!(target.id, WorkerId(19));
+            peer.end_session().await;
+            handle.dispatched(now + Duration::from_micros(250));
+
+            drop(peer.redial(1));
+            peer.read_hello().await;
+            let complete = outcome(WorkerId(28), TransportClass::Ok);
+            handle.completed(&complete, now + Duration::from_millis(5));
             drop(handle);
             reports(
                 &mut peer,
@@ -2532,7 +2647,10 @@ mod tests {
             let mut peer = Peer::new(1);
             let mut ask = request(&[1], 7);
             ask.facts.budget_micros = 200_000;
-            ask.constraints.demands = Demands { runtime: 7 };
+            ask.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let before = tokio::time::Instant::now();
             let answer = timeout(
                 PATIENCE,

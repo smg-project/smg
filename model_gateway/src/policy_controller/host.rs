@@ -41,14 +41,15 @@ use axum::{
 use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
-    decision::{Decision, Lifted, Pair, ShedReason, Targets, Trace, MAX_TARGETS},
-    door::{Door, Maker, Refused, Request},
+    decision::{Decision, Lifted, Pair, ShadowKind, ShedReason, Targets, Trace, MAX_TARGETS},
+    door::{Door, Maker, Refused, Request, Swept},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
+    spec::DecodePick,
     store::{GatewayId, MemoryStore, World},
-    view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
+    view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
     worker_host::Objects,
-    AppliedSpec, DerivedKey, KeySource,
+    AppliedSpec, DerivedKey, KeySource, MediaCounts, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
 
@@ -136,10 +137,28 @@ pub(crate) struct Ask<'a> {
     pub rid: Option<&'a str>,
     /// A regular attempt is single. A pair is asked at its prefill.
     pub phase: Phase,
+    /// The route asks a pair's decode again behind its prefill's answer
+    /// ([`Placed::decode_again`]). Where the document in force picks the
+    /// decode after the prefill ([`DecodePick::AfterPrefill`]), such an ask
+    /// states the later decode: its decision books the prefill alone and
+    /// names the decode's targets. A route that never asks again states
+    /// nothing here, and keeps one decision under every document.
+    pub decode_again: bool,
     /// The size of the prompt in tokens. Zero uses the count from hashing if available.
     pub prompt_tokens: u32,
+    /// The media the request carries, by count. Zero where it carries
+    /// none. A stage that places by media reads it.
+    pub media: MediaCounts,
+    /// The wires the route dials. A route that dials one states it, and
+    /// the controller places among the rows that serve it. None stated
+    /// leaves every row in.
+    pub wires: WireModes,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
+    /// The retry number, `0` for the first attempt. `None` counts the rows
+    /// of `tried`, one a failed attempt. A stage whose failed attempt names
+    /// more rows than one states the number: a pair names two.
+    pub attempt: Option<u8>,
     /// The attempt's prompt hashes, where it has them. The stage that holds
     /// the tokens fills this once per attempt, before its first ask.
     pub hashes: Option<&'a Hashes>,
@@ -148,7 +167,8 @@ pub(crate) struct Ask<'a> {
 impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
-    /// input of a routing key, nothing tried, no hashes.
+    /// input of a routing key, no media, no stated wire, nothing tried, no
+    /// stated attempt, no hashes, no second ask of a decode.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -157,8 +177,12 @@ impl<'a> Ask<'a> {
             headers: None,
             rid: None,
             phase: Phase::Single,
+            decode_again: false,
             prompt_tokens: 0,
+            media: MediaCounts::NONE,
+            wires: WireModes::NONE,
             tried: &[],
+            attempt: None,
             hashes: None,
         }
     }
@@ -213,15 +237,18 @@ impl<'a> Ask<'a> {
             session_key: key,
             phase: self.phase,
             prompt_tokens: self.prompt_tokens,
+            media: self.media,
             client_key,
-            attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
+            attempt: self
+                .attempt
+                .unwrap_or_else(|| u8::try_from(self.tried.len()).unwrap_or(u8::MAX)),
             tried: self.tried,
             seed: rand::rng().random(),
             ..RequestFacts::default()
         };
         if let Some(hashes) = self.hashes {
             facts.block_hashes = &hashes.blocks;
-            facts.hash_kind = HashKind::Token;
+            facts.hash_kind = hashes.kind;
             facts.block_size = hashes.block_size;
             facts.namespace_seed = hashes.namespace_seed;
             if facts.prompt_tokens == 0 {
@@ -233,9 +260,17 @@ impl<'a> Ask<'a> {
             facts,
             constraints: Constraints {
                 excluded: missed,
+                wire_modes: self.wires,
                 ..Constraints::default()
             },
         }
+    }
+
+    /// Whether this ask states the later decode under `spec`: its route
+    /// asks the decode again, and the document picks the decode after the
+    /// prefill.
+    fn decode_later(&self, spec: &AppliedSpec) -> bool {
+        self.decode_again && spec.decode_pick() == DecodePick::AfterPrefill
     }
 }
 
@@ -264,7 +299,11 @@ impl Maker for Made<'_, '_> {
             KeySource::Rid => "rid",
         }));
         let key = derived.map_or(Identity::NONE, |derived| derived.key);
-        self.ask.request(key, client_key, self.missed)
+        let mut request = self.ask.request(key, client_key, self.missed);
+        // The document's word, like the keys: read from the generation
+        // that decides.
+        request.constraints.decode_later = self.ask.decode_later(world.spec());
+        request
     }
 }
 
@@ -287,6 +326,17 @@ pub(crate) enum Unplaced {
     Refused(Refused),
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
+    /// A pair's ask found no endpoint, and by membership no prefill pairs
+    /// with a decode: each pool's pairing keys and the components the two
+    /// pools disagree on, as the store's pair classes hold them.
+    NoCompatiblePair {
+        /// The prefill pool's pairing keys.
+        prefill: Vec<String>,
+        /// The decode pool's pairing keys.
+        decode: Vec<String>,
+        /// The components the pools disagree on.
+        mismatches: Vec<String>,
+    },
     /// A pair can be sent, but its prefill has no admission room.
     NoRoom,
     /// The prefill admission queue refused the request.
@@ -313,6 +363,7 @@ impl Unplaced {
     /// |---|---|
     /// | The pool is saturated, admission found no room, or the controller queued the request | 503 `worker_overload_protection_shed`, with a retry hint |
     /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
+    /// | A pair's pools hold workers and no prefill pairs with a decode | 503 `no_compatible_pd_pair`, naming what the pools disagree on |
     /// | A controller queue is at its limit | 429 `admission_queue_full`, with a retry hint |
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
     /// | The prefill admission queue is full or timed out | 429 `pd_prefill_queue_full` or `pd_prefill_queue_timeout` |
@@ -364,6 +415,11 @@ impl Unplaced {
                     "the gateway could send to no target the policy controller picked",
                 )
             }
+            Self::NoCompatiblePair {
+                ref prefill,
+                ref decode,
+                ref mismatches,
+            } => placement::no_compatible_pair(model, mismatches, prefill, decode),
             Self::Admission(PrefillAdmissionRejection::QueueFull) => prefill_queue_full(),
             Self::Admission(PrefillAdmissionRejection::QueueTimeout) => prefill_queue_timeout(),
             Self::Shed {
@@ -460,6 +516,25 @@ impl Host {
         }
     }
 
+    /// One pass of the door's clock at `now`: the call of the host's timer
+    /// ([`upkeep`](super::upkeep)), about once a second.
+    pub(crate) fn sweep(&self, now: Instant) -> Swept {
+        self.door.sweep(now)
+    }
+
+    /// How many shadows said `kind` beside a single decision of the
+    /// binding at position `binding`: the door's count, which the timer
+    /// shows as a series.
+    pub(crate) fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
+        self.door.shadowed(binding, kind)
+    }
+
+    /// How many decisions panicked, the shadows that did beside a live
+    /// decision that stood among them: the door's count, shown the same way.
+    pub(crate) fn faults(&self) -> u64 {
+        self.door.faults()
+    }
+
     /// An attempt's prompt hashes for `model`, under the generation in force.
     /// The stage holding the tokens calls this once before the first ask.
     /// Each ask borrows the same result through [`Ask::hashes`].
@@ -511,6 +586,53 @@ impl Host {
             }
             let profile = spec.engine().profiles().get(usize::from(trace.profile))?;
             Some(Arc::from(profile.name.as_str()))
+        })
+    }
+
+    /// Counts a pair's second ask of its decode for `model`, as an ask
+    /// counts its decision: under the generation and the profile of a
+    /// call that `picked`, and under none for a call that shed or was
+    /// refused, whose decision the handle does not hand on.
+    fn count_decode_call(
+        &self,
+        model: &str,
+        picked: Option<&Decision>,
+        outcome: &'static str,
+        seconds: f64,
+    ) {
+        let trace = picked.map(Decision::trace);
+        Metrics::record_policy_decision(
+            model,
+            PolicyDecision {
+                generation: trace.map_or(0, |trace| trace.generation),
+                profile: picked.and_then(profile_of),
+                outcome,
+                mode: "embedded",
+            },
+            || trace.and_then(|trace| self.profile_name(trace)),
+            seconds,
+        );
+    }
+
+    /// Why no pair can be made for `ask`, where it asks for one on the wires
+    /// it states and the store's pair classes refuse that side of its
+    /// fleet. The classes judge from membership alone, as the classic pair
+    /// index does, so a fleet that pairs nothing reads the classic's answer
+    /// and not a missing endpoint.
+    ///
+    /// An ask that states no wire does not say which side it draws from. It
+    /// keeps the controller's shed.
+    fn unpaired(&self, ask: &Ask<'_>) -> Option<Unplaced> {
+        if ask.phase == Phase::Single || ask.wires.is_empty() {
+            return None;
+        }
+        self.door.store().with_world(|world| {
+            let refusal = world.pairs(ask.model)?.refusal(ask.wires)?;
+            Some(Unplaced::NoCompatiblePair {
+                prefill: refusal.prefill.clone(),
+                decode: refusal.decode.clone(),
+                mismatches: refusal.mismatches.clone(),
+            })
         })
     }
 
@@ -634,11 +756,14 @@ impl Host {
             }
             Decision::Shed(shed) => {
                 self.trace_decision(&decision, None);
-                Err(Unplaced::Shed {
+                let unpaired = (shed.reason == ShedReason::NoEndpoints)
+                    .then(|| self.unpaired(ask))
+                    .flatten();
+                Err(unpaired.unwrap_or(Unplaced::Shed {
                     reason: shed.reason,
                     emptied_by: shed.emptied_by,
                     retry_after_secs: shed.retry_after_secs,
-                })
+                }))
             }
             Decision::Queue(_) => Err(Unplaced::Queued),
         }
@@ -703,10 +828,25 @@ impl Host {
 
     /// Takes the first sendable pair whose prefill has room. The admission
     /// lock can be held here, so every lookup happens in the ask.
-    #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
     pub(crate) fn commit_pair(
         &self,
         asked: Asked,
+        room: Option<&PrefillSelectionContext<'_>>,
+        missed: &mut Vec<WorkerId>,
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
+        self.commit_pair_where(asked, |_| true, room, missed, now)
+    }
+
+    /// The pair's commit on a route with a rule of its own: as
+    /// [`Host::commit_pair`], and a target either of whose workers `holds`
+    /// refuses is passed over like one the gateway cannot send to. The
+    /// rule is the route's, as [`Host::commit_where`] says of a regular one.
+    #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
+    pub(crate) fn commit_pair_where(
+        &self,
+        asked: Asked,
+        holds: impl Fn(&dyn Worker) -> bool,
         room: Option<&PrefillSelectionContext<'_>>,
         missed: &mut Vec<WorkerId>,
         now: Instant,
@@ -722,8 +862,11 @@ impl Host {
             let Some(pair) = target.pair else {
                 continue;
             };
-            let prefill = prefill.filter(|worker| routable_but_for_veto(worker.as_ref()));
-            let decode = decode.filter(|worker| routable_but_for_veto(worker.as_ref()));
+            let sendable = |worker: &Arc<dyn Worker>| {
+                routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+            };
+            let prefill = prefill.filter(sendable);
+            let decode = decode.filter(sendable);
             let (Some(worker), Some(decode)) = (&prefill, decode.as_ref()) else {
                 failed[index] = [
                     prefill.is_none().then_some(target.id),
@@ -769,6 +912,23 @@ impl Host {
         admission: Option<&PrefillAdmission>,
         routing_key: Option<&str>,
     ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        self.place_pair_where(ask, |_| true, admission, routing_key)
+            .await
+    }
+
+    /// Places a pair on a route with a rule of its own: as
+    /// [`Host::place_pair`], over [`Host::commit_pair_where`]. The pass
+    /// that reads which prefills are full and the probe of a request
+    /// behind a waiter count a worker the rule refuses as one the gateway
+    /// cannot send to.
+    pub(crate) async fn place_pair_where(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        admission: Option<&PrefillAdmission>,
+        routing_key: Option<&str>,
+    ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        let holds = &holds;
         let missed = Mutex::new(Vec::new());
         // The attempt's first ask, whichever half makes it: each wake's
         // decision starts from the attempt's list, which stays empty
@@ -778,9 +938,11 @@ impl Host {
             admission,
             routing_key,
             Placed::worker,
-            || self.probe_pair(ask, &missed, &first),
-            || self.decide_pair(ask, admission, missed.lock().clone(), &first),
-            |asked, room| self.commit_pair(asked, room, &mut missed.lock(), Instant::now()),
+            || self.probe_pair(ask, holds, &missed, &first),
+            || self.decide_pair(ask, holds, admission, missed.lock().clone(), &first),
+            |asked, room| {
+                self.commit_pair_where(asked, holds, room, &mut missed.lock(), Instant::now())
+            },
         )
         .await
         .map_err(|error| match error {
@@ -795,6 +957,7 @@ impl Host {
     async fn decide_pair(
         &self,
         ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Sync),
         admission: Option<&PrefillAdmission>,
         mut missed: Vec<WorkerId>,
         first: &AtomicBool,
@@ -810,8 +973,10 @@ impl Host {
                 let (Some(prefill), Some(decode)) = (prefill, decode) else {
                     continue;
                 };
-                if routable_but_for_veto(prefill.as_ref()) && routable_but_for_veto(decode.as_ref())
-                {
+                let sendable = |worker: &Arc<dyn Worker>| {
+                    routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+                };
+                if sendable(prefill) && sendable(decode) {
                     if !admission.reads_full(prefill) {
                         return Ok(asked);
                     }
@@ -833,6 +998,7 @@ impl Host {
     async fn probe_pair(
         &self,
         ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Sync),
         missed: &Mutex<Vec<WorkerId>>,
         first: &AtomicBool,
     ) -> Option<Unplaced> {
@@ -844,7 +1010,7 @@ impl Host {
                 WorkerType::Decode => &mut decode,
                 WorkerType::Regular | WorkerType::Encode => continue,
             };
-            *found = *found || routable_but_for_veto(worker.as_ref());
+            *found = *found || (routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref()));
             if prefill && decode {
                 return None;
             }
@@ -995,6 +1161,12 @@ impl Placed {
         self.rank
     }
 
+    /// The size the placement's lease states, for a case that reads it.
+    #[cfg(test)]
+    pub(crate) fn lease_tokens(&self) -> Option<u32> {
+        self.handle.lease().map(|leased| leased.lease.tokens)
+    }
+
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
         self.handle.dispatched(now);
@@ -1079,6 +1251,85 @@ impl Placed {
         }
         false
     }
+
+    /// Whether the pair's decode stands chosen and booked nowhere: its ask
+    /// stated the later decode, and the decode's dispatch is still owed.
+    /// The route asks it again behind its prefill's answer
+    /// ([`Self::decode_again`]), or sends the first pick's.
+    pub(crate) fn decode_waits(&self) -> bool {
+        self.handle.decode_chosen()
+    }
+
+    /// Asks the pair's decode again at `now`, on the rows of that instant:
+    /// behind the prefill's answer, and ahead of the prefill's end. `ask`
+    /// states the request as its first ask did. A pick moves the placement
+    /// to the first of its decodes the gateway can send to and `holds`
+    /// admits: the route's rule, as at the first commit. Returns the decode
+    /// the call moved the placement to, and `None` where the placement
+    /// keeps the decode it named.
+    ///
+    /// The call never fails its request. A decode that does not stand
+    /// chosen takes no call. A call the door sheds or refuses leaves the
+    /// decode the first pick named, still chosen. Where the call picked
+    /// and the gateway can send to none of its decodes, the decode side's
+    /// lease is given up: the first pick's decode is then sent unbooked.
+    pub(crate) fn decode_again(
+        &mut self,
+        host: &Host,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool,
+        now: Instant,
+    ) -> Option<&Arc<dyn Worker>> {
+        let placed = self.pair.as_deref_mut()?;
+        if !self.handle.decode_chosen() {
+            return None;
+        }
+        let made = Made {
+            ask,
+            missed: &[],
+            source: Cell::new(None),
+        };
+        let handle = &mut self.handle;
+        let started = Instant::now();
+        // The call's request is made as the first ask's was: from the
+        // world the door decides it under, by the sources of that document.
+        let decided = handle.decide_decode_under(&made, now).copied();
+        let seconds = started.elapsed().as_secs_f64();
+        // A pick issued the side. A shed and a refusal left it chosen: the
+        // handle answers the first pick behind a shed, so the side tells
+        // the two apart.
+        let (outcome, picked) = match decided {
+            Err(_) => ("refused", None),
+            Ok(_) if handle.decode_chosen() => ("shed", None),
+            Ok(decision) => (outcome(&decision), Some(decision)),
+        };
+        host.count_decode_call(ask.model, picked.as_ref(), outcome, seconds);
+        let Some(Decision::Pick(pick)) = picked else {
+            return None;
+        };
+        for (index, target) in pick.targets.iter().enumerate() {
+            let Some(pair) = target.pair.filter(|_| target.id == self.id) else {
+                continue;
+            };
+            let sendable = |worker: &Arc<dyn Worker>| {
+                routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+            };
+            let Some(worker) = host.worker(pair.decode_id).filter(sendable) else {
+                continue;
+            };
+            // The call took its first target. A later one is taken by name.
+            if index == 0 || self.handle.take_decode(index).is_some() {
+                placed.decode = worker;
+                placed.side = pair;
+                placed.targets = pick.targets;
+                placed.index = index;
+                return Some(&placed.decode);
+            }
+        }
+        self.handle
+            .released_decode(ReleaseReason::CommitFailed, now);
+        None
+    }
 }
 
 impl fmt::Debug for Placed {
@@ -1098,20 +1349,26 @@ impl fmt::Debug for Placed {
 pub(crate) struct Held {
     /// Dropped first: a report still owed is said while the load stands.
     placed: Placed,
-    /// The load of the placement's worker, given back at the drop.
+    /// The load of the worker the response is read from, given back at the
+    /// drop.
     #[expect(dead_code, reason = "held for its drop alone")]
     guard: WorkerLoadGuard,
 }
 
 impl Held {
-    /// The placement beside the load guard `guard` makes of its worker. The
-    /// guard is asked of the placement's own worker, so the two do not name
-    /// two workers, and neither is dropped ahead of its turn.
+    /// The placement beside the load guard `guard` makes of the worker its
+    /// response is read from: a single's worker, a pair's decode. The guard
+    /// is asked of the placement's own worker, so the two do not name two
+    /// workers, and neither is dropped ahead of its turn.
+    ///
+    /// A pair's prefill holds its load by the admission guard
+    /// [`Host::place_pair`] hands back apart. Its router gives that one up
+    /// when the prefill phase ends, ahead of the response.
     pub(crate) fn new(
         placed: Placed,
         guard: impl FnOnce(&Arc<dyn Worker>) -> WorkerLoadGuard,
     ) -> Self {
-        let guard = guard(placed.worker());
+        let guard = guard(placed.decode().unwrap_or_else(|| placed.worker()));
         Self { placed, guard }
     }
 
@@ -1123,6 +1380,8 @@ impl Held {
 
 mod ride;
 pub(crate) use ride::{BehindAnswer, Sent};
+#[cfg(test)]
+mod decode_again_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

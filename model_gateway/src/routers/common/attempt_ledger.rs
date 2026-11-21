@@ -61,6 +61,13 @@ pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
     });
 }
 
+/// The kind of the worker whose side alone failed, where `response` names
+/// one ([`FailedSide`]).
+pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
+    let side = response.extensions().get::<FailedSide>();
+    side.map(|side| side.worker_type)
+}
+
 /// Whether `response` is a failure the answering worker must not see again
 /// for this request: the worker's own 500, the one retryable status a worker
 /// gives a request it processed and failed on. Its "not served now" statuses
@@ -74,6 +81,8 @@ pub(crate) fn is_definitive_failure(response: &Response) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct AttemptLedger {
     inner: Mutex<Ledger>,
+    /// Whether the policy controller's host places the request's attempts.
+    hosted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +95,29 @@ struct Ledger {
 }
 
 impl AttemptLedger {
+    /// The ledger of a request whose attempts the policy controller's host
+    /// places where `hosted`, and the classic policies otherwise.
+    pub(crate) fn of(hosted: bool) -> Self {
+        Self {
+            inner: Mutex::default(),
+            hosted,
+        }
+    }
+
+    /// Whether `worker` could take the request's next attempt, as the
+    /// selection of that attempt judges a worker. The classic policies pass
+    /// over a worker that is not available. A host reads the overload veto
+    /// from the controller's rows, and the flag on the object mirrors a
+    /// verdict of any row of the worker: under a host it closes no retry
+    /// window, and the retry's placement answers for the worker.
+    pub(crate) fn takes(&self, worker: &dyn Worker) -> bool {
+        if self.hosted {
+            worker.routing_state().eligible_ignoring_overload()
+        } else {
+            worker.is_available()
+        }
+    }
+
     /// Record an attempt's outcome on `worker`'s circuit breaker: a success or
     /// a capacity pushback as always, a failure only the first time this
     /// request fails on the worker.
@@ -135,9 +167,9 @@ impl AttemptLedger {
     }
 
     /// Close the retry window on a definitive failure. The workers that gave
-    /// the answer take no further attempt of this request; when no available
-    /// worker in `pool` is left to take one, the answer is marked terminal and
-    /// goes back to the client as it is. A failure of one side alone
+    /// the answer take no further attempt of this request; when no worker in
+    /// `pool` is left to take one ([`Self::takes`]), the answer is marked
+    /// terminal and goes back to the client as it is. A failure of one side alone
     /// ([`FailedSide`]) closes the window on that side's worker only, and the
     /// alternative is sought among the workers of its kind. Any other
     /// response passes untouched.
@@ -166,7 +198,7 @@ impl AttemptLedger {
         let alternative = pool.into_iter().any(|worker| {
             side.as_ref()
                 .is_none_or(|side| *worker.worker_type() == side.worker_type)
-                && worker.is_available()
+                && self.takes(worker.as_ref())
                 && self.admits(worker.as_ref())
         });
         if !alternative {
@@ -238,6 +270,26 @@ mod tests {
         ledger.record_outcome(worker.as_ref(), 503);
         ledger.record_outcome(worker.as_ref(), 429);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn a_hosted_requests_retry_window_is_not_closed_by_the_overload_flag() {
+        let w1 = worker("http://w1:8080", 5);
+        let w2 = worker("http://w2:8080", 5);
+        w2.set_overloaded(true);
+        let pool = [Arc::clone(&w1), Arc::clone(&w2)];
+
+        // The classic policies pass over the flagged worker: the answer
+        // stands.
+        let mut classic = answered(StatusCode::INTERNAL_SERVER_ERROR);
+        AttemptLedger::default().settle(&mut classic, [&w1], pool.iter());
+        assert!(!is_retryable_response(&classic));
+
+        // A host reads the veto from the controller's rows: the retry is
+        // left to its placement.
+        let mut hosted = answered(StatusCode::INTERNAL_SERVER_ERROR);
+        AttemptLedger::of(true).settle(&mut hosted, [&w1], pool.iter());
+        assert!(is_retryable_response(&hosted));
     }
 
     #[test]

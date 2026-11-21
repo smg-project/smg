@@ -193,6 +193,9 @@ pub struct WorkerRuntime {
     overloaded: AtomicBool,
     /// Liveness veto, a [`StallReason`] as `u8` (0 = none).
     stall: AtomicU8,
+    /// Set while a liveness signal of the worker waits for the manager's
+    /// loop ([`Self::mark_liveness_signalled`]).
+    liveness_signalled: AtomicBool,
     /// The `smg_worker_state` series last published for the worker (the
     /// series table's index plus one; 0 = none yet), so the series the
     /// worker leaves is set to zero when the next is set to one. Shared
@@ -698,6 +701,7 @@ impl WorkerRuntime {
             revision: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
             stall: AtomicU8::new(0),
+            liveness_signalled: AtomicBool::new(false),
             published_state: AtomicU8::new(0),
             publish_lock: Mutex::new(()),
             last_contact_ms: AtomicU64::new(super::health::liveness::now_ms()),
@@ -779,6 +783,23 @@ impl WorkerRuntime {
     pub fn set_stall(&self, reason: Option<StallReason>) -> bool {
         let next = reason.map_or(0, |reason| reason as u8);
         self.stall.swap(next, Ordering::AcqRel) != next
+    }
+
+    /// Mark that a liveness signal of the worker waits for the manager's
+    /// loop; `true` when none did, which is when the caller sends one. So
+    /// at most one such signal waits per worker, however often the veto
+    /// moves and whether or not a loop reads the channel.
+    pub(crate) fn mark_liveness_signalled(&self) -> bool {
+        !self.liveness_signalled.swap(true, Ordering::AcqRel)
+    }
+
+    /// The loop took the liveness signal: the next move of the veto signals
+    /// again. The loop calls it before its sink reads the veto, and it is a
+    /// swap, so it reads the mark's last write. A move that marked ahead of
+    /// it is ordered ahead of the sink's read, and a move behind it finds no
+    /// mark and signals again. So no move is lost.
+    pub(crate) fn liveness_signal_taken(&self) {
+        self.liveness_signalled.swap(false, Ordering::AcqRel);
     }
 
     /// The code of the `smg_worker_state` series published last (0 when

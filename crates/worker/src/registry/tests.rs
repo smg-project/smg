@@ -11,6 +11,7 @@ use crate::{
     identity::basic::WorkerLoadGuard,
     metrics::{series as worker_series, series::WorkerSeriesRecorder},
     model_card::ModelCard,
+    registry::event::WorkerConnected,
     test_support::{no_health_check, worker_with_model_aliases, BasicWorkerBuilder},
 };
 
@@ -216,19 +217,31 @@ async fn a_returned_connect_signal_receiver_is_taken_again_with_what_was_sent_me
         .expect("the first take");
     registry
         .connect_signal_sender()
-        .send(WorkerConnected {
+        .send(WorkerSignal::Connected(WorkerConnected {
             url: "ipc:///tmp/w.ipc".to_string(),
             revision: 3,
-        })
+        }))
         .expect("send on a live channel");
     registry.return_connect_signal_receiver(held);
-    registry.connect_signal_receiver_returned().await;
+    // A lost wake fails here by its message, not by a hang.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        registry.connect_signal_receiver_returned(),
+    )
+    .await
+    .expect("a hand-back nobody awaited is kept for the next await");
 
     let mut again = registry
         .take_connect_signal_receiver()
         .expect("the receiver is back");
     let got = again.recv().await.expect("the signal sent meanwhile");
-    assert_eq!(got.revision, 3);
+    assert!(
+        matches!(
+            &got,
+            WorkerSignal::Connected(WorkerConnected { revision: 3, .. })
+        ),
+        "{got:?}"
+    );
 }
 
 #[tokio::test]
@@ -239,15 +252,20 @@ async fn connect_signal_sender_delivers_to_the_receiver() {
         .take_connect_signal_receiver()
         .expect("receiver present");
 
-    tx.send(WorkerConnected {
+    tx.send(WorkerSignal::Connected(WorkerConnected {
         url: "ipc:///tmp/w.ipc".to_string(),
         revision: 7,
-    })
+    }))
     .expect("send on a live channel");
 
     let got = rx.recv().await.expect("a delivered signal");
-    assert_eq!(got.url, "ipc:///tmp/w.ipc");
-    assert_eq!(got.revision, 7);
+    assert!(
+        matches!(
+            &got,
+            WorkerSignal::Connected(WorkerConnected { url, revision: 7 }) if url == "ipc:///tmp/w.ipc"
+        ),
+        "{got:?}"
+    );
 }
 
 #[test]

@@ -29,7 +29,7 @@ use super::{
 use crate::{
     config::{PolicyConfig, RouterConfig},
     middleware::ReportedRefusal,
-    policy_controller::host::testing::{bed_over, bed_over_models, MODEL},
+    policy_controller::host::testing::{bed_over, bed_over_models, record_bed_over, MODEL},
     routers::{
         common::{
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
@@ -144,6 +144,42 @@ async fn the_same_bed_with_no_host_is_placed_by_the_classic_policy() -> Case {
     Ok(())
 }
 
+/// A repeated prompt keeps its worker over plain HTTP. The route states the
+/// request's text, the host hashes its windows, and the record of sent
+/// prefixes places by them: the workers publish no cache events and state no
+/// block size.
+#[tokio::test]
+async fn a_repeated_prompt_keeps_its_worker_over_http() -> Case {
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        workers.push(fixed_status_upstream(&[CHAT], StatusCode::OK).await);
+    }
+    let urls: Vec<&str> = workers.iter().map(|(url, _)| url.as_str()).collect();
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _store) = record_bed_over(Arc::clone(&registry), &urls);
+    let router = router(registry, Some(host));
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    // Five windows of text at the document's block size.
+    let prompt = "the same long prompt, ".repeat(16);
+    let request = Arc::new(serde_json::from_value(json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}]
+    }))?);
+    for _ in 0..40 {
+        let answer = router
+            .route_chat(None, &meta, Arc::clone(&request), MODEL)
+            .await;
+        assert_eq!(answer.status(), StatusCode::OK);
+    }
+    let mut hits: Vec<usize> = workers
+        .iter()
+        .map(|(_, hits)| hits.load(Ordering::SeqCst))
+        .collect();
+    hits.sort_unstable();
+    assert_eq!(hits, [0, 0, 40]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_attempt_is_never_placed_on_a_worker_of_another_wire() -> Case {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
@@ -213,6 +249,35 @@ async fn a_placed_attempt_says_its_dispatch_and_its_lease_ends_with_it() -> Case
     Ok(())
 }
 
+/// A prompt under one window is pinned as the classic's prefix policy pins
+/// it: the host keys it by what it has, so its sends land on one worker.
+#[tokio::test]
+async fn a_prompt_under_one_window_lands_on_one_worker_under_the_prefix_ring() -> Case {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let mut upstreams = Vec::new();
+    for _ in 0..3 {
+        upstreams.push(fixed_status_upstream(&[GENERATE], StatusCode::OK).await);
+    }
+    let urls: Vec<&str> = upstreams.iter().map(|(url, _)| url.as_str()).collect();
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &urls);
+    let mut doc = PolicySpec::preset("prefix_hash")?;
+    doc.generation += 1;
+    store.apply(AppliedSpec::validate(&doc)?)?;
+    let router = router(registry, Some(host));
+    for _ in 0..6 {
+        let request = serde_json::from_value(json!({"text": "a prompt of 26 bytes, once"}))?;
+        let response = router.route_generate(None, &meta, request, MODEL).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let mut hits: Vec<usize> = upstreams
+        .iter()
+        .map(|(_, hits)| hits.load(Ordering::SeqCst))
+        .collect();
+    hits.sort_unstable();
+    assert_eq!(hits, [0, 0, 6]);
+    Ok(())
+}
 #[tokio::test]
 async fn a_retry_names_the_row_of_its_failed_attempt() -> Case {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::SERVICE_UNAVAILABLE).await;
@@ -554,6 +619,56 @@ async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() -> Ca
     );
     assert!(response.extensions().get::<ReportedRefusal>().is_some());
     assert_eq!(hits.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+/// Under the host a request that names its worker is refused by name where
+/// the model's classic policy holds it to that worker, on the typed line
+/// and on the transcription line, and no worker is asked. Under a policy
+/// that reads no target the header changes nothing.
+#[tokio::test]
+async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> Case {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let mut headers = HeaderMap::new();
+    headers.insert("x-smg-target-worker", HeaderValue::from_static("0"));
+    for (policy, refused) in [
+        (PolicyConfig::ConsistentHashing, true),
+        (PolicyConfig::RoundRobin, false),
+    ] {
+        let (url, hits) = fixed_status_upstream(&[GENERATE, TRANSCRIBE], StatusCode::OK).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let (host, ..) = bed_over(Arc::clone(&registry), &[&url]);
+        let mut router = router(registry, Some(host));
+        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
+        let request = serde_json::from_value(json!({"text": "hi"}))?;
+        let generated = router
+            .route_generate(Some(&headers), &meta, request, MODEL)
+            .await;
+        let request = TranscriptionRequest {
+            model: MODEL.into(),
+            ..TranscriptionRequest::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"audio"),
+            file_name: "speech.wav".into(),
+            content_type: Some(AUDIO_TYPE.into()),
+        };
+        let transcribed = router
+            .route_audio_transcriptions(Some(&headers), &meta, &request, audio, MODEL)
+            .await;
+        for response in [generated, transcribed] {
+            if refused {
+                assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+                assert_eq!(
+                    extract_error_code_from_response(&response),
+                    "not_decided_by_policy_controller"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), if refused { 0 } else { 2 });
+    }
     Ok(())
 }
 

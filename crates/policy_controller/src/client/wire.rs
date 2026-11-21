@@ -78,6 +78,7 @@ pub(crate) fn request(request: &door::Request<'_>) -> (proto::DecideRequest, usi
             seed: facts.seed,
             prompt_text: Vec::new(),
             block_size: facts.block_size,
+            client_key: facts.client_key,
         }),
         constraints: Some(proto::Constraints {
             excluded: constraints.excluded.iter().map(|id| id.0).collect(),
@@ -86,6 +87,9 @@ pub(crate) fn request(request: &door::Request<'_>) -> (proto::DecideRequest, usi
             subset_hint: constraints.subset_hint,
         }),
         again: false,
+        // No link asks its decode later: the controller issues both sides.
+        decode_later: false,
+        decode_of: None,
     };
     (asked, facts.block_hashes.len() - held)
 }
@@ -354,7 +358,7 @@ mod tests {
     use super::{decided, frame, request};
     use crate::{
         client::MAX_HASHES,
-        controller::wire::{Checked, Decided, Leased, Lists, Viewed},
+        controller::wire::{Beside, Checked, Decided, Leased, Lists, Viewed},
         decision::{
             Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
             Trace,
@@ -407,6 +411,7 @@ mod tests {
                 },
                 seed: 24,
                 block_size: 25,
+                client_key: 29,
                 ..RequestFacts::default()
             },
             constraints: Constraints {
@@ -451,6 +456,7 @@ mod tests {
             let (sent, left_out) = request(&asked);
             assert_eq!(left_out, 0);
             let facts = sent.facts.as_ref().expect("request facts");
+            assert_eq!(facts.client_key, want.client_key);
             if tenant.is_none() {
                 assert!(facts.tenant.is_none());
             }
@@ -477,36 +483,41 @@ mod tests {
                 held: &[],
                 in_flight: None,
                 max_block_hashes: want.block_hashes.len(),
-                named: None,
                 pins: None,
+                signal_cells: None,
             };
-            checked.read(&mut Lists::default(), view, |facts, constraints| {
-                assert_eq!(facts.model, want.model);
-                assert_eq!(facts.namespace_seed, want.namespace_seed);
-                assert_eq!(facts.tenant, want.tenant);
-                assert_eq!(facts.priority, want.priority);
-                assert_eq!(facts.streaming, want.streaming);
-                assert_eq!(facts.max_output_tokens, want.max_output_tokens);
-                assert_eq!(facts.prompt_tokens, want.prompt_tokens);
-                assert_eq!(facts.block_hashes, want.block_hashes);
-                assert_eq!(facts.hash_kind, want.hash_kind);
-                assert_eq!(facts.session_key, want.session_key);
-                assert_eq!(facts.phase, want.phase);
-                assert_eq!(facts.attempt, want.attempt);
-                assert_eq!(facts.tried, want.tried);
-                assert_eq!(facts.budget_micros, view.budget_micros);
-                assert_eq!(facts.headers, want.headers);
-                assert_eq!(facts.media, want.media);
-                assert_eq!(facts.seed, want.seed);
-                assert_eq!(facts.block_size, want.block_size);
-                assert_eq!(constraints.excluded, asked.constraints.excluded);
-                assert_eq!(constraints.wire_modes, asked.constraints.wire_modes);
-                assert_eq!(
-                    constraints.overload_lifted,
-                    asked.constraints.overload_lifted
-                );
-                assert_eq!(constraints.subset_hint, asked.constraints.subset_hint);
-            });
+            checked.read(
+                &mut Lists::default(),
+                view,
+                door::unnamed,
+                |facts, constraints| {
+                    assert_eq!(facts.model, want.model);
+                    assert_eq!(facts.namespace_seed, want.namespace_seed);
+                    assert_eq!(facts.tenant, want.tenant);
+                    assert_eq!(facts.priority, want.priority);
+                    assert_eq!(facts.streaming, want.streaming);
+                    assert_eq!(facts.max_output_tokens, want.max_output_tokens);
+                    assert_eq!(facts.prompt_tokens, want.prompt_tokens);
+                    assert_eq!(facts.block_hashes, want.block_hashes);
+                    assert_eq!(facts.hash_kind, want.hash_kind);
+                    assert_eq!(facts.session_key, want.session_key);
+                    assert_eq!(facts.phase, want.phase);
+                    assert_eq!(facts.attempt, want.attempt);
+                    assert_eq!(facts.tried, want.tried);
+                    assert_eq!(facts.budget_micros, view.budget_micros);
+                    assert_eq!(facts.headers, want.headers);
+                    assert_eq!(facts.media, want.media);
+                    assert_eq!(facts.seed, want.seed);
+                    assert_eq!(facts.block_size, want.block_size);
+                    assert_eq!(constraints.excluded, asked.constraints.excluded);
+                    assert_eq!(constraints.wire_modes, asked.constraints.wire_modes);
+                    assert_eq!(
+                        constraints.overload_lifted,
+                        asked.constraints.overload_lifted
+                    );
+                    assert_eq!(constraints.subset_hint, asked.constraints.subset_hint);
+                },
+            );
         }
     }
 
@@ -559,10 +570,10 @@ mod tests {
             held: &[],
             in_flight: None,
             max_block_hashes: 0,
-            named: None,
             pins: None,
+            signal_cells: None,
         };
-        checked.read(&mut Lists::default(), view, |facts, _| {
+        checked.read(&mut Lists::default(), view, door::unnamed, |facts, _| {
             assert_eq!(facts.tenant.hash, want.tenant.hash);
             assert_eq!(facts.session().get(), want.session().get());
         });
@@ -653,7 +664,11 @@ mod tests {
                 decision,
                 Some(Leased {
                     lease,
-                    decode: paired.then_some(lease.session),
+                    beside: if paired {
+                        Beside::Decode(lease.session)
+                    } else {
+                        Beside::Alone
+                    },
                     left: Duration::from_millis(17),
                     due: now + Duration::from_secs(1),
                 }),
@@ -781,7 +796,7 @@ mod tests {
                     side: Side::Prefill,
                     ..Lease::default()
                 },
-                decode: Some(crate::view::Session::NONE),
+                beside: Beside::Decode(crate::view::Session::NONE),
                 left: Duration::from_secs(1),
                 due: now + Duration::from_secs(1),
             }),
@@ -833,7 +848,7 @@ mod tests {
                     id: LeaseId(17),
                     ..Lease::default()
                 },
-                decode: None,
+                beside: Beside::Alone,
                 left: Duration::from_secs(1),
                 due: now + Duration::from_secs(1),
             }),
@@ -852,7 +867,7 @@ mod tests {
                     id: LeaseId(17),
                     ..Lease::default()
                 },
-                decode: None,
+                beside: Beside::Alone,
                 left: Duration::from_secs(1),
                 due: now + Duration::from_secs(1),
             }),

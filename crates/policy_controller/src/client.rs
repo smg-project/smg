@@ -10,7 +10,9 @@
 //! a time ([`Client::decide`]). [`Link`] shares the session and one decide
 //! stream across a host's requests and releases the leases of a decision
 //! its caller never takes. [`Handle::asked`](crate::handle::Handle::asked)
-//! holds a linked decision and sends its reports on that session.
+//! holds a linked decision and sends its reports on the session that
+//! stands when it reports ([`Link::redial`]). A document the controller
+//! pushes reaches the link's holder ([`Link::spec_pushes`]).
 //!
 //! A watch of the controller's workers opens on either client's channel
 //! ([`Client::watch_workers`], [`Link::watch_workers`]). Once open it has
@@ -42,7 +44,7 @@
 //! caller's budget ([`Link::ask`]) and a report waits for nothing
 //! ([`Link::report`]). The readers of the session and decide stream wait
 //! with no bound of their own. The link sets the channel's keepalive,
-//! which ends a link whose controller went silent ([`Link::connect`]).
+//! which ends a session whose controller went silent ([`Link::connect`]).
 
 use std::{
     future::{poll_fn, Future},
@@ -76,7 +78,7 @@ pub(crate) mod wire;
 
 #[cfg(test)]
 pub(crate) use link::tests::{poll, Peer};
-pub use link::{Full, Link, Unanswered};
+pub use link::{Link, SpecPushes, Unanswered};
 
 /// Frames the client may queue toward the controller.
 const SESSION_QUEUE: usize = 16;
@@ -179,15 +181,19 @@ pub enum Error {
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
-    /// long as the queue covers. The link ended, and the controller's
-    /// session grace covers the leases whose end was not said
-    /// ([`Link::report`]).
+    /// long as the queue covers. The session ended, and the reports its
+    /// queue held are lost with it ([`Link::report`]).
     #[error("the link's report queue was full")]
     ReportsFull,
-    /// A watch was asked of a link that had ended. [`Link::ended`] gives
-    /// the cause.
+    /// A watch was asked of a link with no session standing.
+    /// [`Link::ended`] gives the cause.
     #[error("the link has ended")]
     LinkEnded,
+    /// A link was dialed again while its session stood, or a dial found
+    /// its session let go ahead of its start. The next session took that
+    /// one's place, as it does at the controller ([`Link::redial`]).
+    #[error("the link was dialed again")]
+    Redialed,
     /// The decide stream has no credit left: the gateway decides this
     /// request itself. Nothing was sent, and the stream stands.
     #[error("the decide stream has no credit left: the gateway decides this request itself")]
@@ -266,8 +272,10 @@ impl Session {
         wait: Duration,
     ) -> Result<(Self, u64), Error> {
         let (frames, queued) = mpsc::channel(SESSION_QUEUE);
+        // This client takes no pushed document: its hello states no
+        // generation.
         frames
-            .send(hello(gateway_id, floor))
+            .send(hello(gateway_id, floor, 0))
             .await
             .map_err(|_| Error::NoWelcome("the session's queue is closed".to_owned()))?;
         let (answers, welcome, term) =
@@ -385,8 +393,10 @@ fn numbered(seq: u64, floor: u64, frame: gateway_frame::Frame) -> GatewayFrame {
 }
 
 /// The session's first frame: the hello of `gateway_id`, numbered 1, which
-/// states `floor` as the term it saw and as its term floor.
-fn hello(gateway_id: &str, floor: u64) -> GatewayFrame {
+/// states `floor` as the term it saw and as its term floor. `generation`
+/// is the controller's generation whose document the gateway's own engine
+/// runs, and 0 where it runs none of the controller's.
+fn hello(gateway_id: &str, floor: u64, generation: u64) -> GatewayFrame {
     GatewayFrame {
         seq: 1,
         term_floor: floor,
@@ -395,6 +405,7 @@ fn hello(gateway_id: &str, floor: u64) -> GatewayFrame {
             protocol_min: PROTOCOL_VERSION,
             protocol_max: PROTOCOL_VERSION,
             term_seen: floor,
+            generation,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             ..Hello::default()
         })),
@@ -1145,7 +1156,7 @@ mod tests {
 
     #[test]
     fn the_hello_is_the_first_frame_and_states_the_floor_twice() {
-        let frame = hello("gateway-1", 7);
+        let frame = hello("gateway-1", 7, 3);
         assert_eq!((frame.seq, frame.term_floor), (1, 7), "{frame:?}");
         let hello = match frame.frame {
             Some(gateway_frame::Frame::Hello(hello)) => Some(hello),
@@ -1154,6 +1165,7 @@ mod tests {
         .expect("the first frame is a hello");
         assert_eq!(hello.gateway_id, "gateway-1");
         assert_eq!(hello.term_seen, 7);
+        assert_eq!(hello.generation, 3);
         assert_eq!(
             (hello.protocol_min, hello.protocol_max),
             (PROTOCOL_VERSION, PROTOCOL_VERSION)
@@ -2269,6 +2281,7 @@ mod tests {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         };
         // A longer name is written with a longer length: fill, then mend.
         let mut name = size - request.encoded_len();

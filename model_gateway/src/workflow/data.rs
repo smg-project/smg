@@ -82,6 +82,12 @@ pub struct RegistrationNotes {
     /// resolves it from the model card and the names; none for an HTTP
     /// worker, the legacy parsers or a model no table reads).
     pub symphony_table: Option<&'static str>,
+    /// The pool-size groups the registration touches, as the gateway's
+    /// check read them ahead of the write: each new worker's group, and
+    /// the group of the worker it replaces. Where a local worker is a row,
+    /// the door writes the registry ahead of the registration step, which
+    /// no longer finds the worker a replacement moved out of its group.
+    pub pool_groups: worker_workflow::PoolGroups,
 }
 
 /// Unified data for worker registration workflows (both local and external),

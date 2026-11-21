@@ -872,7 +872,7 @@ def launcher_policies() -> list[str]:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     RouterArgs.add_cli_args(parser)
     choices = parser._option_string_actions["--policy"].choices
-    assert choices is not None
+    assert choices is not None, "the launcher's --policy option holds no choices"
     return list(choices)
 
 

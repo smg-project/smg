@@ -133,7 +133,10 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
     // What a registration states for a hard demand is none of the three
     // facts: its next life is handed the status too.
     let mut other_runtime = facts("http://w:8000", 3);
-    other_runtime.demand_facts = DemandFacts { runtime: 9 };
+    other_runtime.demand_facts = DemandFacts {
+        runtime: 9,
+        ..DemandFacts::default()
+    };
     let stated = store.upsert(other_runtime).id();
     assert_eq!(
         WorkersStore::get(&store, stated).expect("the row").status,
@@ -233,6 +236,63 @@ fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log(
         workers.changes_since(head - 1),
         MembershipTail::Changes(changes) if changes.len() == 1
     ));
+}
+
+#[test]
+fn snapshot_sort_does_not_hold_the_workers_lock() {
+    let store = Arc::new(MemoryStore::new());
+    let id = store.upsert(facts("http://c:8000", 1)).id();
+    store.upsert(facts("http://a:8000", 1));
+    store.upsert(facts("http://b:8000", 1));
+    let revision = WorkersStore::get(store.as_ref(), id)
+        .expect("the row")
+        .revision;
+    let epoch = store.epoch();
+    let (cloned, resume) = store.pause_snapshot_after_clone();
+
+    let snapshot_store = Arc::clone(&store);
+    let snapshot = std::thread::spawn(move || WorkersStore::snapshot(snapshot_store.as_ref()));
+    cloned
+        .recv_timeout(PATIENCE)
+        .expect("snapshot reached the sort");
+
+    let writer_store = Arc::clone(&store);
+    let (written_tx, written_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let change = writer_store.set_status(id, WorkerStatus::Ready, revision);
+        written_tx
+            .send(change)
+            .expect("the test receives the write");
+    });
+    let written_while_paused = written_rx.recv_timeout(PATIENCE);
+
+    resume.send(()).expect("resume the snapshot");
+    let (snapshot_epoch, rows) = snapshot.join().expect("snapshot thread");
+    writer.join().expect("writer thread");
+    assert_eq!(snapshot_epoch, epoch, "epoch was read with the rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.facts.key.as_str())
+            .collect::<Vec<_>>(),
+        ["http://a:8000", "http://b:8000", "http://c:8000"],
+        "snapshot rows are ordered by key"
+    );
+    assert_eq!(
+        rows.iter().find(|row| row.id == id).map(|row| row.status),
+        Some(WorkerStatus::Pending),
+        "the snapshot keeps the row copied before the status write"
+    );
+    assert!(
+        matches!(
+            written_while_paused,
+            Ok(Some(MembershipChange::StatusChanged {
+                id: changed,
+                from: WorkerStatus::Pending,
+                to: WorkerStatus::Ready,
+            })) if changed == id
+        ),
+        "status write waited for snapshot sorting"
+    );
 }
 
 #[test]
@@ -1599,8 +1659,12 @@ fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
     assert!(sessions.lookup(2).is_some());
 }
 
+/// A removed worker's pins of record stand through its absence, and the
+/// worker it was takes them back where its key is registered again, under
+/// the id the registration makes. A new life of the same worker in place
+/// keeps its own. Another worker under the key takes none.
 #[test]
-fn a_removed_workers_pins_of_record_leave_with_its_row() {
+fn a_key_registered_again_as_the_worker_it_was_takes_its_pins_of_record() {
     let store = MemoryStore::new();
     let (a, b) = (
         ready(&store, "http://a:8000"),
@@ -1611,17 +1675,343 @@ fn a_removed_workers_pins_of_record_leave_with_its_row() {
     sessions.pin(11, a, now, None);
     sessions.pin(12, b, now, None);
     sessions.pin(13, a, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
     let revision = WorkersStore::get(&store, a).expect("the row").revision;
     store.remove(a, revision).expect("removed");
-    // The removal's own write drops them: no sweep ran, and no rule
-    // stands.
-    assert!(sessions.lookup(11).is_none() && sessions.lookup(13).is_none());
-    assert_eq!(sessions.lookup(12).map(|pin| pin.worker), Some(b));
+    // The removal drops none: the key may be registered again.
+    assert_eq!((of(11), of(13)), (Some(a), Some(a)));
+    let again = store.upsert(facts("http://a:8000", 2)).id();
+    assert_ne!(again, a);
+    assert_eq!((of(11), of(13)), (Some(again), Some(again)));
+    assert_eq!(of(12), Some(b));
+    let life = store.upsert(facts("http://b:8000", 2)).id();
+    assert_ne!(life, b);
+    assert_eq!(of(12), Some(life), "a new life of the same worker");
+    // Removed again, then registered in another role: another worker.
+    let revision = WorkersStore::get(&store, again).expect("the row").revision;
+    store.remove(again, revision).expect("removed");
+    store.upsert(WorkerFacts {
+        role: Role::Decode,
+        ..facts("http://a:8000", 3)
+    });
+    assert_eq!((of(11), of(13)), (None, None));
     assert_eq!(sessions.len(), 1);
-    // A replaced incarnation's row is gone as well, and so is its pin.
-    let replaced = store.upsert(facts("http://b:8000", 2)).id();
-    assert_ne!(replaced, b);
-    assert!(sessions.is_empty(), "the old incarnation's pin");
+    // A new life in another role, in place: another worker too.
+    store.upsert(WorkerFacts {
+        role: Role::Prefill,
+        ..facts("http://b:8000", 3)
+    });
+    assert!(sessions.is_empty(), "the old worker's pin");
+}
+
+/// Two registrations of one key rename its pins of record in their order.
+/// The second lands where the first has let the workers lock go, and the
+/// pin names the last life: in place, and for a key that left.
+#[test]
+fn registrations_of_one_key_rename_its_pins_of_record_in_their_order() {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::memory::seam;
+
+    let store = Rc::new(MemoryStore::new());
+    let sessions: &dyn SessionsStore = &*store;
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    let now = Instant::now();
+    // The third life of `key`, registered behind the next registration.
+    let third_behind = |key: &'static str| {
+        let third = Rc::new(Cell::new(None));
+        let (behind, seen) = (Rc::clone(&store), Rc::clone(&third));
+        seam::on_release(move || seen.set(Some(behind.upsert(facts(key, 3)).id())));
+        third
+    };
+    // In place: the key's second life is replaced by its third at once.
+    let a = ready(&store, "http://a:8000");
+    sessions.pin(11, a, now, None);
+    let third = third_behind("http://a:8000");
+    store.upsert(facts("http://a:8000", 2));
+    assert!(third.get().is_some(), "the hook ran");
+    assert_eq!(of(11), third.get());
+    // A key that left: registered again, and that life replaced at once.
+    let b = ready(&store, "http://b:8000");
+    sessions.pin(12, b, now, None);
+    let revision = WorkersStore::get(&*store, b).expect("the row").revision;
+    store.remove(b, revision).expect("removed");
+    let third = third_behind("http://b:8000");
+    store.upsert(facts("http://b:8000", 2));
+    assert!(third.get().is_some(), "the hook ran");
+    assert_eq!(of(12), third.get());
+}
+
+/// A key that stays away longer than the absence's time takes no pin
+/// back: the time is the longest TTL among the document's session rules.
+#[test]
+fn a_key_registered_again_past_the_absences_time_takes_no_pin() {
+    let store = MemoryStore::new();
+    let ruled = manual_ruled(1, 1, 1);
+    store.apply(ruled).expect("above the unbound start");
+    let a = ready(&store, "http://a:8000");
+    let sessions: &dyn SessionsStore = &store;
+    sessions.pin(11, a, Instant::now(), None);
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    assert!(sessions.lookup(11).is_some(), "inside its time");
+    std::thread::sleep(Duration::from_millis(1_100));
+    store.upsert(facts("http://a:8000", 2));
+    assert_eq!(sessions.lookup(11), None);
+}
+
+/// A key that stays away is forgotten at the store's tick, in the engine's
+/// table and of record: no membership write and no decision has to follow.
+#[test]
+fn the_tick_ends_the_absence_of_a_key_that_stays_away() {
+    let store = MemoryStore::new();
+    let ruled = manual_ruled(1, 1, 1);
+    store.apply(ruled).expect("above the unbound start");
+    let a = ready(&store, "http://a:8000");
+    let sessions: &dyn SessionsStore = &store;
+    sessions.pin(11, a, Instant::now(), None);
+    let key = Session::from_raw(21);
+    let world = store.world();
+    let table = world.spec().engine().sessions();
+    table.dispatched(key, SessionVerdict::Pinned, a);
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    store.sweep_pins(Instant::now());
+    assert!(sessions.lookup(11).is_some(), "inside its time");
+    assert_eq!(table.pins(key).map(|pins| pins[0]), Some(a));
+    store.sweep_pins(Instant::now() + Duration::from_millis(1_100));
+    assert_eq!((sessions.lookup(11), table.pins(key)), (None, None));
+}
+
+/// `follower` takes `change`, a write `leader` just made, by the door a
+/// standby's applier and a gateway's watcher use.
+fn followed(leader: &MemoryStore, follower: &MemoryStore, change: MembershipChange) {
+    let row = match change {
+        MembershipChange::Registered { id } | MembershipChange::Replaced { new: id, .. } => {
+            WorkersStore::get(leader, id)
+        }
+        _ => None,
+    };
+    let epoch = WorkersStore::epoch(leader);
+    follower.follow(Position::default(), epoch, change, row);
+    assert_eq!(WorkersStore::epoch(follower), epoch, "the change landed");
+}
+
+/// A follower takes its leader's steps for a key's session pins, in its
+/// engine's table and of record. A followed removal drops none. The worker
+/// it was takes them back at its followed registration, under the id that
+/// registration made. A followed new life of the same worker keeps its
+/// own. Another worker under the key takes none.
+#[test]
+fn a_followed_key_registered_again_as_the_worker_it_was_takes_its_pins() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let join = |facts: WorkerFacts| {
+        let change = leader.upsert(facts);
+        followed(&leader, &follower, change);
+        change.id()
+    };
+    let leave = |id: WorkerId| {
+        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let change = leader.remove(id, revision).expect("removed");
+        followed(&leader, &follower, change);
+    };
+    let (a, b) = (
+        join(facts("http://a:8000", 1)),
+        join(facts("http://b:8000", 1)),
+    );
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    sessions.pin(11, a, now, None);
+    sessions.pin(12, b, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    // The follower's engine holds a pin of its own.
+    let key = Session::from_raw(21);
+    let world = follower.world();
+    let table = world.spec().engine().sessions();
+    table.dispatched(key, SessionVerdict::Pinned, a);
+    let held = || table.pins(key).map(|pins| pins[0]);
+    leave(a);
+    assert_eq!((of(11), held()), (Some(a), Some(a)), "none is dropped");
+    let again = join(facts("http://a:8000", 2));
+    assert_ne!(again, a);
+    assert_eq!((of(11), held()), (Some(again), Some(again)));
+    assert_eq!(of(12), Some(b));
+    let life = join(facts("http://b:8000", 2));
+    assert_ne!(life, b);
+    assert_eq!(of(12), Some(life), "a new life of the same worker");
+    // Removed again, then registered in another role: another worker.
+    leave(again);
+    join(WorkerFacts {
+        role: Role::Decode,
+        ..facts("http://a:8000", 3)
+    });
+    assert_eq!((of(11), held()), (None, None));
+    assert_eq!(sessions.len(), 1);
+    // A new life in another role, in place: another worker too.
+    join(WorkerFacts {
+        role: Role::Prefill,
+        ..facts("http://b:8000", 3)
+    });
+    assert!(sessions.is_empty(), "the old worker's pin");
+}
+
+/// A follower counts a key's absence by its own clock, from the removal
+/// it followed. A key registered again past that time takes no pin, at
+/// its followed registration and at a snapshot that holds it again.
+#[test]
+fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
+    let leader = MemoryStore::new();
+    let followers = [MemoryStore::new(), MemoryStore::new()];
+    let joined = leader.upsert(facts("http://a:8000", 1));
+    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    for follower in &followers {
+        follower
+            .apply(manual_ruled(1, 1, 1))
+            .expect("above the unbound start");
+        followed(&leader, follower, joined);
+        SessionsStore::pin(follower, 11, joined.id(), Instant::now(), None);
+    }
+    let removed = leader.remove(joined.id(), revision.revision);
+    let removed = removed.expect("removed");
+    for follower in &followers {
+        followed(&leader, follower, removed);
+        let pin = SessionsStore::lookup(follower, 11);
+        assert!(pin.is_some(), "inside its time");
+    }
+    std::thread::sleep(Duration::from_millis(1_100));
+    let again = leader.upsert(facts("http://a:8000", 2));
+    followed(&leader, &followers[0], again);
+    assert!(followers[1].watch_from(leader.cut(Kinds::Watched)));
+    for follower in &followers {
+        assert_eq!(SessionsStore::lookup(follower, 11), None);
+    }
+}
+
+/// A follower files the key of a removal it followed. Where it leads
+/// next, its own registration of the key takes the pins.
+#[test]
+fn a_key_a_follower_saw_leave_takes_its_pins_at_the_followers_own_write() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let joined = leader.upsert(facts("http://a:8000", 1));
+    followed(&leader, &follower, joined);
+    let sessions: &dyn SessionsStore = &follower;
+    sessions.pin(11, joined.id(), Instant::now(), None);
+    let revision = WorkersStore::get(&leader, joined.id()).expect("the row");
+    let removed = leader.remove(joined.id(), revision.revision);
+    followed(&leader, &follower, removed.expect("removed"));
+    let again = follower.upsert(facts("http://a:8000", 2)).id();
+    assert_eq!(sessions.lookup(11).map(|pin| pin.worker), Some(again));
+}
+
+/// A snapshot's rows move a key's session pins as the writes it stands
+/// for would have, in the engine's table and of record, at a gateway's
+/// watch and at a standby's restore. A key the cut holds under a new id
+/// takes its pins where it is the worker it was. Another worker's pins
+/// leave. A key the cut drops keeps its pins on file, and takes them at
+/// its followed registration.
+#[test]
+fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
+    for restore in [false, true] {
+        let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+        let lay = || {
+            let cut = leader.cut(Kinds::All);
+            if restore {
+                follower.restore_from(cut)
+            } else {
+                follower.watch_from(cut)
+            }
+        };
+        let keys = [
+            "http://a:8000",
+            "http://b:8000",
+            "http://c:8000",
+            "http://d:8000",
+        ];
+        let [a, b, c, d] = keys.map(|key| leader.upsert(facts(key, 1)).id());
+        assert!(lay());
+        let sessions: &dyn SessionsStore = &follower;
+        let now = Instant::now();
+        for (key, worker) in [(11, a), (12, b), (13, c), (14, d)] {
+            sessions.pin(key, worker, now, None);
+        }
+        let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+        // The follower's engine holds a pin of its own.
+        let key = Session::from_raw(21);
+        let world = follower.world();
+        let table = world.spec().engine().sessions();
+        table.dispatched(key, SessionVerdict::Pinned, a);
+        let held = || table.pins(key).map(|pins| pins[0]);
+        // The follower hears none of these writes.
+        let leave = |id: WorkerId| {
+            let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+            leader.remove(id, revision).expect("removed");
+        };
+        leave(a);
+        let again = leader.upsert(facts("http://a:8000", 2)).id();
+        leave(b);
+        leader.upsert(WorkerFacts {
+            role: Role::Decode,
+            ..facts("http://b:8000", 2)
+        });
+        leave(c);
+        assert!(lay());
+        assert_eq!((of(11), held()), (Some(again), Some(again)));
+        assert_eq!(of(12), None, "another worker under the key");
+        assert_eq!((of(13), of(14)), (Some(c), Some(d)), "none is dropped");
+        let back = leader.upsert(facts("http://c:8000", 2));
+        followed(&leader, &follower, back);
+        assert_eq!(of(13), Some(back.id()), "the dropped key was on file");
+    }
+}
+
+/// A key on file when a snapshot comes stays there where the cut does not
+/// hold it. Where the cut holds it again as the worker it was, it takes
+/// its pins.
+#[test]
+fn a_snapshot_returns_a_key_that_had_left_to_its_pins() {
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let [a, b] = ["http://a:8000", "http://b:8000"].map(|key| {
+        let change = leader.upsert(facts(key, 1));
+        followed(&leader, &follower, change);
+        change.id()
+    });
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    sessions.pin(11, a, now, None);
+    sessions.pin(12, b, now, None);
+    let of = |key: u64| sessions.lookup(key).map(|pin| pin.worker);
+    for id in [a, b] {
+        let revision = WorkersStore::get(&leader, id).expect("the row").revision;
+        let change = leader.remove(id, revision).expect("removed");
+        followed(&leader, &follower, change);
+    }
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert_eq!((of(11), of(12)), (Some(a), Some(b)), "both stay on file");
+    let again = leader.upsert(facts("http://a:8000", 2)).id();
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert_eq!((of(11), of(12)), (Some(again), Some(b)));
+    let back = leader.upsert(facts("http://b:8000", 2));
+    followed(&leader, &follower, back);
+    assert_eq!(of(12), Some(back.id()), "still on file behind two cuts");
+}
+
+/// The rows a snapshot drops are filed while the list has room. Past it
+/// a row's pins leave at once.
+#[test]
+fn a_snapshot_files_no_more_keys_than_the_list_holds() {
+    use super::memory::GONE_KEYS;
+    let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
+    let ids: Vec<WorkerId> = (0..GONE_KEYS + 2)
+        .map(|at| leader.upsert(facts(&format!("http://w{at}:8000"), 1)).id())
+        .collect();
+    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    let sessions: &dyn SessionsStore = &follower;
+    let now = Instant::now();
+    for (key, &id) in (1..).zip(&ids) {
+        sessions.pin(key, id, now, None);
+    }
+    assert!(follower.watch_from(MemoryStore::new().cut(Kinds::Watched)));
+    assert_eq!(sessions.len(), GONE_KEYS);
 }
 
 /// The door of a writer that knows a key's rule by its lease alone: the
@@ -1701,7 +2091,7 @@ fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
         },
     );
     assert_eq!(sessions.len(), 3);
-    assert_eq!(sessions.drop_worker(WorkerId(9)), 1);
+    assert_eq!(sessions.drop_workers(&[WorkerId(9)]), 1);
     let two = store.micros(now + Duration::from_secs(2));
     assert_eq!(sessions.expire(two), 1);
     assert_eq!(sessions.lookup(11), None);
@@ -1943,8 +2333,8 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
     let mut heard = None;
     assert!(store.unlocked());
-    let issued = store
-        .issue_decided_decode(gateway, id, decode, None, now, |lease| {
+    let (issued, _) = store
+        .issue_decided_decode(gateway, id, (decode, None), now, |lease| {
             assert!(!store.unlocked(), "the issue is told under the turn");
             heard = Some(*lease);
         })
@@ -2762,6 +3152,7 @@ fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store.deciding(|world| {
@@ -3013,6 +3404,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store
@@ -3043,6 +3435,7 @@ fn held_count(world: &World, gateway: GatewayId, now: Instant) -> u32 {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     let view = world
@@ -3205,6 +3598,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     let mut out = ViewBuffers::default();
     store
@@ -3404,6 +3798,7 @@ fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
         now,
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store.build_view("m", Role::Single, &ask, &mut built);
     assert!(built.candidates.iter().all(|row| row.in_flight == 0));
@@ -4820,7 +5215,7 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
         }
     }
     assert_eq!(sessions.len(), keys);
-    assert_eq!(sessions.drop_worker(WorkerId(1)), keys / 2);
+    assert_eq!(sessions.drop_workers(&[WorkerId(1)]), keys / 2);
     assert_eq!(sessions.len(), keys / 2);
     for (i, key) in (1_u64..).take(keys).enumerate() {
         assert_eq!(sessions.lookup(key).is_some(), !first(i), "key {key}");
@@ -4855,6 +5250,37 @@ fn told_ids() -> Vec<(u64, Said)> {
     let told = told().into_iter();
     told.map(|(record, said)| (record.lease.id.0 & 0xffff_ffff, said))
         .collect()
+}
+
+thread_local! {
+    static LEASE_HASHES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Default)]
+pub(super) struct LeaseHashes;
+
+impl std::hash::BuildHasher for LeaseHashes {
+    type Hasher = rustc_hash::FxHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        LEASE_HASHES.set(LEASE_HASHES.get() + 1);
+        Self::Hasher::default()
+    }
+}
+
+#[test]
+fn dispatch_and_completion_each_look_up_the_lease_once() {
+    let now = Instant::now();
+    let (store, _, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let hashes = |said| {
+        LEASE_HASHES.set(0);
+        store.hand(&hand, ids[0], said);
+        LEASE_HASHES.get()
+    };
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    let complete = Said::Completed(done(Side::Single));
+    assert_eq!((hashes(dispatch), hashes(complete)), (1, 1));
 }
 
 #[test]
@@ -5316,6 +5742,7 @@ fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
         now: Instant::now(),
         pinned: None,
         affinity: false,
+        signal_cells: false,
     };
     store.deciding(|world| {
         if let Some(built) = world.build("m", Role::Single, &ask, &mut *out) {

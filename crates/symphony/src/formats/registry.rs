@@ -536,6 +536,14 @@ mod tests {
         for v4 in ["deepseek-ai/DeepSeek-V4-Pro", "deepseek-v4-pro"] {
             assert_eq!(table_for(v4), Some(Table::DeepSeekV4), "{v4}");
         }
+        // DeepSeek-V4-Flash-0731 is a group of its own, its encoder's effort table differing from
+        // V4-Flash's, but it writes V4-Flash's output: the V4 table, by the bare name as well.
+        for v4 in [
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "deepseek-v4-flash-0731",
+        ] {
+            assert_eq!(table_for(v4), Some(Table::DeepSeekV4), "{v4}");
+        }
         // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
         // architecture through the V3.2 encoder, as its recorded sets say: the family's table.
         for v3_2 in [

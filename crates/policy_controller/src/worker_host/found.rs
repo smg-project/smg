@@ -1,21 +1,41 @@
 //! The facts a worker object states of its row.
 
+use std::sync::Arc;
+
 use smg_worker::{
     identity::basic::Worker,
-    worker::{ConnectionMode, HealthCheckConfig},
+    worker::{ConnectionMode, HealthCheckConfig, WorkerSpec},
 };
 
-use super::object::role;
+use super::{door::Over, object::role};
 use crate::{
-    store::{HealthPolicy, Overload, WorkerFacts},
+    store::{
+        pairing::{PairingDescriptor, LAYOUT_FACTS},
+        HealthPolicy, Overload, WorkerFacts,
+    },
     view::{threshold_permille, WireModes},
 };
+
+/// The engine a worker's rows stand under: the address its ranks share, or
+/// its own, as it was registered. A join base is not that key: it drops an
+/// HTTP address's trailing slash.
+pub(super) fn engine_of(worker: &dyn Worker) -> &str {
+    let spec = &worker.metadata().spec;
+    spec.dp_base_url.as_deref().unwrap_or(&spec.url)
+}
 
 /// The facts a provider states of a worker it found, from the object to the
 /// row as the module's table describes. Facts the object does not carry
 /// come from the standing row, or from the store's defaults. The models are
 /// the ones the object serves now, and a threshold of its own registration
-/// is stated over the standing row's.
+/// is stated over the standing row's. A threshold it leaves out stays the
+/// standing row's: this reading keeps it under every verb. A door that
+/// writes a replacement by id ([`Over::Replaced`]) clears it past this
+/// reading.
+///
+/// The pairing descriptor is the standing row's here too. A door whose rows
+/// hold one states the worker's own in its place (`paired`, below). The
+/// controller's door states none: its log carries no descriptor.
 pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts {
     let defaults = WorkerFacts::default();
     let standing = standing.unwrap_or(&defaults);
@@ -24,7 +44,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
     let checks = &metadata.health_config;
     WorkerFacts {
         key: spec.url.clone(),
-        engine: spec.dp_base_url.as_ref().unwrap_or(&spec.url).clone(),
+        engine: engine_of(worker).to_owned(),
         incarnation: standing.incarnation,
         role: role(spec.worker_type),
         wire_modes: match spec.connection_mode {
@@ -65,17 +85,14 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             timeout_ms: milliseconds(checks.timeout_secs),
             probes: !checks.disable_health_check,
         },
-        overload: Overload {
-            kv_usage_permille: spec
-                .overload
-                .token_usage
-                .map(threshold_permille)
-                .or(standing.overload.kv_usage_permille),
-            waiting_requests: spec
-                .overload
-                .waiting_requests
-                .map(|waiting| u32::try_from(waiting).unwrap_or(u32::MAX))
-                .or(standing.overload.waiting_requests),
+        overload: {
+            let own = thresholds(spec);
+            Overload {
+                kv_usage_permille: own
+                    .kv_usage_permille
+                    .or(standing.overload.kv_usage_permille),
+                waiting_requests: own.waiting_requests.or(standing.overload.waiting_requests),
+            }
         },
         // A window the object's registration left at the default is not a
         // fact of the row: the object built from the row takes the default.
@@ -83,6 +100,78 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             != HealthCheckConfig::default().drain_settle_secs)
             .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
         demand_facts: standing.demand_facts,
+    }
+}
+
+/// The thresholds a worker's own registration states.
+fn thresholds(spec: &WorkerSpec) -> Overload {
+    Overload {
+        kv_usage_permille: spec.overload.token_usage.map(threshold_permille),
+        waiting_requests: spec
+            .overload
+            .waiting_requests
+            .map(|waiting| u32::try_from(waiting).unwrap_or(u32::MAX)),
+    }
+}
+
+/// The facts `built` states at a write that names `over`: [`facts`], and at
+/// a replacement by id the thresholds as its own registration states them.
+/// A replacement is its maker's whole statement of what a registration can
+/// state, so a threshold it leaves out is cleared. An add finds no row to
+/// keep one from. An upsert and an update keep the standing row's.
+pub(crate) fn stated(
+    built: &dyn Worker,
+    standing: Option<&WorkerFacts>,
+    over: Option<Over<'_>>,
+) -> WorkerFacts {
+    let facts = facts(built, standing);
+    match over {
+        Some(Over::Replaced(_)) => WorkerFacts {
+            overload: thresholds(&built.metadata().spec),
+            ..facts
+        },
+        Some(Over::Updated(_)) | None => facts,
+    }
+}
+
+/// The pairing facts `worker` offers a partner, as a row states them: the
+/// protocol its operator set, its KV transport, its version, and its KV
+/// layout facts in the store's order. The worker derived them once, at its
+/// build, and a gateway's own pair index reads the same descriptor. So the
+/// fields are mapped here and no label is read: one rule says what a worker
+/// reports. A layout fact the store keeps no slot for is left out, since
+/// its rule could not read it. `None` where the worker reports nothing, as
+/// the rule reads a row with no descriptor.
+fn pairing(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
+    let offered = worker.pd_pairing();
+    let mut descriptor = PairingDescriptor {
+        protocol: offered.explicit().map(str::to_owned),
+        transport: offered.transport().map(str::to_owned),
+        version: offered.version().map(str::to_owned),
+        ..PairingDescriptor::default()
+    };
+    for (name, value) in offered.kv_layout() {
+        let slot = LAYOUT_FACTS.iter().position(|&(_, fact)| fact == name);
+        if let Some(slot) = slot {
+            descriptor.kv_layout[slot] = Some(value.to_owned());
+        }
+    }
+    descriptor.normalize();
+    (descriptor != PairingDescriptor::default()).then(|| Arc::new(descriptor))
+}
+
+/// [`stated`], with the pairing descriptor `built` derived at its build in
+/// place of the standing row's ([`pairing`]): the reading of a door whose
+/// rows hold a descriptor. A worker that reports nothing withdraws the
+/// standing one.
+pub(crate) fn paired(
+    built: &dyn Worker,
+    standing: Option<&WorkerFacts>,
+    over: Option<Over<'_>>,
+) -> WorkerFacts {
+    WorkerFacts {
+        pairing: pairing(built),
+        ..stated(built, standing, over)
     }
 }
 
@@ -102,15 +191,17 @@ mod tests {
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
-        worker::{HealthCheckConfig, OverloadUpdate, WorkerSpec},
+        pd::pairing::{layout_labels, PairingMismatch, PdPairingMode},
+        worker::{HealthCheckConfig, OverloadUpdate, RuntimeType, WorkerSpec},
     };
 
-    use super::facts;
+    use super::{facts, paired, pairing};
     use crate::{
         demands::DemandFacts,
+        spec::Pairing,
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
-            pairing::PairingDescriptor,
+            pairing::{mismatch, Member, PairingDescriptor, LAYOUT_FACTS},
             Ask, GatewayId, HealthPolicy, LoadSink as _, LoadSource, Maker, MemoryStore, Overload,
             Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
             WorkersStore as _,
@@ -211,7 +302,10 @@ mod tests {
                 scrape_interval_ms: 3_000,
             },
             reachable_from: Reachability::Gateway(GatewayId(42)),
-            demand_facts: DemandFacts { runtime: 7 },
+            demand_facts: DemandFacts {
+                runtime: 7,
+                ..DemandFacts::default()
+            },
             ..bare.clone()
         };
         let old = WorkerFacts {
@@ -233,6 +327,169 @@ mod tests {
             }
         );
         assert_eq!(facts(&worker, Some(&old)), expected);
+    }
+
+    /// A worker of `runtime` with `labels`.
+    fn offering(runtime: RuntimeType, labels: &[(&str, &str)]) -> impl Worker {
+        let mut spec = WorkerSpec::new(URL.to_owned());
+        spec.runtime_type = runtime;
+        spec.labels = labels
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        <BasicWorkerBuilder>::from_spec(spec).build()
+    }
+
+    /// The descriptor is the one the worker derived at its build: each field
+    /// in its place, a blank value dropped, and the four layout facts in the
+    /// order the worker's own rule compares them. Each runtime's transport
+    /// is its worker's. The table of every door keeps the standing row's.
+    #[test]
+    fn a_worker_offers_the_pairing_facts_it_derived() {
+        let worker = offering(
+            RuntimeType::Sglang,
+            &[
+                ("pairing_protocol", " pd "),
+                ("disaggregation_transfer_backend", "NIXL"),
+                ("version", "1.2"),
+                ("kv_cache_dtype", "fp8"),
+                ("block_size", "16"),
+                ("attention_backend", "fa3"),
+                ("model_dtype", "bf16"),
+            ],
+        );
+        let offered = worker.pd_pairing();
+        let stated = pairing(&worker).expect("a descriptor");
+        assert_eq!(stated.protocol.as_deref(), Some("pd"));
+        assert_eq!(stated.transport.as_deref(), Some("nixl"));
+        assert_eq!(stated.version.as_deref(), Some("1.2"));
+        assert_eq!(stated.protocol.as_deref(), offered.explicit());
+        assert_eq!(stated.transport.as_deref(), offered.transport());
+        assert_eq!(stated.version.as_deref(), offered.version());
+        let layout: Vec<_> = offered.kv_layout().map(|(_, value)| value).collect();
+        assert_eq!(layout, ["fp8", "16", "fa3", "bf16"]);
+        let slots = stated.kv_layout.iter().map(|value| value.as_deref());
+        assert!(slots.eq(layout.into_iter().map(Some)));
+
+        // Each runtime that names a transport states its worker's.
+        for (runtime, labels, transport) in [
+            (
+                RuntimeType::Vllm,
+                [("kv_connector", "NixlConnector")],
+                "nixl",
+            ),
+            (
+                RuntimeType::Sglang,
+                [("disaggregation_transfer_backend", "nixl")],
+                "nixl",
+            ),
+            (RuntimeType::TokenSpeed, [("tier", "gold")], "mooncake"),
+        ] {
+            let worker = offering(runtime, &labels);
+            let stated = pairing(&worker).expect("a descriptor");
+            assert_eq!(stated.transport.as_deref(), Some(transport), "{runtime:?}");
+            assert_eq!(stated.transport.as_deref(), worker.pd_pairing().transport());
+        }
+
+        // The row holds what the rule reads. A worker keeps a connector it
+        // does not know as it stands, blanks and all, and the row reads the
+        // name past them.
+        let mut spec = WorkerSpec::new(URL.to_owned());
+        spec.runtime_type = RuntimeType::Vllm;
+        spec.kv_connector = Some(" Custom ".to_owned());
+        let padded = <BasicWorkerBuilder>::from_spec(spec).build();
+        assert_eq!(padded.pd_pairing().transport(), Some(" custom "));
+        let read = pairing(&padded).expect("a descriptor");
+        assert_eq!(read.transport.as_deref(), Some("custom"));
+
+        // A worker that reports nothing offers no descriptor, and withdraws
+        // the standing row's at a door that reads its own.
+        let silent = offering(RuntimeType::Sglang, &[("version", " ")]);
+        assert_eq!(pairing(&silent), None);
+        let standing = WorkerFacts {
+            pairing: Some(stated),
+            ..WorkerFacts::default()
+        };
+        assert_eq!(paired(&silent, Some(&standing), None).pairing, None);
+        assert_eq!(paired(&worker, None, None).pairing, standing.pairing);
+        // The table states the standing row's descriptor, and none of its own.
+        assert_eq!(facts(&worker, None).pairing, None);
+        assert_eq!(facts(&silent, Some(&standing)).pairing, standing.pairing);
+    }
+
+    /// The store's layout facts are the worker crate's, name for name and in
+    /// its order. The map leaves out a fact the store keeps no slot for, so
+    /// a fact added there with no slot here fails this case.
+    #[test]
+    fn the_stores_layout_facts_are_the_workers_own() {
+        let slots = LAYOUT_FACTS.iter().map(|&(_, fact)| fact);
+        assert!(layout_labels().eq(slots));
+    }
+
+    /// The store's rule over the rows of two workers names the mismatch the
+    /// workers' own rule names, in each mode: a row that states its worker's
+    /// descriptor states every fact the rule reads.
+    #[test]
+    fn two_rows_pair_as_their_workers_do() {
+        fn member(row: &WorkerFacts) -> Member<'_> {
+            Member::new(
+                WorkerId(1),
+                row.wire_modes,
+                &row.engine_kind,
+                row.pairing.as_deref(),
+            )
+        }
+        let labelled = |labels: &[(&str, &str)]| offering(RuntimeType::Sglang, labels);
+        let fleet = [
+            labelled(&[]),
+            labelled(&[("pairing_protocol", "a")]),
+            labelled(&[("pairing_protocol", "b")]),
+            labelled(&[("disaggregation_transfer_backend", "nixl")]),
+            labelled(&[("disaggregation_transfer_backend", "mooncake")]),
+            labelled(&[("version", "1")]),
+            labelled(&[("version", "2")]),
+            labelled(&[("kv_cache_dtype", "fp8")]),
+            labelled(&[("kv_cache_dtype", "auto")]),
+            labelled(&[("page_size", "16")]),
+            labelled(&[("block_size", "32")]),
+            labelled(&[("attention_backend", "fa3")]),
+            labelled(&[("model_dtype", "bf16")]),
+            labelled(&[
+                ("disaggregation_transfer_backend", "nixl"),
+                ("version", "1"),
+                ("page_size", "16"),
+            ]),
+            offering(RuntimeType::Vllm, &[("kv_connector", "NixlConnector")]),
+            offering(RuntimeType::Vllm, &[]),
+            offering(RuntimeType::TokenSpeed, &[]),
+            offering(
+                RuntimeType::TokenSpeed,
+                &[("disaggregation_transfer_backend", "nixl")],
+            ),
+            offering(RuntimeType::Unspecified, &[("version", "1")]),
+        ];
+        let rows: Vec<_> = fleet
+            .iter()
+            .map(|worker| paired(worker, None, None))
+            .collect();
+        let modes = [
+            (Pairing::Strict, PdPairingMode::Strict),
+            (Pairing::Lenient, PdPairingMode::Lenient),
+            (Pairing::Off, PdPairingMode::Off),
+        ];
+        for (rule, classic) in modes {
+            for (prefill, prefill_row) in fleet.iter().zip(&rows) {
+                for (decode, decode_row) in fleet.iter().zip(&rows) {
+                    let by_rows = mismatch(&member(prefill_row), &member(decode_row), rule)
+                        .map(|component| component.to_string());
+                    let by_workers = prefill
+                        .pd_pairing()
+                        .mismatch(decode.pd_pairing(), classic)
+                        .map(PairingMismatch::describe);
+                    assert_eq!(by_rows, by_workers, "{rule:?}");
+                }
+            }
+        }
     }
 
     /// A model list set after the object was built, and a threshold of its
@@ -293,6 +550,7 @@ mod tests {
             now,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut view = ViewBuffers::default();
         store

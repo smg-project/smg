@@ -539,13 +539,13 @@ const ROUTING_FLAGS: &[Row] = &[
     refused("routing-key-override", &[], "routing_key_override.enabled"),
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
-    refused("grouped-dp-sticky", &["hash"], "grouped_dp_sticky"),
     kept(
-        "enable-igw",
+        "grouped-dp-sticky",
         &[],
-        &[],
-        "which models a gateway serves is its deployment, not the document's",
+        &["hash"],
+        "the dispatch pins a key to an engine of a grouped worker behind the decision",
     ),
+    lands("enable-igw", &[], &[]),
     refused(
         "dp-minimum-tokens-scheduler",
         &[],
@@ -772,6 +772,28 @@ fn the_print_checks_its_document_as_the_gateway_checks_one_it_hosts() {
     assert_eq!(
         tenant.refusal(),
         Some("view.headers[0]: header \"x-tenant-id\" is on the deny-list")
+    );
+}
+
+/// The print's check is the start's own: a document past the operators'
+/// door's bound prints with the refusal a start stops by. Twenty thousand
+/// cache boundaries are a line the flags' own checks take.
+#[test]
+fn the_print_refuses_a_document_past_the_doors_bound_as_a_start_does() {
+    let boundaries: Vec<String> = (1..=20_000).map(|at| at.to_string()).collect();
+    let boundaries = boundaries.join(",");
+    let answer = printed(&[
+        "smg",
+        "--policy",
+        "cache_aware",
+        "--cache-boundaries",
+        &boundaries,
+        "--print-policy-spec",
+    ]);
+    let written = answer.document().expect("the document prints").len();
+    assert_eq!(
+        answer.refusal(),
+        Some(format!("the document is {written} bytes; at most 131072").as_str())
     );
 }
 

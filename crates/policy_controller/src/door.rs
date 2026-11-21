@@ -8,8 +8,8 @@
 //! fence and the budget that a wire and an election bring. A host that
 //! embeds the engine runs it on the caller's thread ([`Door`]): no frame
 //! is built and no thread is hopped. A single's issued lease records the
-//! token prefix for its first target when the naming read a record of
-//! sent prefixes and the target has no cache-event lane.
+//! prefix for its first target when the naming read a record of
+//! sent prefixes and the store has heard no cache event of the target.
 //!
 //! A request reaches the order in the form it was asked in (the trait
 //! `Asked`): a frame as the served controller checked it, or the facts a
@@ -29,7 +29,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -40,20 +40,20 @@ pub(crate) use crate::store::world::narrow;
 use crate::{
     counts::Slot,
     decider::Decider,
-    decision::{Decision, Shed, ShedReason, Target, Trace},
+    decision::{Decision, Pair, Pick, ShadowKind, Shed, ShedReason, Target, Targets, Trace},
     demands::{DemandFacts, Demands},
     framework::{
-        release, EncodeItems, EncodePlaced, Engine, Plan, Scratch, KEEPS_DECIDERS,
-        SAMPLES_DECISIONS,
+        release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
+        KEEPS_DECIDERS, SAMPLES_DECISIONS, SHADOWS,
     },
     lease::{Lease, LeaseId, LeaseKind, Lifecycle, Outcome, Side},
     sessions::{Forgets, SessionVerdict},
     spec::AppliedSpec,
     store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeRefused, DecodeSide, EncodePairBuffers,
-        GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore,
-        MemoryStore, Named, Naming, PairBuffers, Picked, Pin, Said, SessionsStore, Sides,
-        ViewBuffers, World,
+        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeIssue, DecodeRefused, DecodeSide, Dispatch,
+        EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
+        LeasesStore, MemoryStore, Named, Naming, PairBuffers, Picked, Pin, Said, SessionsStore,
+        Sides, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, HashKind, KeyedRow, NamedAffinity,
@@ -88,6 +88,12 @@ pub(crate) trait Asked {
     /// Whether the asker sends a pair's decode after its prefill has run:
     /// the pair's first decision then files the decode side chosen.
     fn decode_later(&self) -> bool;
+    /// Whether the request asks the decode side of a pair's lease: a
+    /// request of the served wire alone, read at the decode phase. It
+    /// takes a side's path whatever its model is bound to ([`entry`]).
+    fn asks_decode(&self) -> bool {
+        false
+    }
     /// How many block hashes the request carries.
     fn hashes(&self) -> usize;
     /// How many of them the generation of `spec` reads.
@@ -99,14 +105,28 @@ pub(crate) trait Asked {
     /// The request's seed.
     fn seed(&self) -> u64;
     /// Hands `decide` the request in the engine's form, with what the
-    /// deciding host's view adds to it.
-    fn read<R>(
+    /// deciding host's view adds to it. `name` is asked first, over that
+    /// form with no row named, and what it answers stands as the request's
+    /// named rows ([`RequestFacts::named`]) for `decide`: the form is built
+    /// once. A decision that names no row hands [`unnamed`].
+    fn read<'n, R>(
         &self,
         lists: &mut Self::Lists,
         viewed: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R;
 }
+
+/// The naming of a decision that names no row ([`Asked::read`]).
+pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<NamedAffinity<'static>> {
+    None
+}
+
+/// How many of a generation's bindings count their shadows in a row of
+/// their own ([`Door::shadowed`]). The bindings behind them count in the
+/// last row. A host that shows the counts walks this many rows.
+pub const SHADOW_ROWS: usize = 16;
 
 /// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
@@ -122,6 +142,62 @@ pub(crate) struct Part {
     /// Requests that carried more block hashes than their generation
     /// reads of them.
     pub(crate) hashes_cut: AtomicU64,
+    /// The shadows of this decider's decisions ([`Part::shadowed`]),
+    /// laid at its first: the part of a decider that shadows nothing
+    /// stays its one pair of lines.
+    shadowed: OnceLock<Box<ShadowCounts>>,
+}
+
+/// One decider's counts of its shadows, on lines of their own: a row a
+/// binding by its position in its generation, a count a kind. A table
+/// for each place a shadow is asked ([`Counted`]).
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; 4]);
+
+impl ShadowCounts {
+    fn of(&self, binding: u32, table: Counted, kind: ShadowKind) -> &AtomicU64 {
+        let table = match table {
+            Counted::Single => 0,
+            Counted::Side(side) => 1 + side.index(),
+            Counted::Later => 3,
+        };
+        let row = (binding as usize).min(SHADOW_ROWS - 1);
+        &self.0[table][row][kind.index()]
+    }
+}
+
+/// Where a shadow was asked: the table it is counted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Counted {
+    /// Beside a single's decision.
+    Single,
+    /// Beside this side of a pair, at the pair's decision.
+    Side(PairSide),
+    /// Beside a decode decided after its prefill, at that second
+    /// decision. The pair's first decision counted its decode side
+    /// beside the decode it named first: the two are never one count.
+    Later,
+}
+
+impl Part {
+    /// The count of the shadows that said `kind` beside a decision of
+    /// the binding at position `binding`, for the decider that counts
+    /// one: its counts are laid here at its first. `at` says where the
+    /// shadow was asked.
+    pub(crate) fn shadowed(&self, binding: u32, at: Counted, kind: ShadowKind) -> &AtomicU64 {
+        let counts = self.shadowed.get_or_init(Box::default);
+        counts.of(binding, at, kind)
+    }
+
+    /// That count as it stands, for a reader: none where the decider
+    /// has counted no shadow.
+    pub(crate) fn shadowed_so_far(&self, binding: u32, at: Counted, kind: ShadowKind) -> u64 {
+        let counts = self.shadowed.get();
+        counts.map_or(0, |counts| {
+            counts.of(binding, at, kind).load(Ordering::Relaxed)
+        })
+    }
 }
 
 /// One of the parts' counts, summed over `parts`.
@@ -131,7 +207,8 @@ pub(crate) fn summed(parts: &[Part], count: impl Fn(&Part) -> &AtomicU64) -> u64
 }
 
 /// The stage a decision is shed under when its pool has rows and its
-/// gateway shares a wire with none of them.
+/// gateway shares a wire with none of them, or its request's runtime is
+/// none of theirs ([`Unmet::Runtime`](crate::demands::Unmet::Runtime)).
 pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
@@ -364,7 +441,9 @@ pub(crate) enum Entry {
     Pair,
     /// Another side of a pair plan. A pair's alternates ride its answer
     /// and a retry is a new pair request, so that side has no decision,
-    /// and one side's entry of the engine never makes one.
+    /// and one side's entry of the engine never makes one. The one
+    /// decision a side has is the decode of a lease its request names
+    /// ([`Asked::asks_decode`]).
     Side,
 }
 
@@ -387,6 +466,9 @@ fn entry_and_plan<A: Asked>(world: &World, taken: &Taken<'_, A>) -> (Entry, Plan
             Phase::Prefill => (Entry::Pair, binding.plan),
             _ => (Entry::Side, binding.plan),
         },
+        // A decode call whose model a reload bound to no pair plan is a
+        // side's request still: its lease's own test answers it.
+        _ if taken.request.asks_decode() => (Entry::Side, Plan::Single),
         _ => (Entry::Single, Plan::Single),
     }
 }
@@ -395,9 +477,12 @@ fn entry_and_plan<A: Asked>(world: &World, taken: &Taken<'_, A>) -> (Entry, Plan
 /// lease takes of its request. Over rows the store named it is made at the
 /// entry that states what the pick's first target holds of them
 /// ([`Engine::decide_stated`]), and over any other view at the plain entry.
-struct ByEngine<'a>(&'a Engine);
+/// Under `KEEPS` each is the entry's keeping form, which keeps what the
+/// decision read of its session key for the request's shadow
+/// ([`Engine::decide_keeping`]).
+struct ByEngine<'a, const KEEPS: bool>(&'a Engine);
 
-impl ByEngine<'_> {
+impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
     // Forced into each form's one call: out of line the plain form would
     // pay a call the closure it stands for never made.
     #[inline(always)]
@@ -410,27 +495,13 @@ impl ByEngine<'_> {
         scratch: &mut Scratch,
     ) -> (Decision, Option<Booking>) {
         let engine = self.0;
-        if candidates.is_empty() && pool.pool_size > 0 {
-            // What the gateway states of itself left none of a pool
-            // that has rows: said under that constraint's name, where
-            // the engine would name no stage.
-            let emptied_by = if constraints.subset_hint == Some(0) {
-                SUBSET_HINT
-            } else {
-                WIRES
-            };
-            let none = shed(
-                ShedReason::NoEndpoints,
-                emptied_by,
-                facts.seed,
-                pool.generation,
-            );
-            return (none, None);
-        }
-        let decision = if STATED {
-            engine.decide_stated(facts, pool, candidates, constraints, scratch)
-        } else {
-            engine.decide(facts, pool, candidates, constraints, scratch)
+        let decision = match (STATED, KEEPS) {
+            (false, false) => engine.decide(facts, pool, candidates, constraints, scratch),
+            (true, false) => engine.decide_stated(facts, pool, candidates, constraints, scratch),
+            (false, true) => engine.decide_keeping(facts, pool, candidates, constraints, scratch),
+            (true, true) => {
+                engine.decide_stated_keeping(facts, pool, candidates, constraints, scratch)
+            }
         };
         // What a pick's lease takes of its request, read where the
         // request stands as the engine read it.
@@ -459,7 +530,7 @@ impl ByEngine<'_> {
     }
 }
 
-impl Decides<(Decision, Option<Booking>)> for ByEngine<'_> {
+impl Decides<(Decision, Option<Booking>)> for ByEngine<'_, false> {
     fn over(
         self,
         facts: &RequestFacts<'_>,
@@ -481,6 +552,21 @@ impl Decides<(Decision, Option<Booking>)> for ByEngine<'_> {
     ) -> (Decision, Option<Booking>) {
         self.decided::<true>(facts, pool, candidates, constraints, scratch)
     }
+
+    /// What the request states of itself left none of a pool that has
+    /// rows: said under that stage's name, where the engine would name no
+    /// stage.
+    fn emptied(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        _: &Constraints<'_>,
+        _: &mut Scratch,
+        stage: &'static str,
+    ) -> (Decision, Option<Booking>) {
+        let none = shed(ShedReason::NoEndpoints, stage, facts.seed, pool.generation);
+        (none, None)
+    }
 }
 
 /// The engine's decision over the world of one load, for a request that
@@ -499,11 +585,440 @@ pub(crate) fn decide_in<A: Asked>(
     if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    let ((decision, booking), built) = hand(world, taken, buffers, &own.undialed, ByEngine(engine));
+    let plain = ByEngine::<false>(engine);
+    let ((decision, booking), built) = hand(world, taken, buffers, &own.undialed, plain);
     (
         decision,
         booking.map(|booking| Booking { built, ..booking }),
     )
+}
+
+/// What a request's budget must still hold at the end of its live
+/// decision for its shadow to be asked. A shadow asked with less could
+/// take a served answer past its budget, where the decider's last read
+/// refuses it.
+pub(crate) const SHADOW_FLOOR: Duration = Duration::from_millis(1);
+
+/// What a decision's shadow said beside it, where one was due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shadowed {
+    /// The position of the request's binding in its generation.
+    pub(crate) binding: u32,
+    /// The shadow's decision beside the live one, and
+    /// [`ShadowKind::Skipped`] where the shadow was due and not asked.
+    pub(crate) kind: ShadowKind,
+    /// The first target of the shadow's pick.
+    pub(crate) first: Option<WorkerId>,
+}
+
+/// What became of a decision's shadow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shadow {
+    /// None was due: the request's binding asks none, or the door made
+    /// the decision itself over a view its gateway left no row.
+    NotDue,
+    /// One was due: what it said, or that it was not asked.
+    Said(Shadowed),
+    /// The shadow panicked, and the panic was held where it was asked.
+    Faulted,
+}
+
+/// [`ByEngine`] under a generation that shadows. The live decision is
+/// made at the engine's keeping entries and taken with its booking as
+/// values. Then the binding's shadow is asked over the same view
+/// ([`Engine::shadow`]), ahead of the commit: the rows and the counts are
+/// those the live decision read, and no stage has heard of its lease.
+/// The shadow writes the scratch and its own stages, and nothing the
+/// commit reads.
+///
+/// A shadow that is due is not asked in two places, and is said as
+/// skipped. A request with less than [`SHADOW_FLOOR`] of its budget left
+/// keeps that for its answer. And the rows the live decision was handed
+/// are not the shadow profile's where that profile would be handed
+/// others ([`ShadowRows::Apart`]). A shadow profile that reads no column
+/// is asked without the rows named for the live one
+/// ([`ShadowRows::Unnamed`]). One that is named rows of its own is asked
+/// over rows the door names again for it ([`ShadowRows::Own`],
+/// [`OwnRows`]), behind the live decision and the floor.
+///
+/// A shadow that panics is held here, inside the catch its host keeps
+/// round the decision: the live decision stands as decided.
+///
+/// A decider is built for one way of asking its shadow ([`ShadowAsk`]):
+/// one whose shadow reads the live decision's rows carries nothing of a
+/// naming.
+struct Shadowing<'a, L, R> {
+    engine: &'a Engine,
+    /// The request's binding and how its shadow reads the live
+    /// decision's rows, as the seat read them ahead of the order
+    /// ([`Engine::shadow_for`]).
+    due: (u32, ShadowRows),
+    /// What the request's budget still holds at the end of the live
+    /// decision: asked there, and only where a shadow is due.
+    left: L,
+    /// How the shadow is asked.
+    ask: R,
+}
+
+/// How a [`Shadowing`] decider asks its shadow, by the rows the shadow
+/// profile reads: those of its live decision ([`LiveRows`]), or none of
+/// them ([`OwnRows`]).
+trait ShadowAsk {
+    /// Whether the live decision reads the affinity column its needs
+    /// declare ([`Decides::reads_column`]).
+    fn reads_column(&self) -> bool;
+
+    /// The shadow's decision over the live decision's view, by `rows`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the engine's shadow entry and its inputs, beside the rows' word"
+    )]
+    fn shadow(
+        self,
+        engine: &Engine,
+        rows: ShadowRows,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision>;
+}
+
+/// The asking of a shadow that reads the rows its live decision was
+/// handed ([`ShadowRows::Same`]), or the view without the rows named for
+/// the live profile ([`ShadowRows::Unnamed`]).
+struct LiveRows;
+
+impl ShadowAsk for LiveRows {
+    fn reads_column(&self) -> bool {
+        true
+    }
+
+    // Forced into the decider's one call: the asking stands in line
+    // there, as it did where the decider held no other.
+    #[inline(always)]
+    fn shadow(
+        self,
+        engine: &Engine,
+        rows: ShadowRows,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        match rows {
+            // A profile that reads no column is named no row, live or
+            // as a shadow: the names would turn its pick to a draw.
+            ShadowRows::Unnamed => {
+                let unnamed = RequestFacts {
+                    named: None,
+                    ..*facts
+                };
+                engine.shadow(&unnamed, pool, candidates, constraints, scratch)
+            }
+            _ => engine.shadow(facts, pool, candidates, constraints, scratch),
+        }
+    }
+}
+
+/// The asking of a shadow that reads none of its live decision's rows:
+/// one that is named rows of its own ([`ShadowRows::Own`]), and one that
+/// is skipped ([`ShadowRows::Apart`]). It holds what the door names such
+/// rows by, beside the request: the world of the decision's one load,
+/// the gateway and the wires its view was built and narrowed for,
+/// whether a demand may have taken a row of it, and the buffer the rows
+/// are written on.
+struct OwnRows<'a> {
+    world: &'a World,
+    gateway: GatewayId,
+    wires: Option<WireModes>,
+    cut: bool,
+    named: &'a mut Named,
+    /// Whether the live profile reads the affinity column by its own
+    /// stages: no column is filled for such a shadow's sake.
+    column: bool,
+    /// The binding's position: its shadow's rows are named under that
+    /// shadow profile's own cap ([`Engine::shadow_cap_at`]).
+    binding: u32,
+}
+
+impl ShadowAsk for OwnRows<'_> {
+    fn reads_column(&self) -> bool {
+        self.column
+    }
+
+    fn shadow(
+        self,
+        engine: &Engine,
+        rows: ShadowRows,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        // A shadow that is skipped is asked nothing: its decider stops
+        // ahead of the asking.
+        if rows != ShadowRows::Own {
+            return None;
+        }
+        // A profile that is named rows of its own reads them in the
+        // column's place, as it does live.
+        let cap = engine.shadow_cap_at(self.binding);
+        let named = self.name(engine, cap, facts, candidates, constraints);
+        let own = RequestFacts {
+            named: Some(named.affinity()),
+            affinity: &[],
+            ..*facts
+        };
+        engine.shadow(&own, pool, candidates, constraints, scratch)
+    }
+}
+
+impl<'a> OwnRows<'a> {
+    /// The rows of `candidates` named for the shadow of `facts`' request
+    /// under `cap`, as [`hand`] names a live profile's: by the request's
+    /// block hashes as the engine reads them, on the decision's seed, at
+    /// the instant its view was built. A cap full of holders the shadow
+    /// profile's pass refuses is read past as a live profile's is
+    /// ([`World::name_kept`]), by the shadow profile's own test of a row
+    /// ([`Engine::shadow_keeps_at`]).
+    fn name(
+        self,
+        engine: &Engine,
+        cap: u32,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+    ) -> &'a Named {
+        let Self {
+            world,
+            gateway,
+            wires,
+            cut,
+            named,
+            binding,
+            ..
+        } = self;
+        let role = role_of(facts.phase);
+        let naming = Naming {
+            gateway,
+            block_hashes: facts.block_hashes,
+            namespace_seed: facts.namespace_seed,
+            seed: facts.seed,
+            cap,
+            wires,
+            now_micros: facts.now_micros,
+        };
+        let (model, kind) = (facts.model, facts.hash_kind);
+        if cut {
+            world.name_in::<true>(model, role, &naming, candidates, kind, named);
+        } else {
+            world.name_in::<false>(model, role, &naming, candidates, kind, named);
+        }
+        world.name_kept(model, role, &naming, candidates, named, || {
+            let test = engine.shadow_keeps_at(binding, facts, constraints)?;
+            Some(move |row: &Candidate| test.keeps(row))
+        });
+        named
+    }
+}
+
+impl<L: FnOnce() -> Duration, R: ShadowAsk> Shadowing<'_, L, R> {
+    // Forced into each form's one call, as the plain decider's is.
+    #[inline(always)]
+    fn decided<const STATED: bool>(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        let engine = self.engine;
+        let keeping = ByEngine::<true>(engine);
+        let live = keeping.decided::<STATED>(facts, pool, candidates, constraints, scratch);
+        let (binding, rows) = self.due;
+        let said = |kind, first| {
+            Shadow::Said(Shadowed {
+                binding,
+                kind,
+                first,
+            })
+        };
+        // Rows the shadow profile would not be handed, in either form.
+        if rows == ShadowRows::Apart || (self.left)() < SHADOW_FLOOR {
+            return (live, said(ShadowKind::Skipped, None));
+        }
+        #[cfg(test)]
+        if let Some(asking) = ON_SHADOW.take() {
+            asking();
+        }
+        let ask = self.ask;
+        let asked = catch_unwind(AssertUnwindSafe(|| {
+            ask.shadow(engine, rows, facts, pool, candidates, constraints, scratch)
+        }));
+        let shadow = match asked {
+            Ok(Some(shadow)) => {
+                let first = shadow.pick().and_then(|pick| pick.targets.first());
+                said(
+                    ShadowKind::of(&live.0, &shadow),
+                    first.map(|target| target.id),
+                )
+            }
+            Ok(None) => Shadow::NotDue,
+            Err(payload) => {
+                // A payload's own drop can panic: the engine's helper
+                // frees it under a catch of its own.
+                release(payload);
+                Shadow::Faulted
+            }
+        };
+        (live, shadow)
+    }
+}
+
+impl<L: FnOnce() -> Duration, R: ShadowAsk> Decides<((Decision, Option<Booking>), Shadow)>
+    for Shadowing<'_, L, R>
+{
+    fn over(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        self.decided::<false>(facts, pool, candidates, constraints, scratch)
+    }
+
+    fn over_named(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        self.decided::<true>(facts, pool, candidates, constraints, scratch)
+    }
+
+    /// The door's own shed over a view with no row, under the name of
+    /// the stage that took the last of them: no profile decided it, so
+    /// no shadow is set beside it.
+    fn emptied(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+        stage: &'static str,
+    ) -> ((Decision, Option<Booking>), Shadow) {
+        let plain = ByEngine::<false>(self.engine);
+        let none = plain.emptied(facts, pool, constraints, scratch, stage);
+        (none, Shadow::NotDue)
+    }
+
+    fn reads_column(&self) -> bool {
+        self.ask.reads_column()
+    }
+}
+
+/// [`decide_in`] for a request whose binding names a shadow: the live
+/// decision with its booking, and what became of that shadow
+/// ([`Shadowing`]). `due` is the engine's word of the binding
+/// ([`Engine::shadow_for`]), read once ahead of the decision. `left` says
+/// what the request's budget still holds at the end of the live decision,
+/// by its host's own clock. The shadow is asked over the rows its live
+/// decision was handed ([`LiveRows`]): one that reads none of them is
+/// decided by [`decide_own_in`].
+pub(crate) fn decide_shadowed_in<A: Asked>(
+    world: &World,
+    taken: &Taken<'_, A>,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    due: (u32, ShadowRows),
+    left: impl FnOnce() -> Duration,
+) -> ((Decision, Option<Booking>), Shadow) {
+    // Rows of the shadow's own have an asking of their own
+    // ([`decide_own_in`]), and a pair's sides an order of their own
+    // ([`pair_shadowed_in`]): a caller that hands either here would have
+    // the shadow asked over the live profile's rows. The stop stands
+    // ahead of the shadow's catch: a debug build stops at it, where a
+    // stop inside the catch would be counted as the shadow's fault.
+    debug_assert!(
+        !matches!(due.1, ShadowRows::Own | ShadowRows::Sides),
+        "a shadow that reads rows of its own is asked by its own order"
+    );
+    shadowed_by(world, taken, buffers, own, due, left, LiveRows)
+}
+
+/// [`decide_shadowed_in`] for a shadow that reads none of its live
+/// decision's rows: one that is named rows of its own, or one that is
+/// skipped ([`OwnRows`]). No column is filled for such a shadow's sake:
+/// the live decision's is filled where its own profile reads it.
+///
+/// `named` is the buffer the shadow's rows are named on. Its host keeps
+/// it beside `buffers`, which the hand holds while the shadow is named.
+/// It is left with no record to write where no shadow was named: a
+/// naming an earlier decision left is no word of this one's issue.
+pub(crate) fn decide_own_in<A: Asked>(
+    world: &World,
+    taken: &Taken<'_, A>,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    due: (u32, ShadowRows),
+    named: &mut Named,
+    left: impl FnOnce() -> Duration,
+) -> ((Decision, Option<Booking>), Shadow) {
+    let engine = world.spec().engine();
+    named.clear_sent();
+    let ask = OwnRows {
+        world,
+        gateway: taken.gateway,
+        wires: taken.request.wires(),
+        cut: !taken
+            .request
+            .demands()
+            .held_by(role_of(taken.request.phase()))
+            .is_none(),
+        named,
+        column: engine.live_column_at(due.0, taken.request.phase()),
+        binding: due.0,
+    };
+    shadowed_by(world, taken, buffers, own, due, left, ask)
+}
+
+/// The hand of a shadowed decision by one way of asking its shadow
+/// ([`ShadowAsk`]): the live decision with its booking, and what became
+/// of that shadow.
+#[inline(always)]
+fn shadowed_by<A: Asked, R: ShadowAsk>(
+    world: &World,
+    taken: &Taken<'_, A>,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    due: (u32, ShadowRows),
+    left: impl FnOnce() -> Duration,
+    ask: R,
+) -> ((Decision, Option<Booking>), Shadow) {
+    let spec = world.spec();
+    let engine = spec.engine();
+    if taken.request.hashes() > taken.request.hashes_read(spec) {
+        own.hashes_cut.fetch_add(1, Ordering::Relaxed);
+    }
+    let shadowing = Shadowing {
+        engine,
+        due,
+        left,
+        ask,
+    };
+    let (((decision, booking), shadow), built) =
+        hand(world, taken, buffers, &own.undialed, shadowing);
+    let booking = booking.map(|booking| Booking { built, ..booking });
+    ((decision, booking), shadow)
 }
 
 /// The engine's pair decision over the world of one load, for the request
@@ -535,7 +1050,7 @@ pub(crate) fn pair_in<A: Asked>(
         ..
     } = buffers;
     let later = taken.request.decode_later();
-    pair_with(
+    pair_with::<false, _, _, _>(
         world,
         taken,
         own,
@@ -553,8 +1068,139 @@ pub(crate) fn pair_in<A: Asked>(
             |facts, decision, built, scratch| {
                 pair_booking(world, facts, decision, built, scratch, later)
             },
+            no_shadow,
         ),
     )
+}
+
+/// What became of each side's shadow of a pair, the prefill's then the
+/// decode's.
+pub(crate) type SideShadows = [Shadow; 2];
+
+/// [`pair_in`] for a request whose pair binding names a shadow for a
+/// side (`binding`, [`Engine::shadow_for`]): the live pair with its
+/// booking, and what became of each side's shadow. A named side is
+/// decided once more by its shadow profile over the rows the live side
+/// decided over ([`Engine::shadow_side`]), behind the pair's booking and
+/// ahead of its commit: no stage has heard of the pair's leases. A side
+/// is compared with its own: the live prefill with the prefill shadow's
+/// first target, the live decode with the decode shadow's.
+///
+/// A shadow is asked beside a pair that picked: a pair that was shed or
+/// queued has no live side to set one beside. A request with less than
+/// [`SHADOW_FLOOR`] of its budget left keeps that for its answer, and
+/// each named side is said as skipped. So is a side whose shadow
+/// profile would be handed another column than its live side's pool
+/// carries ([`Engine::side_apart`]). A shadow that panics is held
+/// here, the live pair stands as decided, and the side behind it is not
+/// asked over the scratch it left.
+pub(crate) fn pair_shadowed_in<A: Asked>(
+    world: &World,
+    taken: &Taken<'_, A>,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    binding: u32,
+) -> ((Decision, Option<PairBooking>), SideShadows) {
+    let Buffers {
+        pair,
+        scratch,
+        lists,
+        ..
+    } = buffers;
+    let later = taken.request.decode_later();
+    let left = taken.left;
+    let mut sides = [Shadow::NotDue; 2];
+    let answer = pair_with::<false, _, _, _>(
+        world,
+        taken,
+        own,
+        pair,
+        (lists, scratch),
+        |pair, _, model, ask, wires, subset| {
+            let built = world.build_pair(model, &ask, pair)?;
+            world.count_pair_in_flight(&built, &ask, pair);
+            Some((built, pair.narrow(wires, subset, &built)))
+        },
+        (
+            |engine, pair, facts, pool, cx, scratch| {
+                engine.decide_pair(facts, pool, pair.pools(), cx, cx, scratch)
+            },
+            |facts, decision, built, scratch| {
+                pair_booking(world, facts, decision, built, scratch, later)
+            },
+            |engine, pair, facts, pool, cx, decision, scratch| {
+                let Some(live) = decision.pick() else {
+                    return;
+                };
+                for side in PairSide::BOTH {
+                    let pools = pair.pools();
+                    let said = side_shadow(engine, (binding, side), live, left, || {
+                        engine.shadow_side(binding, side, facts, pool, pools, cx, cx, live, scratch)
+                    });
+                    sides[side.index()] = said;
+                    if said == Shadow::Faulted {
+                        break;
+                    }
+                }
+            },
+        ),
+    );
+    (answer, sides)
+}
+
+/// One side's shadow beside a decision that picked `live`: a pair's
+/// ([`pair_shadowed_in`]), or the decode of a pair decided after its
+/// prefill ([`Door::decode_shadowed`]). `ask` decides the side once more
+/// by the engine's entry for that decision, and `left` is what the
+/// request's budget still holds.
+fn side_shadow(
+    engine: &Engine,
+    (binding, side): (u32, PairSide),
+    live: &Pick,
+    left: Duration,
+    ask: impl FnOnce() -> Option<Decision>,
+) -> Shadow {
+    if !engine.shadows_side(binding, side) {
+        return Shadow::NotDue;
+    }
+    let said = |kind, first| {
+        Shadow::Said(Shadowed {
+            binding,
+            kind,
+            first,
+        })
+    };
+    // A column the shadow profile would not be handed, or a budget
+    // kept for the answer.
+    if engine.side_apart(binding, side) || left < SHADOW_FLOOR {
+        return said(ShadowKind::Skipped, None);
+    }
+    let asked = catch_unwind(AssertUnwindSafe(ask));
+    match asked {
+        Ok(Some(shadow)) => {
+            let first = shadow.pick().and_then(|pick| pick.targets.first());
+            let first = first.map(|target| target.id);
+            // A pair's first target names its prefill, with the decode
+            // beside it.
+            let own = live.targets.first().and_then(|target| match side {
+                PairSide::Prefill => Some(target.id),
+                PairSide::Decode => target.pair.map(|pair| pair.decode_id),
+            });
+            let kind = match first {
+                Some(_) if first == own => ShadowKind::Agreed,
+                Some(_) => ShadowKind::OtherTarget,
+                None => ShadowKind::OtherOutcome,
+            };
+            said(kind, first)
+        }
+        Ok(None) => Shadow::NotDue,
+        Err(payload) => {
+            // A payload's own drop can panic: the engine's helper
+            // frees it under a catch of its own.
+            release(payload);
+            Shadow::Faulted
+        }
+    }
 }
 
 /// Decides a request's pair and places its encode items over one world.
@@ -574,7 +1220,7 @@ pub(crate) fn encode_pair_in<A: Asked>(
     } = buffers;
     let rows: &mut EncodePairBuffers = encode.get_or_insert_with(Box::default);
     let later = taken.request.decode_later();
-    let answer = pair_with(
+    let answer = pair_with::<false, _, _, _>(
         world,
         taken,
         own,
@@ -583,7 +1229,9 @@ pub(crate) fn encode_pair_in<A: Asked>(
         |rows, engine, model, mut ask, wires, subset| {
             if !items.keys.is_empty() {
                 // The prefill binding names the encode profile for the pair.
-                ask.affinity |= engine.pair_encode_needs(model).affinity;
+                let needs = engine.pair_encode_needs(model);
+                ask.affinity |= needs.affinity;
+                ask.signal_cells |= needs.signal_cells;
             }
             let built = world.build_encode_pair(model, &ask, rows)?;
             // Counts follow the build's row order until narrowing moves it.
@@ -607,6 +1255,7 @@ pub(crate) fn encode_pair_in<A: Asked>(
             |facts, decision, built, scratch| {
                 pair_booking(world, facts, decision, built, scratch, later)
             },
+            no_shadow,
         ),
     );
     // A subset or wire cut can shed before the engine's entry clears what
@@ -617,9 +1266,26 @@ pub(crate) fn encode_pair_in<A: Asked>(
     answer
 }
 
+/// What a pair's plain order asks behind its booking ([`pair_with`]):
+/// nothing.
+fn no_shadow<R>(
+    _: &Engine,
+    _: &R,
+    _: &RequestFacts<'_>,
+    _: &PoolFacts<'_>,
+    _: &Constraints<'_>,
+    _: &Decision,
+    _: &mut Scratch,
+) {
+}
+
 /// Reads a built pair, decides over it, and takes what `book` files of the
-/// decision.
-fn pair_with<A: Asked, R, B>(
+/// decision. The decision is shown the facts of the pool it places in
+/// first: the prefills', or under `DECODE` the decodes', where a decode
+/// call places in that pool alone. `behind` runs last, over the same
+/// rows: a pair's shadows ([`pair_shadowed_in`]), or nothing
+/// ([`no_shadow`]).
+fn pair_with<const DECODE: bool, A: Asked, R, B>(
     world: &World,
     taken: &Taken<'_, A>,
     own: &Part,
@@ -633,7 +1299,7 @@ fn pair_with<A: Asked, R, B>(
         Option<WireModes>,
         Option<u32>,
     ) -> Option<((Built, Built), (u64, bool))>,
-    (decide, book): (
+    (decide, book, behind): (
         impl FnOnce(
             &Engine,
             &R,
@@ -643,6 +1309,15 @@ fn pair_with<A: Asked, R, B>(
             &mut Scratch,
         ) -> Decision,
         impl FnOnce(&RequestFacts<'_>, &Decision, Option<(Built, Built)>, &Scratch) -> Option<B>,
+        impl FnOnce(
+            &Engine,
+            &R,
+            &RequestFacts<'_>,
+            &PoolFacts<'_>,
+            &Constraints<'_>,
+            &Decision,
+            &mut Scratch,
+        ),
     ),
 ) -> (Decision, Option<B>) {
     let Taken {
@@ -675,6 +1350,7 @@ fn pair_with<A: Asked, R, B>(
         now,
         pinned: None,
         affinity: prefill.affinity || decode.affinity,
+        signal_cells: prefill.signal_cells || decode.signal_cells,
     };
     // One side alone is no pair: the engine answers over no candidate, as
     // it answers any host that hands it none.
@@ -693,7 +1369,8 @@ fn pair_with<A: Asked, R, B>(
     let demanded = !request.demands().is_none();
     let mut emptied = false;
     let built = build(rows, engine, model, ask, wires, subset).map(|(built, (took, none))| {
-        pool = built.0.pool_facts();
+        let shown = if DECODE { built.1 } else { built.0 };
+        pool = shown.pool_facts();
         emptied = none || demanded;
         if took > 0 {
             own.undialed.fetch_add(took, Ordering::Relaxed);
@@ -710,16 +1387,17 @@ fn pair_with<A: Asked, R, B>(
     let viewed = Viewed {
         now_micros: built.map_or_else(|| world.micros(now), |(prefill, _)| prefill.now_micros),
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
-        // A pair's columns ride its two pools, and a pair names no rows.
+        // A pair's columns and cells ride its two pools, and a pair names
+        // no rows.
         affinity: &[],
         stalled: &[],
         held: &[],
         in_flight: None,
         max_block_hashes: request.hashes_read(spec),
-        named: None,
         pins: pins.map(|pins| pins as &dyn PinSource),
+        signal_cells: None,
     };
-    request.read(lists, viewed, |facts, constraints| {
+    request.read(lists, viewed, unnamed, |facts, constraints| {
         if emptied {
             let emptied_by = if constraints.subset_hint == Some(0) {
                 SUBSET_HINT
@@ -736,6 +1414,10 @@ fn pair_with<A: Asked, R, B>(
         }
         let decision = decide(engine, rows, facts, &pool, constraints, scratch);
         let booking = book(facts, &decision, built, scratch);
+        // What the order asks behind the pair's booking, over the same
+        // rows: the booking is a value by now, and the step may write
+        // the scratch.
+        behind(engine, rows, facts, &pool, constraints, &decision, scratch);
         (decision, booking)
     })
 }
@@ -845,7 +1527,13 @@ pub(crate) struct PairBooking {
 /// first read, at that read's instant, from which [`DISPATCH_TTL`] runs
 /// for its gateway to name a dispatch. The lease books the count the
 /// decision's own world lays beside its target's row, and the engine that
-/// decided is told of it.
+/// decided is told of it by `told`, the telling its caller hands. A lease
+/// on file is a request on its way to that target: the record of sent
+/// prefixes takes the prefix `named` holds, where the target's pool keeps
+/// one ([`World::sent`]).
+///
+/// The store builds its issue for each telling, so a caller with a
+/// telling of its own leaves every other caller's issue as it was built.
 ///
 /// # Errors
 ///
@@ -856,32 +1544,33 @@ pub(crate) fn issue<A: Asked>(
     world: &World,
     taken: &Taken<'_, A>,
     term: u64,
-    decision: &Decision,
     booking: Booking,
+    named: &Named,
+    told: impl Fn(&Lease),
 ) -> Result<Lease, LeaseRefused> {
     let record = record_of(taken, term, &booking, Side::Single);
     let booked = booked_in(world, &booking);
     // Under one hold of the turn the store applies what is handed, files
     // the lease, tells the engine that decided of it, and ends and tells
-    // the leases it finds past their dispatch deadline.
-    let engine = world.spec().engine();
-    let told = |lease: &Lease| {
-        engine.on_decision_issued(lease, decision);
-    };
-    // A decision that read its key's count files a lease that books the
-    // key, whatever it did with the pin: the next read holds this request.
-    if booking.counted {
+    // the leases it finds past their dispatch deadline. A decision that
+    // read its key's count files a lease that books the key, whatever it
+    // did with the pin: the next read holds this request.
+    let lease = if booking.counted {
         store.issue_keyed(record, booked, told)
     } else {
         store.issue_decided(record, booked, told)
-    }
+    }?;
+    world.sent(named, booking.target);
+    Ok(lease)
 }
 
 /// Issues the two leases of a pair's pick, [`issue`] for a pair: a lease a
 /// side under the one id the store mints, one record and one write of the
 /// file, each side booking the count beside its own pool's row, and the
-/// engine told once a side, the prefill's first. `Ok` is the prefill
-/// side's lease, then the decode side's.
+/// engine told once a side it issues, the prefill's first. A decode side
+/// filed chosen is told at its own issue and dated then: a decode call's,
+/// or else its dispatch ([`issued_later`]). `Ok` is the prefill side's
+/// lease, then the decode side's.
 ///
 /// # Errors
 ///
@@ -907,6 +1596,146 @@ pub(crate) fn issue_pair<A: Asked>(
     })?;
     // A pair's two leases share the id the store minted.
     Ok((lease, decode.lease(&lease)))
+}
+
+/// What a decode call's pick files: the decode side, beside the slot of
+/// the count it books.
+pub(crate) type DecodeBooking = (DecodeSide, Option<Slot>);
+
+/// The decode side of the pair's lease `lease` decided over one world, for
+/// both doors. The store's own test of the lease comes first, so a call
+/// it refuses runs no stage. Then the pair's rows are built and narrowed
+/// as [`pair_in`] builds them, and the engine's decode entry runs over the
+/// partners of the held prefill. The decode profile is shown the decode
+/// pool's facts: its size, its list and whether every row of it holds a
+/// report. A pick comes with what its issue files.
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: why the lease takes no decode side. Nothing is built.
+pub(crate) fn decode_in<A: Asked>(
+    world: &World,
+    store: &MemoryStore,
+    taken: &Taken<'_, A>,
+    lease: LeaseId,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused> {
+    decode_with(world, store, taken, lease, buffers, own, |_| no_shadow)
+}
+
+/// [`decode_in`] with the step its order asks behind the side's booking
+/// ([`pair_with`]): `behind` makes it for the held prefill. The plain
+/// order's step is none ([`no_shadow`]), and a door's shadowed order
+/// asks the decode side's shadow there ([`Door::decode_shadowed`]).
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: as [`decode_in`] refuses.
+fn decode_with<A: Asked, B>(
+    world: &World,
+    store: &MemoryStore,
+    taken: &Taken<'_, A>,
+    lease: LeaseId,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    behind: impl FnOnce(WorkerId) -> B,
+) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused>
+where
+    B: FnOnce(
+        &Engine,
+        &PairBuffers,
+        &RequestFacts<'_>,
+        &PoolFacts<'_>,
+        &Constraints<'_>,
+        &Decision,
+        &mut Scratch,
+    ),
+{
+    let prefill = store.held_prefill(taken.gateway, lease)?;
+    let Buffers {
+        pair,
+        scratch,
+        lists,
+        ..
+    } = buffers;
+    Ok(pair_with::<true, _, _, _>(
+        world,
+        taken,
+        own,
+        pair,
+        (lists, scratch),
+        |pair, _, model, ask, wires, subset| {
+            let built = world.build_pair(model, &ask, pair)?;
+            world.count_pair_in_flight(&built, &ask, pair);
+            Some((built, pair.narrow(wires, subset, &built)))
+        },
+        (
+            |engine, pair, facts, pool, cx, scratch| {
+                let facts = RequestFacts {
+                    phase: Phase::Decode,
+                    ..*facts
+                };
+                engine.decide_decode(&facts, pool, pair.pools(), prefill, cx, scratch)
+            },
+            |facts, decision, built, _| {
+                let (pick, (_, decodes)) = decision.pick().zip(built)?;
+                let first = pick.targets.first()?.pair?;
+                let side = DecodeSide {
+                    target: first.decode_id,
+                    picked: Picked::of_decodes(&pick.targets),
+                    session: RequestFacts {
+                        phase: Phase::Decode,
+                        ..*facts
+                    }
+                    .session(),
+                    state: LeaseState::ISSUED,
+                    tokens: facts.prompt_tokens,
+                    target_index: 0,
+                };
+                Some((side, world.booked(&decodes, side.target)))
+            },
+            behind(prefill),
+        ),
+    ))
+}
+
+/// Files a decode call's pick under the lease's id and tells the engine,
+/// under one hold of the file. The side is on file when the engine hears:
+/// a stage that panics there is held and counted, as under a report, and
+/// the caller still gets the pick the file holds. The side's lease comes
+/// with its issue's count, for a door that may undo it.
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: the lease moved since the call's first test.
+pub(crate) fn issue_decode<A: Asked>(
+    store: &MemoryStore,
+    world: &World,
+    taken: &Taken<'_, A>,
+    lease: LeaseId,
+    decision: &Decision,
+    booking: DecodeBooking,
+) -> Result<(Lease, DecodeIssue), DecodeRefused> {
+    let spec = world.spec();
+    store.issue_decided_decode(taken.gateway, lease, booking, taken.now, |lease| {
+        // The lease keeps the generation of its first decision, and the
+        // engine of that generation alone hears its words ([`issuing`]).
+        // Behind a reload the engine of this instant decided the side and
+        // hears nothing of the lease.
+        let Some(engine) = issuing(spec, lease) else {
+            return;
+        };
+        // The issue is dated at this call ([`issued_later`]).
+        let heard = || issued_later(world, engine, lease, decision, taken.now);
+        match catch_unwind(AssertUnwindSafe(heard)) {
+            Ok(()) => store.call_returned(),
+            Err(payload) => {
+                release(payload);
+                store.call_faulted();
+            }
+        }
+    })
 }
 
 /// The record of the lease `booking` asks on `side`, as its door hands it
@@ -974,13 +1803,15 @@ pub(crate) fn shed(
     })
 }
 
-/// How a decision is made over the view [`hand`] reads, in two forms: over
-/// rows of which no stage of the profile's own reads the holdings, and
-/// over rows the store named for the profile's own affinity stages. A
-/// function of the view decides alike over both. A decider that says more
-/// of a decision over named rows writes the second form, and [`hand`] asks
-/// it at a call of its own, so a decision that names no row meets no test
-/// for it.
+/// How a decision is made over the view [`hand`] reads, in three forms:
+/// over rows of which no stage of the profile's own reads the holdings,
+/// over rows the store named for the profile's own affinity stages, and
+/// over a pool that has rows of which the request's own narrowing left
+/// none. A function of the view decides alike over all three. A decider
+/// that says more of a decision over named rows writes the second form,
+/// and [`hand`] asks it at a call of its own, so a decision that names no
+/// row meets no test for it. A decider that names the stage an emptied
+/// pool is shed under writes the third.
 pub(crate) trait Decides<R> {
     fn over(
         self,
@@ -1003,6 +1834,33 @@ pub(crate) trait Decides<R> {
         Self: Sized,
     {
         self.over(facts, pool, candidates, constraints, scratch)
+    }
+
+    /// The answer for a pool that has rows of which the request's own
+    /// narrowing left none, and the stage that took the last of them:
+    /// asked over no rows unless the decider names the stage itself.
+    fn emptied(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+        _stage: &'static str,
+    ) -> R
+    where
+        Self: Sized,
+    {
+        self.over(facts, pool, &[], constraints, scratch)
+    }
+
+    /// Whether the affinity column the decision's needs declare has a
+    /// reader over the rows this decider is handed. The needs join a
+    /// shadow profile's to the live one's
+    /// ([`Engine::reads_for`](crate::framework::Engine::reads_for)). A
+    /// decider says no where the shadow alone declared the column and
+    /// reads none of the live decision's rows: [`hand`] then fills none.
+    fn reads_column(&self) -> bool {
+        true
     }
 }
 
@@ -1033,6 +1891,7 @@ type Read<'a> = (
     &'a [Candidate],
     (&'a [u32], &'a [u32]),
     &'a [AffinityFacts],
+    Option<&'a crate::SignalCells>,
     Option<crate::LentCounts<'a>>,
     Option<Built>,
 );
@@ -1067,6 +1926,12 @@ type Read<'a> = (
 /// index: the column it builds holds a row's age and no holder. Over the
 /// rows it named the decision is asked in the decider's form for them
 /// ([`Decides::over_named`]).
+///
+/// A pool that has rows of which the request's own narrowing left none is
+/// answered in the decider's form for it ([`Decides::emptied`]), under
+/// the stage that took the last row: the request's hint of 0, the last
+/// demand its rows failed first ([`Unmet`](crate::demands::Unmet)), or its
+/// gateway's wires.
 ///
 /// A request whose profile holds a stage that may refuse by a report of
 /// leases ([`Filter::refuses_by_reports`](crate::framework::Filter::refuses_by_reports))
@@ -1108,8 +1973,11 @@ pub(crate) fn hand<A: Asked, R>(
     // is named no row and keeps its column. The deciding profile answers
     // for itself: the needs are merged over a pair's two phases and a
     // sessions rule, so they say only where to ask, and no other decision
-    // pays the second walk.
-    let cap = if needs.affinity {
+    // pays the second walk. They join a shadow profile's too: a column
+    // that the shadow alone declared, and reads none of, is not filled
+    // ([`Decides::reads_column`]).
+    let column = needs.affinity && decide.reads_column();
+    let cap = if column {
         engine.named_for(model, phase)
     } else {
         0
@@ -1119,14 +1987,10 @@ pub(crate) fn hand<A: Asked, R>(
         gateway,
         now,
         pinned: None,
-        affinity: needs.affinity && !names,
+        affinity: column && !names,
+        signal_cells: needs.signal_cells,
     };
-    let role = match phase {
-        Phase::Single => Role::Single,
-        Phase::Prefill => Role::Prefill,
-        Phase::Decode => Role::Decode,
-        Phase::Encode => Role::Encode,
-    };
+    let role = role_of(phase);
     let Buffers {
         view,
         held: holds,
@@ -1137,7 +2001,7 @@ pub(crate) fn hand<A: Asked, R>(
         keyed,
         ..
     } = buffers;
-    let (wires, demands) = (request.wires(), request.demands());
+    let wires = request.wires();
     // No member serves the model in the role: the engine answers over no
     // candidate, as it answers any host that hands it none.
     let none = || PoolFacts {
@@ -1149,11 +2013,12 @@ pub(crate) fn hand<A: Asked, R>(
     // door writes with the counts on it for a plugin, which is shown a
     // row's bits and ages as the row's own fields. A request that states a
     // hard demand is handed written rows, as one that states wires is.
-    let by_door = wires.is_none() && request.subset() != Some(0) && demands.is_none();
-    // Whether a demand took a row of the build: the rows left are named
-    // within themselves then.
-    let mut cut = false;
-    let (pool, now_micros, candidates, masks, affinity, counts, built): Read<'_> = if by_door {
+    let by_door = wires.is_none() && request.subset() != Some(0) && request.demands().is_none();
+    // The last demand the rows a demand took failed first, where one took
+    // a row of the build: the rows left are named within themselves then.
+    let mut unmet: Option<crate::demands::Unmet> = None;
+    let (pool, now_micros, candidates, masks, affinity, cells, counts, built): Read<'_> = if by_door
+    {
         match world.view(model, role, &ask, shown, view) {
             Some(read) => (
                 read.pool_facts(),
@@ -1161,10 +2026,20 @@ pub(crate) fn hand<A: Asked, R>(
                 read.candidates,
                 (read.stalled, world.held(&read, &ask, holds)),
                 read.affinity,
+                read.signal_cells,
                 read.in_flight,
                 Some(read.built),
             ),
-            None => (none(), world.micros(now), &[], (&[], &[]), &[], None, None),
+            None => (
+                none(),
+                world.micros(now),
+                &[],
+                (&[], &[]),
+                &[],
+                None,
+                None,
+                None,
+            ),
         }
     } else {
         let built = world.build(model, role, &ask, view);
@@ -1181,16 +2056,20 @@ pub(crate) fn hand<A: Asked, R>(
                 // narrowing, all but the list's name: the rows the wires
                 // left are another list of the pool.
                 let mut pool: PoolFacts<'_> = built.pool_facts();
+                // The request's demands, read where a row is written: the
+                // path that writes none carries none of them past its test.
+                // A prefill's rows are held to the input alone.
+                let demands = request.demands().held_by(role);
                 let took = if demands.is_none() {
                     Took {
                         undialed: narrow(view, wires, request.subset()),
-                        demanded: 0,
+                        ..Took::default()
                     }
                 } else {
                     world.demand_facts(&built, &ask, demanded);
                     narrow_demanded(view, demanded, wires, request.subset(), demands)
                 };
-                cut = took.demanded != 0;
+                unmet = took.unmet;
                 if took.undialed > 0 {
                     undialed.fetch_add(took.undialed, Ordering::Relaxed);
                 }
@@ -1213,6 +2092,8 @@ pub(crate) fn hand<A: Asked, R>(
             &view.candidates,
             (&[], &[]),
             &view.affinity,
+            // The cells the build wrote, each kept row's at its new place.
+            view.cells(),
             None,
             built,
         )
@@ -1226,8 +2107,8 @@ pub(crate) fn hand<A: Asked, R>(
         held,
         in_flight: counts,
         max_block_hashes: request.hashes_read(spec),
-        named: None,
         pins: pins.map(|pins| pins as &dyn PinSource),
+        signal_cells: cells,
     };
     // The store's sessions, where the decision's rule has an in-flight
     // cap: a keyed request reads its key's count there. Under any other
@@ -1252,44 +2133,102 @@ pub(crate) fn hand<A: Asked, R>(
         // The index reads a view by its gateway's wires alone. Rows a
         // demand cut are named within the rows that stay: a row the
         // demand took is named by nobody and takes no place of the cap.
-        if cut {
-            world.name_in::<true>(model, role, &naming, candidates, hash_kind, named);
-        } else {
-            world.name_in::<false>(model, role, &naming, candidates, hash_kind, named);
-        }
+        // The naming is a step of the read: it runs once the request
+        // stands in the engine's form, and the rows it names are written
+        // into that form in place.
+        let name = move |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
+            // The names borrow the buffer past this call: the closure
+            // gives its hold of it up.
+            let named = named;
+            if unmet.is_some() {
+                world.name_in::<true>(model, role, &naming, candidates, hash_kind, named);
+            } else {
+                world.name_in::<false>(model, role, &naming, candidates, hash_kind, named);
+            }
+            // Under a cap the holders named may all be rows the pass
+            // refuses, and a warm worker behind them is then never named.
+            // A naming that fills its cap is held to the pass's own test
+            // of a row, where the engine hands one: a cap full of refused
+            // holders is read past. A naming shorter than its cap, or with
+            // none, is asked nothing and the test is not made.
+            world.name_kept(model, role, &naming, candidates, named, || {
+                let test = engine.keeps_for(model, phase, facts, constraints)?;
+                Some(move |row: &Candidate| test.keeps(row))
+            });
+            Some(named.affinity())
+        };
         // Over the rows it named the decider is asked in its form for
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
-        let viewed = Viewed {
-            named: Some(named.affinity()),
-            ..viewed
-        };
-        let answer = request.read(lists, viewed, |facts, constraints| match sessions {
-            None => decide.over_named(facts, &pool, candidates, constraints, scratch),
-            Some(sessions) => keyed.lend(
-                sessions,
-                facts,
-                constraints,
-                candidates,
-                |facts, constraints| {
-                    decide.over_named(facts, &pool, candidates, constraints, scratch)
-                },
-            ),
+        let answer = request.read(lists, viewed, name, |facts, constraints| {
+            if candidates.is_empty() && pool.pool_size > 0 {
+                let subset = request.subset();
+                return emptied(decide, facts, &pool, constraints, scratch, subset, unmet);
+            }
+            // The engine's ask, written once for the two ways to it: at
+            // once, or behind the key's read.
+            let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
+                decide.over_named(facts, &pool, candidates, constraints, scratch)
+            };
+            match sessions {
+                None => ask(facts, constraints),
+                Some(sessions) => keyed.lend(sessions, facts, constraints, candidates, ask),
+            }
         });
         return (answer, built);
     }
     named.clear_sent();
-    let answer = request.read(lists, viewed, |facts, constraints| match sessions {
-        None => decide.over(facts, &pool, candidates, constraints, scratch),
-        Some(sessions) => keyed.lend(
-            sessions,
-            facts,
-            constraints,
-            candidates,
-            |facts, constraints| decide.over(facts, &pool, candidates, constraints, scratch),
-        ),
+    let answer = request.read(lists, viewed, unnamed, |facts, constraints| {
+        if candidates.is_empty() && pool.pool_size > 0 {
+            let subset = request.subset();
+            return emptied(decide, facts, &pool, constraints, scratch, subset, unmet);
+        }
+        let ask = |facts: &RequestFacts<'_>, constraints: &Constraints<'_>| {
+            decide.over(facts, &pool, candidates, constraints, scratch)
+        };
+        match sessions {
+            None => ask(facts, constraints),
+            Some(sessions) => keyed.lend(sessions, facts, constraints, candidates, ask),
+        }
     });
     (answer, built)
+}
+
+/// The answer for a pool that has rows of which the request's own narrowing
+/// left none, in the decider's form for it ([`Decides::emptied`]), under
+/// the stage that took the last of them: the request's hint of 0, the last
+/// demand its rows failed first, or its gateway's wires. A routine of its
+/// own, out of line, asked inside the request's read where the decider is
+/// asked: a pool that keeps a row pays one test for this answer, the test
+/// its decider had, and the door's routine keeps the frame it had.
+#[cold]
+#[inline(never)]
+fn emptied<R>(
+    decide: impl Decides<R>,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    constraints: &Constraints<'_>,
+    scratch: &mut Scratch,
+    subset: Option<u32>,
+    unmet: Option<crate::demands::Unmet>,
+) -> R {
+    let stage = if subset == Some(0) {
+        SUBSET_HINT
+    } else {
+        unmet.map_or(WIRES, crate::demands::Unmet::stage)
+    };
+    decide.emptied(facts, pool, constraints, scratch, stage)
+}
+
+/// The role whose pool decides a request of `phase`: the pool [`hand`]
+/// reads its rows of, and the one a shadow's own rows are named in.
+const fn role_of(phase: Phase) -> Role {
+    match phase {
+        Phase::Single => Role::Single,
+        Phase::Prefill => Role::Prefill,
+        Phase::Decode => Role::Decode,
+        Phase::Encode => Role::Encode,
+    }
 }
 
 /// Whether the request's own narrowing can leave a row: a subset of none
@@ -1307,15 +2246,20 @@ pub(crate) struct Took {
     /// The name of the rows a demand took, by their places in the build's
     /// list: `0` where no demand took a row.
     pub(crate) demanded: u64,
+    /// The last of the demands those rows failed first, in the order a
+    /// host answers for them ([`Unmet`](crate::demands::Unmet)): the stage
+    /// a pool the demands left nobody is shed under. `None` where no demand
+    /// took a row.
+    pub(crate) unmet: Option<crate::demands::Unmet>,
 }
 
 /// [`narrow`] for a request that states hard demands ([`Demands`]): one
 /// pass keeps the rows that share a wire with the gateway and meet every
-/// demand, each by its entry of `facts`, the build's column
-/// ([`World::demand_facts`]). A row with no entry meets none. The kept rows
-/// keep their order and take their positions, and every column beside them
-/// follows in the same step: the affinity column and the facts. A hint of
-/// 0 keeps none.
+/// demand, each by its own vision bit and its entry of `facts`, the
+/// build's column ([`World::demand_facts`]). A row with no entry states
+/// nothing there. The kept rows keep their order and take their positions,
+/// and every column beside them follows in the same step: the affinity
+/// column, the signal cells and the facts. A hint of 0 keeps none.
 ///
 /// The rows a demand took are named by their places in the build's list
 /// ([`Took::demanded`]), never by what the demand states: two requests
@@ -1331,11 +2275,15 @@ pub(crate) fn narrow_demanded(
     if subset == Some(0) {
         view.candidates.clear();
         view.affinity.clear();
+        view.signal_cells.refill(0);
         facts.clear();
         return Took::default();
     }
     // The column is by row, where the profile declared one.
     let column = !view.affinity.is_empty();
+    // The signal cells are by row too, where the build wrote any.
+    let mut cells =
+        crate::store::world::KeptCells::of(&mut view.signal_cells, view.candidates.len());
     let mut took = Took::default();
     let (mut kept, mut position) = (0, 0_u32);
     for at in 0..view.candidates.len() {
@@ -1344,11 +2292,9 @@ pub(crate) fn narrow_demanded(
             took.undialed += 1;
             continue;
         }
-        let Some(stated) = facts
-            .get(at)
-            .copied()
-            .filter(|stated| demands.met_by(*stated))
-        else {
+        // A row with no entry states nothing.
+        let stated = facts.get(at).copied().unwrap_or_default();
+        if let Some(unmet) = demands.unmet_by(row.vision, stated) {
             // One more than the place: the first row's taking is no zero.
             // Each place turns the fold by a product of the places' own
             // word: the name is of these places in their order, and of
@@ -1356,19 +2302,28 @@ pub(crate) fn narrow_demanded(
             took.demanded = (took.demanded ^ (at as u64 + 1))
                 .wrapping_mul(PLACES)
                 .max(1);
+            took.unmet = took.unmet.max(Some(unmet));
             continue;
-        };
+        }
         view.candidates[kept] = Candidate { position, ..row };
         position += 1;
         if column {
             view.affinity[kept] = view.affinity[at];
         }
-        facts[kept] = stated;
+        if let Some(cells) = &mut cells {
+            cells.keep(at);
+        }
+        if let Some(entry) = facts.get_mut(kept) {
+            *entry = stated;
+        }
         kept += 1;
     }
     view.candidates.truncate(kept);
     if column {
         view.affinity.truncate(kept);
+    }
+    if let Some(cells) = cells {
+        cells.end();
     }
     facts.truncate(kept);
     took
@@ -1432,12 +2387,13 @@ pub(crate) struct Viewed<'a> {
     /// How many of the request's block hashes the deciding generation
     /// reads.
     pub(crate) max_block_hashes: usize,
-    /// The rows the deciding host named in the column's place, where the
-    /// request's profile takes them.
-    pub(crate) named: Option<NamedAffinity<'a>>,
     /// The pins of record the host lends the decision ([`PinSource`]);
     /// `None` where it keeps none.
     pub(crate) pins: Option<&'a dyn PinSource>,
+    /// The candidates' signal cells, as the view handed them: `None` for
+    /// a profile that reads no signal, and for a pair, whose cells ride
+    /// its pools.
+    pub(crate) signal_cells: Option<&'a crate::SignalCells>,
 }
 
 /// Tells the engine what was said of a lease: one function of the record
@@ -1462,7 +2418,9 @@ pub(crate) struct Viewed<'a> {
 /// A dispatch is told on the target its report names by index,
 /// as the record holds the pick, and the lease told names that index:
 /// the record was read before the door wrote it. A report that names no
-/// target of the pick tells nothing.
+/// target of the pick tells nothing. A pair's decode side that stood
+/// chosen is told its issue first ([`chosen_dispatched`]): no call
+/// issued it, and it goes out as the first pick's.
 ///
 /// A pair's lease is told by side: a dispatch on the side its frame names,
 /// with that side's lease and on that side's worker, and an end once a
@@ -1507,7 +2465,7 @@ pub(crate) fn told(
 /// hears nothing of it: no dispatch, no end, and no issue of a side a call
 /// decides later.
 #[inline]
-fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
+pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
     (spec.generation() == lease.generation).then(|| spec.engine())
 }
 
@@ -1557,12 +2515,19 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
             }
             pinned(store, &lease, stood, engine, id, at);
             if let Some(engine) = engine {
-                engine.dispatched_stages(
-                    &lease,
-                    &target,
-                    dispatch.side,
-                    dispatch.since_decision_micros,
-                );
+                if stood.is_chosen() {
+                    // A decode side no call issued goes out as the first
+                    // pick's, and this dispatch books it: the stages hear
+                    // its issue first, as they hear every side's.
+                    chosen_dispatched(world, engine, found, &lease, &target, dispatch, at);
+                } else {
+                    engine.dispatched_stages(
+                        &lease,
+                        &target,
+                        dispatch.side,
+                        dispatch.since_decision_micros,
+                    );
+                }
             }
         }
         Said::Completed(outcome) => {
@@ -1577,6 +2542,94 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
             }
         }
     }
+}
+
+/// Tells `engine`'s stages the issue of a pair's decode side the store
+/// files behind the pair's first decision: at its decode call, or at the
+/// dispatch that sends it with no call ([`chosen_dispatched`]).
+///
+/// One rule dates an issue: the instant the store files the side, on the
+/// store's own clock. A side filed in its decision bears that decision's
+/// instant ([`record_of`]). A side filed later is told here under its
+/// lease dated `at`, the instant of that filing as its caller states it.
+/// In process that is the instant the host hands its call, where the
+/// door reads no clock. No served controller files a side later yet: a
+/// frame asks for no later decode, and a handle over a link refuses the
+/// decode call. On the day one does, it is the decider's read at the
+/// call, or the read of the dispatch's frame. The lease on file keeps
+/// the instant of the pair's first decision for its other words.
+///
+/// A stage that dates its bookings by its issues reads a date far behind
+/// its newest as a clock that went back, and ends what it passed. So a
+/// later issue bears neither the instant of that first decision nor the
+/// date a gateway gives a dispatch.
+fn issued_later(world: &World, engine: &Engine, lease: &Lease, decision: &Decision, at: Instant) {
+    let issued = Lease {
+        issued_micros: world.micros(at),
+        ..*lease
+    };
+    engine.on_decision_issued(&issued, decision);
+}
+
+/// Tells `engine`'s stages the dispatch of a pair's decode side that no
+/// call issued, as the frame read at `at` names it: the side's issue
+/// first ([`issued_later`]), then the dispatch's own word. The side goes
+/// out as the first pick's and the store books it at this dispatch, so
+/// the dispatch is the side's issue too: a stage that books at an issue
+/// books the worker that serves, as it does at a decode call's issue.
+///
+/// The issue names the pair's pick as the lease's record keeps it: every
+/// target's two workers and their ranks, with no trace beside the
+/// generation. The record keeps no position, and each target bears the
+/// default one, 0, as the target of a dispatch's word does: a stage reads
+/// the worker by its id. The issue's lease names the target the dispatch
+/// took and that target's worker as the one it books. The dispatch's
+/// word then keeps the lease's own instant and names the same worker as
+/// the one the issue booked: no stage books it twice.
+///
+/// Out of line: no other dispatch builds a pick, and the teller's frame
+/// stays as short as it was.
+#[inline(never)]
+fn chosen_dispatched(
+    world: &World,
+    engine: &Engine,
+    found: &Sides,
+    lease: &Lease,
+    target: &Target,
+    dispatch: Dispatch,
+    at: Instant,
+) {
+    let named = |index| {
+        let prefill = found.target_of(Side::Prefill, index)?;
+        Some((prefill, found.target_of(Side::Decode, index)?))
+    };
+    let mut targets = Targets::new();
+    for ((id, dp_rank), (decode_id, decode_dp_rank)) in (0..=u8::MAX).map_while(named) {
+        targets.push(Target {
+            id,
+            dp_rank,
+            pair: Some(Pair {
+                decode_id,
+                decode_dp_rank,
+                ..Pair::default()
+            }),
+            ..Target::default()
+        });
+    }
+    let decision = Decision::Pick(Pick {
+        targets,
+        trace: Trace {
+            generation: lease.generation,
+            ..Trace::default()
+        },
+        ..Pick::default()
+    });
+    let sent = Lease {
+        booked: target.id,
+        ..*lease
+    };
+    issued_later(world, engine, &sent, &decision, at);
+    engine.dispatched_stages(&sent, target, dispatch.side, dispatch.since_decision_micros);
 }
 
 /// Writes a keyed lease's pin of record at its dispatch (design 5.1, the
@@ -1765,20 +2818,22 @@ impl Asked for Request<'_> {
         self.facts.seed
     }
 
-    fn read<R>(
+    fn read<'n, R>(
         &self,
         (): &mut (),
         viewed: Viewed<'_>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let hashes = self.facts.block_hashes;
-        let facts = RequestFacts {
+        let mut facts = RequestFacts {
             // The first hashes, as deep as the generation reads.
             block_hashes: hashes.get(..viewed.max_block_hashes).unwrap_or(hashes),
             budget_micros: viewed.budget_micros,
             now_micros: viewed.now_micros,
             affinity: viewed.affinity,
-            named: viewed.named,
+            // Written below, by the naming's answer.
+            named: None,
             lent_in_flight: viewed.in_flight.as_ref(),
             // The door decides over the store's rows: a list a host lent
             // names rows of its own, and its word that it counted stands
@@ -1788,9 +2843,8 @@ impl Asked for Request<'_> {
             session_counted: false,
             // Cells a caller handed are by its own list's positions too:
             // read by the store's, an in-range read would answer another
-            // row's value. The door reads its own view's cells, and its
-            // view hands none yet.
-            signal_cells: None,
+            // row's value. The door reads its own view's cells.
+            signal_cells: viewed.signal_cells,
             ..self.facts
         };
         let constraints = Constraints {
@@ -1799,6 +2853,7 @@ impl Asked for Request<'_> {
             pins: viewed.pins,
             ..self.constraints
         };
+        facts.named = name(&facts, &constraints);
         decide(&facts, &constraints)
     }
 }
@@ -1850,17 +2905,18 @@ impl Stated for Request<'_> {
     }
 }
 
-/// A decode call's request with the seat of its lease's file. The call
-/// decides at that seat, behind the decision that stands there: a caller
-/// that takes up a seat's work applies what was handed to its file, so a
-/// prefill's dispatch that waits there is applied ahead of the call's read.
-/// From another seat the call would read a file that applies nothing while
-/// its own caller decides, and a sent prefill would read as not sent.
-struct Called<'r, 'q>(&'r Request<'q>, usize);
+/// A decode call's request with the seat of its lease's file: one its host
+/// stated, or one its host makes. The call decides at that seat, behind the
+/// decision that stands there: a caller that takes up a seat's work applies
+/// what was handed to its file, so a prefill's dispatch that waits there is
+/// applied ahead of the call's read. From another seat the call would read
+/// a file that applies nothing while its own caller decides, and a sent
+/// prefill would read as not sent.
+struct Called<'s, S>(&'s S, usize);
 
-impl Stated for Called<'_, '_> {
+impl<S: Stated> Stated for Called<'_, S> {
     fn model(&self) -> &str {
-        self.0.facts.model
+        self.0.model()
     }
 
     fn own_seat(&self) -> Option<usize> {
@@ -1868,8 +2924,8 @@ impl Stated for Called<'_, '_> {
     }
 
     #[inline(always)]
-    fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
-        order(self.0)
+    fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        self.0.under(world, order)
     }
 }
 
@@ -2028,6 +3084,21 @@ pub struct Door {
     faults: AtomicU64,
     /// What the reports left beside a full ring, a list a file.
     kept: Box<[Kept]>,
+    /// The rows named again for a decision's shadow, a buffer a seat
+    /// ([`OwnNamed`]).
+    own_named: Box<[OwnNamed]>,
+}
+
+/// The buffer a seat's holder names a shadow's own rows on, where the
+/// shadow profile is named rows of its own ([`ShadowRows::Own`]). It
+/// stands beside its seat, on lines of its own, and not in it: a seat
+/// keeps its size, and no decision reaches the buffer but one whose
+/// shadow is named such rows. Its holder is the seat's, so its lock is
+/// never waited for. It grows at the seat's first such shadow.
+#[derive(Default)]
+#[repr(align(128))]
+struct OwnNamed {
+    named: Mutex<Named>,
 }
 
 /// What the door keeps for one file while its ring is full
@@ -2091,6 +3162,8 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static ON_SAMPLE_READ: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    /// Called once between a live decision and its shadow.
+    static ON_SHADOW: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
 }
 
 /// The threads that have called a door so far.
@@ -2132,6 +3205,7 @@ impl Door {
             seat_flags: AtomicU8::new(0),
             parts: (0..deciders).map(|_| Part::default()).collect(),
             kept: (0..deciders).map(|_| Kept::default()).collect(),
+            own_named: (0..deciders).map(|_| OwnNamed::default()).collect(),
             store,
             term,
             faults: AtomicU64::new(0),
@@ -2148,7 +3222,10 @@ impl Door {
         &self.store
     }
 
-    /// How many decisions panicked.
+    /// How many decisions panicked, and how many shadows did beside a
+    /// decision that stood: a shadow's panic refuses no request, and its
+    /// live answer is issued. A decision made again behind a lease the
+    /// store refused counts each panic of its shadow.
     #[must_use]
     pub fn faults(&self) -> u64 {
         self.faults.load(Ordering::Relaxed)
@@ -2168,6 +3245,44 @@ impl Door {
         summed(&self.parts, |part| &part.hashes_cut)
     }
 
+    /// How many decisions made here had a shadow that said `kind`
+    /// beside them ([`ShadowKind`]), for the binding at position
+    /// `binding` of its generation. A shadow is counted behind its
+    /// decision's commit, and a decision the door refused counts none.
+    /// The count is a position's: a later generation's binding at the
+    /// same position counts on, and a binding past the sixteenth
+    /// counts with the sixteenth.
+    #[must_use]
+    pub fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
+        let parts = self.parts.iter();
+        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Single, kind));
+        counts.sum()
+    }
+
+    /// [`Self::shadowed`] for one side of a pair's binding: how many
+    /// pairs decided here had a shadow of `side` that said `kind` beside
+    /// that side of them. A pair's binding counts by its sides, and
+    /// nothing under [`Self::shadowed`].
+    #[must_use]
+    pub fn shadowed_side(&self, binding: u32, side: PairSide, kind: ShadowKind) -> u64 {
+        let parts = self.parts.iter();
+        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Side(side), kind));
+        counts.sum()
+    }
+
+    /// [`Self::shadowed_side`] for a decode decided after its prefill
+    /// ([`Self::decide_decode`]): how many such calls had a shadow of
+    /// the decode side that said `kind` beside the decode the call
+    /// picked. The count is its own. The pair's first decision counts
+    /// its decode side under [`Self::shadowed_side`], beside the decode
+    /// it named first.
+    #[must_use]
+    pub fn shadowed_later(&self, binding: u32, kind: ShadowKind) -> u64 {
+        let parts = self.parts.iter();
+        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Later, kind));
+        counts.sum()
+    }
+
     /// One decision for `gateway`'s `request` at `now`, on the calling
     /// thread: one load of the published rows, the engine's decision and,
     /// for a pick, its lease, filed at the issue with the engine told.
@@ -2181,10 +3296,7 @@ impl Door {
         request: &Request<'_>,
         now: Instant,
     ) -> Result<Decided, Refused> {
-        self.deciding(gateway, request, now, |world, at, term, taken, buffers| {
-            let entry = entry(world, taken);
-            self.order(world, at, term, taken, buffers, entry)
-        })
+        self.deciding(gateway, request, now, Whole(self))
     }
 
     /// [`Door::decide`] for a request its host makes from the world the
@@ -2220,11 +3332,11 @@ impl Door {
     ) -> Result<(Decided, bool), Refused> {
         let made = Made(maker);
         let mut later = false;
-        let decided = self.deciding(gateway, &made, now, |world, at, term, taken, buffers| {
-            later = taken.request.decode_later();
-            let entry = entry(world, taken);
-            self.order(world, at, term, taken, buffers, entry)
-        })?;
+        let order = WholeStated {
+            door: self,
+            later: &mut later,
+        };
+        let decided = self.deciding(gateway, &made, now, order)?;
         Ok((decided, later))
     }
 
@@ -2244,17 +3356,12 @@ impl Door {
         placed: &mut EncodePlaced,
         now: Instant,
     ) -> Result<Decided, Refused> {
-        let decided = self.deciding(gateway, request, now, |world, at, term, taken, buffers| {
-            let (entry, plan) = entry_and_plan(world, taken);
-            if matches!((entry, plan), (Entry::Pair, Plan::Epd { .. })) {
-                let (decision, booking) =
-                    encode_pair_in(world, taken, items, placed, buffers, &self.parts[at]);
-                self.file_pair(world, term, taken, decision, booking)
-            } else {
-                placed.clear();
-                self.order(world, at, term, taken, buffers, entry)
-            }
-        });
+        let order = WithEncode {
+            door: self,
+            items,
+            placed: &mut *placed,
+        };
+        let decided = self.deciding(gateway, request, now, order);
         if decided.is_err() {
             placed.clear();
         }
@@ -2288,16 +3395,41 @@ impl Door {
         lease: LeaseId,
         now: Instant,
     ) -> Result<Decided, Refused> {
+        self.decode_called(gateway, request, lease, now)
+    }
+
+    /// [`Door::decide_decode`] for a request its host makes from the world
+    /// the call decides under ([`Maker::make`]). The sources of the
+    /// request's routing key and the decode profile that reads the key are
+    /// then of one load, across a reload that lands beside the call.
+    ///
+    /// A maker that panics is a decision that faulted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Door::decide_decode`].
+    pub fn decide_decode_under(
+        &self,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        lease: LeaseId,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
+        self.decode_called(gateway, &Made(maker), lease, now)
+    }
+
+    /// The decode call for `request` at the seat of its lease's file.
+    fn decode_called(
+        &self,
+        gateway: GatewayId,
+        request: &impl Stated,
+        lease: LeaseId,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
         // The call mints no id: it spends no term and raises none.
         let term = self.term.load(Ordering::Relaxed);
         let called = Called(request, self.store.file_of(lease));
-        self.at_a_seat(
-            term,
-            gateway,
-            &called,
-            now,
-            |world, at, _, taken, buffers| self.decode(world, at, taken, buffers, lease),
-        )
+        self.at_a_seat(term, gateway, &called, now, DecodeCall(self, lease))
     }
 
     /// Finds a sampled decision by gateway and request id. A read holds
@@ -2388,13 +3520,7 @@ impl Door {
         gateway: GatewayId,
         request: &impl Stated,
         now: Instant,
-        mut order: impl FnMut(
-            &World,
-            usize,
-            u64,
-            &Taken<'_, Request<'_>>,
-            &mut Buffers<()>,
-        ) -> Result<Decided, Refused>,
+        mut order: impl Orders,
     ) -> Result<Decided, Refused> {
         match self.once(gateway, request, now, &mut order) {
             Err(Refused::Unleased) => self.once(gateway, request, now, order),
@@ -2411,13 +3537,7 @@ impl Door {
         gateway: GatewayId,
         request: &impl Stated,
         now: Instant,
-        order: impl FnOnce(
-            &World,
-            usize,
-            u64,
-            &Taken<'_, Request<'_>>,
-            &mut Buffers<()>,
-        ) -> Result<Decided, Refused>,
+        order: impl Orders,
     ) -> Result<Decided, Refused> {
         let term = self.term.load(Ordering::Relaxed);
         let outcome = self.at_a_seat(term, gateway, request, now, order);
@@ -2437,22 +3557,16 @@ impl Door {
     /// Takes the seat the last generation called for and checks it
     /// against the world loaded there. If an apply changed which seat
     /// the request belongs at, it takes that seat and loads again. The
-    /// same world governs the decision and its sampling. A call that names
-    /// its lease's seat and decides at its model's applies what waits at
-    /// the lease's file first ([`Door::stand_at`]).
+    /// same world governs the decision, its shadow and its sampling. A call
+    /// that names its lease's seat and decides at its model's applies what
+    /// waits at the lease's file first ([`Door::stand_at`]).
     fn at_a_seat(
         &self,
         term: u64,
         gateway: GatewayId,
         request: &impl Stated,
         now: Instant,
-        order: impl FnOnce(
-            &World,
-            usize,
-            u64,
-            &Taken<'_, Request<'_>>,
-            &mut Buffers<()>,
-        ) -> Result<Decided, Refused>,
+        mut order: impl Orders,
     ) -> Result<Decided, Refused> {
         let store = &*self.store;
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
@@ -2521,16 +3635,46 @@ impl Door {
                     // decider's at work is.
                     place: None,
                 };
-                let decided = order(&world, at, term, &taken, buffers);
-                if flags & SAMPLES_DECISIONS != 0 {
-                    if let Ok(answer) = &decided {
-                        if sample_count.keeps(0, engine, &answer.decision) {
-                            let samples = &self.seats[at].samples;
-                            samples.lock().push(0, engine, &taken, &answer.decision);
+                // One test for a generation that neither shadows nor
+                // samples: its order is the plain one, which stands last.
+                if flags & (SAMPLES_DECISIONS | SHADOWS) != 0 {
+                    // The request's shadow is asked for first, by one
+                    // lookup of the binding its order decides under. A
+                    // request whose binding names none is ordered as a
+                    // generation that shadows nowhere orders it.
+                    let due = match flags & SHADOWS {
+                        0 => None,
+                        _ => {
+                            let under = order.binding(engine, &request.facts);
+                            under.and_then(|under| engine.shadow_at(under))
                         }
+                    };
+                    // Each order's answer is built in its own place:
+                    // two that met in one would cost a copy of it.
+                    let Some((binding, rows)) = due else {
+                        let decided = order.plain(&world, at, term, &taken, buffers);
+                        if flags & SAMPLES_DECISIONS != 0 {
+                            // A kept record names that binding: it is
+                            // looked up for a kept decision alone.
+                            let said = || (order.binding(engine, &request.facts), None, [None; 2]);
+                            self.sampled(at, engine, &taken, &decided, said, sample_count);
+                        }
+                        return decided;
+                    };
+                    let mut due = Due {
+                        binding,
+                        rows,
+                        said: None,
+                        sides: [None; 2],
+                    };
+                    let decided = order.shadowed(&world, at, term, &taken, buffers, &mut due);
+                    if flags & SAMPLES_DECISIONS != 0 {
+                        let said = || (Some(binding), due.said, due.sides);
+                        self.sampled(at, engine, &taken, &decided, said, sample_count);
                     }
+                    return decided;
                 }
-                decided
+                order.plain(&world, at, term, &taken, buffers)
             };
             let decided = catch_unwind(AssertUnwindSafe(|| request.under(&world, taken_up)));
             // The load ends with the decision.
@@ -2571,6 +3715,29 @@ impl Door {
         let at_file = slot.at_file.get_or_insert_with(|| self.store.at_work());
         at_file.work();
         self.leave(at, at_file);
+    }
+
+    /// Keeps a made decision in the seat's samples where its turn to be
+    /// sampled came, with the binding its order decided under and what
+    /// its shadow said (`said`, asked for a kept decision alone).
+    // Forced into each order's tail: the sampling stands in line there,
+    // as it did where one order ran.
+    #[inline(always)]
+    fn sampled(
+        &self,
+        at: usize,
+        engine: &Engine,
+        taken: &Taken<'_, Request<'_>>,
+        decided: &Result<Decided, Refused>,
+        said: impl FnOnce() -> (Option<u32>, Option<Shadowed>, [Option<Shadowed>; 2]),
+        count: &mut SampleCount,
+    ) {
+        let Ok(answer) = decided else { return };
+        if count.keeps(0, engine, &answer.decision) {
+            let (binding, said, sides) = said();
+            let mut samples = self.seats[at].samples.lock();
+            samples.push(0, binding, taken, &answer.decision, said, sides);
+        }
     }
 
     /// Takes the seat of `model`'s decider and waits for it: a model's
@@ -2694,25 +3861,201 @@ impl Door {
         match entry {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
-                let lease = booking
-                    .map(|booking| -> Result<_, LeaseRefused> {
-                        let lease = issue(&self.store, world, taken, term, &decision, booking)?;
-                        world.sent(&buffers.named, booking.target);
-                        Ok(lease)
-                    })
-                    .transpose()
-                    .map_err(|_| Refused::Unleased)?;
-                Ok(Decided {
-                    decision,
-                    lease: lease.map(|lease| Leased {
-                        lease,
-                        due: taken.due(),
-                    }),
-                })
+                let lease =
+                    self.file::<PLAIN>(world, term, taken, &buffers.named, &decision, booking)?;
+                Ok(Decided { decision, lease })
             }
             Entry::Pair => self.pair(world, at, term, taken, buffers),
             Entry::Side => Err(Refused::PairSide),
         }
+    }
+
+    /// What stands behind a single's decision, in each of its orders
+    /// ([`Self::order`], [`Self::order_shadowed`], [`Self::order_own`]):
+    /// a pick's lease is issued, the engine that decided is told of it,
+    /// and the record of sent prefixes takes the prefix of `named`
+    /// ([`issue`]). `named` is the live decision's naming, or the
+    /// naming of a shadow its pool keeps the record for
+    /// ([`Self::shadowed_order`]). A step that joins a single's commit
+    /// is written here, once, and stands in every order.
+    ///
+    /// Each order builds a copy of its own (`ORDER`), with a telling of
+    /// its own: the store builds its issue for each telling, so no
+    /// order's issue moves where another's is built.
+    #[inline(always)]
+    fn file<const ORDER: u8>(
+        &self,
+        world: &World,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        named: &Named,
+        decision: &Decision,
+        booking: Option<Booking>,
+    ) -> Result<Option<Leased>, Refused> {
+        let engine = world.spec().engine();
+        let told = |lease: &Lease| {
+            engine.on_decision_issued(lease, decision);
+        };
+        let lease = booking
+            .map(|booking| issue(&self.store, world, taken, term, booking, named, told))
+            .transpose()
+            .map_err(|_| Refused::Unleased)?;
+        Ok(lease.map(|lease| Leased {
+            lease,
+            due: taken.due(),
+        }))
+    }
+
+    /// [`Self::order`] for a request whose binding names a shadow
+    /// (`due`, [`Engine::shadow_for`]). A pair's binding that names one
+    /// for a side takes an order of its own ([`Self::order_sides`]). A
+    /// single's decision is made
+    /// at the engine's keeping entries, and the shadow is asked over the
+    /// same view ahead of the commit ([`decide_shadowed_in`]). The commit
+    /// is the plain order's ([`Self::file`]). What the shadow said comes
+    /// back counted, behind a commit that held: a decision whose lease
+    /// the store refused counts none. A shadow that panicked is counted
+    /// with the door's faults and the scratch it left is dropped, both
+    /// behind the commit: the live decision is issued as decided. The
+    /// budget is the one its host stated at the decision's instant: in
+    /// process the door reads no clock.
+    ///
+    /// A shadow that reads none of its live decision's rows takes an
+    /// order of its own ([`Self::order_own`]): this one pays one test
+    /// for it and runs no part of a naming.
+    fn order_shadowed(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        if matches!(
+            due.rows,
+            ShadowRows::Own | ShadowRows::Apart | ShadowRows::Sides
+        ) {
+            return self.order_own(world, at, term, taken, buffers, due);
+        }
+        self.shadowed_order::<SHADOWED>(world, at, term, taken, buffers, due)
+    }
+
+    /// [`Self::order_shadowed`] for a shadow that reads none of its live
+    /// decision's rows: one that is named rows of its own, or one that
+    /// is skipped ([`decide_own_in`]). Out of line, with a copy of the
+    /// commit of its own: no other order runs a part of it.
+    #[inline(never)]
+    fn order_own(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        if due.rows == ShadowRows::Sides {
+            return self.order_sides(world, at, term, taken, buffers, due);
+        }
+        self.shadowed_order::<OWN_ROWS>(world, at, term, taken, buffers, due)
+    }
+
+    /// [`Self::order_shadowed`] for a request whose binding is a pair's
+    /// and names a shadow for a side ([`ShadowRows::Sides`]). The request
+    /// that enters the pair at its prefill is decided with its sides'
+    /// shadows ([`pair_shadowed_in`]) and committed as any pair
+    /// ([`Self::file_pair`]). What each side's shadow said is counted by
+    /// its side, behind a commit that held. A shadow that panicked is
+    /// counted with the door's faults and the scratch it left is
+    /// dropped, both behind the commit: the live pair is issued as
+    /// decided. Any other request under the binding takes its plain
+    /// order here. A decode decided after its prefill asks its shadow at
+    /// its own call ([`Self::decode_shadowed`]).
+    fn order_sides(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        let entry = entry(world, taken);
+        if !matches!(entry, Entry::Pair) {
+            return self.order(world, at, term, taken, buffers, entry);
+        }
+        let own = &self.parts[at];
+        let ((decision, booking), sides) =
+            pair_shadowed_in(world, taken, buffers, own, due.binding);
+        let decided = self.file_pair(world, term, taken, decision, booking);
+        if sides.contains(&Shadow::Faulted) {
+            // The next decision reads nothing a shadow left.
+            buffers.scratch = Scratch::default();
+            self.faults.fetch_add(1, Ordering::Relaxed);
+        }
+        let decided = decided?;
+        for (side, shadow) in PairSide::BOTH.into_iter().zip(sides) {
+            if let Shadow::Said(said) = shadow {
+                let count = own.shadowed(said.binding, Counted::Side(side), said.kind);
+                count.fetch_add(1, Ordering::Relaxed);
+                due.sides[side.index()] = Some(said);
+            }
+        }
+        Ok(decided)
+    }
+
+    /// The body of the two shadowed orders, built once for each
+    /// ([`Self::order_shadowed`], [`Self::order_own`]): the decision
+    /// with its shadow, the commit ([`Self::file`]), then what the
+    /// shadow said or its fault.
+    ///
+    /// The record of sent prefixes takes the live decision's naming.
+    /// Where the live profile is named no row, its pool keeps the
+    /// record for a shadow that is named rows of its own
+    /// ([`Engine::pool_record_for`]). The issue then writes the prefixes
+    /// that shadow's naming folded, on the live decision's worker: the
+    /// shadow reads where the requests went. A shadow that was not
+    /// asked named nothing, and its decision writes no record.
+    #[inline(always)]
+    fn shadowed_order<const ORDER: u8>(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        let own = &self.parts[at];
+        let word = (due.binding, due.rows);
+        // The order of a shadow's own rows holds its seat's buffer for
+        // them through the commit: the issue may write from it.
+        let mut lent = match ORDER {
+            OWN_ROWS => Some(self.own_named[at].named.lock()),
+            _ => None,
+        };
+        let ((decision, booking), shadow) = match lent.as_deref_mut() {
+            Some(named) => decide_own_in(world, taken, buffers, own, word, named, || taken.left),
+            None => decide_shadowed_in(world, taken, buffers, own, word, || taken.left),
+        };
+        let named = match lent.as_deref() {
+            Some(own_named) if buffers.named.sent_pool().is_none() => own_named,
+            _ => &buffers.named,
+        };
+        let filed = self.file::<ORDER>(world, term, taken, named, &decision, booking);
+        if shadow == Shadow::Faulted {
+            // The next decision reads nothing the shadow left.
+            buffers.scratch = Scratch::default();
+            self.faults.fetch_add(1, Ordering::Relaxed);
+        }
+        let lease = filed?;
+        if let Shadow::Said(shadow) = shadow {
+            let count = own.shadowed(shadow.binding, Counted::Single, shadow.kind);
+            count.fetch_add(1, Ordering::Relaxed);
+            due.said = Some(shadow);
+        }
+        Ok(Decided { decision, lease })
     }
 
     /// A pair's order: decided for both sides and, for a pick, issued a
@@ -2755,10 +4098,9 @@ impl Door {
         })
     }
 
-    /// A decode call's order. The store's own test of the lease comes
-    /// first, so a call it refuses runs no stage. Then the pair's rows of
-    /// this instant, the engine's decode entry over the held prefill's
-    /// partners and, for a pick, the side's issue under the lease's id.
+    /// A decode call's order at this door: the decision ([`decode_in`]) and,
+    /// for a pick, the side's issue under the lease's id
+    /// ([`Self::file_decode`]).
     #[inline(never)]
     fn decode(
         &self,
@@ -2768,90 +4110,381 @@ impl Door {
         buffers: &mut Buffers<()>,
         lease: LeaseId,
     ) -> Result<Decided, Refused> {
-        let store = &*self.store;
-        let prefill = store
-            .held_prefill(taken.gateway, lease)
-            .map_err(Refused::Decode)?;
-        let Buffers {
-            pair,
-            scratch,
-            lists,
-            ..
-        } = buffers;
-        let (decision, side) = pair_with(
-            world,
-            taken,
-            &self.parts[at],
-            pair,
-            (lists, scratch),
-            |pair, _, model, ask, wires, subset| {
-                let built = world.build_pair(model, &ask, pair)?;
-                world.count_pair_in_flight(&built, &ask, pair);
-                Some((built, pair.narrow(wires, subset, &built)))
-            },
-            (
-                |engine, pair, facts, pool, cx, scratch| {
-                    let facts = RequestFacts {
-                        phase: Phase::Decode,
-                        ..*facts
-                    };
-                    engine.decide_decode(&facts, pool, pair.pools(), prefill, cx, scratch)
-                },
-                |facts, decision, built, _| {
-                    let (pick, (_, decodes)) = decision.pick().zip(built)?;
-                    let first = pick.targets.first()?.pair?;
-                    let side = DecodeSide {
-                        target: first.decode_id,
-                        picked: Picked::of_decodes(&pick.targets),
-                        session: RequestFacts {
-                            phase: Phase::Decode,
-                            ..*facts
-                        }
-                        .session(),
-                        state: LeaseState::ISSUED,
-                        tokens: facts.prompt_tokens,
-                        target_index: 0,
-                    };
-                    Some((side, world.booked(&decodes, side.target)))
-                },
-            ),
-        );
-        let Some((side, slot)) = side else {
-            return Ok(Decided {
-                decision,
-                lease: None,
-            });
-        };
-        let spec = world.spec();
-        let lease = store
-            .issue_decided_decode(taken.gateway, lease, side, slot, taken.now, |lease| {
-                // The lease keeps the generation of its first decision, and
-                // the engine of that generation alone hears its words
-                // ([`issuing`]). Behind a reload the engine of this instant
-                // decided the side and hears nothing of the lease.
-                let Some(engine) = issuing(spec, lease) else {
+        let (store, own) = (&*self.store, &self.parts[at]);
+        let decided = decode_in(world, store, taken, lease, buffers, own);
+        self.file_decode(world, taken, lease, decided)
+    }
+
+    /// [`Self::decode`] for a call whose pair binding names a shadow for
+    /// a side. The decode side is decided once more by its shadow
+    /// profile, behind the side's booking and ahead of its issue, over
+    /// the rows the call decided over
+    /// ([`Engine::shadow_decode_later`]). It is compared with the decode
+    /// this call picked and counted on its own
+    /// ([`Door::shadowed_later`]), behind an issue that held. A shadow
+    /// that panicked is counted with the door's faults and the scratch
+    /// it left is dropped: the call answers as decided. Out of line: the
+    /// plain call runs no part of it.
+    #[inline(never)]
+    fn decode_shadowed(
+        &self,
+        world: &World,
+        at: usize,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        lease: LeaseId,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        let (binding, left) = (due.binding, taken.left);
+        let mut said = Shadow::NotDue;
+        let (store, own) = (&*self.store, &self.parts[at]);
+        let decided = decode_with(world, store, taken, lease, buffers, own, |prefill| {
+            let said = &mut said;
+            move |engine: &Engine,
+                  pair: &PairBuffers,
+                  facts: &RequestFacts<'_>,
+                  pool: &PoolFacts<'_>,
+                  cx: &Constraints<'_>,
+                  decision: &Decision,
+                  scratch: &mut Scratch| {
+                let Some(live) = decision.pick() else {
                     return;
                 };
-                // The side is on file by now. A stage that panics while it
-                // hears of the issue is held and counted, as under a
-                // report: the host still gets the pick the file holds.
-                let heard = || engine.on_decision_issued(lease, &decision);
-                match catch_unwind(AssertUnwindSafe(heard)) {
-                    Ok(()) => store.call_returned(),
-                    Err(payload) => {
-                        release(payload);
-                        store.call_faulted();
-                    }
-                }
-            })
-            .map_err(Refused::Decode)?;
+                // The call's facts, as its live decode read them.
+                let facts = RequestFacts {
+                    phase: Phase::Decode,
+                    ..*facts
+                };
+                let pools = pair.pools();
+                *said = side_shadow(engine, (binding, PairSide::Decode), live, left, || {
+                    engine.shadow_decode_later(binding, &facts, pool, pools, prefill, cx, scratch)
+                });
+            }
+        });
+        let decided = self.file_decode(world, taken, lease, decided);
+        if said == Shadow::Faulted {
+            // The next decision reads nothing the shadow left.
+            buffers.scratch = Scratch::default();
+            self.faults.fetch_add(1, Ordering::Relaxed);
+        }
+        let decided = decided?;
+        if let Shadow::Said(said) = said {
+            let count = own.shadowed(said.binding, Counted::Later, said.kind);
+            count.fetch_add(1, Ordering::Relaxed);
+            due.sides[PairSide::Decode.index()] = Some(said);
+        }
+        Ok(decided)
+    }
+
+    /// Files what a decode call decided, for its two orders
+    /// ([`Self::decode`], [`Self::decode_shadowed`]): for a pick, the
+    /// side's issue under the lease's id ([`issue_decode`]).
+    #[inline(always)]
+    fn file_decode(
+        &self,
+        world: &World,
+        taken: &Taken<'_, Request<'_>>,
+        lease: LeaseId,
+        decided: Result<(Decision, Option<DecodeBooking>), DecodeRefused>,
+    ) -> Result<Decided, Refused> {
+        let store = &*self.store;
+        let (decision, booking) = decided.map_err(Refused::Decode)?;
+        let lease = booking
+            .map(|booking| issue_decode(store, world, taken, lease, &decision, booking))
+            .transpose()
+            .map_err(Refused::Decode)?
+            .map(|(lease, _)| lease);
         Ok(Decided {
             decision,
-            lease: Some(Leased {
+            lease: lease.map(|lease| Leased {
                 lease,
                 due: taken.due(),
             }),
         })
+    }
+}
+
+/// The plain order's copy of a single's commit ([`Door::file`]).
+const PLAIN: u8 = 0;
+/// The copy of the order whose shadow reads its live decision's rows.
+const SHADOWED: u8 = 1;
+/// The copy of the order whose shadow reads none of them.
+const OWN_ROWS: u8 = 2;
+
+/// A decision's shadow at its seat: what the seat read of the request's
+/// binding ahead of the order ([`Engine::shadow_at`]), and what the
+/// order leaves of the shadow.
+struct Due {
+    /// The binding's position in its generation.
+    binding: u32,
+    /// How its shadow reads the rows of the live decision.
+    rows: ShadowRows,
+    /// What the shadow said, behind a commit that held.
+    said: Option<Shadowed>,
+    /// What each side's shadow of a pair said, the prefill's then the
+    /// decode's, behind a commit that held.
+    sides: [Option<Shadowed>; 2],
+}
+
+/// The order of one decision at its seat, in the two forms a seat runs
+/// it in. A generation that neither shadows nor samples runs the plain
+/// form and no part of the other. Under one that shadows, a request
+/// whose binding names no shadow runs the plain form too.
+trait Orders {
+    /// The position of the binding the order's live decision runs
+    /// under: the one the request's own phase resolves to
+    /// ([`Engine::binding_position`]). An order whose live decision runs
+    /// under another binding answers that one. The seat reads the
+    /// request's shadow word ([`Engine::shadow_at`]) and names its
+    /// sampled record by this one answer.
+    #[inline(always)]
+    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
+        engine.binding_position(facts.model, facts.phase)
+    }
+
+    /// Decides the request and, for a pick, issues its lease.
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused>;
+
+    /// [`Self::plain`] for a request whose binding names a shadow
+    /// ([`Door::order_shadowed`]). What the shadow said is left in
+    /// `due`: the answer is built where it is returned, and is not
+    /// carried beside a second value.
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused>;
+}
+
+/// An order lent to a run. A decision whose lease the store refused runs
+/// its order twice: the first run borrows it and the second takes it, so
+/// each run is an instance of its own, as each closure's was.
+impl<O: Orders> Orders for &mut O {
+    #[inline(always)]
+    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
+        (**self).binding(engine, facts)
+    }
+
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        (**self).plain(world, at, term, taken, buffers)
+    }
+
+    #[inline(always)]
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        (**self).shadowed(world, at, term, taken, buffers, due)
+    }
+}
+
+/// The order of [`Door::decide`] and [`Door::decide_under`]: the request
+/// takes the path its plan gives it ([`entry`]).
+struct Whole<'d>(&'d Door);
+
+impl Orders for Whole<'_> {
+    // Forced into the seat's call: out of line the plain order would pay
+    // a call the closure it stands for never made.
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        let entry = entry(world, taken);
+        self.0.order(world, at, term, taken, buffers, entry)
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        self.0.order_shadowed(world, at, term, taken, buffers, due)
+    }
+}
+
+/// [`Whole`] for [`Door::decide_under_stated`]: each run of the order
+/// notes what the made request said of its decode
+/// ([`Asked::decode_later`]).
+struct WholeStated<'d, 'l> {
+    door: &'d Door,
+    later: &'l mut bool,
+}
+
+impl Orders for WholeStated<'_, '_> {
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        *self.later = taken.request.decode_later();
+        Whole(self.door).plain(world, at, term, taken, buffers)
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        *self.later = taken.request.decode_later();
+        Whole(self.door).shadowed(world, at, term, taken, buffers, due)
+    }
+}
+
+/// The order of [`Door::decide_decode`]: the decode side of the pair's
+/// lease on file ([`Door::decode`]). Where the pair's binding names a
+/// shadow for a side, the decode side's is asked beside the call
+/// ([`Door::decode_shadowed`]). The call decides under the pair binding
+/// its model's prefill lookup resolves to, whatever phase it states
+/// ([`Engine::pair_position`]): its shadow word and its sampled record
+/// are that binding's.
+struct DecodeCall<'d>(&'d Door, LeaseId);
+
+impl Orders for DecodeCall<'_> {
+    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
+        engine.pair_position(facts.model)
+    }
+
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        _: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        self.0.decode(world, at, taken, buffers, self.1)
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        _: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        // The word is a pair binding's that names a shadow for a side
+        // ([`Self::binding`]).
+        self.0
+            .decode_shadowed(world, at, taken, buffers, self.1, due)
+    }
+}
+
+/// The order of [`Door::decide_encode_pair`]: the request that enters an
+/// `epd` plan is decided as a pair with its encode items placed, and any
+/// other as [`Whole`] orders it, with `placed` cleared.
+struct WithEncode<'d, 'i, 'p> {
+    door: &'d Door,
+    items: EncodeItems<'i>,
+    placed: &'p mut EncodePlaced,
+}
+
+impl WithEncode<'_, '_, '_> {
+    /// The pair's order, for the request that enters an `epd` plan.
+    /// `Err` is the path of any other request, with `placed` cleared.
+    #[inline(always)]
+    fn pair(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Result<Decided, Refused>, Entry> {
+        let (entry, plan) = entry_and_plan(world, taken);
+        if !matches!((entry, plan), (Entry::Pair, Plan::Epd { .. })) {
+            self.placed.clear();
+            return Err(entry);
+        }
+        let own = &self.door.parts[at];
+        let (decision, booking) =
+            encode_pair_in(world, taken, self.items, self.placed, buffers, own);
+        Ok(self.door.file_pair(world, term, taken, decision, booking))
+    }
+}
+
+impl Orders for WithEncode<'_, '_, '_> {
+    #[inline(always)]
+    fn plain(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        match self.pair(world, at, term, taken, buffers) {
+            Ok(decided) => decided,
+            Err(entry) => self.door.order(world, at, term, taken, buffers, entry),
+        }
+    }
+
+    fn shadowed(
+        &mut self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        // An `epd` pair is decided with its encode items and asks no
+        // shadow of its sides. Any other request is ordered as
+        // [`Door::decide`] orders it, with `placed` cleared: a pair of
+        // another plan asks its sides' shadows, and a binding of one
+        // profile enters no pair.
+        if due.rows == ShadowRows::Sides {
+            if let Ok(decided) = self.pair(world, at, term, taken, buffers) {
+                return decided;
+            }
+        } else {
+            self.placed.clear();
+        }
+        self.door
+            .order_shadowed(world, at, term, taken, buffers, due)
     }
 }
 
@@ -2881,24 +4514,26 @@ pub(crate) mod tests {
         builtins::{Best, Random},
         catalog::Catalog,
         decider::Decider,
-        decision::{Decision, ShedReason, Target, Targets},
+        decision::{Decision, Lifted, ShedReason, Target, Targets},
         demands::{DemandFacts, Demands},
-        framework::{DecisionScope, EncodeItems, EncodePlaced, Picker, TieBand},
+        framework::{DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         sessions::SessionVerdict,
         spec::{AppliedSpec, Needs, PolicySpec},
         store::{
             Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
-            HealthSink, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
-            Picked, Said, SessionsStore, VetoWrite, ViewBuffers, WorkerFacts, WorkerStatus,
-            WorkersStore,
+            HealthSink, HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink,
+            LoadSource, MemoryStore, Picked, Said, SessionsStore, VetoWrite, ViewBuffers,
+            WorkerFacts, WorkerStatus, WorkersStore,
         },
         view::{
             Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts, RequestFacts,
             Role, Session, WireModes, WorkerId,
         },
-        DecisionRecord,
+        DecisionRecord, References, Unmet,
     };
+
+    mod shadow;
 
     pub(crate) const MODEL: &str = "model-a";
     pub(crate) const GATEWAY: GatewayId = GatewayId(11);
@@ -2979,6 +4614,25 @@ pub(crate) mod tests {
         let document = PolicySpec::pair_presets("least_load", "least_load")?;
         apply_pair_document(&store, document)?;
         Ok(Arc::new(store))
+    }
+
+    /// The stock pair document filters its prefills by a bit the host
+    /// supplies. A row the store builds reads that bit open, so the document
+    /// as written places a pair over the store's rows. With the bit unset it
+    /// kept no prefill and shed every pair.
+    #[test]
+    fn a_pair_is_placed_over_the_stores_rows_under_the_stock_pair_document() {
+        let store = MemoryStore::new();
+        member(&store, "p0", Role::Prefill);
+        member(&store, "d0", Role::Decode);
+        let document = PolicySpec::pair_presets("least_load", "least_load");
+        let applied = AppliedSpec::validate(&document.expect("the stock presets"));
+        let applied = store.apply(applied.expect("the stock document"));
+        applied.expect("a first generation");
+        let door = Door::new(Arc::new(store));
+        let answer = door.decide(GATEWAY, &pair_request(b"pair"), Instant::now());
+        let decided = answer.expect("no refusal");
+        assert!(decided.lease.is_some(), "the stock document shed the pair");
     }
 
     fn apply_epd(store: &MemoryStore) -> Result<(), Box<dyn Error>> {
@@ -3167,6 +4821,7 @@ pub(crate) mod tests {
             now: Instant::now(),
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let mut out = ViewBuffers::default();
         store.deciding(|world| {
@@ -3912,6 +5567,191 @@ pub(crate) mod tests {
         )
     }
 
+    /// One prefill and two decodes. A decode call shows its profile the
+    /// decode pool's facts beside the decode rows: the pool the profile
+    /// places in, and never the prefills'.
+    #[test]
+    fn a_decode_call_shows_its_profile_the_decode_pools_facts() {
+        #[derive(Debug)]
+        struct Shown(Arc<Mutex<Vec<(u32, usize)>>>);
+
+        impl Lifecycle for Shown {}
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown-pool"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        impl DecisionScope for Shown {
+            fn open(&self, _: &RequestFacts<'_>, rows: &[Candidate], pool: &PoolFacts<'_>) {
+                self.0.lock().push((pool.pool_size, rows.len()));
+            }
+
+            fn close(&self) {}
+        }
+
+        let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&shown);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("shown-pool", move || Box::new(Shown(Arc::clone(&kept))))
+            .expect("a free filter name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = 2;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        let filters = &mut decode.expect("the decode profile").filter;
+        filters.push("shown-pool".into());
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+        let door = Door::new(store);
+        let now = Instant::now();
+        let asked = later_request(b"pool");
+        let first = door.decide(GATEWAY, &asked, now).expect("a pair");
+        let lease = first.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        shown.lock().clear();
+        let called = door.decide_decode(GATEWAY, &asked, lease, now);
+        assert!(called.expect("a decode").decision.pick().is_some());
+        // The pool's size as its facts say it, and the rows read.
+        assert_eq!(shown.lock().as_slice(), [(2, 2)]);
+    }
+
+    /// A pair's decode asked later and sent with no decode call goes out
+    /// as the first pick's, here on its second target. The stages hear the
+    /// side's issue ahead of its dispatch, as they hear every side's: the
+    /// pick as the lease's record keeps it, under a lease that names the
+    /// target taken. The issue is dated when the store is told, here
+    /// three seconds behind the dispatch the report names, and never by
+    /// the gateway's date of that dispatch. The dispatch's own word then
+    /// names that worker as the one the issue booked, under the lease's
+    /// own instant.
+    #[test]
+    fn a_decode_sent_with_no_call_is_told_issued_ahead_of_its_dispatch() {
+        let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+        let heard = hearing_decode(&store);
+        let door = Door::new(store);
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let first = door.decide(GATEWAY, &asked, now).expect("a pair");
+        let decodes = decodes_of(&first.decision);
+        assert_eq!(decodes.len(), 2, "a decode a target");
+        let leased = first.lease.expect("a lease").lease;
+        door.report(GATEWAY, leased.id, pair_dispatch(Side::Prefill, now));
+        // The side is chosen, not issued: no word of it yet.
+        assert_eq!(heard.lock().as_slice(), []);
+        let sent = Dispatch {
+            side: Side::Decode,
+            target_index: 1,
+            since_decision_micros: 250,
+        };
+        let told = now + Duration::from_secs(3);
+        door.report(GATEWAY, leased.id, Said::Dispatched(sent, told));
+        let issued = leased.issued_micros;
+        assert_eq!(
+            heard.lock().as_slice(),
+            [
+                ("issued", 1, decodes[1], issued + 3_000_000, decodes.clone()),
+                ("dispatched", 1, decodes[1], issued, vec![decodes[1]]),
+            ]
+        );
+    }
+
+    /// A decode call made three seconds behind its pair's first decision.
+    /// The stages hear the side's issue dated at the call, when the store
+    /// files the side. The lease the call hands back keeps the first
+    /// decision's instant, as the lease on file does for its other words.
+    #[test]
+    fn a_decode_call_dates_its_issue_at_the_call() {
+        let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+        let heard = hearing_decode(&store);
+        let door = Door::new(store);
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let first = door.decide(GATEWAY, &asked, now).expect("a pair");
+        let leased = first.lease.expect("a lease").lease;
+        door.report(GATEWAY, leased.id, pair_dispatch(Side::Prefill, now));
+        let called = now + Duration::from_secs(3);
+        let decided = door
+            .decide_decode(GATEWAY, &asked, leased.id, called)
+            .expect("a decode");
+        let decodes = decodes_of(&decided.decision);
+        let side = decided.lease.expect("the decode's lease").lease;
+        let issued = leased.issued_micros;
+        assert_eq!((side.side, side.issued_micros), (Side::Decode, issued));
+        assert_eq!(
+            heard.lock().as_slice(),
+            [("issued", 0, decodes[0], issued + 3_000_000, decodes.clone())]
+        );
+    }
+
+    /// The two ranks of one engine are two rows, each under its own key
+    /// and id. The second rank is the lighter: the pair's first pick sends
+    /// the prefill there, and the decode call names the held prefill at
+    /// that same rank.
+    #[test]
+    fn a_decode_call_names_the_held_prefill_at_its_own_rank() {
+        let store = pair_fleet(0, 1).expect("a decode worker under the pair plan");
+        let rank = |dp_rank: u16| {
+            let facts = WorkerFacts {
+                key: format!("http://p-ranks:8000/{dp_rank}"),
+                engine: "http://p-ranks:8000".into(),
+                incarnation: 1,
+                role: Role::Prefill,
+                models: vec![MODEL.to_owned()],
+                dp_rank,
+                dp_size: 2,
+                max_running: Some(4_096),
+                ..WorkerFacts::default()
+            };
+            ready(&store, facts)
+        };
+        let ranks = [rank(0), rank(1)];
+        let at = Instant::now();
+        for (worker, dp_rank, queued) in [(ranks[0], 0, 80), (ranks[1], 1, 0)] {
+            let row = LoadRow {
+                queued,
+                live_rate: 2_000,
+                ..LoadRow::default()
+            };
+            store.record(worker, dp_rank, row, at, LoadSource::Stream);
+        }
+        let now = store.publish_due().map_or(at, |due| due.max(at));
+        store.publish(now);
+        let door = Door::new(store);
+        let asked = later_request(b"ranks");
+        // Every target of a pick names its prefill, by worker and rank.
+        let prefills = |decision: &Decision| -> Vec<(WorkerId, u16)> {
+            let pick = decision.pick();
+            pick.into_iter()
+                .flat_map(|pick| pick.targets.iter())
+                .map(|target| (target.id, target.dp_rank))
+                .collect()
+        };
+        let first = door.decide(GATEWAY, &asked, now).expect("a pair");
+        assert_eq!(prefills(&first.decision), [(ranks[1], 1)]);
+        let lease = first.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let called = door
+            .decide_decode(GATEWAY, &asked, lease, now)
+            .expect("a decode");
+        assert_eq!(prefills(&called.decision), [(ranks[1], 1)]);
+    }
+
     #[test]
     fn the_call_is_refused_by_name_and_moves_nothing() {
         let store = pair_fleet(1, 1).expect("a pair fleet");
@@ -4042,6 +5882,86 @@ pub(crate) mod tests {
         assert_eq!(pair_counts(&store, workers), [1, 1]);
     }
 
+    /// A word of a pair's decode side as a stage hears it: its name, the
+    /// lease's target index, the worker the lease books, the lease's
+    /// instant and the decodes the word names.
+    type DecodeWord = (&'static str, u8, WorkerId, u64, Vec<WorkerId>);
+
+    /// The decode each target of a pick names, in the pick's order.
+    fn decodes_of(decision: &Decision) -> Vec<WorkerId> {
+        let targets = decision
+            .pick()
+            .into_iter()
+            .flat_map(|pick| pick.targets.iter());
+        targets
+            .filter_map(|target| target.pair)
+            .map(|pair| pair.decode_id)
+            .collect()
+    }
+
+    /// Applies the pair presets to `store` as generation 2, the decode side
+    /// picking through a stage that keeps every issue and every dispatch
+    /// it hears of a decode side: the words are returned.
+    fn hearing_decode(store: &MemoryStore) -> Arc<Mutex<Vec<DecodeWord>>> {
+        #[derive(Debug)]
+        struct Hears(Arc<Mutex<Vec<DecodeWord>>>);
+
+        impl Lifecycle for Hears {
+            fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+                if lease.side == Side::Decode {
+                    let named = decodes_of(decision);
+                    let word = ("issued", lease.target_index, lease.booked);
+                    let mut heard = self.0.lock();
+                    heard.push((word.0, word.1, word.2, lease.issued_micros, named));
+                }
+            }
+
+            fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, _: u32) {
+                if side == Side::Decode {
+                    let word = ("dispatched", lease.target_index, lease.booked);
+                    let mut heard = self.0.lock();
+                    heard.push((word.0, word.1, word.2, lease.issued_micros, vec![target.id]));
+                }
+            }
+        }
+
+        impl Picker for Hears {
+            fn name(&self) -> &'static str {
+                "hears-decode"
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                rows: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                Best.pick(facts, rows, kept, scores, band, out);
+            }
+        }
+
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("hears-decode", move || Box::new(Hears(Arc::clone(&kept))));
+        added.expect("a free picker name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = 2;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        decode.expect("the decode profile").pick = "hears-decode".into();
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+        heard
+    }
+
     /// Applies the pair presets to `store` as `generation`, the decode side
     /// picking through a stage that keeps every word it hears of leases in
     /// `heard`: a stage hears the words of both sides.
@@ -4129,6 +6049,49 @@ pub(crate) mod tests {
         assert!(store.sides(GATEWAY, lease).is_none());
         assert_eq!(*reloaded.lock(), [""; 0]);
         assert_eq!(*first.lock(), ["issued", "dispatched"]);
+    }
+
+    /// A decode call's request its host makes is made from the world the
+    /// call decides under, as a first decision's is. An apply that lands
+    /// while the host makes it is the next decision's: the call in hand
+    /// keeps the world it handed.
+    #[test]
+    fn a_decode_calls_request_is_made_from_the_world_the_call_decides_under() {
+        /// Says the generation it was handed, then applies the next one.
+        struct Reloads<'t>(&'t MemoryStore, Cell<u64>);
+
+        impl Maker for Reloads<'_> {
+            fn model(&self) -> &str {
+                MODEL
+            }
+
+            fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
+                let handed = world.spec().generation();
+                self.1.set(handed);
+                let document = PolicySpec::pair_presets("least_load", "least_load");
+                let mut document = document.expect("a spec");
+                document.generation = handed + 1;
+                apply_pair_document(self.0, document).expect("a later generation");
+                later_request(b"pair")
+            }
+        }
+
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let asked = later_request(b"pair");
+        let answer = door.decide(GATEWAY, &asked, now).expect("the pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let standing = || store.with_world(|world| world.spec().generation());
+        let before = standing();
+        let raced = Reloads(&store, Cell::new(0));
+        let answer = door.decide_decode_under(GATEWAY, &raced, lease, now);
+        let answer = answer.expect("a decode decision");
+        let side = answer.lease.map(|leased| leased.lease.side);
+        assert_eq!(side, Some(Side::Decode));
+        assert_eq!(answer.decision.trace().generation, raced.1.get());
+        assert_eq!((raced.1.get(), standing()), (before, before + 1));
     }
 
     /// A caller that stands at its seat until the case sends it on: it
@@ -4773,9 +6736,15 @@ pub(crate) mod tests {
         assert_eq!(first.map(|target| target.id), Some(members[1]));
     }
 
-    /// A ready member of [`MODEL`] under `role` that states `runtime` for a
-    /// request's hard demands, `0` for none, in `store`.
-    fn states(store: &MemoryStore, name: &str, role: Role, runtime: u32) -> WorkerId {
+    /// A ready member of [`MODEL`] under `role` in `store` that takes images
+    /// where `vision`, and states `stated` beside it for a request's hard
+    /// demands.
+    fn states_facts(
+        store: &MemoryStore,
+        name: &str,
+        role: Role,
+        (vision, stated): (bool, DemandFacts),
+    ) -> WorkerId {
         let key = format!("http://{name}:8000");
         let facts = WorkerFacts {
             key: key.clone(),
@@ -4785,7 +6754,8 @@ pub(crate) mod tests {
             models: vec![MODEL.to_owned()],
             dp_size: 1,
             max_running: Some(4_096),
-            demand_facts: DemandFacts { runtime },
+            vision,
+            demand_facts: stated,
             ..WorkerFacts::default()
         };
         let id = store.upsert(facts).id();
@@ -4797,14 +6767,36 @@ pub(crate) mod tests {
         id
     }
 
-    /// A store under the `random` preset whose ready members of [`MODEL`]
-    /// state the runtimes of `stated`, one a member, in that order.
+    /// [`states_facts`] for a member that states a runtime and no more: `0`
+    /// states none.
+    fn states(store: &MemoryStore, name: &str, role: Role, runtime: u32) -> WorkerId {
+        let stated = DemandFacts {
+            runtime,
+            ..DemandFacts::default()
+        };
+        states_facts(store, name, role, (false, stated))
+    }
+
+    /// [`stating_facts`] for members that state a runtime and no more.
     fn stating(stated: &[u32]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
+        let facts = stated.iter().map(|&runtime| {
+            let stated = DemandFacts {
+                runtime,
+                ..DemandFacts::default()
+            };
+            (false, stated)
+        });
+        stating_facts(&facts.collect::<Vec<_>>())
+    }
+
+    /// A store under the `random` preset whose ready members of [`MODEL`]
+    /// state the facts of `stated`, one a member, in that order: its vision
+    /// bit, then what it states beside it.
+    fn stating_facts(stated: &[(bool, DemandFacts)]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
         let store = MemoryStore::new();
-        let ids = stated
-            .iter()
-            .enumerate()
-            .map(|(place, &runtime)| states(&store, &format!("r{place}"), Role::Single, runtime));
+        let ids = stated.iter().enumerate().map(|(place, &stated)| {
+            states_facts(&store, &format!("r{place}"), Role::Single, stated)
+        });
         let ids: Vec<WorkerId> = ids.collect();
         store.publish_now();
         let applied = store.apply(preset("random", 1));
@@ -4824,7 +6816,10 @@ pub(crate) mod tests {
             for seed in 0..64_u64 {
                 let id = [seed.to_le_bytes(), u64::from(runtime).to_le_bytes()].concat();
                 let mut asked = request(&id, seed);
-                asked.constraints.demands = Demands { runtime };
+                asked.constraints.demands = Demands {
+                    runtime,
+                    ..Demands::default()
+                };
                 let decided = door.decide(GATEWAY, &asked, Instant::now());
                 let decided = decided.expect("a decision");
                 let pick = decided.decision.pick().expect("a member states it");
@@ -4854,7 +6849,10 @@ pub(crate) mod tests {
         let (store, _) = stating(&[7, 0]);
         let door = Door::new(Arc::clone(&store));
         let mut asked = request(b"r-1", 7);
-        asked.constraints.demands = Demands { runtime: 9 };
+        asked.constraints.demands = Demands {
+            runtime: 9,
+            ..Demands::default()
+        };
         let decided = door.decide(GATEWAY, &asked, Instant::now());
         let decided = decided.expect("a decision");
         match decided.decision {
@@ -4867,6 +6865,48 @@ pub(crate) mod tests {
         assert!(decided.lease.is_none());
         assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
         assert_eq!(door.undialed(), 0);
+    }
+
+    /// A prefill-phase request of a model no pair plan binds is decided
+    /// as a single over its prefill pool. Its rows are held to the input
+    /// alone: the completion's bound is a decode's to hold, and a host
+    /// states both bounds whatever the phase. A single is held to both.
+    #[test]
+    fn a_lone_prefill_is_held_to_the_input_and_a_single_to_both_bounds() {
+        let store = MemoryStore::new();
+        let window = DemandFacts {
+            window: 8,
+            ..DemandFacts::default()
+        };
+        let prefill = states_facts(&store, "p0", Role::Prefill, (false, window));
+        let single = states_facts(&store, "s0", Role::Single, (false, window));
+        store.publish_now();
+        let applied = store.apply(preset("random", 1));
+        applied.expect("above the unbound start");
+        let store = Arc::new(store);
+        let door = Door::new(Arc::clone(&store));
+        let decide = |id: &[u8], phase: Phase, (input_window, output_window): (u32, u32)| {
+            let mut asked = request(id, 7);
+            asked.facts.phase = phase;
+            asked.constraints.demands = Demands {
+                input_window,
+                output_window,
+                ..Demands::default()
+            };
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            match decided.expect("a decision").decision {
+                Decision::Shed(shed) => Err((shed.reason, shed.emptied_by)),
+                decision => {
+                    let first = decision.pick().and_then(|pick| pick.targets.first());
+                    Ok(first.expect("a target").id)
+                }
+            }
+        };
+        let too_small = Err((ShedReason::NoEndpoints, "context-window"));
+        assert_eq!(decide(b"prefill", Phase::Prefill, (4, 64)), Ok(prefill));
+        assert_eq!(decide(b"long", Phase::Prefill, (16, 64)), too_small);
+        assert_eq!(decide(b"budget", Phase::Single, (4, 64)), too_small);
+        assert_eq!(decide(b"held", Phase::Single, (4, 8)), Ok(single));
     }
 
     /// The store narrows a pair's sides by its gateway's wires and keeps no
@@ -4887,7 +6927,10 @@ pub(crate) mod tests {
         let decide = |id: &[u8], runtime: u32| {
             let mut asked = request(id, 7);
             asked.facts.phase = Phase::Prefill;
-            asked.constraints.demands = Demands { runtime };
+            asked.constraints.demands = Demands {
+                runtime,
+                ..Demands::default()
+            };
             let decided = door.decide(GATEWAY, &asked, Instant::now());
             decided.expect("a decision")
         };
@@ -4930,9 +6973,13 @@ pub(crate) mod tests {
                     });
                     facts.push(DemandFacts {
                         runtime: if position == place { 9 } else { 7 },
+                        ..DemandFacts::default()
                     });
                 }
-                let demands = Demands { runtime: 7 };
+                let demands = Demands {
+                    runtime: 7,
+                    ..Demands::default()
+                };
                 let took = narrow_demanded(&mut view, &mut facts, None, None, demands);
                 assert_eq!(
                     (took.undialed, view.candidates.len()),
@@ -4955,7 +7002,7 @@ pub(crate) mod tests {
                 // No demand took a row: the wires' name alone, or the build's.
                 let dialed = Took {
                     undialed: 1,
-                    demanded: 0,
+                    ..Took::default()
                 };
                 assert_eq!(cut_name(build, Some(wires), dialed), by_wires);
                 assert_eq!(cut_name(build, Some(wires), Took::default()), build);
@@ -4984,7 +7031,10 @@ pub(crate) mod tests {
                 models: vec![MODEL.to_owned()],
                 dp_size: 1,
                 wire_modes,
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..WorkerFacts::default()
             }
         };
@@ -5020,7 +7070,10 @@ pub(crate) mod tests {
             let id = turn.to_le_bytes();
             let mut asked = request(&id, turn);
             asked.constraints.wire_modes = [WireModes::GRPC, WireModes::ZMQ][list];
-            asked.constraints.demands = Demands { runtime: 7 };
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let decided = door.decide(GATEWAY, &asked, Instant::now());
             let decided = decided.expect("a decision");
             let pick = decided.decision.pick().expect("sixteen members state it");
@@ -5068,7 +7121,10 @@ pub(crate) mod tests {
                     events: true,
                     ..Signals::default()
                 },
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..WorkerFacts::default()
             };
             let id = store.upsert(facts).id();
@@ -5115,7 +7171,10 @@ pub(crate) mod tests {
         let hashes = [1_u64];
         let mut asked = request(b"named", 7);
         asked.facts.block_hashes = &hashes;
-        asked.constraints.demands = Demands { runtime: 7 };
+        asked.constraints.demands = Demands {
+            runtime: 7,
+            ..Demands::default()
+        };
         let taken = Taken {
             request: &asked,
             gateway: GATEWAY,
@@ -5145,6 +7204,197 @@ pub(crate) mod tests {
         assert_eq!(rows, [full, short].into_iter().collect());
         assert_eq!(holders, [full]);
         assert_eq!(warming, [short]);
+    }
+
+    /// Media is a demand as a runtime is: a request that needs vision or
+    /// carries media by reference is decided over the members that take it.
+    /// Vision is read of a member's own bit, the one a pairing plan reads,
+    /// and the rest of what it states beside it. A pool that holds none is
+    /// shed under the last demand its members failed first, in a host's
+    /// order of answers: under the plan's own word where that is vision, and
+    /// under the wires where its runtime emptied it.
+    #[test]
+    fn a_media_demand_keeps_the_members_that_take_it_and_names_its_shed() {
+        let member = |vision: bool, references: bool, host_pipeline: bool| {
+            let stated = DemandFacts {
+                runtime: 7,
+                references,
+                host_pipeline,
+                ..DemandFacts::default()
+            };
+            (vision, stated)
+        };
+        let (store, ids) = stating_facts(&[
+            member(true, false, false),
+            member(true, true, true),
+            member(false, true, false),
+        ]);
+        let (plain, host, own) = (ids[0], ids[1], ids[2]);
+        let door = Door::new(Arc::clone(&store));
+        let decide = |tag: u8, demands: Demands| {
+            let mut placed = BTreeSet::new();
+            for seed in 0..48_u64 {
+                let id = [&[tag][..], &seed.to_le_bytes()].concat();
+                let mut asked = request(&id, seed);
+                asked.constraints.demands = demands;
+                let decided = door.decide(GATEWAY, &asked, Instant::now());
+                match decided.expect("a decision").decision {
+                    Decision::Shed(shed) => return Err((shed.reason, shed.emptied_by)),
+                    decision => {
+                        let first = decision.pick().and_then(|pick| pick.targets.first());
+                        placed.insert(first.expect("a target").id);
+                    }
+                }
+            }
+            Ok(placed)
+        };
+        let asks = |vision: bool, references: References| Demands {
+            vision,
+            references,
+            ..Demands::default()
+        };
+        let kept = |members: &[WorkerId]| Ok(members.iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(
+            decide(1, asks(true, References::None)),
+            kept(&[plain, host])
+        );
+        assert_eq!(decide(2, asks(false, References::Any)), kept(&[host, own]));
+        assert_eq!(decide(3, asks(false, References::Host)), kept(&[host]));
+        assert_eq!(decide(4, asks(false, References::Worker)), kept(&[own]));
+        // One member takes no images, one processes no reference and one
+        // runs the other pipeline: the last of the three is the pipeline.
+        let nobody = |stage: &'static str| Err((ShedReason::NoEndpoints, stage));
+        assert_eq!(
+            decide(5, asks(true, References::Worker)),
+            nobody("pipeline")
+        );
+        // Every member fails at its runtime, the first demand of the order.
+        let elsewhere = Demands {
+            runtime: 9,
+            ..asks(true, References::Host)
+        };
+        assert_eq!(decide(6, elsewhere), nobody(super::WIRES));
+        assert_eq!(door.undialed(), 0);
+        // A pool none of whose members takes images is shed under the word
+        // the pairing plan sheds under.
+        let (blind, _) = stating_facts(&[member(false, true, true), member(false, false, false)]);
+        let blind = Door::new(blind);
+        let mut asked = request(b"blind", 1);
+        asked.constraints.demands = asks(true, References::Any);
+        let decided = blind.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(
+            shed,
+            Ok((ShedReason::NoEndpoints, crate::framework::VISION))
+        );
+    }
+
+    /// A hint of 0 keeps no row whatever the request demands: its pool is
+    /// shed under the hint's stage, and under no demand's.
+    #[test]
+    fn a_hint_of_none_beside_a_demand_is_shed_under_the_hint() {
+        let (store, _) = stating_facts(&[(false, DemandFacts::default())]);
+        let door = Door::new(store);
+        let mut asked = request(b"both", 1);
+        asked.constraints.subset_hint = Some(0);
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(shed, Ok((ShedReason::NoEndpoints, super::SUBSET_HINT)));
+    }
+
+    /// A model no member serves is no pool the request's own narrowing
+    /// emptied: a request for it that states a demand is shed under no
+    /// stage, as one that states none is.
+    #[test]
+    fn a_demand_for_a_model_no_member_serves_is_shed_under_no_stage() {
+        let (store, _) = stating_facts(&[(true, DemandFacts::default())]);
+        let door = Door::new(store);
+        let mut asked = request(b"absent", 1);
+        asked.facts.model = "a-model-nobody-serves";
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let shed = match decided.expect("a decision").decision {
+            Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
+            decision => Err(decision.pick().is_some()),
+        };
+        assert_eq!(shed, Ok((ShedReason::NoEndpoints, "none")));
+    }
+
+    /// A row a vision demand took is named by nobody, as one a runtime took
+    /// is: the member that holds the request's first block takes no image,
+    /// and the request is decided over the member that does.
+    #[test]
+    fn a_vision_demand_that_took_the_holder_names_the_rows_that_stay() {
+        use crate::store::{
+            BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, SequenceHash, Signals,
+            StoredBlock,
+        };
+
+        let store = MemoryStore::new();
+        let applied = store.apply(preset("cache_aware", 1));
+        applied.expect("above the unbound start");
+        let member = |name: &str, vision: bool| {
+            let facts = WorkerFacts {
+                key: name.to_owned(),
+                engine: name.to_owned(),
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                vision,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(&store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+            id
+        };
+        let (blind, sighted) = (member("blind", false), member("sighted", true));
+        store.publish_now();
+        let hashes = [17_u64];
+        let events = [KvEvent::Stored {
+            parent: None,
+            blocks: vec![StoredBlock {
+                seq_hash: SequenceHash(hashes[0]),
+                content_hash: ContentHash(hashes[0]),
+            }],
+        }];
+        let batch = BatchFacts {
+            sequence: 1,
+            ..BatchFacts::default()
+        };
+        assert_eq!(store.admit(blind, 0, batch, &events), BatchOutcome::Applied);
+        let door = Door::new(Arc::new(store));
+        let mut asked = request(b"seen", 1);
+        asked.facts.block_hashes = &hashes;
+        asked.constraints.demands = Demands {
+            vision: true,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let decision = decided.expect("a decision").decision;
+        let first = decision.pick().and_then(|pick| pick.targets.first());
+        assert_eq!(first.map(|target| target.id), Some(sighted));
     }
 
     /// One pass narrows a built view by its gateway's wires and its
@@ -5180,7 +7430,10 @@ pub(crate) mod tests {
                         ..AffinityFacts::default()
                     });
                 }
-                facts.push(DemandFacts { runtime });
+                facts.push(DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                });
             }
             (view, facts)
         };
@@ -5200,9 +7453,19 @@ pub(crate) mod tests {
         // The wire takes the third row, the demand the second and the
         // fourth, which states no runtime.
         let (mut view, mut facts) = built(true, sevens);
-        let took = narrow_demanded(&mut view, &mut facts, grpc, None, Demands { runtime: 7 });
+        let took = narrow_demanded(
+            &mut view,
+            &mut facts,
+            grpc,
+            None,
+            Demands {
+                runtime: 7,
+                ..Demands::default()
+            },
+        );
         assert_eq!(took.undialed, 1);
         assert_ne!(took.demanded, 0);
+        assert_eq!(took.unmet, Some(Unmet::Runtime));
         assert_eq!(
             read(&view, &facts),
             (kept.clone(), vec![100, 104], vec![7, 7])
@@ -5210,12 +7473,30 @@ pub(crate) mod tests {
         // The same rows taken of a view with no column, under other
         // numbers and a positive hint: one list, one name.
         let (mut view, mut facts) = built(false, [3, 5, 3, 0, 3]);
-        let again = narrow_demanded(&mut view, &mut facts, grpc, Some(2), Demands { runtime: 3 });
+        let again = narrow_demanded(
+            &mut view,
+            &mut facts,
+            grpc,
+            Some(2),
+            Demands {
+                runtime: 3,
+                ..Demands::default()
+            },
+        );
         assert_eq!(again, took);
         assert_eq!(read(&view, &facts), (kept, vec![], vec![3, 3]));
         // Another demand leaves another list, under another name.
         let (mut view, mut facts) = built(true, sevens);
-        let other = narrow_demanded(&mut view, &mut facts, None, None, Demands { runtime: 9 });
+        let other = narrow_demanded(
+            &mut view,
+            &mut facts,
+            None,
+            None,
+            Demands {
+                runtime: 9,
+                ..Demands::default()
+            },
+        );
         assert_eq!(other.undialed, 0);
         assert!(other.demanded != 0 && other.demanded != took.demanded);
         assert_eq!(read(&view, &facts), (vec![(11, 0)], vec![101], vec![9]));
@@ -5227,20 +7508,92 @@ pub(crate) mod tests {
             none,
             Took {
                 undialed: 1,
-                demanded: 0
+                demanded: 0,
+                unmet: None,
             }
         );
         assert_eq!(read(&view, &facts).0, [(10, 0), (11, 1), (13, 2), (14, 3)]);
         // A hint of 0 keeps none.
         let (mut view, mut facts) = built(true, sevens);
-        let hinted = narrow_demanded(&mut view, &mut facts, None, Some(0), Demands { runtime: 7 });
+        let hinted = narrow_demanded(
+            &mut view,
+            &mut facts,
+            None,
+            Some(0),
+            Demands {
+                runtime: 7,
+                ..Demands::default()
+            },
+        );
         assert_eq!(hinted, Took::default());
         assert_eq!(read(&view, &facts), (vec![], vec![], vec![]));
         // A row with no entry of the column meets no demand.
         let (mut view, mut facts) = built(true, sevens);
         facts.truncate(1);
-        narrow_demanded(&mut view, &mut facts, None, None, Demands { runtime: 7 });
+        narrow_demanded(
+            &mut view,
+            &mut facts,
+            None,
+            None,
+            Demands {
+                runtime: 7,
+                ..Demands::default()
+            },
+        );
         assert_eq!(read(&view, &facts), (vec![(10, 0)], vec![100], vec![7]));
+    }
+
+    /// The leader's doubt of a worker reaches the door's decision as a
+    /// gateway's own doubt does, for every gateway of the store. A doubted
+    /// member beside sound ones is passed over. A pool doubted on every
+    /// member is steered with the doubt lifted, and the trace says so: a
+    /// doubt is not an outage.
+    #[test]
+    fn the_leaders_doubt_of_a_worker_reaches_the_doors_decision() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let members: Vec<WorkerId> = booked(&store, Role::Single)
+            .iter()
+            .map(|&(id, _)| id)
+            .collect();
+        let doubt = |member: WorkerId, stalled: bool| {
+            let row = WorkersStore::get(&*store, member).expect("the member's row");
+            let bits = LeaderBits { stalled };
+            let written = store.leader_bits(member, row.revision, bits, &|| true);
+            assert!(matches!(written, HealthWrite::Stood(_)), "{written:?}");
+        };
+        let decide = |id: &[u8], seed: u64| {
+            let decided = door.decide(GATEWAY, &request(id, seed), now);
+            decided.expect("a decision").decision
+        };
+
+        // One doubted member beside two sound ones: no seed picks it, and
+        // no veto is lifted.
+        doubt(members[0], true);
+        for seed in 0..32_u64 {
+            let decision = decide(&seed.to_be_bytes(), seed);
+            let pick = decision.pick().expect("two sound members stand");
+            let first = pick.targets.first().map(|target| target.id);
+            assert_ne!(first, Some(members[0]));
+            assert_eq!(pick.trace.lifted, Lifted::None);
+        }
+
+        // The pool doubted whole: steered, with the doubt lifted.
+        doubt(members[1], true);
+        doubt(members[2], true);
+        let decision = decide(b"whole", 7);
+        let pick = decision.pick().expect("a doubt is not an outage");
+        assert_eq!(pick.trace.lifted, Lifted::Liveness);
+
+        // The doubt cleared on one member: it takes the request, and no
+        // veto is lifted.
+        doubt(members[1], false);
+        let decision = decide(b"cleared", 7);
+        let pick = decision.pick().expect("a sound member stands");
+        let first = pick.targets.first().map(|target| target.id);
+        assert_eq!(first, Some(members[1]));
+        assert_eq!(pick.trace.lifted, Lifted::None);
     }
 
     /// In process no election hands a term over: the door starts a store
@@ -6139,10 +8492,10 @@ pub(crate) mod tests {
     }
 
     /// The door reads its own view's cells, never the request's: cells a
-    /// caller hands on the request's facts are by its own list's positions,
-    /// and the store's view hands none yet. Here the caller's cells hold a
-    /// value at every position the store's pool has, and every read
-    /// through the door is no value.
+    /// caller hands on the request's facts are by its own list's positions.
+    /// Here the caller's cells hold a value at every position the store's
+    /// pool has and the store holds none, and every read through the door
+    /// is no value.
     #[test]
     fn the_door_reads_none_of_the_cells_a_caller_hands_on_the_request() {
         let store = fleet(1);
@@ -6178,6 +8531,623 @@ pub(crate) mod tests {
         let read = read.lock();
         assert!(!read.is_empty(), "the stage was asked");
         assert!(read.iter().all(Option::is_none), "{read:?}");
+    }
+
+    /// A cap full of holders the pass refuses is read past: the cases, over
+    /// the `cache_aware` preset.
+    mod refused_holders {
+        use std::{
+            cmp::Reverse,
+            sync::atomic::AtomicU64,
+            time::{Duration, Instant},
+        };
+
+        use kv_index::chain_prefix_hash;
+
+        use super::{request, GATEWAY, MODEL};
+        use crate::{
+            demands::{DemandFacts, Demands},
+            door::{hand, Buffers, Request, Scratch, Taken},
+            spec::{AppliedSpec, BestParams, OverloadSpec, PickStage, PolicySpec},
+            store::{
+                Ask, BatchFacts, BatchOutcome, ContentHash, HealthSink, KvEvent, KvEventSink,
+                LoadSink, LoadSource, MemoryStore, Named, Naming, SequenceHash, Signals,
+                StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            },
+            view::{Candidate, Constraints, LoadRow, PoolFacts, RequestFacts, Role, WorkerId},
+        };
+
+        /// The blocks of the cases' request.
+        const BLOCKS: [u64; 3] = [1, 2, 3];
+
+        /// A store under the `cache_aware` preset whose picker takes a
+        /// sample of `cap` rows, which caps a naming at `cap`. A worker
+        /// whose engine reports a queued request reads over its thresholds,
+        /// at once: the store publishes with no window.
+        fn sampled(cap: u32) -> MemoryStore {
+            let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+            let profile = document.profiles.get_mut("cache_aware");
+            let profile = profile.expect("the preset's profile");
+            profile.pick = PickStage::Best(BestParams { sample: cap }).into();
+            document.bindings[0].overload = Some(OverloadSpec {
+                waiting_requests: Some(1),
+                ..OverloadSpec::default()
+            });
+            let store = MemoryStore::with_publish_window(Duration::ZERO);
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            store.apply(spec).expect("above the unbound start");
+            store
+        }
+
+        /// A ready member that states `runtime`, reports its blocks and
+        /// holds the first `depth` blocks of the request.
+        fn holder_at(store: &MemoryStore, name: &str, depth: usize, runtime: u32) -> WorkerId {
+            let facts = WorkerFacts {
+                key: name.to_owned(),
+                engine: name.to_owned(),
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                signals: Signals {
+                    events: true,
+                    ..Signals::default()
+                },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+            store.publish_now();
+            let mut blocks: Vec<StoredBlock> = Vec::with_capacity(depth);
+            for &content in &BLOCKS[..depth] {
+                let seq_hash = match blocks.last() {
+                    Some(parent) => chain_prefix_hash(parent.seq_hash, ContentHash(content)),
+                    None => SequenceHash(content),
+                };
+                let content_hash = ContentHash(content);
+                blocks.push(StoredBlock {
+                    seq_hash,
+                    content_hash,
+                });
+            }
+            if !blocks.is_empty() {
+                let parent = None;
+                let events = [KvEvent::Stored { parent, blocks }];
+                let batch = BatchFacts {
+                    sequence: 1,
+                    ..BatchFacts::default()
+                };
+                assert_eq!(store.admit(id, 0, batch, &events), BatchOutcome::Applied);
+            }
+            id
+        }
+
+        /// [`holder_at`] for a member that states no runtime.
+        fn holder(store: &MemoryStore, name: &str, depth: usize) -> WorkerId {
+            holder_at(store, name, depth, 0)
+        }
+
+        /// What a decision is handed and decides: the holders named, by
+        /// member with their depths, the deepest first, the members that
+        /// read over their thresholds, and the engine's pick over the rows
+        /// with the overlap it states.
+        struct Decided {
+            holders: Vec<(WorkerId, u32)>,
+            over: Vec<WorkerId>,
+            pick: Option<(WorkerId, u16)>,
+        }
+
+        /// The holders of `named` by their members in `rows`, the deepest
+        /// first.
+        fn by_depth(named: &[crate::NamedHolder], rows: &[Candidate]) -> Vec<(WorkerId, u32)> {
+            let held =
+                |holder: &crate::NamedHolder| (rows[holder.row as usize].id, holder.overlap_blocks);
+            let mut holders: Vec<(WorkerId, u32)> = named.iter().map(held).collect();
+            holders.sort_by_key(|&(_, blocks)| Reverse(blocks));
+            holders
+        }
+
+        /// The decision of `asked` through the door's hand, by the engine.
+        fn decided(store: &MemoryStore, asked: &Request<'_>) -> Decided {
+            let taken = Taken {
+                request: asked,
+                gateway: GATEWAY,
+                now: Instant::now(),
+                left: Duration::MAX,
+                pins: None,
+                place: None,
+            };
+            let mut buffers = Buffers::default();
+            let undialed = AtomicU64::new(0);
+            store.deciding(|world| {
+                let engine = world.spec().engine();
+                let read = |facts: &RequestFacts<'_>,
+                            pool: &PoolFacts<'_>,
+                            rows: &[Candidate],
+                            cx: &Constraints<'_>,
+                            scratch: &mut Scratch| {
+                    let named = facts.named.expect("the profile names its rows");
+                    let holders = by_depth(named.holders, rows);
+                    let over = rows.iter().filter(|row| row.health.overloaded);
+                    let mut over: Vec<WorkerId> = over.map(|row| row.id).collect();
+                    over.sort_unstable();
+                    // The engine's form over named rows: it states the
+                    // pick's overlap.
+                    let decision = engine.decide_stated(facts, pool, rows, cx, scratch);
+                    let pick = decision.pick().and_then(|pick| {
+                        let first = pick.targets.first()?;
+                        Some((first.id, pick.overlap().blocks))
+                    });
+                    Decided {
+                        holders,
+                        over,
+                        pick,
+                    }
+                };
+                hand(world, &taken, &mut buffers, &undialed, read).0
+            })
+        }
+
+        /// The holders a naming under no test names for `facts` under a cap
+        /// of `cap`, as the door names them: by member, the deepest first.
+        fn plainly_named(
+            store: &MemoryStore,
+            facts: &RequestFacts<'_>,
+            cap: u32,
+        ) -> Vec<(WorkerId, u32)> {
+            let mut view = ViewBuffers::default();
+            let mut named = Named::default();
+            store.deciding(|world| {
+                let ask = Ask {
+                    gateway: GATEWAY,
+                    now: Instant::now(),
+                    pinned: None,
+                    affinity: false,
+                    signal_cells: false,
+                };
+                let read = world.view(MODEL, Role::Single, &ask, false, &mut view);
+                let read = read.expect("the pool");
+                let naming = Naming {
+                    gateway: GATEWAY,
+                    block_hashes: facts.block_hashes,
+                    namespace_seed: facts.namespace_seed,
+                    seed: facts.seed,
+                    cap,
+                    wires: None,
+                    now_micros: read.built.now_micros,
+                };
+                world.name(MODEL, Role::Single, &naming, read.candidates, &mut named);
+                by_depth(&named.holders, read.candidates)
+            })
+        }
+
+        /// A host's filter that reads the column the naming writes is asked
+        /// by its pass alone. Ahead of the naming no row holds the column:
+        /// a test made there would refuse the deep holder, which the filter
+        /// keeps once it is named, and the lookup made again would name the
+        /// shallow one in its place.
+        #[test]
+        fn a_filter_that_reads_the_naming_is_asked_by_its_pass_alone() {
+            use crate::{Catalog, Filter, Needs};
+
+            /// Keeps one worker only where the naming says it holds a block.
+            #[derive(Debug)]
+            struct Warm(WorkerId);
+
+            impl Filter for Warm {
+                fn name(&self) -> &'static str {
+                    "warm"
+                }
+
+                fn row_wise(&self) -> bool {
+                    true
+                }
+
+                fn needs(&self) -> Needs {
+                    Needs {
+                        affinity: true,
+                        ..Needs::default()
+                    }
+                }
+
+                fn keep(
+                    &self,
+                    facts: &RequestFacts<'_>,
+                    row: &Candidate,
+                    _: &Constraints<'_>,
+                ) -> bool {
+                    row.id != self.0 || facts.affinity_at(row.position).overlap_blocks != 0
+                }
+            }
+
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            holder(&store, "shallow", 1);
+            holder(&store, "idle", 0);
+            let mut catalog = Catalog::builtin();
+            let made = catalog.filter("warm", move || Box::new(Warm(deep)));
+            made.expect("a name the catalog does not hold");
+            let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+            document.generation += 1;
+            let profile = document.profiles.get_mut("cache_aware");
+            let profile = profile.expect("the preset's profile");
+            profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+            profile.filter.push("warm".into());
+            let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+            let applied = store.apply(spec.expect("the document validates"));
+            applied.expect("the next generation");
+            store.publish_now();
+            let mut asked = request(b"warm", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(deep, 3)]);
+            assert_eq!(decided.pick, Some((deep, 3)));
+        }
+
+        /// A host's filter that reads the key's counts is asked by its pass
+        /// alone. The counts are lent behind the naming: a test made ahead
+        /// of them would refuse the deep holder, where the key has a
+        /// request in flight, and the shallow one would be picked.
+        #[test]
+        fn a_filter_that_reads_the_keys_counts_is_asked_by_its_pass_alone() {
+            use std::sync::Arc;
+
+            use crate::{
+                door::Door,
+                spec::{PrefixAffinityParams, ScoreStage},
+                view::Identity,
+                Catalog, Filter, Needs,
+            };
+
+            /// Keeps one worker for a streaming request only where its key
+            /// has a request in flight there.
+            #[derive(Debug)]
+            struct KeyLocal(WorkerId);
+
+            impl Filter for KeyLocal {
+                fn name(&self) -> &'static str {
+                    "key-local"
+                }
+
+                fn row_wise(&self) -> bool {
+                    true
+                }
+
+                fn needs(&self) -> Needs {
+                    Needs {
+                        session_in_flight: true,
+                        ..Needs::default()
+                    }
+                }
+
+                fn keep(
+                    &self,
+                    facts: &RequestFacts<'_>,
+                    row: &Candidate,
+                    _: &Constraints<'_>,
+                ) -> bool {
+                    row.id != self.0 || !facts.streaming || facts.session_in_flight(row) > 0
+                }
+            }
+
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            holder(&store, "shallow", 2);
+            holder(&store, "idle", 0);
+            let mut catalog = Catalog::builtin();
+            let made = catalog.filter("key-local", move || Box::new(KeyLocal(deep)));
+            made.expect("a name the catalog does not hold");
+            let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+            document.generation += 1;
+            let profile = document.profiles.get_mut("cache_aware");
+            let profile = profile.expect("the preset's profile");
+            profile.pick = PickStage::Best(BestParams { sample: 1 }).into();
+            profile.filter.push("key-local".into());
+            profile.score =
+                vec![ScoreStage::PrefixAffinity(PrefixAffinityParams::default()).into()];
+            let spec = AppliedSpec::validate_in(&document, &catalog, &[]);
+            let applied = store.apply(spec.expect("the document validates"));
+            applied.expect("the next generation");
+            let door = Door::new(Arc::new(store));
+            let now = Instant::now();
+            // The key's first request goes to the deep holder and stays in
+            // flight there.
+            let mut first = request(b"first", 7);
+            first.facts.block_hashes = &BLOCKS;
+            first.facts.session_key = Identity::hashed(123);
+            let primed = door.decide(GATEWAY, &first, now).expect("the key's first");
+            let target = primed.decision.pick().and_then(|pick| pick.targets.first());
+            assert_eq!(target.map(|target| target.id), Some(deep));
+            assert!(primed.lease.is_some(), "the key's lease is live");
+            // Its second, streaming: the filter keeps the deep holder by
+            // the key's count there.
+            let mut second = request(b"second", 7);
+            second.facts.block_hashes = &BLOCKS;
+            second.facts.session_key = first.facts.session_key;
+            second.facts.streaming = true;
+            let second = door
+                .decide(GATEWAY, &second, now)
+                .expect("the key's second");
+            let pick = second.decision.pick().expect("a pick");
+            let picked = pick.targets.first().map(|target| target.id);
+            assert_eq!((picked, pick.overlap().blocks), (Some(deep), 3));
+        }
+
+        /// Rows a demand took take no round of the lookup made again: it
+        /// is kept within the rows that stay. Five deeper holders of
+        /// another runtime stand ahead of the warm one, more than the
+        /// rounds: the retry is named the warm one all the same.
+        #[test]
+        fn rows_a_demand_took_take_no_round_of_the_lookup_made_again() {
+            let store = sampled(1);
+            let tried = [holder_at(&store, "tried", 3, 7)];
+            for other in 0..5 {
+                holder_at(&store, &format!("other-runtime-{other}"), 2, 9);
+            }
+            let warm = holder_at(&store, "warm", 1, 7);
+            holder_at(&store, "idle", 0, 7);
+            let mut asked = request(b"cut", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(warm, 1)]);
+            assert_eq!(decided.pick, Some((warm, 1)));
+        }
+
+        /// A retry is named the holder behind the one it tried. Under a
+        /// cap of one the deeper holder would fill the cap, and it is the
+        /// one row the retry may not take: the shallower one is named, and
+        /// the pick states that worker's own overlap.
+        #[test]
+        fn a_retry_is_named_the_holder_behind_the_one_it_tried() {
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            let shallow = holder(&store, "shallow", 2);
+            holder(&store, "idle", 0);
+            let tried = [deep];
+            let mut asked = request(b"retry", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(shallow, 2)]);
+            assert_eq!(decided.pick, Some((shallow, 2)));
+        }
+
+        /// A shadow's rows are held to its own profile's test of a row,
+        /// not to its live profile's. Under a cap of one, a live profile
+        /// that refuses the rows a request tried is named the holder
+        /// behind the tried one. Its shadow holds no such filter: it is
+        /// named the deep holder, which its own pass keeps, and takes it.
+        /// The other way about the live profile keeps the deep holder,
+        /// and its shadow is named the one behind it.
+        #[test]
+        fn a_shadow_of_other_filters_is_named_by_its_own_test_of_a_row() {
+            use std::sync::Arc;
+
+            use crate::{decision::ShadowKind, door::Door, spec::ShadowSpec};
+
+            // A retry of the deep holder, where the live profile or else
+            // its shadow refuses the rows a request tried: the live
+            // answer, what the shadow said with its first target, and
+            // the depths of the holders named for the shadow alone.
+            let retried = |shadow_refuses: bool| {
+                let mut document =
+                    PolicySpec::preset("cache_aware").expect("a preset of this build");
+                document.explain.sample = 1;
+                let live = document.profiles.get_mut("cache_aware");
+                let live = live.expect("the preset's profile");
+                live.pick = PickStage::Best(BestParams { sample: 1 }).into();
+                let mut twin = live.clone();
+                // The preset's last filter refuses the rows a request
+                // tried: one of the two profiles goes without it.
+                let loose = if shadow_refuses { live } else { &mut twin };
+                loose.filter.pop();
+                document.profiles.insert("twin".into(), twin);
+                document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+                let store = MemoryStore::with_publish_window(Duration::ZERO).with_deciders(1);
+                let spec = AppliedSpec::validate(&document).expect("the document validates");
+                store.apply(spec).expect("above the unbound start");
+                let deep = holder(&store, "deep", 3);
+                let shallow = holder(&store, "shallow", 2);
+                holder(&store, "idle", 0);
+                let door = Door::new(Arc::new(store));
+                let tried = [deep];
+                let mut asked = request(b"retry", 7);
+                asked.facts.block_hashes = &BLOCKS;
+                asked.facts.tried = &tried;
+                let decided = door.decide(GATEWAY, &asked, Instant::now());
+                let decided = decided.expect("a decision");
+                let live = decided
+                    .decision
+                    .pick()
+                    .and_then(|pick| pick.targets.first());
+                let live = live.map(|target| target.id);
+                let record = door.explain(GATEWAY, b"retry");
+                let record = record.expect("the sampled decision");
+                let named = door.own_named[0].named.lock();
+                let depths = named.holders.iter().map(|holder| holder.overlap_blocks);
+                let depths: Vec<u32> = depths.collect();
+                let shadow = (record.shadow, record.shadow_target);
+                ((live, shadow, depths), (deep, shallow))
+            };
+            let other = Some(ShadowKind::OtherTarget);
+            let ((live, shadow, depths), (deep, shallow)) = retried(false);
+            assert_eq!(live, Some(shallow));
+            assert_eq!((shadow, depths), ((other, Some(deep)), vec![3]));
+            let ((live, shadow, depths), (deep, shallow)) = retried(true);
+            assert_eq!(live, Some(deep));
+            assert_eq!((shadow, depths), ((other, Some(shallow)), vec![2]));
+        }
+
+        /// A hot prefix: the two workers that hold it whole read over
+        /// their thresholds and would fill a cap of two. Other rows stand
+        /// under theirs, so no veto is lifted, and the holder under its
+        /// thresholds is named.
+        #[test]
+        fn a_cap_full_of_holders_over_their_thresholds_names_the_one_under_them() {
+            let store = sampled(2);
+            let mut hot = [holder(&store, "hot-a", 3), holder(&store, "hot-b", 3)];
+            hot.sort_unstable();
+            let cool = holder(&store, "cool", 1);
+            holder(&store, "idle", 0);
+            let now = Instant::now();
+            for id in hot {
+                let queued = LoadRow {
+                    queued: 1,
+                    ..LoadRow::default()
+                };
+                store.record(id, 0, queued, now, LoadSource::Stream);
+            }
+            store.publish_now();
+            let mut asked = request(b"hot", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.over, hot, "the two read over their thresholds");
+            assert_eq!(decided.holders, [(cool, 1)]);
+            assert_eq!(decided.pick, Some((cool, 1)));
+        }
+
+        /// A cap full of holders behind the asking gateway's veto is read
+        /// past, under a doubt as under a hold: the holder the gateway
+        /// vetoes nothing of is named.
+        #[test]
+        fn a_cap_full_of_holders_behind_the_gateways_veto_is_read_past() {
+            let store = sampled(2);
+            let doubted = holder(&store, "doubted", 3);
+            let held = holder(&store, "held", 3);
+            let free = holder(&store, "free", 1);
+            holder(&store, "idle", 0);
+            let now = Instant::now();
+            let until = now + Duration::from_secs(60);
+            let veto = |member: WorkerId, hold: Option<Instant>, stands: bool| {
+                let written =
+                    store.gateway_veto_noted(GATEWAY, member, Some(until), hold, stands, now);
+                assert_eq!(written, VetoWrite::Written);
+            };
+            veto(doubted, None, false);
+            veto(held, Some(until), false);
+            let mut asked = request(b"veto", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(free, 1)]);
+            assert_eq!(decided.pick, Some((free, 1)));
+        }
+
+        /// A holder that is not ready is read past where it fills the cap.
+        #[test]
+        fn a_holder_that_is_not_ready_is_read_past_where_it_fills_the_cap() {
+            let store = sampled(1);
+            let down = holder(&store, "down", 3);
+            let up = holder(&store, "up", 2);
+            holder(&store, "idle", 0);
+            let row = WorkersStore::get(&store, down).expect("the row");
+            let unready = store.set_status(down, WorkerStatus::NotReady, row.revision);
+            unready.expect("the row stands");
+            store.publish_now();
+            let mut asked = request(b"down", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(up, 2)]);
+            assert_eq!(decided.pick, Some((up, 2)));
+        }
+
+        /// A naming no holder of which is refused names what a naming
+        /// under no test names: the same rows by the same draw. Three
+        /// holders stand at one depth under a cap of two, so the decision's
+        /// seed draws the two.
+        #[test]
+        fn a_naming_no_holder_of_which_is_refused_names_what_main_names() {
+            let store = sampled(2);
+            for name in ["a", "b", "c"] {
+                holder(&store, name, 2);
+            }
+            holder(&store, "idle", 0);
+            let mut drawn = std::collections::BTreeSet::new();
+            for seed in 0..32 {
+                let mut asked = request(b"plain", seed);
+                asked.facts.block_hashes = &BLOCKS;
+                let plain = plainly_named(&store, &asked.facts, 2);
+                assert_eq!(plain.len(), 2, "seed {seed}");
+                assert_eq!(decided(&store, &asked).holders, plain, "seed {seed}");
+                drawn.insert(plain);
+            }
+            assert!(drawn.len() > 1, "the seed draws the two: {drawn:?}");
+        }
+
+        /// A naming one of whose holders passes stands as it was made. The
+        /// retry tried the deeper of the two a cap of two names and the
+        /// other passes: no lookup is made again, the tried row stays named
+        /// for the pass to drop, and the holder behind the two is not read.
+        #[test]
+        fn a_naming_one_holder_of_which_passes_stands_as_made() {
+            let store = sampled(2);
+            let deep = holder(&store, "deep", 3);
+            let mid = holder(&store, "mid", 2);
+            holder(&store, "shallow", 1);
+            holder(&store, "idle", 0);
+            let tried = [deep];
+            let mut asked = request(b"stands", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, plainly_named(&store, &asked.facts, 2));
+            assert_eq!(decided.holders, [(deep, 3), (mid, 2)]);
+            assert_eq!(decided.pick, Some((mid, 2)));
+        }
+
+        /// Where no holder passes the first read stands. Every row was
+        /// tried, so the pass's soft filter steps aside and reads the names
+        /// a naming under no test hands it.
+        #[test]
+        fn where_no_holder_passes_the_first_read_stands() {
+            let store = sampled(1);
+            let deep = holder(&store, "deep", 3);
+            let shallow = holder(&store, "shallow", 2);
+            let idle = holder(&store, "idle", 0);
+            let tried = [deep, shallow, idle];
+            let mut asked = request(b"all", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, plainly_named(&store, &asked.facts, 1));
+            assert_eq!(decided.holders, [(deep, 3)]);
+            assert_eq!(decided.pick, Some((deep, 3)));
+        }
+
+        /// A view a demand cut is named within the rows that stay, and
+        /// its holders are held to the test alike. The demand takes the
+        /// deepest holder and the retry tried the next: the third is named.
+        #[test]
+        fn a_cut_view_is_named_within_the_rows_that_stay_and_asks_the_test() {
+            let store = sampled(1);
+            holder_at(&store, "gone", 3, 9);
+            let deep = holder_at(&store, "deep", 2, 7);
+            let shallow = holder_at(&store, "shallow", 1, 7);
+            holder_at(&store, "idle", 0, 7);
+            let tried = [deep];
+            let mut asked = request(b"cut", 7);
+            asked.facts.block_hashes = &BLOCKS;
+            asked.facts.tried = &tried;
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
+            let decided = decided(&store, &asked);
+            assert_eq!(decided.holders, [(shallow, 1)]);
+            assert_eq!(decided.pick, Some((shallow, 1)));
+        }
     }
 
     /// One read of a key's shard names the rows that carry the key's
@@ -6654,6 +9624,150 @@ pub(crate) mod tests {
             assert!(decided.is_ok(), "{:?}", decided.err());
         }
         assert_eq!(door.faults(), 0);
+        Ok(())
+    }
+
+    /// A request that states a hard demand is decided over the rows the
+    /// demand leaves, and each of them reads its own signal value at its
+    /// new place: the cells follow the rows through that narrowing as the
+    /// affinity column does.
+    #[test]
+    fn rows_a_demand_leaves_read_their_own_signal_values() {
+        use crate::store::{SignalSink, Taken};
+
+        /// What the stage read: each row's worker with its value.
+        type Read = Vec<(WorkerId, Option<f64>)>;
+
+        /// Reads one signal of every row it scores and keeps each row's
+        /// worker with what it read.
+        #[derive(Debug)]
+        struct ReadsEach {
+            held: crate::SignalColumn,
+            read: Arc<Mutex<Read>>,
+        }
+
+        impl Lifecycle for ReadsEach {}
+
+        impl crate::Scorer for ReadsEach {
+            fn name(&self) -> &'static str {
+                "reads-each"
+            }
+
+            fn score(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                let rows = kept.iter().map(|&row| &candidates[row as usize]);
+                let read = rows.map(|row| (row.id, self.held.read(facts, row)));
+                self.read.lock().extend(read);
+                out.fill(0.0);
+                TieBand::NORMALIZED
+            }
+
+            fn needs(&self) -> Needs {
+                Needs {
+                    signal_cells: true,
+                    ..Needs::default()
+                }
+            }
+        }
+
+        let (store, ids) = stating(&[9, 7, 9, 7]);
+        let read = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&read);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.scorer_with("reads-each", move |build| {
+            Ok(Box::new(ReadsEach {
+                held: build.signal_column("held")?,
+                read: Arc::clone(&kept),
+            }))
+        });
+        added.expect("a free name");
+        let document: PolicySpec = serde_json::from_str(
+            r#"{"apiVersion":"smg.policy/v1","generation":2,
+                "signals":{"held":{"unit":"tokens"}},
+                "profiles":{"p":{"score":["reads-each"],"pick":"best"}}}"#,
+        )
+        .expect("a well-formed document");
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("the catalog holds the stage"));
+        applied.expect("a later generation");
+        let now = Instant::now();
+        for (id, value) in ids.iter().zip([10.0, 11.0, 12.0, 13.0]) {
+            let held = store.signal_column("held");
+            let taken = store.signal_value(*id, 0, &held, "tokens", value, now);
+            assert_eq!(taken, Taken::Written);
+        }
+        store.publish_now();
+        let door = Door::new(Arc::clone(&store));
+        let mut asked = request(b"stays", 7);
+        asked.constraints.demands = Demands {
+            runtime: 7,
+            ..Demands::default()
+        };
+        let decided = door.decide(GATEWAY, &asked, now).expect("a decision");
+        assert!(decided.decision.pick().is_some(), "{decided:?}");
+        // The demand left the second and the fourth member: each read the
+        // value written for it, and no other row was read.
+        let mut read = read.lock().clone();
+        read.sort_by_key(|&(id, _)| id);
+        let mut left = [(ids[1], Some(11.0)), (ids[3], Some(13.0))];
+        left.sort_by_key(|&(id, _)| id);
+        assert_eq!(read, left);
+    }
+
+    /// A stage of the encode profile alone reads a signal: the door asks
+    /// the view for the cells on that profile's need, and the stage reads
+    /// its encoder's value.
+    #[test]
+    fn an_encode_profiles_stage_reads_its_encoders_signal_value() -> Result<(), Box<dyn Error>> {
+        use crate::{
+            spec::{AcrossRanks, SignalSpec},
+            store::{SignalSink, Taken},
+        };
+
+        let (door, encoder) = push_fleet()?;
+        let read = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&read);
+        let mut catalog = Catalog::builtin();
+        catalog.scorer_with("reads-held", move |build| {
+            Ok(Box::new(ReadsHeld {
+                held: build.signal_column("held")?,
+                read: Arc::clone(&kept),
+            }))
+        })?;
+        let mut document = encode_document()?;
+        document.generation = 2;
+        let held = SignalSpec {
+            unit: "tokens".into(),
+            max_age_ms: None,
+            across_ranks: AcrossRanks::default(),
+        };
+        document.signals.insert("held".into(), held);
+        let encode = document.profiles.get_mut("encode");
+        let encode = encode.ok_or("missing encode profile")?;
+        encode.score.push("reads-held".into());
+        let digest = document.digest()?;
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])?;
+        door.store().apply(spec)?;
+        let now = Instant::now();
+        let held = door.store().signal_column("held");
+        let taken = door
+            .store()
+            .signal_value(encoder, 0, &held, "tokens", 7.0, now);
+        assert_eq!(taken, Taken::Written);
+        door.store().publish_now();
+        let mut placed = EncodePlaced::new();
+        let asked = pair_request(b"r-1");
+        let decided = door.decide_encode_pair(GATEWAY, &asked, items(), &mut placed, now);
+        assert!(decided.is_ok(), "{:?}", decided.err());
+        let read = read.lock();
+        assert!(!read.is_empty(), "the encode profile's stage was asked");
+        assert!(read.iter().all(|value| *value == Some(7.0)), "{read:?}");
         Ok(())
     }
 

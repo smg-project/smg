@@ -4,7 +4,8 @@
 //! engine: liveness, the health and load reads, the labels the engine
 //! reports of its model and of itself, the admin calls and the engine's two
 //! pushed streams, each in the crate's own types. [`EngineConnector`] makes
-//! a connection, and dials a gRPC address once. The host
+//! a connection, dials a gRPC address once, and may keep the [`LoadSource`]
+//! of an HTTP worker. The host
 //! implements both over its own client type and hands the connector to the
 //! worker builder; the request path reads its own client type back from the
 //! handle with `downcast_arc`.
@@ -185,6 +186,23 @@ pub struct ZmqLink {
     pub request_timeout: Option<Duration>,
 }
 
+/// What the load monitor asks a host for an HTTP worker's load: the one
+/// call. A host that keeps its workers' loads on a service of its own hands
+/// a source from its connector ([`EngineConnector::http_load_source`]).
+///
+/// Loads alone: a source carries no health, no label and no KV event. A
+/// call that fails is a missing report. It says nothing of the worker's
+/// health, which stays its health check's.
+///
+/// A call stands under the poll's deadline. A call that is late is dropped
+/// where it waits and is a missing report, so it must be safe to cancel.
+#[async_trait]
+pub trait LoadSource: Send + Sync {
+    /// Read the load report of the worker's engine, every rank it has, as a
+    /// connection's load read answers it.
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status>;
+}
+
 /// Makes a worker's engine connection. The host implements it over its own
 /// client. A worker gets it from its builder, handed in or as the builder's
 /// default ([`ConnectorDefault`]); a worker with neither refuses a gRPC or
@@ -213,6 +231,28 @@ pub trait EngineConnector: fmt::Debug + Send + Sync {
     /// anything answers at the address, before a detection asks each
     /// runtime in turn. An error is the reason as the detection reports it.
     async fn dial_grpc(&self, base_url: &str, timeout: Duration) -> Result<(), String>;
+
+    /// The load source of the HTTP worker of `runtime` at `base_url`, where
+    /// the host keeps one. `None`, the default, leaves the worker's load to
+    /// the poll over HTTP.
+    ///
+    /// An HTTP worker asks at its first load poll and keeps the answer for
+    /// its life, `None` included. A host whose service is down at the ask
+    /// hands its source all the same: the source's calls fail until the
+    /// service is back, each a missing report.
+    ///
+    /// The ask stands under the poll's deadline. An ask that is late is
+    /// dropped where it waits, so it must be safe to cancel: that poll is a
+    /// missing report, nothing is kept, and the next poll asks again. The
+    /// load monitor polls a worker with a source through it alone, under
+    /// the same deadline: no load request goes to the worker.
+    async fn http_load_source(
+        &self,
+        _base_url: &str,
+        _runtime: RuntimeType,
+    ) -> Option<Arc<dyn LoadSource>> {
+        None
+    }
 }
 
 /// The connector a builder gives a worker it was handed none for. It is a

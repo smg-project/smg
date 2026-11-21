@@ -371,7 +371,13 @@ fn saturation(
 /// pass; the list's stays a call.
 #[inline(always)]
 fn holds(classes: &ClassBits, far: &[u32], class: u32) -> bool {
-    classes.has(class) || (!far.is_empty() && far_holds(far, class))
+    holds_in(classes.words(), far, class)
+}
+
+/// [`holds`] over a set's words, for a pass that bound them once.
+#[inline(always)]
+fn holds_in(words: &[u64], far: &[u32], class: u32) -> bool {
+    ClassBits::has_in(words, class) || (!far.is_empty() && far_holds(far, class))
 }
 
 /// Whether `far` holds `class`. A numbering that is dense over the rows
@@ -699,8 +705,12 @@ impl Engine {
         let (mut cx, mut decode_cx) = (cx, decode_cx);
         if !every_prefill {
             side.prefills.clear();
+            // The open classes are read once a row here. Their words and
+            // their far list are bound ahead of the pass: read through the
+            // scratch, each row loaded their place and their count again.
+            let (open, far_open) = (side.open.words(), side.far_open.as_slice());
             for (at, row) in pools.prefills.iter().enumerate() {
-                if open_class(class_of(at)) {
+                if holds_in(open, far_open, class_of(at)) {
                     side.prefills.push(row, at, pools.prefill_affinity);
                 }
             }
@@ -749,8 +759,11 @@ impl Engine {
             admitted.decode_affinity = &side.decodes.affinity;
             admitted.decode_signal_cells = pools.decode_signal_cells.map(|_| &side.decodes.cells);
         }
-        let pair = self.decide_pair(facts, pool, admitted, cx, decode_cx, scratch);
-        let Decision::Pick(mut pick) = pair else {
+        // The pair's pick is turned where its decision stands and returned
+        // as that decision: taking it out and putting it back copies it
+        // twice.
+        let mut pair = self.decide_pair(facts, pool, admitted, cx, decode_cx, scratch);
+        let Decision::Pick(pick) = &mut pair else {
             return pair;
         };
         if !every_prefill || !every_decode {
@@ -768,7 +781,7 @@ impl Engine {
             pick.targets = targets;
         }
         if !needs {
-            return Decision::Pick(pick);
+            return pair;
         }
         // The alternates of a pair keep its prefill, so the first target's
         // class is every target's.
@@ -829,7 +842,8 @@ impl Engine {
                 &mut side.run,
             );
             match of_key {
-                Decision::Pick(of_key) => {
+                // A key's pick is read where its decision stands.
+                Decision::Pick(ref of_key) => {
                     let Some(target) = of_key.targets.first() else {
                         return gap(ENCODERS);
                     };
@@ -842,6 +856,6 @@ impl Engine {
                 Decision::Shed(_) | Decision::Queue(_) => return of_key,
             }
         }
-        Decision::Pick(pick)
+        pair
     }
 }

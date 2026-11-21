@@ -11,8 +11,8 @@ use crate::{
         WorkerFacts, WorkerStatus, WorkersStore,
     },
     AppliedSpec, Candidate, Catalog, Constraints, Engine, Filter, Lease, Lifecycle, LoadRow,
-    Membership, Pair, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch, Sent, SentCredit, Side,
-    SpecError, Target, TieBand, WorkerId, API_VERSION,
+    Membership, Pair, PolicySpec, PoolFacts, RequestFacts, Scorer, Scratch, Sent, SentCounts,
+    SentCredit, Side, SpecError, Target, TieBand, WorkerId, API_VERSION,
 };
 
 const POOL: &str = "work";
@@ -274,6 +274,89 @@ fn the_limit_ends_sends_at_its_cutoff_and_earlier() {
     assert_eq!(sent.read(&clock(at + 17_000), &a), one(331));
     a.load_sampled_at_micros = at + 4;
     assert_eq!(sent.read(&clock(at + 17_001), &a), Sent::default());
+}
+
+#[test]
+fn the_two_number_read_says_the_requests_and_stated_tokens_of_the_whole_read() {
+    let (engine, sent) = built(None);
+    let a = row(331, 3);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 1, 0);
+    send(&engine, &a, START + 2, 293);
+
+    let facts = clock(START + 700);
+    let reads = sent.reads(&facts);
+    let whole = reads.of(&a);
+    assert_eq!(whole.unsized_requests, 1);
+    let counts = SentCounts {
+        requests: 3,
+        tokens: u64::from(TOKENS) + 293,
+    };
+    assert_eq!(reads.counts(&a), counts);
+    assert_eq!(
+        (whole.requests, whole.tokens),
+        (counts.requests, counts.tokens)
+    );
+    assert_eq!(reads.counts(&row(337, a.dp_rank)), SentCounts::default());
+}
+
+#[test]
+fn the_two_number_read_releases_the_sends_a_report_reflects() {
+    let (engine, sent) = built(None);
+    let mut a = row(347, 3);
+    let at = START + u64::from(DELAY);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START + 7, 293);
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = at;
+
+    // No other read ran first: this one releases the send the report
+    // reflects, and the whole read finds it gone.
+    let facts = clock(at + 400);
+    let later = SentCounts {
+        requests: 1,
+        tokens: 293,
+    };
+    assert_eq!(sent.reads(&facts).counts(&a), later);
+    assert_eq!(sent.read(&facts, &a), one(293));
+}
+
+#[test]
+fn a_release_leaves_a_later_send_of_no_stated_size_in_the_read_that_ran_it() {
+    let (engine, sent) = built(None);
+    let mut a = row(353, 5);
+    send(&engine, &a, START, 0);
+    send(&engine, &a, START + 9, 0);
+    // A report that reflects the first send: the read that releases it
+    // still counts the second, and counts it as of no stated size.
+    a.load = Some(LoadRow::default());
+    a.load_sampled_at_micros = START + u64::from(DELAY);
+    assert_eq!(
+        sent.read(&clock(0), &a),
+        Sent {
+            requests: 1,
+            tokens: 0,
+            unsized_requests: 1,
+        }
+    );
+}
+
+#[test]
+fn the_two_number_read_counts_no_send_past_the_time_limit() {
+    let (engine, sent) = built(Some(17));
+    let a = row(349, 3);
+    let at = START + u64::from(DELAY);
+    send(&engine, &a, START, TOKENS);
+
+    let held = SentCounts {
+        requests: 1,
+        tokens: u64::from(TOKENS),
+    };
+    assert_eq!(sent.reads(&clock(at + 16_999)).counts(&a), held);
+    assert_eq!(
+        sent.reads(&clock(at + 17_000)).counts(&a),
+        SentCounts::default()
+    );
 }
 
 #[test]
@@ -982,6 +1065,84 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
     assert!(!keeps(&a), "two sends are not under two");
     assert!(keeps(&b), "another row's sends are its own");
     // The count the factory was handed is the one the engine feeds.
+    assert_eq!(
+        readers.lock()[0].read(&facts, &a),
+        Sent {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+            ..Sent::default()
+        }
+    );
+}
+
+/// Picks the kept row its profile sent the fewest requests, the first of
+/// them at a tie.
+#[derive(Debug)]
+struct LeastSent {
+    sent: Arc<SentCredit>,
+}
+
+impl Lifecycle for LeastSent {}
+
+impl crate::framework::Picker for LeastSent {
+    fn name(&self) -> &'static str {
+        "least-sent"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        _: &[f32],
+        _: TieBand,
+        out: &mut crate::decision::Targets,
+    ) {
+        let sent = |row: &&u32| self.sent.read(facts, &candidates[**row as usize]).requests;
+        if let Some(&row) = kept.iter().min_by_key(sent) {
+            out.push(crate::builtins::target_of(&candidates[row as usize]));
+        }
+    }
+}
+
+/// A registered picker holds its profile's count of sends, as a registered
+/// filter does. A profile whose only reader of sends is its picker keeps
+/// its limit: the picker is built ahead of the limit's check. The count its
+/// factory was handed is the profile's own, the one the engine feeds.
+#[test]
+fn a_registered_picker_reads_the_sends_of_its_profile() {
+    let readers = Readers::default();
+    let kept = Arc::clone(&readers);
+    let mut catalog = Catalog::builtin();
+    catalog
+        .picker_with("least-sent", move |build| {
+            let sent = build.sent();
+            kept.lock().push(Arc::clone(&sent));
+            Ok(Box::new(LeastSent { sent }))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": {
+            "work": {
+                "sent_ttl_ms": 24_001,
+                "filter": ["healthy"],
+                "score": ["least-requests"],
+                "pick": "least-sent"
+            }
+        }
+    }))
+    .expect("a document");
+    let engine = document
+        .validate_in(&catalog, &[])
+        .expect("the picker reads the sends the limit ages");
+    assert_eq!(engine.sent_credits.len(), 1);
+
+    let a = row(127, 3);
+    let facts = clock(START + 700);
+    send(&engine, &a, START, TOKENS);
+    send(&engine, &a, START, TOKENS);
     assert_eq!(
         readers.lock()[0].read(&facts, &a),
         Sent {

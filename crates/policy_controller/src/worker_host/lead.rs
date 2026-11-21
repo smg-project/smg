@@ -9,9 +9,10 @@
 pub trait Lead: Send + Sync + 'static {
     /// The term this replica leads under, or `None` while it follows.
     ///
-    /// Called under a worker object's mutation lock, and for a projection
-    /// under the store's locks too: it must not block, and must take no
-    /// lock that is held while the registry or the store is written.
+    /// Called under a worker object's mutation lock, and under the store's
+    /// locks too, at a verdict and at a projection alike: it must not
+    /// block, and must take no lock that is held while the registry or the
+    /// store is written.
     fn term(&self) -> Option<u64>;
 }
 

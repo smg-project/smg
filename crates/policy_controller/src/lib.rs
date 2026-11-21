@@ -21,7 +21,9 @@
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
 //!   issues one yet). A decision books nothing by itself: its door files
 //!   the pick's lease at the issue, which books the first target, and the
-//!   host reports the lifecycle back.
+//!   host reports the lifecycle back. One issue books another target: a
+//!   pair's decode asked for later and sent with no decode call is issued
+//!   at its dispatch, on the target that dispatch took.
 //! - 4.3, the lifecycle ([`lease`]): the [`Lease`] a decision carries and the
 //!   [`Lifecycle`] hooks a stateful stage learns from (issued, dispatched,
 //!   completed, released, membership, signal).
@@ -181,12 +183,12 @@ pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
     Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-pub use demands::{DemandFacts, Demands};
+pub use demands::{DemandFacts, Demands, References, Unmet};
 pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
-    Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
-    Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
+    Front, Narrowed, PairPools, PairSide, PairTable, PairTableError, Picker, Plan, Profile, Scorer,
+    Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
@@ -195,7 +197,7 @@ pub use lease::{
 pub use reports::{ReportReads, Reports};
 pub use ring::{ConsistentHash, Ring};
 pub use routing_key::{DerivedKey, KeySource, KeySources};
-pub use sent::{Sent, SentCredit};
+pub use sent::{Sent, SentCounts, SentCredit};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };
@@ -232,7 +234,11 @@ pub use view::{
 ///   decision's rows and cuts a list at the profile's sample, the holders'
 ///   draw and the warming rows' draw;
 /// - the first value of the holders' stream, and of each stream so seeded:
-///   the seed of each lookup a naming makes again, a stream a round.
+///   the seed of each lookup a naming makes again, a stream a round;
+/// - the first value of the seed under the store's mask for refused
+///   holders, and of each stream so seeded: the seed of each lookup a
+///   naming makes again past a cap of holders the pass refused, a stream a
+///   round.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

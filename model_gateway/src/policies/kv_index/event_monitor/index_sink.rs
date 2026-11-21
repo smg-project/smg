@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 use smg_grpc_client::common_proto::{kv_cache_event, KvEventBatch};
 use smg_worker::{
-    kv_events::apply::{WorkerIndexCounters, WorkerIndexState},
+    kv_events::apply::{store_width, WorkerIndexCounters, WorkerIndexState},
     metrics::writers::Metrics,
 };
 use tracing::{debug, info};
@@ -136,15 +136,10 @@ impl KvEventMonitor {
             let Some(kv_cache_event::Data::Stored(stored)) = &event.data else {
                 continue;
             };
-            let Some(block) = stored.blocks.first() else {
+            let Some(tokens) = store_width(stored).and_then(|width| usize::try_from(width).ok())
+            else {
                 continue;
             };
-            let Ok(tokens) = usize::try_from(block.block_size) else {
-                continue;
-            };
-            if tokens == 0 {
-                continue;
-            }
             // The common case, a block of the size of record, costs one shared
             // read; the write lock is taken only to change the size.
             if block_sizes

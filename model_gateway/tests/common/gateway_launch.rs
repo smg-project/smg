@@ -43,7 +43,10 @@ pub enum Until {
     /// The gateway answers `GET /health` with 200 on the first watched port:
     /// the proof that the gateway itself serves there, where a bare connect
     /// would also pass for another process on the port ([`free_ports`]
-    /// keeps a picked port from one on Linux alone).
+    /// keeps a picked port from one on Linux alone). The kill at the first
+    /// answer takes the lines the gateway's writer thread has not written
+    /// yet: a case that reads a line of the log keeps its gateway
+    /// ([`Gateway`]) and waits for the line ([`log_with_line`]).
     Served,
 }
 

@@ -896,10 +896,10 @@ async fn manager_loop_promotes_zmq_worker_on_connect_signal() {
 
     registry
         .connect_signal_sender()
-        .send(WorkerConnected {
+        .send(WorkerSignal::Connected(WorkerConnected {
             url: "ipc:///tmp/connect.ipc".to_string(),
             revision,
-        })
+        }))
         .expect("connect signal must reach the manager loop");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1244,10 +1244,10 @@ async fn a_demoted_worker_stays_out_on_its_contacts_read_and_returns_on_the_sche
     let contact = tokio::time::Instant::now();
     registry
         .connect_signal_sender()
-        .send(WorkerConnected {
+        .send(WorkerSignal::Connected(WorkerConnected {
             url: url.clone(),
             revision,
-        })
+        }))
         .unwrap();
     wait_until(
         contact + Duration::from_secs(5),
@@ -3147,6 +3147,7 @@ struct RecordingSink {
     answer: ProbeAnswer,
     probes: parking_lot::Mutex<Vec<(WorkerId, bool, u64, WorkerStatus)>>,
     connects: parking_lot::Mutex<Vec<(WorkerId, u64)>>,
+    liveness: parking_lot::Mutex<Vec<(WorkerId, u64)>>,
 }
 
 impl RecordingSink {
@@ -3155,6 +3156,7 @@ impl RecordingSink {
             answer,
             probes: parking_lot::Mutex::default(),
             connects: parking_lot::Mutex::default(),
+            liveness: parking_lot::Mutex::default(),
         }
     }
 }
@@ -3180,6 +3182,10 @@ impl HealthSink for RecordingSink {
     ) -> Option<(WorkerStatus, WorkerStatus)> {
         self.connects.lock().push((worker_id.clone(), revision));
         None
+    }
+
+    fn liveness_moved(&self, worker_id: &WorkerId, revision: u64) {
+        self.liveness.lock().push((worker_id.clone(), revision));
     }
 }
 
@@ -3224,10 +3230,10 @@ async fn maybe_start_with_sink_hands_every_fact_to_the_sink_it_was_given() {
     .expect("health checks are on");
     registry
         .connect_signal_sender()
-        .send(WorkerConnected {
+        .send(WorkerSignal::Connected(WorkerConnected {
             url: unprobed.url().to_string(),
             revision: unprobed.revision(),
-        })
+        }))
         .expect("the manager takes the connect signal");
 
     wait_until(
@@ -3513,10 +3519,10 @@ async fn a_loop_started_behind_another_is_signalled_once_the_first_ends() {
     let signal = || {
         registry
             .connect_signal_sender()
-            .send(WorkerConnected {
+            .send(WorkerSignal::Connected(WorkerConnected {
                 url: worker.url().to_string(),
                 revision: worker.revision(),
-            })
+            }))
             .expect("the channel has its receiver");
     };
     let first_sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
@@ -3554,4 +3560,89 @@ async fn a_loop_started_behind_another_is_signalled_once_the_first_ends() {
         1,
         "the first read no more"
     );
+}
+
+/// The collector tells its sink of a worker's liveness in three places: for
+/// every worker at the loop's start, at each move of a worker's veto, and
+/// where a worker is laid in another's place. Each tell carries the id and
+/// the revision of the worker that stands there, and no reading.
+#[tokio::test]
+async fn the_collector_tells_its_sink_each_move_of_a_workers_liveness() {
+    use crate::runtime::StallReason;
+
+    let registry = Arc::new(WorkerRegistry::new());
+    let build = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..HealthCheckConfig::default()
+                })
+                .connect_signal_tx(registry.connect_signal_sender())
+                .build(),
+        )
+    };
+    let told = |sink: &RecordingSink, count: usize| sink.liveness.lock().len() == count;
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(5);
+    let moved = build("http://moved:1");
+    let quiet = build("http://quiet:1");
+    let moved_id = registry.register(moved.clone()).unwrap();
+    let quiet_id = registry.register(quiet.clone()).unwrap();
+    let sink = Arc::new(RecordingSink::answering(ProbeAnswer::Stale));
+    let _manager =
+        WorkerManager::start_with_sink(registry.clone(), sink.clone(), test_config(), None);
+
+    // The start: every worker, each at its revision.
+    wait_until(deadline(), "the start tells every worker", || {
+        told(&sink, 2)
+    })
+    .await;
+    let at_start = sink.liveness.lock().clone();
+    assert!(at_start.contains(&(moved_id.clone(), moved.revision())));
+    assert!(at_start.contains(&(quiet_id, quiet.revision())));
+
+    // A move of the veto: one tell, of that worker.
+    assert!(moved.set_stall(Some(StallReason::Unreachable)));
+    wait_until(deadline(), "the move is told", || told(&sink, 3)).await;
+    assert_eq!(
+        sink.liveness.lock()[2],
+        (moved_id.clone(), moved.revision())
+    );
+
+    // Two moves before the loop runs again are one signal and one tell:
+    // the sink reads the veto on the object.
+    assert!(moved.set_stall(None));
+    assert!(moved.set_stall(Some(StallReason::Wedged)));
+    wait_until(deadline(), "the two moves are told", || told(&sink, 4)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(told(&sink, 4), "one signal waited for the two moves");
+
+    // A veto that stands is no move.
+    assert!(!moved.set_stall(Some(StallReason::Wedged)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(told(&sink, 4));
+
+    // A worker laid in another's place took its running state, the veto
+    // with it: the sink is told at the replacement's revision.
+    let replacement = build("http://moved:1");
+    assert!(registry.replace(&moved_id, replacement.clone()));
+    wait_until(deadline(), "the replacement is told", || told(&sink, 5)).await;
+    assert_eq!(
+        sink.liveness.lock()[4],
+        (moved_id.clone(), replacement.revision())
+    );
+    assert_eq!(replacement.stall_reason(), Some(StallReason::Wedged));
+
+    // A registered worker starts with no veto, and the signal of a worker
+    // that left is nobody's: neither is told.
+    registry.register(build("http://new:1")).unwrap();
+    registry
+        .connect_signal_sender()
+        .send(WorkerSignal::LivenessMoved {
+            url: "http://gone:1".to_string(),
+        })
+        .expect("the channel has its receiver");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(told(&sink, 5));
 }
