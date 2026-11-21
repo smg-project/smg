@@ -25,7 +25,7 @@ use crate::{
     },
     policies::standard_filters,
     stages::{
-        lifecycle::Lifecycle,
+        lifecycle::{Lifecycle, Words},
         scorers::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
     },
     tracking::{
@@ -389,6 +389,14 @@ impl Lifecycle for LeastLoad {
     fn on_membership(&self, change: &Membership<'_>) {
         if self.feeds {
             self.sent.membership(change);
+        }
+    }
+
+    /// The dispatch, where the stage feeds its own count of sends.
+    fn hears(&self) -> Words {
+        Words {
+            dispatch: self.feeds,
+            ..Words::NONE
         }
     }
 }
