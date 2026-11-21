@@ -28,7 +28,10 @@
 //! For LLaMA 4, tokens = num_tiles * (tile_size / patch_size)²
 //! where patch_size is typically 14, giving 576 tokens per tile.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::Array4;
@@ -40,6 +43,8 @@ use crate::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        rgb_runs::RgbSplitter,
+        scratch,
         transforms::{self, TransformError},
     },
 };
@@ -307,24 +312,30 @@ impl Llama4VisionProcessor {
         }
     }
 
-    /// One image's elements in output order, each handed to `run` once: the
-    /// canvas tiles, then the global view behind more than one tile.
-    fn write_image(
-        &self,
-        image: &DynamicImage,
-        plan: &Plan,
-        mut run: impl FnMut(usize, &[[u8; 3]], usize),
-    ) {
+    /// One image's tiles in output order, each channel of a tile handed to
+    /// `run` once as bytes: the canvas tiles, then the global view behind
+    /// more than one tile.
+    fn write_image(&self, image: &DynamicImage, plan: &Plan, mut run: impl FnMut(usize, &[u8])) {
         let tile = self.tile_size as usize;
         let (width, height) = plan.resized;
-        let resized = transforms::resize(image, width, height, FilterType::Triangle);
+        // The resizer's same-size pass is a copy of the bytes.
+        let resized = if image.dimensions() == plan.resized {
+            Cow::Borrowed(image)
+        } else {
+            Cow::Owned(transforms::resize(
+                image,
+                width,
+                height,
+                FilterType::Triangle,
+            ))
+        };
         let (width, height, rgb) = transforms::rgb_bytes(&resized);
-        tile_rows(&rgb, (width, height), plan.grid, tile, &mut run);
+        tile_blocks(&rgb, (width, height), plan.grid, tile, &mut run);
         if plan.has_global() {
             let global =
                 transforms::resize(image, self.tile_size, self.tile_size, FilterType::Triangle);
             let (width, height, rgb) = transforms::rgb_bytes(&global);
-            tile_rows(&rgb, (width, height), (1, 1), tile, &mut run);
+            tile_blocks(&rgb, (width, height), (1, 1), tile, &mut run);
         }
     }
 
@@ -400,30 +411,36 @@ impl Plan {
     }
 }
 
-/// The rows of a `rows` x `columns` canvas in output order (tile, channel,
-/// row), `rgb` at its top left: `run` takes a row's channel, its pixels
-/// inside the image and the count of margin elements behind them.
-fn tile_rows(
+/// The tiles of a `rows` x `columns` canvas in output order, `rgb` at its
+/// top left and black (0) beyond it: `run` takes a tile's channel and that
+/// channel's bytes.
+fn tile_blocks(
     rgb: &[u8],
     (width, height): (usize, usize),
     (rows, columns): (usize, usize),
     tile: usize,
-    mut run: impl FnMut(usize, &[[u8; 3]], usize),
+    mut run: impl FnMut(usize, &[u8]),
 ) {
-    let (pixels, _) = rgb.as_chunks::<3>();
+    let splitter = RgbSplitter::detect();
+    let block = tile * tile;
+    let mut bytes = vec![0u8; 3 * block];
     for tile_y in 0..rows {
         for tile_x in 0..columns {
             let left = (tile_x * tile).min(width);
-            let inside = (width - left).min(tile);
-            for channel in 0..3 {
-                for y in tile_y * tile..(tile_y + 1) * tile {
-                    let row = if y < height {
-                        &pixels[y * width + left..][..inside]
-                    } else {
-                        &[]
-                    };
-                    run(channel, row, tile - row.len());
-                }
+            let top = (tile_y * tile).min(height);
+            let (inside, filled) = ((width - left).min(tile), (height - top).min(tile));
+            if inside < tile || filled < tile {
+                bytes.fill(0);
+            }
+            let (r, rest) = bytes.split_at_mut(block);
+            let (g, b) = rest.split_at_mut(block);
+            for y in 0..filled {
+                let row = &rgb[((top + y) * width + left) * 3..][..inside * 3];
+                let at = y * tile..y * tile + inside;
+                splitter.split(row, &mut r[at.clone()], &mut g[at.clone()], &mut b[at]);
+            }
+            for (channel, of_channel) in bytes.chunks_exact(block).enumerate() {
+                run(channel, of_channel);
             }
         }
     }
@@ -450,13 +467,11 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let table = self.norm().table_f32();
         // Every image's tiles land in the one buffer the engine reads:
         // [total_tiles, C, H, W], no batch dimension, no zero-padding.
-        let mut data = Vec::with_capacity(tiles * 3 * tile * tile);
+        let mut data = scratch::take_f32_cap(tiles * 3 * tile * tile);
         for (image, plan) in images.iter().zip(&plans) {
-            self.write_image(image, plan, |channel, row, margin| {
+            self.write_image(image, plan, |channel, bytes| {
                 let table = &table[channel];
-                data.extend(row.iter().map(|pixel| table[usize::from(pixel[channel])]));
-                // The canvas outside the image is black (0), normalized.
-                data.extend(std::iter::repeat_n(table[0], margin));
+                data.extend(bytes.iter().map(|&byte| table[usize::from(byte)]));
             });
         }
 
@@ -482,20 +497,15 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let plans = self.plans(images);
         let tile = self.tile_size as usize;
         let tiles: usize = plans.iter().map(Plan::tiles).sum();
-        let element = writer.element_size();
-        let row_bytes = tile * element;
-        // A pooled buffer: its bytes are a previous request's until the rows
-        // are written, and the rows cover it.
-        let mut wire = buffer_pool::take(tiles * 3 * tile * row_bytes);
-        let black = vec![0u8; tile];
+        let block_bytes = tile * tile * writer.element_size();
+        // A pooled buffer: its bytes are a previous request's until the tiles
+        // are written, and the tiles cover it.
+        let mut wire = buffer_pool::take(tiles * 3 * block_bytes);
         let mut written = 0;
         for (image, plan) in images.iter().zip(&plans) {
-            self.write_image(image, plan, |channel, row, margin| {
-                let (inside, outside) =
-                    wire[written..written + row_bytes].split_at_mut(row.len() * element);
-                writer.write_channel(inside, row, channel);
-                writer.write_run(outside, &black[..margin], channel);
-                written += row_bytes;
+            self.write_image(image, plan, |channel, bytes| {
+                writer.write_run(&mut wire[written..written + block_bytes], bytes, channel);
+                written += block_bytes;
             });
         }
         debug_assert_eq!(written, wire.len(), "the tiles cover the wire");
