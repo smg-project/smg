@@ -3048,6 +3048,46 @@ async fn a_replaced_workers_sentinel_leaves_its_successors_series() {
     assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
 }
 
+/// A load series carries its worker's registered role. A successor
+/// registered in another role writes other series, so its report keeps no
+/// sentinel from its predecessor's: those end, and the successor's stand.
+#[tokio::test]
+async fn a_successor_registered_in_another_role_keeps_no_sentinel_from_its_predecessors_load_series(
+) {
+    let of_type = |worker_type: WorkerType| -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new("http://w:1")
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Http)
+            .model(ModelCard::new("m"))
+            .build();
+        worker.set_status(WorkerStatus::Ready);
+        Arc::new(worker)
+    };
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = of_type(WorkerType::Prefill);
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        let next = of_type(WorkerType::Decode);
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+        monitor.flush_pushed();
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    let running_under = |role: &str| {
+        let role = format!("role=\"{role}\"");
+        rendered
+            .lines()
+            .find(|l| l.starts_with("smg_engine_running_requests{") && l.contains(&role))
+            .unwrap_or_else(|| panic!("no running series with {role}:\n{rendered}"))
+    };
+    assert!(running_under("prefill").ends_with(" -1"), "{rendered}");
+    assert!(running_under("decode").ends_with(" 9"), "{rendered}");
+}
+
 /// A worker with no data-parallel width can report more than one rank.
 /// The eviction's sentinel covers every rank its report spanned.
 #[tokio::test]
@@ -3161,7 +3201,12 @@ async fn the_batchs_sentinel_covers_every_rank_of_the_row() {
 /// file's lay, the answer's series and the published row.
 fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
     let _ = monitor.apply_polled_load("http://w:1", &answer, Instant::now());
-    Metrics::record_engine_load("http://w:1", worker.model_id(), &answer);
+    Metrics::record_engine_load(
+        "http://w:1",
+        worker.model_id(),
+        registered_engine_role(*worker.worker_type()),
+        &answer,
+    );
     let reports = monitor.pushed_reports.lock();
     monitor.publish_rows(
         &reports,

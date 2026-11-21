@@ -12,8 +12,8 @@ use openai_protocol::{chat::ChatCompletionRequest, responses::ResponsesRequest};
 use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use smg_policy_controller::{
-    lease::TransportClass,
     store::{GatewayId, LeasesStore},
+    tracking::lease::TransportClass,
 };
 
 use super::super::HarmonyStreamingProcessor;

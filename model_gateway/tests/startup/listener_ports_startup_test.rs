@@ -18,6 +18,8 @@
 use std::{fs, net::TcpListener};
 
 use gateway_launch::{base_args, free_ports, launch_with, serial, Launch, Until, EXIT_TIMEOUT, IP};
+// The one test that binds a second socket runs on Linux alone.
+#[cfg(target_os = "linux")]
 use tokio::net::TcpSocket;
 
 use crate::gateway_launch;

@@ -1185,14 +1185,32 @@ impl Extensions {
     /// to their engines. Delegate to [`BackendConnector::shared`] for engines
     /// you want the gateway to connect to as usual.
     ///
-    /// For gRPC or ZMQ inference, and for a ZMQ worker's label refresh, the
-    /// gateway requires a [`BackendClient`]. It refuses other connections with
-    /// `its engine connection is not the gateway's backend client`.
+    /// A gRPC connection of your own carries a worker's health, loads and
+    /// events. The gateway puts it behind a front ([`Fronted`]) and sends
+    /// requests through its own client, which it connects to the worker's
+    /// address and runtime at the first request. So an engine the gateway's
+    /// client speaks to must listen there. The worker's connection is the
+    /// front: read your own type back through [`Fronted::front`]. If you
+    /// hold the gateway's client already, return [`Fronted::over`] of yours
+    /// and it, and the two share one channel.
+    ///
+    /// For ZMQ inference, and for a ZMQ worker's label refresh, the gateway
+    /// requires a [`BackendClient`] as the worker's connection. It refuses
+    /// another with `its engine connection is not the gateway's backend
+    /// client`.
     /// If the connection supplies load reports, let the worker runtime be
     /// the only poller of that engine's load.
     ///
+    /// An HTTP worker connects no engine, and its load is polled over HTTP.
+    /// A connector that keeps such a worker's load on a service of its own
+    /// answers [`EngineConnector::http_load_source`]: the worker runtime
+    /// then polls that source alone and sends the worker no load request.
+    ///
     /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
     /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
+    /// [`Fronted`]: crate::routers::grpc::backend_client::Fronted
+    /// [`Fronted::front`]: crate::routers::grpc::backend_client::Fronted::front
+    /// [`Fronted::over`]: crate::routers::grpc::backend_client::Fronted::over
     #[must_use]
     pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
         self.connector = Some(connector);
@@ -3803,6 +3821,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 #[cfg(test)]
 mod tests {
     mod connector;
+    mod load_source;
 
     use std::convert::Infallible;
 
@@ -3937,7 +3956,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_waits_for_the_first_snapshot_on_both_routers() {
         use axum::body::{to_bytes, Body};
-        use smg_policy_controller::controller::Scope;
+        use smg_policy_controller::service::controller::Scope;
         use tokio::{sync::oneshot, time};
         use tower::ServiceExt;
 
@@ -4065,8 +4084,8 @@ mod tests {
         use std::time::Instant;
 
         use smg_policy_controller::{
+            engine::view::{Role, WireModes},
             store::{Ask, GatewayId, HealthPolicy, Maker, ViewBuffers, WorkerFacts},
-            view::{Role, WireModes},
             worker_host::Expect,
         };
         use smg_worker::runtime::StallReason;

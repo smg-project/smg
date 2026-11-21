@@ -11,12 +11,12 @@ use super::{
     INDEX_WORKERS,
 };
 use crate::{
+    engine::view::WorkerId,
     store::{
         kv_events::{RankCursor, GAP_CLEAR_THRESHOLD},
         BatchFacts, BatchOutcome, KvEventSink, MemoryStore, ResyncReason, Signals, SnapshotChunk,
         WorkerFacts, WorkersStore,
     },
-    view::WorkerId,
 };
 
 const MODEL: &str = "m";
@@ -30,14 +30,17 @@ mod sent_prefixes {
 
     use super::*;
     use crate::{
-        door::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
+        document::{spec, spec::AffinitySource},
+        engine::{
+            door::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
+            view,
+            view::{Candidate, Role, WireModes},
+        },
         predictor::Predictor,
-        spec::AffinitySource,
         store::{
             index::{seam, Predicted},
             Ask, GatewayId, Kinds, Named, Naming, Position, Reachability, ViewBuffers,
         },
-        view::{Candidate, Role, WireModes},
     };
 
     type Case = Result<(), Box<dyn std::error::Error>>;
@@ -957,7 +960,9 @@ mod sent_prefixes {
 
     #[test]
     fn a_stage_that_reads_cache_events_keeps_the_index_holders_first() -> Case {
-        use crate::spec::{BestParams, PickStage, PolicySpec, PrefixAffinityParams, ScoreStage};
+        use crate::document::spec::{
+            BestParams, PickStage, PolicySpec, PrefixAffinityParams, ScoreStage,
+        };
 
         let store = MemoryStore::new();
         let sent = plain(&store, "sent", WireModes::GRPC, Reachability::Any);
@@ -976,7 +981,7 @@ mod sent_prefixes {
             profile.score.push(second.into());
         }
         let spec = applied(&document)?;
-        let cap = spec.engine().named_for(MODEL, crate::view::Phase::Single);
+        let cap = spec.engine().named_for(MODEL, view::Phase::Single);
         assert_eq!(cap, 1);
         store.apply(spec)?;
         publish(&store, indexed);
@@ -991,7 +996,7 @@ mod sent_prefixes {
 
     #[test]
     fn a_write_reads_its_permission_under_the_guard() -> Case {
-        let store = Arc::new(MemoryStore::new());
+        let store = MemoryStore::new();
         let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
         plain(&store, "b", WireModes::GRPC, Reachability::Any);
         store.apply(applied(&merged(1)?)?)?;
@@ -1000,24 +1005,43 @@ mod sent_prefixes {
         let record = record(&store).ok_or("the model's record")?;
         let standing = store.deciding(|world| world.standing(MODEL, Role::Single));
         let allowed = Arc::clone(&standing.ok_or("the pool's standing")?.tables.allowed[row]);
-        // This case holds the guard a write waits for. A removal's first
-        // step lands meanwhile: the worker's word is cleared.
-        let held = record.record.write();
-        let (started, on) = mpsc::channel();
-        let writer = {
-            let store = Arc::clone(&store);
-            thread::spawn(move || {
-                let _ = started.send(());
-                store.deciding(|world| world.sent(&cold, id));
-            })
-        };
-        on.recv()?;
-        thread::sleep(Duration::from_millis(50));
-        allowed.store(false, Ordering::Relaxed);
-        drop(held);
-        writer.join().map_err(|_| "the writer's thread")?;
+        // A removal's first step lands as the write takes the guard: the
+        // worker's word is cleared.
+        seam::set(seam::Point::Guarded, move || {
+            allowed.store(false, Ordering::Relaxed);
+        });
+        store.deciding(|world| world.sent(&cold, id));
+        assert!(!seam::pending(), "the step ran under the write's guard");
         let blocks = record.record.read().deepest(&keys(&HASHES)).blocks();
         assert_eq!(blocks, 0, "a worker that left is not written back");
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_waits_for_no_thread_that_holds_the_record() -> Case {
+        let store = MemoryStore::new();
+        let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let (cold, _) = named(&store, None, 16, 7);
+        let record = record(&store).ok_or("the model's record")?;
+        let slices = || store.deciding(|world| world.sent_slices(MODEL, Role::Single));
+        // Another decider writes the record. A lease issued meanwhile
+        // leaves its naming out and takes no guard.
+        let held = record.record.write();
+        thread::scope(|scope| {
+            let (finished, done) = mpsc::channel();
+            let (store, cold) = (&store, &cold);
+            scope.spawn(move || {
+                store.deciding(|world| world.sent(cold, id));
+                let _ = finished.send(());
+            });
+            let finished = done.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            finished
+        })?;
+        assert_eq!(slices(), Some(0), "a held record is not written");
+        store.deciding(|world| world.sent(&cold, id));
+        assert_eq!(slices(), Some(1), "a free record is");
         Ok(())
     }
 
@@ -1078,7 +1102,7 @@ mod sent_prefixes {
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),
-            crate::spec::IndexSpec {
+            spec::IndexSpec {
                 max_size: 16,
                 ..Default::default()
             },
@@ -1125,7 +1149,7 @@ mod sent_prefixes {
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),
-            crate::spec::IndexSpec {
+            spec::IndexSpec {
                 max_size: 16,
                 ..Default::default()
             },
@@ -1196,7 +1220,7 @@ fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
 /// the pools are walked.
 #[test]
 fn a_write_that_moves_no_member_walks_no_pool() {
-    use crate::door::tests::sent_prefixes::{applied, merged};
+    use crate::engine::door::tests::sent_prefixes::{applied, merged};
 
     let store = MemoryStore::new();
     admitted(&store, "a");
@@ -2515,12 +2539,12 @@ mod named {
 
     use super::{admitted, batch, chain, publisher, stored, MODEL};
     use crate::{
+        engine::view::{Candidate, LoadRow, Role, WireModes, WorkerId},
         store::{
             index::{seam, PoolIndex},
             Ask, BatchOutcome, GatewayId, KvEventSink, LoadSink, LoadSource, MemoryStore, Named,
             Naming, Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkersStore,
         },
-        view::{Candidate, LoadRow, Role, WireModes, WorkerId},
         AppliedSpec, PolicySpec,
     };
 
@@ -4194,7 +4218,7 @@ mod named {
     /// them again, and one whose stage holds another number rules by it.
     #[test]
     fn a_generation_rules_the_warming_rows_from_its_apply() {
-        use crate::spec::{Pairing, ScoreSpec, ScoreStage};
+        use crate::document::spec::{Pairing, ScoreSpec, ScoreStage};
 
         let store = MemoryStore::new();
         store.apply(sampled(1)).expect("above the unbound start");

@@ -22,7 +22,7 @@ use std::{
 
 use parking_lot::Mutex;
 use prost::Message as _;
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     elector::ElectionSettings,
     proto::{
         controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,

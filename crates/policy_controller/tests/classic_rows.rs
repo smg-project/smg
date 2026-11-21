@@ -34,11 +34,12 @@
 //! of one grouped worker was pinned to by its key. Two hashes place no key
 //! alike, so it must replay with the requests of one key on one rank, and
 //! a counted row count for count or share for share.
-//! A retry-wire row and a media row hold the gateway's answer to each
-//! request of one pool, a retry that stays on its wire and a request
-//! that carries media among them: the workers the request may be placed
-//! on, or its refusal. Each must replay answer for answer, a refusal by
-//! its status and its code.
+//! A retry-wire row, a media row and a context-window row hold the
+//! gateway's answer to each request of one pool, a retry that stays on
+//! its wire, a request that carries media and a request of some size
+//! among them: the workers the request may be placed on, or its refusal.
+//! Each must replay answer for answer, a refusal by its status and its
+//! code.
 //! No row is decided differently but where its module names it. The store
 //! judges an engine by rules of its own, and the overload module holds a
 //! recorded row they decide apart from the gateway to the verdicts its
@@ -68,6 +69,7 @@ mod classic {
     pub mod all_vetoed;
     pub mod bucket;
     pub mod cache_aware;
+    pub mod context_window;
     pub mod demand_bed;
     pub mod encode_pair;
     pub mod manual;
@@ -134,10 +136,6 @@ const OWED_SHEETS: &[OwedSheet] = &[
     OwedSheet {
         policy: "pair-select",
         by: "the placement of a prefill and decode pair",
-    },
-    OwedSheet {
-        policy: "context-window",
-        by: "a request's hard demands: the context window's two bounds",
     },
     OwedSheet {
         policy: "constraint-decider",
@@ -297,14 +295,20 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-/// A retry-wire row and a media row name the workers a request may take
-/// or its refusal, so each module brings its own replay too, over one
-/// bed; their copied rows name each runtime by a token, and the pair
-/// index's rule holds them as well.
-const MODULES: [Module; 14] = [
+/// A retry-wire row, a media row and a context-window row name the
+/// workers a request may take or its refusal, so each module brings its
+/// own replay too, over one bed; their copied rows name each runtime by
+/// a token, and the pair index's rule holds them as well.
+const MODULES: [Module; 15] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
+    Module {
+        policy: classic::context_window::POLICY,
+        inline: classic::context_window::INLINE,
+        replay: classic::context_window::replay_rows,
+        copied: classic::pair_index::copied_row_defects,
+    },
     Module {
         policy: classic::encode_pair::POLICY,
         inline: classic::encode_pair::INLINE,
@@ -670,6 +674,13 @@ fn the_classic_sticky_rank_rows_replay_rank_for_rank_and_count_for_count() {
 #[test]
 fn the_classic_media_rows_replay_answer_for_answer() {
     let (rows, defects) = replay_sheet(classic::media_refs::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_context_window_rows_replay_answer_for_answer() {
+    let (rows, defects) = replay_sheet(classic::context_window::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -1144,6 +1155,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "broken.json",
             "bucket.json",
             "cache_aware.json",
+            "context-window.json",
             "encode_pair.json",
             "manual.json",
             "media-refs.json",

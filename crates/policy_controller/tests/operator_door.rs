@@ -3,7 +3,7 @@
 use std::{error::Error, sync::Arc, time::Instant};
 
 use smg_policy_controller::{
-    operator::{
+    document::operator::{
         snapshot::{told, Asked, Rows},
         Applied, Format, SpecDoor, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
     },

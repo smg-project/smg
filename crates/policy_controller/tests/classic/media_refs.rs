@@ -116,6 +116,7 @@ impl Replayed for Row {
                     runtime: runtimes.number(&worker.runtime),
                     references: worker.processes_references,
                     host_pipeline: worker.gateway_pipeline,
+                    ..DemandFacts::default()
                 },
             });
         }
@@ -127,6 +128,7 @@ impl Replayed for Row {
                 runtime,
                 vision: asked.pixels,
                 references: asked.references(),
+                ..Demands::default()
             };
             let constraints = Constraints {
                 wire_modes,

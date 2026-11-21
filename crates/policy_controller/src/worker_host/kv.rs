@@ -43,19 +43,24 @@
 //! object was laid again opens no feed.
 //!
 //! A row's stream and a stream's rows are kept under one lock: a row
-//! moves between two streams in one step. A stream that leaves reaches
-//! only the rows it still writes. It clears them in the store outside
-//! that lock, which every row's batch takes, and each stays its row until
-//! its clear ends. A stream that would take one in between passes its
-//! batch over, so a removal clears nothing a new stream wrote.
+//! moves between two streams in one step, and the store clears it in
+//! that step, so the clear takes nothing a later stream wrote. A stream
+//! that leaves reaches only the rows it still writes. It clears them in
+//! the store outside that lock, which every row's batch takes, and each
+//! stays its row until its clear ends. A stream that would take one in
+//! between passes its batch over, so a removal clears nothing a new
+//! stream wrote.
 //!
 //! An open feed's own row that the holder stands at rank 0 is taken by no
 //! other stream: only a route read before the row was laid again asks for
 //! it, and that batch is passed over. A feed's open asks the holder
-//! whether its object still stands for the row in the hold that writes
-//! the row's entry. So a row laid again behind that answer is taken from
-//! the stale feed by the stream the holder then routes to it, and never
-//! by the stale feed from that stream.
+//! whether its object still stands for the row, and whether the row
+//! still stands at rank 0, in the hold that writes the row's entry. An
+//! object the holder kept through a move stands for its row above rank 0
+//! too, so the first answer does not give the second. A row laid again
+//! behind those answers is taken from the stale feed by the stream the
+//! holder then routes to it, and never by the stale feed from that
+//! stream.
 //!
 //! # The block size
 //!
@@ -70,6 +75,17 @@
 //! other word. The adapter keeps the model each open row streams for and
 //! the engine's word for each model. The store keeps the size of record.
 //!
+//! # The series
+//!
+//! A batch the store takes is applied and accounted for by the worker
+//! crate's one routine, under the URL of the stream's worker: its blocks
+//! by operation, the stores the index did not take as they came, its age
+//! and the batch itself. The adapter adds what its own answers say: a
+//! live batch's pace, the worker's index blocks, a batch behind its
+//! lane's cursor, a gap that asks a replay, and each reset by its reason.
+//! The series are the worker crate's, written to the recorder in scope as
+//! the collector's are.
+//!
 //! # Limits
 //!
 //! - A store on an indexed tier raises the row's block of record whether or
@@ -82,6 +98,13 @@
 //!   every row it wrote.
 //! - What a row's old stream had in flight as the row moved, a batch or a
 //!   reset, can land behind the new stream's clear.
+//! - What the store's cursor decides by itself is in no series: a gap kept
+//!   or cleared, the batches missed, the degraded ranks, and the reason it
+//!   emptied a rank ahead of a batch.
+//! - The index-blocks gauge moves at a batch: a rank the store emptied
+//!   shows at its row's next batch.
+//! - A batch the adapter passes over by itself is counted nowhere: one of
+//!   a rank with no row laid, or one on a stream that is ending.
 
 use std::{
     collections::HashMap,
@@ -97,20 +120,21 @@ use smg_worker::{
     common_proto::{kv_cache_event::Data, KvEventBatch},
     identity::basic::Worker,
     kv_events::{
-        apply::{apply_events, BlockIndex, HeldBlocks, WorkerIndexState},
+        apply::{apply_counted, apply_events, BlockIndex, HeldBlocks, WorkerIndexState},
         port::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         KvEventFeed, KvEventHost,
     },
+    metrics::writers::Metrics,
     registry::Generation,
 };
 
 use super::Objects;
 use crate::{
+    engine::view::WorkerId,
     store::{
         self, ApplyError, ChainBlockMap, KvEvent, LaneWriter, SequenceHash, StoredBlock,
         WorkerGroups,
     },
-    view::WorkerId,
 };
 
 /// The worker crate's KV event port over a store's KV event sink.
@@ -120,6 +144,9 @@ pub struct KvAdapter<S: ?Sized> {
     rows: Mutex<Rows>,
     /// What the streams said of their models' block sizes.
     sizes: Mutex<Sizes>,
+    /// The URL each open feed's worker is named by in the cache-event
+    /// series, by the feed's own row.
+    urls: Mutex<HashMap<WorkerId, Arc<str>>>,
     /// Where the ranks of an engine stand, where a host handed its holder.
     ranks: Option<Arc<dyn Ranks>>,
     store: Arc<S>,
@@ -196,6 +223,8 @@ struct Applied {
     /// batch that reads another resets the state first: the store emptied
     /// the rank in between.
     emptied: Option<u64>,
+    /// The blocks the row's map held behind its last batch.
+    blocks: usize,
 }
 
 /// The row's reverse map inside the rules' state. The map is the lane's,
@@ -325,6 +354,7 @@ impl<S: ?Sized> KvAdapter<S> {
         Self {
             rows: Mutex::new(Rows::default()),
             sizes: Mutex::new(Sizes::default()),
+            urls: Mutex::new(HashMap::new()),
             ranks,
             store,
         }
@@ -351,11 +381,30 @@ impl<S: ?Sized> KvAdapter<S> {
     }
 
     /// Whether the holder stands `row` at rank 0: the row of a feed of its
-    /// own, which no other stream's batch is routed to.
+    /// own, which no other stream's batch is routed to. An adapter with no
+    /// holder to ask routes every batch to its stream's own row, so every
+    /// row stands there.
     fn stands_lowest(&self, row: WorkerId) -> bool {
         self.ranks
             .as_ref()
-            .is_some_and(|ranks| ranks.row_of(row, 0).is_some())
+            .is_none_or(|ranks| ranks.row_of(row, 0).is_some())
+    }
+
+    /// The blocks the rows `id`'s stream writes held behind their last
+    /// batches: what its worker's index-blocks gauge says.
+    fn held(&self, id: WorkerId) -> usize {
+        let states: Vec<_> = {
+            let rows = self.rows.lock();
+            let own = rows.written.get(&id).filter(|own| own.stream == id);
+            let fed = rows.fed.get(&id).into_iter().flatten();
+            let fed = fed.filter_map(|row| rows.written.get(row));
+            own.into_iter()
+                .chain(fed)
+                .map(|written| Arc::clone(&written.applied))
+                .collect()
+        };
+        // Each row's state by itself, outside the table's lock.
+        states.iter().map(|state| state.lock().blocks).sum()
     }
 }
 
@@ -393,35 +442,39 @@ where
     /// begins from nothing, as a feed's own row does at its open: what the
     /// store kept of it was decided by facts that are gone, or by another
     /// stream's batches. The stream that wrote it reaches it no longer:
-    /// the row changes lists in one hold of the lock. The row's new state
-    /// comes back. `None`, with nothing done, where the row is not this
-    /// stream's to take, and the batch is passed over. Its stream is
-    /// leaving and still clears it: a later batch takes the row. Or it is
-    /// an open feed's own row that the holder still stands at rank 0: only
-    /// a route read before the row was laid again asks for it.
+    /// the row changes lists, and the store clears it, in one hold of the
+    /// lock. The clear is of one row, and of nothing where the store never
+    /// held it. The row's new state comes back. `None`, with nothing done,
+    /// where the row is not this stream's to take, and the batch is passed
+    /// over. Its stream is leaving and still clears it: a later batch
+    /// takes the row. Or it is an open feed's own row that the holder
+    /// still stands at rank 0: only a route read before the row was laid
+    /// again asks for it.
     fn take(&self, stream: WorkerId, row: WorkerId) -> Option<Arc<Mutex<Applied>>> {
-        let applied = {
-            let mut rows = self.rows.lock();
-            let own_feed = rows
-                .written
-                .get(&row)
-                .is_some_and(|before| before.stream == row);
-            // The holder is asked in the hold, and for such a row alone.
-            if own_feed && self.stands_lowest(row) {
-                return None;
-            }
-            rows.claim(stream, row)?
-        };
-        // Outside the lock, which every row's batch takes.
+        let mut rows = self.rows.lock();
+        let own_feed = rows
+            .written
+            .get(&row)
+            .is_some_and(|before| before.stream == row);
+        // The holder is asked in the hold, and for such a row alone.
+        if own_feed && self.stands_lowest(row) {
+            return None;
+        }
+        let applied = rows.claim(stream, row)?;
+        // In the hold that wrote the entry: no stream claims the row, and
+        // writes it, ahead of this clear.
         self.store.removed(row);
         Some(applied)
     }
 
-    /// A feed's own row begins. `false`, with nothing done, where `stands`
-    /// says the feed's object stands for the row no longer. `stands` is
-    /// asked in the hold that writes the row's entry: a row laid again
-    /// behind its answer is taken from this feed by the stream the holder
-    /// then routes to it, and never by this feed from that stream.
+    /// A feed's own row begins. An error, with nothing done, says why it
+    /// does not. [`NoFeed::NoRow`]: `stands` says the feed's object stands
+    /// for the row no longer. [`NoFeed::UpperRank`]: the holder stands the
+    /// row above rank 0. An object kept through such a move still stands
+    /// for the row, which is its engine's stream's now. Both are asked in
+    /// the hold that writes the row's entry: a row laid again behind the
+    /// answers is taken from this feed by the stream the holder then
+    /// routes to it, and never by this feed from that stream.
     ///
     /// A row the adapter holds no facts for begins from nothing: what the
     /// store kept of its stream was decided by facts that are gone. The
@@ -430,24 +483,24 @@ where
     /// its engine, begins from nothing too. One a leaving stream still
     /// clears is left to it, and this feed's batches are passed over until
     /// that ends.
-    fn begin(&self, row: WorkerId, stands: impl FnOnce() -> bool) -> bool {
-        {
-            let mut rows = self.rows.lock();
-            if !stands() {
-                return false;
-            }
-            let own = rows
-                .written
-                .get(&row)
-                .is_some_and(|written| written.stream == row);
-            if own || rows.claim(row, row).is_none() {
-                return true;
-            }
+    fn begin(&self, row: WorkerId, stands: impl FnOnce() -> bool) -> Result<(), NoFeed> {
+        let mut rows = self.rows.lock();
+        if !stands() {
+            return Err(NoFeed::NoRow);
         }
-        // Outside the lock, which every row's batch takes, and on the
-        // caller's task: the clear ends before the feed is handed back.
-        self.store.removed(row);
-        true
+        if !self.stands_lowest(row) {
+            return Err(NoFeed::UpperRank);
+        }
+        let own = rows
+            .written
+            .get(&row)
+            .is_some_and(|written| written.stream == row);
+        if !own && rows.claim(row, row).is_some() {
+            // In the hold that wrote the entry, as a take's clear is, and
+            // on the caller's task: it ends before the feed is handed back.
+            self.store.removed(row);
+        }
+        Ok(())
     }
 
     /// Keep the state `id`'s own row was applied under, where the table
@@ -518,6 +571,9 @@ where
         let Some((applied, kept)) = self.applied(id, row) else {
             return BatchOutcome::Skipped;
         };
+        // The stream's worker, as its series name it.
+        let url = self.urls.lock().get(&id).cloned();
+        let snapshot = facts.snapshot.is_some();
         let facts = store::BatchFacts {
             sequence: facts.sequence,
             clears: facts.clears,
@@ -531,11 +587,16 @@ where
             .iter()
             .any(|event| matches!(event.data, Some(Data::Stored(_))));
         let mut record = None;
+        let mut took = None;
         // The cursor reads the header alone. The body runs where it admits
         // the batch: inside the lane's turn, with the table's lock let go.
         let outcome = self.store.admit_through(row, rank, facts, &mut |lane| {
             let mut applied = applied.lock();
-            let Applied { state, emptied } = &mut *applied;
+            let Applied {
+                state,
+                emptied,
+                blocks,
+            } = &mut *applied;
             if *emptied != Some(lane.emptied()) {
                 // The store emptied the rank since the row's last batch, or
                 // the row begins: what the rules kept beside the map goes
@@ -550,7 +611,31 @@ where
             let worker = lane.worker();
             {
                 let lending = Lending::new(lane, state);
-                apply_events(&batch.events, worker, &Lane(lending.lane), lending.state);
+                took = match &url {
+                    // Applied and accounted for under the worker's name.
+                    Some(url) => {
+                        let (op, disposition) = if snapshot {
+                            ("snapshot", "snapshot")
+                        } else {
+                            ("stored", "applied")
+                        };
+                        Some(apply_counted(
+                            batch,
+                            url,
+                            worker,
+                            &Lane(lending.lane),
+                            lending.state,
+                            op,
+                            disposition,
+                        ))
+                    }
+                    // A row no feed was opened for names no series.
+                    None => {
+                        apply_events(&batch.events, worker, &Lane(lending.lane), lending.state);
+                        None
+                    }
+                };
+                *blocks = lending.state.blocks.len();
             }
             *emptied = Some(lane.emptied());
             record = state.block_of_record();
@@ -563,10 +648,30 @@ where
                 if let Some(width) = record.filter(|_| stores) {
                     self.learn(id, width);
                 }
+                if let Some(url) = &url {
+                    // A live batch's duration is the stream's pace. A
+                    // snapshot chunk publishes none.
+                    if let Some(took) = took.filter(|_| !snapshot) {
+                        Metrics::record_kv_event_apply(url, took.as_secs_f64());
+                    }
+                    Metrics::set_kv_index_blocks(url, self.held(id));
+                }
                 BatchOutcome::Applied
             }
-            store::BatchOutcome::Skipped => BatchOutcome::Skipped,
+            store::BatchOutcome::Skipped => {
+                // A batch behind its lane's cursor. A row with no lane
+                // skips every batch and counts none.
+                let behind = || self.store.cursor(row, rank).is_some();
+                if let Some(url) = url.as_ref().filter(|_| behind()) {
+                    Metrics::record_kv_event_batch(url, "stale");
+                }
+                BatchOutcome::Skipped
+            }
             store::BatchOutcome::Gap { expected, received } => {
+                // The collector asks the publisher to replay from here.
+                if let Some(url) = &url {
+                    Metrics::record_kv_event_gap(url, "replay_requested", 0);
+                }
                 BatchOutcome::Gap { expected, received }
             }
         }
@@ -579,6 +684,9 @@ where
     }
 
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
+        if let Some(url) = self.urls.lock().get(&id) {
+            Metrics::record_kv_event_resync(url, reason.as_str());
+        }
         let reason = match reason {
             ResyncReason::OutOfRange => store::ResyncReason::OutOfRange,
             ResyncReason::DataLoss => store::ResyncReason::DataLoss,
@@ -616,12 +724,14 @@ where
 
     fn removed(&self, id: WorkerId) {
         self.sizes.lock().models.remove(&id);
+        self.urls.lock().remove(&id);
         // What the stream still writes goes with it, since no stream feeds
         // it now: the rows of other ranks, and its own unless another
         // stream took it. Each is marked in the one hold that reads the
         // list, cleared in the store outside the lock, and forgotten. A
         // stream that would take one in between passes its batch over, so
-        // nothing a new stream wrote is cleared here.
+        // nothing a new stream wrote is cleared here. These clears take
+        // every block the stream stored: no batch waits for them.
         let leaving = {
             let mut rows = self.rows.lock();
             let Rows { written, fed } = &mut *rows;
@@ -758,17 +868,21 @@ where
         // The ticket was written at the enrollment, and the feed opens
         // later, on the subscription's task. A row laid again since is
         // another object's, and may be another stream's by now: its ticket
-        // opens nothing. The holder is asked as the row begins.
+        // opens nothing. Nor does the ticket of a kept object whose row
+        // stands above rank 0 by now. The holder is asked both as the row
+        // begins, and the answer names the reason.
         let ticket = ticket.and_then(|row| {
             self.sink
                 .begin(row, || self.row_of(worker) == Some(row))
-                .then_some(row)
-                .ok_or(NoFeed::NoRow)
+                .map(|()| row)
         });
         match ticket {
             Ok(row) => {
                 // The model the row's stored blocks name a size for.
                 self.sink.sizes.lock().models.insert(row, Arc::from(model));
+                // The name the stream's series go under.
+                let url = Arc::from(worker.url());
+                self.sink.urls.lock().insert(row, url);
                 Some((Arc::clone(&self.sink), row))
             }
             Err(NoFeed::NoRow) => {
@@ -798,7 +912,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        sync::{OnceLock, Weak},
+        time::Instant,
+    };
 
     use kv_index::salt::{content_hash_with_seed, namespace_seed};
     use smg_worker::{
@@ -813,11 +930,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        engine::view::Role,
         store::{
             Ask, GatewayId, KvEventSink as _, MemoryStore, Named, Naming, Signals, ViewBuffers,
             WorkerFacts, WorkersStore,
         },
-        view::Role,
         worker_host::Members,
     };
 
@@ -2165,11 +2282,13 @@ mod tests {
         assert_eq!(f.store.indexed_blocks(row, 0), 1);
     }
 
-    /// The store keeps a row's lane at the row's own rank. A row above
-    /// rank 0 is given no feed yet. Where one is opened for it, it begins
-    /// from nothing as every row does.
+    /// The store keeps a row's lane at the row's own rank. A row the holder
+    /// stands above rank 0 is its engine's rank 0 stream's. A ticket for
+    /// it opens no feed, and what the store keeps of the row stands: such
+    /// a ticket was written before a kept object's row moved there. It is
+    /// counted as an upper rank's: the holder keeps the row.
     #[test]
-    fn a_row_above_rank_0_the_adapter_never_fed_begins_from_nothing_too() {
+    fn a_ticket_for_a_row_above_rank_0_opens_no_feed() {
         let f = Fixture::new();
         let stores = batch([
             Data::Stored(main_store(1, 0)),
@@ -2182,20 +2301,22 @@ mod tests {
         );
         assert_eq!(f.blocks(), 1);
 
-        // A host's own adapter over the same store holds no facts for the
-        // row.
+        // A host over the same store: its holder stands the row at rank 1,
+        // and the row's object stands for it.
         let host = f.host();
         let worker = host
             .objects
             .registry()
             .get_by_url(URL)
             .expect("the worker's object");
-        let (sink, row) = host
-            .open(Ok(f.row), &worker, MODEL)
-            .expect("the row's feed");
-        assert_eq!(sink.cursor(row, RANK), None);
-        assert_eq!(f.blocks(), 0);
-        assert!(begun(&sink, row));
+        assert!(host.open(Ok(f.row), &worker, MODEL).is_none());
+        assert_eq!(
+            f.store.cursor(f.row, RANK).map(|cursor| cursor.applied),
+            Some(7)
+        );
+        assert_eq!(f.blocks(), 1);
+        let unfed = host.unfed();
+        assert_eq!((unfed.no_row, unfed.upper_rank), (0, 1));
     }
 
     #[test]
@@ -2314,6 +2435,224 @@ mod tests {
                 ..Signals::default()
             },
             ..WorkerFacts::default()
+        }
+    }
+
+    /// The cache-event series of the fixture's worker, read from a recorder
+    /// of the case's own. The recorder's crates come with the controller.
+    #[cfg(feature = "controller")]
+    mod series {
+        use metrics_exporter_prometheus::{
+            PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+        };
+
+        use super::*;
+
+        struct Series {
+            recorder: PrometheusRecorder,
+            handle: PrometheusHandle,
+        }
+
+        impl Series {
+            fn new() -> Self {
+                let recorder = PrometheusBuilder::new().build_recorder();
+                let handle = recorder.handle();
+                Self { recorder, handle }
+            }
+
+            /// The value of `name` for the fixture's worker under `labels`,
+            /// where the series stands.
+            fn read(&self, name: &str, labels: &[&str]) -> Option<f64> {
+                let worker = format!("worker=\"{URL}\"");
+                let open = format!("{name}{{");
+                self.handle.render().lines().find_map(|line| {
+                    let (series, value) = line.rsplit_once(' ')?;
+                    let named = series.starts_with(&open) && series.contains(&worker);
+                    let all = labels.iter().all(|label| series.contains(label));
+                    (named && all).then(|| value.parse().ok()).flatten()
+                })
+            }
+
+            /// Whether any cache-event series names the fixture's worker.
+            /// The worker's object has series of its own.
+            fn names_the_worker(&self) -> bool {
+                let worker = format!("worker=\"{URL}\"");
+                let rendered = self.handle.render();
+                let mut lines = rendered.lines();
+                lines.any(|line| line.starts_with("smg_kv_") && line.contains(&worker))
+            }
+        }
+
+        /// A batch the store takes counts its blocks by operation and
+        /// itself as applied, publishes its pace and sets the worker's
+        /// index blocks. A removal behind it counts its blocks and moves
+        /// the gauge.
+        #[test]
+        fn an_applied_batch_counts_its_blocks_and_sets_the_workers_gauge() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let mut first = wide(1, 32);
+                first.events.extend(wide(2, 32).events);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &first),
+                    BatchOutcome::Applied
+                );
+                let stored = series.read("smg_kv_event_blocks_total", &["op=\"stored\""]);
+                assert_eq!(stored, Some(2.0));
+                let applied = &["disposition=\"applied\""];
+                assert_eq!(
+                    series.read("smg_kv_event_batches_total", applied),
+                    Some(1.0)
+                );
+                assert_eq!(series.read("smg_kv_index_blocks", &[]), Some(2.0));
+                assert_eq!(
+                    series.read("smg_kv_event_apply_seconds_count", &[]),
+                    Some(1.0)
+                );
+
+                let gone = batch([Data::Removed(removed(&[2]))]);
+                assert_eq!(sink.admit(f.row, 0, facts(2), &gone), BatchOutcome::Applied);
+                let removed = series.read("smg_kv_event_blocks_total", &["op=\"removed\""]);
+                assert_eq!(removed, Some(1.0));
+                assert_eq!(
+                    series.read("smg_kv_event_batches_total", applied),
+                    Some(2.0)
+                );
+                assert_eq!(series.read("smg_kv_index_blocks", &[]), Some(1.0));
+            });
+        }
+
+        /// A snapshot chunk counts its blocks and itself under the
+        /// snapshot's own words, and publishes no pace.
+        #[test]
+        fn a_snapshot_chunk_counts_under_its_own_words_and_publishes_no_pace() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let chunk = BatchFacts {
+                    snapshot: Some(SnapshotChunk {
+                        unknown_before: false,
+                    }),
+                    ..facts(7)
+                };
+                assert_eq!(
+                    sink.admit(f.row, 0, chunk, &wide(1, 32)),
+                    BatchOutcome::Applied
+                );
+                let stored = series.read("smg_kv_event_blocks_total", &["op=\"snapshot\""]);
+                assert_eq!(stored, Some(1.0));
+                let chunks = &["disposition=\"snapshot\""];
+                assert_eq!(series.read("smg_kv_event_batches_total", chunks), Some(1.0));
+                assert_eq!(series.read("smg_kv_index_blocks", &[]), Some(1.0));
+                assert_eq!(series.read("smg_kv_event_apply_seconds_count", &[]), None);
+            });
+        }
+
+        /// A batch behind its lane's cursor counts as stale, and a gap
+        /// counts the replay the collector asks.
+        #[test]
+        fn a_stale_batch_and_a_gap_count_under_their_own_words() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                    BatchOutcome::Applied
+                );
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                    BatchOutcome::Skipped
+                );
+                let stale = &["disposition=\"stale\""];
+                assert_eq!(series.read("smg_kv_event_batches_total", stale), Some(1.0));
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(3), &wide(3, 32)),
+                    BatchOutcome::Gap {
+                        expected: 2,
+                        received: 3
+                    }
+                );
+                let asked = &["outcome=\"replay_requested\""];
+                assert_eq!(series.read("smg_kv_event_gaps_total", asked), Some(1.0));
+                // Neither moved the applied count or the stored blocks.
+                let applied = &["disposition=\"applied\""];
+                assert_eq!(
+                    series.read("smg_kv_event_batches_total", applied),
+                    Some(1.0)
+                );
+                let stored = series.read("smg_kv_event_blocks_total", &["op=\"stored\""]);
+                assert_eq!(stored, Some(1.0));
+            });
+        }
+
+        /// A reset counts under its reason, each reason by itself.
+        #[test]
+        fn a_reset_counts_under_its_reason() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                sink.resync(f.row, Some(0), ResyncReason::Snapshot);
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                let lost = &["reason=\"data_loss\""];
+                assert_eq!(series.read("smg_kv_event_resyncs_total", lost), Some(2.0));
+                let snapshot = &["reason=\"snapshot\""];
+                assert_eq!(
+                    series.read("smg_kv_event_resyncs_total", snapshot),
+                    Some(1.0)
+                );
+            });
+        }
+
+        /// A store whose parent the row does not hold is placed as a chain
+        /// of its own and counted for the worker: the rules' own count
+        /// reaches a series.
+        #[test]
+        fn a_parentless_store_is_counted_for_the_worker() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                let (_host, sink) = opened(&f);
+                let orphan = KvBlocksStored {
+                    parent_block_hash: Some(99),
+                    ..wide_store(1, 32)
+                };
+                let orphan = batch([Data::Stored(orphan)]);
+                assert_eq!(
+                    sink.admit(f.row, 0, facts(1), &orphan),
+                    BatchOutcome::Applied
+                );
+                let stores = series.read("smg_kv_event_parentless_stores_total", &[]);
+                assert_eq!(stores, Some(1.0));
+                let blocks = series.read("smg_kv_event_parentless_blocks_total", &[]);
+                assert_eq!(blocks, Some(1.0));
+            });
+        }
+
+        /// A row no feed was opened for names no series: its batch is
+        /// applied by the rules alone. A feed that left names none either.
+        #[test]
+        fn a_row_with_no_open_feed_names_no_series() {
+            let series = Series::new();
+            metrics::with_local_recorder(&series.recorder, || {
+                let f = Fixture::single(Some(BLOCK_SIZE));
+                assert_eq!(
+                    f.sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+                    BatchOutcome::Applied
+                );
+                assert_eq!(f.store.indexed_blocks(f.row, 0), 1);
+                assert!(!series.names_the_worker());
+
+                let (_host, sink) = opened(&f);
+                sink.removed(f.row);
+                sink.resync(f.row, None, ResyncReason::DataLoss);
+                assert!(!series.names_the_worker());
+            });
         }
     }
 
@@ -2728,7 +3067,8 @@ mod tests {
     fn a_feeds_open_asks_the_holder_in_the_hold_that_writes_its_row() {
         let f = Fixture::single(Some(BLOCK_SIZE));
         let sink = &f.sink;
-        assert!(sink.begin(f.row, || sink.rows.try_lock().is_none()));
+        let held = sink.begin(f.row, || sink.rows.try_lock().is_none());
+        assert_eq!(held, Ok(()));
         {
             let rows = sink.rows.lock();
             let begun = rows.written.get(&f.row).expect("the row's entry");
@@ -2736,7 +3076,98 @@ mod tests {
         }
         // A row its object stands for no longer begins nothing.
         sink.removed(f.row);
-        assert!(!sink.begin(f.row, || false));
+        assert_eq!(sink.begin(f.row, || false), Err(NoFeed::NoRow));
         assert!(sink.rows.lock().written.is_empty());
+    }
+
+    /// A store that says, at each clear of a row, whether the adapter over
+    /// it holds its rows.
+    struct Clears {
+        store: Arc<Store>,
+        sink: OnceLock<Weak<KvAdapter<Store>>>,
+        held: Mutex<Vec<bool>>,
+    }
+
+    impl store::KvEventSink for Clears {
+        type Batch = [KvEvent];
+
+        fn admit(
+            &self,
+            id: WorkerId,
+            rank: u16,
+            facts: store::BatchFacts,
+            batch: &[KvEvent],
+        ) -> store::BatchOutcome {
+            self.store.admit(id, rank, facts, batch)
+        }
+
+        fn admit_through(
+            &self,
+            id: WorkerId,
+            rank: u16,
+            facts: store::BatchFacts,
+            body: &mut dyn FnMut(&mut LaneWriter<'_>),
+        ) -> store::BatchOutcome {
+            self.store.admit_through(id, rank, facts, body)
+        }
+
+        fn reconnected(&self, id: WorkerId) {
+            self.store.reconnected(id);
+        }
+
+        fn resync(&self, id: WorkerId, rank: Option<u16>, reason: store::ResyncReason) {
+            self.store.resync(id, rank, reason);
+        }
+
+        fn cursor(&self, id: WorkerId, rank: u16) -> Option<store::KvCursor> {
+            self.store.cursor(id, rank)
+        }
+
+        fn removed(&self, id: WorkerId) {
+            if let Some(sink) = self.sink.get().and_then(Weak::upgrade) {
+                self.held.lock().push(sink.rows.try_lock().is_none());
+            }
+            self.store.removed(id);
+        }
+
+        fn block_size(&self, model: &str) -> Option<u32> {
+            self.store.block_size(model)
+        }
+
+        fn set_block_size(&self, model: &str, size: u32) {
+            self.store.set_block_size(model, size);
+        }
+
+        fn forget_block_size(&self, model: &str) {
+            self.store.forget_block_size(model);
+        }
+    }
+
+    /// A row's first clear runs in the hold that writes its entry, at a
+    /// stream's take and at a feed's open. No stream claims the row, and
+    /// writes it, between the two, so the clear takes nothing a later
+    /// stream wrote. A removal's clear runs outside the lock, behind its
+    /// mark: it takes every block the stream stored.
+    #[test]
+    fn a_claimed_rows_first_clear_runs_in_the_hold_that_writes_its_entry() {
+        let store = Arc::new(MemoryStore::new());
+        let clears = Arc::new(Clears {
+            store: Arc::clone(&store) as Arc<Store>,
+            sink: OnceLock::new(),
+            held: Mutex::default(),
+        });
+        let sink = Arc::new(KvAdapter::new(Arc::clone(&clears) as Arc<Store>));
+        assert!(clears.sink.set(Arc::downgrade(&sink)).is_ok());
+        let row = store.upsert(rank_facts(URL, URL, 0)).id();
+        let other = store.upsert(rank_facts(OTHER, OTHER, 0)).id();
+
+        // Another stream's take of the row, then the open of its own feed.
+        assert!(sink.take(other, row).is_some());
+        assert_eq!(sink.begin(row, || true), Ok(()));
+        assert_eq!(*clears.held.lock(), [true, true]);
+
+        // The feed's removal.
+        sink.removed(row);
+        assert_eq!(*clears.held.lock(), [true, true, false]);
     }
 }

@@ -35,7 +35,7 @@ use std::{fmt, sync::Arc, time::Instant};
 use axum::http::StatusCode;
 use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
 use smg_grpc_client::{is_constraint_failure, is_request_timeout};
-use smg_policy_controller::lease::TransportClass;
+use smg_policy_controller::tracking::lease::TransportClass;
 use smg_worker::identity::{
     basic::{ConnectionModeExt, Worker, WorkerTypeExt},
     endpoint::Endpoint,

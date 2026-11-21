@@ -539,7 +539,12 @@ const ROUTING_FLAGS: &[Row] = &[
     refused("routing-key-override", &[], "routing_key_override.enabled"),
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
-    refused("grouped-dp-sticky", &["hash"], "grouped_dp_sticky"),
+    kept(
+        "grouped-dp-sticky",
+        &[],
+        &["hash"],
+        "the dispatch pins a key to an engine of a grouped worker behind the decision",
+    ),
     lands("enable-igw", &[], &[]),
     refused(
         "dp-minimum-tokens-scheduler",

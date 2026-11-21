@@ -454,7 +454,37 @@ message DecideRequest {
   // share a fingerprint read as one request. A repeat its stream answers
   // Busy before a decider takes it (no credit, a full queue, a budget of 0)
   // ends nothing: the earlier lease waits out its dispatch deadline.
+  //
+  // Beside decode_of the word reaches one side. It takes back the issue of
+  // the decode side of the lease that field names, where a call issued it
+  // and no dispatch named it, and nothing else: no search by the id's
+  // fingerprint is run for a frame that carries decode_of, with the word or
+  // without. The side is chosen again and holds the first decision's decode
+  // targets, ahead of the decision and whatever its answer. A pick of the
+  // same frame issues it anew. Where the frame brings no pick, a Dispatched
+  // that names a target of the first decision books the side.
+  //
+  // A gateway that sent a decode call and read no answer asks it again with
+  // this word before it sends a decode. Until then the unread answer's
+  // issue stands, and a Dispatched names a target of that answer's pick: it
+  // would book a worker the decode never reached.
   bool again = 4;
+  // This pair's decode is sent after its prefill has run. The decision names
+  // the decode targets and issues the prefill side alone: the decode side is
+  // chosen, books nothing and waits under no dispatch deadline. Read on a
+  // request that enters a pair plan at its prefill, and on no other.
+  bool decode_later = 5;
+  // This request asks the decode side of the pair's lease this id names,
+  // issued to this gateway, while its prefill is dispatched and not ended and
+  // its decode side is chosen. The facts and the constraints are the
+  // request's own, as on its first decision. It is read at the decode phase,
+  // whatever its facts' phase says, and its decode_later is not read. The
+  // answer's pick names decode targets, each with the lease's prefill, under
+  // the same lease id. A refusal is a Busy with a reason of its own, and a
+  // decision that sheds is no refusal of the request, whose prefill runs:
+  // behind either the gateway sends the decode the first pick named, and
+  // that Dispatched books the side. An id of 0 is out of range.
+  optional fixed64 decode_of = 6;
 }
 
 message DecideAnswer {
@@ -909,13 +939,18 @@ message WorkerSpec {
   // (WorkerEvent.ranks). Every rule holds before the first write: a
   // refusal of a rank or of the group writes nothing. A lead lost between
   // two ranks is UNAVAILABLE and leaves the ranks written before it: a
-  // MODE_UPSERT lays the rest, and a MODE_ADD meets them as ALREADY_EXISTS.
+  // MODE_UPSERT lays the rest, and so does the same MODE_ADD called again.
   // At most 64: INVALID_ARGUMENT above, and above 1 where the controller's
   // build lays no ranks.
   //
   // The modes hold for the engine. MODE_ADD: ALREADY_EXISTS where a row
   // stands under a rank's URL or the engine stands in another form (its
-  // plain row, or ranks the registration does not state). MODE_REPLACE:
+  // plain row, or ranks the registration does not state). One standing is
+  // the add's own: where every rank that stands is this caller's with
+  // equal facts and a rank is absent, the call lays the absent ranks and
+  // answers each standing rank `relabelled`, the row unmoved. An engine
+  // whose every rank stands is ALREADY_EXISTS, with equal facts too: an add
+  // whose answer was lost reads the rows (WatchWorkers). MODE_REPLACE:
   // NOT_FOUND unless every stated rank stands; each is its next
   // incarnation. MODE_UPSERT lays each rank over what stands. Under REPLACE
   // and UPSERT the engine's rows that the registration does not state leave

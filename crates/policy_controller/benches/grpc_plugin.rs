@@ -34,12 +34,14 @@ use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use served::{Behaviour, TestPlugin, ALL, FILTER, PICK, SCORE};
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
-    grpc::{
-        BreakerSpec, EventSet, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin, Runtime,
-        Transport,
+    plugins::{
+        grpc::{
+            BreakerSpec, EventSet, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin,
+            Runtime, Transport,
+        },
+        shared::OpenDecisions,
     },
-    plugins::OpenDecisions,
+    stages::builtins::{Best, Healthy, LeastRequests},
     Binding, Constraints, Engine, Filter, Lease, Lifecycle, Needs, Picker, Plan, PoolFacts,
     Profile, RequestFacts, Scorer, Scratch, Side, Target, Weighted,
 };

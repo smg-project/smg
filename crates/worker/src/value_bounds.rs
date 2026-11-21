@@ -30,7 +30,10 @@ pub(crate) fn stands(name: &str, unit: &str, value: f64, kept: &[NamedValue]) ->
 
 /// Puts a list as an answer stated it under the bounds, in place, and
 /// answers how many entries left it. The kept entries keep their order and
-/// their strings, and nothing is allocated.
+/// their strings. A list that holds room for [`MAX_VALUES`] entries or
+/// fewer is bound where it lies, and nothing is allocated. One that holds
+/// more gives the rest back, so a report holds the bound's room at the
+/// most, as a pushed record's list does, whatever its engine stated.
 pub(crate) fn bound(values: &mut Vec<NamedValue>) -> usize {
     let stated = values.len();
     values.truncate(MAX_VALUES);
@@ -43,6 +46,7 @@ pub(crate) fn bound(values: &mut Vec<NamedValue>) -> usize {
         }
     }
     values.truncate(kept);
+    values.shrink_to(MAX_VALUES);
     stated - kept
 }
 
@@ -119,6 +123,32 @@ mod tests {
         assert_eq!(bound(&mut values), 2);
         assert_eq!(values.len(), 63);
         assert_eq!(names(&values)[0], "ready_1");
+    }
+
+    #[test]
+    fn a_list_stated_past_the_bounds_gives_the_room_of_what_left_back() {
+        let entries = |count: u32| -> Vec<_> {
+            (0..count)
+                .map(|index| value(&format!("ready_{index}"), "items", f64::from(index)))
+                .collect()
+        };
+        let mut past = entries(4_096);
+        assert_eq!(bound(&mut past), 4_096 - MAX_VALUES);
+        assert_eq!(past.len(), MAX_VALUES);
+        assert_eq!(past.capacity(), MAX_VALUES);
+        // One entry kept of a list stated as long holds the bound's room,
+        // as a pushed record's list is sized.
+        let mut one = entries(4_096);
+        for entry in &mut one[1..] {
+            entry.value = f64::NAN;
+        }
+        assert_eq!(bound(&mut one), 4_095);
+        assert_eq!((one.len(), one.capacity()), (1, MAX_VALUES));
+        // A list within the bound is bound where it lies.
+        let mut within = entries(MAX_VALUES as u32);
+        let lies = (within.as_ptr(), within.capacity());
+        assert_eq!(bound(&mut within), 0);
+        assert_eq!((within.as_ptr(), within.capacity()), lies);
     }
 
     #[test]

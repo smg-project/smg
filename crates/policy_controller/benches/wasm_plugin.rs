@@ -44,11 +44,13 @@ use column::build_column;
 use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
-    decider::Decider,
-    plugins::OpenDecisions,
-    spec::MAX_BLOCK_HASHES,
-    wasm::{EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+    document::spec::MAX_BLOCK_HASHES,
+    engine::decider::Decider,
+    plugins::{
+        shared::OpenDecisions,
+        wasm::{EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+    },
+    stages::builtins::{Best, Healthy, LeastRequests},
     Binding, Constraints, Engine, Lease, Lifecycle, Membership, Needs, Plan, PoolFacts, Profile,
     RequestFacts, Scratch, Side, Target, Weighted, WorkerId,
 };

@@ -11,8 +11,8 @@ use smg_worker::{
 };
 
 use crate::{
+    engine::view::{Role, WireModes},
     store::{HealthPolicy, WorkerFacts, WorkerRow, WorkerStatus},
-    view::{Role, WireModes},
 };
 
 /// The worker object of `row`: every fact of the row a collector or the

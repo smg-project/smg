@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use super::{ask, facts, member, rank_among, ASKER, MODEL};
 use crate::{
+    engine::view::{Role, WorkerId},
     store::{GatewayId, MemoryStore, Reachability, ViewBuffers, WorkersStore},
-    view::{Role, WorkerId},
 };
 
 const E: &str = "grpc://e:9000";

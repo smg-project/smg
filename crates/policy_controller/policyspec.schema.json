@@ -290,7 +290,14 @@
       "description": "A filter: its bare name, a built-in mapped to its parameters, or the name of a filter the host adds mapped to its parameters.",
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "examples": [
+            "healthy",
+            "not-overloaded",
+            "has-capacity",
+            "has-room",
+            "not-tried"
+          ]
         },
         {
           "$ref": "#/$defs/FilterStage"
@@ -328,7 +335,7 @@
       ]
     },
     "HasRoomParams": {
-      "description": "`has-room` by a rule: a worker has room where what it holds is at most\nits capacity less the headroom, `used <= (1 - headroom) * capacity`.\nThe filter stays soft: where no worker has room, every worker stands.\nWritten bare, `has-room` reads the bit its host sets. A null under the\nname, the slip of a bare name written with a colon, is refused with\nboth forms named. A reader that takes a null for an empty map refuses\nit by the part it lacks.",
+      "description": "`has-room` by a rule: a worker has room where what it holds is at most\nits capacity less the headroom, `used <= (1 - headroom) * capacity`.\nThe filter stays soft: where no worker has room, every worker stands.\nWritten bare, `has-room` reads the bit its host sets. A null under the\nname, the slip of a bare name written with a colon, is refused with\nboth forms named, whichever reader takes the document.",
       "type": "object",
       "properties": {
         "used": {
@@ -403,7 +410,18 @@
       "description": "A scorer: its bare name (a stock scorer at its defaults, or a scorer the host adds at weight one), a stock scorer mapped to its weight and parameters, or the name of a scorer the host adds mapped to its weight and parameters. The stock scorers a document names bare: least-load, least-requests, fewest-sessions, session-affinity, prefix-affinity, kv-pressure, warmup-slice, bucket, consistent-hash.",
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "examples": [
+            "least-load",
+            "least-requests",
+            "fewest-sessions",
+            "session-affinity",
+            "prefix-affinity",
+            "kv-pressure",
+            "warmup-slice",
+            "bucket",
+            "consistent-hash"
+          ]
         },
         {
           "$ref": "#/$defs/ScoreStage"
@@ -1122,7 +1140,17 @@
       "description": "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool. The stock pickers a document names bare: best, round-robin, random, power-of-two, count-first, power-of-two-count-first, passthrough, manual.",
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "examples": [
+            "best",
+            "round-robin",
+            "random",
+            "power-of-two",
+            "count-first",
+            "power-of-two-count-first",
+            "passthrough",
+            "manual"
+          ]
         },
         {
           "$ref": "#/$defs/PickStage"
@@ -1214,7 +1242,8 @@
         "pd-pair": {
           "$ref": "#/$defs/PdPairPlanSpec",
           "default": {
-            "pairing": "lenient"
+            "pairing": "lenient",
+            "decode": "with-prefill"
           }
         }
       },
@@ -1227,6 +1256,11 @@
         "pairing": {
           "$ref": "#/$defs/Pairing",
           "default": "lenient"
+        },
+        "decode": {
+          "description": "When a pair's decode side is picked: `with-prefill` (the default)\nor `after-prefill`.",
+          "$ref": "#/$defs/DecodePick",
+          "default": "with-prefill"
         }
       },
       "additionalProperties": false
@@ -1248,6 +1282,21 @@
           "description": "Runtime, transport and KV layout are known on both sides and agree,\nand reported engine versions match.",
           "type": "string",
           "const": "strict"
+        }
+      ]
+    },
+    "DecodePick": {
+      "description": "When a pair's decode side is picked.",
+      "oneOf": [
+        {
+          "description": "With the prefill, in the pair's one decision.",
+          "type": "string",
+          "const": "with-prefill"
+        },
+        {
+          "description": "After the prefill has run, on a route that sends the decode then.\nThe pair's first decision books the prefill alone and names the\ndecode's targets. The host asks the decode again when the prefill\nhas answered, and that decision reads the rows of its own instant.\nA route that sends both sides at once keeps the first decision's\ndecode.",
+          "type": "string",
+          "const": "after-prefill"
         }
       ]
     },
@@ -1709,7 +1758,7 @@
           "type": "string"
         },
         {
-          "description": "Shadow profiles by side. Validation currently refuses this form.",
+          "description": "A pair's shadow profiles by side: `prefill`, `decode` or both.",
           "type": "object",
           "additionalProperties": {
             "type": "string"

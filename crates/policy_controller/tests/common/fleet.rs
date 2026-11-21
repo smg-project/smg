@@ -63,14 +63,17 @@ use smg_grpc_client::{
     tokenspeed_proto, vllm_proto, TokenSpeedSchedulerClient, VllmEngineClient,
 };
 use smg_policy_controller::{
-    client::Client,
-    controller::{
-        Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
-    },
-    proto::{
-        self, completed::Class, policy_controller_client::PolicyControllerClient,
-        register_worker_request::Mode, worker_event::Event, Completed, Dispatched, LeaderInfo,
-        Side, Welcome,
+    engine::view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
+    service::{
+        client::Client,
+        controller::{
+            Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+        },
+        proto::{
+            self, completed::Class, policy_controller_client::PolicyControllerClient,
+            register_worker_request::Mode, worker_event::Event, Completed, Dispatched, LeaderInfo,
+            Side, Welcome,
+        },
     },
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, Kinds, KvCursor,
@@ -78,7 +81,6 @@ use smg_policy_controller::{
         MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
-    view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
     AppliedSpec, Catalog, LeaseId, PolicySpec, TransportClass,
 };
 use tokio::{

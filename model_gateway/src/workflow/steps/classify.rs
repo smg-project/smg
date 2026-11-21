@@ -25,7 +25,7 @@ use crate::{
 
 /// Quick-probe timeout for classification. Deliberately short — the full
 /// connection timeout is applied later by `DetectConnectionModeStep`.
-const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
+pub(crate) const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
 
 /// Known local backend `owned_by` values returned by `/v1/models`.
 const LOCAL_OWNED_BY: &[&str] = &["sglang", "vllm", "trtllm", "nvidia"];

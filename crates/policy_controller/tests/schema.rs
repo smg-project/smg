@@ -7,7 +7,9 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::{MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES},
+    document::spec::{
+        MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
+    },
     Catalog, PolicySpec,
 };
 
@@ -97,14 +99,11 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     assert_eq!(over_least["required"], serde_json::json!(["request_cost"]));
     assert_eq!(over_least["properties"]["request_cost"]["type"], "number");
     // Its parameters have no default: the stock scorers a document names
-    // bare, listed in the entry's description, leave it out.
-    let listed = defs["ScoreSpec"]["description"]
-        .as_str()
-        .expect("a description");
-    let (_, bare) = listed
-        .rsplit_once(" names bare: ")
+    // bare, the open string's examples, leave it out.
+    let bare = defs["ScoreSpec"]["anyOf"][0]["examples"]
+        .as_array()
         .expect("the stock names");
-    assert!(!bare.contains("least-cost"), "{bare}");
+    assert!(!bare.iter().any(|name| name == "least-cost"), "{bare:?}");
 }
 
 /// A stage's name is open in both forms for a scorer and a picker, as for
@@ -117,10 +116,21 @@ fn the_committed_schema_admits_a_scorer_and_a_picker_by_any_name() {
     let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
     let defs = &schema["$defs"];
     let scorers: Vec<&str> = Catalog::builtin().scorers().collect();
+    // The open string lists the stock names a document writes bare, and
+    // enforces none.
+    let bare: Vec<&str> = scorers
+        .iter()
+        .copied()
+        .filter(|name| !matches!(*name, "resident-work" | "least-cost"))
+        .collect();
+    let pickers: Vec<&str> = Catalog::builtin()
+        .pickers()
+        .filter(|name| *name != "best-with-temperature")
+        .collect();
     assert_eq!(
         defs["ScoreSpec"]["anyOf"],
         serde_json::json!([
-            { "type": "string" },
+            { "type": "string", "examples": bare },
             { "$ref": "#/$defs/ScoreStage" },
             {
                 "type": "object",
@@ -134,7 +144,7 @@ fn the_committed_schema_admits_a_scorer_and_a_picker_by_any_name() {
     assert_eq!(
         defs["PickSpec"]["anyOf"],
         serde_json::json!([
-            { "type": "string" },
+            { "type": "string", "examples": pickers },
             { "$ref": "#/$defs/PickStage" },
             {
                 "type": "object",
@@ -156,13 +166,25 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
         defs["ProfileSpec"]["properties"]["filter"]["items"]["$ref"],
         "#/$defs/FilterSpec"
     );
-    // A bare name is any string: a host adds names. A built-in with
-    // parameters has a schema of its own. A host's name with parameters
-    // is one key, no built-in's, mapped to a map.
+    // A bare name is any string: a host adds names, and the stock ones
+    // are listed as examples. A built-in with parameters has a schema of
+    // its own. A host's name with parameters is one key, no built-in's,
+    // mapped to a map.
+    let filters: Vec<&str> = Catalog::builtin().filters().collect();
+    assert_eq!(
+        filters,
+        [
+            "healthy",
+            "not-overloaded",
+            "has-capacity",
+            "has-room",
+            "not-tried"
+        ]
+    );
     assert_eq!(
         defs["FilterSpec"]["anyOf"],
         serde_json::json!([
-            { "type": "string" },
+            { "type": "string", "examples": filters },
             { "$ref": "#/$defs/FilterStage" },
             {
                 "type": "object",
@@ -277,18 +299,14 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         defs["SessionsSpec"]["properties"]["ttl_s"]["default"],
         14_400
     );
-    // The stock names a document writes bare stand in each entry's
-    // description: the catalog minus the stages whose parameters have no
-    // default.
+    // The stock names a document writes bare are the open string's
+    // examples, listed and not enforced: the catalog minus the stages
+    // whose parameters have no default.
     let bare = |def: &str| -> Vec<String> {
-        let description = defs[def]["description"].as_str().expect("a description");
-        let (_, names) = description
-            .rsplit_once(" names bare: ")
-            .expect("the stock names");
+        let names = defs[def]["anyOf"][0]["examples"].as_array();
+        let names = names.expect("the stock names").iter();
         names
-            .trim_end_matches('.')
-            .split(", ")
-            .map(str::to_string)
+            .map(|name| name.as_str().expect("a name").to_string())
             .collect()
     };
     // Read from the stock catalog, the one the validator resolves a name in.

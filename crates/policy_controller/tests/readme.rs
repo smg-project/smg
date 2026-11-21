@@ -246,8 +246,8 @@ fn field(line: &str) -> Option<&str> {
 /// is one flag, spelled with dashes.
 fn flags() -> Vec<String> {
     [
-        include_str!("../src/controller/run.rs"),
-        include_str!("../src/controller/discovery/flags.rs"),
+        include_str!("../src/service/controller/run.rs"),
+        include_str!("../src/service/controller/discovery/flags.rs"),
     ]
     .into_iter()
     .flat_map(|declaration| {
@@ -276,7 +276,7 @@ fn calls() -> Vec<&'static str> {
 /// The series the standalone controller exports: each name its metrics
 /// module declares.
 fn series() -> Vec<&'static str> {
-    include_str!("../src/controller/metrics.rs")
+    include_str!("../src/service/controller/metrics.rs")
         .split("&str =")
         .skip(1)
         .filter_map(|rest| rest.trim_start().strip_prefix('"')?.split('"').next())

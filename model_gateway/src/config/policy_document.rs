@@ -30,6 +30,10 @@
 //!   them under `routing_key`. The manual policy names them in its session
 //!   rule while they are headers alone, and under `routing_key` once the
 //!   override adds the request's own id.
+//! - A number that means never lands as the largest its place holds: a
+//!   balance threshold past the document's width, and the sweep interval of
+//!   an index the configuration never sweeps. The classic trims an index at
+//!   its sweep alone, so that index's size bound lands as the largest too.
 //!
 //! # What is refused
 //!
@@ -40,19 +44,24 @@
 //! # What is left out
 //!
 //! The document of many routers plans one family where the other has no
-//! document. Pairs are left out under the manual policy, whose session rule
-//! runs under the single plan alone, and beside the encode mode. Single
-//! workers are left out of a pair configuration whose main policy reads a
-//! setting no document says. A request of the family left out is refused,
-//! as it was.
+//! document. Pairs are left out of a regular configuration under the manual
+//! policy, whose session rule runs under the single plan alone, and beside
+//! the encode mode. Single workers are left out of a pair configuration
+//! whose main policy reads a setting no document says. A request of the
+//! family left out is refused, as it was.
 //!
 //! # What is not read
 //!
 //! What the gateway keeps for itself under the controller is no part of the
 //! document: the pools and their addresses, discovery, the probes and the
 //! load poll, retries and the breaker, the prefill queue and the decode
-//! rooms. The copy of the cache boundaries at the top of the configuration
-//! decides nothing either: each policy reads its own.
+//! rooms. The pin of a sticky key to one engine of a grouped worker is the
+//! dispatch's as well: it runs behind the decision, on the worker the
+//! decision names. Its key is the gateway's own, read from the routing-key
+//! headers. A supplied document names its own key sources, which need not
+//! be that key, so the pin is refused beside one. The copy of the cache
+//! boundaries at the top of the configuration decides nothing either: each
+//! policy reads its own.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -62,13 +71,15 @@ use smg_policy_controller::{
         DEFAULT_WARMUP_SECS, DEFAULT_WARMUP_SHARE, DEFAULT_WARMUP_THIN_RATIO,
     },
     bucket,
-    builtins::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT},
-    spec::{
+    document::spec::{
         BestWithTemperatureParams, BindingSpec, BoundedLoadParams, BucketParams,
         ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
         LeastLoadParams, OverloadSpec, Pairing, PickStage, PrefixAffinityParams, ProfileSpec,
         RoutingKeySpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
         MANUAL_SESSION_HEADER, MAX_KEY_SOURCES, OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
+    },
+    stages::builtins::{
+        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
     AppliedSpec, Assignment, Phase, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
 };
@@ -178,6 +189,16 @@ impl RouterConfig {
         let Some(given) = &self.policy_spec else {
             return Ok(said);
         };
+        // The dispatch pins a sticky key by the gateway's own key. A supplied
+        // document names its own key sources: where they are not that key,
+        // the pin would split a conversation the document keeps together.
+        if self.grouped_dp_sticky != GroupedDpSticky::Off {
+            return Err(unsaid(
+                "grouped_dp_sticky",
+                self.grouped_dp_sticky.as_str(),
+                "beside a supplied document the pin would read the gateway's own key, which that document's key sources need not be",
+            ));
+        }
         let mut given = given.clone();
         if given.generation == 0 {
             given.generation = 1;
@@ -313,16 +334,6 @@ fn first_difference(
 
 /// The settings that decide a placement today and that no document says.
 fn refuse_unsaid(config: &RouterConfig) -> Result<(), PolicyDocumentError> {
-    match config.grouped_dp_sticky {
-        GroupedDpSticky::Off => {}
-        GroupedDpSticky::Hash => {
-            return Err(unsaid(
-                "grouped_dp_sticky",
-                GroupedDpSticky::Hash.as_str(),
-                "the document has no rule that pins a key to one engine of a grouped worker",
-            ));
-        }
-    }
     if config.dp_minimum_tokens_scheduler {
         return Err(unsaid(
             "dp_minimum_tokens_scheduler",
@@ -569,7 +580,7 @@ fn write_policy<'a>(
         } => {
             let written = BucketParams {
                 abs_threshold: unless(
-                    narrow("balance_abs_threshold", *balance_abs_threshold)?,
+                    threshold(*balance_abs_threshold),
                     bucket::DEFAULT_ABS_THRESHOLD,
                 ),
                 rel_threshold: unless(*balance_rel_threshold, bucket::DEFAULT_REL_THRESHOLD),
@@ -611,7 +622,7 @@ fn write_policy<'a>(
             let prefix_tokens = Some(narrow("prefix_token_count", *prefix_token_count)?);
             let bounded_load = Some(BoundedLoadParams {
                 factor: Some(*load_factor),
-                abs_margin: Some(narrow("balance_abs_threshold", *balance_abs_threshold)?),
+                abs_margin: Some(threshold(*balance_abs_threshold)),
             });
             let bare = ConsistentHashParams::default().weight;
             restage(profile, name, "consistent-hash", bare, |weight| {
@@ -660,10 +671,7 @@ fn write_policy<'a>(
             // them.
             let gates = Gates::default();
             let spill = SpillParams {
-                abs: unless(
-                    narrow("balance_abs_threshold", *balance_abs_threshold)?,
-                    gates.abs,
-                ),
+                abs: unless(threshold(*balance_abs_threshold), gates.abs),
                 rel: unless(*balance_rel_threshold, gates.rel),
                 prefix_margin_tokens: unless(
                     *balance_prefix_margin_tokens,
@@ -785,6 +793,13 @@ where
     T::try_from(value).map_err(|_| unsaid(setting, value, "past the document's range"))
 }
 
+/// A balance threshold in the document's width. One past the width lands as
+/// the width's largest number: no load reaches either, so the stage that
+/// reads it decides the same under both.
+fn threshold(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 /// Seconds of a session rule in the document's width. The rule reads its
 /// largest value as for ever, so a setting that large has no place in it.
 fn seconds(setting: &'static str, secs: u64) -> Result<u32, PolicyDocumentError> {
@@ -861,9 +876,18 @@ impl Shared<'_> {
                 .map(|at| narrow("cache_boundaries", *at))
                 .collect::<Result<_, _>>()?;
         }
-        let index = self
-            .index
-            .map(|(kind, ttl_s, max_size, sweep_s)| IndexSpec {
+        let index = self.index.map(|(kind, ttl_s, max_size, sweep_s)| {
+            // The classic trims its index at its sweep alone, and sweeps
+            // nothing at an interval of zero: that index is never trimmed.
+            // The document's cadence and size both start at one, so its
+            // longest cadence and its largest size say it. No sweep falls
+            // inside a process's life, and no write meets the bound.
+            let (max_size, sweep_s) = if sweep_s == 0 {
+                (u64::MAX, u32::MAX)
+            } else {
+                (max_size, sweep_s)
+            };
+            IndexSpec {
                 kind: match kind {
                     CacheIndexKind::Tree => IndexKind::Tree,
                     CacheIndexKind::Hash => IndexKind::Hash,
@@ -871,7 +895,8 @@ impl Shared<'_> {
                 ttl_s,
                 max_size,
                 sweep_s,
-            });
+            }
+        });
         if let Some(index) = index.and_then(|index| unless(index, IndexSpec::default())) {
             document.index.insert("*".to_string(), index);
         }
@@ -1994,14 +2019,6 @@ mod tests {
             (sticky, "routing_key_override.enabled", "true"),
             (
                 RouterConfig {
-                    grouped_dp_sticky: GroupedDpSticky::Hash,
-                    ..round_robin()
-                },
-                "grouped_dp_sticky",
-                "hash",
-            ),
-            (
-                RouterConfig {
                     dp_minimum_tokens_scheduler: true,
                     ..round_robin()
                 },
@@ -2084,6 +2101,110 @@ mod tests {
             },
         });
         assert_eq!(refusal(&wide).0, "load_metric.request_tokens");
+    }
+
+    #[test]
+    fn the_pin_to_an_engine_of_a_grouped_worker_moves_no_document() {
+        // The dispatch pins a sticky key behind the decision, on the worker
+        // the decision names: the document is the same with the pin on.
+        let pinned = RouterConfig {
+            grouped_dp_sticky: GroupedDpSticky::Hash,
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(pinned.policy_document(), Ok(preset("round_robin")));
+        assert_eq!(pinned.policy_document_in_force(), Ok(preset("round_robin")));
+        // The pin reads the gateway's own key, and a supplied document names
+        // its own key sources: beside one the pin is refused by its name.
+        let given = RouterConfig {
+            grouped_dp_sticky: GroupedDpSticky::Hash,
+            policy_spec: Some(preset("least_load")),
+            ..RouterConfig::default()
+        };
+        assert!(matches!(
+            given.policy_document_in_force(),
+            Err(PolicyDocumentError::Unsaid {
+                setting: "grouped_dp_sticky",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_balance_threshold_past_the_documents_width_lands_as_its_largest_number() {
+        // A threshold no load reaches: the classic's way to switch a spill
+        // off. The document's largest number is one too, and the controller
+        // takes it.
+        let never = usize::MAX;
+        let bucket = config(PolicyConfig::Bucket {
+            balance_abs_threshold: never,
+            balance_rel_threshold: 1.5,
+            bucket_adjust_interval_secs: 5,
+        });
+        let prefix_hash = config(PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: never,
+            cache_boundaries: Vec::new(),
+        });
+        let cache_aware = config(PolicyConfig::cache_aware(0.3, never, 1.5, 120, 67_108_864));
+        for (config, at) in [
+            (bucket, "/profiles/bucket/score/0/bucket/abs_threshold"),
+            (
+                prefix_hash,
+                "/profiles/prefix_hash/score/0/consistent-hash/bounded_load/abs_margin",
+            ),
+            (
+                cache_aware,
+                "/profiles/cache_aware/score/1/prefix-affinity/spill/abs",
+            ),
+        ] {
+            let document = config.policy_document().expect("a document");
+            let written = serde_json::to_value(&document).expect("a written form");
+            assert_eq!(written.pointer(at), Some(&json!(u32::MAX)), "{at}");
+            assert_eq!(config.hosted_policy(&document).err(), None, "{at}");
+        }
+    }
+
+    #[test]
+    fn an_index_the_configuration_never_sweeps_is_never_trimmed() {
+        // The classic trims its index at its sweep alone, and sweeps nothing
+        // at an interval of zero: the configured size bounds nothing. The
+        // document says so with its longest cadence and its largest size,
+        // which no write of the controller's record meets.
+        let swept_every = |secs| PolicyConfig::cache_aware(0.3, 64, 1.5, secs, 67_108_864);
+        let unswept = config(swept_every(0));
+        let document = unswept.policy_document().expect("a document");
+        assert_eq!(
+            document.index.get("*"),
+            Some(&IndexSpec {
+                max_size: u64::MAX,
+                sweep_s: u32::MAX,
+                ..IndexSpec::default()
+            })
+        );
+        assert_eq!(unswept.hosted_policy(&document).err(), None);
+        // A swept index keeps the size it is trimmed to.
+        let swept = config(PolicyConfig::cache_aware(0.3, 64, 1.5, 60, 1024))
+            .policy_document()
+            .expect("a document");
+        assert_eq!(
+            swept.index.get("*"),
+            Some(&IndexSpec {
+                max_size: 1024,
+                sweep_s: 60,
+                ..IndexSpec::default()
+            })
+        );
+
+        // Two sides are still compared as the configuration spells them.
+        let sides = RouterConfig {
+            mode: pair_mode(Some(swept_every(0)), Some(swept_every(60))),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(
+            refusal(&sides).1,
+            r#"["tree",180,67108864,0] and ["tree",180,67108864,60]"#
+        );
     }
 
     /// `config` as a gateway of many routers runs it.
@@ -2283,5 +2404,96 @@ mod tests {
             refusal(&many_routers(keyed)),
             ("routing_key_override.enabled", "true".to_string())
         );
+    }
+
+    /// A pair configuration with round robin on both sides, under `main`.
+    fn round_robin_pairs_under(main: PolicyConfig) -> RouterConfig {
+        RouterConfig {
+            mode: pair_mode(
+                Some(PolicyConfig::RoundRobin),
+                Some(PolicyConfig::RoundRobin),
+            ),
+            ..config(main)
+        }
+    }
+
+    /// The cache-aware policy at its flags' defaults, over blocks of `blocks`.
+    fn cache_aware_over(blocks: usize) -> PolicyConfig {
+        let mut policy = at_flag_defaults("cache_aware");
+        if let PolicyConfig::CacheAware { block_size, .. } = &mut policy {
+            *block_size = blocks;
+        }
+        policy
+    }
+
+    #[test]
+    fn many_routers_write_the_view_and_index_of_a_main_policy_no_side_runs() {
+        // Round robin places both sides of a pair and names no view and no
+        // index. A tuned cache-aware policy places single workers: what it
+        // shares with every side lands in the document all the same.
+        let mut main = PolicyConfig::cache_aware(0.3, 64, 1.5, 60, 16_777_216);
+        if let PolicyConfig::CacheAware { block_size, .. } = &mut main {
+            *block_size = 256;
+        }
+        let single = config(main.clone())
+            .policy_document()
+            .expect("the regular document");
+        assert!(single.view.block_size.is_some() && !single.index.is_empty());
+        let pairs = round_robin_pairs_under(main);
+        let paired = pairs.policy_document().expect("the pair document");
+        let both = many_routers(pairs.clone())
+            .policy_document()
+            .expect("the document of many routers");
+
+        assert_eq!(both.bindings.len(), 2);
+        assert_eq!(both.bindings.last(), single.bindings.first());
+        assert_eq!(
+            both.profiles.get("cache_aware"),
+            single.profiles.get("cache_aware")
+        );
+        for side in ["prefill", "decode"] {
+            assert_eq!(both.profiles.get(side), paired.profiles.get(side), "{side}");
+        }
+        assert_eq!((&both.view, &both.index), (&single.view, &single.index));
+        assert_eq!(pairs.hosted_policy(&both).err(), None);
+    }
+
+    #[test]
+    fn many_routers_keep_the_manual_rule_on_the_single_binding_alone() {
+        // The manual policy places single workers while round robin places
+        // both sides of a pair. The session rule and the view's header are
+        // the single binding's, and the pair binding holds no rule.
+        let manual = at_flag_defaults("manual");
+        let single = config(manual.clone())
+            .policy_document()
+            .expect("the regular document");
+        let pairs = round_robin_pairs_under(manual);
+        let both = many_routers(pairs.clone())
+            .policy_document()
+            .expect("the document of many routers");
+
+        assert_eq!(both.bindings.len(), 2);
+        let pair = both.bindings.first().expect("the pair binding");
+        assert_eq!((&pair.sessions, &pair.routing_key), (&None, &None));
+        let rule = both.bindings.last().expect("the single binding");
+        assert!(rule.sessions.is_some());
+        assert_eq!(Some(rule), single.bindings.first());
+        assert_eq!(both.view, single.view);
+        assert!(!both.view.headers.is_empty());
+        assert_eq!(pairs.hosted_policy(&both).err(), None);
+    }
+
+    #[test]
+    fn many_routers_plan_pairs_alone_where_the_main_policy_names_another_shared_value() {
+        // The view holds one block size. The sides agree on theirs and the
+        // main policy names another, so single workers have no document and
+        // the pair configuration plans its own family alone.
+        let clash = RouterConfig {
+            mode: pair_mode(Some(cache_aware_over(16)), Some(cache_aware_over(16))),
+            ..config(cache_aware_over(32))
+        };
+        let pairs_alone = clash.policy_document();
+        assert!(pairs_alone.is_ok(), "{pairs_alone:?}");
+        assert_eq!(many_routers(clash).policy_document(), pairs_alone);
     }
 }

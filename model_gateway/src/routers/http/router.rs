@@ -40,7 +40,7 @@ use openai_protocol::{
     UNKNOWN_MODEL_ID,
 };
 use reqwest::multipart::{Form, Part};
-use smg_policy_controller::view::WorkerId;
+use smg_policy_controller::engine::view::WorkerId;
 use smg_worker::{
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
@@ -70,7 +70,7 @@ use crate::{
         otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
     policies::{CacheNamespace, PolicyRegistry},
-    policy_controller::host::{self, Ask, BehindAnswer, Host, Placed, Prompt, Sent},
+    policy_controller::engine::{self, Ask, BehindAnswer, Placed, PolicyEngine, Prompt, Sent},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -168,21 +168,22 @@ struct TypedAttempt<'a, T> {
     /// attempt. A retry names them in its ask, and their count is the ask's
     /// retry number. Classic policies leave it empty.
     tried_rows: &'a parking_lot::Mutex<Vec<WorkerId>>,
-    /// The request's own id, kept where the router's host asks: a source
-    /// of the request's routing key.
+    /// The request's own id, kept where the router's policy engine asks: a
+    /// source of the request's routing key.
     rid: Option<&'a str>,
 }
 
 /// The regular HTTP router places typed requests and multipart transcriptions
-/// through its host or its injected load balancing policies.
+/// through its policy engine or its injected load balancing policies.
 ///
 /// Proxied GETs and realtime sessions pick their worker by no routing
-/// policy: they read the worker registry directly, with a host or without.
+/// policy: they read the worker registry directly, with a policy engine or
+/// without.
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    /// The policy controller's host, when it places this router's requests.
-    host: Option<Arc<Host>>,
+    /// The policy engine, when it places this router's requests.
+    policy_engine: Option<Arc<PolicyEngine>>,
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
@@ -257,7 +258,7 @@ impl Router {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
-            host: ctx.policy_host.clone(),
+            policy_engine: ctx.policy_engine.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
             stream_stall_timeout: match ctx.router_config.stream_body_stall_timeout_secs {
@@ -495,10 +496,10 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
-        // The lease frees the parsed request at its dispatch, so the host's
-        // asks read the request's own id from here.
+        // The lease frees the parsed request at its dispatch, so the policy
+        // engine's asks read the request's own id from here.
         let rid = self
-            .host
+            .policy_engine
             .as_ref()
             .and_then(|_| typed_req.rid().map(str::to_owned));
         // Resolve once, here, so every registry, policy and metrics lookup
@@ -537,7 +538,7 @@ impl Router {
             // The state the attempts share; `TypedAttempt` names each piece.
             let tried = parking_lot::Mutex::new(Vec::new());
             let tried_rows = parking_lot::Mutex::new(Vec::new());
-            let ledger = AttemptLedger::of(self.host.is_some());
+            let ledger = AttemptLedger::of(self.policy_engine.is_some());
             let attempt = TypedAttempt {
                 headers,
                 lease: &lease,
@@ -727,7 +728,7 @@ impl Router {
         &self,
         attempt: &TypedAttempt<'_, T>,
     ) -> Response {
-        let (worker, mut placed) = match &self.host {
+        let (worker, mut placed) = match &self.policy_engine {
             None => {
                 let worker = match self.select_worker_for_attempt(attempt) {
                     Ok(worker) => worker,
@@ -746,7 +747,7 @@ impl Router {
                 }
                 (worker, None)
             }
-            Some(host) => match self.place_attempt(host, attempt).await {
+            Some(policy_engine) => match self.place_attempt(policy_engine, attempt).await {
                 Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
                 Err(refusal) => return refusal,
             },
@@ -815,8 +816,8 @@ impl Router {
 
     /// The refusal of a request that names its worker, where the model's
     /// classic policy holds it to that worker ([`placement::strict_target`]).
-    /// The host reads no explicit target yet and would place the request on
-    /// another worker, so the shape is refused by name.
+    /// The policy engine reads no explicit target yet and would place the
+    /// request on another worker, so the shape is refused by name.
     fn explicit_target_refusal(
         &self,
         model_id: &str,
@@ -839,7 +840,7 @@ impl Router {
     /// the rule is held here.
     async fn place_attempt<T>(
         &self,
-        host: &Host,
+        policy_engine: &PolicyEngine,
         attempt: &TypedAttempt<'_, T>,
     ) -> Result<Placed, Response> {
         let model = if attempt.model_id == UNKNOWN_MODEL_ID {
@@ -868,7 +869,7 @@ impl Router {
         if let Some(refusal) = self.explicit_target_refusal(&model, attempt.headers) {
             return Err(refusal);
         }
-        let id = host::mark();
+        let id = engine::mark();
         let tried = attempt.tried_rows.lock().clone();
         // The prompt the classic arm routes by: the request's token ids
         // where it has them, else its text.
@@ -877,7 +878,7 @@ impl Router {
                 text: view.text,
                 ..Prompt::of(view.tokens, view.cache_namespace)
             };
-            host.hashes(&model, &prompt)
+            policy_engine.hashes(&model, &prompt)
         });
         let ask = Ask {
             streaming: attempt.is_stream,
@@ -888,7 +889,7 @@ impl Router {
             ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
-        let placed = host
+        let placed = policy_engine
             .place_where(
                 &ask,
                 |worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker),
@@ -1298,7 +1299,7 @@ impl Router {
     /// the worker's answer. Separate from `route_typed_request` because the
     /// endpoint is not JSON-bodied: the form is sent once (no retry could
     /// replay it) and never passes through `prepare_request`. Under the
-    /// policy controller's host the worker is the host's placement, with no
+    /// policy engine the worker is the engine's placement, with no
     /// re-check, and a streamed answer carries it to the end of its body.
     async fn route_multipart_transcription(
         &self,
@@ -1321,7 +1322,7 @@ impl Router {
         // exit below.
         let outcome = self.begin_route(route, model_id, is_stream);
 
-        let (worker, mut placed) = match &self.host {
+        let (worker, mut placed) = match &self.policy_engine {
             None => {
                 let worker = match self.select_transcription_worker(headers, model_id, &routing) {
                     Ok(worker) => worker,
@@ -1345,8 +1346,8 @@ impl Router {
                 }
                 (worker, None)
             }
-            Some(host) => match self
-                .place_transcription(host, headers, body.rid(), model_id, is_stream)
+            Some(policy_engine) => match self
+                .place_transcription(policy_engine, headers, body.rid(), model_id, is_stream)
                 .await
             {
                 Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
@@ -1421,7 +1422,7 @@ impl Router {
     /// worker, and it keeps to this router's own pool ([`RoutingPool::HttpRegular`]).
     async fn place_transcription(
         &self,
-        host: &Host,
+        policy_engine: &PolicyEngine,
         headers: Option<&HeaderMap>,
         rid: Option<&str>,
         model_id: &str,
@@ -1444,26 +1445,27 @@ impl Router {
             return Err(refusal);
         }
 
-        let id = host::mark();
+        let id = engine::mark();
         let ask = Ask {
             streaming,
             headers,
             rid,
             ..Ask::of(&id, model_id)
         };
-        host.place_where(
-            &ask,
-            |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
-            Instant::now(),
-        )
-        .await
-        .map_err(|unplaced| {
-            self.report_refusal(
-                TRANSCRIPTION_REFUSAL_SITE,
-                model_id,
-                unplaced.answer(model_id),
+        policy_engine
+            .place_where(
+                &ask,
+                |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
+                Instant::now(),
             )
-        })
+            .await
+            .map_err(|unplaced| {
+                self.report_refusal(
+                    TRANSCRIPTION_REFUSAL_SITE,
+                    model_id,
+                    unplaced.answer(model_id),
+                )
+            })
     }
 
     fn transcription_dp_not_supported() -> Response {
@@ -2059,6 +2061,10 @@ fn build_transcription_form(
     if let Some(stream) = body.stream {
         form = form.text("stream", stream.to_string());
     }
+    // The form's other text parts, in order, under the names they came with.
+    for (name, value) in &body.other {
+        form = form.text(name.clone(), value.clone());
+    }
 
     Ok(form)
 }
@@ -2530,7 +2536,7 @@ impl Router {
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
-        if self.host.is_some() {
+        if self.policy_engine.is_some() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PLACED_BY_CONTROLLER);
             return Err(req);
         }
@@ -3320,7 +3326,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
-            host: None,
+            policy_engine: None,
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -3388,7 +3394,7 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
-            host: None,
+            policy_engine: None,
             ..create_test_regular_router()
         };
 
@@ -3739,7 +3745,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            host: None,
+            policy_engine: None,
             retry_config: retry,
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -4512,7 +4518,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
-            host: None,
+            policy_engine: None,
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -6050,7 +6056,7 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
-            host: None,
+            policy_engine: None,
             ..create_test_regular_router()
         };
 

@@ -26,8 +26,8 @@ use super::{
     Refused, Remover, Standing, Wrote,
 };
 use crate::{
+    engine::view::WorkerId,
     store::{Maker, Unmade, WorkersStore},
-    view::WorkerId,
 };
 
 /// The provider name used by the host's own discovery source.
@@ -122,8 +122,9 @@ pub struct RemoveWorkersAtDoor<G> {
 ///
 /// The write lays a job's workers, the ranks of one engine, in one door
 /// turn, and the job's mode is what it expects to stand. An upsert expects
-/// anything. A create-only job expects nothing of the engine, and its ranks
-/// are added whole or not at all. A replacement by id expects the row
+/// anything. A create-only job expects nothing of the engine: tried again
+/// behind a lost lead, it lays the ranks the lead left unwritten
+/// ([`Expect::Nothing`]). A replacement by id expects the row
 /// behind the registry's worker of that id, read through `objects` at the
 /// revision the job names.
 ///
@@ -1785,11 +1786,15 @@ mod tests {
         assert!(!StepExecutor::<Registration>::is_retryable(&write, &error));
         assert_eq!(f.store.epoch(), epoch);
 
-        // Two ranks, the second standing: the door checks every rank in its
-        // one turn ahead of a write, so the first is not written.
+        // Two ranks, the second standing with another label: the door
+        // checks every rank in its one turn ahead of a write, so the first
+        // is not written.
         let f = Fixture::new();
         let ranks = ranked_workers(2);
-        f.store.upsert(facts(ranks[1].as_ref(), None));
+        f.store.upsert(WorkerFacts {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..facts(ranks[1].as_ref(), None)
+        });
         let epoch = f.store.epoch();
         let mut cx = f.registration(WorkerJobAsker::Api, ranks);
         cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
@@ -1799,6 +1804,19 @@ mod tests {
             "Step failed: write_workers_at_door - Worker http://worker:8000 already exists"
         );
         assert_eq!(f.store.epoch(), epoch);
+
+        // The second standing as the job states it: the job is the same add
+        // tried again, and it lays the first rank.
+        let f = Fixture::new();
+        let ranks = ranked_workers(2);
+        f.store.upsert(facts(ranks[1].as_ref(), None));
+        let mut cx = f.registration(WorkerJobAsker::Api, ranks);
+        cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
+        f.write()
+            .execute(&mut cx)
+            .await
+            .expect("the first rank laid");
+        assert_eq!(f.store.snapshot().1.len(), 2);
 
         // Two free ranks are added whole.
         let f = Fixture::new();

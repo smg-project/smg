@@ -37,15 +37,24 @@ impl ModelProcessorSpec for Inkling2Spec {
     }
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
-        metadata.config_model_type() == Some("inkling2")
+        // Looped checkpoints (`inkling2_loop`) take the same media.
+        metadata
+            .config_model_type()
+            .is_some_and(|model_type| ["inkling2", "inkling2_loop"].contains(&model_type))
             || metadata
                 .config
                 .get("architectures")
                 .and_then(Value::as_array)
                 .is_some_and(|items| {
-                    items
-                        .iter()
-                        .any(|item| item.as_str() == Some("Inkling2ForConditionalGeneration"))
+                    items.iter().any(|item| {
+                        item.as_str().is_some_and(|name| {
+                            [
+                                "Inkling2ForConditionalGeneration",
+                                "Inkling2LoopForConditionalGeneration",
+                            ]
+                            .contains(&name)
+                        })
+                    })
                 })
     }
 
@@ -150,6 +159,8 @@ mod tests {
         for config in [
             json!({"model_type":"inkling2"}),
             json!({"architectures":["Inkling2ForConditionalGeneration"]}),
+            json!({"model_type":"inkling2_loop"}),
+            json!({"architectures":["Inkling2LoopForConditionalGeneration"]}),
         ] {
             let metadata = ModelMetadata {
                 model_id: "org/inkling-checkpoint",
@@ -165,6 +176,7 @@ mod tests {
             json!({}),
             json!({"model_type":"inkling_mm_model"}),
             json!({"architectures":["Inkling2ForConditionalGenerationSuffix"]}),
+            json!({"architectures":["Inkling2LoopForConditionalGenerationSuffix"]}),
         ] {
             let metadata = ModelMetadata {
                 model_id: "org/inkling2",

@@ -19,13 +19,17 @@ use super::{
     WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
-    decider::Decider,
-    decision::{Target, Targets},
-    demands::DemandFacts,
-    lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
-    replication::Log,
+    document::spec,
+    engine::{
+        decider::Decider,
+        decision,
+        decision::{Target, Targets},
+        demands::DemandFacts,
+        view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
+    },
+    service::replication::Log,
     sessions::SessionVerdict,
-    view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
+    tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -236,6 +240,63 @@ fn a_watcher_tails_the_changes_after_its_epoch_and_snapshots_again_past_the_log(
         workers.changes_since(head - 1),
         MembershipTail::Changes(changes) if changes.len() == 1
     ));
+}
+
+#[test]
+fn snapshot_sort_does_not_hold_the_workers_lock() {
+    let store = Arc::new(MemoryStore::new());
+    let id = store.upsert(facts("http://c:8000", 1)).id();
+    store.upsert(facts("http://a:8000", 1));
+    store.upsert(facts("http://b:8000", 1));
+    let revision = WorkersStore::get(store.as_ref(), id)
+        .expect("the row")
+        .revision;
+    let epoch = store.epoch();
+    let (cloned, resume) = store.pause_snapshot_after_clone();
+
+    let snapshot_store = Arc::clone(&store);
+    let snapshot = std::thread::spawn(move || WorkersStore::snapshot(snapshot_store.as_ref()));
+    cloned
+        .recv_timeout(PATIENCE)
+        .expect("snapshot reached the sort");
+
+    let writer_store = Arc::clone(&store);
+    let (written_tx, written_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let change = writer_store.set_status(id, WorkerStatus::Ready, revision);
+        written_tx
+            .send(change)
+            .expect("the test receives the write");
+    });
+    let written_while_paused = written_rx.recv_timeout(PATIENCE);
+
+    resume.send(()).expect("resume the snapshot");
+    let (snapshot_epoch, rows) = snapshot.join().expect("snapshot thread");
+    writer.join().expect("writer thread");
+    assert_eq!(snapshot_epoch, epoch, "epoch was read with the rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.facts.key.as_str())
+            .collect::<Vec<_>>(),
+        ["http://a:8000", "http://b:8000", "http://c:8000"],
+        "snapshot rows are ordered by key"
+    );
+    assert_eq!(
+        rows.iter().find(|row| row.id == id).map(|row| row.status),
+        Some(WorkerStatus::Pending),
+        "the snapshot keeps the row copied before the status write"
+    );
+    assert!(
+        matches!(
+            written_while_paused,
+            Ok(Some(MembershipChange::StatusChanged {
+                id: changed,
+                from: WorkerStatus::Pending,
+                to: WorkerStatus::Ready,
+            })) if changed == id
+        ),
+        "status write waited for snapshot sorting"
+    );
 }
 
 #[test]
@@ -1477,8 +1538,8 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
 
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
 /// every `sweep_s`.
-fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::AppliedSpec {
-    use crate::spec::{AppliedSpec, PolicySpec};
+fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec {
+    use crate::document::spec::{AppliedSpec, PolicySpec};
 
     let mut document = PolicySpec::preset("manual").expect("a preset of this build");
     document.generation = generation;
@@ -1578,7 +1639,7 @@ fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
 /// leaves at its own end, and a pin with none stays.
 #[test]
 fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
-    use crate::spec::{AppliedSpec, PolicySpec};
+    use crate::document::spec::{AppliedSpec, PolicySpec};
 
     let store = MemoryStore::new();
     let now = Instant::now();
@@ -2141,7 +2202,7 @@ fn pair(
 ) -> (LeaseRecord, DecodeSide) {
     let mut targets = Targets::new();
     for &decode_id in decodes {
-        let pair = crate::decision::Pair {
+        let pair = decision::Pair {
             decode_id,
             ..Default::default()
         };
@@ -2276,8 +2337,8 @@ fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
     assert!(leases.dispatched(gateway, id, on(Side::Prefill, 0), now));
     let mut heard = None;
     assert!(store.unlocked());
-    let issued = store
-        .issue_decided_decode(gateway, id, decode, None, now, |lease| {
+    let (issued, _) = store
+        .issue_decided_decode(gateway, id, (decode, None), now, |lease| {
             assert!(!store.unlocked(), "the issue is told under the turn");
             heard = Some(*lease);
         })
@@ -3464,7 +3525,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
 #[test]
 fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     use crate::{
-        view::{Candidate, RequestFacts},
+        engine::view::{Candidate, RequestFacts},
         AppliedSpec, Catalog, Lifecycle, PolicySpec, Scorer, TieBand,
     };
 
@@ -5193,6 +5254,53 @@ fn told_ids() -> Vec<(u64, Said)> {
     let told = told().into_iter();
     told.map(|(record, said)| (record.lease.id.0 & 0xffff_ffff, said))
         .collect()
+}
+
+thread_local! {
+    static LEASE_HASHES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Default)]
+pub(super) struct LeaseHashes;
+
+impl std::hash::BuildHasher for LeaseHashes {
+    type Hasher = rustc_hash::FxHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        LEASE_HASHES.set(LEASE_HASHES.get() + 1);
+        Self::Hasher::default()
+    }
+}
+
+#[test]
+fn dispatch_and_completion_each_look_up_the_lease_once() {
+    let now = Instant::now();
+    let (store, _, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let hashes = |said| {
+        LEASE_HASHES.set(0);
+        store.hand(&hand, ids[0], said);
+        LEASE_HASHES.get()
+    };
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    let complete = Said::Completed(done(Side::Single));
+    assert_eq!((hashes(dispatch), hashes(complete)), (1, 1));
+}
+
+#[cfg(feature = "controller")]
+#[test]
+fn a_decode_take_back_looks_up_the_lease_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    store.set_term(1);
+    issue_pair(&store, chosen_pair(id.0, p, &[d], now)).expect("the key is free");
+    assert!(store.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    assert_eq!(store.issue_decode(gateway, id, decode_side(d), now), Ok(()));
+
+    LEASE_HASHES.set(0);
+    assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+    assert_eq!(LEASE_HASHES.get(), 1);
 }
 
 #[test]

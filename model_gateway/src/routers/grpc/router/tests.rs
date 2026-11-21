@@ -138,25 +138,25 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
     }
 }
 
-/// A store has one host, the context's. The router's stages ask that one,
-/// and the router builds none of its own.
+/// A store has one policy engine, the context's. The router's stages ask that
+/// one, and the router builds none of its own.
 #[tokio::test]
-async fn a_router_asks_the_host_of_its_context() {
-    use crate::policy_controller::host::testing::bed;
+async fn a_router_asks_the_policy_engine_of_its_context() {
+    use crate::policy_controller::engine::testing::bed;
 
     let config = grpc_config(regular_routing_mode()).build_unchecked();
     let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
-    let (host, _store, _workers) = bed(&[]);
-    let host = Arc::new(host);
+    let (policy_engine, _store, _workers) = bed(&[]);
+    let policy_engine = Arc::new(policy_engine);
     Arc::get_mut(&mut ctx)
         .expect("the context is not shared yet")
-        .policy_host = Some(Arc::clone(&host));
-    assert_eq!(Arc::strong_count(&host), 2);
+        .policy_engine = Some(Arc::clone(&policy_engine));
+    assert_eq!(Arc::strong_count(&policy_engine), 2);
 
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     assert!(
-        Arc::strong_count(&host) > 2,
-        "the router's stages hold the context's host"
+        Arc::strong_count(&policy_engine) > 2,
+        "the router's stages hold the context's policy engine"
     );
     drop(router);
 }

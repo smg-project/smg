@@ -16,12 +16,12 @@ use std::{
 use openai_protocol::model_card::ModelCard;
 use parking_lot::Mutex;
 use smg_policy_controller::{
+    engine::view::{Role, WireModes, WorkerId},
     store::{
         Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore,
         Overload, ViewBuffers, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
         PUBLISH_WINDOW,
     },
-    view::{Role, WireModes, WorkerId},
     worker_host::{
         Expect, Membership, Objects, Over, Refused, Remover, Standing, StoreDoor, Wrote,
     },
@@ -41,7 +41,7 @@ use super::{feed, Feed, FeedDoor};
 use crate::{
     config::RouterConfig,
     policy_controller::{
-        host::{Ask, Host, Unplaced},
+        engine::{Ask, PolicyEngine, Unplaced},
         start,
     },
     routers::{
@@ -139,9 +139,9 @@ fn a_write_at_the_door_puts_the_workers_object_in_the_registry() {
 async fn a_written_row_is_in_force_for_the_next_decision() {
     let store = start_store().expect("the store starts");
     let (_, feed) = bed(&store);
-    let host = Host::new(store, Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(store, Arc::clone(&feed.objects));
     let row = register(&*feed.door).expect("the worker registers");
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"first"), Instant::now())
         .await
         .expect("the next decision picks the worker");
@@ -152,7 +152,7 @@ async fn a_written_row_is_in_force_for_the_next_decision() {
 async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
     let store = start_store().expect("the store starts");
     let (registry, feed) = bed(&store);
-    let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(Arc::clone(&store), Arc::clone(&feed.objects));
     let row = register_with(&*feed.door, probed).expect("the worker registers");
     let object = feed.objects.object(row).expect("the row has an object");
     let worker = registry.get(&object).expect("the worker stands");
@@ -169,7 +169,7 @@ async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
         Some((WorkerStatus::Pending, WorkerStatus::Ready))
     );
     assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"first"), Instant::now())
         .await
         .expect("the ready row takes a decision");
@@ -191,7 +191,7 @@ async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
     );
     assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
     assert!(matches!(
-        host.ask(&ask(b"down"), &[], Instant::now()).await,
+        policy_engine.ask(&ask(b"down"), &[], Instant::now()).await,
         Err(Unplaced::Shed { .. })
     ));
 
@@ -208,7 +208,7 @@ async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
         }
     );
     assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"back"), Instant::now())
         .await
         .expect("the recovered row takes a decision");
@@ -348,6 +348,70 @@ fn settle_brings_a_row_written_past_the_door_into_the_registry() {
     assert_eq!(registry.get_id_by_url(URL), Some(object));
 }
 
+/// The pool-size gauge's sample for the group of `model`, or none where
+/// the group never had a worker.
+fn pool_size(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+    model: &str,
+) -> Option<String> {
+    let model = format!("model=\"{model}\"");
+    handle
+        .render()
+        .lines()
+        .find(|line| line.starts_with("smg_worker_pool_size{") && line.contains(&model))
+        .and_then(|line| line.rsplit(' ').next().map(str::to_owned))
+}
+
+/// A row this gateway follows moves the pool-size gauge with no workflow
+/// step beside it. The settle that lays its object counts it, and the
+/// settle that takes the object out leaves the group at zero.
+#[test]
+fn a_followed_row_moves_the_pool_size_gauge_as_it_joins_and_as_it_leaves() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let store = Arc::new(MemoryStore::default());
+        let (registry, feed) = bed(&store);
+        // A follower of a served controller writes the store itself.
+        let row = store.upsert(stated()).id();
+        feed.settle();
+        assert!(feed.objects.object(row).is_some());
+        assert_eq!(pool_size(&handle, MODEL).as_deref(), Some("1"));
+
+        let stands = store.by_key(URL).expect("the row");
+        assert!(store.remove(stands.id, stands.revision).is_some());
+        feed.settle();
+        assert!(registry.get_by_url(URL).is_none());
+        assert_eq!(pool_size(&handle, MODEL).as_deref(), Some("0"));
+    });
+}
+
+/// A replacement the door hands the holder moves both pool groups in one
+/// step. The only worker of a model, moved to another model, leaves the
+/// old model's gauge at zero.
+#[test]
+fn a_replacement_at_the_door_moves_the_gauge_of_both_groups() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let (_, feed) = bed(&Arc::new(MemoryStore::default()));
+        for (model, left) in [("m1", None), ("m2", Some("m1"))] {
+            let new: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(URL)
+                    .model(ModelCard::new(model))
+                    .build(),
+            );
+            feed.door
+                .found_built(&Maker::Control, Expect::Anything, &new, None)
+                .expect("the door takes the registration");
+            assert_eq!(pool_size(&handle, model).as_deref(), Some("1"), "{model}");
+            if let Some(left) = left {
+                assert_eq!(pool_size(&handle, left).as_deref(), Some("0"), "{left}");
+            }
+        }
+    });
+}
+
 /// The store shows a replacement inside its own write, and with probes
 /// off the door readies it there, ahead of the listener. A door with no
 /// listener leaves that state standing: the registry holds the old object.
@@ -355,7 +419,7 @@ fn settle_brings_a_row_written_past_the_door_into_the_registry() {
 async fn a_replacement_takes_no_request_until_its_object_is_laid() {
     let store = start_store().expect("the store starts");
     let (registry, feed) = bed(&store);
-    let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(Arc::clone(&store), Arc::clone(&feed.objects));
     register(&*feed.door).expect("the worker registers");
     let old = registry.get_by_url(URL).expect("the first object stands");
 
@@ -373,14 +437,14 @@ async fn a_replacement_takes_no_request_until_its_object_is_laid() {
     let stale = registry.get_by_url(URL).expect("the old object stands");
     assert!(Arc::ptr_eq(&stale, &old));
 
-    let gap = host
+    let gap = policy_engine
         .place(&ask(b"gap"), Instant::now())
         .await
         .expect_err("a row with no object takes no request");
     assert!(matches!(gap, Unplaced::NoTargetHolds), "{gap:?}");
 
     feed.settle();
-    let placed = host
+    let placed = policy_engine
         .place(&ask(b"laid"), Instant::now())
         .await
         .expect("the replacement's object takes the request");
@@ -676,9 +740,9 @@ fn a_worker_that_states_a_width_and_no_rank_is_one_row_with_its_object() {
 async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let store = start_store().expect("the store starts");
     let (registry, feed) = bed(&store);
-    let host = Host::new(store, Arc::clone(&feed.objects));
+    let policy_engine = PolicyEngine::new(store, Arc::clone(&feed.objects));
     let row = register(&*feed.door).expect("the worker registers");
-    let before = host
+    let before = policy_engine
         .place(&ask(b"first"), Instant::now())
         .await
         .expect("the worker is picked before draining");
@@ -689,7 +753,7 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let seen = feed.objects.standing(&object).expect("the object's row");
     let by = Remover::Maker(&Maker::Control);
     assert_eq!(feed.door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
-    let drained = host
+    let drained = policy_engine
         .place(&ask(b"next"), Instant::now())
         .await
         .expect_err("a draining worker takes no decision");

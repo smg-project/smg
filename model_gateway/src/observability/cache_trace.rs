@@ -97,7 +97,7 @@ struct Selection {
     gates: Vec<Value>,
 }
 
-/// One decision of the policy controller, as the host read it.
+/// One decision of the policy controller, as the policy engine read it.
 pub(crate) struct Decided {
     pub profile: Option<Arc<str>>,
     pub outcome: &'static str,

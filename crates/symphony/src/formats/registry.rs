@@ -12,8 +12,8 @@
 //! outside the wire), recorded once by the group's primary. Every group whose table is on main is
 //! here, its primary and its other checkpoints under the primary's organisation, spelled in
 //! `groups.json` beside this module (one group per line; the crate's build script writes the file
-//! as the `GROUPS` constant); `tests/readme.rs` writes the README's models table from the same
-//! groups and checks that the two agree.
+//! as the `GROUPS` constant); `tests/readme.rs` reads the README's models table and checks
+//! that it and these groups agree.
 //!
 //! A lookup matches the repository name, the text after the last path separator (either slash),
 //! exactly and without regard to case, under any organisation or path: `Qwen/Qwen3-8B`,

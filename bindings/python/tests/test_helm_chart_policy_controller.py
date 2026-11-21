@@ -743,7 +743,9 @@ def test_the_chart_says_how_many_generations_a_store_keeps():
     """A spec store keeps its last generations by the crate's own count. The
     values, the README and the store's example each say that count in words:
     a count that moves fails here until the three follow."""
-    store = REPO / "crates" / "policy_controller" / "src" / "operator" / "spec_store.rs"
+    store = (
+        REPO / "crates" / "policy_controller" / "src" / "document" / "operator" / "spec_store.rs"
+    )
     (retained,) = re.findall(
         r"^pub\(crate\) const RETAINED: usize = (\d+);$", store.read_text(), re.M
     )
@@ -1856,7 +1858,7 @@ def test_the_image_job_starts_on_what_these_cases_read():
         crate / "src" / "bin" / "smg-policy-controller.rs",
         # The store's own count of the generations it keeps, which the
         # chart's texts say in words.
-        crate / "src" / "operator" / "spec_store.rs",
+        crate / "src" / "document" / "operator" / "spec_store.rs",
         crate / "contracts" / "smg-policy.wit",
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.

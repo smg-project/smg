@@ -353,8 +353,8 @@ mod tests {
     use crate::{
         app_context::testing::app_context_for_tests,
         policy_controller::{
+            engine::{Ask, PolicyEngine},
             feed::{feed, following},
-            host::{Ask, Host},
             start,
         },
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
@@ -1027,7 +1027,7 @@ mod tests {
     /// A start-up job for a plain HTTP worker, with the health checks off:
     /// the store holds one Ready row at the worker's URL, the registry holds
     /// the object the job built, which the holder keeps as the row's, and
-    /// the host's next decision picks the row.
+    /// the policy engine's next decision picks the row.
     #[tokio::test]
     async fn a_local_workers_job_ends_as_a_ready_row_and_the_holders_object() {
         let url = serve_json_routes(vec![
@@ -1069,7 +1069,7 @@ mod tests {
         assert_eq!(written.worker_urls, [url]);
 
         let model = object.model_id().to_string();
-        let placed = Host::new(Arc::clone(&store), Arc::clone(&feed.objects))
+        let placed = PolicyEngine::new(Arc::clone(&store), Arc::clone(&feed.objects))
             .place(&Ask::of(b"first", &model), Instant::now())
             .await
             .expect("the next decision picks the worker");

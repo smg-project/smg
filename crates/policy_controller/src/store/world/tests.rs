@@ -14,18 +14,20 @@ use super::{
     PoolVetoes, StaleGeneration, VetoEnds, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
-    builtins::ResidentWork,
-    counts::Slot,
-    lease::{Lease, Lifecycle, Side},
-    spec::{BindingSpec, Match, OverloadSpec, Pairing},
+    document::spec::{BindingSpec, Match, OverloadSpec, Pairing},
+    engine::view::{
+        fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
+        WireModes, WorkerId,
+    },
+    stages::builtins::ResidentWork,
     store::{
         loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeaderBits, LeasesStore,
         LoadSink, LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor,
         Reachability, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
-    view::{
-        fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
-        WireModes, WorkerId,
+    tracking::{
+        counts::Slot,
+        lease::{Lease, Lifecycle, Side},
     },
     AppliedSpec, PairPools, PairTable, PolicySpec, Scorer, Scratch, Target,
 };
@@ -47,8 +49,8 @@ mod written;
 mod sent_prefixes {
     use super::*;
     use crate::{
-        door::tests::sent_prefixes::{applied, merged},
-        spec::{IndexKind, IndexSpec},
+        document::spec::{IndexKind, IndexSpec},
+        engine::door::tests::sent_prefixes::{applied, merged},
         store::{index::Predicted, KvEventSink},
     };
 
@@ -448,7 +450,7 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
 /// order: another gateway's host-local row has no entry there.
 #[test]
 fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
-    use crate::demands::DemandFacts;
+    use crate::engine::demands::DemandFacts;
 
     let store = MemoryStore::new();
     let now = Instant::now();

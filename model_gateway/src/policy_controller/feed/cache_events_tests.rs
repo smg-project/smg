@@ -15,11 +15,11 @@ use smg_grpc_client::{
     TokenSpeedSchedulerClient as SchedulerClient,
 };
 use smg_policy_controller::{
+    engine::view::{Role, WireModes, WorkerId},
     store::{
         Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink, Maker, MemoryStore, Named, Naming,
         Signals, ViewBuffers, WorkerFacts,
     },
-    view::{Role, WireModes, WorkerId},
     worker_host::{Expect, Wrote},
     AppliedSpec, PolicySpec,
 };

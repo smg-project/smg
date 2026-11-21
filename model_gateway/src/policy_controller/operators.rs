@@ -29,13 +29,15 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use smg_policy_controller::{
-    operator::{
-        snapshot::{self, Asked, Rows},
-        Document, DryRun, Format, NeedsRow, SpecDoor, Turn, Unanswered, MAX_DOCUMENT_BYTES,
+    document::{
+        operator::{
+            snapshot::{self, Asked, Rows},
+            Document, DryRun, Format, NeedsRow, SpecDoor, Turn, Unanswered, MAX_DOCUMENT_BYTES,
+        },
+        spec::{Digest, Needs},
     },
-    spec::{Digest, Needs},
+    engine::view::Phase,
     store::MemoryStore,
-    view::Phase,
 };
 use tracing::error;
 

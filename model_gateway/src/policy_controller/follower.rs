@@ -10,15 +10,17 @@
 //! The store publishes a snapshot's rows as it lays them, and so it does
 //! a replaced incarnation and a status change. Between such an event and
 //! its settle a decision can name a row whose worker the registry does
-//! not hold yet. The host passes that target over and asks again.
+//! not hold yet. The policy engine passes that target over and asks again.
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use smg_policy_controller::{
-    client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
+    service::{
+        client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
+        watcher::{Ended, Watcher},
+    },
     store::token,
-    watcher::{Ended, Watcher},
 };
 use tokio::{
     sync::{oneshot, watch},
@@ -273,10 +275,12 @@ pub(crate) mod tests {
         x509::X509,
     };
     use smg_policy_controller::{
-        controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
-        proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
+        engine::view::WorkerId,
+        service::{
+            controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
+            proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
+        },
         store::{MemoryStore, WorkerStatus, WorkersStore},
-        view::WorkerId,
     };
     use tokio::{sync::oneshot, time};
     use tonic::{transport::Channel, Request};
@@ -288,8 +292,8 @@ pub(crate) mod tests {
     use crate::{
         config::RouterConfig,
         policy_controller::{
+            engine::{Ask, PolicyEngine},
             feed::{following, Feed},
-            host::{Ask, Host},
             start,
         },
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
@@ -541,14 +545,14 @@ pub(crate) mod tests {
             .expect("the controller was picked");
             let registry = Arc::new(WorkerRegistry::new());
             let feed = followed(&store, &registry);
-            let host = Host::new(store, Arc::clone(&feed.objects));
+            let policy_engine = PolicyEngine::new(store, Arc::clone(&feed.objects));
             let follower = Follower::start(settings(controller.address), feed);
             until("the first snapshot", || {
                 follower.followed() == Followed::Fleet
             })
             .await;
 
-            let placed = host
+            let placed = policy_engine
                 .place(&Ask::of(b"first", "model"), Instant::now())
                 .await
                 .expect("a decision picks the followed worker");

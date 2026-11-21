@@ -10,12 +10,12 @@ use axum::{
 use serde_json::{json, Value};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
 use smg_policy_controller::{
-    operator::Turn,
+    document::operator::Turn,
+    engine::view::WireModes,
     store::{
         EncodeOffer, GatewayId, Maker, Overload, PairingDescriptor, Reachability, WorkerFacts,
         WorkersStore,
     },
-    view::WireModes,
     PolicySpec,
 };
 use tower::ServiceExt;

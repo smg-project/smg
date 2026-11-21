@@ -770,6 +770,26 @@ pub(crate) fn policy_declined(model: &str, declined_at: &str) -> Response {
     response
 }
 
+/// The 503 for a fleet whose prefill and decode pools hold workers and no
+/// prefill of them pairs with a decode: `mismatches` are the components the
+/// pools disagree on, `prefill` and `decode` each pool's pairing keys. The
+/// verdict reads membership alone, so the classic selection and the policy
+/// engine give one answer for one fleet.
+pub(crate) fn no_compatible_pair(
+    model: &str,
+    mismatches: &[String],
+    prefill: &[String],
+    decode: &[String],
+) -> Response {
+    error::service_unavailable(
+        "no_compatible_pd_pair",
+        format!(
+            "No prefill/decode pair for model '{model}' shares a KV transfer protocol (mismatch \
+             on {mismatches:?}; prefill: {prefill:?}, decode: {decode:?})"
+        ),
+    )
+}
+
 /// The workers of `pool` a placement may use: those on `wire` when a retry
 /// pins one, narrowed to the ones the request's candidate filter admits. A
 /// failed pool's veto fallback and its verdict are judged over these, so a

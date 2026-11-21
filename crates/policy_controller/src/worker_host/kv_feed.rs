@@ -34,8 +34,8 @@ use tokio::{
 
 use super::{KvHost, Objects};
 use crate::{
+    engine::view::WireModes,
     store::{index::indexed_under, world::phase_of, MemoryStore, WorkerFacts, WorkersStore},
-    view::WireModes,
     Engine,
 };
 

@@ -8,18 +8,15 @@ use smg_worker::{
     settings::UnhealthyRemovalScope,
 };
 
-use super::{
-    found::{facts, stated},
-    kv_feed::asks_events,
-    Standing,
-};
+use super::{found::paired, kv_feed::asks_events, Standing};
 use crate::{
+    engine::view::WorkerId,
     store::{
         membership::{self, NotMaker, Past},
+        pairing::PairingDescriptor,
         HealthSink, Laid, Maker, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch,
         WorkerRow, WorkerStatus, WorkersStore,
     },
-    view::WorkerId,
 };
 
 /// What a write of the door made of the row.
@@ -58,23 +55,24 @@ pub enum Refused {
     NotLeading(String),
     /// Another writer moved the row under the call.
     Moved,
-    /// A row stands where a registration expects none: under a URL it
-    /// states, or one it would retire.
+    /// A row stands where an add expects none: under a URL it states, or
+    /// one it would retire. The rows of the same add, tried again, are not
+    /// such rows ([`Expect::Nothing`]).
     Stands,
     /// The row a replacement or a refresh names is draining: its removal
     /// takes the worker.
     Draining,
     /// The row's maker is outside the health removal scope.
     OutOfScope,
-    /// A refresh's worker states another fact than the row's labels. A
-    /// refresh writes the labels alone.
+    /// A refresh's worker states another fact than the row's labels and
+    /// the pairing they derive. A refresh writes those alone.
     NotLabelsAlone,
 }
 
 impl Refused {
     pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
     pub(crate) const NOT_LABELS_ALONE: &str =
-        "a refresh writes a row's labels and states no other fact";
+        "a refresh writes a row's labels and the pairing they derive, and states no other fact";
 }
 
 /// Who asks to drain or remove a row.
@@ -98,6 +96,14 @@ pub enum Expect {
     /// Nothing: an add. A row standing under a URL it states, or one the
     /// registration would retire, refuses it whole ([`Refused::Stands`]),
     /// whoever made the row.
+    ///
+    /// One standing is the add's own. A lead lost between two rows leaves
+    /// the rows written before it, and the same add tried again lays the
+    /// rest: every row that stands under a URL it states is its maker's
+    /// and states equal facts, and a row is left to write. The standing
+    /// rows answer unmoved and the others are registered. An engine that
+    /// stands whole refuses the add, and so does a standing row that
+    /// differs or is another maker's.
     Nothing,
     /// The row its asker saw, at the revision it saw: a replacement by id,
     /// which states that one row. No row refuses it ([`Refused::Absent`]),
@@ -166,9 +172,11 @@ pub trait Membership: Send + Sync + 'static {
     /// Lays the rows one registration states of one engine, each with the
     /// worker its registration built, over what it expects to stand. A
     /// row's URL is its worker's, and its facts are the ones the worker
-    /// states over the standing row ([`facts`](super::facts)), by the
-    /// write's verb. The engine is the one the rows' own facts state, so no
-    /// caller names it another way.
+    /// states over the standing row ([`facts`]), by the
+    /// write's verb. A door whose rows hold a pairing descriptor states the
+    /// one the worker derived at its build in place of the standing row's.
+    /// The engine is the one the rows' own facts state, so no caller names
+    /// it another way.
     ///
     /// A registration is held whole: each row to the rule of
     /// [`found`](Self::found), the rows together to the engine's full
@@ -181,8 +189,10 @@ pub trait Membership: Send + Sync + 'static {
     /// nothing. At a door whose lead can move, the term is asked ahead of
     /// each row's write and each removal: a lead lost between two of them
     /// refuses there ([`Refused::NotLeading`]), and what was written before
-    /// it stands. A guarded write ([`Expect::Seen`]) states the one row its
-    /// asker saw and changes it where it stands, by that row's own rule.
+    /// it stands. An upsert lays the rest, and so does the same add tried
+    /// again ([`Expect::Nothing`]). A guarded write ([`Expect::Seen`])
+    /// states the one row its asker saw and changes it where it stands, by
+    /// that row's own rule.
     ///
     /// Each door says what it does with the objects. A door whose host
     /// keeps built objects hands them to the holder for the write's turn
@@ -195,6 +205,8 @@ pub trait Membership: Send + Sync + 'static {
     /// against that object. Every door reads the verb: a replacement by id
     /// states its thresholds whole, and any other write keeps the standing
     /// row's where a built worker states none.
+    ///
+    /// [`facts`]: super::facts
     fn found_rows(
         &self,
         maker: &Maker,
@@ -223,30 +235,36 @@ pub trait Membership: Send + Sync + 'static {
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
 
     /// Write the labels of the worker the health loop's refresh rebuilt,
-    /// over the row the asker saw under the worker's URL. The labels are
-    /// the engine's word and nobody's registration: no maker is asked, a
-    /// control call's row and a provider's are served alike, and the row
-    /// keeps the maker it has.
+    /// and the pairing descriptor they derive, over the row the asker saw
+    /// under the worker's URL. Both are the engine's word and nobody's
+    /// registration: no maker is asked, a control call's row and a
+    /// provider's are served alike, and the row keeps the maker it has.
     ///
     /// The facts `built` states over the standing row ([`facts`]) may
-    /// differ from the row's in the labels alone. Any other difference is
-    /// refused ([`Refused::NotLabelsAlone`]), so a refresh starts no life. No
-    /// row, another row or revision, and a draining row refuse it too. The
-    /// labels' room is tested as a registration's is. Equal labels write
-    /// nothing and answer [`Wrote::Unmoved`].
+    /// differ from the row's in the labels and the descriptor alone. Any
+    /// other difference is refused ([`Refused::NotLabelsAlone`]), so a
+    /// refresh starts no life. No row, another row or revision, and a
+    /// draining row refuse it too. The stated facts' room is tested as a
+    /// registration's is: the controller's door, whose log carries no
+    /// descriptor, refuses a refresh that states one as it refuses such a
+    /// registration. Equal labels and an equal descriptor write nothing
+    /// and answer [`Wrote::Unmoved`].
     ///
     /// Each door says what it does with the object, as for
     /// [`Self::found_built`]. A door whose host keeps built objects hands
     /// `built` to the holder in the write's turn, whether or not a label
     /// moved: a refresh can rebuild what no row states. A door over a door
-    /// passes the call on. Any other door writes the labels alone.
+    /// passes the call on. Any other door writes the row alone.
     ///
-    /// `over` is the object the refresh rebuilt from. Equal labels move no
-    /// revision, so the row's guard cannot tell an older rebuild from a
-    /// newer one: a door that hands `built` in refuses the refresh as moved
-    /// where another object stands for the row by then, or none. It asks
-    /// ahead of the row's guard, so a worker that left reads as moved
-    /// there. A door that keeps no object has nothing to hold it against.
+    /// `over` is the object the refresh rebuilt from. Equal labels and an
+    /// equal descriptor move no revision, so the row's guard cannot tell an
+    /// older rebuild from a newer one: a door that hands `built` in refuses
+    /// the refresh as moved where another object stands for the row by
+    /// then, or none. It asks ahead of the row's guard, so a worker that
+    /// left reads as moved there. A door that keeps no object has nothing
+    /// to hold it against.
+    ///
+    /// [`facts`]: super::facts
     fn refreshed(
         &self,
         seen: Standing,
@@ -301,16 +319,24 @@ const RANKS: Refused = Refused::Past(Past {
     why: "a registration states every rank of one engine under its own URL",
 });
 
+/// How a door reads the facts a built worker states over the row that
+/// stands under its URL, by the write's verb. A door whose rows hold a
+/// pairing descriptor reads the worker's own with them ([`paired`]). A door
+/// whose log carries none reads the facts alone, and the row keeps the
+/// descriptor that stands.
+pub(crate) type Reading = fn(&dyn Worker, Option<&WorkerFacts>, Option<Over<'_>>) -> WorkerFacts;
+
 /// The rows `built` states, handed to `write`: each worker's URL, and its
-/// facts over the row that stands there, by the write's verb ([`stated`]).
+/// facts over the row that stands there, as the door reads them (`read`).
 pub(crate) fn stating<T>(
     built: &[Arc<dyn Worker>],
     over: Option<Over<'_>>,
+    read: Reading,
     write: impl FnOnce(&[Stated<'_>]) -> T,
 ) -> T {
     let states: Vec<_> = built
         .iter()
-        .map(|worker| move |standing: Option<&WorkerFacts>| stated(worker.as_ref(), standing, over))
+        .map(|worker| move |standing: Option<&WorkerFacts>| read(worker.as_ref(), standing, over))
         .collect();
     let rows: Vec<_> = built
         .iter()
@@ -336,27 +362,38 @@ fn states_the_engine_whole(ready: &[Ready]) -> bool {
     matches!(ready, [(only, _)] if only.key == only.engine && only.dp_rank == 0)
 }
 
-/// Check one stated row by its own rule, over what its write expects to
-/// stand under its URL. Nothing is written. The row's event signal is
-/// stated here, over the facts its callback states ([`asks_events`]).
+/// The row a write expects to stand under `url`, read once for the row's
+/// rule.
+fn standing_under(
+    store: &MemoryStore,
+    expect: Expect,
+    url: &str,
+) -> Result<Option<WorkerRow>, Refused> {
+    Ok(match expect {
+        Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
+        Expect::Nothing | Expect::Anything => store.by_key(url),
+    })
+}
+
+/// Check one stated row by its own rule, over the row its write expects to
+/// stand under its URL ([`standing_under`]). Nothing is written. The row's
+/// event signal is stated here, over the facts its callback states
+/// ([`asks_events`]).
 fn ready_row(
     turn: &impl Turn,
     maker: &Maker,
     expect: Expect,
     Stated { url, state }: &Stated<'_>,
+    standing: Option<WorkerRow>,
 ) -> Result<Ready, Refused> {
     let store = turn.store();
-    let standing = match expect {
-        Expect::Seen(seen) => Some(seen_row(store, url, seen)?),
-        Expect::Nothing | Expect::Anything => store.by_key(url),
-    };
-    // An add changes no standing row, so it asks no maker and states no
-    // fact: its refusal is the same whoever made the row.
-    if expect == Expect::Nothing && standing.is_some() {
-        return Err(Refused::Stands);
-    }
     if let Some(row) = &standing {
-        made_by(row, maker)?;
+        // An add of several rows asks no maker here. What it meets is
+        // judged over its rows together, and its refusal is the same
+        // whoever made the row ([`same_add`]).
+        if expect != Expect::Nothing {
+            made_by(row, maker)?;
+        }
         // A draining row is leaving. Laid over, it would take the
         // URL's next life and its removal would leave the worker: the
         // removal wins over a replacement.
@@ -384,8 +421,39 @@ fn ready_row(
     Ok((facts, laid))
 }
 
+/// What an add meets, over the rows it states. An add writes no row that
+/// stands, and one standing is its own: a lead lost between two rows leaves
+/// the rows written before it, and the same add tried again lays the rest.
+/// It is the same add where every standing row is its maker's and would
+/// answer unmoved, and a row is left to write. An engine that stands whole,
+/// another maker's row and a row whose facts differ refuse it, the same
+/// whoever made the row.
+///
+/// The rule reads what stands and nothing of a first attempt, so it holds
+/// at the next leader's door too.
+fn same_add(store: &MemoryStore, maker: &Maker, ready: &[Ready]) -> Result<(), Refused> {
+    let mut writes = false;
+    for (_, laid) in ready {
+        let Some((id, laid)) = laid else {
+            writes = true;
+            continue;
+        };
+        let own = store.get(*id).is_some_and(|row| row.made_by(maker).is_ok());
+        if !own || *laid != Laid::Unmoved {
+            return Err(Refused::Stands);
+        }
+    }
+    if writes {
+        Ok(())
+    } else {
+        Err(Refused::Stands)
+    }
+}
+
 /// Lay one row by its own rule alone: the write of [`Membership::found`].
-/// No rule of the engine's other rows is held and no row leaves.
+/// No rule of the engine's other rows is held and no row leaves. One row
+/// has no rest to lay, so an add of it is refused by any row that stands,
+/// before a fact is stated and whoever made the row.
 pub(crate) fn lay_one(
     turn: &impl Turn,
     maker: &Maker,
@@ -393,7 +461,11 @@ pub(crate) fn lay_one(
     url: &str,
     state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
 ) -> Result<Wrote, Refused> {
-    let (facts, laid) = ready_row(turn, maker, expect, &Stated { url, state })?;
+    let standing = standing_under(turn.store(), expect, url)?;
+    if expect == Expect::Nothing && standing.is_some() {
+        return Err(Refused::Stands);
+    }
+    let (facts, laid) = ready_row(turn, maker, expect, &Stated { url, state }, standing)?;
     turn.check_term()?;
     write_row(turn, maker, facts, laid)
 }
@@ -425,17 +497,29 @@ pub(crate) fn lay(
         };
         return lay_one(turn, maker, expect, row.url, row.state).map(|wrote| vec![wrote]);
     }
-    let mut ready = Vec::with_capacity(rows.len());
+    let store = turn.store();
+    let mut standing = Vec::with_capacity(rows.len());
     for row in rows {
-        ready.push(ready_row(turn, maker, expect, row)?);
+        standing.push(standing_under(store, expect, row.url)?);
+    }
+    // An add with no row left to write is refused before a fact is stated,
+    // whoever made the rows that stand.
+    if expect == Expect::Nothing && standing.iter().all(Option::is_some) {
+        return Err(Refused::Stands);
+    }
+    let mut ready = Vec::with_capacity(rows.len());
+    for (row, standing) in rows.iter().zip(standing) {
+        ready.push(ready_row(turn, maker, expect, row, standing)?);
     }
     lay_ready(turn, maker, expect == Expect::Nothing, ready)
 }
 
 /// The group's rule over the rows one registration states, then the rows
 /// that leave and the writes. A door that states its rows by a rule of its
-/// own enters here, behind that rule: `adds` says the registration expects
-/// no row of the engine to stand.
+/// own enters here, behind that rule: `adds` says the registration is an
+/// add, which meets the rows that stand by the add's rule ([`same_add`])
+/// and retires none. Such a door hands an add's standing row in with what
+/// laying it would make, and asks its maker of no row.
 pub(crate) fn lay_ready(
     turn: &impl Turn,
     maker: &Maker,
@@ -449,6 +533,9 @@ pub(crate) fn lay_ready(
             why: "a registration states at least one row",
         }));
     };
+    if adds {
+        same_add(store, maker, &ready)?;
+    }
     // The engine is the one the first row states. The others are held to
     // it below, and the store is asked by it.
     let engine = first.engine.as_str();
@@ -620,35 +707,82 @@ pub(crate) fn take(
     changed(store.remove(row.id, row.revision), Wrote::Removed)
 }
 
-/// Write the labels a refresh's rebuilt worker states over the guarded row
-/// while the door holds its turn. The row's other facts are the test of
-/// the refresh's scope and are not written: the door states a row's event
-/// signal at its registration, and a refresh leaves it as it stands.
+/// Write what a refresh's rebuilt worker states over the guarded row while
+/// the door holds its turn: its labels, and the pairing descriptor they
+/// derive. The row's other facts are the test of the refresh's scope and
+/// are not written: the door states a row's event signal at its
+/// registration, and a refresh leaves it as it stands. The worker is read
+/// as the door reads one (`read`), under no verb: a door whose log carries
+/// no descriptor keeps the standing one, so its refresh moves labels alone.
 pub(crate) fn refresh(
     turn: &impl Turn,
     seen: Standing,
     built: &dyn Worker,
+    read: Reading,
+) -> Result<Wrote, Refused> {
+    refresh_stated(turn, seen, built.url(), &|standing| {
+        read(built, Some(standing), None)
+    })
+}
+
+/// [`refresh`] over the facts `state` makes of the guarded row.
+///
+/// Labels are no part of a row's offer, and a patch writes them under the
+/// row's guard. A descriptor is part of it. Where it moved, the row takes
+/// the write a registration takes in place, and the store derives the
+/// row's pair classes again there. That write has no guard of its own: the
+/// door's turn holds the row as the guard read it.
+fn refresh_stated(
+    turn: &impl Turn,
+    seen: Standing,
+    url: &str,
+    state: &dyn Fn(&WorkerFacts) -> WorkerFacts,
 ) -> Result<Wrote, Refused> {
     let store = turn.store();
-    let row = seen_row(store, built.url(), seen)?;
+    let row = seen_row(store, url, seen)?;
     // A draining row is leaving: its removal wins over a refresh, as over
     // a replacement.
     if row.status == WorkerStatus::Draining {
         return Err(Refused::Draining);
     }
-    let mut stated = facts(built, Some(&row.facts));
+    let mut stated = state(&row.facts);
     let labels = mem::replace(&mut stated.labels, row.facts.labels.clone());
+    let mut pairing = mem::replace(&mut stated.pairing, row.facts.pairing.clone());
     if stated != row.facts {
         return Err(Refused::NotLabelsAlone);
     }
-    if labels == row.facts.labels {
+    // The row holds its descriptor as the pairing rule reads it. A stated
+    // one that differs is read the same way before it counts as moved: its
+    // blanks are dropped. One that reports nothing is none on either side,
+    // as the rule reads a row that has no descriptor.
+    let held = row.facts.pairing.as_ref();
+    if let Some(descriptor) = pairing.as_mut().filter(|said| held != Some(&**said)) {
+        Arc::make_mut(descriptor).normalize();
+    }
+    let reports = |said: &Arc<PairingDescriptor>| **said != PairingDescriptor::default();
+    pairing = pairing.filter(reports);
+    let pairing_moved = pairing.as_ref() != held.filter(|held| reports(held));
+    if labels == row.facts.labels && !pairing_moved {
         return Ok(Wrote::Unmoved(row.id));
     }
     stated.labels = labels;
+    stated.pairing = pairing;
     stated.bounded(&row.maker).map_err(Refused::Past)?;
     turn.room(&stated, &row.maker)?;
-    // The patch is a write of the turn: the term is asked ahead of it.
+    // The write, in place or by the patch, is a write of the turn: the term
+    // is asked ahead of it.
     turn.check_term()?;
+    if pairing_moved {
+        return match store.upsert_by(stated, row.maker) {
+            MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
+                Ok(Wrote::InPlace(id))
+            }
+            MembershipChange::Registered { .. }
+            | MembershipChange::Replaced { .. }
+            | MembershipChange::Removed { .. }
+            | MembershipChange::StatusChanged { .. } => Err(Refused::Moved),
+        };
+    }
     let patch = WorkerPatch {
         labels: Some(stated.labels),
         ..WorkerPatch::default()
@@ -658,6 +792,8 @@ pub(crate) fn refresh(
 
 /// The membership door over a store alone, for a host with no election or
 /// log. A host shares one door for its store so its writes share a turn.
+/// Its rows hold a pairing descriptor: a write of a built worker states the
+/// one the worker derived at its build.
 pub struct StoreDoor {
     store: Arc<MemoryStore>,
     base: u64,
@@ -743,7 +879,7 @@ impl Membership for StoreDoor {
     }
 
     // This door has no holder. The rows take the facts alone, by the
-    // write's verb.
+    // write's verb, each with its worker's own pairing descriptor.
     fn found_rows(
         &self,
         maker: &Maker,
@@ -751,7 +887,7 @@ impl Membership for StoreDoor {
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
     ) -> Result<Vec<Wrote>, Refused> {
-        stating(built, over, |rows| self.rows(maker, expect, rows))
+        stating(built, over, paired, |rows| self.rows(maker, expect, rows))
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
@@ -762,14 +898,17 @@ impl Membership for StoreDoor {
         self.call(|| take(&self.store, by, url, seen), Wrote::changed)
     }
 
-    // This door has no holder. The row takes the labels alone.
+    // This door has no holder. The row alone takes the refresh.
     fn refreshed(
         &self,
         seen: Standing,
         built: &Arc<dyn Worker>,
         _: &Arc<dyn Worker>,
     ) -> Result<Wrote, Refused> {
-        self.call(|| refresh(self, seen, built.as_ref()), Wrote::changed)
+        self.call(
+            || refresh(self, seen, built.as_ref(), paired),
+            Wrote::changed,
+        )
     }
 }
 
@@ -788,27 +927,31 @@ pub(super) mod tests {
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
         settings::UnhealthyRemovalScope,
-        worker::{HealthCheckConfig, WorkerType},
+        worker::{HealthCheckConfig, RuntimeType, WorkerType},
     };
 
     use super::{
-        changed, lay, lay_one, Expect, Membership, Refused, Remover, Standing, Stated, StoreDoor,
-        Turn, Wrote,
+        changed, lay, lay_one, refresh_stated, Expect, Membership, Refused, Remover, Standing,
+        Stated, StoreDoor, Turn, Wrote,
     };
     use crate::{
-        demands::{DemandFacts, Demands},
-        door::{
-            tests::{request, GATEWAY, MODEL},
-            Door,
+        document::spec::{AppliedSpec, Pairing, PolicySpec},
+        engine::{
+            demands::{DemandFacts, Demands},
+            door::{
+                tests::{pair_request, request, GATEWAY, MODEL},
+                Door,
+            },
+            view::{Role, WireModes, WorkerId},
         },
-        spec::{AppliedSpec, PolicySpec},
         store::{
             index::indexed_under,
             membership::{self, Past},
+            pairing::PairingDescriptor,
             Maker, MembershipChange, MembershipTail, MemoryStore, Signals, WorkerFacts, WorkerRow,
             WorkerStatus, WorkersStore,
         },
-        view::{Role, WireModes, WorkerId},
+        worker_host::facts,
     };
 
     const URL: &str = "http://worker:8000";
@@ -1301,6 +1444,16 @@ pub(super) mod tests {
         };
         let low = one(&ranks[0], Expect::Nothing);
         assert!(matches!(low, Ok(Wrote::Registered(_))), "{low:?}");
+        // An add of the row again is refused before a fact is stated,
+        // whoever made the row: one row has no rest to lay.
+        let unstated = |_: Option<&WorkerFacts>| -> WorkerFacts { panic!("no fact is stated") };
+        let pool = Maker::provider("pool", "private/key").expect("a maker");
+        for maker in [&Maker::Control, &pool] {
+            assert_eq!(
+                door.found(maker, Expect::Nothing, &ranks[0].key, &unstated),
+                Err(Refused::Stands)
+            );
+        }
         // The rows write holds the engine to its width where one rank stands.
         let epoch = store.epoch();
         assert!(matches!(
@@ -1334,6 +1487,73 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn an_add_tried_again_lays_the_ranks_its_first_attempt_left() {
+        check_same_add(local_door).expect("the same add");
+    }
+
+    /// The rows a lost lead leaves, then the same add: the rank that stands
+    /// answers unmoved under its id and the others are registered. With
+    /// every rank standing the engine is whole, and the add is refused.
+    fn check_same_add(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let three = ranked(3);
+        let first = door
+            .found(&Maker::Control, Expect::Nothing, &three[0].key, &|_| {
+                three[0].clone()
+            })
+            .map_err(|_| "the first rank alone")?;
+        let add = || find_rows_over(&*door, &Maker::Control, Expect::Nothing, &three);
+        let wrote = add().map_err(|_| "the same add")?;
+        let [Wrote::Unmoved(stood), Wrote::Registered(_), Wrote::Registered(_)] = wrote.as_slice()
+        else {
+            return Err("one rank unmoved and two registered");
+        };
+        assert_eq!(first, Wrote::Registered(*stood));
+        assert_eq!(store.snapshot().1.len(), 3);
+        let epoch = store.epoch();
+        assert_eq!(add(), Err(Refused::Stands));
+        assert_eq!(store.epoch(), epoch);
+        Ok(())
+    }
+
+    #[test]
+    fn an_add_over_a_standing_rank_that_is_not_its_own_writes_nothing() {
+        check_add_not_its_own(local_door).expect("each add refused");
+    }
+
+    /// An add lays the rest by what stands alone. A standing rank whose
+    /// facts differ, a rank another maker wrote and a rank past the stated
+    /// width each refuse it whole as a row that stands, and nothing is
+    /// written.
+    fn check_add_not_its_own(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let three = ranked(3);
+        door.found(&Maker::Control, Expect::Nothing, &three[2].key, &|_| {
+            three[2].clone()
+        })
+        .map_err(|_| "the last rank alone")?;
+        let before = store.snapshot();
+        let refused = |maker: &Maker, facts: &[WorkerFacts]| {
+            let add = find_rows_over(&*door, maker, Expect::Nothing, facts);
+            assert_eq!(add, Err(Refused::Stands));
+            assert_eq!(store.snapshot(), before);
+        };
+
+        // The add states a label the standing rank does not.
+        let mut labelled = three.clone();
+        for facts in &mut labelled {
+            facts.labels.insert("tier".to_owned(), "gold".to_owned());
+        }
+        refused(&Maker::Control, &labelled);
+        // Another maker states the same rows.
+        let provider = Maker::provider("pool", "private/key").map_err(|_| "the provider")?;
+        refused(&provider, &three);
+        // The standing rank is past the width the add states.
+        refused(&Maker::Control, &ranked(2));
+        Ok(())
+    }
+
+    #[test]
     fn no_row_stated_is_refused() {
         check_empty(local_door);
     }
@@ -1357,6 +1577,8 @@ pub(super) mod tests {
         check_whole_row(open)?;
         check_other_maker(open)?;
         check_invalid_ranks(open);
+        check_same_add(open)?;
+        check_add_not_its_own(open)?;
         let (store, door) = open();
         check_unchanged(&store, &*door)?;
         check_empty(open);
@@ -1449,11 +1671,11 @@ pub(super) mod tests {
         }
     }
 
-    /// An add registers an absent URL, and a standing row refuses it before
-    /// a fact is stated, whoever made the row. A replacement is laid over
-    /// the row its asker saw by the rule every registration takes, and is
-    /// refused where that row moved or left. An add of ranks is whole or
-    /// not at all.
+    /// An add registers an absent URL. Where every row it states stands it
+    /// is refused before a fact is stated, whoever made the rows. A
+    /// replacement is laid over the row its asker saw by the rule every
+    /// registration takes, and is refused where that row moved or left. An
+    /// add of ranks over a standing rank that differs writes no rank.
     pub(crate) fn check_expectations(open: Open) {
         let (store, door) = open();
         let control = Maker::Control;
@@ -1545,10 +1767,14 @@ pub(super) mod tests {
         );
         assert_eq!(store.by_key(URL), None);
 
-        // The second of two ranks stands: the add writes neither.
+        // The second of two ranks stands with another label: the add
+        // writes neither.
         let (store, door) = open();
         let two = ranked(2);
-        store.upsert(two[1].clone());
+        store.upsert(WorkerFacts {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..two[1].clone()
+        });
         let epoch = store.epoch();
         assert_eq!(
             find_rows_over(&*door, &control, Expect::Nothing, &two),
@@ -1804,6 +2030,214 @@ pub(super) mod tests {
             assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Absent));
         }
         Ok(())
+    }
+
+    /// A refresh's scope is its worker's labels and the pairing descriptor
+    /// they derive. A descriptor that moved is laid in place, with a label
+    /// or by itself, and the row keeps its id, its maker and every other
+    /// fact. One that differs from the row's by its blanks alone is the
+    /// row's. One that reports nothing is none, stated or held: it
+    /// withdraws a row's descriptor and writes nothing over a row with
+    /// none. Another fact beside a moved descriptor is refused, and
+    /// nothing is written.
+    #[test]
+    fn a_refresh_lays_the_pairing_its_labels_derive() {
+        let (store, door) = door();
+        let first: Arc<dyn Worker> = Arc::new(built("gold").build());
+        let registered = door.found_built(&Maker::Control, Expect::Nothing, &first, None);
+        assert!(registered.is_ok(), "{registered:?}");
+        let row = store.by_key(URL).expect("the registered row");
+        let version = |version: &str| {
+            Some(Arc::new(PairingDescriptor {
+                version: Some(version.to_owned()),
+                ..PairingDescriptor::default()
+            }))
+        };
+        let refresh = |seen: &WorkerRow, pairing: Option<Arc<PairingDescriptor>>, tier: &str| {
+            refresh_stated(&door, standing(seen), URL, &|standing| {
+                let mut facts = standing.clone();
+                facts.pairing.clone_from(&pairing);
+                facts.labels.insert("tier".to_owned(), tier.to_owned());
+                facts
+            })
+        };
+
+        // The descriptor and a label move together.
+        let wrote = refresh(&row, version("2"), "silver");
+        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        let moved = store.by_key(URL).expect("the refreshed row");
+        let mut facts = row.facts.clone();
+        facts.labels.insert("tier".to_owned(), "silver".to_owned());
+        facts.pairing = version("2");
+        assert_eq!(
+            moved,
+            WorkerRow {
+                facts,
+                revision: row.revision + 1,
+                ..row.clone()
+            }
+        );
+
+        // The same version between blanks is the row's descriptor.
+        let equal = refresh(&moved, version(" 2 "), "silver");
+        assert_eq!(equal, Ok(Wrote::Unmoved(row.id)));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&moved));
+
+        // The descriptor moves by itself, then is withdrawn: by none, and
+        // by one that reports nothing, which the row holds as none.
+        let empty = || Some(Arc::new(PairingDescriptor::default()));
+        let mut bare = moved.clone();
+        for withdrawn in [None, version(" ")] {
+            let wrote = refresh(&bare, version("3"), "silver");
+            assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+            let again = store.by_key(URL).expect("the row of a moved descriptor");
+            assert_eq!(again.facts.pairing, version("3"));
+            assert_eq!(again.facts.labels, moved.facts.labels);
+            let wrote = refresh(&again, withdrawn, "silver");
+            assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+            bare = store
+                .by_key(URL)
+                .expect("the row of a withdrawn descriptor");
+            assert_eq!(bare.facts.pairing, None);
+        }
+
+        // Over a row with none, one that reports nothing writes nothing.
+        for nothing in [empty(), version(" ")] {
+            let unmoved = refresh(&bare, nothing, "silver");
+            assert_eq!(unmoved, Ok(Wrote::Unmoved(row.id)));
+            assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
+        }
+
+        // Another fact beside a moved descriptor is outside the scope.
+        let stray = refresh_stated(&door, standing(&bare), URL, &|standing| {
+            let mut facts = standing.clone();
+            facts.pairing = version("4");
+            facts.priority += 1;
+            facts
+        });
+        assert_eq!(stray, Err(Refused::NotLabelsAlone));
+        assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
+
+        // A row may hold one that reports nothing, as a registration states
+        // it. It reads as a row with none.
+        let laid = door.found(&Maker::Control, Expect::Anything, URL, &|standing| {
+            let mut facts = standing.expect("the standing row").clone();
+            facts.pairing = empty();
+            facts
+        });
+        assert_eq!(laid, Ok(Wrote::InPlace(row.id)));
+        let held = store.by_key(URL).expect("the row of the registration");
+        assert_eq!(held.facts.pairing, empty());
+        for nothing in [None, empty()] {
+            let unmoved = refresh(&held, nothing, "silver");
+            assert_eq!(unmoved, Ok(Wrote::Unmoved(row.id)));
+            assert_eq!(store.by_key(URL).as_ref(), Some(&held));
+        }
+    }
+
+    /// A worker of a runtime that names its transfer backend by a label, at
+    /// `url` in `role`, of `version`.
+    fn partner(url: &str, role: WorkerType, version: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            <BasicWorkerBuilder>::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(role)
+                .runtime_type(RuntimeType::Sglang)
+                .label("disaggregation_transfer_backend", "nixl")
+                .label("version", version)
+                .build(),
+        )
+    }
+
+    /// The store's door holds a pairing descriptor in its rows, so it states
+    /// the one a built worker derived, at a registration and at a refresh.
+    /// A holder still takes the object for the row's, since the table keeps
+    /// the row's own descriptor, and the same registration again writes
+    /// nothing. A refresh that moves the version label moves the
+    /// descriptor, and under the strict rule the next decision reads it:
+    /// the pair's request finds no pair, by name, and is placed again once
+    /// the prefill follows.
+    #[test]
+    fn the_stores_door_states_the_pairing_its_worker_derived() {
+        const DECODE: &str = "http://decode:8000";
+        let (store, door) = door();
+        let mut strict =
+            PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+        strict.generation = 1;
+        strict.plans.pd_pair.pairing = Pairing::Strict;
+        for side in ["prefill", "decode"] {
+            let profile = strict.profiles.get_mut(side).expect("the side's profile");
+            profile
+                .filter
+                .retain(|stage| !matches!(stage.name(), "has-capacity" | "has-room"));
+        }
+        store
+            .apply(AppliedSpec::validate(&strict).expect("the document validates"))
+            .expect("the first generation");
+        let prefill = partner(URL, WorkerType::Prefill, "1");
+        let decode = partner(DECODE, WorkerType::Decode, "1");
+        // Each row is laid, and a check's word makes it ready.
+        let ready = |built: &Arc<dyn Worker>| {
+            let wrote = door.found_built(&Maker::Control, Expect::Nothing, built, None);
+            assert!(wrote.is_ok(), "{wrote:?}");
+            let laid = store.by_key(built.url()).expect("the registered row");
+            let _ = store.set_status(laid.id, WorkerStatus::Ready, laid.revision);
+            store.by_key(built.url()).expect("the ready row")
+        };
+        let first = ready(&prefill);
+        let row = ready(&decode);
+        let said = row.facts.pairing.as_deref().expect("a descriptor");
+        assert_eq!(said.transport.as_deref(), Some("nixl"));
+        assert_eq!(said.version.as_deref(), Some("1"));
+        assert_eq!(facts(decode.as_ref(), Some(&row.facts)), row.facts);
+        let again = door.found_built(&Maker::Control, Expect::Anything, &decode, None);
+        assert_eq!(again, Ok(Wrote::Unmoved(row.id)));
+        let pairs = || {
+            store.publish_now();
+            store.with_world(|world| {
+                let classes = world.pairs(MODEL).expect("both pools hold a worker");
+                let refused = classes.refusal(WireModes::HTTP);
+                (
+                    classes.pairs(),
+                    refused.map(|refusal| refusal.mismatches.clone()),
+                )
+            })
+        };
+        // A pair's request, decided over the rows as they stand: the
+        // prefill and its decode, or nobody.
+        let policy = Door::new(Arc::clone(&store));
+        let placed = |id: &'static [u8]| {
+            store.publish_now();
+            let mut asked = pair_request(id);
+            asked.constraints.wire_modes = WireModes::HTTP;
+            let decided = policy.decide(GATEWAY, &asked, Instant::now());
+            let decided = decided.expect("a decision");
+            let target = decided.decision.pick()?.targets.first()?;
+            Some((target.id, target.pair.map(|pair| pair.decode_id)))
+        };
+        assert_eq!(pairs(), (1, None));
+        assert_eq!(placed(b"first"), Some((first.id, Some(row.id))));
+
+        // The decode comes back on another version: no pair, by name.
+        let rebuilt = partner(DECODE, WorkerType::Decode, "2");
+        let wrote = door.refreshed(standing(&row), &rebuilt, &decode);
+        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        let moved = store.by_key(DECODE).expect("the refreshed row");
+        let version = moved
+            .facts
+            .pairing
+            .as_deref()
+            .and_then(|said| said.version.as_deref());
+        assert_eq!(version, Some("2"));
+        assert_eq!(pairs(), (0, Some(vec!["version".to_owned()])));
+        assert_eq!(placed(b"second"), None);
+
+        // The prefill follows, and the same request is placed again.
+        let followed = partner(URL, WorkerType::Prefill, "2");
+        let wrote = door.refreshed(standing(&first), &followed, &prefill);
+        assert_eq!(wrote, Ok(Wrote::InPlace(first.id)));
+        assert_eq!(pairs(), (1, None));
+        assert_eq!(placed(b"third"), Some((first.id, Some(row.id))));
     }
 
     #[test]
@@ -2150,6 +2584,14 @@ pub(super) mod tests {
     }
 
     fn lay_under(turn: &TermFor<'_>, facts: &[WorkerFacts]) -> Result<Vec<Wrote>, Refused> {
+        lay_as(turn, Expect::Anything, facts)
+    }
+
+    fn lay_as(
+        turn: &TermFor<'_>,
+        expect: Expect,
+        facts: &[WorkerFacts],
+    ) -> Result<Vec<Wrote>, Refused> {
         let states: Vec<_> = facts
             .iter()
             .map(|facts| move |_: Option<&WorkerFacts>| facts.clone())
@@ -2162,7 +2604,7 @@ pub(super) mod tests {
                 state,
             })
             .collect();
-        lay(turn, &Maker::Control, Expect::Anything, &rows)
+        lay(turn, &Maker::Control, expect, &rows)
     }
 
     /// The term is asked ahead of every write, whatever the write makes of
@@ -2208,6 +2650,37 @@ pub(super) mod tests {
             Err(Refused::NotLeading("the term moved".to_owned()))
         );
         assert_eq!(store.snapshot(), (0, Vec::new()));
+    }
+
+    /// A lead lost behind an add's first row leaves that row. The same add
+    /// under a term that holds lays the rest, and the row that stands
+    /// answers unmoved.
+    #[test]
+    fn an_add_that_lost_its_lead_lays_the_rest_when_it_is_tried_again() {
+        let (store, _) = door();
+        let three = ranked(3);
+        let add = |checks| {
+            let turn = TermFor(&store, std::cell::Cell::new(checks));
+            lay_as(&turn, Expect::Nothing, &three)
+        };
+        assert_eq!(
+            add(1),
+            Err(Refused::NotLeading("the term moved".to_owned()))
+        );
+        assert_eq!(store.snapshot().1.len(), 1);
+        let wrote = add(3);
+        assert!(
+            matches!(
+                wrote.as_deref(),
+                Ok([
+                    Wrote::Unmoved(_),
+                    Wrote::Registered(_),
+                    Wrote::Registered(_)
+                ])
+            ),
+            "{wrote:?}"
+        );
+        assert_eq!(store.snapshot().1.len(), 3);
     }
 
     #[test]

@@ -5,7 +5,6 @@ mod find_worker_to_update;
 mod forget_cache_events;
 mod provider_workers;
 mod rediscover_labels;
-mod refresh_pool_sizes;
 mod release_tokenizer;
 mod remove_from_policy_registry;
 mod submit_tokenizer_job;
@@ -29,7 +28,6 @@ use provider_workers::{
     ForProviderWorkers, DRAIN_PROVIDER_WORKERS_STEP, REMOVE_PROVIDER_WORKERS_STEP,
 };
 pub use rediscover_labels::RediscoverLabelsStep;
-use refresh_pool_sizes::{RefreshPoolSizesStep, REFRESH_POOL_SIZES_STEP};
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 use smg_policy_controller::worker_host::{removal_at_door, REMOVE_WORKERS_AT_DOOR_STEP};
@@ -103,7 +101,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
 /// controller's store, and the line is the store crate's removal at the
 /// feed's door, under `scope` for a health check's removal. The door marks
 /// a drained row's worker `Draining` in the registry ([`DrainingDoor`]),
-/// and the holder takes a removed row's object out of it. Five gateway
+/// and the holder takes a removed row's object out of it. Four gateway
 /// steps follow:
 /// ```text
 ///     find_workers_to_remove
@@ -118,15 +116,15 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
 ///              |
 ///     remove_provider_workers
 ///              |
-///       +------+---------------+------------------+
-///       |                      |                  |
-///  forget_cache_events  refresh_pool_sizes  release_tokenizer
+///           +--+----------------+
+///           |                   |
+///  forget_cache_events  release_tokenizer
 /// ```
 /// The door's steps leave a worker with no row alone. A provider's worker
 /// has none, and the two steps behind them are the registry's own: they
 /// drain it and take it out, as the classic line does. A removal that
 /// names workers of both kinds has each taken where it stands
-/// ([`ForProviderWorkers`]). The last three write nothing to the run's
+/// ([`ForProviderWorkers`]). The last two write nothing to the run's
 /// data, so they stand side by side, and a cleanup that fails or times out
 /// holds no other back. No step writes the classic policies: they decide
 /// nothing there.
@@ -171,16 +169,6 @@ pub(crate) fn worker_removal_line(
                 "Forget the cache events of the removed workers",
                 Arc::new(ForgetCacheEventsStep),
             )
-            .with_retry(single_attempt())
-            .depends_on(&[REMOVE_PROVIDER_WORKERS_STEP]),
-        )
-        .add_step(
-            StepDefinition::new(
-                REFRESH_POOL_SIZES_STEP,
-                "Refresh the pool sizes the removed workers left",
-                Arc::new(RefreshPoolSizesStep),
-            )
-            .with_timeout(Duration::from_secs(10))
             .with_retry(single_attempt())
             .depends_on(&[REMOVE_PROVIDER_WORKERS_STEP]),
         )
@@ -343,7 +331,7 @@ mod tests {
     };
     use smg_policy_controller::{
         store::{Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore},
-        worker_host::{facts, Expect, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
+        worker_host::{facts, Expect, Remover, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
     };
     use smg_worker::{
         identity::basic::{ConnectionMode, Worker},
@@ -666,8 +654,74 @@ mod tests {
         );
     }
 
+    /// The update step's refresh at the door, by the door's answer. A
+    /// worker rebuilt from the row's object takes its place, and the row
+    /// takes its labels. One rebuilt from an object that stands no more is
+    /// dropped, and so is one whose row is draining: the step says so and
+    /// the standing object stays. One that states another fact than its
+    /// labels fails by name.
+    #[test]
+    fn under_the_feed_a_refresh_is_laid_or_dropped_by_the_doors_answer() {
+        let store = Arc::new(MemoryStore::default());
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(&store, &registry, BackendConnector::shared());
+        let step = UpdateAtDoorStep::new(Arc::clone(&feed.door), Arc::clone(&feed.objects));
+        let url = "http://ours:8000";
+        let built = |model: &str, tier: &str| -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(url).model(ModelCard::new(model));
+            Arc::new(worker.label("tier", tier).build())
+        };
+        let seen = || {
+            let id = registry.get_id_by_url(url).expect("the object's id");
+            feed.objects.standing(&id).expect("the object's row")
+        };
+        let stands = |worker: &Arc<dyn Worker>| {
+            let held = registry.get_by_url(url);
+            held.is_some_and(|held| Arc::ptr_eq(&held, worker))
+        };
+        let tier = || {
+            let row = store.by_key(url).expect("the row");
+            row.facts.labels.get("tier").cloned()
+        };
+
+        let first = built("m", "a");
+        let wrote = feed
+            .door
+            .found_built(&Maker::Control, Expect::Anything, &first, None);
+        assert!(wrote.is_ok(), "{wrote:?}");
+
+        let second = built("m", "b");
+        let laid = step.refresh(seen(), &second, &first);
+        assert!(matches!(laid, Ok(true)), "{laid:?}");
+        assert!(stands(&second));
+        assert_eq!(tier().as_deref(), Some("b"));
+
+        // Rebuilt from the object the second replaced: an older refresh.
+        let late = step.refresh(seen(), &built("m", "c"), &first);
+        assert!(matches!(late, Ok(false)), "{late:?}");
+        assert!(stands(&second));
+        assert_eq!(tier().as_deref(), Some("b"));
+
+        let refused = step.refresh(seen(), &built("n", "b"), &second);
+        let why = refused.map_err(|error| error.to_string());
+        let named = "states another fact than its labels";
+        assert!(
+            why.as_ref().is_err_and(|why| why.contains(named)),
+            "{why:?}"
+        );
+        assert!(stands(&second));
+
+        let by = Remover::Maker(&Maker::Control);
+        let drained = feed.door.drained(by, url, seen());
+        assert!(drained.is_ok(), "{drained:?}");
+        let leaving = step.refresh(seen(), &built("m", "c"), &second);
+        assert!(matches!(leaving, Ok(false)), "{leaving:?}");
+        assert!(stands(&second));
+        assert_eq!(feed.objects.unhanded(), 0);
+    }
+
     /// With no feed the line is the one it was. Under a feed it is the
-    /// store crate's removal at the door and five gateway steps, each
+    /// store crate's removal at the door and four gateway steps, each
     /// behind one step alone. No step writes the classic policies, and none
     /// takes a row's worker out of the registry by hand.
     #[test]
@@ -682,7 +736,7 @@ mod tests {
             ),
             ("release_tokenizer", &["remove_from_worker_registry"]),
         ];
-        let at_the_door: [(&str, &[&str]); 9] = [
+        let at_the_door: [(&str, &[&str]); 8] = [
             ("find_workers_to_remove", &[]),
             ("settle_drained_workers", &["drain_workers_at_door"]),
             ("drain_workers_at_door", &["find_workers_to_remove"]),
@@ -690,7 +744,6 @@ mod tests {
             ("drain_provider_workers", &["remove_workers_at_door"]),
             ("remove_provider_workers", &["drain_provider_workers"]),
             ("forget_cache_events", &["remove_provider_workers"]),
-            ("refresh_pool_sizes", &["remove_provider_workers"]),
             ("release_tokenizer", &["remove_provider_workers"]),
         ];
         let registry = Arc::new(WorkerRegistry::new());
@@ -802,7 +855,6 @@ mod tests {
             for step in ["drain_provider_workers", "remove_provider_workers"] {
                 assert_eq!(ended(step), provider_steps, "{url} {step}");
             }
-            assert_eq!(ended("refresh_pool_sizes"), StepStatus::Succeeded, "{url}");
             // The registry's drain waits the provider's own window.
             assert_eq!(asked.elapsed() >= window, url == provider, "{url}");
             assert!(!stands(url, &stood), "{url}");
@@ -971,7 +1023,6 @@ mod tests {
             "remove_workers_at_door",
             "drain_provider_workers",
             "remove_provider_workers",
-            "refresh_pool_sizes",
         ] {
             let ended = state.step_states[&StepId::new(step)].status;
             assert_eq!(ended, StepStatus::Succeeded, "{step}");

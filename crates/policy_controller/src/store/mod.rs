@@ -63,7 +63,7 @@
 //! generation the store holds, which [`MemoryStore::apply`] alone replaces:
 //! a decision reads its rows and its engine in one load.
 //!
-//! [`LoadRow`]: crate::view::LoadRow
+//! [`LoadRow`]: crate::engine::view::LoadRow
 
 pub mod encoding;
 pub mod health;
@@ -101,6 +101,7 @@ pub use leases::{
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use membership::{Laid, NotMaker};
+pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
