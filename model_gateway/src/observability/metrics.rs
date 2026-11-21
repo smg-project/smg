@@ -2452,7 +2452,8 @@ impl Metrics {
     }
 
     /// A model got its first worker while no binding of the supplied
-    /// policy document names it: the classic policies place its requests.
+    /// policy document plans its single requests: the classic policies
+    /// place them.
     pub fn record_policy_unbound_model() {
         counter!(POLICY_UNBOUND_MODELS_TOTAL).increment(1);
     }

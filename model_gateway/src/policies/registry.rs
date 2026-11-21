@@ -53,11 +53,13 @@ use crate::{
 /// ([`PolicyRegistry::with_policy_engine`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentOrigin {
-    /// Made from the gateway's routing settings: it says what they say, so
-    /// a worker's `policy` label chooses a model's policy as ever.
+    /// The document the gateway's routing settings mean, made from them or
+    /// handed back by the operator: it says what they say, so a worker's
+    /// `policy` label chooses a model's policy as ever.
     Settings,
-    /// Supplied by the operator: its bindings say which profile places a
-    /// model, whatever a worker's `policy` label says.
+    /// Supplied by the operator, and saying another thing than the routing
+    /// settings: its bindings say which profile places a model, whatever a
+    /// worker's `policy` label says.
     Supplied,
 }
 
@@ -1006,13 +1008,15 @@ impl PolicyRegistry {
                 }
                 (Place::Unbound, _) if supplied => {
                     warn!(
-                        "Model {model_id}: no binding of the policy document names it, \
-                         the classic policies place it"
+                        "Model {model_id}: no binding of the policy document plans its single requests, \
+                         the classic policies place them"
                     );
                     Metrics::record_policy_unbound_model();
                 }
                 // A binding that plans no single request names the model: a
-                // pair's, whose requests the side policies place.
+                // pair's, whose requests the side policies place. The start
+                // refuses a supplied document under which this gateway
+                // would place a single request of such a model.
                 (Place::Unbound | Place::NoSide | Place::NotAlone { .. }, _) => {}
             }
         }
