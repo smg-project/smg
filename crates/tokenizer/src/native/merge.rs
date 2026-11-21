@@ -530,8 +530,8 @@ impl MergeTable {
             min_operand[right as usize] = min_operand[right as usize].min(rank);
         }
         // The tokens in rank order, placed and not sorted: the analysis
-        // orders them by id, one pass where they come in order. A second
-        // token of a rank goes after the placed ones.
+        // orders them by id, one pass where they come in order. A token
+        // another of its rank displaces goes after the placed ones.
         let mut by_rank: Vec<Option<&Vec<u8>>> = vec![None; ranks_end];
         let mut twice = Vec::new();
         for (token, &rank) in ranks {
