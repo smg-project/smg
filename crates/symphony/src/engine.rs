@@ -1106,7 +1106,9 @@ impl Engine {
     }
 
     /// The bytes of a tag a wrapping stay was still reading when the stay ends or a marker the
-    /// table ignores arrives: they spelled no closing tag, and are the stay's text.
+    /// table ignores arrives: they spelled no closing tag, and are the stay's text. Only a
+    /// wrapping stay of the XML syntax ever holds one, so its callers ask first, and every
+    /// other stay and table pays one test of a field for it.
     fn release_held_tag(&mut self, out: &mut Events) {
         if let Some(tag) = self.stay.tag.take() {
             self.wrapping(
@@ -1190,7 +1192,9 @@ impl Engine {
     /// The run the stay held is the state's text: the whitespace is shown, and an ignored
     /// terminal among it is dropped in its place.
     fn release_stay(&mut self, out: &mut Events) {
-        self.release_held_tag(out);
+        if self.stay.tag.is_some() {
+            self.release_held_tag(out);
+        }
         if self.stay.held.is_empty() {
             return;
         }
@@ -1209,7 +1213,9 @@ impl Engine {
     /// after its last text as much as a lead no text followed, and the run a wrapping stay held
     /// after its last text, the template's spacing before the terminal that ended the stay.
     fn end_stay(&mut self, out: &mut Events) {
-        self.release_held_tag(out);
+        if self.stay.tag.is_some() {
+            self.release_held_tag(out);
+        }
         // A content or reasoning stay's run is whitespace the format treats as structural; a
         // wrapping stay's is the template's wrapping, as it is before the stay's first text.
         let spacing = match self.emits() {
@@ -1313,7 +1319,9 @@ impl Engine {
         }
         if self.format.ignored(index) {
             // A tag a wrapping stay was reading ends at the marker: its bytes came before.
-            self.release_held_tag(out);
+            if self.stay.tag.is_some() {
+                self.release_held_tag(out);
+            }
             let text = self.format.terminal_text(index).to_string();
             if self.call_holds_markers() {
                 self.text(Cow::Owned(text), out);
