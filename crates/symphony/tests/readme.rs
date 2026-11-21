@@ -366,7 +366,7 @@ const GROUPS: &[Group] = &[
         released: "2025-12-08",
         smg: (Some("json"), None),
         table: None,
-        set: Some(328_664),
+        set: Some(328_661),
         status: Status::Pending,
     },
     Group {
@@ -376,7 +376,7 @@ const GROUPS: &[Group] = &[
         released: "2025-12-09",
         smg: (Some("json"), None),
         table: None,
-        set: Some(328_664),
+        set: Some(328_661),
         status: Status::Pending,
     },
     Group {
@@ -1227,8 +1227,8 @@ const GROUPS: &[Group] = &[
         released: "2026-10-01",
         smg: (None, None),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(11),
+        status: Status::Replaying,
     },
     Group {
         slug: "granite-speech-3.2-8b",
@@ -1347,7 +1347,7 @@ const GROUPS: &[Group] = &[
         released: "2026-07-14",
         smg: (Some("inkling"), Some("inkling")),
         table: Some(Table::Inkling),
-        set: Some(589_659),
+        set: Some(589_676),
         status: Status::Replaying,
     },
     Group {
@@ -2355,7 +2355,7 @@ const GROUPS: &[Group] = &[
         released: "2026-09-01",
         smg: (None, None),
         table: None,
-        set: Some(12_825),
+        set: Some(12_820),
         status: Status::Pending,
     },
     Group {
