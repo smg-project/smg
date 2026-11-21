@@ -184,6 +184,25 @@ impl Tags {
         stuttered_marker: None,
         json_arguments: false,
     };
+    /// Step 3's: `<steptml:parameter name="…">` and `</steptml:parameter>`, the call's end the
+    /// invoke's closing tag with `<｜tool_call_end｜>` behind it, every tag of a call on one line,
+    /// nothing before the block; otherwise MiniMax M2's.
+    pub const STEPTML: Self = Self {
+        parameter_open: "<steptml:parameter name=\"",
+        parameter_close: "</steptml:parameter>",
+        invoke_close: "</steptml:invoke><｜tool_call_end｜>",
+        cdata: false,
+        value_on_its_own_line: false,
+        tags_on_their_own_lines: false,
+        block_per_call: false,
+        typing: Typing::Declared,
+        before_block: "",
+        tag_end: TagEnd::Angle,
+        indexed_calls: false,
+        structural_tokens: &[],
+        stuttered_marker: None,
+        json_arguments: false,
+    };
     /// dots3's: MiniMax M2's tags, a block around each call, every value on a line of its own.
     pub const DOTS3: Self = Self {
         parameter_open: "<parameter name=\"",

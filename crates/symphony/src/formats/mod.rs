@@ -51,6 +51,7 @@ pub mod qwen2_5;
 pub mod qwen3;
 pub mod registry;
 pub mod seed_oss;
+pub mod steptml;
 pub mod xlam;
 
 pub use command::command;
@@ -91,6 +92,7 @@ pub use qwen2_5::qwen2_5;
 pub use qwen3::qwen3;
 pub use registry::{for_model, for_model_shared, groups, table_for, Table};
 pub use seed_oss::seed_oss;
+pub use steptml::steptml;
 pub use xlam::xlam;
 
 /// The one part of its chat template's layout a registry table that thinks carries: the thought

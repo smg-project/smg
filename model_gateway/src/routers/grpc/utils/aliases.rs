@@ -114,7 +114,11 @@ pub const UNANSWERED: [(&str, &str); 12] = [
         "a thought between `◁think▷` and `◁/think▷`, which no table reads: the Kimi K2 \
          line's table reads `<think>`",
     ),
-    ("step3", "Step 3's calls and thought: no table"),
+    (
+        "step3",
+        "Step 3's calls and thought, which the registry reads with the steptml table; the legacy \
+         parser types a value by its look, the table by what the tool declares: no alias yet",
+    ),
     ("sarashina", "Sarashina's calls: no table"),
     (
         "cohere",

@@ -34,7 +34,8 @@ use super::{
     command, deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3,
     function_gemma, gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon,
     kimi_k2, kimi_k3, lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2,
-    minimax_m3, mistral, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    minimax_m3, mistral, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, steptml,
+    xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -106,6 +107,8 @@ tables! {
     MinimaxM2 => "minimax_m2", minimax_m2;
     /// [`minimax_m3()`].
     MinimaxM3 => "minimax_m3", minimax_m3;
+    /// [`steptml()`].
+    Steptml => "steptml", steptml;
     /// [`mistral_v13()`].
     MistralV13 => "mistral_v13", mistral_v13;
     /// [`llama_nemotron()`].
