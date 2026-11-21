@@ -10,8 +10,9 @@ use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, PolicySpec},
     engine::{LoadRow, Role, WireModes, WorkerId},
     store::{
-        Ask as StoreAsk, BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource,
-        MemoryStore, PairBuffers, Signals, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource, MemoryStore,
+        PairBuffers, Signals, ViewQuery as StoreAsk, WorkerFacts, WorkerStatus as RowStatus,
+        WorkersStore,
     },
     tracking::LeaseId,
 };
@@ -252,7 +253,7 @@ pub(crate) fn report_loads(store: &MemoryStore, busy: &str, idle: &str) -> Insta
 /// The requests the store counts in flight on `row`, a row of [`MODEL`]'s
 /// pair pools.
 pub(crate) fn pair_in_flight(store: &MemoryStore, row: WorkerId) -> u32 {
-    store.with_world(|world| {
+    store.with_snapshot(|world| {
         let ask = StoreAsk {
             gateway: GATEWAY,
             now: Instant::now(),

@@ -31,7 +31,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
     document::{PolicySpec, API_VERSION},
     engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, Target},
-    tracking::{Lease, Lifecycle, Side},
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

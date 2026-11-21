@@ -47,11 +47,11 @@
 //!
 //! The reader is the stream itself and never waits for a decision: a frame
 //! is stamped with its receipt, checked ([`Checked`]) and handed to its
-//! model's decider ([`Deciders`](super::deciders::Deciders)), or answered
-//! here with `Busy`: for no credit, for a replica that does not lead, for
-//! a budget of 0, for the queue's depth, or, with no reason, where the
-//! decider's thread ended. Every `Busy` is counted at its reason
-//! ([`Counts`](super::deciders::Counts)).
+//! model's decider ([`DecisionSlots`](super::decision_slots::DecisionSlots)),
+//! or answered here with `Busy`: for no credit, for a replica that does not
+//! lead, for a budget of 0, for the queue's depth, or, with no reason, where
+//! the decider's thread ended. Every `Busy` is counted at its reason
+//! ([`DecideStats`](super::decision_slots::DecideStats)).
 //!
 //! Credits ride the stream: it starts with [`WINDOW`], a request spends
 //! one, and a `Credit` frame grants half a window each time that many
@@ -87,7 +87,7 @@ use tokio::{
 use tonic::{codegen::tokio_stream::Stream, Status, Streaming};
 
 use super::{
-    deciders::{Job, Refused},
+    decision_slots::{Job, Refused},
     gateways::Presence,
     lifecycle,
     principal::Principal,
@@ -574,16 +574,16 @@ mod tests {
         service::{
             controller::{
                 config::Scope,
-                deciders::{
+                decision_slots::{
                     tests::{
                         busy, call, fleet, frame, frame_for, gone, hearing, later_spec, lease_of,
                         pair_frame, picked, preset, ready, sent, settled, Script, SideCalls, Step,
                         BUDGET, MODEL, PATIENCE,
                     },
-                    Clock, Counts, Deciders, Job, Reads,
+                    Clock, DecideStats, DecisionSlots, Job, Reads,
                 },
-                election::{LeasePlace, Standing},
-                gateways::{tests::PATIENT, Seat},
+                election::{ElectionObservation, LeasePlace},
+                gateways::{tests::PATIENT, SessionPlace},
                 principal::{tests::told, Layer, ENTRY},
                 replication::journaled_for,
                 service::{Service, Shared},
@@ -591,7 +591,7 @@ mod tests {
                 watch_workers::tests::Woken,
                 wire::{Checked, Decided, MAX_FRAME},
             },
-            elector::{Elector, Tick},
+            elector::{Elector, TickOutcome},
             proto::{self, busy::Reason, decide_answer::Answer, identity::Form},
         },
         store::{leases::DISPATCH_TTL, HealthSink, LeasesStore},
@@ -618,7 +618,7 @@ mod tests {
     /// preset as generation 1, and deciders on the case's clock.
     struct Bed {
         elector: Elector,
-        standing: watch::Sender<Standing>,
+        standing: watch::Sender<ElectionObservation>,
         shared: Arc<Shared>,
         script: Arc<Script>,
         /// The members serving the cases' model in the single role, ready.
@@ -643,14 +643,15 @@ mod tests {
         cap: Option<u32>,
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
-        let start =
-            |reads: &Reads| Deciders::start(deciders, depth, reads).expect("the deciders start");
+        let start = |reads: &Reads| {
+            DecisionSlots::start(deciders, depth, reads).expect("the deciders start")
+        };
         bed_over(start, deciders, cap, steps).await
     }
 
     /// [`bed_with`] over the deciders `start` makes of what they read.
     async fn bed_over(
-        start: impl FnOnce(&Reads) -> Deciders,
+        start: impl FnOnce(&Reads) -> DecisionSlots,
         deciders: usize,
         cap: Option<u32>,
         steps: impl IntoIterator<Item = Step>,
@@ -664,12 +665,12 @@ mod tests {
         let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         // The election's report tells the store the term of each take: a
         // lease is minted under the store's own term.
         store.set_term(1);
-        let (standing, stood) = watch::channel(Standing {
+        let (standing, stood) = watch::channel(ElectionObservation {
             holder: IDENTITY.to_owned(),
             term: 1,
             looked: true,
@@ -699,7 +700,7 @@ mod tests {
             &elector,
             stood.clone(),
             (Arc::clone(&store), feed),
-            Arc::new(crate::stages::Catalog::builtin()),
+            Arc::new(crate::stages::StageRegistry::builtin()),
             deciders,
         )
         .expect("the deciders start");
@@ -743,7 +744,7 @@ mod tests {
             self.counts().busy[reason as usize].load(Ordering::Relaxed)
         }
 
-        fn counts(&self) -> &Counts {
+        fn counts(&self) -> &DecideStats {
             self.shared.deciders.counts()
         }
 
@@ -759,7 +760,7 @@ mod tests {
 
         /// A session of the gateway `name` takes its seat at the clock's
         /// hour, under `term`.
-        fn welcomed(&self, name: &str, term: u64) -> Seat {
+        fn welcomed(&self, name: &str, term: u64) -> SessionPlace {
             self.shared
                 .gateways
                 .welcome(told(name).gateway(), name, term, self.now())
@@ -771,9 +772,9 @@ mod tests {
         /// the term.
         fn takes(&mut self, term: u64) {
             let tick = self.elector.tick(self.now()).expect("the take");
-            assert_eq!(tick, Tick::Acquired { term });
+            assert_eq!(tick, TickOutcome::Acquired { term });
             self.shared.store.set_term(term);
-            self.standing.send_replace(Standing {
+            self.standing.send_replace(ElectionObservation {
                 holder: IDENTITY.to_owned(),
                 term,
                 looked: true,
@@ -1445,7 +1446,7 @@ mod tests {
         stream.send(frame(4, 4)).await;
         let answer = stream.answer().await;
         assert_eq!((busy(&answer), answer.term), (Reason::NotLeader, 1));
-        bed.standing.send_replace(Standing {
+        bed.standing.send_replace(ElectionObservation {
             holder: "controller-1@10.0.0.8:30100".to_owned(),
             term: 4,
             looked: true,

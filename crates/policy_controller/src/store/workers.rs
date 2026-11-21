@@ -149,14 +149,14 @@ pub struct WorkerFacts {
     /// the default states none. The store derives the encode classes from
     /// it, with the engine kind as the runtime, where a membership write
     /// moves a member or an offer and where a generation moves the pairing
-    /// mode ([`encoding`](super::encoding)). The door drops a blank
+    /// mode (`encoding`). The door drops a blank
     /// connector and reads its name past its blanks.
     pub encode: EncodeOffer,
     /// The worker takes images, as its registration states: an encoder
     /// encodes them and a decode attends to them. A request that needs
     /// vision ([`Demands::vision`](crate::engine::demands::Demands::vision)) takes
     /// no other worker, so a registration that changes the bit starts
-    /// another life ([`Self::laid_over`]).
+    /// another life ([`Self::compare_to_standing`]).
     pub vision: bool,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
@@ -214,7 +214,7 @@ impl WorkerFacts {
 /// changes nothing of the row there. Two makers are one where they agree
 /// whole.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Maker {
+pub enum Registrant {
     /// A control call. Any caller of the control scope changes the row.
     #[default]
     Control,
@@ -224,7 +224,7 @@ pub enum Maker {
     Provider(Arc<ProviderKey>),
 }
 
-impl Maker {
+impl Registrant {
     /// The bytes of a provider's name: a label key's bound.
     pub const NAME_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
     /// The bytes of a provider's key for one worker: a URL's bound.
@@ -242,24 +242,35 @@ impl Maker {
     /// the provider's own text and may hold an address with a credential:
     /// no refusal, log line or metric label carries it. A key past its bound
     /// is refused and never shortened, since two shortened keys can meet.
-    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Result<Self, Unmade> {
+    pub fn provider(
+        provider: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<Self, ProviderKeyError> {
         let (provider, key) = (provider.into(), key.into());
         if provider.is_empty() {
-            return Err(Unmade::Provider("a provider's row names its provider"));
+            return Err(ProviderKeyError::Provider(
+                "a provider's row names its provider",
+            ));
         }
         if provider.len() > Self::NAME_BYTES {
-            return Err(Unmade::Provider("a provider's name is at most 128 bytes"));
+            return Err(ProviderKeyError::Provider(
+                "a provider's name is at most 128 bytes",
+            ));
         }
         if !token(&provider) {
-            return Err(Unmade::Provider(
+            return Err(ProviderKeyError::Provider(
                 "a provider's name is one token of visible ASCII with no comma",
             ));
         }
         if key.is_empty() {
-            return Err(Unmade::Key("a provider's row names its key for the worker"));
+            return Err(ProviderKeyError::Key(
+                "a provider's row names its key for the worker",
+            ));
         }
         if key.len() > Self::KEY_BYTES {
-            return Err(Unmade::Key("a provider's key is at most 2048 bytes"));
+            return Err(ProviderKeyError::Key(
+                "a provider's key is at most 2048 bytes",
+            ));
         }
         Ok(Self::Provider(Arc::new(ProviderKey { provider, key })))
     }
@@ -281,7 +292,7 @@ pub fn token(name: &str) -> bool {
 /// Why a provider's name and key make no maker: the part that breaks its
 /// rule, with the rule as a refusal says it. The words hold neither text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Unmade {
+pub enum ProviderKeyError {
     /// The provider's name.
     #[error("{0}")]
     Provider(&'static str),
@@ -291,7 +302,7 @@ pub enum Unmade {
 }
 
 /// A provider's name with its own key for one worker, each inside its rule:
-/// [`Maker::provider`] alone makes one.
+/// [`Registrant::provider`] alone makes one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProviderKey {
     provider: String,
@@ -325,7 +336,7 @@ pub struct WorkerRow {
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
     /// Who made the row.
-    pub maker: Maker,
+    pub maker: Registrant,
 }
 
 /// The mutable facts of a row a patch may change (`PatchWorker`; today the
@@ -437,9 +448,9 @@ pub trait WorkersStore: Send + Sync {
     /// with another incarnation is `Replaced` (the old id leaves with its
     /// state); the same key and incarnation refresh the facts in place
     /// (`Resized` when the data-parallel width moved, else `Relabelled`).
-    /// A new key's row is a control call's ([`Maker::Control`]).
+    /// A new key's row is a control call's ([`Registrant::Control`]).
     fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
-        self.upsert_by(facts, Maker::Control)
+        self.upsert_by(facts, Registrant::Control)
     }
 
     /// [`Self::upsert`] from `maker`: a new key's row is made by it. A row
@@ -451,7 +462,7 @@ pub trait WorkersStore: Send + Sync {
     /// life of a key with a number no life of the key had: the membership
     /// doors do ([`life`](super::membership::life)), and a row they made
     /// never comes back under its id.
-    fn upsert_by(&self, facts: WorkerFacts, maker: Maker) -> MembershipChange;
+    fn upsert_by(&self, facts: WorkerFacts, maker: Registrant) -> MembershipChange;
 
     /// Change a row's mutable facts; `None` when the row is gone or
     /// `revision` moved.
@@ -479,7 +490,7 @@ pub trait WorkersStore: Send + Sync {
     fn epoch(&self) -> u64;
 
     /// Every row with the epoch it stands at.
-    fn snapshot(&self) -> (u64, Vec<WorkerRow>);
+    fn all_rows(&self) -> (u64, Vec<WorkerRow>);
 
     /// The changes after `epoch`, or the instruction to snapshot again.
     fn changes_since(&self, epoch: u64) -> MembershipTail;

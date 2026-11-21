@@ -32,15 +32,16 @@ mod sent_prefixes {
     use crate::{
         document::{spec, spec::AffinitySource},
         engine::{
-            door::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
+            store_backed_engine::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
             view,
             view::{Candidate, Role, WireModes},
         },
-        predictor::Predictor,
         store::{
             index::{seam, Predicted},
-            Ask, GatewayId, Kinds, Named, Naming, Position, Reachability, ViewBuffers,
+            AffinityQuery, AffinityRowsBuffers, GatewayId, JournalKinds, Position, Reachability,
+            ViewBuffers, ViewQuery,
         },
+        tracking::prefix_predictor::PrefixPredictor,
     };
 
     type Case = Result<(), Box<dyn std::error::Error>>;
@@ -83,12 +84,12 @@ mod sent_prefixes {
 
     fn keys(hashes: &[u64]) -> Vec<u64> {
         let mut keys = Vec::new();
-        Predictor::fold_into(&mut keys, 0, hashes);
+        PrefixPredictor::fold_into(&mut keys, 0, hashes);
         keys
     }
 
     fn predicted(store: &MemoryStore, id: WorkerId) -> Option<()> {
-        record(store)?.record.write().sent(&keys(&HASHES), id, 0);
+        record(store)?.record.write().record(&keys(&HASHES), id, 0);
         Some(())
     }
 
@@ -97,7 +98,7 @@ mod sent_prefixes {
         wires: Option<WireModes>,
         cap: u32,
         seed: u64,
-    ) -> (Named, Vec<WorkerId>) {
+    ) -> (AffinityRowsBuffers, Vec<WorkerId>) {
         named_from(store, GatewayId::LOCAL, wires, cap, seed)
     }
 
@@ -107,12 +108,12 @@ mod sent_prefixes {
         wires: Option<WireModes>,
         cap: u32,
         seed: u64,
-    ) -> (Named, Vec<WorkerId>) {
-        let mut named = Named::default();
+    ) -> (AffinityRowsBuffers, Vec<WorkerId>) {
+        let mut named = AffinityRowsBuffers::default();
         let mut view = ViewBuffers::default();
         store.deciding(|world| {
             let now = Instant::now();
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway,
                 now,
                 pinned: None,
@@ -124,7 +125,7 @@ mod sent_prefixes {
                 view.candidates
                     .retain(|row| row.wire_modes.intersects(wires));
             }
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &HASHES,
                 namespace_seed: 0,
@@ -133,7 +134,7 @@ mod sent_prefixes {
                 wires,
                 now_micros: 0,
             };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
         });
         let ids = view.candidates.iter().map(|row| row.id).collect();
         (named, ids)
@@ -145,11 +146,11 @@ mod sent_prefixes {
         store: &MemoryStore,
         cap: u32,
         keeps: impl Fn(&Candidate) -> bool,
-    ) -> (Named, Vec<WorkerId>) {
-        let mut named = Named::default();
+    ) -> (AffinityRowsBuffers, Vec<WorkerId>) {
+        let mut named = AffinityRowsBuffers::default();
         let mut view = ViewBuffers::default();
         store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: Instant::now(),
                 pinned: None,
@@ -157,7 +158,7 @@ mod sent_prefixes {
                 signal_cells: false,
             };
             world.build(MODEL, Role::Single, &ask, &mut view);
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &HASHES,
                 namespace_seed: 0,
@@ -167,7 +168,7 @@ mod sent_prefixes {
                 now_micros: 0,
             };
             let rows = &view.candidates;
-            world.name(MODEL, Role::Single, &naming, rows, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, rows, &mut named);
             world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, || {
                 Some(&keeps)
             });
@@ -178,8 +179,8 @@ mod sent_prefixes {
 
     /// Each holder named: its worker, its blocks by the index and by the
     /// record.
-    fn holders(named: &Named, rows: &[WorkerId]) -> Vec<(WorkerId, u32, u32)> {
-        let worker = |holder: &crate::engine::NamedHolder| rows[holder.row as usize];
+    fn holders(named: &AffinityRowsBuffers, rows: &[WorkerId]) -> Vec<(WorkerId, u32, u32)> {
+        let worker = |holder: &crate::engine::AffinityHolder| rows[holder.row as usize];
         let each = named.holders.iter();
         each.map(|holder| {
             (
@@ -524,7 +525,7 @@ mod sent_prefixes {
         for &id in &ids {
             predicted(&store, id).ok_or("a record with a placement")?;
         }
-        let blocks = |named: &Named| -> Vec<(u32, u32)> {
+        let blocks = |named: &AffinityRowsBuffers| -> Vec<(u32, u32)> {
             let holders = named.holders.iter();
             holders
                 .map(|holder| (holder.overlap_blocks, holder.predicted_blocks))
@@ -614,8 +615,8 @@ mod sent_prefixes {
         let grpc = plain(&store, "grpc", WireModes::GRPC, Reachability::Any);
         store.apply(applied(&merged(1)?)?)?;
         let record = record(&store).ok_or("the model's record")?;
-        record.record.write().sent(&keys(&HASHES), http, 0);
-        record.record.write().sent(&keys(&HASHES[..3]), grpc, 0);
+        record.record.write().record(&keys(&HASHES), http, 0);
+        record.record.write().record(&keys(&HASHES[..3]), grpc, 0);
         let (named, rows) = named(&store, Some(WireModes::GRPC), 16, 7);
         assert_eq!(rows, vec![grpc]);
         assert_eq!(named.holders.len(), 1);
@@ -701,10 +702,10 @@ mod sent_prefixes {
             plain(&leader, "b", WireModes::GRPC, Reachability::Any);
             let own = sent_to(&leader, id)?;
             let standby = MemoryStore::new();
-            assert!(standby.restore_from(leader.cut(Kinds::All)));
+            assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
             let replayed = sent_to(&standby, id)?;
             let watcher = MemoryStore::new();
-            assert!(watcher.watch_from(leader.cut(Kinds::Watched)));
+            assert!(watcher.watch_from(leader.checkpoint(JournalKinds::Watched)));
             let watched = sent_to(&watcher, id)?;
 
             let change = leader.upsert(moved);
@@ -718,7 +719,7 @@ mod sent_prefixes {
                 row,
             );
             assert!(left(&replayed), "a standby's replay");
-            assert!(watcher.watch_from(leader.cut(Kinds::Watched)));
+            assert!(watcher.watch_from(leader.checkpoint(JournalKinds::Watched)));
             assert!(left(&watched), "a watch's snapshot");
         }
         Ok(())
@@ -815,7 +816,7 @@ mod sent_prefixes {
         store.apply(applied(&merged(1)?)?)?;
         let record = record(&store).ok_or("the model's record")?;
         let gone = keys(&(100..196).collect::<Vec<_>>());
-        record.record.write().sent(&gone, a, 0);
+        record.record.write().record(&gone, a, 0);
         predicted(&store, b).ok_or("a live placement")?;
 
         let row = store.get(a).ok_or("the registered row")?;
@@ -919,7 +920,7 @@ mod sent_prefixes {
         store.apply(applied(&merged(1)?)?)?;
         predicted(&store, a).ok_or("the old placement")?;
         let predicted = record(&store).ok_or("the model's record")?;
-        let mut cut = store.cut(Kinds::All);
+        let mut cut = store.checkpoint(JournalKinds::All);
         cut.rows.retain(|row| row.id == b);
         assert!(store.restore_from(cut));
         assert_eq!(predicted.record.read().deepest(&keys(&HASHES)).blocks(), 0);
@@ -944,7 +945,7 @@ mod sent_prefixes {
         assert_eq!(warm.holders.len(), 1);
         // A replica that recorded while it led restores a cut that holds
         // the worker at another rank: a cache of its own.
-        let mut cut = store.cut(Kinds::All);
+        let mut cut = store.checkpoint(JournalKinds::All);
         let rows = &mut cut.rows;
         let row = rows.iter_mut().find(|row| row.id == id);
         let row = row.ok_or("the cut's row")?;
@@ -981,7 +982,7 @@ mod sent_prefixes {
             profile.score.push(second.into());
         }
         let spec = applied(&document)?;
-        let cap = spec.engine().named_for(MODEL, view::Phase::Single);
+        let cap = spec.engine().affinity_rows_cap(MODEL, view::Phase::Single);
         assert_eq!(cap, 1);
         store.apply(spec)?;
         publish(&store, indexed);
@@ -1098,7 +1099,7 @@ mod sent_prefixes {
         predicted
             .record
             .write()
-            .sent(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
+            .record(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),
@@ -1145,7 +1146,7 @@ mod sent_prefixes {
         predicted
             .record
             .write()
-            .sent(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
+            .record(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),
@@ -1220,7 +1221,7 @@ fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
 /// the pools are walked.
 #[test]
 fn a_write_that_moves_no_member_walks_no_pool() {
-    use crate::engine::door::tests::sent_prefixes::{applied, merged};
+    use crate::engine::store_backed_engine::tests::sent_prefixes::{applied, merged};
 
     let store = MemoryStore::new();
     admitted(&store, "a");
@@ -2543,8 +2544,9 @@ mod named {
         engine::view::{Candidate, LoadRow, Role, WireModes, WorkerId},
         store::{
             index::{seam, PoolIndex},
-            Ask, BatchOutcome, GatewayId, KvEventSink, LoadSink, LoadSource, MemoryStore, Named,
-            Naming, Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkersStore,
+            AffinityQuery, AffinityRowsBuffers, BatchOutcome, GatewayId, KvEventSink, LoadSink,
+            LoadSource, MemoryStore, Reachability, Signals, ViewBuffers, ViewQuery, WorkerFacts,
+            WorkerRow, WorkersStore,
         },
     };
 
@@ -2617,9 +2619,9 @@ mod named {
         taken: &[WorkerId],
     ) -> Handed {
         let mut view = ViewBuffers::default();
-        let mut named = Named::default();
+        let mut named = AffinityRowsBuffers::default();
         store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway,
                 now: at,
                 pinned: None,
@@ -2634,7 +2636,7 @@ mod named {
                     .retain(|row| row.wire_modes.intersects(wires));
             }
             view.candidates.retain(|row| !taken.contains(&row.id));
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway,
                 block_hashes: request,
                 namespace_seed: 0,
@@ -2644,9 +2646,21 @@ mod named {
                 now_micros: built.now_micros,
             };
             if taken.is_empty() {
-                world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+                world.fill_affinity_rows(
+                    MODEL,
+                    Role::Single,
+                    &naming,
+                    &view.candidates,
+                    &mut named,
+                );
             } else {
-                world.name_cut(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+                world.fill_affinity_rows_narrowed(
+                    MODEL,
+                    Role::Single,
+                    &naming,
+                    &view.candidates,
+                    &mut named,
+                );
             }
         });
         let rows: Vec<WorkerId> = view.candidates.iter().map(|row| row.id).collect();
@@ -2797,7 +2811,7 @@ mod named {
 
     /// [`named_under_a_kept_world_each`], each naming then held to a test
     /// that refuses the rows of `refused` where it names some
-    /// ([`World::name_kept`](crate::store::World::name_kept)).
+    /// ([`StoreSnapshot::name_kept`](crate::store::StoreSnapshot::name_kept)).
     fn named_under_a_kept_world_less(
         store: &MemoryStore,
         request: &[u64],
@@ -2807,10 +2821,10 @@ mod named {
         then: impl FnOnce(),
     ) -> (Vec<Vec<(WorkerId, u32)>>, Vec<WorkerId>) {
         let mut view = ViewBuffers::default();
-        let mut named = Named::default();
+        let mut named = AffinityRowsBuffers::default();
         let mut each = Vec::with_capacity(seeds.len());
         let before: Vec<WorkerId> = store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: Instant::now(),
                 pinned: None,
@@ -2823,7 +2837,7 @@ mod named {
             then();
             let before: Vec<WorkerId> = view.candidates.iter().map(|row| row.id).collect();
             for &seed in seeds {
-                let naming = Naming {
+                let naming = AffinityQuery {
                     gateway: GatewayId::LOCAL,
                     block_hashes: request,
                     namespace_seed: 0,
@@ -2832,7 +2846,13 @@ mod named {
                     wires: None,
                     now_micros: built.now_micros,
                 };
-                world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+                world.fill_affinity_rows(
+                    MODEL,
+                    Role::Single,
+                    &naming,
+                    &view.candidates,
+                    &mut named,
+                );
                 if let Some(refused) = refused {
                     let keeps = |row: &Candidate| !refused.contains(&row.id);
                     let rows = &view.candidates;
@@ -3037,9 +3057,9 @@ mod named {
     /// read is set aside then, and at no other time.
     fn looks_again(store: &MemoryStore, request: &[u64], cap: u32, refused: &[WorkerId]) -> bool {
         let mut view = ViewBuffers::default();
-        let mut named = Named::default();
+        let mut named = AffinityRowsBuffers::default();
         store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: Instant::now(),
                 pinned: None,
@@ -3047,7 +3067,7 @@ mod named {
                 signal_cells: false,
             };
             let built = world.build(MODEL, Role::Single, &ask, &mut view);
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GatewayId::LOCAL,
                 block_hashes: request,
                 namespace_seed: 0,
@@ -3057,7 +3077,7 @@ mod named {
                 now_micros: built.expect("the pool").now_micros,
             };
             let rows = &view.candidates;
-            world.name(MODEL, Role::Single, &naming, rows, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, rows, &mut named);
             let keeps = |row: &Candidate| !refused.contains(&row.id);
             world.name_kept(MODEL, Role::Single, &naming, rows, &mut named, || {
                 Some(keeps)
@@ -3299,9 +3319,9 @@ mod named {
             .map(|id| another(id, &format!("third-{id:x}")))
             .collect();
         let mut view = ViewBuffers::default();
-        let mut named = Named::default();
+        let mut named = AffinityRowsBuffers::default();
         let rows: Vec<WorkerId> = store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: Instant::now(),
                 pinned: None,
@@ -3333,7 +3353,7 @@ mod named {
                 told.set(true);
                 step(inside);
             });
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &request,
                 namespace_seed: 0,
@@ -3342,7 +3362,7 @@ mod named {
                 wires: None,
                 now_micros: built.now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
             assert!(ran.get(), "the step ran inside the naming");
             assert!(!seam::pending(), "no step is left set behind the naming");
             view.candidates.iter().map(|row| row.id).collect()
@@ -3688,7 +3708,7 @@ mod named {
             for bits in 0u8..8 {
                 let wires = (bits != 0).then(|| WireModes::from_bits(bits));
                 let view = handed(&store, gateway, wires, &[], (16, 1)).rows;
-                let naming = Naming {
+                let naming = AffinityQuery {
                     gateway,
                     block_hashes: &[],
                     namespace_seed: 0,
@@ -3803,9 +3823,9 @@ mod named {
     /// worker.
     fn warming_at(store: &MemoryStore, now_micros: u64) -> Vec<WorkerId> {
         let mut view = ViewBuffers::default();
-        let mut named = Named::default();
+        let mut named = AffinityRowsBuffers::default();
         store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: Instant::now(),
                 pinned: None,
@@ -3815,7 +3835,7 @@ mod named {
             world
                 .build(MODEL, Role::Single, &ask, &mut view)
                 .expect("the pool");
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &[],
                 namespace_seed: 0,
@@ -3824,7 +3844,7 @@ mod named {
                 wires: None,
                 now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
         });
         let rows = &view.candidates;
         let named = named.warming.iter();
@@ -3915,9 +3935,9 @@ mod named {
         let id = admitted(&store, "a");
         holds(&store, id, &[1, 2, 3]);
         let mut view = ViewBuffers::default();
-        let mut named = Named::default();
+        let mut named = AffinityRowsBuffers::default();
         store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: Instant::now(),
                 pinned: None,
@@ -3929,7 +3949,7 @@ mod named {
                 .expect("the pool");
             // As a subset hint of 0 leaves it.
             view.candidates.clear();
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &[1, 2, 3],
                 namespace_seed: 0,
@@ -3938,7 +3958,7 @@ mod named {
                 wires: None,
                 now_micros: built.now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
         });
         assert!(named.holders.is_empty() && named.warming.is_empty());
     }
@@ -3975,7 +3995,7 @@ mod named {
             })
         };
         let reached = |wires: Option<WireModes>| {
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &[],
                 namespace_seed: 0,

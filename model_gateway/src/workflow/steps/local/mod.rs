@@ -30,7 +30,7 @@ use provider_workers::{
 pub use rediscover_labels::RediscoverLabelsStep;
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
-use smg_policy_controller::worker_host::{removal_at_door, REMOVE_WORKERS_AT_DOOR_STEP};
+use smg_policy_controller::worker_host::{removal_from_store, REMOVE_WORKERS_FROM_STORE_STEP};
 use smg_worker::{
     jobs::WorkerJobAsker,
     settings::UnhealthyRemovalScope,
@@ -138,7 +138,7 @@ pub(crate) fn worker_removal_line(
     // The feed's holder leaves a worker's status to the gateway's health
     // checks, so the drain's mark on the worker is this line's to make.
     let door = Arc::new(DrainingDoor::new(Arc::clone(&feed.door), Arc::clone(rows)));
-    removal_at_door::<AppContext>(door, Arc::clone(rows), scope)
+    removal_from_store::<AppContext>(door, Arc::clone(rows), scope)
         .add_step(
             StepDefinition::new(
                 DRAIN_PROVIDER_WORKERS_STEP,
@@ -148,7 +148,7 @@ pub(crate) fn worker_removal_line(
             // The window is the worker's own setting, as in the classic line.
             .with_timeout(SETTLE_STEP_TIMEOUT)
             .with_retry(single_attempt())
-            .depends_on(&[REMOVE_WORKERS_AT_DOOR_STEP]),
+            .depends_on(&[REMOVE_WORKERS_FROM_STORE_STEP]),
         )
         .add_step(
             StepDefinition::new(
@@ -330,8 +330,8 @@ mod tests {
         worker::{HealthCheckConfig, WorkerStatus},
     };
     use smg_policy_controller::{
-        store::{Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore},
-        worker_host::{facts, Expect, Remover, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
+        store::{MemoryStore, Registrant, WorkerStatus as RowStatus, WorkersStore},
+        worker_host::{facts, Precondition, Remover, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP},
     };
     use smg_worker::{
         identity::basic::{ConnectionMode, Worker},
@@ -687,7 +687,7 @@ mod tests {
         let first = built("m", "a");
         let wrote = feed
             .door
-            .found_built(&Maker::Control, Expect::Anything, &first, None);
+            .found_built(&Registrant::Control, Precondition::Any, &first, None);
         assert!(wrote.is_ok(), "{wrote:?}");
 
         let second = built("m", "b");
@@ -711,7 +711,7 @@ mod tests {
         );
         assert!(stands(&second));
 
-        let by = Remover::Maker(&Maker::Control);
+        let by = Remover::Registrant(&Registrant::Control);
         let drained = feed.door.drained(by, url, seen());
         assert!(drained.is_ok(), "{drained:?}");
         let leaving = step.refresh(seen(), &built("m", "c"), &second);
@@ -796,11 +796,11 @@ mod tests {
             "http://theirs:8000",
             "https://provider.example/v1",
         );
-        let found_by = Maker::provider(DISCOVERY, theirs).unwrap();
-        for (maker, url) in [(Maker::Control, ours), (found_by, theirs)] {
+        let found_by = Registrant::provider(DISCOVERY, theirs).unwrap();
+        for (maker, url) in [(Registrant::Control, ours), (found_by, theirs)] {
             let worker = built(url);
             feed.door
-                .found(&maker, Expect::Anything, url, &|standing| {
+                .found(&maker, Precondition::Any, url, &|standing| {
                     facts(worker.as_ref(), standing)
                 })
                 .unwrap();
@@ -865,7 +865,7 @@ mod tests {
         let stood = registry.get_by_url(theirs).unwrap();
         let state = removal(theirs).await;
         assert_eq!(state.status, WorkflowStatus::Failed);
-        let drain = &state.step_states[&StepId::new(DRAIN_WORKERS_AT_DOOR_STEP)];
+        let drain = &state.step_states[&StepId::new(DRAIN_WORKERS_IN_STORE_STEP)];
         let refusal = drain.last_error.as_deref().unwrap_or_default();
         assert!(
             refusal.contains("its worker is changed at the provider's source"),
@@ -923,7 +923,7 @@ mod tests {
                 .build(),
         );
         feed.door
-            .found(&Maker::Control, Expect::Anything, url, &|standing| {
+            .found(&Registrant::Control, Precondition::Any, url, &|standing| {
                 facts(built.as_ref(), standing)
             })
             .unwrap();
@@ -979,8 +979,8 @@ mod tests {
             );
             feed.door
                 .found(
-                    &Maker::Control,
-                    Expect::Anything,
+                    &Registrant::Control,
+                    Precondition::Any,
                     ranked.url(),
                     &|standing| facts(ranked.as_ref(), standing),
                 )

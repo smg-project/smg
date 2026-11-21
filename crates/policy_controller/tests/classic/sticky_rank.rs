@@ -18,7 +18,9 @@ use serde::Deserialize;
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{Constraints, Engine, Identity, RequestFacts, Role, Scratch},
-    store::{Ask, GatewayId, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{
+        GatewayId, MemoryStore, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
+    },
 };
 
 use crate::{same_shares, shares};
@@ -152,7 +154,7 @@ impl Bed {
     fn pick(&mut self, key: Option<&str>) -> Option<u16> {
         self.seed += 1;
         let now = Instant::now();
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now,
             pinned: None,
@@ -164,7 +166,7 @@ impl Bed {
             (&self.engine, &mut self.out, &mut self.scratch, self.seed);
         // The rows as the store lends them, with the pool's engines beside
         // them: the door a host decides through.
-        self.store.with_world(|world| {
+        self.store.with_snapshot(|world| {
             let view = world.view(MODEL, Role::Single, &ask, false, out)?;
             let facts = RequestFacts {
                 model: MODEL,

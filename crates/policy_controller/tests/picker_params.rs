@@ -6,8 +6,7 @@ use smg_policy_controller::{
         Candidate, Constraints, Health, Picker, PoolFacts, RequestFacts, Scratch, Targets, TieBand,
         WorkerId,
     },
-    stages::{Best, Catalog, StageBuild, StageError},
-    tracking::Lifecycle,
+    stages::{Best, Lifecycle, StageBuild, StageError, StageRegistry},
 };
 
 /// Passes over the first `rows` of the workers the filters left and picks
@@ -41,7 +40,7 @@ impl Picker for PastFirst {
 
 #[test]
 fn a_yaml_parameter_moves_the_pick() {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .picker_with("past-first", |build: &mut StageBuild<'_>| {
             let rule: PastFirst = build.params()?;

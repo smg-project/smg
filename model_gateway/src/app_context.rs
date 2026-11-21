@@ -15,7 +15,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::{stages::Catalog, store::MemoryStore};
+use smg_policy_controller::{stages::StageRegistry, store::MemoryStore};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -337,7 +337,7 @@ impl AppContext {
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
-        stages: Option<Catalog>,
+        stages: Option<StageRegistry>,
         connector: Option<Arc<dyn EngineConnector>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
@@ -781,7 +781,7 @@ impl AppContextBuilder {
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
-        stages: Option<Catalog>,
+        stages: Option<StageRegistry>,
         connector: Option<Arc<dyn EngineConnector>>,
     ) -> Result<Self, String> {
         // A served model aliased under a vendor name keeps that vendor's
@@ -986,7 +986,7 @@ impl AppContextBuilder {
     fn with_policy_controller(
         mut self,
         config: &RouterConfig,
-        stages: Option<Catalog>,
+        stages: Option<StageRegistry>,
     ) -> Result<Self, String> {
         let started =
             policy_controller::start_with(config, stages).map_err(|refusal| refusal.to_string())?;
@@ -1525,8 +1525,8 @@ mod tests {
     async fn under_the_feed_the_collectors_sink_is_the_feeds() {
         use smg_policy_controller::{
             engine::{Role, WireModes},
-            store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
-            worker_host::{Expect, Wrote},
+            store::{HealthPolicy, LoadSink, Registrant, WorkerFacts},
+            worker_host::{MembershipWriteOutcome, Precondition},
         };
         use smg_worker::common_proto::EngineLoad;
 
@@ -1564,9 +1564,11 @@ mod tests {
             },
             ..WorkerFacts::default()
         };
-        let Ok(Wrote::Registered(row)) =
+        let Ok(MembershipWriteOutcome::Registered(row)) =
             feed.door
-                .found(&Maker::Control, Expect::Nothing, URL, &|_| facts.clone())
+                .found(&Registrant::Control, Precondition::Absent, URL, &|_| {
+                    facts.clone()
+                })
         else {
             panic!("the worker registers at the feed's door");
         };

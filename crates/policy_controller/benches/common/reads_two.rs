@@ -3,7 +3,7 @@ use smg_policy_controller::{
     document::Needs,
     engine::{Candidate, RequestFacts, Scorer, TieBand},
     load::SignalColumn,
-    tracking::Lifecycle,
+    stages::Lifecycle,
 };
 
 /// Scores a row by the two values it reads: the less of both, the better.

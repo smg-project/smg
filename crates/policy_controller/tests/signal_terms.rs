@@ -10,7 +10,8 @@ use smg_policy_controller::{
         PoolFacts, RequestFacts, Scratch, Target, WorkerId,
     },
     load::{SignalCell, SignalCells},
-    tracking::{Lease, Lifecycle, Side},
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 /// The decisions' instant on the host's clock.

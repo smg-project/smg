@@ -5,8 +5,7 @@ use smg_policy_controller::{
     engine::{
         Candidate, Constraints, Health, PoolFacts, RequestFacts, Scorer, Scratch, TieBand, WorkerId,
     },
-    stages::{Catalog, StageBuild},
-    tracking::Lifecycle,
+    stages::{Lifecycle, StageBuild, StageRegistry},
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -43,7 +42,7 @@ impl Scorer for PreferWorker {
 #[test]
 fn a_yaml_parameter_moves_the_pick() {
     let engine = {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .scorer_with("prefer-worker", |build: &mut StageBuild<'_>| {
                 Ok(Box::new(build.params::<PreferWorker>()?))

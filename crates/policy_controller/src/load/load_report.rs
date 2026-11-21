@@ -348,7 +348,7 @@ struct Stated {
 /// Whose sample a report is: what says which of its entries a keeper
 /// reads, and under which sample instant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReportOf {
+pub enum LoadReportRanks {
     /// A polled answer's: one sample of every rank it lists, each entry
     /// its own.
     EveryRank {
@@ -365,7 +365,7 @@ pub enum ReportOf {
     },
 }
 
-impl ReportOf {
+impl LoadReportRanks {
     /// Whether the entry of `rank` is the report's own sample.
     fn is_of(self, rank: i32) -> bool {
         match self {
@@ -462,7 +462,7 @@ impl RankValues {
     pub fn values(
         &mut self,
         report: &WorkerLoadResponse,
-        of: ReportOf,
+        of: LoadReportRanks,
         columns: &Arc<[SignalColumn]>,
         sampled_at: Instant,
         each: impl FnMut(&SignalColumn, &str, f64, Instant),
@@ -522,7 +522,7 @@ impl RankValues {
     pub fn keep(
         &mut self,
         report: &WorkerLoadResponse,
-        of: ReportOf,
+        of: LoadReportRanks,
         columns: &Arc<[SignalColumn]>,
         sampled_at: Instant,
     ) -> bool {
@@ -534,7 +534,7 @@ impl RankValues {
         }
         self.read_under(columns);
         let several = report.loads.len() > 1;
-        let record = matches!(of, ReportOf::OneRank { .. });
+        let record = matches!(of, LoadReportRanks::OneRank { .. });
         // Which of the kept ranks this report lists. One that neither the
         // last pushed report nor the last answer lists takes its
         // statements: an answer can leave out a rank the pushed report
@@ -1082,8 +1082,8 @@ mod tests {
         columns: &Arc<[SignalColumn]>,
         (sampled_at, now): (Instant, Instant),
     ) -> Vec<(String, String, f64, u128)> {
-        let answer = ReportOf::EveryRank { pushed: None };
-        let of = record_of.map_or(answer, |rank| ReportOf::OneRank { rank });
+        let answer = LoadReportRanks::EveryRank { pushed: None };
+        let of = record_of.map_or(answer, |rank| LoadReportRanks::OneRank { rank });
         let mut handed = Vec::new();
         keeper.values(
             report,

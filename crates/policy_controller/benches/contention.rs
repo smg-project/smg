@@ -29,7 +29,8 @@ use std::{
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
     engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch},
-    tracking::{Lease, Lifecycle, Side},
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 /// The presets with a stateful stage (the credit tally, the rotation table)

@@ -53,7 +53,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) use crate::engine::door::Viewed;
+pub(crate) use crate::engine::store_backed_engine::Viewed;
 use crate::{
     document::{
         operator::{Document, NeedsRow, Status},
@@ -62,10 +62,10 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, Target},
         demands::Demands,
-        door::Asked,
+        store_backed_engine::RequestForm,
         view::{
-            fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
-            ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
+            fingerprint, key_of_session, AffinityRows, Constraints, HashKind, Header, Identity,
+            MediaCounts, ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
         },
     },
     service::proto::{
@@ -353,7 +353,7 @@ impl Checked {
         &self,
         lists: &mut Lists,
         view: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let (facts, constraints) = (&self.facts, &self.constraints);
@@ -454,7 +454,7 @@ impl Checked {
     }
 }
 
-impl Asked for Checked {
+impl RequestForm for Checked {
     type Lists = Lists;
 
     fn model(&self) -> &str {
@@ -515,7 +515,7 @@ impl Asked for Checked {
         &self,
         lists: &mut Lists,
         viewed: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         Self::read(self, lists, viewed, name, decide)
@@ -946,11 +946,11 @@ mod tests {
         document::spec::MAX_BLOCK_HASHES,
         engine::{
             decision::{
-                Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
-                Trace,
+                Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
+                Targets, Trace,
             },
-            door,
-            door::unnamed,
+            store_backed_engine,
+            store_backed_engine::unnamed,
             view::{
                 fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
                 ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
@@ -1106,7 +1106,7 @@ mod tests {
             spec::PolicySpec,
         },
         engine::{Candidate, Filter},
-        stages::Catalog,
+        stages::StageRegistry,
     };
 
     /// A need the contract's row has no flag for writes no row: the engine
@@ -1134,7 +1134,7 @@ mod tests {
             }
         }
 
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages
             .filter("held", || Box::new(Held))
             .expect("a free name");
@@ -1189,7 +1189,7 @@ mod tests {
             media: true,
             ..crate::document::Needs::default()
         };
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages
             .filter("tokens", move || Box::new(Reads("tokens", tokens)))
             .expect("a free name")
@@ -1712,12 +1712,12 @@ mod tests {
     /// its facts say, and is no pair's first request: its bit is not read.
     #[test]
     fn a_frame_keeps_its_decode_later_bit_and_its_decode_of_id() {
-        use crate::engine::{door::Asked, view::Phase};
+        use crate::engine::{store_backed_engine::RequestForm, view::Phase};
         let said = |later: bool, of: Option<u64>| {
             let mut frame = with(|facts| facts.phase = proto::Phase::Prefill.into());
             (frame.decode_later, frame.decode_of) = (later, of);
             let frame = Checked::new(frame).expect("no word is a field out of its range");
-            assert_eq!(Asked::decode_later(&frame), frame.decode_later());
+            assert_eq!(RequestForm::decode_later(&frame), frame.decode_later());
             let of = frame.decode_of().map(|lease| lease.0);
             assert_eq!(frame.asks_decode(), of.is_some());
             (frame.says_more(), frame.decode_later(), of, frame.phase())
@@ -1846,7 +1846,7 @@ mod tests {
     #[test]
     fn the_wire_carries_the_lifted_veto() {
         let steered = Trace {
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
             ..Trace::default()
         };
         assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);
@@ -1921,7 +1921,7 @@ mod tests {
             },
             ..Pick::default()
         });
-        let shed = door::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let shed = store_backed_engine::shed(ShedReason::NoEndpoints, "wires", 0, 6);
         let encoded = |decision| {
             super::decision(decision)
                 .trace

@@ -447,8 +447,8 @@ impl StepExecutor<WorkerWorkflowData> for RegisterBesideRowsStep {
 mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerSpec};
     use smg_policy_controller::{
-        store::{Maker, MemoryStore},
-        worker_host::{facts, Expect},
+        store::{MemoryStore, Registrant},
+        worker_host::{facts, Precondition},
     };
     use smg_worker::jobs::WorkerJobAsker;
     use wfaas::WorkflowInstanceId;
@@ -543,7 +543,7 @@ mod tests {
         let url = "http://worker:8080";
         let row = worker("m");
         feed.door
-            .found(&Maker::Control, Expect::Anything, url, &|standing| {
+            .found(&Registrant::Control, Precondition::Any, url, &|standing| {
                 facts(row.as_ref(), standing)
             })
             .unwrap();

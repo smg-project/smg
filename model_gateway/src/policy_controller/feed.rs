@@ -33,10 +33,11 @@ use std::{
 
 use parking_lot::Mutex;
 use smg_policy_controller::{
-    store::{LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
+    store::{LoadSink as StoreLoadSink, MemoryStore, Registrant, WorkerFacts},
     worker_host::{
-        Expect, HealthAdapter, KvFeed, LoadAdapter, Membership, Objects, Over, Refused, Remover,
-        SoleLead, Standing, StoreDoor, Wrote,
+        HealthAdapter, KvFeed, LoadAdapter, MembershipWriteOutcome, MembershipWriteRefused,
+        MembershipWriter, Objects, Over, Precondition, Remover, RowRevision, SoleLead,
+        StoreMembershipWriter,
     },
 };
 use smg_worker::{
@@ -62,7 +63,7 @@ use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerMonitor, Worke
 #[derive(Clone)]
 pub(crate) struct Feed {
     /// The membership door: the store's own, for a host with no election.
-    pub door: Arc<dyn Membership>,
+    pub door: Arc<dyn MembershipWriter>,
     /// The one writer of the objects of rows where the controller was picked.
     pub objects: Arc<Objects<ModelWorkerSnapshot>>,
     /// The store the door writes and the holder follows.
@@ -368,7 +369,7 @@ fn holder(
 
 fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed {
     let objects = Arc::new(objects);
-    let door = StoreDoor::new(Arc::clone(store)).telling({
+    let door = StoreMembershipWriter::new(Arc::clone(store)).telling({
         let objects = Arc::clone(&objects);
         let store = Arc::clone(store);
         move || settle(&objects, &store, None)
@@ -399,37 +400,40 @@ fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed
 /// A guarded write names the object it replaces, and the holder refuses it
 /// in that turn where another object stands.
 struct FeedDoor {
-    door: StoreDoor,
+    door: StoreMembershipWriter,
     turn: Arc<Mutex<()>>,
     objects: Arc<Objects<ModelWorkerSnapshot>>,
     store: Arc<MemoryStore>,
 }
 
 impl FeedDoor {
-    fn write<T>(&self, write: impl FnOnce(&StoreDoor) -> Result<T, Refused>) -> Result<T, Refused> {
+    fn write<T>(
+        &self,
+        write: impl FnOnce(&StoreMembershipWriter) -> Result<T, MembershipWriteRefused>,
+    ) -> Result<T, MembershipWriteRefused> {
         let _turn = self.turn.lock();
         write(&self.door)
     }
 }
 
-impl Membership for FeedDoor {
+impl MembershipWriter for FeedDoor {
     fn found(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<Wrote, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| door.found(maker, expect, url, state))
     }
 
     fn found_rows(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<Wrote>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         self.write(|door| {
             let seen = over.map(Over::object);
             self.objects.handing(self.store.as_ref(), built, seen, || {
@@ -438,20 +442,30 @@ impl Membership for FeedDoor {
         })
     }
 
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: RowRevision,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| door.drained(by, url, seen))
     }
 
-    fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+    fn gone(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: RowRevision,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| door.gone(by, url, seen))
     }
 
     fn refreshed(
         &self,
-        seen: Standing,
+        seen: RowRevision,
         built: &Arc<dyn Worker>,
         over: &Arc<dyn Worker>,
-    ) -> Result<Wrote, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| {
             self.objects
                 .handing_one(self.store.as_ref(), built, Some(over), || {

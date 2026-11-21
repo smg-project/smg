@@ -37,17 +37,14 @@ use smg_policy_controller::{
     document::Needs,
     engine::{
         Binding, Constraints, Engine, Filter, Picker, Plan, PoolFacts, Profile, RequestFacts,
-        Scorer, Scratch, Target, Weighted,
+        Scorer, Scratch, Target, WeightedScorer,
     },
     plugins::{
-        grpc::{
-            BreakerSpec, EventSet, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin,
-            Runtime, Transport,
-        },
-        shared::OpenDecisions,
+        grpc::{GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin, Runtime, Transport},
+        shared::{BreakerSpec, OpenDecisions},
     },
-    stages::{Best, Healthy, LeastRequests},
-    tracking::{Lease, Lifecycle, Side},
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{EventSet, Lease, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -103,7 +100,7 @@ fn plugin_engine(plugin: &Arc<Plugin>, stages: u32) -> Engine {
     engine_of(Profile {
         name: "plugin".into(),
         filters: vec![filter],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer,
             weight: 1.0,
         }],
@@ -116,7 +113,7 @@ fn native_engine() -> Engine {
     engine_of(Profile {
         name: "native".into(),
         filters: vec![Box::new(Healthy)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -280,7 +277,7 @@ fn bypassed(c: &mut Criterion) {
             Arc::clone(&bound),
             Some(Box::new(Healthy)),
         ))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(GrpcScorer::new(
                 Arc::clone(&bound),
                 Some(Box::new(LeastRequests)),

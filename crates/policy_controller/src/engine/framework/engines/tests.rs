@@ -4,11 +4,13 @@
 
 use std::cell::RefCell;
 
-use super::super::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, TieBand, Weighted};
+use super::super::{
+    Binding, Engine, Filter, Picker, Plan, Profile, Scorer, TieBand, WeightedScorer,
+};
 use crate::{
     document::spec::{BoundedLoadParams, Needs},
     engine::{
-        decision::{Decision, Lifted, Targets, MAX_TARGETS},
+        decision::{Decision, LiftedVeto, Targets, MAX_TARGETS},
         view::{
             fingerprint, Candidate, Constraints, Engines, Health, Identity, PoolFacts,
             RequestFacts, WorkerId,
@@ -19,8 +21,12 @@ use crate::{
         cache_aware::Gates, consistent_hashing::ConsistentHash, power_of_two::PowerOfTwo,
         random::Random,
     },
-    stages::builtins::{Best, CountFirst, NotOverloaded, SampledBest},
-    tracking::lease::{Lifecycle, Membership},
+    stages::{
+        filters::NotOverloaded,
+        lifecycle::Lifecycle,
+        pickers::{Best, CountFirst, SampledBest},
+    },
+    tracking::lease::Membership,
     Draw,
 };
 
@@ -112,7 +118,7 @@ fn engine_with(picker: Box<dyn Picker>) -> Engine {
     let profile = Profile {
         name: "unit".into(),
         filters: vec![Box::new(Asked)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(Handed),
             weight: 1.0,
         }],
@@ -574,7 +580,7 @@ fn ring_engine() -> Engine {
 
 /// `ring` under `best` and the filter of this file.
 fn ring_engine_of(ring: ConsistentHash) -> Engine {
-    let scorer = Weighted {
+    let scorer = WeightedScorer {
         scorer: Box::new(ring),
         weight: 1.0,
     };
@@ -582,14 +588,14 @@ fn ring_engine_of(ring: ConsistentHash) -> Engine {
 }
 
 /// One profile of `filters` and `scorers` under `best`.
-fn engine_of(filters: Vec<Box<dyn Filter>>, scorers: Vec<Weighted>) -> Engine {
+fn engine_of(filters: Vec<Box<dyn Filter>>, scorers: Vec<WeightedScorer>) -> Engine {
     engine_under(filters, scorers, Box::new(Best))
 }
 
 /// One profile of `filters` and `scorers` under `picker`.
 fn engine_under(
     filters: Vec<Box<dyn Filter>>,
-    scorers: Vec<Weighted>,
+    scorers: Vec<WeightedScorer>,
     picker: Box<dyn Picker>,
 ) -> Engine {
     let profile = Profile {
@@ -657,7 +663,7 @@ fn placed(
     rows: &[Candidate],
     engines: Engines<'_>,
     epoch: u64,
-) -> Option<(Vec<u32>, Lifted, bool)> {
+) -> Option<(Vec<u32>, LiftedVeto, bool)> {
     let facts = RequestFacts {
         model: "m",
         session_key: Identity::plain(key),
@@ -674,7 +680,7 @@ fn placed_as(
     rows: &[Candidate],
     engines: Engines<'_>,
     epoch: u64,
-) -> Option<(Vec<u32>, Lifted, bool)> {
+) -> Option<(Vec<u32>, LiftedVeto, bool)> {
     let pool = PoolFacts {
         pool_size: rows.len() as u32,
         generation: 1,
@@ -779,7 +785,7 @@ fn a_shadow_is_walked_as_its_live_decision_is() {
     let ring = |name: &str| Profile {
         name: name.into(),
         filters: vec![Box::new(Asked)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(ConsistentHash::new(None)),
             weight: 1.0,
         }],
@@ -1217,11 +1223,11 @@ fn a_row_the_fence_left_out_of_a_shown_pool_owns_its_keys_once_the_feed_names_it
 fn a_ring_with_a_stage_behind_it_is_its_profiles_run() {
     // The second stage moves the order, so no walk alone places a request.
     let both = || {
-        let ring = Weighted {
+        let ring = WeightedScorer {
             scorer: Box::new(ConsistentHash::new(None)),
             weight: 1.0,
         };
-        let cost = Weighted {
+        let cost = WeightedScorer {
             scorer: Box::new(Handed),
             weight: 4.0,
         };
@@ -1251,7 +1257,7 @@ fn a_ring_with_a_stage_behind_it_is_its_profiles_run() {
 
 #[test]
 fn a_ring_beside_a_filter_that_reads_its_pool_whole_is_its_profiles_run() {
-    let ring = Weighted {
+    let ring = WeightedScorer {
         scorer: Box::new(ConsistentHash::new(None)),
         weight: 1.0,
     };
@@ -1315,7 +1321,7 @@ fn a_pick_the_whole_pass_makes_behind_the_unit_reads_the_stream_on() {
 /// overload veto, marked as the validator marks a profile the ring alone
 /// places: a keyed request keeps its key's worker over the veto.
 fn kept_ring() -> Engine {
-    let scorer = Weighted {
+    let scorer = WeightedScorer {
         scorer: Box::new(ConsistentHash::new(None)),
         weight: 1.0,
     };
@@ -1355,9 +1361,9 @@ fn a_key_kept_over_the_veto_is_placed_by_the_walk_as_the_whole_pass_places_it() 
             // The one row under its thresholds stands without the lift,
             // whether the walk met it or not.
             let stood = if under == u32::MAX {
-                Lifted::Overload
+                LiftedVeto::Overload
             } else {
-                Lifted::None
+                LiftedVeto::None
             };
             assert_eq!(lifted, stood, "{key}, one in {under}");
             walked += u32::from(by_walk);
@@ -1392,7 +1398,7 @@ fn a_key_under_a_binding_that_sheds_is_walked_with_the_veto_standing() {
 #[test]
 fn a_ring_under_a_picker_that_narrows_is_its_profiles_run() {
     let ring_under = |picker: Box<dyn Picker>| {
-        let scorer = Weighted {
+        let scorer = WeightedScorer {
             scorer: Box::new(ConsistentHash::new(None)),
             weight: 1.0,
         };

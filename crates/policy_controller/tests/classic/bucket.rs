@@ -23,7 +23,8 @@ use smg_policy_controller::{
     engine::{
         Candidate, Constraints, Engine, Health, Phase, PoolFacts, RequestFacts, Scratch, WorkerId,
     },
-    tracking::{Lease, Lifecycle, Membership},
+    stages::Lifecycle,
+    tracking::{Lease, Membership},
 };
 
 use crate::{Outcome, Recorded, Replayed};

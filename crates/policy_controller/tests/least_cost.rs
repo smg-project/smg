@@ -12,8 +12,8 @@ use smg_policy_controller::{
         Candidate, Constraints, Engine, Health, LoadRow, Pick, PoolFacts, RequestFacts, Scorer,
         Scratch, Target, TieBand, WorkerId,
     },
-    stages::{score_costs, Catalog},
-    tracking::{Lease, Lifecycle, Side},
+    stages::{score_costs, Lifecycle, StageRegistry},
+    tracking::{Lease, Side},
 };
 
 fn parse(score: &str, pick: &str) -> Result<PolicySpec, serde_yaml::Error> {
@@ -961,7 +961,7 @@ fn a_registered_scorer_uses_the_same_tie_and_a_zero_band() {
     assert_eq!(band, TieBand(0.0));
     assert_eq!(out, [1.0, 1.0, 0.0]);
 
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer("own-cost", || Box::new(OwnCost))
         .expect("a new name");

@@ -20,7 +20,7 @@ use crate::{
     },
     plugins::shared::shown_hashes,
     tracking::{
-        counts::with_counts,
+        in_flight::with_counts,
         lease::{
             Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass,
         },
@@ -1040,8 +1040,8 @@ mod tests {
     use super::{layout::*, *};
     use crate::{
         document::spec::MAX_BLOCK_HASHES,
-        engine::view::{Header, MediaCounts, NamedAffinity, NamedHolder, WorkerId},
-        plugins::wasm::config::HeaderSet,
+        engine::view::{AffinityHolder, AffinityRows, Header, MediaCounts, WorkerId},
+        plugins::shared::config::HeaderSet,
     };
 
     fn candidate_row() -> Candidate {
@@ -1183,13 +1183,13 @@ mod tests {
     #[test]
     fn both_fills_give_a_named_holder_its_depth_and_every_other_row_nothing() {
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
-                holders: &[NamedHolder {
+            named: Some(AffinityRows {
+                holders: &[AffinityHolder {
                     row: 1,
                     overlap_blocks: 17,
                     predicted_blocks: 0,
                 }],
-                ..NamedAffinity::default()
+                ..AffinityRows::default()
             }),
             ..RequestFacts::default()
         };
@@ -1219,7 +1219,7 @@ mod tests {
     /// table, the rows themselves reading zero.
     #[test]
     fn both_fills_give_a_row_the_count_its_request_reads() {
-        use crate::tracking::counts::tests::Lent;
+        use crate::tracking::in_flight::tests::Lent;
         let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
         for (row, position) in rows.iter_mut().zip(0..) {
             row.position = position;

@@ -108,8 +108,8 @@ use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{LoadRow, Role, SignalSource, WorkerId},
     store::{
-        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
-        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, ViewQuery,
+        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -183,8 +183,8 @@ fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>, Instant) {
 
 /// The decision every build is timed for: a second after the window that
 /// opened at `opened`.
-fn ask_at(opened: Instant, affinity: bool) -> Ask {
-    Ask {
+fn ask_at(opened: Instant, affinity: bool) -> ViewQuery {
+    ViewQuery {
         gateway: GatewayId(1),
         now: opened + Duration::from_secs(1),
         pinned: None,
@@ -205,13 +205,13 @@ impl Fixture {
         }
     }
 
-    fn ask(&self, affinity: bool) -> Ask {
+    fn ask(&self, affinity: bool) -> ViewQuery {
         ask_at(self.window.get(), affinity)
     }
 }
 
 /// One build into the fixture's buffers; the rows it wrote.
-fn build(store: &MemoryStore, ask: &Ask, out: &mut ViewBuffers) -> usize {
+fn build(store: &MemoryStore, ask: &ViewQuery, out: &mut ViewBuffers) -> usize {
     let built = store.build_view(MODEL, Role::Single, black_box(ask), out);
     black_box(&out.candidates);
     black_box(&out.affinity);
@@ -260,22 +260,23 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
         let ask = fixture.ask(false);
         let until = ask.now + Duration::from_secs(60);
         let member = |nth: usize| fixture.ids[nth * n / 8];
-        let mut cell = |c: &mut Criterion, group: &str, id: &str, ask: &Ask, masked: usize| {
-            assert_eq!(build(&fixture.store, ask, &mut fixture.out), n);
-            let stalled = fixture
-                .out
-                .candidates
-                .iter()
-                .filter(|row| row.health.stalled)
-                .count();
-            assert_eq!(stalled, masked, "{group}/{id}/{n}");
-            let mut group = c.benchmark_group(group);
-            group.throughput(Throughput::Elements(n as u64));
-            group.bench_with_input(BenchmarkId::new(id, n), &n, |b, _| {
-                b.iter(|| build(&fixture.store, ask, &mut fixture.out));
-            });
-            group.finish();
-        };
+        let mut cell =
+            |c: &mut Criterion, group: &str, id: &str, ask: &ViewQuery, masked: usize| {
+                assert_eq!(build(&fixture.store, ask, &mut fixture.out), n);
+                let stalled = fixture
+                    .out
+                    .candidates
+                    .iter()
+                    .filter(|row| row.health.stalled)
+                    .count();
+                assert_eq!(stalled, masked, "{group}/{id}/{n}");
+                let mut group = c.benchmark_group(group);
+                group.throughput(Throughput::Elements(n as u64));
+                group.bench_with_input(BenchmarkId::new(id, n), &n, |b, _| {
+                    b.iter(|| build(&fixture.store, ask, &mut fixture.out));
+                });
+                group.finish();
+            };
         let mut standing = 0;
         for (count, group, id) in [
             (1_usize, "policy_store", "view_build_veto1"),
@@ -337,7 +338,7 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
                         .store
                         .gateway_veto(GatewayId(2 * holders), sick, Some(until));
                 }
-                let middle = Ask {
+                let middle = ViewQuery {
                     gateway: GatewayId(count + 1),
                     ..ask
                 };
@@ -645,7 +646,7 @@ fn publish(c: &mut Criterion, fixtures: &mut [Fixture]) {
                         if reader {
                             // The last publication's world takes the place
                             // of the one three publications back.
-                            kept[(turn % 2) as usize] = Some(fixture.store.world());
+                            kept[(turn % 2) as usize] = Some(fixture.store.snapshot());
                         }
                         let due = opened + PUBLISH_WINDOW;
                         fixture.window.set(due);
@@ -745,7 +746,7 @@ fn spawn_writer(
 /// of a write: two seconds without one is a broken cell.
 fn await_publication(
     store: &MemoryStore,
-    ask: &Ask,
+    ask: &ViewQuery,
     out: &mut ViewBuffers,
     before: &[Option<LoadRow>],
 ) {

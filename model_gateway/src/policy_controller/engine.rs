@@ -43,12 +43,12 @@ use rand::RngExt;
 use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
     engine::{
-        Constraints, Decision, Door, Identity, Lifted, Maker, MediaCounts, Pair, Phase, Refused,
-        Request, RequestFacts, ShadowKind, ShedReason, Swept, Targets, Trace, WireModes, WorkerId,
-        MAX_TARGETS,
+        Constraints, Decision, DecisionRefused, Identity, LiftedVeto, MediaCounts, Pair, Phase,
+        Request, RequestFacts, RequestFromSnapshot, ShadowKind, ShedReason, StoreBackedEngine,
+        SweepOutcome, Targets, Trace, WireModes, WorkerId, MAX_TARGETS,
     },
-    store::{GatewayId, MemoryStore, World},
-    tracking::{Handle, Outcome, ReleaseReason, Side, TransportClass},
+    store::{GatewayId, MemoryStore, StoreSnapshot},
+    tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
     worker_host::Objects,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
@@ -199,7 +199,7 @@ impl<'a> Ask<'a> {
     ///
     /// The routing key borrows the document. The door hands the ask the
     /// world it decides under, and the keys are derived there
-    /// ([`Handle::decide_under`]).
+    /// ([`DecisionGuard::decide_under`]).
     fn keys<'s>(&self, spec: &'s AppliedSpec) -> (Option<DerivedKey<'s>>, u64)
     where
         'a: 's,
@@ -282,12 +282,12 @@ struct Made<'r, 'a> {
     source: Cell<Option<&'static str>>,
 }
 
-impl Maker for Made<'_, '_> {
+impl RequestFromSnapshot for Made<'_, '_> {
     fn model(&self) -> &str {
         self.ask.model
     }
 
-    fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
+    fn make<'w>(&'w self, world: &'w StoreSnapshot) -> Request<'w> {
         let (derived, client_key) = self.ask.keys(world.spec());
         self.source.set(derived.map(|derived| match derived.source {
             KeySource::Header(_) => "header",
@@ -318,7 +318,7 @@ pub(crate) enum Unplaced {
     /// The controller queued the request.
     Queued,
     /// The door made no decision.
-    Refused(Refused),
+    Refused(DecisionRefused),
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
     /// A pair's ask found no endpoint, and by membership no prefill pairs
@@ -481,13 +481,13 @@ pub(crate) struct Asked {
     targets: Targets,
     /// The prefill and decode resolved for each pair target.
     pairs: [[Option<Arc<dyn Worker>>; 2]; MAX_TARGETS],
-    handle: Handle<Arc<Door>>,
+    handle: DecisionGuard<Arc<StoreBackedEngine>>,
 }
 
 /// The policy engine in this process: the door over the
 /// controller's store, and the holder of the gateway's worker objects.
 pub(crate) struct PolicyEngine {
-    door: Arc<Door>,
+    door: Arc<StoreBackedEngine>,
     workers: Workers,
 }
 
@@ -506,14 +506,14 @@ impl PolicyEngine {
     /// worker `objects`.
     pub(crate) fn new(store: Arc<MemoryStore>, objects: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
         Self {
-            door: Arc::new(Door::new(store)),
+            door: Arc::new(StoreBackedEngine::new(store)),
             workers: Workers::Held(objects),
         }
     }
 
     /// One pass of the door's clock at `now`: the call of the policy engine's
     /// timer ([`upkeep`](super::upkeep)), about once a second.
-    pub(crate) fn sweep(&self, now: Instant) -> Swept {
+    pub(crate) fn sweep(&self, now: Instant) -> SweepOutcome {
         self.door.sweep(now)
     }
 
@@ -542,7 +542,7 @@ impl PolicyEngine {
     #[cfg(test)]
     pub(crate) fn at_keys(store: Arc<MemoryStore>, registry: Arc<WorkerRegistry>) -> Self {
         Self {
-            door: Arc::new(Door::new(store)),
+            door: Arc::new(StoreBackedEngine::new(store)),
             workers: Workers::AtKey(registry),
         }
     }
@@ -575,7 +575,7 @@ impl PolicyEngine {
     }
 
     fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
-        self.door.store().with_world(|world| {
+        self.door.store().with_snapshot(|world| {
             let spec = world.spec();
             if spec.generation() != trace.generation {
                 return None;
@@ -622,7 +622,7 @@ impl PolicyEngine {
         if ask.phase == Phase::Single || ask.wires.is_empty() {
             return None;
         }
-        self.door.store().with_world(|world| {
+        self.door.store().with_snapshot(|world| {
             let refusal = world.pairs(ask.model)?.refusal(ask.wires)?;
             Some(Unplaced::NoCompatiblePair {
                 prefill: refusal.prefill.clone(),
@@ -661,9 +661,9 @@ impl PolicyEngine {
                     .collect(),
                 seed: trace.seed,
                 lifted: match trace.lifted {
-                    Lifted::None => "none",
-                    Lifted::Overload => "overload",
-                    Lifted::Liveness => "liveness",
+                    LiftedVeto::None => "none",
+                    LiftedVeto::Overload => "overload",
+                    LiftedVeto::Liveness => "liveness",
                 },
                 shed,
                 worker: worker.cloned(),
@@ -710,7 +710,7 @@ impl PolicyEngine {
             source: Cell::new(None),
         };
         let started = Instant::now();
-        let decided = Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
+        let decided = DecisionGuard::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
         let seconds = started.elapsed().as_secs_f64();
         // A key's source counts once an attempt, at its first ask, as a
         // keyed selection of the gateway's own policies counts it: an ask
@@ -719,7 +719,7 @@ impl PolicyEngine {
         if let Some(source) = made.source.get().filter(|_| first) {
             Metrics::record_routing_key_source(source);
         }
-        let decision = decided.as_ref().ok().map(Handle::decision);
+        let decision = decided.as_ref().ok().map(DecisionGuard::decision);
         let trace = decision.map(Decision::trace);
         let generation = trace.map_or(0, |trace| trace.generation);
         let profile = decision.and_then(profile_of);
@@ -1129,7 +1129,7 @@ pub(crate) struct Placed {
     /// A pair's own part, behind one pointer: a regular placement rides in
     /// its router's request context, whose size a case pins.
     pair: Option<Box<PlacedPair>>,
-    handle: Handle<Arc<Door>>,
+    handle: DecisionGuard<Arc<StoreBackedEngine>>,
 }
 
 /// A route's rule for a decode its second commit may take, as a kept ask

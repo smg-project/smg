@@ -62,7 +62,7 @@ impl Asked {
         match self.references {
             None => References::None,
             Some(Pin::Any) => References::Any,
-            Some(Pin::Only) => References::Host,
+            Some(Pin::Only) => References::Caller,
             Some(Pin::Never) => References::Worker,
         }
     }

@@ -22,9 +22,8 @@ use serde_json::{json, Value};
 use smg_policy_controller::{
     document::{operator::SpecRejected, AppliedSpec, PolicySpec, RoutingSettingsError, SpecError},
     engine::{Candidate, RequestFacts, Role, Scorer, TieBand, WireModes, WorkerId},
-    stages::{Catalog, CatalogError},
+    stages::{Lifecycle, StageRegistry, StageRegistryError},
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
-    tracking::Lifecycle,
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
 
@@ -80,7 +79,7 @@ fn the_classic_policies_start_no_store() -> Case {
 fn the_store_starts_with_the_document_the_routing_configuration_means() -> Case {
     let config = picked(RouterConfig::default());
     let store = start(&config)?.ok_or("the controller was picked and no store started")?;
-    let world = store.world();
+    let world = store.snapshot();
     assert_eq!(world.spec().generation(), 1);
     assert_eq!(
         world.spec().digest(),
@@ -101,7 +100,7 @@ fn the_store_starts_on_the_given_document() -> Case {
             ..RouterConfig::default()
         });
         let store = start(&config)?.ok_or("the controller was picked and no store started")?;
-        let world = store.world();
+        let world = store.snapshot();
         assert_eq!(world.spec().generation(), runs);
         assert_eq!(world.spec().digest(), Some(digest));
     }
@@ -483,7 +482,7 @@ fn a_provider_mode_of_a_multi_router_gateway_starts_the_store() -> Case {
         });
         let store = start(&config)?.ok_or("a self-hosted request lost the controller")?;
         assert_eq!(
-            store.world().spec().digest(),
+            store.snapshot().spec().digest(),
             Some(
                 picked(RouterConfig {
                     enable_igw: true,
@@ -517,7 +516,7 @@ fn a_provider_mode_of_a_multi_router_gateway_runs_a_given_document() -> Case {
             document,
         );
         let store = start(&config)?.ok_or("the given document started no store")?;
-        let world = store.world();
+        let world = store.snapshot();
         assert_eq!(world.spec().generation(), 2);
         assert_eq!(
             world.spec().digest(),
@@ -652,8 +651,8 @@ impl Scorer for SteadyScore {
     }
 }
 
-fn host_stages() -> Result<Catalog, CatalogError> {
-    let mut stages = Catalog::builtin();
+fn host_stages() -> Result<StageRegistry, StageRegistryError> {
+    let mut stages = StageRegistry::builtin();
     stages.scorer(SCORER, || Box::new(SteadyScore))?;
     Ok(stages)
 }
@@ -684,7 +683,7 @@ fn the_store_starts_with_a_registered_scorer() -> Case {
     let config = running(RouterConfig::default(), document);
     let started = start_with(&config, Some(host_stages()?))?
         .ok_or("the controller was picked and no store started")?;
-    let world = started.store.world();
+    let world = started.store.snapshot();
     assert_eq!(world.spec().generation(), generation);
     assert_eq!(world.spec().digest(), Some(digest));
     Ok(())
@@ -839,7 +838,7 @@ async fn a_hosts_catalog_and_document_reach_the_store_through_the_context() -> C
         .policy_store
         .as_ref()
         .ok_or("the controller was picked and no store started")?;
-    assert_eq!(store.world().spec().digest(), Some(digest));
+    assert_eq!(store.snapshot().spec().digest(), Some(digest));
 
     // The stock start holds no stage of a host, and says so by name.
     let refusal = AppContext::from_config(config, 30, None, None).await.err();
@@ -1222,7 +1221,7 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
     let generation = hosted
         .policy_store
         .as_ref()
-        .map(|store| store.world().spec().generation());
+        .map(|store| store.snapshot().spec().generation());
     assert_eq!(generation, Some(1));
     let mut unsaid = picked(quiet());
     unsaid.routing_key_override.enabled = true;
@@ -1360,8 +1359,8 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
 /// its feed's door under `url`: the context and the worker's row.
 async fn context_with_a_worker(url: &str) -> Result<(AppContext, WorkerId), Box<dyn Error>> {
     use smg_policy_controller::{
-        store::{HealthPolicy, Maker},
-        worker_host::{Expect, Wrote},
+        store::{HealthPolicy, Registrant},
+        worker_host::{MembershipWriteOutcome, Precondition},
     };
 
     let context = AppContext::from_config(picked(quiet()), 30, None, None).await?;
@@ -1371,21 +1370,23 @@ async fn context_with_a_worker(url: &str) -> Result<(AppContext, WorkerId), Box<
         .ok_or("the store has no feed")?;
     let wrote = feed
         .door
-        .found(&Maker::Control, Expect::Nothing, url, &|_| WorkerFacts {
-            key: url.to_owned(),
-            engine: url.to_owned(),
-            role: Role::Single,
-            wire_modes: WireModes::HTTP,
-            models: vec!["model-a".to_owned()],
-            dp_size: 1,
-            max_running: Some(64),
-            health: HealthPolicy {
-                probes: false,
-                ..HealthPolicy::default()
-            },
-            ..WorkerFacts::default()
+        .found(&Registrant::Control, Precondition::Absent, url, &|_| {
+            WorkerFacts {
+                key: url.to_owned(),
+                engine: url.to_owned(),
+                role: Role::Single,
+                wire_modes: WireModes::HTTP,
+                models: vec!["model-a".to_owned()],
+                dp_size: 1,
+                max_running: Some(64),
+                health: HealthPolicy {
+                    probes: false,
+                    ..HealthPolicy::default()
+                },
+                ..WorkerFacts::default()
+            }
         });
-    let Ok(Wrote::Registered(row)) = wrote else {
+    let Ok(MembershipWriteOutcome::Registered(row)) = wrote else {
         return Err(format!("expected a registration, got {wrote:?}").into());
     };
     Ok((context, row))

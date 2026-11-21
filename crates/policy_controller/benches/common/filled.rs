@@ -8,7 +8,7 @@ use smg_policy_controller::{engine::Role, store::MemoryStore};
 
 /// The pool of `model` and `role` lists `rows` members.
 pub fn filled(store: &MemoryStore, model: &str, role: Role, rows: usize) {
-    let listed = store.world().members(model, role);
+    let listed = store.snapshot().members(model, role);
     assert_eq!(
         listed,
         Some(rows),

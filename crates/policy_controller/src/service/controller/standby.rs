@@ -30,7 +30,7 @@ use tonic::{
 use tracing::{info, warn};
 
 use super::{
-    election::Standing,
+    election::ElectionObservation,
     generations::Generations,
     principal::ENTRY,
     replication::BEAT,
@@ -44,9 +44,11 @@ use crate::{
             self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
             replication_event::Event as Sent,
         },
-        replication::{Log, Lost},
+        replication::{Log, LogPositionLost},
     },
-    store::{Cut, Kinds, LeasesStore, LoadSample, MemoryStore, Position, WorkerRow},
+    store::{
+        JournalKinds, LeasesStore, LoadSample, MemoryStore, Position, StoreCheckpoint, WorkerRow,
+    },
 };
 
 /// Why a standby stopped applying its leader's stream.
@@ -102,8 +104,8 @@ impl Follower {
     /// log stands at the place its own run drew, and its leader continues
     /// it from the leader's first write.
     pub(crate) fn place(&self) -> Position {
-        let head = self.log.head(Kinds::All);
-        if self.log.first(Kinds::All) == Some(head) {
+        let head = self.log.head(JournalKinds::All);
+        if self.log.first(JournalKinds::All) == Some(head) {
             Position::default()
         } else {
             head
@@ -117,7 +119,7 @@ impl Follower {
     /// is the place of a standby that applied nothing.
     pub(crate) fn asking(&self) -> Position {
         Position {
-            seq: self.log.head(Kinds::All).seq.max(1),
+            seq: self.log.head(JournalKinds::All).seq.max(1),
             term: 0,
         }
     }
@@ -136,7 +138,7 @@ impl Follower {
     /// applied.
     pub(crate) fn restore(
         &self,
-        cut: Cut,
+        cut: StoreCheckpoint,
         told: Option<&proto::GenerationEvent>,
     ) -> Result<bool, Refused> {
         let following = match (told, &self.generations) {
@@ -182,12 +184,14 @@ impl Follower {
                 // with a term's start, which writes no row. The log joins
                 // there first: told the term with no place to journal it
                 // at, it would start a lead of the store's own.
-                Err(Lost) if matches!(event.event, Some(Sent::TermStart(_))) => {
-                    self.log.join(at).map_err(|Lost| Halt::Lost(at))?;
+                Err(LogPositionLost) if matches!(event.event, Some(Sent::TermStart(_))) => {
+                    self.log
+                        .join(at)
+                        .map_err(|LogPositionLost| Halt::Lost(at))?;
                     self.store.follow_term(at);
                     continue;
                 }
-                Err(Lost) => return Err(Halt::Lost(at)),
+                Err(LogPositionLost) => return Err(Halt::Lost(at)),
             };
             match &event.event {
                 Some(Sent::Membership(told)) => {
@@ -252,7 +256,7 @@ impl Staged {
         &mut self,
         batch: &proto::ReplicationBatch,
         now: Instant,
-    ) -> Result<Option<Cut>, Refused> {
+    ) -> Result<Option<StoreCheckpoint>, Refused> {
         let refused = |path, why| Err(Refused { path, why });
         let Some(part) = &batch.snapshot else {
             return refused(
@@ -285,7 +289,7 @@ impl Staged {
             self.generation = part.generation.as_deref().cloned();
         }
         worker_wire::told_part(part, now, &mut self.rows, &mut self.loads)?;
-        Ok(part.last.then(|| Cut {
+        Ok(part.last.then(|| StoreCheckpoint {
             at,
             epoch: part.membership_epoch,
             rows: std::mem::take(&mut self.rows),
@@ -536,7 +540,7 @@ impl Streak {
 /// Waits `wait` at most between two streams. A wait for the lease to be
 /// read again (`lease`) ends at the election's next step; a streak's wait
 /// ends at the step that names another holder.
-async fn pause(steps: &mut watch::Receiver<Standing>, lease: bool, wait: Duration) {
+async fn pause(steps: &mut watch::Receiver<ElectionObservation>, lease: bool, wait: Duration) {
     let holder = steps.borrow_and_update().holder.clone();
     let moved = async {
         while steps.changed().await.is_ok() {
@@ -686,7 +690,11 @@ impl Standby {
     /// lease's sake: with [`Next::Turn`] once the lease names another
     /// holder, another term of the same one or this replica, with
     /// [`Next::Lease`] once the election is gone.
-    async fn turned(&self, steps: &mut watch::Receiver<Standing>, leader: &Leader) -> Next {
+    async fn turned(
+        &self,
+        steps: &mut watch::Receiver<ElectionObservation>,
+        leader: &Leader,
+    ) -> Next {
         loop {
             if steps.changed().await.is_err() {
                 return Next::Lease;
@@ -992,11 +1000,11 @@ mod tests {
                 election::LeasePlace,
                 replication::{journaled, journaled_from, parts, Replication},
             },
-            elector::{ElectionSettings, Elector, Tick},
+            elector::{ElectionSettings, Elector, TickOutcome},
             proto::policy_controller_server::{PolicyController, PolicyControllerServer},
             replication::{Entry, Event},
         },
-        stages::catalog,
+        stages::registry,
         store::{LoadSink, LoadSource, WorkerFacts, WorkerStatus, WorkersStore},
     };
 
@@ -1012,7 +1020,8 @@ mod tests {
     /// The place before a log's first write, where a standby that applied
     /// nothing is continued from.
     fn start(log: &Log) -> Position {
-        log.first(Kinds::All).expect("every write is retained")
+        log.first(JournalKinds::All)
+            .expect("every write is retained")
     }
 
     /// A leader's store and log under term 1, and a standby's applier over
@@ -1048,7 +1057,7 @@ mod tests {
     fn entries(log: &Log, mut place: Position) -> Vec<Entry> {
         let (mut all, mut out) = (Vec::new(), Vec::new());
         loop {
-            log.read(Kinds::All, place, 64, &mut out)
+            log.read(JournalKinds::All, place, 64, &mut out)
                 .expect("the place is held");
             let Some(last) = out.last() else {
                 return all;
@@ -1099,7 +1108,7 @@ mod tests {
     /// What a replica holds, without the instants: its place, its epoch,
     /// its rows and its load rows.
     fn held(store: &MemoryStore) -> impl PartialEq + std::fmt::Debug {
-        let cut = store.cut(Kinds::All);
+        let cut = store.checkpoint(JournalKinds::All);
         let rows: Vec<_> = cut
             .rows
             .into_iter()
@@ -1165,7 +1174,7 @@ mod tests {
         // It applied nothing: it names no place of any run, and its log
         // stands where its own run drew.
         assert_eq!(follower.place(), Position::default());
-        assert_eq!(start(&followed), followed.head(Kinds::All));
+        assert_eq!(start(&followed), followed.head(JournalKinds::All));
         let at = Instant::now();
         first(&leader, at);
         follow(&follower, &led, at);
@@ -1185,7 +1194,7 @@ mod tests {
             format!("{:?}", held(&leader))
         );
         assert_eq!(told(&followed), told(&led));
-        assert_eq!(follower.place(), led.head(Kinds::All));
+        assert_eq!(follower.place(), led.head(JournalKinds::All));
         assert!(told(&led).len() > 10, "{:?}", told(&led));
     }
 
@@ -1195,7 +1204,7 @@ mod tests {
         let mut elector =
             Elector::alone("controller-0@10.0.0.7:30100", ElectionSettings::default())
                 .expect("the default settings are in order");
-        let Ok(Tick::Acquired { term }) = elector.tick(at) else {
+        let Ok(TickOutcome::Acquired { term }) = elector.tick(at) else {
             panic!("a free lease is taken at the first tick");
         };
         let cut = Replication::new(Arc::clone(store), Arc::clone(log), elector.fence())
@@ -1206,7 +1215,7 @@ mod tests {
 
     /// The cut a standby stages from the `parts` of a snapshot, read at
     /// `at`.
-    fn staged(parts: &[proto::ReplicationBatch], at: Instant) -> Cut {
+    fn staged(parts: &[proto::ReplicationBatch], at: Instant) -> StoreCheckpoint {
         let mut staged = Staged::default();
         let mut cut = None;
         for part in parts {
@@ -1225,7 +1234,7 @@ mod tests {
         standby.upsert(facts("http://stale:8000", 1));
         let first = snapshot(&leader, at);
         assert_eq!(follower.restore(staged(&first, at), None), Ok(true));
-        assert_eq!(follower.place(), leader.1.head(Kinds::All));
+        assert_eq!(follower.place(), leader.1.head(JournalKinds::All));
         assert_eq!(held(&standby), held(&leader.0));
         rest(&leader.0, at);
         follow(&follower, &leader.1, at);
@@ -1518,7 +1527,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_streaks_wait_ends_at_the_step_that_names_another_holder() {
-        let stands = |holder: &str, term| Standing {
+        let stands = |holder: &str, term| ElectionObservation {
             holder: holder.to_owned(),
             term,
             looked: true,
@@ -1860,8 +1869,8 @@ mod tests {
 
         /// What the election saw: this leader holds the lease as `id`
         /// under `term`.
-        fn holds(&self, id: &str, term: u64) -> Standing {
-            Standing {
+        fn holds(&self, id: &str, term: u64) -> ElectionObservation {
+            ElectionObservation {
                 holder: format!("{id}@{}", self.addr),
                 term,
                 looked: true,
@@ -1874,13 +1883,16 @@ mod tests {
     /// A replica that follows: its candidate, its election's writer and
     /// its loop, which dials the port of `bed` and holds a stream quiet
     /// for `quiet` at most.
-    fn standing_by(bed: &Bed, quiet: Duration) -> (Elector, watch::Sender<Standing>, Standby) {
+    fn standing_by(
+        bed: &Bed,
+        quiet: Duration,
+    ) -> (Elector, watch::Sender<ElectionObservation>, Standby) {
         let elector = Elector::alone(OWN, ElectionSettings::default())
             .expect("the default settings are in order");
-        let (standing, stood) = watch::channel(Standing::default());
+        let (standing, stood) = watch::channel(ElectionObservation::default());
         let journal = journaled(&LeasePlace::File("shared".into()), 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
-        let catalog = Arc::new(crate::stages::Catalog::builtin());
+        let catalog = Arc::new(crate::stages::StageRegistry::builtin());
         let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)
             .expect("the deciders start");
         let mut standby = Standby::new(Arc::new(shared), bed.addr.port());
@@ -1946,7 +1958,7 @@ mod tests {
         let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
         assert_eq!(ended.why.as_deref(), Some("Aborted: deposed"));
-        assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
+        assert_eq!(standby.follower.place(), leader.1.head(JournalKinds::All));
         assert_eq!(*bed.names.lock(), ["standby-0"]);
     }
 
@@ -1968,7 +1980,7 @@ mod tests {
             }
             let tail = entries(&leader.1, place);
             let head = if stated {
-                leader.1.head(Kinds::All).seq
+                leader.1.head(JournalKinds::All).seq
             } else {
                 0
             };
@@ -2008,7 +2020,7 @@ mod tests {
         // store's own stands past every place its log drew: it takes the
         // next number where the leader's places lie above the standby's
         // own. This leader's start there.
-        let drawn = standby.follower.log.head(Kinds::All);
+        let drawn = standby.follower.log.head(JournalKinds::All);
         let above = journaled_from(&LeasePlace::File("shared".into()), drawn.seq + 1);
         let leader: Replica = (above.0, above.1.log);
         leader.0.set_term(1);
@@ -2056,12 +2068,12 @@ mod tests {
             let leader = led();
             let now = Instant::now();
             let parts = snapshot(&leader, now);
-            let place = leader.1.head(Kinds::All);
+            let place = leader.1.head(JournalKinds::All);
             // A row written while the snapshot was sent: the last part
             // states a head one past the snapshot's place.
             leader.0.upsert(facts("http://b:8000", 1));
             let written = entries(&leader.1, place);
-            let head = leader.1.head(Kinds::All).seq;
+            let head = leader.1.head(JournalKinds::All).seq;
             standing.send_replace(bed.holds("leader-1", 1));
             let named = standby.shared.leader(None);
             let applied = AtomicBool::new(false);
@@ -2122,7 +2134,7 @@ mod tests {
         };
         let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
-        assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
+        assert_eq!(standby.follower.place(), leader.1.head(JournalKinds::All));
         assert_eq!(start(&standby.shared.feed.log), start(&leader.1));
     }
 
@@ -2136,7 +2148,7 @@ mod tests {
         leader.0.record(b, 0, running(1), now, LoadSource::Stream);
         let parts = snapshot(&leader, now);
         assert_eq!(parts.len(), 2, "the rows' part and the load rows'");
-        let place = leader.1.head(Kinds::All);
+        let place = leader.1.head(JournalKinds::All);
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
         let applied = AtomicBool::new(false);
@@ -2161,7 +2173,7 @@ mod tests {
         };
         let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
-        assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
+        assert_eq!(standby.follower.place(), leader.1.head(JournalKinds::All));
         assert_eq!(held(&standby.shared.store), held(&leader.0));
         let lag = standby.shared.lag.age(Instant::now());
         assert!(lag.is_some(), "a restore is a frame applied");
@@ -2319,7 +2331,7 @@ mod tests {
         // it saw as it is. The leader answers its snapshot, and the event
         // after it again does not land: a streak's wait, not a stream.
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(Kinds::All);
+        let restored = leader.1.head(JournalKinds::All);
         let lost = gap(&leader, restored);
         let applied = AtomicBool::new(false);
         let script = async {
@@ -2354,7 +2366,7 @@ mod tests {
         // A restore, an event that lands, then one that does not: the pair
         // is over, and the next stream opens at once.
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(Kinds::All);
+        let restored = leader.1.head(JournalKinds::All);
         leader.0.upsert(facts("http://landed:8000", 1));
         let lands = entries(&leader.1, restored).remove(0);
         let lost = gap(&leader, lands.at);
@@ -2378,7 +2390,7 @@ mod tests {
         // A restore, then one batch whose first event lands and whose
         // second does not: an event landed since the restore all the same.
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(Kinds::All);
+        let restored = leader.1.head(JournalKinds::All);
         leader.0.upsert(facts("http://halved:8000", 1));
         let lands = entries(&leader.1, restored).remove(0);
         let halved = proto::ReplicationBatch {
@@ -2478,7 +2490,7 @@ mod tests {
         let leader = led();
         let now = Instant::now();
         let parts = snapshot(&leader, now);
-        let restored = leader.1.head(Kinds::All);
+        let restored = leader.1.head(JournalKinds::All);
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
         let hello = |place: Position| {
@@ -2561,7 +2573,7 @@ mod tests {
         // An event did not land, and the replica took its own lease since.
         standby.asks.store(true, Ordering::Relaxed);
         let took = elector.tick(Instant::now());
-        assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
+        assert!(matches!(took, Ok(TickOutcome::Acquired { .. })), "{took:?}");
         let applied = AtomicBool::new(false);
         let ended = standby.stream(&named, &applied).await;
         assert_eq!((ended.next, ended.applied), (Next::Lease, false));
@@ -2598,8 +2610,8 @@ mod tests {
         // This replica takes the lease: it leaves the stream, and at the
         // election's next step it dials nobody.
         let took = elector.tick(Instant::now());
-        assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
-        let own = Standing {
+        assert!(matches!(took, Ok(TickOutcome::Acquired { .. })), "{took:?}");
+        let own = ElectionObservation {
             holder: OWN.to_owned(),
             term: 4,
             looked: true,
@@ -2729,8 +2741,8 @@ mod tests {
         // This replica takes the lease: the frame it applied before its
         // lead is forgotten.
         let took = elector.tick(Instant::now());
-        assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
-        standing.send_replace(Standing {
+        assert!(matches!(took, Ok(TickOutcome::Acquired { .. })), "{took:?}");
+        standing.send_replace(ElectionObservation {
             holder: OWN.to_owned(),
             term: 3,
             looked: true,
@@ -2907,7 +2919,7 @@ mod tests {
 
     /// The stock door over a replica's store.
     fn door((store, _): &Replica) -> Arc<Generations> {
-        let catalog = Arc::new(catalog::Catalog::builtin());
+        let catalog = Arc::new(registry::StageRegistry::builtin());
         Arc::new(Generations::new(Arc::clone(store), catalog))
     }
 
@@ -2957,7 +2969,7 @@ mod tests {
             spec_document(following.document(0).expect("held")),
             spec_document(leading.document(0).expect("held"))
         );
-        assert_eq!(following.counts().applied, 1, "the one that stood");
+        assert_eq!(following.apply_counts().applied, 1, "the one that stood");
 
         // An applier with no door does not apply a generation: its standby
         // leaves the synced state at that place, the term's start applied.
@@ -3012,7 +3024,7 @@ mod tests {
         assert_eq!(following.generation(), 0);
         // The generation lands behind the restore, at no place of its own.
         assert_eq!(follower.restore(stage().0, stated.as_ref()), Ok(true));
-        assert_eq!(follower.place(), leader.1.head(Kinds::All));
+        assert_eq!(follower.place(), leader.1.head(JournalKinds::All));
         assert_eq!(held(&standby.0), held(&leader.0));
         assert_eq!(
             spec_document(following.document(0).expect("held")),

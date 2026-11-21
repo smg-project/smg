@@ -466,7 +466,7 @@ impl Plugin {
     /// opens it once per decision. A build that binds the plugin to several
     /// profiles takes each set from one [`Plugin::binder`]; taken here, each
     /// set would forward the lifecycle.
-    pub fn bind(self: &Arc<Self>) -> Arc<Bound> {
+    pub fn bind(self: &Arc<Self>) -> Arc<PluginBinding> {
         self.binder().bind()
     }
 }
@@ -483,7 +483,7 @@ impl Drop for Plugin {
 
 /// A frame on its way: the ticket its send returned. The take reads the
 /// frame's answer over the same ticket, and the wait between the two is one
-/// function (`Bound::wait`): a host that parks a decision on its ticket
+/// function (`PluginBinding::wait`): a host that parks a decision on its ticket
 /// instead of blocking its thread replaces that function alone.
 #[derive(Clone, Copy)]
 struct Ticket {
@@ -586,8 +586,8 @@ pub struct Binder {
 impl Binder {
     /// The bound set of one profile of this build: the three adapters of
     /// the profile share it, and the engine opens it once per decision.
-    pub fn bind(&self) -> Arc<Bound> {
-        Arc::new(Bound {
+    pub fn bind(&self) -> Arc<PluginBinding> {
+        Arc::new(PluginBinding {
             plugin: Arc::clone(&self.plugin),
             opens: ThreadLocal::new(),
             stages: AtomicU32::new(0),
@@ -599,7 +599,7 @@ impl Binder {
 
 /// A plugin bound to one profile: its open decisions per thread and the
 /// stages the profile asks of it.
-pub struct Bound {
+pub struct PluginBinding {
     plugin: Arc<Plugin>,
     opens: ThreadLocal<RefCell<Opens>>,
     /// The stage bits the profile binds this plugin as.
@@ -610,9 +610,9 @@ pub struct Bound {
     unimplemented_said: AtomicBool,
 }
 
-impl fmt::Debug for Bound {
+impl fmt::Debug for PluginBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Bound")
+        f.debug_struct("PluginBinding")
             .field("plugin", &self.plugin.inner.name)
             .finish_non_exhaustive()
     }
@@ -627,7 +627,7 @@ fn phase_slot(phase: Phase) -> usize {
     }
 }
 
-impl Bound {
+impl PluginBinding {
     pub fn plugin(&self) -> &Arc<Plugin> {
         &self.plugin
     }
@@ -1106,21 +1106,21 @@ impl Bound {
 /// This open marks its phase open and counts the decision before it reads
 /// the runtime's clock and builds its frame, so it runs under the guard
 /// that undoes an open that stops half-way.
-impl DecisionScope for Bound {
+impl DecisionScope for PluginBinding {
     fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>) {
         let mut half_open = HalfOpen::new(self);
-        Bound::open(self, facts, candidates, pool);
+        PluginBinding::open(self, facts, candidates, pool);
         half_open.returned();
     }
 
     fn close(&self) {
-        Bound::close(self);
+        PluginBinding::close(self);
     }
 }
 
 /// The shared stage adapters read the bound decision through this: the gRPC
 /// kind's answers, named by the plugin.
-impl BoundPlugin for Bound {
+impl BoundPlugin for PluginBinding {
     fn name(&self) -> &'static str {
         self.plugin.name()
     }
@@ -1138,7 +1138,7 @@ impl BoundPlugin for Bound {
     }
 
     fn take_observer(&self) -> bool {
-        Bound::take_observer(self)
+        PluginBinding::take_observer(self)
     }
 
     fn bound_to(&self, stage: Stage) {
@@ -1151,11 +1151,11 @@ impl BoundPlugin for Bound {
     }
 
     fn keep(&self, facts: &RequestFacts<'_>, position: u32) -> Result<bool, Fallback> {
-        Bound::keep(self, facts, position)
+        PluginBinding::keep(self, facts, position)
     }
 
     fn retain(&self, facts: &RequestFacts<'_>, kept: &mut Vec<u32>) -> Result<(), Fallback> {
-        Bound::retain(self, facts, kept)
+        PluginBinding::retain(self, facts, kept)
     }
 
     fn score(
@@ -1164,7 +1164,7 @@ impl BoundPlugin for Bound {
         kept: &[u32],
         out: &mut [f32],
     ) -> Result<TieBand, Fallback> {
-        Bound::score(self, facts, kept, out)
+        PluginBinding::score(self, facts, kept, out)
     }
 
     fn pick(
@@ -1173,7 +1173,7 @@ impl BoundPlugin for Bound {
         kept: &[u32],
         scores: &[f32],
     ) -> Result<u32, Fallback> {
-        Bound::pick(self, facts, kept, scores)
+        PluginBinding::pick(self, facts, kept, scores)
     }
 
     fn observe_issued(&self, lease: &Lease, decision: &Decision) {

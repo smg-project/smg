@@ -7,7 +7,7 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-use crate::{load::signals, tracking::counts};
+use crate::{load::signals, tracking::in_flight};
 
 /// The stable identity of a candidate: a hash of the registration key and the
 /// incarnation, never a URL. A same-URL replacement is a new id.
@@ -60,6 +60,18 @@ pub enum HashKind {
 /// window is this many times the model's block size in bytes, and a text's
 /// size in tokens is its bytes over this.
 pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
+
+/// How many whole blocks of `block_size` lie within the first `tokens`
+/// tokens of a request hashed in `kind`: the tokens over the block size,
+/// under the text kind their bytes over the window's size in bytes. A
+/// block size is one at least.
+pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
+    let units = match kind {
+        HashKind::Token => tokens,
+        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
+    };
+    units / block_size
+}
 
 /// Where a candidate's load row came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -396,10 +408,10 @@ pub struct AffinityFacts {
 /// release build reads them as they stand, a row past the count naming
 /// nobody. In-process only.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct NamedAffinity<'a> {
+pub struct AffinityRows<'a> {
     /// The rows that hold a leading part of the request, ascending by row,
     /// each with what it holds. A row not named reads as holding nothing.
-    pub holders: &'a [NamedHolder],
+    pub holders: &'a [AffinityHolder],
     /// The pool's warming rows, ascending, by the warm-up stage's rule as
     /// the host applied it: the thin whatever the fleet's age, else the
     /// young unless every row is young.
@@ -418,7 +430,7 @@ pub struct NamedAffinity<'a> {
 /// of what it holds, by both readings. Its age and its index size stay with
 /// the host, which ruled the warming rows from them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NamedHolder {
+pub struct AffinityHolder {
     /// The row's index in the candidate slice.
     pub row: u32,
     /// As [`AffinityFacts::overlap_blocks`].
@@ -427,7 +439,7 @@ pub struct NamedHolder {
     pub predicted_blocks: u32,
 }
 
-impl<'a> NamedAffinity<'a> {
+impl<'a> AffinityRows<'a> {
     /// Row `index`'s entry: what the host said the row holds when it is
     /// named, nothing held otherwise.
     ///
@@ -438,7 +450,7 @@ impl<'a> NamedAffinity<'a> {
     /// come in the draw's order, and such a branch is one nothing predicts.
     #[inline]
     pub(crate) fn entry(&self, index: u32) -> AffinityFacts {
-        const NOBODY: NamedHolder = NamedHolder {
+        const NOBODY: AffinityHolder = AffinityHolder {
             row: 0,
             overlap_blocks: 0,
             predicted_blocks: 0,
@@ -459,7 +471,7 @@ impl<'a> NamedAffinity<'a> {
     }
 
     /// Whether the engine drew the rows a stage is handed: it set their
-    /// mean ([`NamedAffinity::mean_in_flight`]). They stand in the draw's
+    /// mean ([`AffinityRows::mean_in_flight`]). They stand in the draw's
     /// order, so a pass reads each row by a search and keeps no cursor; a
     /// walk is the read of a pool read whole, whose rows stand ascending.
     /// The sign chooses a cost and never an answer: both reads answer
@@ -470,7 +482,7 @@ impl<'a> NamedAffinity<'a> {
     }
 }
 
-impl NamedHolder {
+impl AffinityHolder {
     /// The row's entry of a column: what it holds by both readings, and
     /// nothing said of its age or its index.
     #[inline]
@@ -543,15 +555,15 @@ impl<'a, T: Copy> Walk<'a, T> {
 
 /// One pass's reads of the rows a host named, in the pass's own order.
 #[derive(Debug)]
-pub(crate) struct NamedWalk<'a>(Walk<'a, NamedHolder>);
+pub(crate) struct NamedWalk<'a>(Walk<'a, AffinityHolder>);
 
 impl NamedWalk<'_> {
-    /// Row `index`'s entry, as [`NamedAffinity::entry`] reads it.
+    /// Row `index`'s entry, as [`AffinityRows::entry`] reads it.
     #[inline]
     pub(crate) fn entry(&mut self, index: u32) -> AffinityFacts {
         self.0
             .find(index, |holder| holder.row)
-            .map_or_else(AffinityFacts::default, NamedHolder::facts)
+            .map_or_else(AffinityFacts::default, AffinityHolder::facts)
     }
 }
 
@@ -561,7 +573,7 @@ impl NamedWalk<'_> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Feed<'a> {
     Column(&'a [AffinityFacts]),
-    Named(NamedAffinity<'a>),
+    Named(AffinityRows<'a>),
 }
 
 impl Feed<'_> {
@@ -574,7 +586,7 @@ impl Feed<'_> {
     }
 
     /// The mean in flight the engine set behind a draw
-    /// ([`NamedAffinity::mean_in_flight`]): the rows named carry it, a
+    /// ([`AffinityRows::mean_in_flight`]): the rows named carry it, a
     /// column carries none.
     pub(crate) fn drawn_mean(self) -> Option<f32> {
         match self {
@@ -584,7 +596,7 @@ impl Feed<'_> {
     }
 
     /// Row `index`'s entry: a column's own, where an index past the end
-    /// fails, or a named row's ([`NamedAffinity::entry`]).
+    /// fails, or a named row's ([`AffinityRows::entry`]).
     #[inline]
     pub(crate) fn entry(self, index: u32) -> AffinityFacts {
         match self {
@@ -757,16 +769,16 @@ pub struct Candidate {
 }
 
 /// How far back the store's decision clock starts.
-pub(crate) const REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
+pub(crate) const LOAD_REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
 
 /// A sample clipped to the clock's origin must already be past the limit.
-pub(crate) const MAX_REPORT_AGE_MS: u32 = REPORT_CLOCK_HISTORY_MS - 1;
+pub(crate) const MAX_LOAD_REPORT_AGE_MS: u32 = LOAD_REPORT_CLOCK_HISTORY_MS - 1;
 
 /// The oldest sample a decision can use under a report age limit.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReportCutoff(u64);
+pub(crate) struct LoadReportCutoff(u64);
 
-impl ReportCutoff {
+impl LoadReportCutoff {
     /// The cutoff of a view that sets no limit: no sample is older than
     /// the clock's origin, so every report is read.
     pub(crate) const ANY_AGE: Self = Self(0);
@@ -824,7 +836,7 @@ pub(crate) fn mean_in_flight(
     if rows.is_empty() {
         return 0.0;
     }
-    let sum: u64 = crate::tracking::counts::with_counts!(facts, |counts| rows
+    let sum: u64 = crate::tracking::in_flight::with_counts!(facts, |counts| rows
         .iter()
         .map(|&i| u64::from(counts(&candidates[i as usize])))
         .sum());
@@ -939,7 +951,7 @@ pub struct RequestFacts<'a> {
     /// the count itself. A pair takes none: a position is a place in one
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
-    pub lent_in_flight: Option<&'a counts::LentCounts<'a>>,
+    pub lent_in_flight: Option<&'a in_flight::PoolInFlightCounts<'a>>,
     /// The rows that carry requests of this request's session key, each
     /// with its count, where the host did not write the count into the
     /// rows ([`Candidate::session_in_flight`]): a host that keeps the
@@ -979,11 +991,11 @@ pub struct RequestFacts<'a> {
     /// the candidates, until the decision is committed. In-process only: a
     /// wire carries each candidate's facts in its record.
     pub affinity: &'a [AffinityFacts],
-    /// The rows the host names in that column's place ([`NamedAffinity`]):
+    /// The rows the host names in that column's place ([`AffinityRows`]):
     /// beside an empty column, the affinity stages read them. A pair
     /// decision takes none: its sides read their pools' columns. In-process
     /// only.
-    pub named: Option<NamedAffinity<'a>>,
+    pub named: Option<AffinityRows<'a>>,
     /// The fingerprint of `model` when the host holds it, as a host that
     /// keeps its models makes it once a model; [`ModelFingerprint::NONE`]
     /// when it does not, and each read of [`RequestFacts::session`] then
@@ -1059,7 +1071,7 @@ impl<'a> RequestFacts<'a> {
     /// The column is asked first, so a host that fills one pays nothing for
     /// the rows it does not name.
     #[inline(always)]
-    pub(crate) fn named_alone(&self) -> Option<NamedAffinity<'a>> {
+    pub(crate) fn named_alone(&self) -> Option<AffinityRows<'a>> {
         if self.affinity.is_empty() {
             self.named
         } else {
@@ -1120,7 +1132,7 @@ impl<'a> RequestFacts<'a> {
     /// and the read is that entry: an index past its end is a host's
     /// mistake and fails as an index past the candidates does, never as a
     /// default in the entry's place. Where the host named rows in the
-    /// column's place ([`NamedAffinity`]), a named row reads what the host
+    /// column's place ([`AffinityRows`]), a named row reads what the host
     /// said it holds and every other row nothing held. Each read tests the
     /// feed and its bound: a pass over a pool takes the column once
     /// ([`RequestFacts::affinity`]) and walks it beside the rows, as this
@@ -1226,7 +1238,7 @@ pub struct Constraints<'a> {
     /// pair's request that states a demand, under the stage `wires`,
     /// whatever its sides state. In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
-    /// before it sends it over a link (`Handle::asked`).
+    /// before it sends it over a link (`DecisionGuard::asked`).
     pub demands: crate::engine::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a
@@ -1372,12 +1384,12 @@ pub struct PoolFacts<'a> {
     /// decision is the one by rank. A host that says the fact of a pool
     /// that holds a row without a report is answered by what the row
     /// lacks: in front it makes the stage say that it must be asked whole
-    /// ([`Front::Whole`](crate::engine::Front::Whole)), and the decision is the
-    /// whole pass's, which paid for its ranks' reading. Behind the rows in
-    /// front it is not costed where they decide alone, and the decision is
-    /// the one by rank. Where they cannot, their band being wider than the
-    /// ranks leave room for, every row is asked, that row with them, and
-    /// the decision is the whole pass's. In-process only.
+    /// ([`ScoreFront::Whole`](crate::engine::ScoreFront::Whole)), and the
+    /// decision is the whole pass's, which paid for its ranks' reading. Behind
+    /// the rows in front it is not costed where they decide alone, and the
+    /// decision is the one by rank. Where they cannot, their band being wider
+    /// than the ranks leave room for, every row is asked, that row with them,
+    /// and the decision is the whole pass's. In-process only.
     pub reported: bool,
     /// The pool's engines, where the host lists them ([`Engines`]): the
     /// candidates are then the rows the list's positions name. Empty by
@@ -1388,7 +1400,7 @@ pub struct PoolFacts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracking::counts::tests::Lent;
+    use crate::tracking::in_flight::tests::Lent;
 
     /// One reader, two feeds: a row's requests in flight are the lent count
     /// at the row's position where the host lends a table, whatever the
@@ -1551,15 +1563,15 @@ mod tests {
     #[test]
     fn a_walk_of_the_rows_named_reads_each_row_as_the_search_does() {
         let holders = [(1, 4, 0), (4, 9, 2), (5, 1, 7), (9, 3, 0)].map(
-            |(row, overlap_blocks, predicted_blocks)| NamedHolder {
+            |(row, overlap_blocks, predicted_blocks)| AffinityHolder {
                 row,
                 overlap_blocks,
                 predicted_blocks,
             },
         );
-        let named = NamedAffinity {
+        let named = AffinityRows {
             holders: &holders,
-            ..NamedAffinity::default()
+            ..AffinityRows::default()
         };
         let orders: [&[u32]; 4] = [
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
@@ -1574,7 +1586,7 @@ mod tests {
             }
         }
         // No row named: nothing held at any row.
-        let mut walk = NamedAffinity::default().walk();
+        let mut walk = AffinityRows::default().walk();
         assert_eq!(walk.entry(0), AffinityFacts::default());
         assert_eq!(walk.entry(3), AffinityFacts::default());
     }
@@ -1584,16 +1596,16 @@ mod tests {
     /// cursor, where the walk asked in that order does.
     #[test]
     fn a_read_behind_a_draw_searches_the_rows_named_and_keeps_no_cursor() {
-        let holders = [(1, 4), (4, 9), (9, 3)].map(|(row, overlap_blocks)| NamedHolder {
+        let holders = [(1, 4), (4, 9), (9, 3)].map(|(row, overlap_blocks)| AffinityHolder {
             row,
             overlap_blocks,
             predicted_blocks: 0,
         });
-        let whole = NamedAffinity {
+        let whole = AffinityRows {
             holders: &holders,
-            ..NamedAffinity::default()
+            ..AffinityRows::default()
         };
-        let drawn = NamedAffinity {
+        let drawn = AffinityRows {
             mean_in_flight: Some(1.0),
             ..whole
         };
@@ -1633,21 +1645,21 @@ mod tests {
     #[test]
     fn rows_named_in_the_columns_place_read_what_each_holds() {
         let holders = [
-            NamedHolder {
+            AffinityHolder {
                 row: 1,
                 overlap_blocks: 9,
                 predicted_blocks: 0,
             },
-            NamedHolder {
+            AffinityHolder {
                 row: 4,
                 overlap_blocks: 3,
                 predicted_blocks: 7,
             },
         ];
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
+            named: Some(AffinityRows {
                 holders: &holders,
-                ..NamedAffinity::default()
+                ..AffinityRows::default()
             }),
             ..RequestFacts::default()
         };
@@ -1657,7 +1669,7 @@ mod tests {
         });
         assert_eq!(read, [(0, 0), (9, 0), (0, 0), (3, 7), (0, 0)]);
         let nobody = RequestFacts {
-            named: Some(NamedAffinity::default()),
+            named: Some(AffinityRows::default()),
             ..RequestFacts::default()
         };
         assert_eq!(nobody.affinity_at(3), AffinityFacts::default());

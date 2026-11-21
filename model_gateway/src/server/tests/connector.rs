@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use mock_worker::config::SchedulerWire;
 use smg_policy_controller::{
     engine::{Role, WireModes},
-    store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
-    worker_host::{Expect, Membership, Wrote},
+    store::{HealthPolicy, LoadSink, Registrant, WorkerFacts},
+    worker_host::{MembershipWriteOutcome, MembershipWriter, Precondition},
 };
 use smg_worker::{
     common_proto::KvEventBatch,
@@ -588,7 +588,7 @@ async fn placed_after_one_poll(
     read: &Read,
     engines: &[(String, &str, f64)],
 ) -> String {
-    let door: &dyn Membership = &*app.policy_feed.as_ref().unwrap().door;
+    let door: &dyn MembershipWriter = &*app.policy_feed.as_ref().unwrap().door;
     for (url, kind, _) in engines {
         let facts = WorkerFacts {
             key: url.clone(),
@@ -605,8 +605,13 @@ async fn placed_after_one_poll(
             },
             ..WorkerFacts::default()
         };
-        let wrote = door.found(&Maker::Control, Expect::Nothing, url, &|_| facts.clone());
-        assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
+        let wrote = door.found(&Registrant::Control, Precondition::Absent, url, &|_| {
+            facts.clone()
+        });
+        assert!(
+            matches!(wrote, Ok(MembershipWriteOutcome::Registered(_))),
+            "{wrote:?}"
+        );
     }
     let (first, _, _) = &engines[0];
     let worker = app.worker_registry.get_by_url(first).unwrap();
@@ -627,7 +632,7 @@ async fn placed_after_one_poll(
     }
     // One value an engine was taken, and none dropped.
     let taken = u64::try_from(engines.len()).unwrap();
-    assert_eq!(store.counts().signal_writes, [taken, 0, 0, 0, 0, 0]);
+    assert_eq!(store.stats().signal_writes, [taken, 0, 0, 0, 0, 0]);
 
     let policy_engine = app.policy_engine.as_ref().unwrap();
     let ask = Ask::of(b"polled", MODEL_ID);

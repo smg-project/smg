@@ -47,7 +47,7 @@ use std::{
 use net::http_get;
 use replicas::{Lease, Record, Replica, ROOM};
 use smg_policy_controller::service::{
-    elector::{ElectionSettings, FileLease, LeaseBackend, LeaseRecord, Written},
+    elector::{ConditionalWriteOutcome, ElectionSettings, FileLease, LeaseBackend, LeaseRecord},
     proto::{
         policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, SnapshotRequest,
     },
@@ -834,7 +834,7 @@ async fn lost_under_a_live_leader(loss: Loss) {
                             ..held.clone()
                         };
                         let written = store.write(Some(&held), &cleared).expect("the clearing");
-                        (written == Written::Done).then_some(held.term)
+                        (written == ConditionalWriteOutcome::Done).then_some(held.term)
                     })
                     .expect("a clearing lands within its tries")
             }

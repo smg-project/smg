@@ -46,15 +46,15 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use smg_policy_controller::{
     document::{Needs, MAX_BLOCK_HASHES},
     engine::{
-        Binding, Constraints, Decider, Engine, Plan, PoolFacts, Profile, RequestFacts, Scratch,
-        Target, Weighted, WorkerId,
+        Binding, Constraints, DecisionSlot, Engine, Plan, PoolFacts, Profile, RequestFacts,
+        Scratch, Target, WeightedScorer, WorkerId,
     },
     plugins::{
         shared::OpenDecisions,
-        wasm::{EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+        wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
     },
-    stages::{Best, Healthy, LeastRequests},
-    tracking::{Lease, Lifecycle, Membership, Side},
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{EventSet, Lease, Membership, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -93,7 +93,7 @@ fn plugin_engine(plugin: &Arc<Plugin>) -> Engine {
     let profile = Profile {
         name: "plugin".into(),
         filters: vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(Arc::clone(&bound), None)),
             weight: 1.0,
         }],
@@ -107,7 +107,7 @@ fn native_engine() -> Engine {
     engine_of(Profile {
         name: "native".into(),
         filters: vec![Box::new(Healthy)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -508,7 +508,7 @@ fn decide_named(c: &mut Criterion) {
             ..PoolFacts::default()
         };
         let cx = Constraints::default();
-        let turn = Decider::new(0).enter();
+        let turn = DecisionSlot::new(0).enter();
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::new(world, n), &n, |b, _| {
             let mut seed = 0u64;

@@ -30,8 +30,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
     engine::{LoadRow, Role, SignalSource},
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore, PUBLISH_WINDOW,
+        GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, ViewQuery, WorkerFacts,
+        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -93,11 +93,17 @@ fn pair_pool(n: usize) -> (Arc<MemoryStore>, Instant) {
 /// `iters` pair builds through one door on buffers of this thread's own,
 /// after one untimed build held to both pools' sizes; the wall time they
 /// took.
-fn pair_builds(store: &MemoryStore, ask: &Ask, owned: bool, n: usize, iters: u64) -> Duration {
+fn pair_builds(
+    store: &MemoryStore,
+    ask: &ViewQuery,
+    owned: bool,
+    n: usize,
+    iters: u64,
+) -> Duration {
     let mut out = PairBuffers::default();
     let one = |out: &mut PairBuffers| {
         if owned {
-            store.world().build_pair(MODEL, black_box(ask), out)
+            store.snapshot().build_pair(MODEL, black_box(ask), out)
         } else {
             store.build_pair(MODEL, black_box(ask), out)
         }
@@ -124,7 +130,7 @@ fn pair(c: &mut Criterion) {
         let (store, opened) = pair_pool(n);
         // The decision every pair is timed for: a second after the window
         // that opened last.
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now: opened + Duration::from_secs(1),
             pinned: None,
