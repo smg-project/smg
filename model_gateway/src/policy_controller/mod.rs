@@ -215,10 +215,10 @@ impl InProcess {
     /// engine through, and no classic policy places one.
     ///
     /// They do where the engine decides every request of the document in
-    /// force whole today: single requests alone, under no sessions rule,
-    /// each place picked by its picker alone or decided by a profile that
-    /// asks nothing this process does not feed a whole decision
-    /// ([`fed`]). Under any other document the
+    /// force whole today: single requests alone, each place picked by its
+    /// picker alone or decided by a profile that asks nothing this process
+    /// does not feed a whole decision, and each sessions rule comparing no
+    /// count it does not feed ([`fed`]). Under any other document the
     /// routers keep their classic placement pass, whose policies ask the
     /// engine for the pick. The set grows with what the engine decides
     /// whole, and this question goes when it decides every document.
@@ -248,7 +248,14 @@ impl InProcess {
 /// pass: a hash ring, a header of the request, a named signal's cells, and
 /// the media a request carries. No route states a request's media counts
 /// to the engine: a stage that declared them would read none for every
-/// request, with no error.
+/// request, with no error. Nor is a session key's own count of requests
+/// on a worker fed, so a sessions rule with an in-flight cap keeps that
+/// pass too.
+///
+/// The hash ring of a list stands beside the list already, filled off the
+/// path of a request ([`engine::PolicyEngine::fill_rings`]). It is not
+/// stated here until it places a key on the worker the classic policy's
+/// ring does: a key then keeps its worker when the setting is turned on.
 fn fed() -> Needs {
     Needs {
         token_hashes: true,

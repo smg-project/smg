@@ -1560,6 +1560,50 @@ mod tests {
         }
     }
 
+    /// Under the manual policy a gateway that decides in its own process
+    /// holds the engine object the routers ask, whatever the assignment of
+    /// a key's first request. Under the two policies that place by a hash
+    /// ring it holds none yet: the classic policy places their requests.
+    #[tokio::test]
+    async fn a_context_in_process_holds_the_engine_object_under_the_manual_policy() {
+        use crate::config::ManualAssignmentMode;
+
+        let built = |policy: PolicyConfig| async move {
+            let config = RouterConfig {
+                policy_controller: true,
+                ..config_with_policy(policy)
+            };
+            AppContext::from_config(config, 10, None, None)
+                .await
+                .expect("a context")
+        };
+        for assignment_mode in [
+            ManualAssignmentMode::Random,
+            ManualAssignmentMode::MinLoad,
+            ManualAssignmentMode::MinGroup,
+            ManualAssignmentMode::Delegate,
+        ] {
+            let manual = PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 14_400,
+                assignment_mode,
+            };
+            let context = built(manual).await;
+            assert!(context.policy_engine.is_some(), "{assignment_mode:?}");
+        }
+        let prefix_hash = PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: Vec::new(),
+        };
+        for policy in [PolicyConfig::ConsistentHashing, prefix_hash] {
+            let name = policy.name();
+            let context = built(policy).await;
+            assert!(context.policy_engine.is_none(), "{name}");
+        }
+    }
+
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
     async fn spawn_echo_server() -> String {

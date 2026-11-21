@@ -753,10 +753,13 @@ fn a_stage_that_reads_media_is_not_decided_whole_while_no_route_states_it() -> C
 /// places is picked alone. The default policy's is one: its profile reads
 /// who holds the prompt and the workers' load reports, and this process
 /// feeds a whole decision both. So is every policy whose stages read a
-/// worker's record, its report or the prompt's size. A policy that places
-/// by a hash ring or by a header of the request is not yet: the routers
-/// keep their classic pass under it, and a supplied document of it is
-/// refused by its first stage that asks more than a pick.
+/// worker's record, its report or the prompt's size. So is the manual
+/// policy: it leaves the placement to its sessions rule, whose key the
+/// gateway's own ask derives and whose pins are the engine's table, and
+/// the rule compares at most a count the worker object keeps. A policy
+/// that places by a hash ring or by a header of the request is not yet:
+/// the routers keep their classic pass under it, and a supplied document
+/// of it is refused by its first stage that asks more than a pick.
 #[test]
 fn the_engine_decides_whole_what_this_process_feeds() -> Case {
     let started = |policy: PolicyConfig| -> Result<InProcess, Box<dyn Error>> {
@@ -777,12 +780,28 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
         .needs_for("a-model", Phase::Single);
     assert!(declared.affinity && declared.loads);
     assert!(declared.within(fed()));
-    // Of every routing policy, the engine decides whole all but the three
-    // that place by a hash ring or by a header of the request.
+    // Of every routing policy, the engine decides whole all but the two
+    // that place by a hash ring.
     for policy in policies() {
         let name = policy.name();
-        let classic = matches!(name, "consistent_hashing" | "prefix_hash" | "manual");
+        let classic = matches!(name, "consistent_hashing" | "prefix_hash");
         assert_eq!(started(policy)?.decides_whole(), !classic, "{name}");
+    }
+    // The manual policy is decided whole under each assignment of a key's
+    // first request: the fewest session keys compares a count the worker
+    // object keeps, and the others compare none.
+    for assignment_mode in [
+        ManualAssignmentMode::Random,
+        ManualAssignmentMode::MinLoad,
+        ManualAssignmentMode::MinGroup,
+        ManualAssignmentMode::Delegate,
+    ] {
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 14_400,
+            assignment_mode,
+        };
+        assert!(started(manual)?.decides_whole(), "{assignment_mode:?}");
     }
     // The bucket stage places by the prompt's size and says so, and this
     // process counts the size: a route that would send a body on unread

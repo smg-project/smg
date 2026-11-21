@@ -15,11 +15,15 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
     document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec},
-    engine::{worker_id, PolicyEngine as OwnEngine},
+    engine::{
+        worker_id, Candidate, PolicyEngine as OwnEngine, RequestFacts, Scorer, Target, TieBand,
+    },
     policies::power_of_two::PowerOfTwoMetric,
+    stages::{Lifecycle, StageRegistry},
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
     },
+    tracking::{EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
 };
 use smg_worker::test_support::RefusedAddress;
 use tokio::{net::TcpListener, time::timeout};
@@ -1040,6 +1044,13 @@ async fn a_body_that_would_stream_takes_the_buffered_path_under_a_followed_contr
 /// policy engine of the stock document `preset`, over one ready worker of
 /// [`MODEL`] a URL in the router's own registry. No store stands behind it.
 fn own_router(preset: &str, urls: &[&str]) -> Case<Router> {
+    let mut document = PolicySpec::preset(preset)?;
+    document.generation = 1;
+    own_router_under(AppliedSpec::validate(&document)?, urls)
+}
+
+/// [`own_router`] under the applied document `spec`.
+fn own_router_under(spec: AppliedSpec, urls: &[&str]) -> Case<Router> {
     let registry = Arc::new(WorkerRegistry::new());
     for url in urls {
         let worker = BasicWorkerBuilder::new(*url)
@@ -1050,9 +1061,7 @@ fn own_router(preset: &str, urls: &[&str]) -> Case<Router> {
             .register(Arc::new(worker))
             .ok_or("the worker did not register")?;
     }
-    let mut document = PolicySpec::preset(preset)?;
-    document.generation = 1;
-    let engine = Arc::new(OwnEngine::new(AppliedSpec::validate(&document)?));
+    let engine = Arc::new(OwnEngine::new(spec));
     let policy_engine = PolicyEngine::own(engine, Arc::clone(&registry));
     // The app's task fills a list's hash ring off the path of a request,
     // and no request does: this bed has no such task, and fills the ring of
@@ -1222,6 +1231,156 @@ async fn a_request_keyed_by_a_header_is_streamed_to_its_keys_worker() -> Case {
         }
         let hits: Vec<usize> = hits.iter().map(|hit| hit.load(Ordering::SeqCst)).collect();
         assert!(hits.contains(&12), "{preset}: the key moved: {hits:?}");
+    }
+    Ok(())
+}
+
+/// A typed request under `manual`, decided by the engine of this process
+/// with no store behind it. A key's first request is assigned a worker,
+/// its dispatch pins the key in the engine's table, and every later
+/// request of the key follows the pin. Many keys reach every worker.
+#[tokio::test]
+async fn a_typed_request_follows_its_keys_pin_under_the_engine_of_this_process() -> Case {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let mut urls = Vec::new();
+    let mut hits = Vec::new();
+    for _ in 0..3 {
+        let (url, hit) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        urls.push(url);
+        hits.push(hit);
+    }
+    let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let router = own_router("manual", &urls)?;
+    let hits = || -> Vec<usize> { hits.iter().map(|hit| hit.load(Ordering::SeqCst)).collect() };
+
+    // One key sixteen times, then forty-eight keys once each.
+    for turn in 0..64 {
+        let key = if turn < 16 {
+            "conv".to_owned()
+        } else {
+            format!("conv-{turn}")
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", HeaderValue::from_str(&key)?);
+        let request = serde_json::from_value(json!({"text": "hi"}))?;
+        let response = router
+            .route_generate(Some(&headers), &meta, request, MODEL)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        if turn == 15 {
+            assert!(hits().contains(&16), "the key moved: {:?}", hits());
+        }
+    }
+    assert!(
+        hits().iter().all(|&hit| hit > 0),
+        "a worker took no key: {:?}",
+        hits()
+    );
+    Ok(())
+}
+
+/// A word a stage heard of a lease.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Word {
+    Dispatched,
+    Completed(TransportClass),
+    Released(ReleaseReason),
+}
+
+/// What a stage heard, in the order it heard it.
+type Heard = Arc<parking_lot::Mutex<Vec<Word>>>;
+
+/// A scorer that scores every worker alike and takes every word of a
+/// lease.
+#[derive(Debug)]
+struct Hearing(Heard);
+
+impl Lifecycle for Hearing {
+    fn hears(&self) -> EventSet {
+        EventSet::LEASE
+    }
+
+    fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+        self.0.lock().push(Word::Dispatched);
+    }
+
+    fn on_completed(&self, _: &Lease, outcome: &Outcome) {
+        self.0.lock().push(Word::Completed(outcome.class));
+    }
+
+    fn on_released(&self, _: &Lease, reason: ReleaseReason) {
+        self.0.lock().push(Word::Released(reason));
+    }
+}
+
+impl Scorer for Hearing {
+    fn name(&self) -> &'static str {
+        "hearing"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// [`own_router`] under the `random` preset with [`Hearing`] as its
+/// profile's one scorer, and what that scorer heard.
+fn hearing_router(urls: &[&str]) -> Case<(Router, Heard)> {
+    let heard = Heard::default();
+    let kept = Arc::clone(&heard);
+    let mut stages = StageRegistry::builtin();
+    stages.scorer("hearing", move || Box::new(Hearing(Arc::clone(&kept))))?;
+    let mut document = PolicySpec::preset("random")?;
+    document.generation = 1;
+    let profile = document.profiles.get_mut("random").ok_or("the profile")?;
+    profile.score = vec!["hearing".into()];
+    profile.pick = "best".into();
+    let spec = AppliedSpec::validate_in(&document, &stages, &[])?;
+    Ok((own_router_under(spec, urls)?, heard))
+}
+
+/// A placement on the streamed path says its dispatch once, at the send,
+/// and hears its end as a completion in the class of the answer: at the
+/// last frame of a streamed answer's body, and where the router reads the
+/// answer otherwise, a worker's failure as the failure it is. The
+/// placement's drop then owes its lease nothing: no end is the drop's
+/// word, a release or a cancellation.
+#[tokio::test]
+async fn a_placement_on_the_streamed_path_is_dispatched_once_and_ends_as_a_completion() -> Case {
+    let (url, frames) = gated_stream(GENERATE).await?;
+    let (router, heard) = hearing_router(&[&url])?;
+    let (answer, _) = streamed(&router, streamed_request(&[GENERATE_BODY])).await;
+    let response = answer.map_err(|_| "the router buffered the request")?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*heard.lock(), [Word::Dispatched]);
+    let mut body = response.into_body().into_data_stream();
+    frames.send(Bytes::from_static(FIRST_FRAME)).await?;
+    assert_eq!(next_frame(&mut body).await?.as_ref(), FIRST_FRAME);
+    assert_eq!(*heard.lock(), [Word::Dispatched]);
+    drop(frames);
+    assert!(timeout(FRAME_WAIT, body.next()).await?.is_none());
+    let ended = [Word::Dispatched, Word::Completed(TransportClass::Ok)];
+    assert_eq!(*heard.lock(), ended);
+    drop(body);
+    assert_eq!(*heard.lock(), ended);
+
+    for (status, class) in [
+        (StatusCode::OK, TransportClass::Ok),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            TransportClass::ServerError,
+        ),
+    ] {
+        let (url, _) = fixed_status_upstream(&[GENERATE], status).await;
+        let (router, heard) = hearing_router(&[&url])?;
+        let (answer, _) = streamed(&router, streamed_request(&[GENERATE_BODY])).await;
+        let response = answer.map_err(|_| "the router buffered the request")?;
+        assert_eq!(response.status(), status);
+        let ended = [Word::Dispatched, Word::Completed(class)];
+        assert_eq!(*heard.lock(), ended, "{status}");
+        drop(response);
+        assert_eq!(*heard.lock(), ended, "{status}");
     }
     Ok(())
 }

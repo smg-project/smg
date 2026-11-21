@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use super::{profile_index, Binding, Engine, Marks, Plan, Profile};
+use super::{profile_index, session_needs, Binding, Engine, Marks, Plan, Profile};
 use crate::{document::spec::Needs, engine::view::Phase, stages::filters::RowTests};
 
 /// A profile whose whole decision is one pick of its picker
@@ -160,8 +160,8 @@ impl Engine {
 
     /// Whether every request of the document is a single request that a
     /// host which feeds `fed` has decided whole in its own process. Each
-    /// binding plans single requests alone and states no sessions rule,
-    /// and each place of it is one of two:
+    /// binding plans single requests alone, and each place of it is one of
+    /// two:
     ///
     /// - one pick of its picker decides it ([`Self::not_alone`]), which
     ///   asks nothing of the host;
@@ -169,13 +169,29 @@ impl Engine {
     ///   ([`Needs::within`]): the whole pass of a gateway's own process
     ///   decides it over records written from the gateway's own data.
     ///
+    /// A binding may state a sessions rule where the host feeds the counts
+    /// the rule compares: each worker's count of session keys in flight
+    /// for an assignment by the fewest keys ([`Needs::active_sessions`]),
+    /// and the key's own count on a worker for an in-flight cap
+    /// ([`Needs::session_in_flight`]). The key is the host's to read from
+    /// its request by the binding's sources, so the header a rule names is
+    /// no feed. The pins are the engine's own table: made at a dispatch
+    /// the host reports, and dropped by the engine's pass.
+    ///
     /// A host that feeds nothing still has decided whole a place whose
     /// stages read a worker's record and nothing more. The set of places
     /// grows with what a host feeds a whole decision.
     #[must_use]
     pub fn single_and_fed(&self, fed: Needs) -> bool {
         let single = |entry: &super::Entry| {
-            entry.binding.plan == Plan::Single && entry.binding.sessions.is_none()
+            let binding = &entry.binding;
+            // The counts a sessions rule compares; its key is read by the
+            // host's own ask, from no view.
+            let counts = Needs {
+                headers: false,
+                ..session_needs(binding)
+            };
+            binding.plan == Plan::Single && counts.within(fed)
         };
         let decided = |(_, phase, index, profile): (&Binding, Phase, u16, &Profile)| {
             if self.in_the_way(index, profile, phase).is_none() {

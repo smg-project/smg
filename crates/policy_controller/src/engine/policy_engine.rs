@@ -807,7 +807,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{Needs, PolicySpec},
+        document::spec::{Assignment, Needs, PolicySpec, SessionsSpec},
         engine::framework::InTheWay,
     };
 
@@ -1016,8 +1016,11 @@ mod tests {
     /// read a worker's record and no more. Least load reads the workers'
     /// reports, and the default policy who holds the prompt beside them.
     /// A host that feeds less than a profile declares, a profile that
-    /// reads a hash ring, one under a sessions rule and a pair's plan are
-    /// not decided so.
+    /// reads a hash ring and a pair's plan are not decided so. A sessions
+    /// rule is the engine's own table, and the host feeds it the counts it
+    /// compares: none for the stock rule, each worker's count of session
+    /// keys for an assignment by the fewest keys, the key's own count for
+    /// a cap.
     #[test]
     fn a_document_is_decided_whole_where_each_place_is_picked_alone_or_fed() {
         let whole = |engine: &PolicyEngine, fed: Needs| engine.spec().engine().single_and_fed(fed);
@@ -1045,11 +1048,34 @@ mod tests {
             ..declared
         };
         assert!(!whole(&default, unfed), "its load stages read reports");
-        // A ring is no part of what the default policy's host feeds, and a
-        // sessions rule is decided by no whole pass here yet.
-        for name in ["consistent_hashing", "prefix_hash", "manual"] {
+        // A ring is no part of what the default policy's host feeds.
+        for name in ["consistent_hashing", "prefix_hash"] {
             assert!(!whole(&preset(name), declared), "{name}");
         }
+        // The stock sessions rule draws a key's first worker and caps
+        // nothing: its host feeds it nothing.
+        assert!(whole(&preset("manual"), nothing));
+        let ruled = |change: fn(&mut SessionsSpec)| {
+            let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+            document.generation = 1;
+            let rule = document.bindings[0].sessions.as_mut();
+            change(rule.expect("the manual preset's rule"));
+            engine_of(&document)
+        };
+        let keys = Needs {
+            active_sessions: true,
+            ..nothing
+        };
+        let by_fewest_keys = ruled(|rule| rule.assignment = Assignment::MinGroup);
+        assert!(!whole(&by_fewest_keys, nothing));
+        assert!(whole(&by_fewest_keys, keys));
+        let capped = ruled(|rule| rule.inflight_cap = 4);
+        assert!(!whole(&capped, keys), "a cap reads the key's own count");
+        let counted = Needs {
+            session_in_flight: true,
+            ..nothing
+        };
+        assert!(whole(&capped, counted));
         let mut pair =
             PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
         pair.generation = 1;
