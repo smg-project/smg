@@ -3341,8 +3341,12 @@ fn torch_aa_passes(
     // weight and one offset for every row, so with the rows of a band side by
     // side a tap is a few vector steps over all of them, and a byte goes
     // through `sample` once instead of once a tap. `band` holds one source
-    // pixel of every row, each as RGB and a fourth value that stays zero. A
-    // value still adds its own taps in the order above, so no bit moves.
+    // pixel of every row, each as RGB and a fourth value that stays zero:
+    // three values a pixel take fewer instructions and less memory, but
+    // measured slower on downscales. A last band of fewer rows leaves the
+    // rows past its own as the band before filled them; those are summed
+    // and never copied out. A value still adds its own taps in the order
+    // above, so no bit moves.
     const BAND: usize = 8;
     let mut rows = plain_f32(in_h * out_w * 3);
     let mut band = plain_f32(in_w * BAND * 4);
