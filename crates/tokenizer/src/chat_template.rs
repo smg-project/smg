@@ -3753,10 +3753,13 @@ pub(crate) fn continue_final_message(
         .and_then(JsonValue::as_str)
         .is_some_and(|reasoning| !reasoning.is_empty())
     {
-        return Err(anyhow!(
+        // The reason stays in the chain under the text, so a caller still
+        // reads the type of a refusal or of the template's own failure.
+        let lost = format!(
             "{reason}: only its text could follow the generation prompt, and its \
              reasoning_content would be lost"
-        ));
+        );
+        return Err(reason.context(lost));
     }
     tracing::debug!(%reason, "appending the continued message after the generation prompt");
     let mut prompt = render(

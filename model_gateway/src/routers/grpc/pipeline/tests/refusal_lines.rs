@@ -489,22 +489,19 @@ async fn a_template_argument_that_breaks_the_render_stays_a_400() {
     }
 }
 
-/// A continuation the render refuses is the request's and stays a 400: a final assistant message
-/// the template does not write cannot be continued, and its reasoning would be lost after the
-/// generation prompt. Nobody types that check, so the stage keeps its ERROR line and the answer
-/// is unmarked.
-#[tokio::test]
-async fn a_continuation_the_render_refuses_stays_a_400() {
+/// The chat door's answer to a request that continues a final assistant message with reasoning,
+/// over a model whose chat template is `template`, and the lines at WARN or above it wrote. The
+/// render cannot fall back on the message's text after a generation prompt: the reasoning would
+/// be lost.
+async fn a_message_with_reasoning_continued_over(
+    template: &str,
+) -> (Response, Vec<(Level, String)>) {
     let mut tokenizer =
         llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
             .expect("a tokenizer");
     tokenizer
-        .set_chat_template(
-            "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}\n{% endif %}\
-             {% endfor %}"
-                .to_string(),
-        )
-        .expect("a template that writes the user turns alone");
+        .set_chat_template(template.to_string())
+        .expect("a template that compiles");
     let (chat, _, components) = both_doors_over(Arc::new(tokenizer)).await;
     let lines = LinesAtWarnOrAbove::default();
     let _subscriber = test_subscriber(lines.clone());
@@ -523,6 +520,20 @@ async fn a_continuation_the_render_refuses_stays_a_400() {
     )
     .await;
 
+    (response, lines.lines())
+}
+
+/// A continuation the render refuses is the request's and stays a 400: a final assistant message
+/// the template does not write cannot be continued, and its reasoning would be lost after the
+/// generation prompt. Nobody types that check, so the stage keeps its ERROR line and the answer
+/// is unmarked.
+#[tokio::test]
+async fn a_continuation_the_render_refuses_stays_a_400() {
+    let (response, lines) = a_message_with_reasoning_continued_over(
+        "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}\n{% endif %}{% endfor %}",
+    )
+    .await;
+
     assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
     assert_eq!(
         error::extract_error_code_from_response(&response),
@@ -530,8 +541,42 @@ async fn a_continuation_the_render_refuses_stays_a_400() {
     );
     assert!(!marked(&response));
     assert_eq!(
-        lines.lines(),
+        lines,
         [(Level::ERROR, "Failed to process chat messages".to_string())]
+    );
+}
+
+/// The same continuation over a template that fails on its own account is the deployment's 500
+/// `chat_template_render_failed`: the template failed before the render could continue anything,
+/// and the reasoning that would be lost is said after that failure, not in its place.
+#[tokio::test]
+async fn a_continuation_over_a_template_that_fails_on_its_own_is_a_500() {
+    let (response, lines) =
+        a_message_with_reasoning_continued_over("{% include 'tools.jinja' %}").await;
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        error::extract_error_code_from_response(&response),
+        "chat_template_render_failed"
+    );
+    assert!(!marked(&response));
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines[0],
+        (Level::ERROR, "Failed to process chat messages".to_string())
+    );
+    assert!(
+        lines[1].0 == Level::ERROR && lines[1].1.starts_with("Stage "),
+        "{lines:?}"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the answer's body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("Failed to render template: template not found: ")
+            && body.contains("its reasoning_content would be lost"),
+        "{body}"
     );
 }
 

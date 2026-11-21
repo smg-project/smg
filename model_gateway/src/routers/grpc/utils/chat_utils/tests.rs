@@ -2994,18 +2994,35 @@ fn one_turn_with(kwargs: Value) -> Value {
     })
 }
 
+/// A request that continues a final assistant message whose reasoning the
+/// fallback after a generation prompt would lose.
+fn continuing_a_message_with_reasoning() -> Value {
+    json!({
+        "model": "m",
+        "continue_final_message": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "Partial", "reasoning_content": "still thinking"}
+        ]
+    })
+}
+
 /// A failure that is the template's own whatever the request holds is the
 /// one cause of a failed render answered in the server's class: a 500
 /// `chat_template_render_failed` under the render failure's text, for a
 /// template that asks for another template and for one that names a filter
-/// the engine does not have.
+/// the engine does not have. A continued message whose reasoning would be
+/// lost is answered the same: the template failed before the render could
+/// continue anything.
 #[test]
 fn a_templates_own_failure_is_answered_in_the_servers_class() {
-    for template in [
-        "{% include 'tools.jinja' %}",
-        "{{ messages | no_such_filter }}",
+    let includes_another = "{% include 'tools.jinja' %}";
+    for (template, request) in [
+        (includes_another, one_turn_with(json!({}))),
+        ("{{ messages | no_such_filter }}", one_turn_with(json!({}))),
+        (includes_another, continuing_a_message_with_reasoning()),
     ] {
-        let error = rendered(Some(template), one_turn_with(json!({}))).unwrap_err();
+        let error = rendered(Some(template), request).unwrap_err();
         assert!(error.is_template_failure(), "{template}: {error:?}");
         assert!(!error.is_refusal(), "{template}: {error:?}");
         assert!(
@@ -3093,14 +3110,7 @@ fn a_render_the_request_can_break_stays_a_400() {
             "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}\n{% endif %}\
              {% endfor %}",
         ),
-        json!({
-            "model": "m",
-            "continue_final_message": true,
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "Partial", "reasoning_content": "still thinking"}
-            ]
-        }),
+        continuing_a_message_with_reasoning(),
     )
     .unwrap_err();
     assert!(matches!(continued, PromptError::Failed(_)), "{continued:?}");

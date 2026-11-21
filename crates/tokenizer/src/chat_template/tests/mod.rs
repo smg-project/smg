@@ -1703,6 +1703,45 @@ fn a_templates_own_refusal_is_typed_and_another_render_failure_is_not() {
             .starts_with("Failed to render template: invalid operation: "),
         "{failed}"
     );
+
+    // A continued message whose reasoning the fallback would lose says so
+    // after the failure of its render, which is typed as it was: the
+    // template's refusal a refusal, a render that stops on a value neither.
+    let thinking = [
+        serde_json::json!({"role": "user", "content": "hi"}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "Partial",
+            "reasoning_content": "still thinking"
+        }),
+    ];
+    let continued = |template: &str| {
+        let failed = render_failure(template, &thinking, serde_json::json!({}), true);
+        assert!(
+            failed
+                .to_string()
+                .ends_with("its reasoning_content would be lost"),
+            "{template}: {failed}"
+        );
+        failed
+    };
+    let refused = continued("{{ raise_exception('the roles must alternate') }}");
+    assert!(TemplateRefusal::is(&refused), "{refused:#}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: the roles must alternate"),
+        "{refused}"
+    );
+    let failed = continued("{{ messages[2]['content'] }}");
+    assert!(!TemplateRefusal::is(&failed), "{failed:#}");
+    assert!(!TemplateFailure::is(&failed), "{failed:#}");
+    assert!(
+        failed
+            .to_string()
+            .starts_with("Failed to render template: undefined value"),
+        "{failed}"
+    );
 }
 
 /// The classes of the engine's error kinds, a kind at a time: the template's
@@ -1776,13 +1815,18 @@ fn render_failure(
 /// reads, a kind of the engine's at a time: another template it asks for,
 /// and a filter, a test, a function and a block the engine does not have. So
 /// is a template that is not there to look up. A continued render types it
-/// the same.
+/// the same, and so does one of a message whose reasoning the fallback would
+/// lose, which says so after the failure.
 #[test]
 fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates() {
-    let conversation = [
-        serde_json::json!({"role": "user", "content": "hi"}),
-        serde_json::json!({"role": "assistant", "content": "Partial"}),
-    ];
+    let user = serde_json::json!({"role": "user", "content": "hi"});
+    let partial = serde_json::json!({"role": "assistant", "content": "Partial"});
+    let thinking = serde_json::json!({
+        "role": "assistant",
+        "content": "Partial",
+        "reasoning_content": "still thinking"
+    });
+    let conversation = [user.clone(), partial.clone()];
     for (template, kind) in [
         ("{% include 'tools.jinja' %}", "template not found"),
         ("{% extends 'base.jinja' %}", "template not found"),
@@ -1798,7 +1842,8 @@ fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates
         ("{{ no_such_function() }}", "unknown function"),
         ("{{ self.no_such_block() }}", "unknown block"),
     ] {
-        for continued in [false, true] {
+        for (last, continued) in [(&partial, false), (&partial, true), (&thinking, true)] {
+            let conversation = [user.clone(), last.clone()];
             let failed = render_failure(template, &conversation, serde_json::json!({}), continued);
             assert!(TemplateFailure::is(&failed), "{template}: {failed:#}");
             assert!(!TemplateRefusal::is(&failed), "{template}: {failed:#}");
@@ -1806,6 +1851,14 @@ fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates
                 failed
                     .to_string()
                     .starts_with(&format!("Failed to render template: {kind}: ")),
+                "{template}: {failed}"
+            );
+            assert_eq!(
+                failed.to_string().ends_with(
+                    ": only its text could follow the generation prompt, and its \
+                     reasoning_content would be lost"
+                ),
+                std::ptr::eq(last, &thinking),
                 "{template}: {failed}"
             );
         }
