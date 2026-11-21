@@ -889,7 +889,8 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
 /// conversation through its own `raise_exception`, and where the render
 /// stops on a value (a second message the conversation does not have; a
 /// number the template iterates over on every conversation, its own bug of a
-/// kind the render cannot tell from a request's value). A 500
+/// kind the render cannot tell from a request's value; a macro the template
+/// declares only for a conversation that opens with `hello`). A 500
 /// `chat_template_render_failed`: where the failure is the template's own
 /// whatever the request holds (it asks for another template).
 #[tokio::test]
@@ -914,6 +915,13 @@ async fn count_tokens_tells_a_templates_own_failure_from_a_render_a_value_stops(
             StatusCode::BAD_REQUEST,
             "process_messages_failed",
             "Failed to apply chat template: Failed to render template: invalid operation: ",
+        ),
+        (
+            "{% if messages[0].content == 'hello' %}{% macro greet() %}hi there{% endmacro %}\
+             {% endif %}{{ greet() }}",
+            StatusCode::BAD_REQUEST,
+            "process_messages_failed",
+            "Failed to apply chat template: Failed to render template: unknown function: ",
         ),
         (
             "{% include 'tools.jinja' %}",

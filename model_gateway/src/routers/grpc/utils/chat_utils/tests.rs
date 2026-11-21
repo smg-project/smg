@@ -3044,11 +3044,13 @@ fn a_templates_own_failure_is_answered_in_the_servers_class() {
 
 /// A render the request can break stays the 400 `process_messages_failed` it
 /// was, and is no refusal: a `chat_template_kwargs` entry under the name of
-/// a function the template calls (its own `raise_exception` among them) or
-/// of a kind the template does not expect. Each template is sound without
-/// the entry. A template that breaks on every conversation (it iterates over
-/// a number) fails with the same kind of error, which the render cannot tell
-/// from a request's value: it stays a 400 too, though the template is at
+/// a function the template calls (its own `raise_exception` among them), of
+/// a kind the template does not expect, or naming a template the model does
+/// not have, and a conversation for which the template does not declare the
+/// macro it calls. Each template is sound without the entry, or for another
+/// conversation. A template that breaks on every conversation (it iterates
+/// over a number) fails with the same kind of error, which the render cannot
+/// tell from a request's value: it stays a 400 too, though the template is at
 /// fault. So do a model with no template, a continuation the render refuses
 /// because the message's reasoning would be lost, and a bare message of the
 /// gateway's own checks. The template's own refusal is the request's 400.
@@ -3061,12 +3063,33 @@ fn a_render_the_request_can_break_stays_a_400() {
     let calls_namespace = "{% set ns = namespace(found=false) %}{{ ns.found }}";
     let refuses = "{{ raise_exception('the roles must alternate') }}";
     let writes_a_date = "{{ 'Today Date: ' + date_string }}";
+    let includes_fragments = "{% include fragments %}";
+    let greets_hello = "{% if messages[0].content == 'hello' %}{% macro greet() %}hi there\
+                        {% endmacro %}{% endif %}{{ greet() }}";
 
-    for (template, kwargs) in [
-        (calls_namespace, json!({"namespace": 0})),
-        (refuses, json!({"raise_exception": 0})),
-        (writes_a_date, json!({"date_string": 20_261_120})),
-        ("{% for part in 42 %}{{ part }}{% endfor %}", json!({})),
+    for (template, kwargs, kind) in [
+        (
+            calls_namespace,
+            json!({"namespace": 0}),
+            "invalid operation",
+        ),
+        (refuses, json!({"raise_exception": 0}), "invalid operation"),
+        (
+            writes_a_date,
+            json!({"date_string": 20_261_120}),
+            "invalid operation",
+        ),
+        (
+            "{% for part in 42 %}{{ part }}{% endfor %}",
+            json!({}),
+            "invalid operation",
+        ),
+        (
+            includes_fragments,
+            json!({"fragments": ["missing.jinja"]}),
+            "template not found",
+        ),
+        (greets_hello, json!({}), "unknown function"),
     ] {
         let error = rendered(Some(template), one_turn_with(kwargs.clone())).unwrap_err();
         assert!(
@@ -3074,9 +3097,9 @@ fn a_render_the_request_can_break_stays_a_400() {
             "{template} {kwargs}: {error:?}"
         );
         assert!(
-            error.to_string().starts_with(
-                "Failed to apply chat template: Failed to render template: invalid operation: "
-            ),
+            error.to_string().starts_with(&format!(
+                "Failed to apply chat template: Failed to render template: {kind}: "
+            )),
             "{template} {kwargs}: {error}"
         );
         assert_eq!(answered(error), still_a_400, "{template} {kwargs}");
@@ -3084,6 +3107,22 @@ fn a_render_the_request_can_break_stays_a_400() {
     assert_eq!(
         rendered(Some(calls_namespace), one_turn_with(json!({}))).unwrap(),
         "False"
+    );
+    assert_eq!(
+        rendered(
+            Some(includes_fragments),
+            one_turn_with(json!({"fragments": []}))
+        )
+        .unwrap(),
+        ""
+    );
+    assert_eq!(
+        rendered(
+            Some(greets_hello),
+            json!({"model": "m", "messages": [{"role": "user", "content": "hello"}]})
+        )
+        .unwrap(),
+        "hi there"
     );
     assert_eq!(
         rendered(

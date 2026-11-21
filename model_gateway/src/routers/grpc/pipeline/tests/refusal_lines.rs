@@ -378,12 +378,15 @@ async fn a_template_that_fails_on_its_own_is_a_500_with_the_error_lines_on_both_
 /// a second message, which a conversation of one turn does not have. The second iterates over a
 /// number and fails on every conversation: the template is at fault there, but its error is of
 /// the kind a request's value brings about, which the render cannot tell apart, so it is not
-/// answered as the deployment's.
+/// answered as the deployment's. The third calls a macro it declares only for a conversation
+/// that opens with `hello`: the name is unknown for this one, and the conversation decided that.
 #[tokio::test]
 async fn a_render_that_stops_on_a_value_stays_a_400_on_both_doors() {
     for template in [
         "{{ messages[1]['content'] }}",
         "{% for part in 42 %}{{ part }}{% endfor %}",
+        "{% if messages[0].content == 'hello' %}{% macro greet() %}hi there{% endmacro %}\
+         {% endif %}{{ greet() }}",
     ] {
         let tokenizer = Arc::new(
             MockTokenizer::new()
@@ -422,22 +425,31 @@ async fn a_render_that_stops_on_a_value_stays_a_400_on_both_doors() {
 
 /// A `chat_template_kwargs` entry can break a sound template's render: one under the name of a
 /// function the template calls (its own `raise_exception` among them), one of a kind the
-/// template does not expect. The request is the cause, and the chat door answers the 400
-/// `process_messages_failed`, not the deployment's 500.
+/// template does not expect, one that names a template the model does not have. The request is
+/// the cause, and the chat door answers the 400 `process_messages_failed`, not the deployment's
+/// 500.
 #[tokio::test]
 async fn a_template_argument_that_breaks_the_render_stays_a_400() {
-    for (template, kwargs) in [
+    for (template, kwargs, kind) in [
         (
             "{% set ns = namespace(found=false) %}{{ ns.found }}",
             serde_json::json!({"namespace": 0}),
+            "invalid operation",
         ),
         (
             "{{ raise_exception('the roles must alternate') }}",
             serde_json::json!({"raise_exception": 0}),
+            "invalid operation",
         ),
         (
             "{{ 'Today Date: ' + date_string }}",
             serde_json::json!({"date_string": 20_261_120}),
+            "invalid operation",
+        ),
+        (
+            "{% include fragments %}",
+            serde_json::json!({"fragments": ["missing.jinja"]}),
+            "template not found",
         ),
     ] {
         let tokenizer = Arc::new(
@@ -481,9 +493,9 @@ async fn a_template_argument_that_breaks_the_render_stays_a_400() {
             .expect("the answer's body");
         let body = String::from_utf8_lossy(&body);
         assert!(
-            body.contains(
-                "Failed to apply chat template: Failed to render template: invalid operation: "
-            ),
+            body.contains(&format!(
+                "Failed to apply chat template: Failed to render template: {kind}: "
+            )),
             "{template}: {body}"
         );
     }

@@ -25,11 +25,11 @@ use minijinja::{
             BinOpKind, Call, CallArg, CallType, Expr, ForLoop, IfCond, Macro, Set, Stmt,
             UnaryOpKind,
         },
-        parse, tokenize, Token, WhitespaceConfig,
+        get_compiled_template, parse, tokenize, Instruction, Token, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
     value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
-    Environment, Error as MinijinjaError, ErrorKind, Output, State, Value,
+    Environment, Error as MinijinjaError, ErrorKind, Output, State, Template, Value,
 };
 use rustc_hash::FxHashSet;
 use serde::Serialize;
@@ -293,6 +293,10 @@ struct Nodes<'a> {
     /// Every name the template reads: a bare name anywhere in an expression
     /// (see [`ChatTemplateState::reads`]).
     names: HashSet<&'a str>,
+    /// The name of every other template a statement asks for (`include`,
+    /// `extends`, `import`, `from`), as the expression that names it (see
+    /// `spells_its_templates`).
+    templates: Vec<&'a Expr<'a>>,
 }
 
 impl<'a> Nodes<'a> {
@@ -357,11 +361,11 @@ impl<'a> Nodes<'a> {
             }
             Stmt::Block(b) => self.stmts(&b.body, macros),
             Stmt::Import(i) => {
-                self.expr(&i.expr);
+                self.template(&i.expr);
                 self.expr(&i.name);
             }
             Stmt::FromImport(f) => {
-                self.expr(&f.expr);
+                self.template(&f.expr);
                 for (name, alias) in &f.names {
                     self.expr(name);
                     if let Some(alias) = alias {
@@ -369,8 +373,8 @@ impl<'a> Nodes<'a> {
                     }
                 }
             }
-            Stmt::Extends(e) => self.expr(&e.name),
-            Stmt::Include(i) => self.expr(&i.name),
+            Stmt::Extends(e) => self.template(&e.name),
+            Stmt::Include(i) => self.template(&i.name),
             Stmt::Macro(m) => {
                 self.macros.push(m);
                 for default in &m.defaults {
@@ -392,6 +396,11 @@ impl<'a> Nodes<'a> {
             }
             Stmt::Do(d) => self.call(&d.call),
         }
+    }
+
+    fn template(&mut self, name: &'a Expr<'a>) {
+        self.templates.push(name);
+        self.expr(name);
     }
 
     fn call(&mut self, call: &'a Call<'a>) {
@@ -1704,11 +1713,11 @@ impl std::error::Error for TemplateRefusal {}
 /// A render that failed on the template's own account, whatever its caller
 /// handed it: the compiled template is not there to render, or the engine
 /// stopped on something the template's source alone decides
-/// (`is_the_templates_own`: another template it asks for, a filter, a test,
-/// a function or a block the engine does not have). Output that is not UTF-8
-/// is typed the same: the engine writes text alone, so no value makes it.
-/// The model's template is the one to fix, which its deployment can and no
-/// caller can.
+/// (`is_the_templates_own`: another template it asks for by a name it spells,
+/// a filter, a test or a block the engine does not have, a function it calls
+/// and binds nowhere). Output that is not UTF-8 is typed the same: the engine
+/// writes text alone, so no value makes it. The model's template is the one
+/// to fix, which its deployment can and no caller can.
 ///
 /// A failure a value can bring about (an operation on a value of the wrong
 /// kind, an undefined value, a bad argument) is not this one, though the
@@ -1734,43 +1743,56 @@ impl std::fmt::Display for TemplateFailure {
 
 impl std::error::Error for TemplateFailure {}
 
-/// Whether a render's error is the template's own, whatever its caller
-/// handed it ([`TemplateFailure`]).
+/// Whether an error of rendering `template` is the template's own, whatever
+/// its caller handed it ([`TemplateFailure`]).
 ///
-/// The rule: a kind is the template's own only where the engine raises it
-/// from the template's source alone, so that no value of the caller's (a
-/// message, a tool, a template argument) decides whether it is raised. A kind
-/// a value can bring about stays the plain failure it was, and so does a kind
-/// not shown to be free of them: a caller's mistake never reads as the
+/// The rule: an error is the template's own only where the template's source
+/// alone decides that the statement fails, so that no value of the caller's
+/// (a message, a tool, a template argument) makes that statement render. An
+/// error a value can bring about stays the plain failure it was, and so does
+/// one not shown to be free of them: a caller's mistake never reads as the
 /// template's. The arms are read from the engine's sources at the release
-/// this crate pins; the enum is open, so a kind another release adds, or one
+/// this crate pins. The enum is open, so a kind another release adds, or one
 /// behind an engine feature this crate does not enable, falls to the plain
 /// side until it is classed here.
-fn is_the_templates_own(error: &MinijinjaError) -> bool {
+fn is_the_templates_own(error: &MinijinjaError, template: &Template<'_, '_>) -> bool {
     match error.kind() {
         // The compiler's alone, over a template's source text: no render
         // raises them, and a template that has them does not load.
         ErrorKind::SyntaxError | ErrorKind::BadEscape => true,
         // Another template asked for by name (`include`, `extends`,
-        // `import`). The environment a chat template renders in holds that
-        // one template and has no loader, so no name is another template,
-        // whether the source spells the name or reads it from a value.
-        ErrorKind::TemplateNotFound => true,
+        // `import`, `from`). The environment a chat template renders in holds
+        // that one template and has no loader, so a name the source spells is
+        // never another template. A name read from a value is the caller's
+        // to get wrong: a list of fragments renders when it is empty. The
+        // error does not say which statement raised it, and a value can hand
+        // one statement the name another spells, so the kind is the
+        // template's own only where every such statement spells its name.
+        ErrorKind::TemplateNotFound => spells_its_templates(template.source()),
         // A called name that nothing defines. A caller supplies values and
-        // never a callable, so no value defines the name. A value put under
-        // the name of a function the engine has does shadow it, and the call
-        // then fails as an operation on that value (not callable), another
-        // kind.
-        ErrorKind::UnknownFunction => true,
-        // `self.name()` for a block the template does not define: the name
-        // is in the source.
+        // never a callable, so no value makes the call run: one put under
+        // the name fails it as an operation on that value (not callable),
+        // another kind. The template's own statements bind names too, and a
+        // value decides which of them run: a macro declared under an `if`
+        // is there for one conversation and unknown for the next. So the
+        // kind is the template's own only where its source binds the name
+        // nowhere (`binds`). The detail names it: `name is unknown`.
+        ErrorKind::UnknownFunction => error
+            .detail()
+            .and_then(|detail| detail.strip_suffix(" is unknown"))
+            .is_some_and(|name| !binds(template, name)),
+        // `self.name()` for a block the template does not have: the name is
+        // in the source. The engine compiles a template's blocks wherever
+        // they stand, one under an `if` that does not run among them, so no
+        // value decides which blocks there are.
         ErrorKind::UnknownBlock => true,
         // A filter or a test the engine does not have. Named in the source
         // (`value | name`, `value is name`), the engine says which in the
         // error's detail, and Jinja2 refuses such a template when it compiles
-        // it. Looked up from an argument's value by `map`, `select` and
-        // their kin, the error has no detail, and the value may be the
-        // caller's.
+        // it: the engine reads the name from the environment, which no
+        // statement and no value adds to. Looked up from an argument's value
+        // by `map`, `select` and their kin, the error has no detail, and the
+        // value may be the caller's.
         ErrorKind::UnknownFilter | ErrorKind::UnknownTest => error.detail().is_some(),
         // A write failed, to the output or of a value as text: the engine
         // makes this kind of every `fmt::Error`, the ones `python_formatter`
@@ -1804,6 +1826,37 @@ fn is_the_templates_own(error: &MinijinjaError) -> bool {
         // A kind this build does not name.
         _ => false,
     }
+}
+
+/// Whether every statement of `source` that asks for another template
+/// (`include`, `extends`, `import`, `from`) spells the name it asks for: a
+/// literal, or what the compiler folds to one, which no value takes part in.
+/// False for a source that does not parse.
+fn spells_its_templates(source: &str) -> bool {
+    parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default()).is_ok_and(|ast| {
+        Nodes::of(&ast)
+            .templates
+            .iter()
+            .all(|name| name.as_const().is_some())
+    })
+}
+
+/// Whether the source of `template` binds `name` on any branch: a macro of
+/// that name, or a `set`, a `for`, a `with`, an import, or a parameter of a
+/// macro or of a `call` block that assigns it. The compiled template stores
+/// each through one instruction (`StoreLocal`), wherever its statement
+/// stands. The engine binds two names without it: `loop` in a `for`, and
+/// `caller` in a macro that a `call` block invokes.
+fn binds(template: &Template<'_, '_>, name: &str) -> bool {
+    let compiled = get_compiled_template(template);
+    matches!(name, "loop" | "caller")
+        || iter::once(&compiled.instructions)
+            .chain(compiled.blocks.values())
+            .any(|code| {
+                (0..)
+                    .map_while(|at| code.get(at))
+                    .any(|step| matches!(step, Instruction::StoreLocal(bound) if *bound == name))
+            })
 }
 
 /// Transformers' `{% generation %}` ... `{% endgeneration %}` block marks the
@@ -3880,7 +3933,7 @@ fn render_messages<'a>(
             .any(|cause| cause.is::<RaisedByTemplate>());
         if raised {
             anyhow::Error::new(TemplateRefusal(message))
-        } else if is_the_templates_own(&e) {
+        } else if is_the_templates_own(&e, &tmpl) {
             anyhow::Error::new(TemplateFailure(message))
         } else {
             anyhow!(message)

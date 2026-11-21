@@ -1746,23 +1746,33 @@ fn a_templates_own_refusal_is_typed_and_another_render_failure_is_not() {
 
 /// The classes of the engine's error kinds, a kind at a time: the template's
 /// own where the template's source alone raises the kind, a plain failure
-/// where a value can. A filter or a test the engine does not have is the
-/// template's own only where the source names it: looked up from an
-/// argument's value, the error has no detail and stays plain.
+/// where a value can. Three kinds are the template's own on a condition.
+/// Another template that is not there, where the source spells every name it
+/// asks for. A called name nothing defines, where the error names it and the
+/// source binds it nowhere. A filter or a test the engine does not have,
+/// where the source names it: looked up from an argument's value, the error
+/// has no detail.
 #[test]
 fn each_error_kind_is_classed_by_whether_a_value_can_raise_it() {
-    let own = |kind: ErrorKind| is_the_templates_own(&MinijinjaError::new(kind, "a detail"));
+    let environment = |source: &str| build_environment(source.to_string()).unwrap();
+    let spells = environment("{% include 'tools.jinja' %}{% macro helper() %}{% endmacro %}");
+    let reads = environment("{% include 'tools.jinja' %}{% include fragments %}");
+    let own = |environment: &Environment<'_>, error: MinijinjaError| {
+        is_the_templates_own(&error, &environment.get_template("chat").unwrap())
+    };
     for kind in [
         ErrorKind::SyntaxError,
         ErrorKind::BadEscape,
         ErrorKind::TemplateNotFound,
-        ErrorKind::UnknownFunction,
         ErrorKind::UnknownBlock,
         ErrorKind::UnknownFilter,
         ErrorKind::UnknownTest,
         ErrorKind::WriteFailure,
     ] {
-        assert!(own(kind), "{kind:?}");
+        assert!(
+            own(&spells, MinijinjaError::new(kind, "a detail")),
+            "{kind:?}"
+        );
     }
     for kind in [
         ErrorKind::InvalidOperation,
@@ -1778,24 +1788,42 @@ fn each_error_kind_is_classed_by_whether_a_value_can_raise_it() {
         ErrorKind::BadInclude,
         ErrorKind::EvalBlock,
     ] {
-        assert!(!own(kind), "{kind:?}");
-    }
-    for kind in [ErrorKind::UnknownFilter, ErrorKind::UnknownTest] {
         assert!(
-            !is_the_templates_own(&MinijinjaError::from(kind)),
-            "{kind:?} without a detail"
+            !own(&spells, MinijinjaError::new(kind, "a detail")),
+            "{kind:?}"
         );
+    }
+
+    assert!(
+        !own(
+            &reads,
+            MinijinjaError::new(ErrorKind::TemplateNotFound, "a detail")
+        ),
+        "a template name read from a value"
+    );
+    let unknown = |detail: &'static str| MinijinjaError::new(ErrorKind::UnknownFunction, detail);
+    assert!(own(&spells, unknown("late is unknown")));
+    for (error, why) in [
+        (unknown("helper is unknown"), "a name the source binds"),
+        (unknown("loop is unknown"), "a name the engine binds"),
+        (unknown("caller is unknown"), "a name the engine binds"),
+        (unknown("macro not found"), "a detail that names nothing"),
+        (ErrorKind::UnknownFunction.into(), "no detail"),
+        (ErrorKind::UnknownFilter.into(), "no detail"),
+        (ErrorKind::UnknownTest.into(), "no detail"),
+    ] {
+        assert!(!own(&spells, error), "{why}");
     }
 }
 
-/// The failure of rendering `conversation` through `template` with `kwargs`
-/// as the caller's template arguments.
-fn render_failure(
+/// `conversation` rendered through `template` with `kwargs` as the caller's
+/// template arguments.
+fn rendered_with(
     template: &str,
     conversation: &[serde_json::Value],
     kwargs: serde_json::Value,
     continue_final_message: bool,
-) -> anyhow::Error {
+) -> Result<String> {
     let kwargs: HashMap<String, serde_json::Value> = serde_json::from_value(kwargs).unwrap();
     ChatTemplateState::new(Some(template.to_string()))
         .unwrap()
@@ -1807,7 +1835,16 @@ fn render_failure(
                 ..Default::default()
             },
         )
-        .unwrap_err()
+}
+
+/// The failure of that render ([`rendered_with`]).
+fn render_failure(
+    template: &str,
+    conversation: &[serde_json::Value],
+    kwargs: serde_json::Value,
+    continue_final_message: bool,
+) -> anyhow::Error {
+    rendered_with(template, conversation, kwargs, continue_final_message).unwrap_err()
 }
 
 /// A render that stops on something the template's source alone decides is
@@ -1832,6 +1869,14 @@ fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates
         ("{% extends 'base.jinja' %}", "template not found"),
         (
             "{% import 'macros.jinja' as macros %}",
+            "template not found",
+        ),
+        (
+            "{% from 'macros.jinja' import helper %}",
+            "template not found",
+        ),
+        (
+            "{% include ['tools.jinja', 'functions.jinja'] %}",
             "template not found",
         ),
         ("{{ messages | no_such_filter }}", "unknown filter"),
@@ -1863,6 +1908,22 @@ fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates
             );
         }
     }
+
+    // A block is the template's wherever its statement stands, under a
+    // branch that does not run too: no value makes a block the source has
+    // unknown.
+    let block_under_a_branch = "{% if messages | length > 2 %}{% block late %}here{% endblock %}\
+                                {% endif %}{{ self.late() }}";
+    assert_eq!(
+        rendered_with(
+            block_under_a_branch,
+            &conversation,
+            serde_json::json!({}),
+            false
+        )
+        .unwrap(),
+        "here"
+    );
 
     let unnamed = render_messages(
         &Environment::new(),
@@ -1903,6 +1964,8 @@ fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates
 /// calls, its own `raise_exception` among them. A template that breaks on
 /// every conversation (it iterates over a number) fails with the same kind,
 /// which the render cannot tell from a caller's value, and stays plain too.
+/// So does a function the engine does not have where a macro calls it: the
+/// engine fails that call as an operation on an undefined value.
 #[test]
 fn a_render_failure_a_value_can_bring_about_stays_plain() {
     let one_turn = [serde_json::json!({"role": "user", "content": "hi"})];
@@ -1991,6 +2054,14 @@ fn a_render_failure_a_value_can_bring_about_stays_plain() {
             none(),
             "could not render include",
         ),
+        // A function the engine does not have, called in a macro: the engine
+        // hands a macro each name it reads, this one as an undefined value.
+        (
+            "{% macro helper() %}{{ no_such_function() }}{% endmacro %}{{ helper() }}",
+            &one_turn[..],
+            none(),
+            "invalid operation",
+        ),
         // A filter and a test named by an argument's value.
         (
             "{{ messages | map('no_such_filter') | list }}",
@@ -2026,16 +2097,7 @@ fn a_render_failure_a_value_can_bring_about_stays_plain() {
     // Without the argument that broke them, the templates above are sound:
     // two render, and the third refuses in its own words.
     let sound = |template: &str, kwargs: serde_json::Value| {
-        let kwargs: HashMap<String, serde_json::Value> = serde_json::from_value(kwargs).unwrap();
-        ChatTemplateState::new(Some(template.to_string()))
-            .unwrap()
-            .apply(
-                &one_turn,
-                ChatTemplateParams {
-                    template_kwargs: Some(&kwargs),
-                    ..Default::default()
-                },
-            )
+        rendered_with(template, &one_turn, kwargs, false)
     };
     assert_eq!(sound(calls_namespace, none()).unwrap(), "False");
     assert_eq!(
@@ -2047,6 +2109,125 @@ fn a_render_failure_a_value_can_bring_about_stays_plain() {
         "Today Date: 20 Nov 2026"
     );
     assert!(TemplateRefusal::is(&sound(refuses, none()).unwrap_err()));
+}
+
+/// Another template that is not there is the template's failure only where
+/// the source spells every name it asks for. A name read from a value is the
+/// caller's to get wrong, and an empty list of them renders. The error does
+/// not say which statement raised it, so one statement that reads its name
+/// keeps the failure plain: a value can hand it a name the source spells in
+/// another statement, one that did not run.
+#[test]
+fn a_missing_template_a_value_can_name_stays_plain() {
+    let one_turn = [serde_json::json!({"role": "user", "content": "hi"})];
+    let includes_fragments = "{% include fragments %}";
+    for (template, kwargs) in [
+        (
+            includes_fragments,
+            serde_json::json!({"fragments": ["missing.jinja"]}),
+        ),
+        (
+            includes_fragments,
+            serde_json::json!({"fragments": "missing.jinja"}),
+        ),
+        (
+            "{% extends parent %}",
+            serde_json::json!({"parent": "base.jinja"}),
+        ),
+        (
+            "{% import helpers as helper %}",
+            serde_json::json!({"helpers": "macros.jinja"}),
+        ),
+        (
+            "{% from helpers import helper %}",
+            serde_json::json!({"helpers": "macros.jinja"}),
+        ),
+        (
+            "{% if messages | length > 1 %}{% include 'tools.jinja' %}{% endif %}\
+             {% include fragments %}",
+            serde_json::json!({"fragments": ["tools.jinja"]}),
+        ),
+    ] {
+        let failed = render_failure(template, &one_turn, kwargs.clone(), false);
+        assert!(
+            !TemplateFailure::is(&failed),
+            "{template} {kwargs}: {failed:#}"
+        );
+        assert!(
+            failed
+                .to_string()
+                .starts_with("Failed to render template: template not found: "),
+            "{template} {kwargs}: {failed}"
+        );
+    }
+    let no_fragments = serde_json::json!({"fragments": []});
+    assert_eq!(
+        rendered_with(includes_fragments, &one_turn, no_fragments, false).unwrap(),
+        ""
+    );
+}
+
+/// A call of a name nothing defines is the template's failure only where the
+/// source binds the name on no branch. Where a macro, a `set`, a loop, a
+/// `with`, an import or a parameter binds it somewhere, a value decides
+/// whether the binding ran before the call, and the failure stays plain: the
+/// first template renders a conversation that opens with `hello` and fails
+/// any other. `loop` and `caller` are the engine's to bind and stay plain too.
+#[test]
+fn a_call_of_a_name_the_source_binds_on_some_branch_stays_plain() {
+    let greets_hello = "{% if messages[0].content == 'hello' %}{% macro greet() %}hi there\
+                        {% endmacro %}{% endif %}{{ greet() }}";
+    let one_turn = |content: &str| [serde_json::json!({"role": "user", "content": content})];
+    let none = || serde_json::json!({});
+    assert_eq!(
+        rendered_with(greets_hello, &one_turn("hello"), none(), false).unwrap(),
+        "hi there"
+    );
+    let long = "messages | length > 1";
+    let bound_somewhere = [
+        greets_hello.to_string(),
+        format!("{{% if {long} %}}{{% set late = namespace %}}{{% endif %}}{{{{ late() }}}}"),
+        format!("{{% if {long} %}}{{% set late %}}x{{% endset %}}{{% endif %}}{{{{ late() }}}}"),
+        format!("{{% if {long} %}}{{% set late, other = 1, 2 %}}{{% endif %}}{{{{ late() }}}}"),
+        "{% for late in messages %}{% endfor %}{{ late() }}".to_string(),
+        "{% for role, late in [] %}{% endfor %}{{ late() }}".to_string(),
+        "{% with late = namespace %}{% endwith %}{{ late() }}".to_string(),
+        "{% macro helper(late) %}{% endmacro %}{{ late() }}".to_string(),
+        "{% macro helper() %}{{ caller(1) }}{% endmacro %}\
+         {% call(late) helper() %}{% endcall %}{{ late() }}"
+            .to_string(),
+        format!("{{% if {long} %}}{{% import 'chat' as late %}}{{% endif %}}{{{{ late() }}}}"),
+        format!("{{% if {long} %}}{{% from 'chat' import late %}}{{% endif %}}{{{{ late() }}}}"),
+        "{% block body %}{% set late = namespace %}{% endblock %}{{ late() }}".to_string(),
+        "{{ loop(messages) }}".to_string(),
+        "{{ caller() }}".to_string(),
+    ];
+    for template in &bound_somewhere {
+        let failed = render_failure(template, &one_turn("hi"), none(), false);
+        assert!(!TemplateFailure::is(&failed), "{template}: {failed:#}");
+        assert!(
+            failed
+                .to_string()
+                .starts_with("Failed to render template: unknown function: "),
+            "{template}: {failed}"
+        );
+    }
+
+    // A name the source binds nowhere is the template's own to call, beside
+    // a binding of another name and under a branch a value picks.
+    for template in [
+        format!("{{% if {long} %}}{{% set other = namespace %}}{{% endif %}}{{{{ late() }}}}"),
+        "{% if messages[0].content != 'hello' %}{{ late() }}{% endif %}".to_string(),
+    ] {
+        let failed = render_failure(&template, &one_turn("hi"), none(), false);
+        assert!(TemplateFailure::is(&failed), "{template}: {failed:#}");
+        assert!(
+            failed
+                .to_string()
+                .starts_with("Failed to render template: unknown function: late is unknown"),
+            "{template}: {failed}"
+        );
+    }
 }
 
 /// The render's own checks of the request are not the template's failure,
