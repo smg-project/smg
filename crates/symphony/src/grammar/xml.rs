@@ -724,9 +724,15 @@ mod tests {
         assert_eq!(
             open["format"],
             value!({"type": "sequence", "elements": [
-                {"type": "any_text", "excludes": [
-                    "<tool_call>", "</tool_call>", "<invoke name=\"", "</invoke>", SEP,
-                ]},
+                {"type": "optional", "content": {
+                    "type": "tag",
+                    "begin": "",
+                    "content": {"type": "any_text", "excludes": [
+                        "<mm:think>", "</mm:think>", "<tool_call>", "</tool_call>",
+                        "<invoke name=\"", "</invoke>", SEP,
+                    ]},
+                    "end": "</mm:think>",
+                }},
                 block,
             ]})
         );

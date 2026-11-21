@@ -31,15 +31,29 @@ schema accepts, wherever the marker stands in a message. The forced call's forma
 no tag: its constraint is the request's own schema, which the gateway writes. The gateway's old
 parsers wrote these tags
 by hand, one function per parser; where one exists for a format Symphony has, the derived tag is
-pinned to it in the tests, so the switch changes nothing an engine sees.
+pinned to it in the tests, so the switch changes nothing an engine sees except the open-thought,
+unnamed-start forced tag described below.
 
-With the prompt's reasoning still open, the tag is wrapped in a prefix: free text that can write
-none of the table's markers but the thought's own, nor the call syntax's inner tags, with nothing
-owed at its end, so the forced call follows the reasoning instead of replacing it, as the gateway's
-`wrap_in_reasoning_prefix` does. The text is the thought and its close where the engine applies the
-grammar from the first token, and a newline or nothing where the engine runs a reasoning parser and
-applies the grammar only after the model's own close; a prefix the thought's close ended would be
-owed a second time there, and the model would fill the gap with a fabricated observation and answer.
+With the prompt's reasoning still open, the tag follows a prefix, so the forced call follows the
+reasoning instead of replacing it. Where the engine applies the grammar from the first token, the
+prefix is the thought as a tag closed by its own marker; where it runs a reasoning parser and
+applies the grammar only after the model's own close, there is none but what the template writes
+after the close. Where the engine does not say, a call the request owes takes the two side by
+side, the thought closed by its own marker or nothing of it: a close owed outright would be owed a
+second time behind a reasoning parser, and the model would fill the gap with a fabricated
+observation and answer, while free text with nothing owed at its end would not hold the model to
+the call. A tag that owes no call (`auto`) keeps that free text there: text that can write none of
+the table's markers but the thought's own, nor the call syntax's inner tags, and that may be the
+answer itself. The gateway's older `wrap_in_reasoning_prefix` led only a forced call; that call now
+departs from the older wrap by ending its text at the thought's close.
+
+An engine that starts after its reasoning parser but does not name that start can still choose the
+optional thought after the model's own close. If prose has begun there, the tag holds the call back
+until a second thought close; the response reader is already in content, so it keeps that close as
+content. A client then receives text such as `\n\nProse.\n</think>\n\n` before the call. The older
+free-text lead let prose run on after the close on every engine; here it can run on only where an
+after-reasoning engine has not named its start, and the call waits for a second close.
+
 A table without a thought has nothing to wrap, and the tag comes back as it is; a thought that
 closes only into the block has no prefix, its close being its own way in, and the table gives `None`
 rather than a tag the model could write inside its thought; a thought that closes into the text
@@ -105,7 +119,7 @@ nothing after the call.
 `response_format` of a request, from the same table: the rows into the state the answer is written
 in, the schema, and the answer's close with the end of the turn. Where the output starts in
 content, as in ChatML's tables, it is the schema alone, and it takes no free-text prefix when the
-prompt left the model inside its thought: the prefix leads a forced call because the call's markers
+prompt left the model inside its thought: that prefix leads an `auto` tag because the call's markers
 are excluded from it, so the marker the model writes can only open the tag, but an answer has no
 marker, nothing in free text says where the schema begins, and the model would write a fence or a
 note around its JSON with the end of the turn masked, once its text has left the schema, until a
@@ -116,8 +130,9 @@ token, the thought as a tag closed by its own marker leads the schema, so the mo
 it answers and free text cannot run on after the close. A gateway derives the answer's tag for the
 engine each attempt selects, so a pool whose engines start the grammar at different places (one at
 the first token beside one that does not, during a rolling upgrade, say) gives each engine its own
-shape; `GrammarStart::Either`, the start such a pool names, keeps the prefix for a forced call,
-whose tag is built once for the pool (an answer grammar asked for it still takes the prefix,
+shape; `GrammarStart::Either`, the start such a pool names, gives a forced call, whose tag is built
+once for the pool, the thought closed by its own marker or nothing of it (an answer grammar asked
+for it still takes the free-text prefix,
 loosely, as before, though the gateway no longer asks for one). A table may bound the runs of whitespace the answer's JSON holds between
 its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_whitespace_cnt` on the
 answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON

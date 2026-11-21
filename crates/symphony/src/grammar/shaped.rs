@@ -38,7 +38,7 @@
 //! more may come, the calls are written one after another the same way, each after its lead: free
 //! text after an owed call would be read as content beside it.
 //!
-//! With the prompt's thought open, a tag that owes a call follows the free prefix every syntax's
+//! With the prompt's thought open, a tag that owes a call follows the prefix every syntax's
 //! tag takes; one that owes none takes no prefix, its own free text writing the thought: an engine
 //! reads free text before triggered tags so that the prefix could end inside the call's terminal
 //! and the triggered tags' free text write the rest, a call no tag constrains.

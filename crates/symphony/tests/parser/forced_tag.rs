@@ -180,6 +180,52 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
     assert!(checked > 0, "no table reads calls");
 }
 
+/// A call the request owes is never led by free text, which would not hold the model to it. Where
+/// no start is named, a tag that takes the thought holds the two named starts' tags side by side.
+#[test]
+fn no_owed_call_follows_free_text_that_owes_nothing() {
+    let tools = tools();
+    let mut side_by_side = 0;
+    for table in Table::ALL {
+        let format = table.format();
+        if format.call_syntax().is_none() {
+            continue;
+        }
+        for (configuration, options, passed) in configurations() {
+            if !options.at_least_one || !options.reasoning_open {
+                continue;
+            }
+            let payload = |start| {
+                format
+                    .grammar_for(&tools[passed.clone()], Options { start, ..options })
+                    .map(|tag| tag.payload())
+            };
+            let Some(tag) = payload(options.start) else {
+                continue;
+            };
+            let lead = &tag["format"]["elements"][0];
+            assert_ne!(
+                lead["type"],
+                "any_text",
+                "{} ({configuration}): {tag}",
+                table.name()
+            );
+            if matches!(options.start, GrammarStart::Unknown | GrammarStart::Either) {
+                let thought = payload(GrammarStart::FirstToken).map(
+                    |first| json!({"type": "optional", "content": first["format"]["elements"][0]}),
+                );
+                if thought.as_ref() == Some(lead) {
+                    side_by_side += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        side_by_side > 0,
+        "the sweep meets tables whose tag takes the thought before it"
+    );
+}
+
 #[test]
 fn every_answer_grammar_a_table_writes_passes_the_engines_rule() {
     // An answer held to a JSON schema (`response_format`), with the prompt's thought closed or

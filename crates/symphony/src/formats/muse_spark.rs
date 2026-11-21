@@ -656,9 +656,9 @@ mod tests {
             ]})
         );
         assert_eq!(one["format"]["elements"][1]["stop_after_first"], true);
-        // With the thought left open by the prompt, free text leads the call.
+        // With the thought left open by the prompt, that thought or nothing of it leads the call.
         let open = required_payload(true);
-        assert_eq!(open["format"]["elements"][0]["type"], "any_text");
+        assert_eq!(open["format"]["elements"][0]["type"], "optional");
     }
 
     #[test]

@@ -563,7 +563,7 @@ pub(crate) fn a_call_terminal_ends_an_invoke_whose_arguments_are_json(
 /// thought closed, where the engine does not say or starts at the first token, the calls at once,
 /// as before, and on every start where the prompt wrote `after` itself after the close it wrote
 /// (thinking switched off); with the thought open, the thought closed by its marker (at the first
-/// token) or the free text that may hold the close (where the engine does not say) comes first,
+/// token) or that thought or nothing of it (where the engine does not say) comes first,
 /// then `after`, then the calls.
 pub(crate) fn a_forced_tag_begins_with_the_templates_text(
     format: &Format,
@@ -654,7 +654,7 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
         assert_eq!(elements[0]["end"], close, "{choice}: {first}");
         assert_eq!(elements[1], text, "{choice}: {first}");
         assert_eq!(elements[2], *calls, "{choice}: {first}");
-        // The thought open, where the engine does not say: free text that may hold the close,
+        // The thought open, where the engine does not say: that thought or nothing of it,
         // `after`, the calls.
         let unknown = tag(true, GrammarStart::Unknown);
         let elements = unknown["format"]["elements"]
@@ -662,7 +662,11 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
             .unwrap_or_else(|| panic!("{choice}: {unknown}"));
         assert_eq!(unknown["format"]["type"], "sequence", "{choice}: {unknown}");
         assert_eq!(elements.len(), 3, "{choice}: {unknown}");
-        assert_eq!(elements[0]["type"], "any_text", "{choice}: {unknown}");
+        assert_eq!(
+            elements[0],
+            value!({"type": "optional", "content": first["format"]["elements"][0].clone()}),
+            "{choice}: {unknown}"
+        );
         assert_eq!(elements[1], text, "{choice}: {unknown}");
         assert_eq!(elements[2], *calls, "{choice}: {unknown}");
     }
