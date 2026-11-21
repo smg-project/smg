@@ -31,7 +31,8 @@
 //! request's maker hands ([`RequestMaker::workers`]), with a lease the
 //! request's guard holds to its end. The engine files no lease and keeps no
 //! note of a request: the guard lends back what a later word needs
-//! ([`HeldDecision`]). A single request is decided in [`single`].
+//! ([`HeldDecision`]). A single request is decided in [`single`], and a pair
+//! in [`pair`], with its decode asked again behind its prefill.
 //!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation.
@@ -68,7 +69,7 @@ use super::{
 use crate::{
     document::spec::AppliedSpec,
     names::intern,
-    store::{pairing::Refusal, DecodeRefused, GatewayId, Said},
+    store::{pairing::Refusal, GatewayId, Said},
     tracking::lease::Side,
 };
 
@@ -337,6 +338,23 @@ impl PolicyEngine {
         let profiles = self.spec.engine().profiles();
         Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
     }
+
+    /// A whole decision under the engine's catch: a panic in it costs its
+    /// request alone and is counted ([`DecisionEngine::faults`]).
+    #[inline]
+    fn caught<R>(
+        &self,
+        decide: impl FnOnce() -> Result<R, DecisionRefused>,
+    ) -> Result<R, DecisionRefused> {
+        match catch_unwind(AssertUnwindSafe(decide)) {
+            Ok(decided) => decided,
+            Err(payload) => {
+                release(payload);
+                self.faults.fetch_add(1, Ordering::Relaxed);
+                Err(DecisionRefused::Faulted)
+            }
+        }
+    }
 }
 
 /// The engine of a gateway's own process, asked for whole decisions.
@@ -363,42 +381,47 @@ impl DecisionEngine for PolicyEngine {
         maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
-        let decide = || {
+        self.caught(|| {
             let mut request = maker.make(&self.spec);
             let later = request.constraints.decode_later;
             let decided = match (request.facts.phase, maker.workers()) {
                 (Phase::Single, WorkerLists::Single(members)) => {
                     single::decide(self, &mut request, members, now)
                 }
+                // A pair is decided at its prefill, over its host's two
+                // lists.
+                (Phase::Prefill, WorkerLists::Pair(lists)) => {
+                    let decided = pair::decided(self, &lists, &mut request, None, now);
+                    return Ok((decided, later));
+                }
                 // A request that hands no list of its own is decided over
                 // no worker.
-                (Phase::Single, _) => single::over_none(self, &request),
-                // A pair is decided at its prefill, by the pair's own entry.
-                (Phase::Prefill, _) => single::declined(self, &request, single::PLAN),
+                (Phase::Single | Phase::Prefill, _) => single::over_none(self, &request),
                 (Phase::Decode | Phase::Encode, _) => return Err(DecisionRefused::PairSide),
             };
             Ok((single::issued(self, decided, &request, now), later))
-        };
-        match catch_unwind(AssertUnwindSafe(decide)) {
-            Ok(decided) => decided,
-            Err(payload) => {
-                release(payload);
-                self.faults.fetch_add(1, Ordering::Relaxed);
-                Err(DecisionRefused::Faulted)
-            }
-        }
+        })
     }
 
-    // The guard asks only for a pair's decode that stands chosen, and this
-    // engine issues no pair yet.
+    // The guard asks only where the pair's prefill is held and its decode
+    // stands chosen. A call that hands no pair's lists is decided over no
+    // worker, and its guard keeps the decode the first pick named.
     fn decide_decode_under(
         &self,
         _: GatewayId,
-        _: &impl RequestMaker,
-        _: &HeldDecision<'_>,
-        _: Instant,
+        maker: &impl RequestMaker,
+        held: &HeldDecision<'_>,
+        now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
-        Err(DecisionRefused::Decode(DecodeRefused::NotChosen))
+        self.caught(|| {
+            let mut request = maker.make(&self.spec);
+            Ok(match maker.workers() {
+                WorkerLists::Pair(lists) => {
+                    pair::decided(self, &lists, &mut request, Some(held), now)
+                }
+                _ => single::issued(self, single::over_none(self, &request), &request, now),
+            })
+        })
     }
 
     // A side sent on its own: the encode family's pair has no entry here.
@@ -418,8 +441,10 @@ impl DecisionEngine for PolicyEngine {
         let engine = self.spec.engine();
         let tell = || match held.lease.side {
             Side::Single => single::said(engine, held, said),
-            // No pair's lease is issued here yet.
-            Side::Prefill | Side::Decode | Side::Encode => {}
+            // A pair's guard holds its prefill side's lease.
+            Side::Prefill => pair::said(engine, held, said, |at| self.clock.micros(at)),
+            // No lease is issued for a side on its own.
+            Side::Decode | Side::Encode => {}
         };
         if let Err(payload) = catch_unwind(AssertUnwindSafe(tell)) {
             release(payload);
