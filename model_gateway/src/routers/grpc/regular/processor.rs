@@ -520,10 +520,19 @@ impl ResponseProcessor {
                     parsed_reasoning_tokens += reasoning_tokens;
                 }
                 // The model's own doing, answered as the wire's contract
-                // answers it: one such choice fails the whole request.
+                // answers it: one such choice fails the whole request. The
+                // engine completed the answer, so the failure carries the
+                // engine's counters for the request's settlement, as the
+                // stream settles them on the same failure.
                 Ok(Err(ChoiceFailure::ToolCallFormat(failure))) => {
                     failure.warn(&dispatch.request_id, model);
-                    return Err(failure.response());
+                    let mut response = failure.response();
+                    response_formatting::TokenCounts::of_collected(
+                        &all_responses,
+                        chat_request.expected_choices,
+                    )
+                    .carry_on(&mut response);
+                    return Err(response);
                 }
                 Ok(Err(ChoiceFailure::Read(e))) => {
                     return Err(error::internal_error(
