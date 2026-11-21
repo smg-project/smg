@@ -1739,8 +1739,8 @@ impl ZmqEngineClient {
     /// [`get_loads`](Self::get_loads) with each entry numbered by the rank a
     /// pin reaches, for a reader that scopes the answer to rank workers. A
     /// TokenSpeed rank is its engine's index only when the ranks dialled in
-    /// at indices 0..n in rank order ([`RankIndices`]); the other dialects
-    /// place a pin by index.
+    /// at indices 0..n in rank order; the other dialects place a pin by
+    /// index.
     pub fn get_loads_by_rank(&self) -> WorkerLoadResponse {
         let ZmqBackend::TokenSpeed(client) = &self.backend else {
             return self.get_loads();

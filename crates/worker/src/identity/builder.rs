@@ -290,6 +290,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
     /// Share one connection slot with the other rank workers of a ZMQ engine
     /// group: the group's engines dial one socket set, so its rank workers
     /// run one handshake between them and follow its reconnects together.
+    #[cfg(any(feature = "workflow", test))]
     pub(crate) fn shared_engine_connection(mut self, slot: Arc<EngineConnectionCache>) -> Self {
         self.shared_engine_connection = Some(slot);
         self
