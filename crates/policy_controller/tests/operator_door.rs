@@ -3,7 +3,7 @@
 use std::{error::Error, sync::Arc, time::Instant};
 
 use smg_policy_controller::{
-    operator::{
+    document::operator::{
         snapshot::{told, Asked, Rows},
         Applied, Format, SpecDoor, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
     },
@@ -155,4 +155,60 @@ fn a_host_counts_each_document_it_cannot_apply() {
     let unpublished = door.apply_where(START.to_vec(), json, |_| None, |_, _| Err(stale));
     assert_eq!(unpublished, Err(SpecRejected::Stale(stale)));
     assert_eq!((door.counts().applied, door.counts().rejected), (0, 3));
+}
+
+/// A null under a built-in rule's name, the slip of a bare name written
+/// with a colon, is told both forms at the rule's own path, in both
+/// formats: the door hands the rule's type what the document wrote.
+#[test]
+fn a_null_under_a_built_in_rule_is_told_both_forms_at_its_path() {
+    let store = Arc::new(MemoryStore::new());
+    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random","filter":[{"has-room":null}]}}}"#;
+    let yaml = b"apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\n    filter:\n    - has-room:\n";
+    for (format, bytes) in [
+        (Format::Json, json.as_slice()),
+        (Format::Yaml, yaml.as_slice()),
+    ] {
+        let dry = door.dry_run("", bytes, format).expect("no guard");
+        let refused = dry.would_run.expect_err("a null rule");
+        assert!(
+            matches!(
+                &refused,
+                SpecRejected::Unparsed { path, message, .. }
+                    if path == "profiles.p.filter[0].has-room"
+                        && message.contains(
+                            "expected a rule with `used` and `capacity`, or the bare name `has-room`"
+                        )
+            ),
+            "{refused:?}"
+        );
+    }
+}
+
+/// A parameter no built-in rule holds is refused at its own path, in both
+/// formats: the rule's keys are read by the door's own reader, so the first
+/// key written keeps its place.
+#[test]
+fn an_unknown_parameter_of_a_built_in_rule_is_refused_at_its_own_path() {
+    let store = Arc::new(MemoryStore::new());
+    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random","filter":[{"has-room":{"arp":0,"used":{"load.running":1},"capacity":10}}]}}}"#;
+    let yaml = b"apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\n    filter:\n    - has-room: {arp: 0, used: {load.running: 1}, capacity: 10}\n";
+    for (format, bytes) in [
+        (Format::Json, json.as_slice()),
+        (Format::Yaml, yaml.as_slice()),
+    ] {
+        let dry = door.dry_run("", bytes, format).expect("no guard");
+        let refused = dry.would_run.expect_err("an unknown parameter");
+        assert!(
+            matches!(
+                &refused,
+                SpecRejected::Unparsed { path, message, .. }
+                    if path == "profiles.p.filter[0].has-room.arp"
+                        && message.starts_with("unknown field `arp`")
+            ),
+            "{refused:?}"
+        );
+    }
 }

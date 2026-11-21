@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    load_report,
+    load::load_report,
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
         WorkersStore,
@@ -329,6 +329,7 @@ impl Bed {
             now,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         let now_micros = self.store.micros(now);
         let (engine, out, scratch) = (&self.engine, &mut self.out, &mut self.scratch);

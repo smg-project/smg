@@ -7,8 +7,8 @@ use super::{
     PairingDescriptor, Refusal, LAYOUT_FACTS,
 };
 use crate::{
-    spec::Pairing,
-    view::{WireModes, WorkerId},
+    document::spec::Pairing,
+    engine::view::{WireModes, WorkerId},
 };
 
 mod written;

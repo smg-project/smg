@@ -3188,7 +3188,16 @@ fn fleet_with_holders_of(holders: usize, blocks: usize) -> HolderFleet {
 /// A fleet of `workers`, eight of them; the first `holders` hold `blocks`
 /// blocks each of their own sequence, the rest nothing.
 fn fleet_of(workers: Vec<Arc<dyn Worker>>, holders: usize, blocks: usize) -> HolderFleet {
-    let policy = CacheAwarePolicy::with_config(test_config());
+    fleet_with_config(workers, holders, blocks, test_config())
+}
+
+fn fleet_with_config(
+    workers: Vec<Arc<dyn Worker>>,
+    holders: usize,
+    blocks: usize,
+    config: CacheAwareConfig,
+) -> HolderFleet {
+    let policy = CacheAwarePolicy::with_config(config);
     policy.init_workers(&workers);
     update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 0, 0, 0]);
     let indexer = Arc::new(KvIndex::chain());
@@ -3215,6 +3224,61 @@ fn fleet_of(workers: Vec<Arc<dyn Worker>>, holders: usize, blocks: usize) -> Hol
         indexer,
         heads: prefixes,
     }
+}
+
+const MAXIMAL_DIVERSION_PERIOD_CHILD: &str = "SMG_TEST_MAXIMAL_CACHE_AWARE_DIVERSION_PERIOD";
+
+/// Liveness budgets are first-set-wins process globals, so a child contains this test's value.
+#[test]
+fn a_maximal_cache_aware_diversion_period_does_not_overflow() {
+    if std::env::var_os(MAXIMAL_DIVERSION_PERIOD_CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "policies::cache_aware::tests::a_maximal_cache_aware_diversion_period_does_not_overflow",
+                "--nocapture",
+            ])
+            .env(MAXIMAL_DIVERSION_PERIOD_CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated regression test failed: {status}"
+        );
+        return;
+    }
+
+    let mut budgets = liveness::budgets();
+    budgets.warmup_divert_every = (1_u64 << 63) + 1;
+    liveness::configure_from(budgets);
+    assert_eq!(liveness::warmup().divert_every, (1_u64 << 63) + 1);
+
+    let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let fleet = fleet_with_config(
+        make_workers(&refs),
+        7,
+        1_100,
+        CacheAwareConfig {
+            cache_threshold: 0.25,
+            ..test_config()
+        },
+    );
+    let mut shallow = fleet.heads[0][..32].to_vec();
+    shallow.extend(90_000_000..90_000_048);
+    for _ in 0..2 {
+        assert_eq!(route_tokens(&fleet.policy, &fleet.workers, &shallow), 0);
+    }
+    fleet.policy.divert_hits.store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(route_tokens(&fleet.policy, &fleet.workers, &shallow), 0);
+}
+
+#[test]
+fn a_maximal_cache_aware_diversion_period_does_not_overflow_filter_guard() {
+    assert!(
+        std::env::var_os(MAXIMAL_DIVERSION_PERIOD_CHILD).is_none(),
+        "the isolated child also ran a sibling test"
+    );
 }
 
 #[test]

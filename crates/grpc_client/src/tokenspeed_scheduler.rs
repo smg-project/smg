@@ -541,7 +541,7 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             max_running_requests: load.max_running_requests,
             memory,
             queues,
-            values: Vec::new(),
+            values: crate::stated_values(&load.values),
             // TokenSpeed has no disagg section; canonical PD fields stay None.
             ..Default::default()
         }
@@ -762,6 +762,7 @@ mod load_conversion_tests {
                     retracted: 0,
                 }),
                 num_resident_tokens: None,
+                values: Vec::new(),
             }],
             aggregate: Some(tokenspeed_proto::AggregateMetrics {
                 total_running_reqs: 3,

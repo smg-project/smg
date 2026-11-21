@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import struct
 import time
 from array import array
@@ -864,15 +865,22 @@ class MsgpackSendSocket:
         )
 
         if isinstance(output, BatchTokenIDOutput):
-            self._send_slim(
-                BatchTokenIDSlimOutput.from_full(
-                    output,
-                    engine_index=self.engine_index,
-                    hidden_rows=self.hidden_rows.column(output),
-                    output_adapter=self.output_adapter,
-                    **self._load_tail(),
-                )
+            slim = BatchTokenIDSlimOutput.from_full(
+                output,
+                engine_index=self.engine_index,
+                hidden_rows=self.hidden_rows.column(output),
+                output_adapter=self.output_adapter,
+                **self._load_tail(),
             )
+            self._send_slim(slim)
+            # A diagnostic failure must never enter the relay-abort handler.
+            if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") == "1":
+                try:
+                    from smg_grpc_servicer.sglang.zmq_plugin import trace_qwenvl_output
+
+                    trace_qwenvl_output(slim)
+                except Exception:
+                    pass
             self.traces.finish_batch(output.rids, getattr(output, "finished_reasons", None) or [])
         elif isinstance(output, BatchEmbeddingOutput):
             self._send_slim(

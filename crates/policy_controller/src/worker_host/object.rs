@@ -11,8 +11,8 @@ use smg_worker::{
 };
 
 use crate::{
+    engine::view::{Role, WireModes},
     store::{HealthPolicy, WorkerFacts, WorkerRow, WorkerStatus},
-    view::{Role, WireModes},
 };
 
 /// The worker object of `row`: every fact of the row a collector or the
@@ -72,11 +72,15 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
     spec.kv_block_size = kv_block_size.and_then(|size| usize::try_from(size).ok());
     spec.bootstrap_port = *bootstrap_port;
     let address = dial_address(&row.facts);
-    if address != key {
+    let ranked = address != key;
+    if ranked {
         spec.dp_base_url = Some(address.to_owned());
     }
     if *dp_size > 1 {
-        spec.dp_rank = Some(usize::from(*dp_rank));
+        // A row under its engine's own address that states no rank is the
+        // engine whole: the width it states is no rank's.
+        let whole = !ranked && *dp_rank == 0;
+        spec.dp_rank = (!whole).then(|| usize::from(*dp_rank));
         spec.dp_size = Some(usize::from(*dp_size));
     }
     <BasicWorkerBuilder>::from_spec(spec)
@@ -242,6 +246,19 @@ mod tests {
         assert_eq!(made.status(), ObjectStatus::Ready);
         assert_eq!(made.api_key(), None);
         assert!(made.engine_connector().is_none());
+    }
+
+    /// A row under its engine's own address that states a width is the
+    /// engine whole: the object holds the width and no rank.
+    #[test]
+    fn a_row_under_its_engines_address_holds_its_width_and_no_rank() {
+        let made = object(&row(WorkerFacts {
+            engine: URL.to_string(),
+            dp_size: 4,
+            ..at(URL)
+        }));
+        assert_eq!(made.metadata().spec.dp_base_url, None);
+        assert_eq!((made.dp_rank(), made.dp_size()), (None, Some(4)));
     }
 
     /// A row that is its own engine, and one that names none, dials its key

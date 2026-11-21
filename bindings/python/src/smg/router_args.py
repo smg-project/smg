@@ -1338,7 +1338,8 @@ class RouterArgs:
                 " consistent_hashing places by its routing key, by its policy);"
                 " also sheds"
                 " a worker that crossed a threshold between selection"
-                " and dispatch. Off by default."
+                " and dispatch, except for a request the policy controller"
+                " placed. Off by default."
             ),
         )
         routing_group.add_argument(

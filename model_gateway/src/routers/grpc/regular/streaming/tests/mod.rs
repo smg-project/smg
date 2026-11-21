@@ -16,6 +16,7 @@ mod pd_anchor;
 mod pd_usage;
 mod sse_bytes;
 mod symphony_chat;
+mod symphony_choice;
 mod thinking_display;
 mod usage;
 mod usage_chunk;

@@ -81,7 +81,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
     policies::PolicyRegistry,
-    policy_controller::host::Host,
+    policy_controller::engine::{Placed, PolicyEngine},
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
@@ -119,7 +119,11 @@ pub(crate) enum Endpoint {
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    host: Option<Arc<Host>>,
+    policy_engine: Option<Arc<PolicyEngine>>,
+    /// Whether the pair's policy settings keep a request to the worker it
+    /// names (`placement::pair_keeps_target`). No role policy is built under
+    /// the policy controller, so the selection stage is told.
+    pair_keeps_target: bool,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
@@ -161,7 +165,8 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
-            host: None,
+            policy_engine: None,
+            pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory,
             reasoning_parser_factory,
@@ -186,7 +191,8 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
-            host: None,
+            policy_engine: None,
+            pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -216,11 +222,19 @@ impl PipelineDeps {
         self
     }
 
-    /// Place regular requests through the policy controller's `host`, where
+    /// Place regular requests through the policy engine `policy_engine`, where
     /// the context holds one.
     #[must_use]
-    pub(crate) fn with_host(mut self, host: Option<Arc<Host>>) -> Self {
-        self.host = host;
+    pub(crate) fn with_policy_engine(mut self, policy_engine: Option<Arc<PolicyEngine>>) -> Self {
+        self.policy_engine = policy_engine;
+        self
+    }
+
+    /// Tell the selection stage whether the pair's policy settings keep a
+    /// request to the worker it names (`placement::pair_keeps_target`).
+    #[must_use]
+    pub(crate) fn with_pair_keeps_target(mut self, keeps: bool) -> Self {
+        self.pair_keeps_target = keeps;
         self
     }
 
@@ -284,7 +298,8 @@ impl PipelineDeps {
         Self {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            host: None,
+            policy_engine: None,
+            pair_keeps_target: false,
             prefill_admission: None,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -365,7 +380,8 @@ impl RequestPipeline {
             mode.worker_selection(),
             deps.prefill_admission.clone(),
         )
-        .with_host(deps.host.clone())
+        .with_policy_engine(deps.policy_engine.clone())
+        .with_pair_keeps_target(deps.pair_keeps_target)
         .with_queue_timeout(deps.queue_timeout);
         let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
@@ -588,7 +604,7 @@ impl RequestPipeline {
             acquire_clients(
                 workers,
                 &ctx.input.model_id,
-                self.worker_registry.overload_shed_enabled(),
+                self.rechecks_overload(ctx.state.placed.as_ref()),
             )
             .await
         )?);
@@ -599,6 +615,17 @@ impl RequestPipeline {
             stages.request_building.name(),
             stages.request_building.build(ctx).await
         )
+    }
+
+    /// Whether client acquisition re-checks the chosen workers' overload
+    /// flag: under `--worker-overload-shed`, for a selection the classic
+    /// policies made. A placement the policy engine made is not
+    /// re-checked. There the overload veto is the controller's, read from
+    /// its rows, and the flag on the object mirrors it for the gateway's
+    /// other readers: a worker flagged under another pool's thresholds
+    /// still takes the send the controller decided.
+    fn rechecks_overload(&self, placed: Option<&Placed>) -> bool {
+        placed.is_none() && self.worker_registry.overload_shed_enabled()
     }
 
     /// One dispatch attempt: (re-)selection for retries, plan stamping,
@@ -631,7 +658,7 @@ impl RequestPipeline {
                 acquire_clients(
                     workers,
                     &dctx.model_id,
-                    self.worker_registry.overload_shed_enabled(),
+                    self.rechecks_overload(dctx.placed.as_deref()),
                 )
                 .await?,
             );

@@ -63,7 +63,7 @@
 //! generation the store holds, which [`MemoryStore::apply`] alone replaces:
 //! a decision reads its rows and its engine in one load.
 //!
-//! [`LoadRow`]: crate::view::LoadRow
+//! [`LoadRow`]: crate::engine::view::LoadRow
 
 pub mod encoding;
 pub mod health;
@@ -77,6 +77,7 @@ pub mod memory;
 pub mod pairing;
 pub mod reservations;
 pub mod sessions;
+pub mod signals;
 pub mod workers;
 pub mod world;
 
@@ -86,7 +87,8 @@ mod tests;
 pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, LeaderBits, VetoWrite};
 pub use index::{
-    ContentHash, KvEvent, LaneCounts, Named, SequenceHash, StoredBlock, INDEX_WORKERS,
+    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, Named, SequenceHash,
+    StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
@@ -99,10 +101,12 @@ pub use leases::{
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use membership::{Laid, NotMaker};
+pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
+pub use signals::{SignalSink, Taken};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, Maker, MembershipChange, MembershipTail, Overload,
     ProviderKey, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,

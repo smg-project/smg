@@ -73,7 +73,18 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 ### Routing Policies
 
-`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.disaggregation.prefillPolicy`), not for `--policy`.
+The chart's `router.policy` takes `cache_aware`, `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, and `bucket`: the launcher's `--policy` choices, as listed in `values.schema.json`.
+
+Under a disaggregation mode, a decode role with no `decodePolicy` runs under `router.policy`. The gateway refuses `bucket` for the decode role under `epd`, and under `pd` with `router.enableIgw`: set `router.disaggregation.decodePolicy` beside `router.policy: bucket` there.
+
+| Router value | Default | Description |
+|--------------|---------|-------------|
+| `router.policy` | `""` | Without a document, empty uses the launcher's `cache_aware` default. Beside a document a value fails the render: the document names the policy. |
+| `router.policyController` | `"off"` | `"off"` uses the classic policies. `"on"` selects the policy controller in the gateway process. A bare `on` or `off` works too. Use the top-level `policyController.enabled` for the separate service. |
+| `router.policySpec` | `{}` | Inline policy document. An empty map supplies no document. |
+| `router.policySpecConfigMap` | `""` | Name of your ConfigMap in the release's namespace with the document under `spec.yaml`. An empty name supplies no document. |
+
+To supply a policy document, set `router.policyController` to `"on"`, give one source, and leave `router.policy` empty. A document replaces the routing values. Beside one the router's line carries no cache tuning flag, and a cache tuning value moved from its default or a side policy of disaggregated serving fails the render. The gateway reads the document at start-up. An inline edit rolls the router pods. After editing a named ConfigMap, restart the router pods. What the gateway serves under the policy controller is said in [the controller's README](../../../crates/policy_controller/README.md#in-the-gateway).
 
 ### Disaggregated Serving
 

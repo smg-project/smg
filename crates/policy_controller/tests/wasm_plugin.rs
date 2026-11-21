@@ -24,13 +24,15 @@ use std::{
 };
 
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests, PowerOfTwo, SessionAffinity},
-    decider::Decider,
-    plugins::OpenDecisions,
-    wasm::{
-        Abi, Bound, BreakerSpec, EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec,
-        Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
+    engine::{decider, decider::Decider},
+    plugins::{
+        shared::OpenDecisions,
+        wasm::{
+            Abi, Bound, BreakerSpec, EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec,
+            Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
+        },
     },
+    stages::builtins::{Best, Healthy, LeastRequests, PowerOfTwo, SessionAffinity},
     Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Identity, Lease, Lifecycle,
     Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch,
     ShedReason, Side, Target, Weighted, WorkerId,
@@ -1225,7 +1227,7 @@ impl tracing::Subscriber for Said {
         (*metadata.level() <= tracing::Level::WARN
             && metadata.target().starts_with("smg_policy_controller"))
             || (*metadata.level() == tracing::Level::INFO
-                && metadata.target() == "smg_policy_controller::wasm::bindings")
+                && metadata.target() == "smg_policy_controller::plugins::wasm::bindings")
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -2007,10 +2009,13 @@ fn each_open_decision_of_a_pair_draws_its_own_sequence() {
     let (p1, p2) = (prefill.next_u64(), prefill.next_u64());
     let mut decode = Draw::new(p1);
     let (d1, d2) = (decode.next_u64(), decode.next_u64());
-    assert_eq!(counter_value(&plugin, counter::RANDOM), p1.wrapping_add(d1));
+    assert_eq!(
+        counter_value(&plugin, counter::RANDOM),
+        p1.saturating_add(d1)
+    );
     assert_eq!(
         counter_value(&plugin, counter::PICK_RANDOM),
-        p2.wrapping_add(d2),
+        p2.saturating_add(d2),
         "each pick drew the second value of its own side's sequence"
     );
 }
@@ -8923,7 +8928,7 @@ enum Inside {
 
 thread_local! {
     /// The name a case's thread holds, where a scope of the host can end it.
-    static HELD_NAME: std::cell::RefCell<Option<smg_policy_controller::decider::Acting>> =
+    static HELD_NAME: std::cell::RefCell<Option<decider::Acting>> =
         const { std::cell::RefCell::new(None) };
 }
 

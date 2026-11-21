@@ -7,6 +7,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use kv_index::{
@@ -15,9 +16,12 @@ use kv_index::{
 };
 use tracing::warn;
 
-use crate::common_proto::{
-    kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheLocality,
-    KvCacheTier,
+use crate::{
+    common_proto::{
+        kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheLocality,
+        KvCacheTier, KvEventBatch,
+    },
+    metrics::writers::Metrics,
 };
 
 /// One model's index, as the cache events write it.
@@ -172,6 +176,80 @@ pub fn apply_events<I: BlockIndex>(
     }
     for event in deferred {
         apply_event(event, worker_id, indexer, worker_blocks);
+    }
+}
+/// Apply a batch a worker's index takes and account for it: the blocks it
+/// stored (under `stored_op`) and removed, the stores the index did not
+/// take as is, the batch's age, and the batch itself under `disposition`.
+/// The series are the worker's, under `worker_url`. Returns how long the
+/// apply took: a live stream publishes it as its pace, a snapshot chunk
+/// does not. The worker's index-blocks gauge is its host's to set, since
+/// each host reads that count where its index keeps it.
+pub fn apply_counted<I: BlockIndex>(
+    batch: &KvEventBatch,
+    worker_url: &str,
+    worker_id: u32,
+    indexer: &I,
+    worker_blocks: &mut WorkerIndexState<I::Held>,
+    stored_op: &'static str,
+    disposition: &'static str,
+) -> Duration {
+    let started = Instant::now();
+    let counters_before = worker_blocks.counters;
+    let (mut stored_blocks, mut removed_blocks) = (0usize, 0usize);
+    for event in &batch.events {
+        match &event.data {
+            Some(kv_cache_event::Data::Stored(stored)) => stored_blocks += stored.blocks.len(),
+            Some(kv_cache_event::Data::Removed(removed)) => {
+                removed_blocks += removed.block_hashes.len();
+            }
+            _ => {}
+        }
+    }
+    apply_events(&batch.events, worker_id, indexer, worker_blocks);
+    let took = started.elapsed();
+    record_not_indexed(worker_url, &worker_blocks.counters, &counters_before);
+    if stored_blocks > 0 {
+        Metrics::record_kv_event_blocks(worker_url, stored_op, stored_blocks);
+    }
+    if removed_blocks > 0 {
+        Metrics::record_kv_event_blocks(worker_url, "removed", removed_blocks);
+    }
+    record_lag(worker_url, batch.timestamp);
+    Metrics::record_kv_event_batch(worker_url, disposition);
+    took
+}
+
+/// Publish the stores a batch placed without their parent, the sub-block
+/// stores it left out of the index and the stores the index declined at an
+/// arena cap, if any.
+fn record_not_indexed(worker_url: &str, after: &WorkerIndexCounters, before: &WorkerIndexCounters) {
+    let (stores, blocks) = after.parentless_since(before);
+    if stores > 0 {
+        Metrics::record_kv_event_parentless(worker_url, stores, blocks);
+    }
+    let (stores, blocks) = after.sub_block_since(before);
+    if stores > 0 {
+        Metrics::record_kv_event_sub_block(worker_url, stores, blocks);
+    }
+    let (stores, blocks) = after.cap_refused_since(before);
+    if stores > 0 {
+        Metrics::record_kv_event_cap_refused(worker_url, stores, blocks);
+    }
+}
+
+/// Age of a batch when applied, from the publisher's wall-clock stamp.
+fn record_lag(worker_url: &str, published_at: f64) {
+    if published_at <= 0.0 {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let lag = now - published_at;
+    if lag.is_finite() && lag >= 0.0 {
+        Metrics::record_kv_event_lag(worker_url, lag);
     }
 }
 
@@ -450,12 +528,7 @@ pub fn apply_cleared<I: BlockIndex>(
     worker_blocks: &mut WorkerIndexState<I::Held>,
 ) {
     indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
-    if let Some(view) = &worker_blocks.groups {
-        view.clear();
-    }
-    worker_blocks.copies.clear();
-    worker_blocks.record_before_clear = worker_blocks.block_of_record;
-    worker_blocks.block_of_record = 0;
+    worker_blocks.index_emptied();
 }
 
 /// Convert a proto `KvBlock` to a kv-index `StoredBlock`, hashing its tokens
@@ -506,6 +579,18 @@ pub fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<Index
 pub fn stored_tier(stored: &KvBlocksStored) -> Option<IndexedTier> {
     let first_level = stored.blocks.first().and_then(|block| block.cache_level);
     indexed_tier(stored.tier, first_level)
+}
+
+/// The width a store names for its blocks, in tokens: its first block's,
+/// since an engine writes one width per store. A width of zero or less is
+/// unknown, and names none.
+#[inline]
+pub fn store_width(stored: &KvBlocksStored) -> Option<u32> {
+    stored
+        .blocks
+        .first()
+        .and_then(|block| u32::try_from(block.block_size).ok())
+        .filter(|&width| width > 0)
 }
 
 /// Cache-group kinds whose blocks hold the main attention KV, the ones the
@@ -966,6 +1051,29 @@ pub struct WorkerIndexState<H: HeldBlocks> {
 }
 
 impl<H: HeldBlocks> WorkerIndexState<H> {
+    /// The index dropped every block of the worker: at a clear of its
+    /// stream ([`apply_cleared`]), or by itself, where an index empties a
+    /// worker's blocks in its own turn and says so here before the worker's
+    /// next event. The worker's group view is emptied, and its copies and
+    /// its block of record are forgotten, as a clear leaves them.
+    pub fn index_emptied(&mut self) {
+        if let Some(view) = &self.groups {
+            view.clear();
+        }
+        self.copies.clear();
+        self.record_before_clear = self.block_of_record;
+        self.block_of_record = 0;
+    }
+
+    /// The worker's block of record: tokens per block of the widest block
+    /// its stores carried since its last clear, and none until a store
+    /// names a width.
+    pub fn block_of_record(&self) -> Option<u32> {
+        u32::try_from(self.block_of_record)
+            .ok()
+            .filter(|&width| width > 0)
+    }
+
     /// Count the verdict and place any group under its view mask.
     fn admit(
         &mut self,

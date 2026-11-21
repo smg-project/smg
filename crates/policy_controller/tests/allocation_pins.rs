@@ -25,12 +25,12 @@ use std::{
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
-    door::{Door, Request},
-    handle::Handle,
+    engine::door::{Door, Request},
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
+    tracking::handle::Handle,
     AffinityFacts, AppliedSpec, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
     NamedAffinity, NamedHolder, Outcome, PairPools, PolicySpec, PoolFacts, RequestFacts, Role,
     Scratch, Side, SignalSource, Target, TransportClass, WireModes, WorkerId, PRESETS,
@@ -623,6 +623,7 @@ fn a_build_from_the_store_after_the_first_allocates_nothing() {
                 now: opened + Duration::from_secs(1),
                 pinned: None,
                 affinity,
+                signal_cells: false,
             };
             // The first build sizes the host's buffers.
             store
@@ -680,6 +681,7 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
         now: Instant::now(),
         pinned: None,
         affinity: true,
+        signal_cells: false,
     };
     let mut out = PairBuffers::default();
     // The first build sizes the host's buffers: the rows, the columns and
@@ -844,6 +846,7 @@ fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
                 now: opened + Duration::from_secs(1),
                 pinned: Some(ids[0]),
                 affinity,
+                signal_cells: false,
             };
             // The first view sizes the host's buffers: the mask and the
             // column.

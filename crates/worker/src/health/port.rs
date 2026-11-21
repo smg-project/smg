@@ -1,10 +1,10 @@
 //! The port between the health collector and the sink of what its facts mean
-//! for a worker's status: the two calls of a sink and the answer of the
-//! first. The collector (the probe schedule of
-//! [`manager`](super::manager)) says what it read: one probe's outcome, and
-//! a worker's connect signal. The sink keeps the status, the consecutive
+//! for a worker: the three calls of a sink and the answer of the first. The
+//! collector (the probe schedule of [`manager`](super::manager)) says what
+//! it read: one probe's outcome, a worker's connect signal, and that a
+//! worker's liveness veto moved. The sink keeps the status, the consecutive
 //! counts, the thresholds they are held to and the revision guard, and
-//! answers what the fact did to the status.
+//! answers what a probe or a connect signal did to the status.
 //!
 //! The registry is this crate's sink: its impl runs the status state machine
 //! over the worker objects it holds, and
@@ -33,8 +33,8 @@ pub enum ProbeAnswer {
     Stale,
 }
 
-/// Where the health collector's facts go. Both calls are cold: one a probe,
-/// one a connect signal.
+/// Where the health collector's facts go. Every call is cold: a probe, a
+/// connect signal, a move of the liveness veto.
 ///
 /// The collector calls a sink from its loop and judges no outcome itself:
 /// what a fact did to the status is the sink's answer. Its schedule still
@@ -54,7 +54,8 @@ pub enum ProbeAnswer {
 /// writes nowhere else.
 ///
 /// A sink that holds no row for the worker answers [`ProbeAnswer::Stale`]
-/// to a probe's outcome and `None` to a connect signal.
+/// to a probe's outcome and `None` to a connect signal, and writes nothing
+/// at a move of the liveness veto.
 ///
 /// [guarded]: crate::registry::WorkerRegistry::transition_status_if_revision
 /// [applied]: crate::registry::WorkerRegistry::apply_if_revision
@@ -84,4 +85,20 @@ pub trait HealthSink: Send + Sync {
         worker_id: &WorkerId,
         revision: u64,
     ) -> Option<(WorkerStatus, WorkerStatus)>;
+
+    /// The liveness veto of the worker under `worker_id` may have moved
+    /// ([`Worker::stall_reason`](crate::identity::basic::Worker::stall_reason)):
+    /// it was set, changed its reason or was cleared, or the worker came
+    /// under the collector with a veto no sink was told of. The collector
+    /// says it in three places. At a signal of the worker
+    /// ([`WorkerSignal::LivenessMoved`](crate::registry::event::WorkerSignal::LivenessMoved)).
+    /// Where a worker is laid in another's place, whose running state it
+    /// takes. And for every worker at the loop's start and behind a lagged
+    /// subscription. `revision` is the worker's at the tell.
+    ///
+    /// The call carries no reading. A sink that keeps the veto elsewhere
+    /// reads it on the worker object at its own write, so of two tells the
+    /// later read stands. The default does nothing: the registry's sink
+    /// keeps the veto on the worker object, where routing reads it.
+    fn liveness_moved(&self, _worker_id: &WorkerId, _revision: u64) {}
 }

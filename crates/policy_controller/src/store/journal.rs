@@ -3,7 +3,7 @@
 //! store applied the writes (design 5.4, the leader's log).
 //!
 //! The store knows the trait alone. The replication log
-//! ([`crate::replication::Log`]) is its one implementation: a store with a
+//! ([`crate::service::replication::Log`]) is its one implementation: a store with a
 //! journal is a store whose history a standby or a watcher of its rows can
 //! follow, and a store without one (a gateway deciding in its own process)
 //! pays one branch a write. A journal says once whether it carries load
@@ -11,11 +11,11 @@
 //! than none.
 
 use crate::{
+    engine::view::WorkerId,
     store::{
         loads::LoadSample,
         workers::{MembershipChange, WorkerRow},
     },
-    view::WorkerId,
 };
 
 /// A place in a store's history: the number of a replicated write, and the

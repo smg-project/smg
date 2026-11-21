@@ -340,6 +340,9 @@ pub enum Delta {
         data: Option<String>,
         uri: Option<String>,
         mime_type: Option<AudioMimeType>,
+        /// The audio's channel count and sample rate, as the public API takes them
+        channels: Option<u32>,
+        sample_rate: Option<u32>,
     },
     /// Document delta
     Document {
@@ -765,6 +768,9 @@ pub enum Content {
         data: Option<String>,
         uri: Option<String>,
         mime_type: Option<AudioMimeType>,
+        /// The audio's channel count and sample rate, as the public API takes them
+        channels: Option<u32>,
+        sample_rate: Option<u32>,
     },
 
     /// Document content (PDF)
@@ -780,6 +786,9 @@ pub enum Content {
         uri: Option<String>,
         mime_type: Option<VideoMimeType>,
         resolution: Option<MediaResolution>,
+        /// How the video is sampled, kept as written
+        processing: Option<Value>,
+        name: Option<String>,
     },
 
     /// Thought content
@@ -899,6 +908,11 @@ pub struct Annotation {
     pub end_index: Option<u32>,
     /// Source attributed for a portion of the text (URL, title, or other identifier)
     pub source: Option<String>,
+    /// The annotation's other keys, kept as written: its `type`
+    /// (`url_citation`, `file_citation`, `place_citation`, `speech_metadata`,
+    /// `word_info`) and that kind's fields.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 /// Arguments for URL context call
@@ -1316,6 +1330,56 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audio content keeps its channel count and sample rate, video its
+    /// processing and name, and a text annotation its kind and that kind's
+    /// fields, as the public API writes them. An audio delta keeps its rate.
+    #[test]
+    fn content_keeps_the_audio_video_and_annotation_fields_the_public_api_added() {
+        let contents = serde_json::json!([
+            {"type": "audio", "data": "AAAA", "mime_type": "audio/wav", "channels": 1, "sample_rate": 24000},
+            {
+                "type": "video",
+                "uri": "https://example.com/clip.mp4",
+                "mime_type": "video/mp4",
+                "processing": {"type": "static", "fps": 2.0, "start_offset": "10s"},
+                "name": "clip"
+            },
+            {"type": "text", "text": "Paris is the capital of France.", "annotations": [
+                {
+                    "type": "url_citation",
+                    "start_index": 0,
+                    "end_index": 31,
+                    "url": "https://en.wikipedia.org/wiki/Paris",
+                    "title": "Paris"
+                },
+                {
+                    "type": "file_citation",
+                    "start_index": 0,
+                    "end_index": 5,
+                    "file_name": "atlas.pdf",
+                    "page_number": 12,
+                    "source": "fileSearchStores/atlas/documents/d1"
+                }
+            ]}
+        ]);
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": contents, "store": false
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["input"], contents);
+
+        let delta: Delta = serde_json::from_value(serde_json::json!({
+            "type": "audio", "data": "AAAA", "mime_type": "audio/wav", "channels": 2, "sample_rate": 48000
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&delta).unwrap();
+        assert_eq!(
+            (written["channels"].clone(), written["sample_rate"].clone()),
+            (serde_json::json!(2), serde_json::json!(48000))
+        );
+    }
 
     /// The tools the public API declares beside the ones the gateway knew
     /// read, validate and are written back as sent: computer use, Google

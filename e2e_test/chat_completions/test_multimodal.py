@@ -11,7 +11,11 @@ Usage:
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
+import os
+import uuid
 from pathlib import Path
 
 import pytest
@@ -48,6 +52,58 @@ def _make_image_content(image_source: str) -> dict:
     return {"type": "image_url", "image_url": {"url": image_source}}
 
 
+def _qwenvl_diagnostic_create(request, create, **kwargs):
+    """Give only these existing public Qwen cases per-call correlation metadata."""
+    call_kwargs = kwargs
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") == "1":
+        try:
+            trace_id = "smg-qwenvl-" + uuid.uuid4().hex
+            images = []
+            for message in kwargs["messages"]:
+                for part in message["content"]:
+                    if part["type"] != "image_url":
+                        continue
+                    url = part["image_url"]["url"]
+                    if url.startswith("data:image/") and len(url) <= 3 * 1024**2:
+                        raw = base64.b64decode(url.split(",", 1)[1], validate=True)
+                        images.append(
+                            {
+                                "kind": "actual_base64_bytes",
+                                "bytes": len(raw),
+                                "sha256": hashlib.sha256(raw).hexdigest(),
+                            }
+                        )
+                    else:
+                        images.append(
+                            {
+                                "kind": "URL_not_fetched_by_diagnostic",
+                                "url_sha256": hashlib.sha256(url.encode()).hexdigest(),
+                                "fetched_bytes_sha256": None,
+                            }
+                        )
+            record = json.dumps(
+                {
+                    "client_trace_id": trace_id,
+                    "case": request.node.nodeid[:512],
+                    "images": images[:3],
+                    "temperature": kwargs.get("temperature"),
+                    "max_tokens": kwargs.get("max_tokens"),
+                    "stream": kwargs.get("stream", False),
+                },
+                sort_keys=True,
+            )
+            if len(images) <= 3 and len(record) <= 2048:
+                headers = dict(kwargs.get("extra_headers") or {})
+                if "x-request-id" not in headers:
+                    headers["x-request-id"] = trace_id
+                    logger.warning("SMG_QWENVL_CASE_DIAGNOSTIC %s", record)
+                    call_kwargs = dict(kwargs, extra_headers=headers)
+        except Exception:
+            pass
+    # Keep the only model call outside the diagnostic try: exceptions never retry it.
+    return create(**call_kwargs)
+
+
 # =============================================================================
 # Qwen3-VL multimodal tests (1 GPU)
 # =============================================================================
@@ -62,11 +118,13 @@ class TestMultimodalQwen3VL:
     """Multimodal tests using Qwen3-VL via gRPC."""
 
     @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
-    def test_single_image_base64(self, model, setup_backend, stream):
+    def test_single_image_base64(self, model, setup_backend, stream, request):
         """Test single image understanding with local base64 image."""
         _, _, client, *_ = setup_backend
 
-        response = client.chat.completions.create(
+        response = _qwenvl_diagnostic_create(
+            request,
+            client.chat.completions.create,
             model=model,
             messages=[
                 {
@@ -137,11 +195,13 @@ class TestMultimodalQwen3VL:
         # Qwen3-VL's <|image_pad|> anchor is one a vLLM worker expands itself.
         assert_mm_processing(gateway, worker_expandable=True)
 
-    def test_multi_images_mixed(self, model, setup_backend):
+    def test_multi_images_mixed(self, model, setup_backend, request):
         """Test multiple images with mixed base64 and URL inputs, including duplicates."""
         _, _, client, *_ = setup_backend
 
-        response = client.chat.completions.create(
+        response = _qwenvl_diagnostic_create(
+            request,
+            client.chat.completions.create,
             model=model,
             messages=[
                 {

@@ -5,7 +5,8 @@
 //! `scored` ranks the kept rows by `least-load` and picks the best, so its
 //! filters pass over the whole pool. `drawn` picks by `power-of-two`, which
 //! draws first and asks the filters of the rows it drew. Each stands
-//! `without` the rule and `with_rule`. Ids:
+//! `without` the rule, `with_rule`, and `with_sends`: the rule over rows
+//! that each hold a send its count has not let go. Ids:
 //! `policy_engine/has_room/<profile>_<form>/<n>`. The fleet is the
 //! `decision` bench's with a resident count in every report, so that about
 //! one row in six is over the rule's bound. The decision runs with a fresh
@@ -28,7 +29,8 @@ use std::hint::black_box;
 use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Candidate, Constraints, Engine, PolicySpec, PoolFacts, RequestFacts, Scratch, API_VERSION,
+    Candidate, Constraints, Engine, Lease, Lifecycle, PolicySpec, PoolFacts, RequestFacts, Scratch,
+    Side, Target, API_VERSION,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -70,13 +72,35 @@ fn rows(n: usize) -> Vec<Candidate> {
     view
 }
 
+/// Tells the engine of one send to each row, stated after every report of
+/// the fleet was sampled: the rule's count holds it at each decision.
+fn send_each(engine: &Engine, rows: &[Candidate]) {
+    let lease = Lease {
+        issued_micros: 999_500,
+        tokens: 379,
+        ..Lease::default()
+    };
+    for row in rows {
+        let target = Target {
+            id: row.id,
+            dp_rank: row.dp_rank,
+            ..Target::default()
+        };
+        engine.on_dispatched(&lease, &target, Side::Single, 0);
+    }
+}
+
 fn paths(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/has_room");
+    // Each path: whether the profile holds the rule, whether it draws, and
+    // whether every row holds a send.
     let cells = [
-        ("scored_without", false, false),
-        ("scored_with_rule", true, false),
-        ("drawn_without", false, true),
-        ("drawn_with_rule", true, true),
+        ("scored_without", false, false, false),
+        ("scored_with_rule", true, false, false),
+        ("scored_with_sends", true, false, true),
+        ("drawn_without", false, true, false),
+        ("drawn_with_rule", true, true, false),
+        ("drawn_with_sends", true, true, true),
     ];
     for &n in &SIZES {
         let view = rows(n);
@@ -88,8 +112,11 @@ fn paths(c: &mut Criterion) {
             ..PoolFacts::default()
         };
         let cx = Constraints::default();
-        for (path, with_rule, drawn) in cells {
+        for (path, with_rule, drawn, sends) in cells {
             let engine = policy(with_rule, drawn);
+            if sends {
+                send_each(&engine, &view);
+            }
             let mut scratch = Scratch::new();
             group.bench_with_input(BenchmarkId::new(path, n), &n, |b, _| {
                 let mut seed = 0u64;

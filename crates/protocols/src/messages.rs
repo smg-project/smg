@@ -793,7 +793,8 @@ pub struct ImageBlock {
     pub cache_control: Option<CacheControl>,
 }
 
-/// Image source (base64 or URL)
+/// Image source (base64, URL, or a file uploaded through the public API's
+/// Files API, by its id)
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
@@ -805,6 +806,8 @@ pub enum ImageSource {
     },
     /// A URL or `data:` URL, shared with its readers.
     Url { url: Arc<String> },
+    /// A file uploaded through the public API's Files API, by its id.
+    File { file_id: String },
 }
 
 /// Document content block
@@ -827,7 +830,8 @@ pub struct DocumentBlock {
     pub citations: Option<CitationsConfig>,
 }
 
-/// Document source (base64, text, or URL)
+/// Document source (base64, text, URL, content blocks, or a file uploaded
+/// through the public API's Files API, by its id)
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DocumentSource {
@@ -835,6 +839,7 @@ pub enum DocumentSource {
     Text { data: String },
     Url { url: String },
     Content { content: DocumentContent },
+    File { file_id: String },
 }
 
 /// A content source's content, as the public API takes it: a string, or an
@@ -3408,10 +3413,12 @@ mod tests {
         );
         let unknown_source = refusal(json!({
             "role": "user",
-            "content": [{"type": "image", "source": {"type": "file", "file_id": "file_1"}}]
+            "content": [{"type": "image", "source": {"type": "a_source_of_no_api"}}]
         }));
         assert!(
-            unknown_source.starts_with("unknown variant `file`, expected `base64` or `url`"),
+            unknown_source.starts_with(
+                "unknown variant `a_source_of_no_api`, expected one of `base64`, `url`, `file`"
+            ),
             "{unknown_source}"
         );
         let missing_field = refusal(json!({
@@ -4127,6 +4134,25 @@ mod tests {
             }
             _ => panic!("Expected ToolSearchToolResult variant"),
         }
+    }
+
+    /// An image or a document whose source is a file uploaded through the
+    /// public API's Files API reads, and is written back as sent.
+    #[test]
+    fn an_image_or_document_with_a_file_source_is_accepted() {
+        let content = json!([
+            {"type": "image", "source": {"type": "file", "file_id": "file_011CNha8iCJcU1wXNR6q4V8w"}},
+            {"type": "document", "source": {"type": "file", "file_id": "file_011CPMxVD3fHLUhvTqtsQA5w"}},
+            {"type": "text", "text": "Compare the chart with the report."}
+        ]);
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(written["messages"][0]["content"], content);
     }
 
     /// A search result's text items are written with their `type`, which the

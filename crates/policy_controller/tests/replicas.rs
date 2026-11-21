@@ -46,7 +46,7 @@ use std::{
 
 use net::http_get;
 use replicas::{Lease, Record, Replica, ROOM};
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     elector::{ElectionSettings, FileLease, LeaseBackend, LeaseRecord, Written},
     proto::{
         policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, SnapshotRequest,

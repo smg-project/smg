@@ -9,7 +9,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Response,
 };
 use openai_protocol::{
@@ -20,15 +20,20 @@ use openai_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    framework::{Scorer, TieBand},
-    lease::Lifecycle,
+    document::operator::SpecRejected,
+    engine::{
+        framework::{Scorer, TieBand},
+        view::{Candidate, RequestFacts, Role, WireModes, WorkerId},
+    },
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
-    view::{Candidate, RequestFacts, Role, WireModes},
+    tracking::lease::Lifecycle,
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
 
-use super::{refused, start, start_with, undecided::ROUTER_TYPE, StartError};
+use super::{
+    operators::document_bytes, refused, start, start_with, undecided::ROUTER_TYPE, StartError,
+};
 use crate::{
     app_context::AppContext,
     config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig, RoutingMode},
@@ -411,6 +416,148 @@ async fn adapter_asks(router: &dyn RouterTrait) -> Vec<(&'static str, Response)>
     ]
 }
 
+/// The three provider modes, each over one provider's worker.
+fn provider_modes() -> [RoutingMode; 3] {
+    let worker_urls = vec!["https://provider.example".to_owned()];
+    [
+        RoutingMode::OpenAI {
+            worker_urls: worker_urls.clone(),
+        },
+        RoutingMode::Anthropic {
+            worker_urls: worker_urls.clone(),
+        },
+        RoutingMode::Gemini { worker_urls },
+    ]
+}
+
+#[test]
+fn a_provider_mode_starts_no_store_under_the_setting() -> Case {
+    // A provider mode places its requests by no routing policy: the setting
+    // moves nothing, and the gateway starts as the classic line does.
+    for mode in provider_modes() {
+        let config = picked(RouterConfig {
+            mode,
+            ..RouterConfig::default()
+        });
+        assert!(
+            start(&config)?.is_none(),
+            "the {} mode started a store",
+            config.mode_type()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_document_beside_a_provider_mode_is_refused_by_name() -> Case {
+    for mode in provider_modes() {
+        let config = running(
+            RouterConfig {
+                mode,
+                ..RouterConfig::default()
+            },
+            PolicySpec::preset("random")?,
+        );
+        let refusal = start(&config)
+            .err()
+            .ok_or("a document ran beside a provider mode")?;
+        assert!(matches!(refusal, StartError::Document(_)), "{refusal}");
+        assert!(
+            refusal
+                .to_string()
+                .contains("a provider mode places its requests by no routing policy"),
+            "{refusal}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_provider_mode_of_a_multi_router_gateway_starts_the_store() -> Case {
+    // A multi-router gateway mounts the routers of self-hosted workers
+    // beside the provider's. The setting stays in force for them, on the
+    // document the routing settings mean under the regular mode of many
+    // routers.
+    for mode in provider_modes() {
+        let config = picked(RouterConfig {
+            mode,
+            enable_igw: true,
+            ..RouterConfig::default()
+        });
+        let store = start(&config)?.ok_or("a self-hosted request lost the controller")?;
+        assert_eq!(
+            store.world().spec().digest(),
+            Some(
+                picked(RouterConfig {
+                    enable_igw: true,
+                    ..RouterConfig::default()
+                })
+                .policy_document()?
+                .digest()?
+            ),
+            "the {} mode",
+            config.mode_type()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_provider_mode_of_a_multi_router_gateway_runs_a_given_document() -> Case {
+    // The compare of a given document with the routing settings reads the
+    // multi-router setting too. Without it a provider mode has no document
+    // to compare with, and the start would stop whatever was given.
+    for mode in provider_modes() {
+        let mut document = PolicySpec::preset("round_robin")?;
+        document.generation = 2;
+        let digest = document.digest()?;
+        let config = running(
+            RouterConfig {
+                mode,
+                enable_igw: true,
+                ..RouterConfig::default()
+            },
+            document,
+        );
+        let store = start(&config)?.ok_or("the given document started no store")?;
+        let world = store.world();
+        assert_eq!(world.spec().generation(), 2);
+        assert_eq!(
+            world.spec().digest(),
+            Some(digest),
+            "the {} mode",
+            config.mode_type()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_controller_address_beside_a_provider_mode_stops_the_start() -> Case {
+    // Nothing of such a gateway is placed through a controller. The
+    // validator refuses the address by name. A context built over a
+    // configuration that skipped it stops here: the address is never
+    // dropped in silence.
+    for mode in provider_modes() {
+        let config = picked(RouterConfig {
+            mode,
+            policy_controller_address: Some("controller:30100".to_owned()),
+            ..RouterConfig::default()
+        });
+        let refusal = start(&config)
+            .err()
+            .ok_or("the controller's address was dropped in silence")?;
+        assert!(matches!(refusal, StartError::Document(_)), "{refusal}");
+        assert!(
+            refusal
+                .to_string()
+                .contains("a provider mode places its requests by no routing policy"),
+            "{refusal}"
+        );
+    }
+    Ok(())
+}
+
 /// A configuration with no health probe behind its cases.
 fn quiet() -> RouterConfig {
     let mut config = RouterConfig::default();
@@ -538,11 +685,58 @@ fn the_store_starts_with_a_registered_scorer() -> Case {
     let digest = document.digest()?;
     let generation = document.generation;
     let config = running(RouterConfig::default(), document);
-    let store = start_with(&config, Some(host_stages()?))?
+    let started = start_with(&config, Some(host_stages()?))?
         .ok_or("the controller was picked and no store started")?;
-    let world = store.world();
+    let world = started.store.world();
     assert_eq!(world.spec().generation(), generation);
     assert_eq!(world.spec().digest(), Some(digest));
+    Ok(())
+}
+
+/// A hosted document passes the door's bound at the start: one whose YAML
+/// is past it stops the start by its size. The print option answers by the
+/// same function.
+#[test]
+fn a_document_past_the_doors_bound_stops_the_start_by_its_size() -> Case {
+    let mut document = RouterConfig::default().policy_document()?;
+    let stock = document.bindings[0].clone();
+    let many = (0..4096).map(|n| {
+        let mut binding = stock.clone();
+        binding.matcher.model = format!("tenant-{n:04}/model");
+        binding
+    });
+    document.bindings.splice(0..0, many);
+    let config = running(RouterConfig::default(), document);
+    let written = serde_yaml::to_string(&config.policy_document_in_force()?)?.len();
+    let bound = document_bytes();
+    assert!(written > bound, "{written}");
+    let refusal = start_with(&config, None)
+        .err()
+        .ok_or("the start took a document past the door's bound")?;
+    assert_eq!(
+        refusal.to_string(),
+        format!("the document is {written} bytes; at most {bound}")
+    );
+    Ok(())
+}
+
+/// A given document's `kind` line is no part of its YAML, so the door never
+/// reads it: the start refuses it by name, by the door's own word.
+#[test]
+fn a_given_documents_kind_line_stops_the_start_by_name() -> Case {
+    let document: PolicySpec = serde_yaml::from_str(
+        "apiVersion: smg.policy/v1\nkind: PolicySpec\nprofiles:\n  preview:\n    score: [least-load]\n    pick: best\n",
+    )?;
+    let refusal = start_with(&running(RouterConfig::default(), document), None)
+        .err()
+        .ok_or("the start took a document with a kind line")?;
+    assert!(
+        matches!(
+            &refusal,
+            StartError::Spec(SpecRejected::Invalid(SpecError::Kind(kind))) if kind == "PolicySpec"
+        ),
+        "{refusal:?}"
+    );
     Ok(())
 }
 
@@ -554,7 +748,7 @@ fn the_stock_store_names_the_unknown_scorer() -> Case {
         .ok_or("the stock start took a scorer it does not hold")?;
     assert!(matches!(
         refusal,
-        StartError::Spec(SpecError::UnknownScorer { .. })
+        StartError::Spec(SpecRejected::Invalid(SpecError::UnknownScorer { .. }))
     ));
     assert_eq!(
         refusal.to_string(),
@@ -563,19 +757,50 @@ fn the_stock_store_names_the_unknown_scorer() -> Case {
     Ok(())
 }
 
+/// A host may build its context from a configuration it never validated.
+/// A document handed beside the setting off stops the start in the
+/// validator's words, and no catalog reads it: the classic policies do not
+/// serve in its place in silence.
 #[test]
-fn the_classic_policies_skip_a_document_the_catalog_would_refuse() -> Case {
+fn a_document_beside_the_setting_off_stops_the_start() -> Case {
     let mut config = running(
         RouterConfig::default(),
         scorer_document(&RouterConfig::default(), "unknown-score")?,
     );
     assert!(matches!(
         start_with(&config, Some(host_stages()?)),
-        Err(StartError::Spec(SpecError::UnknownScorer { .. }))
+        Err(StartError::Spec(SpecRejected::Invalid(
+            SpecError::UnknownScorer { .. }
+        )))
     ));
 
     config.policy_controller = false;
-    assert!(start_with(&config, Some(host_stages()?))?.is_none());
+    let refusal = start_with(&config, Some(host_stages()?))
+        .err()
+        .ok_or("the start dropped a given document")?;
+    assert_eq!(
+        refusal.to_string(),
+        "Invalid value for field 'policy_spec': the given document - a policy document is run by the policy controller: set --policy-controller on"
+    );
+    Ok(())
+}
+
+/// The path is written with a configuration and the document is not. A
+/// configuration that holds the path alone would run the routing settings'
+/// document: the start refuses it in the validator's words.
+#[test]
+fn a_path_with_no_loaded_document_stops_the_start() -> Case {
+    let config = picked(RouterConfig {
+        policy_spec_path: Some("routing.yaml".to_owned()),
+        ..RouterConfig::default()
+    });
+    let refusal = start(&config)
+        .err()
+        .ok_or("the start ran the routing settings' document")?;
+    assert_eq!(
+        refusal.to_string(),
+        "Invalid value for field 'policy_spec': routing.yaml - the policy document of this path is not loaded: the builder reads it, or set policy_spec"
+    );
     Ok(())
 }
 
@@ -594,7 +819,7 @@ fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
         .ok_or("the start took a view that reads the tenant header")?;
     assert!(matches!(
         refusal,
-        StartError::Spec(SpecError::DeniedHeader { .. })
+        StartError::Spec(SpecRejected::Invalid(SpecError::DeniedHeader { .. }))
     ));
     assert_eq!(
         refusal.to_string(),
@@ -640,8 +865,8 @@ async fn under_the_setting_many_routers_decide_typed_requests_and_leave_the_rest
     Box::pin(decided_or_classic(config)).await
 }
 
-/// The router asks the host for its typed requests; the router's own cases
-/// hold that.
+/// The router asks the policy engine for its typed requests; the router's own
+/// cases hold that.
 #[tokio::test]
 async fn the_regular_router_is_built_under_the_setting() -> Case {
     let gateway = build_gateway(picked(quiet())).await?;
@@ -652,7 +877,126 @@ async fn the_regular_router_is_built_under_the_setting() -> Case {
     Ok(())
 }
 
-/// The router's selection stage asks the host; the stage's cases hold that.
+/// The HTTP pair router asks the policy engine for each attempt's pair; the
+/// router's own cases hold that. No classic pair policy is built beside it.
+#[tokio::test]
+async fn the_http_pair_router_is_built_under_the_setting() -> Case {
+    let mut config = picked(quiet());
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let (context, gateway) = build(config).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the HTTP pair router is missing")?;
+    assert_eq!(router.router_type(), "pd");
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    Ok(())
+}
+
+/// The HTTP pair router reads what its roles' policy settings keep. Under
+/// the setting the registry holds no role policy, and its main policy here
+/// reads no target, so a role's own setting alone refuses a request that
+/// names its worker. Under settings that keep no target the request goes on
+/// to the policy engine.
+#[tokio::test]
+async fn the_http_pair_router_refuses_an_explicit_target_a_roles_setting_keeps() -> Case {
+    let mut named = HeaderMap::new();
+    named.insert("x-smg-target-worker", "0".parse()?);
+    let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+    let hashing = || Some(PolicyConfig::ConsistentHashing);
+    for (prefill_policy, decode_policy, kept) in [
+        (hashing(), None, true),
+        (None, hashing(), true),
+        (None, None, false),
+    ] {
+        let mut config = picked(quiet());
+        config.policy = PolicyConfig::RoundRobin;
+        config.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy,
+            decode_policy,
+        };
+        let gateway = build_gateway(config).await?;
+        let router = gateway
+            .select_router_for_request(None)
+            .ok_or("the HTTP pair router is missing")?;
+        let routed = router
+            .route_generate(Some(&named), &meta, body(json!({"text": "hi"})), "model-a")
+            .await;
+        let (status, code) = refusal(routed).await;
+        assert_eq!(code == BY_NAME, kept, "{status} {code}");
+    }
+    Ok(())
+}
+
+/// A gateway of many routers mounts every family over its one document.
+/// That document plans pairs under a regular configuration and under a
+/// pair configuration alike, so the HTTP pair family serves under both.
+/// Under the manual policy the document plans single workers alone, and
+/// the family keeps its refusal by name: a pair asked there would be
+/// decided as a single. Under a controller's address it refuses by name
+/// though the document plans pairs: the pair is the controller's to decide
+/// there.
+#[tokio::test]
+async fn many_routers_mount_the_http_pair_router_where_the_document_plans_pairs() -> Case {
+    use crate::routers::{factory::router_ids, RouterFactory};
+
+    let mut regular = picked(quiet());
+    regular.enable_igw = true;
+    let mut pair = regular.clone();
+    pair.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    // A socket that never listens: the follower dials it and tells nothing.
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut followed = pair.clone();
+    followed.policy_controller_address = Some(socket.local_addr()?.to_string());
+    let mut manual = regular.clone();
+    manual.policy = PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    for (config, serves) in [
+        (regular, true),
+        (pair, true),
+        (manual, false),
+        (followed, false),
+    ] {
+        let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+        let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
+        let (_, _, built) = routers
+            .into_iter()
+            .find(|(id, ..)| *id == router_ids::HTTP_PD)
+            .ok_or("the HTTP pair family has no entry")?;
+        let router = built?;
+        if serves {
+            assert_eq!(router.router_type(), "pd");
+        } else {
+            assert_refusing_router(router.as_ref(), "HTTP pair, many routers").await?;
+        }
+        if let Some(follower) = &context.policy_follower {
+            let follower = follower.lock().take().ok_or("the follower was taken")?;
+            follower.stop().await;
+        }
+    }
+    Ok(())
+}
+
+/// The router's selection stage asks the policy engine; the stage's cases hold
+/// that.
 #[tokio::test]
 async fn the_regular_grpc_router_is_built_under_the_setting() -> Case {
     let mut config = picked(quiet());
@@ -663,6 +1007,97 @@ async fn the_regular_grpc_router_is_built_under_the_setting() -> Case {
         .ok_or("the regular gRPC router is missing")?;
     assert_eq!(router.router_type(), "grpc");
     Ok(())
+}
+
+/// The pair router's selection stage asks the policy engine; the stage's cases
+/// and the pipeline's serving cases hold that. No classic pair policy is built
+/// beside it.
+#[tokio::test]
+async fn the_grpc_pair_router_is_built_under_the_setting() -> Case {
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let (context, gateway) = build(config).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the gRPC pair router is missing")?;
+    assert_eq!(router.router_type(), "grpc_pd");
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    Ok(())
+}
+
+/// A gateway of many routers mounts every family over its one document.
+/// That document plans pairs under a regular configuration and under a
+/// pair configuration alike, so the gRPC pair family serves under both.
+/// Under the manual policy the document plans single workers alone, and
+/// the family keeps its refusal by name: a pair asked there would be
+/// decided as a single.
+#[tokio::test]
+async fn many_routers_mount_the_grpc_pair_router_where_the_document_plans_pairs() -> Case {
+    use crate::routers::{factory::router_ids, RouterFactory};
+
+    let mut regular = picked(quiet());
+    regular.enable_igw = true;
+    let mut pair = regular.clone();
+    pair.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let mut manual = regular.clone();
+    manual.policy = PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    for (config, serves) in [(regular, true), (pair, true), (manual, false)] {
+        let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+        let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
+        let (_, _, built) = routers
+            .into_iter()
+            .find(|(id, ..)| *id == router_ids::GRPC_PD)
+            .ok_or("the gRPC pair family has no entry")?;
+        let router = built?;
+        if serves {
+            assert_eq!(router.router_type(), "grpc_pd");
+        } else {
+            assert_refusing_router(router.as_ref(), "gRPC pair, many routers").await?;
+        }
+    }
+    Ok(())
+}
+
+/// Under a controller's address a pair is the controller's to decide, and
+/// no ask reaches it for a pair yet. The gRPC pair family refuses by name
+/// there, as it did, though the gateway's document plans pairs.
+#[tokio::test]
+async fn a_grpc_pair_gateway_that_follows_a_controller_refuses_by_name() -> Case {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    config.policy_controller_address = Some(socket.local_addr()?.to_string());
+    let (context, gateway) = build(config).await?;
+    assert!(context.follows_controller());
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the router is missing")?;
+    assert_refusing_router(router.as_ref(), "gRPC pair under an address").await
 }
 
 async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case {
@@ -700,15 +1135,17 @@ async fn the_pair_routers_refuse_by_name() -> Case {
         prefill_policy: None,
         decode_policy: None,
     };
-    for (family, config) in [
-        ("HTTP pair", pair),
-        ("gRPC pair", grpc_pair),
-        ("gRPC encode pair", encode_pair),
-    ] {
+    for (family, config) in [("HTTP pair", pair), ("gRPC encode pair", encode_pair)] {
         let (context, gateway) = build(config).await?;
         let router = gateway
             .select_router_for_request(None)
             .ok_or("the router is missing")?;
+        // The HTTP pair router asks the policy engine and refuses nothing. Its
+        // own case holds what it is built as.
+        if family == "HTTP pair" {
+            assert_eq!(router.router_type(), "pd");
+            continue;
+        }
         assert_refusing_router(router.as_ref(), family).await?;
         // No classic pair policy was built for the refused family.
         let policies = &context.policy_registry;
@@ -801,10 +1238,10 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
 }
 
 #[tokio::test]
-async fn a_starts_context_holds_the_host_where_it_holds_the_store() -> Case {
+async fn a_starts_context_holds_the_policy_engine_where_it_holds_the_store() -> Case {
     let hosted = Arc::new(AppContext::from_config(picked(quiet()), 30, None, None).await?);
     assert!(hosted.policy_store.is_some());
-    assert!(hosted.policy_host.is_some());
+    assert!(hosted.policy_engine.is_some());
     // A worker the registry holds and the store has no row for. The
     // controller answers for it; the classic policy would have sent to it.
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
@@ -830,7 +1267,7 @@ async fn a_starts_context_holds_the_host_where_it_holds_the_store() -> Case {
 
     let classic = AppContext::from_config(quiet(), 30, None, None).await?;
     assert!(classic.policy_store.is_none());
-    assert!(classic.policy_host.is_none());
+    assert!(classic.policy_engine.is_none());
     Ok(())
 }
 
@@ -853,15 +1290,18 @@ async fn a_starts_context_holds_the_feed_where_it_holds_the_store() -> Case {
 /// Under a controller's address the gateway probes no worker, so a row's
 /// status is its worker's. Elsewhere a worker's status is the gateway's own
 /// to write, and a row's change leaves it. On both paths the worker dials
-/// through the connector the gateway was started with.
+/// through the gateway's wrap of the connector the gateway was started
+/// with: the context's connector, which asks the handed one.
 #[tokio::test]
 async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Case {
+    use smg_worker::workflow::WorkflowHost as _;
+
     const URL: &str = "http://worker:8000";
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let address = socket.local_addr()?.to_string();
-    // A connector of the case's own: each path's worker holds the one
-    // handed over, and no stock one by name.
+    // A connector of the case's own: each path's worker holds the
+    // gateway's wrap of the one handed over, and no stock one by name.
     let handed: Arc<dyn EngineConnector> = Arc::new(BackendConnector);
     let mut dials_through_it = Vec::new();
     for following in [false, true] {
@@ -899,7 +1339,9 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
         let connector = worker
             .engine_connector()
             .ok_or("the worker has no connector")?;
-        dials_through_it.push(Arc::ptr_eq(&connector, &handed));
+        let wrap = context.engine_connector();
+        assert_eq!(format!("{wrap:?}"), "Fronting(BackendConnector)");
+        dials_through_it.push(Arc::ptr_eq(&connector, &wrap));
         assert!(!worker.is_healthy());
         let revision = store.get(row).ok_or("the row left")?.revision;
         store
@@ -917,35 +1359,24 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
     Ok(())
 }
 
-/// The host the context builds stands over the feed's own holder. A worker
-/// written at the context's feed door is placed by the context's host, on
-/// the object the holder laid in the context's registry.
-#[tokio::test]
-async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
-    use std::time::Instant;
-
+/// A context that decides in its own process, with one worker written at
+/// its feed's door under `url`: the context and the worker's row.
+async fn context_with_a_worker(url: &str) -> Result<(AppContext, WorkerId), Box<dyn Error>> {
     use smg_policy_controller::{
         store::{HealthPolicy, Maker},
         worker_host::{Expect, Wrote},
     };
 
-    use super::host::Ask;
-
-    const URL: &str = "http://127.0.0.1:1";
     let context = AppContext::from_config(picked(quiet()), 30, None, None).await?;
     let feed = context
         .policy_feed
         .as_ref()
         .ok_or("the store has no feed")?;
-    let host = context
-        .policy_host
-        .as_ref()
-        .ok_or("the store has no host")?;
     let wrote = feed
         .door
-        .found(&Maker::Control, Expect::Nothing, URL, &|_| WorkerFacts {
-            key: URL.to_owned(),
-            engine: URL.to_owned(),
+        .found(&Maker::Control, Expect::Nothing, url, &|_| WorkerFacts {
+            key: url.to_owned(),
+            engine: url.to_owned(),
             role: Role::Single,
             wire_modes: WireModes::HTTP,
             models: vec!["model-a".to_owned()],
@@ -960,15 +1391,94 @@ async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
     let Ok(Wrote::Registered(row)) = wrote else {
         return Err(format!("expected a registration, got {wrote:?}").into());
     };
-    let placed = host
+    Ok((context, row))
+}
+
+/// The policy engine the context builds stands over the feed's own holder. A
+/// worker written at the context's feed door is placed by the context's policy
+/// engine, on the object the holder laid in the context's registry.
+#[tokio::test]
+async fn a_worker_written_at_the_contexts_door_is_placed_by_its_policy_engine() -> Case {
+    use std::time::Instant;
+
+    use super::engine::Ask;
+
+    const URL: &str = "http://127.0.0.1:1";
+    let (context, row) = context_with_a_worker(URL).await?;
+    let policy_engine = context
+        .policy_engine
+        .as_ref()
+        .ok_or("the store has no policy engine")?;
+    let placed = policy_engine
         .place(&Ask::of(b"r1", "model-a"), Instant::now())
         .await
-        .map_err(|_| "the context's host placed no worker")?;
+        .map_err(|_| "the context's policy engine placed no worker")?;
     assert_eq!(placed.id(), row);
     let laid = context
         .worker_registry
         .get_by_url(URL)
         .ok_or("the registry holds no worker at the URL")?;
     assert!(Arc::ptr_eq(placed.worker(), &laid));
+    Ok(())
+}
+
+/// The context starts its policy engine's timer. A lease placed through the
+/// context's policy engine a minute ago, whose dispatch is never named, is
+/// ended at the timer's next pass: no later request has to end it.
+#[tokio::test]
+async fn a_built_contexts_timer_ends_a_lease_whose_dispatch_was_never_named() -> Case {
+    use std::time::{Duration, Instant};
+
+    use smg_policy_controller::store::{GatewayId, LeasesStore};
+
+    use super::{engine::Ask, upkeep};
+
+    let (context, _) = context_with_a_worker("http://127.0.0.1:1").await?;
+    let policy_engine = context
+        .policy_engine
+        .as_ref()
+        .ok_or("the store has no policy engine")?;
+    let store = context
+        .policy_store
+        .as_ref()
+        .ok_or("the context holds no store")?;
+    let issued = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .ok_or("the clock is under a minute old")?;
+    let placed = policy_engine
+        .place(&Ask::of(b"r1", "model-a"), issued)
+        .await
+        .map_err(|_| "the context's policy engine placed no worker")?;
+    assert_eq!(LeasesStore::live(&**store, GatewayId::LOCAL), 1);
+
+    // The clock is held and moved a tick at a step. The timer's task may
+    // take its first turn inside the first step, and its tick then falls
+    // a millisecond past that step.
+    tokio::time::pause();
+    for _ in 0..3 {
+        tokio::time::advance(upkeep::EVERY).await;
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(LeasesStore::live(&**store, GatewayId::LOCAL), 0);
+    drop(placed);
+    Ok(())
+}
+
+/// Under a controller's address the store mirrors that controller's rows.
+/// The context holds the feed for the follower, and its worker workflows
+/// get none: a write of the gateway's own would set the mirror apart. A
+/// local worker's registration writes no row there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_followed_gateway_hands_its_worker_workflows_no_feed() -> Case {
+    let hosted = AppContext::from_config(picked(quiet()), 30, None, None).await?;
+    assert!(hosted.door_feed().is_some());
+
+    let mut config = picked(quiet());
+    config.policy_controller_address = Some("127.0.0.1:1".to_owned());
+    let followed = AppContext::from_config(config, 30, None, None).await?;
+    assert!(followed.follows_controller());
+    assert!(followed.policy_feed.is_some());
+    assert!(followed.door_feed().is_none());
     Ok(())
 }

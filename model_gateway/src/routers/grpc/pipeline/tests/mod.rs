@@ -39,9 +39,9 @@ use smg_grpc_client::{
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
 use smg_policy_controller::{
-    lease::TransportClass,
+    engine::view::WorkerId,
     store::{GatewayId, HealthSink, LeasesStore, MemoryStore, WorkersStore},
-    view::WorkerId,
+    tracking::lease::TransportClass,
 };
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
@@ -58,7 +58,7 @@ use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerS
 use super::*;
 use crate::{
     config::types::PolicyConfig,
-    policy_controller::host::testing as host_testing,
+    policy_controller::engine::testing as engine_testing,
     routers::{
         common::{
             openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
@@ -146,7 +146,7 @@ async fn a_failed_attempt_ends_its_lease_before_its_guards_go() {
 
 #[tokio::test]
 async fn a_retry_the_selection_cannot_place_does_not_follow() {
-    let pipeline_over = |host| {
+    let pipeline_over = |policy_engine| {
         let deps = PipelineDeps::pair(
             Arc::new(WorkerRegistry::new()),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -154,12 +154,12 @@ async fn a_retry_the_selection_cannot_place_does_not_follow() {
             None,
             Duration::from_secs(60),
         )
-        .with_host(host);
+        .with_policy_engine(policy_engine);
         RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
             .expect("completion pipeline")
     };
-    let (host, _, _) = host_testing::bed(&[]);
-    let hosted = pipeline_over(Some(Arc::new(host)));
+    let (policy_engine, _, _) = engine_testing::bed(&[]);
+    let hosted = pipeline_over(Some(Arc::new(policy_engine)));
 
     let (placed, _store) = place_worker().await;
     let plain = dispatch_context(placed);
@@ -2939,16 +2939,20 @@ async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_str
     );
 }
 
-async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
-    let port = spawn_stub(GatedScheduler::default()).await;
+/// A pair gateway serves a request under the policy controller. The store
+/// is the one such a gateway starts: the document its configuration makes,
+/// over rows as the store builds them. Both sides go out to engines, the
+/// answer is whole, the decode worker is the routed one, and the pair's
+/// lease ends with the answer.
+#[tokio::test]
+async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let worker = register_worker(&registry, port, WorkerType::Regular);
-    let (_, store, _) = host_testing::bed(&[worker.url()]);
-    let mut facts = store.by_key(worker.url()).expect("the worker's row").facts;
-    facts.models = vec![MODEL.to_string()];
-    let row = store.upsert(facts).id();
-    store.publish_now();
-
+    let prefill = register_worker(&registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&registry, decode_port, WorkerType::Decode);
+    let (_, store, _) = engine_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&registry));
     let deps = PipelineDeps::pair(
         Arc::clone(&registry),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -2956,9 +2960,296 @@ async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStor
         None,
         Duration::from_secs(60),
     )
-    .with_host(Some(Arc::new(Host::at_keys(Arc::clone(&store), registry))));
+    .with_policy_engine(Some(Arc::new(policy_engine)));
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+    let started = Instant::now();
+
+    let response = pipeline
+        .execute_completion(
+            completion_request(false),
+            None,
+            MODEL.to_string(),
+            components,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-smg-routed-worker-id"],
+        format!("grpc://127.0.0.1:{decode_port}")
+    );
+    drop(response);
+    // Each side ended whole on its own worker, and no lease is left.
+    for url in [prefill.url(), decode.url()] {
+        let row = store.by_key(url).expect("the side's row").id;
+        assert!(
+            store.completed_ok_since(GatewayId::LOCAL, row, started),
+            "{url}"
+        );
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+/// The router the factory builds for a pair gateway under the policy
+/// controller serves a pair. The factory mounts the pair router over the
+/// context's policy engine, the router's selection stage asks it, and each side
+/// ends whole on its own worker.
+///
+/// The router also tells that stage what the pair's settings keep. Here the
+/// role policies keep an explicit target and the main policy does not, so a
+/// request that names its worker is refused by name.
+#[tokio::test]
+async fn the_factory_builds_a_pair_router_that_serves_under_the_policy_controller() {
+    use crate::{
+        config::{test_support::pd_routing_mode, RoutingMode},
+        routers::{
+            grpc::testing::{grpc_config, grpc_ctx_from, mcp_orchestrator},
+            RouterFactory,
+        },
+    };
+
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let mut config = grpc_config(pd_routing_mode()).build_unchecked();
+    config.policy_controller = true;
+    config.policy = PolicyConfig::RoundRobin;
+    if let RoutingMode::PrefillDecode {
+        prefill_policy,
+        decode_policy,
+        ..
+    } = &mut config.mode
+    {
+        *prefill_policy = Some(PolicyConfig::ConsistentHashing);
+        *decode_policy = Some(PolicyConfig::ConsistentHashing);
+    }
+    let mut ctx = grpc_ctx_from(&config, mcp_orchestrator().await);
+    let prefill = register_worker(&ctx.worker_registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&ctx.worker_registry, decode_port, WorkerType::Decode);
+    let (_, store, _) = engine_testing::pair_bed_started(MODEL, &[prefill.url()], &[decode.url()]);
+    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&ctx.worker_registry));
+    let context = Arc::get_mut(&mut ctx).expect("the context's one hold");
+    context.policy_store = Some(Arc::clone(&store));
+    context.policy_engine = Some(Arc::new(policy_engine));
+    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    ctx.tokenizer_registry
+        .load(
+            "tokenizer-id",
+            MODEL,
+            "test",
+            || async move { Ok(tokenizer) },
+        )
+        .await
+        .expect("load mock tokenizer");
+
+    let router = RouterFactory::create_router(&ctx)
+        .await
+        .expect("the pair router");
+    assert_eq!(router.router_type(), "grpc_pd");
+    let request = || -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "prompt": "Hello world",
+            "stream": false,
+        }))
+        .expect("completion request")
+    };
+    let started = Instant::now();
+    let response = router
+        .route_completion(None, &anonymous(), request(), MODEL)
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    drop(response);
+    for url in [prefill.url(), decode.url()] {
+        let row = store.by_key(url).expect("the side's row").id;
+        assert!(
+            store.completed_ok_since(GatewayId::LOCAL, row, started),
+            "{url}"
+        );
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-smg-target-worker", http::HeaderValue::from_static("0"));
+    let refused = router
+        .route_completion(Some(&headers), &anonymous(), request(), MODEL)
+        .await;
+    assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
+    let body = axum::body::to_bytes(refused.into_body(), 4096)
+        .await
+        .expect("the refusal's body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("not_decided_by_policy_controller")
+            && body.contains("an explicit target worker"),
+        "{body}"
+    );
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
+/// A harmony responses context whose requests the controller places: the
+/// store, the row of its one worker, the registry and the worker's object.
+struct PlacedRig {
+    ctx: ResponsesContext,
+    store: Arc<MemoryStore>,
+    row: WorkerId,
+    registry: Arc<WorkerRegistry>,
+    worker: Arc<dyn Worker>,
+}
+
+async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
+    let rig = placed_harmony_responses_rig().await;
+    (rig.ctx, rig.store, rig.row)
+}
+
+/// A published store with one ready row for each of `workers`, each
+/// serving [`MODEL`], and the pipeline's deps under a policy engine that places
+/// over those rows.
+fn placed_deps(
+    registry: &Arc<WorkerRegistry>,
+    workers: &[Arc<dyn Worker>],
+) -> (PipelineDeps, Arc<MemoryStore>) {
+    let urls: Vec<&str> = workers.iter().map(|worker| worker.url()).collect();
+    let (_, store, _) = engine_testing::bed(&urls);
+    for url in urls {
+        let mut facts = store.by_key(url).expect("the worker's row").facts;
+        facts.models = vec![MODEL.to_string()];
+        store.upsert(facts);
+    }
+    store.publish_now();
+    let deps = PipelineDeps::pair(
+        Arc::clone(registry),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_policy_engine(Some(Arc::new(PolicyEngine::at_keys(
+        Arc::clone(&store),
+        Arc::clone(registry),
+    ))));
+    (deps, store)
+}
+
+async fn placed_harmony_responses_rig() -> PlacedRig {
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = register_worker(&registry, port, WorkerType::Regular);
+    let (deps, store) = placed_deps(&registry, std::slice::from_ref(&worker));
+    let row = store.by_key(worker.url()).expect("the worker's row").id;
     let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
-    (ctx, store, row)
+    PlacedRig {
+        ctx,
+        store,
+        row,
+        registry,
+        worker,
+    }
+}
+
+/// Under `--worker-overload-shed` client acquisition re-checks the overload
+/// flag of a worker the classic policies chose. A worker the controller
+/// placed is not re-checked: the veto is the controller's, read from its
+/// rows, and the flag on the object mirrors it for the gateway's other
+/// readers.
+#[tokio::test]
+async fn a_placed_iteration_is_not_shed_by_the_workers_overload_flag() {
+    let rig = placed_harmony_responses_rig().await;
+    rig.registry.set_overload_shed(true);
+    assert!(rig.registry.set_worker_overloaded(&rig.worker, true));
+    let mut request = responses_request(false);
+    Arc::make_mut(&mut request).stream = Some(false);
+    let started = Instant::now();
+    rig.ctx
+        .pipeline
+        .execute_harmony_responses(&request, &rig.ctx, None)
+        .await
+        .expect("the controller's placement is sent");
+    assert!(rig
+        .store
+        .completed_ok_since(GatewayId::LOCAL, rig.row, started));
+}
+
+/// A retry the controller places is not re-checked either. Two engines
+/// share one count of starts, and the first start either of them sees is
+/// refused: the first attempt fails on the worker the controller chose, and
+/// the retry lands on the other. Both objects read overloaded with shedding
+/// on, and each engine sees the request once.
+#[tokio::test]
+async fn a_placed_retry_is_not_shed_by_the_workers_overload_flag() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut workers = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_first: true,
+            calls: Arc::clone(&starts),
+            seen_request_ids: Arc::clone(&ids),
+            ..Default::default()
+        })
+        .await;
+        workers.push(register_worker(&registry, port, WorkerType::Regular));
+        seen.push(ids);
+    }
+    let (deps, _store) = placed_deps(&registry, &workers);
+    registry.set_overload_shed(true);
+    for worker in &workers {
+        assert!(registry.set_worker_overloaded(worker, true));
+    }
+
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+    let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    for ids in &seen {
+        assert_eq!(calls_seen(ids), 1, "each engine sees one start");
+    }
+}
+
+/// A placed request's definitive failure still moves to the other worker
+/// where that worker's object reads overloaded. Under a policy engine the retry
+/// window reads a worker's status and breaker, and the retry's placement
+/// answers for the veto. Each engine sees the request once, and the second
+/// answer stands.
+#[tokio::test]
+async fn a_placed_requests_definitive_failure_moves_on_past_the_overload_flag() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut workers = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&ids),
+            ..Default::default()
+        })
+        .await;
+        workers.push(register_worker_with_breaker(&registry, port, 5));
+        seen.push(ids);
+    }
+    let (deps, _store) = placed_deps(&registry, &workers);
+    for worker in &workers {
+        assert!(registry.set_worker_overloaded(worker, true));
+    }
+
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+    let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    for ids in &seen {
+        assert_eq!(calls_seen(ids), 1, "each engine sees the request once");
+    }
 }
 
 #[tokio::test]

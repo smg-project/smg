@@ -1971,6 +1971,11 @@ impl ConfigValidator {
         {
             return refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts");
         }
+        // Nothing of a gateway whose every router is a provider's is placed
+        // through a controller: the address would be dropped unsaid.
+        if let Some(mode) = config.provider_alone() {
+            return refuse(&format!("--policy-controller-address supplies the workers, and the {mode} provider mode places its requests by no routing policy"));
+        }
         if config.mode.worker_count() != 0 {
             return refuse("--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode");
         }
@@ -1980,7 +1985,12 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+    /// The two refusals of a policy document that would not run as it was
+    /// given: one beside the switch off, and a path whose document was
+    /// never loaded. The validator holds a configuration to them. The
+    /// controller's start holds the configuration it is handed to them as
+    /// well: a host may build its context from one it never validated.
+    pub(crate) fn validate_policy_document(config: &RouterConfig) -> ConfigResult<()> {
         // A launcher gives the document's path, and a host may hand the
         // document itself. Either one, with the switch off, would be dropped
         // and the classic policies would serve.
@@ -2006,6 +2016,11 @@ impl ConfigValidator {
                 "the policy document of this path is not loaded: the builder reads it, or set policy_spec",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_policy_document(config)?;
 
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
@@ -2139,6 +2154,48 @@ mod tests {
             .to_string();
         for name in names {
             assert!(error.contains(name), "{error}");
+        }
+    }
+
+    /// A gateway keeps a health path of its own under every setting. Where
+    /// it hosts the controller, the worker a registration builds carries
+    /// the path, and the holder keeps that worker as the row's object.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_health_path_of_its_own_is_kept_under_every_setting() {
+        let health_check = HealthCheckConfig {
+            endpoint: "/healthz".to_owned(),
+            ..HealthCheckConfig::default()
+        };
+        for kept in [
+            RouterConfig {
+                policy_controller: true,
+                health_check: health_check.clone(),
+                ..Default::default()
+            },
+            RouterConfig {
+                health_check: health_check.clone(),
+                ..Default::default()
+            },
+            RouterConfig {
+                policy_controller: true,
+                ..Default::default()
+            },
+            RouterConfig {
+                policy_controller: true,
+                health_check: HealthCheckConfig {
+                    disable_health_check: true,
+                    ..health_check.clone()
+                },
+                ..Default::default()
+            },
+            RouterConfig {
+                health_check,
+                ..following_config()
+            },
+        ] {
+            let checked = ConfigValidator::validate_policy_controller(&kept);
+            assert!(checked.is_ok(), "{checked:?}");
         }
     }
 
@@ -2280,6 +2337,40 @@ mod tests {
             },
             &["--policy-controller-address", "--worker-urls"],
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_address_refuses_a_gateway_of_providers_alone() {
+        for mode in [
+            RoutingMode::OpenAI {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Anthropic {
+                worker_urls: Vec::new(),
+            },
+            RoutingMode::Gemini {
+                worker_urls: Vec::new(),
+            },
+        ] {
+            // Nothing of such a gateway is placed through a controller.
+            controller_refusal(
+                &RouterConfig {
+                    mode: mode.clone(),
+                    ..following_config()
+                },
+                &["--policy-controller-address", "provider mode"],
+            );
+            // A multi-router gateway places self-hosted workers beside the
+            // provider's, and the controller supplies them.
+            RouterConfig {
+                mode,
+                enable_igw: true,
+                ..following_config()
+            }
+            .validate()
+            .expect("a multi-router gateway follows a controller beside a provider");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

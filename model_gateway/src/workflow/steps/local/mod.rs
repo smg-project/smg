@@ -1,12 +1,16 @@
 mod check_local_worker;
+mod draining_door;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
+mod forget_cache_events;
+mod provider_workers;
 mod rediscover_labels;
 mod release_tokenizer;
 mod remove_from_policy_registry;
 mod submit_tokenizer_job;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod update_at_door;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;
@@ -15,28 +19,38 @@ mod zmq_labels;
 use std::{sync::Arc, time::Duration};
 
 pub(crate) use check_local_worker::{CheckLocalWorkerStep, CHECK_LOCAL_WORKER_STEP};
+use draining_door::DrainingDoor;
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
+use forget_cache_events::{ForgetCacheEventsStep, FORGET_CACHE_EVENTS_STEP};
 use openai_protocol::worker::WorkerUpdateRequest;
+use provider_workers::{
+    ForProviderWorkers, DRAIN_PROVIDER_WORKERS_STEP, REMOVE_PROVIDER_WORKERS_STEP,
+};
 pub use rediscover_labels::RediscoverLabelsStep;
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
+use smg_policy_controller::worker_host::{removal_at_door, REMOVE_WORKERS_AT_DOOR_STEP};
 use smg_worker::{
     jobs::WorkerJobAsker,
+    settings::UnhealthyRemovalScope,
     workflow::{
-        single_attempt, worker_removal_workflow, RemovalOrder, WorkerRemovalRequest,
-        REMOVE_FROM_WORKER_REGISTRY_STEP,
+        single_attempt, worker_removal_workflow, DrainWorkersStep, RemovalOrder,
+        RemoveFromWorkerRegistryStep, WorkerRemovalRequest, REMOVE_FROM_WORKER_REGISTRY_STEP,
+        SETTLE_STEP_TIMEOUT,
     },
 };
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
+use update_at_door::UpdateAtDoorStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;
-use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, WorkflowDefinition};
+use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, StepExecutor, WorkflowDefinition};
 pub(crate) use zmq_labels::{DiscoverZmqLabelsStep, ZMQ_LABELS_STEP};
 
 use crate::{
     app_context::AppContext,
+    policy_controller::feed::Feed,
     workflow::data::{WorkerRemovalWorkflowData, WorkerUpdateWorkflowData},
 };
 
@@ -75,19 +89,102 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
             .with_retry(single_attempt())
             .depends_on(&[REMOVE_FROM_WORKER_REGISTRY_STEP]),
         )
+        // On the registry step, not the policy cleanup: the release reads
+        // what that step settled, and a cleanup that fails or times out
+        // must not hold it back (a failed step's dependents never run).
+        .add_step(release_tokenizer_step(REMOVE_FROM_WORKER_REGISTRY_STEP))
+}
+
+/// The removal line. With no feed it is [`create_worker_removal_workflow`]'s.
+///
+/// With a feed the gateway's local workers are rows of the policy
+/// controller's store, and the line is the store crate's removal at the
+/// feed's door, under `scope` for a health check's removal. The door marks
+/// a drained row's worker `Draining` in the registry ([`DrainingDoor`]),
+/// and the holder takes a removed row's object out of it. Four gateway
+/// steps follow:
+/// ```text
+///     find_workers_to_remove
+///              |
+///     drain_workers_at_door
+///              |
+///     settle_drained_workers
+///              |
+///     remove_workers_at_door
+///              |
+///     drain_provider_workers
+///              |
+///     remove_provider_workers
+///              |
+///           +--+----------------+
+///           |                   |
+///  forget_cache_events  release_tokenizer
+/// ```
+/// The door's steps leave a worker with no row alone. A provider's worker
+/// has none, and the two steps behind them are the registry's own: they
+/// drain it and take it out, as the classic line does. A removal that
+/// names workers of both kinds has each taken where it stands
+/// ([`ForProviderWorkers`]). The last two write nothing to the run's
+/// data, so they stand side by side, and a cleanup that fails or times out
+/// holds no other back. No step writes the classic policies: they decide
+/// nothing there.
+pub(crate) fn worker_removal_line(
+    door: Option<(&Feed, UnhealthyRemovalScope)>,
+) -> WorkflowDefinition<WorkerRemovalWorkflowData> {
+    let Some((feed, scope)) = door else {
+        return create_worker_removal_workflow();
+    };
+    let rows = &feed.objects;
+    // The feed's holder leaves a worker's status to the gateway's health
+    // checks, so the drain's mark on the worker is this line's to make.
+    let door = Arc::new(DrainingDoor::new(Arc::clone(&feed.door), Arc::clone(rows)));
+    removal_at_door::<AppContext>(door, Arc::clone(rows), scope)
         .add_step(
             StepDefinition::new(
-                "release_tokenizer",
-                "Release the tokenizers of the models no worker serves any more",
-                Arc::new(ReleaseTokenizerStep),
+                DRAIN_PROVIDER_WORKERS_STEP,
+                "Drain the Ready workers no row stands for",
+                Arc::new(ForProviderWorkers::new(Arc::clone(rows), DrainWorkersStep)),
+            )
+            // The window is the worker's own setting, as in the classic line.
+            .with_timeout(SETTLE_STEP_TIMEOUT)
+            .with_retry(single_attempt())
+            .depends_on(&[REMOVE_WORKERS_AT_DOOR_STEP]),
+        )
+        .add_step(
+            StepDefinition::new(
+                REMOVE_PROVIDER_WORKERS_STEP,
+                "Remove the workers no row stands for",
+                Arc::new(ForProviderWorkers::new(
+                    Arc::clone(rows),
+                    RemoveFromWorkerRegistryStep,
+                )),
             )
             .with_timeout(Duration::from_secs(10))
             .with_retry(single_attempt())
-            // On the registry step, not the policy cleanup: the release reads
-            // what that step settled, and a cleanup that fails or times out
-            // must not hold it back (a failed step's dependents never run).
-            .depends_on(&[REMOVE_FROM_WORKER_REGISTRY_STEP]),
+            .depends_on(&[DRAIN_PROVIDER_WORKERS_STEP]),
         )
+        .add_step(
+            StepDefinition::new(
+                FORGET_CACHE_EVENTS_STEP,
+                "Forget the cache events of the removed workers",
+                Arc::new(ForgetCacheEventsStep),
+            )
+            .with_retry(single_attempt())
+            .depends_on(&[REMOVE_PROVIDER_WORKERS_STEP]),
+        )
+        .add_step(release_tokenizer_step(REMOVE_PROVIDER_WORKERS_STEP))
+}
+
+/// The tokenizer release, behind the step that settles what it reads.
+fn release_tokenizer_step(behind: &str) -> StepDefinition<WorkerRemovalWorkflowData> {
+    StepDefinition::new(
+        "release_tokenizer",
+        "Release the tokenizers of the models no worker serves any more",
+        Arc::new(ReleaseTokenizerStep),
+    )
+    .with_timeout(Duration::from_secs(10))
+    .with_retry(single_attempt())
+    .depends_on(&[behind])
 }
 
 /// Create a worker update workflow definition.
@@ -102,40 +199,11 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
 /// ```
 pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflowData> {
     WorkflowDefinition::new("worker_update", "Update worker properties")
-        .add_step(
-            StepDefinition::new(
-                "find_worker_to_update",
-                "Find worker to update",
-                Arc::new(FindWorkerToUpdateStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(single_attempt()),
-        )
-        .add_step(
-            StepDefinition::new(
-                "rediscover_labels",
-                "Re-read the worker's labels from its engine (label refresh only)",
-                Arc::new(RediscoverLabelsStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            // An engine that just came back may still be warming up: one more
-            // try before the refresh is left to the next transition.
-            .with_retry(RetryPolicy {
-                max_attempts: 2,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(3)),
-            })
-            .depends_on(&["find_worker_to_update"]),
-        )
-        .add_step(
-            StepDefinition::new(
-                "update_worker_properties",
-                "Update worker properties",
-                Arc::new(UpdateWorkerPropertiesStep),
-            )
-            .with_timeout(Duration::from_secs(10))
-            .with_retry(single_attempt())
-            .depends_on(&["rediscover_labels"]),
-        )
+        .add_step(find_worker_to_update_step())
+        .add_step(rediscover_labels_step())
+        .add_step(update_worker_properties_step(Arc::new(
+            UpdateWorkerPropertiesStep,
+        )))
         .add_step(
             StepDefinition::new(
                 "update_policies_for_worker",
@@ -146,6 +214,69 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
             .with_retry(single_attempt())
             .depends_on(&["update_worker_properties"]),
         )
+}
+
+/// The update line's first step: the workers an update names.
+fn find_worker_to_update_step() -> StepDefinition<WorkerUpdateWorkflowData> {
+    StepDefinition::new(
+        "find_worker_to_update",
+        "Find worker to update",
+        Arc::new(FindWorkerToUpdateStep),
+    )
+    .with_timeout(Duration::from_secs(10))
+    .with_retry(single_attempt())
+}
+
+/// The label refresh's read of the engine, behind the find step.
+fn rediscover_labels_step() -> StepDefinition<WorkerUpdateWorkflowData> {
+    StepDefinition::new(
+        "rediscover_labels",
+        "Re-read the worker's labels from its engine (label refresh only)",
+        Arc::new(RediscoverLabelsStep),
+    )
+    .with_timeout(Duration::from_secs(10))
+    // An engine that just came back may still be warming up: one more
+    // try before the refresh is left to the next transition.
+    .with_retry(RetryPolicy {
+        max_attempts: 2,
+        backoff: BackoffStrategy::Fixed(Duration::from_secs(3)),
+    })
+    .depends_on(&["find_worker_to_update"])
+}
+
+/// The update step of either line, by the executor that writes the worker.
+fn update_worker_properties_step(
+    executor: Arc<dyn StepExecutor<WorkerUpdateWorkflowData>>,
+) -> StepDefinition<WorkerUpdateWorkflowData> {
+    StepDefinition::new(
+        "update_worker_properties",
+        "Update worker properties",
+        executor,
+    )
+    .with_timeout(Duration::from_secs(10))
+    .with_retry(single_attempt())
+    .depends_on(&["rediscover_labels"])
+}
+
+/// The update line. With no feed it is [`create_worker_update_workflow`]'s.
+///
+/// With a feed the gateway's local workers are rows of the policy
+/// controller's store. The update step writes a row's worker at the feed's
+/// door, and the holder lays its object over the one that stands
+/// ([`UpdateAtDoorStep`]). A provider's worker stays in the registry
+/// alone, and the step writes it there. No step writes the classic
+/// policies: they decide nothing there.
+pub(crate) fn worker_update_line(
+    feed: Option<&Feed>,
+) -> WorkflowDefinition<WorkerUpdateWorkflowData> {
+    let Some(feed) = feed else {
+        return create_worker_update_workflow();
+    };
+    let at_door = UpdateAtDoorStep::new(Arc::clone(&feed.door), Arc::clone(&feed.objects));
+    WorkflowDefinition::new("worker_update", "Update worker properties")
+        .add_step(find_worker_to_update_step())
+        .add_step(rediscover_labels_step())
+        .add_step(update_worker_properties_step(Arc::new(at_door)))
 }
 
 /// Helper to create initial workflow data for worker removal
@@ -194,19 +325,33 @@ pub fn create_worker_update_workflow_data(
 #[cfg(test)]
 mod tests {
     use llm_tokenizer::TokenizerRegistry;
-    use openai_protocol::model_card::ModelCard;
-    use smg_worker::identity::basic::{ConnectionMode, Worker};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, WorkerStatus},
+    };
+    use smg_policy_controller::{
+        store::{Maker, MemoryStore, WorkerStatus as RowStatus, WorkersStore},
+        worker_host::{facts, Expect, Remover, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
+    };
+    use smg_worker::{
+        identity::basic::{ConnectionMode, Worker},
+        workflow::find_workers_by_url,
+    };
     use wfaas::{
-        StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowEngine,
-        WorkflowError, WorkflowId, WorkflowInstanceId, WorkflowResult, WorkflowState,
-        WorkflowStatus,
+        StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowData,
+        WorkflowEngine, WorkflowError, WorkflowId, WorkflowInstanceId, WorkflowResult,
+        WorkflowState, WorkflowStatus,
     };
 
     use super::*;
     use crate::{
         app_context::testing::app_context_for_tests,
         config::RouterConfig,
-        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
+        policy_controller::feed::feed,
+        routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
+        },
         workflow::tokenizer_registration::{
             create_tokenizer_workflow_data, test_support::tokenizer_dir, LoadTokenizerStep,
             TokenizerConfigRequest,
@@ -451,5 +596,449 @@ mod tests {
                 "the model's tokenizer after removing {url}"
             );
         }
+    }
+
+    /// A line's steps and the steps each waits on, in the line's order.
+    fn edges<D: WorkflowData>(workflow: &WorkflowDefinition<D>) -> Vec<(String, Vec<String>)> {
+        workflow
+            .steps
+            .iter()
+            .map(|step| {
+                assert!(step.depends_on_any.is_empty(), "{}", step.id);
+                let waits_on = step.depends_on.iter().map(ToString::to_string).collect();
+                (step.id.to_string(), waits_on)
+            })
+            .collect()
+    }
+
+    /// A table of steps and the steps each waits on, as [`edges`] reads a
+    /// line.
+    fn written(table: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        table
+            .iter()
+            .map(|(id, waits_on)| {
+                let waits_on = waits_on.iter().map(ToString::to_string).collect();
+                ((*id).to_string(), waits_on)
+            })
+            .collect()
+    }
+
+    /// With no feed the update line is the one it was. Under a feed it
+    /// keeps its first three steps, the third writing at the door, and has
+    /// no step that writes the classic policies.
+    #[test]
+    fn the_update_line_is_todays_with_no_feed_and_writes_no_classic_policy_under_one() {
+        let todays: [(&str, &[&str]); 4] = [
+            ("find_worker_to_update", &[]),
+            ("rediscover_labels", &["find_worker_to_update"]),
+            ("update_worker_properties", &["rediscover_labels"]),
+            ("update_policies_for_worker", &["update_worker_properties"]),
+        ];
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(
+            &Arc::new(MemoryStore::default()),
+            &registry,
+            BackendConnector::shared(),
+        );
+
+        assert_eq!(edges(&create_worker_update_workflow()), written(&todays));
+        assert_eq!(edges(&worker_update_line(None)), written(&todays));
+        let at_the_door: [(&str, &[&str]); 3] = [
+            ("find_worker_to_update", &[]),
+            ("rediscover_labels", &["find_worker_to_update"]),
+            ("update_worker_properties", &["rediscover_labels"]),
+        ];
+        assert_eq!(
+            edges(&worker_update_line(Some(&feed))),
+            written(&at_the_door)
+        );
+    }
+
+    /// The update step's refresh at the door, by the door's answer. A
+    /// worker rebuilt from the row's object takes its place, and the row
+    /// takes its labels. One rebuilt from an object that stands no more is
+    /// dropped, and so is one whose row is draining: the step says so and
+    /// the standing object stays. One that states another fact than its
+    /// labels fails by name.
+    #[test]
+    fn under_the_feed_a_refresh_is_laid_or_dropped_by_the_doors_answer() {
+        let store = Arc::new(MemoryStore::default());
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(&store, &registry, BackendConnector::shared());
+        let step = UpdateAtDoorStep::new(Arc::clone(&feed.door), Arc::clone(&feed.objects));
+        let url = "http://ours:8000";
+        let built = |model: &str, tier: &str| -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(url).model(ModelCard::new(model));
+            Arc::new(worker.label("tier", tier).build())
+        };
+        let seen = || {
+            let id = registry.get_id_by_url(url).expect("the object's id");
+            feed.objects.standing(&id).expect("the object's row")
+        };
+        let stands = |worker: &Arc<dyn Worker>| {
+            let held = registry.get_by_url(url);
+            held.is_some_and(|held| Arc::ptr_eq(&held, worker))
+        };
+        let tier = || {
+            let row = store.by_key(url).expect("the row");
+            row.facts.labels.get("tier").cloned()
+        };
+
+        let first = built("m", "a");
+        let wrote = feed
+            .door
+            .found_built(&Maker::Control, Expect::Anything, &first, None);
+        assert!(wrote.is_ok(), "{wrote:?}");
+
+        let second = built("m", "b");
+        let laid = step.refresh(seen(), &second, &first);
+        assert!(matches!(laid, Ok(true)), "{laid:?}");
+        assert!(stands(&second));
+        assert_eq!(tier().as_deref(), Some("b"));
+
+        // Rebuilt from the object the second replaced: an older refresh.
+        let late = step.refresh(seen(), &built("m", "c"), &first);
+        assert!(matches!(late, Ok(false)), "{late:?}");
+        assert!(stands(&second));
+        assert_eq!(tier().as_deref(), Some("b"));
+
+        let refused = step.refresh(seen(), &built("n", "b"), &second);
+        let why = refused.map_err(|error| error.to_string());
+        let named = "states another fact than its labels";
+        assert!(
+            why.as_ref().is_err_and(|why| why.contains(named)),
+            "{why:?}"
+        );
+        assert!(stands(&second));
+
+        let by = Remover::Maker(&Maker::Control);
+        let drained = feed.door.drained(by, url, seen());
+        assert!(drained.is_ok(), "{drained:?}");
+        let leaving = step.refresh(seen(), &built("m", "c"), &second);
+        assert!(matches!(leaving, Ok(false)), "{leaving:?}");
+        assert!(stands(&second));
+        assert_eq!(feed.objects.unhanded(), 0);
+    }
+
+    /// With no feed the line is the one it was. Under a feed it is the
+    /// store crate's removal at the door and four gateway steps, each
+    /// behind one step alone. No step writes the classic policies, and none
+    /// takes a row's worker out of the registry by hand.
+    #[test]
+    fn the_removal_line_is_todays_with_no_feed_and_stands_at_the_door_under_one() {
+        let todays: [(&str, &[&str]); 5] = [
+            ("find_workers_to_remove", &[]),
+            ("drain_workers", &["find_workers_to_remove"]),
+            ("remove_from_worker_registry", &["drain_workers"]),
+            (
+                "remove_from_policy_registry",
+                &["remove_from_worker_registry"],
+            ),
+            ("release_tokenizer", &["remove_from_worker_registry"]),
+        ];
+        let at_the_door: [(&str, &[&str]); 8] = [
+            ("find_workers_to_remove", &[]),
+            ("settle_drained_workers", &["drain_workers_at_door"]),
+            ("drain_workers_at_door", &["find_workers_to_remove"]),
+            ("remove_workers_at_door", &["settle_drained_workers"]),
+            ("drain_provider_workers", &["remove_workers_at_door"]),
+            ("remove_provider_workers", &["drain_provider_workers"]),
+            ("forget_cache_events", &["remove_provider_workers"]),
+            ("release_tokenizer", &["remove_provider_workers"]),
+        ];
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(
+            &Arc::new(MemoryStore::default()),
+            &registry,
+            BackendConnector::shared(),
+        );
+        let door = Some((&feed, UnhealthyRemovalScope::DiscoveryOwned));
+
+        assert_eq!(edges(&create_worker_removal_workflow()), written(&todays));
+        assert_eq!(edges(&worker_removal_line(None)), written(&todays));
+        assert_eq!(edges(&worker_removal_line(door)), written(&at_the_door));
+    }
+
+    /// Three removals through the engine under a feed, each asked by the
+    /// worker API. A row's worker leaves at the door: its row goes, and the
+    /// holder takes its object out of the registry. A provider's worker has
+    /// no row: the door's steps leave it, and the registry's two steps
+    /// behind them drain it for its own window and take it out. The gauge
+    /// step runs each time. A row another maker made is refused by the
+    /// door: nothing drained, so the job fails by the store's sentence, and
+    /// no step takes its object out of the registry by hand.
+    #[tokio::test(start_paused = true)]
+    async fn under_the_feed_a_removal_takes_a_rows_worker_at_the_door_and_a_providers_from_the_registry(
+    ) {
+        let store = Arc::new(MemoryStore::default());
+        let registry = Arc::new(WorkerRegistry::new());
+        let feed = feed(&store, &registry, BackendConnector::shared());
+        let host = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::clone(&registry),
+            None,
+        );
+        let engine: WorkflowEngine<WorkerRemovalWorkflowData> = WorkflowEngine::new();
+        let door = Some((&feed, UnhealthyRemovalScope::DiscoveryOwned));
+        engine.register_workflow(worker_removal_line(door)).unwrap();
+
+        let built = |url: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("m"))
+                    .build(),
+            )
+        };
+        let (ours, theirs, provider) = (
+            "http://ours:8000",
+            "http://theirs:8000",
+            "https://provider.example/v1",
+        );
+        let found_by = Maker::provider(DISCOVERY, theirs).unwrap();
+        for (maker, url) in [(Maker::Control, ours), (found_by, theirs)] {
+            let worker = built(url);
+            feed.door
+                .found(&maker, Expect::Anything, url, &|standing| {
+                    facts(worker.as_ref(), standing)
+                })
+                .unwrap();
+        }
+        // A provider's worker in service, with a drain window of its own.
+        let window = Duration::from_secs(7);
+        let in_service: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(provider)
+                .model(ModelCard::new("m"))
+                .status(WorkerStatus::Ready)
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: window.as_secs(),
+                    ..HealthCheckConfig::default()
+                })
+                .build(),
+        );
+        registry.register(in_service).unwrap();
+
+        // A removal of `url` as the worker API asks it, run to its end.
+        let removal = |url: &'static str| {
+            let (engine, host) = (&engine, Arc::clone(&host));
+            async move {
+                let data = create_worker_removal_workflow_data(
+                    url.to_string(),
+                    None,
+                    host,
+                    WorkerJobAsker::Api,
+                );
+                let instance_id = engine
+                    .start_workflow(WorkflowId::new("worker_removal"), data)
+                    .await
+                    .unwrap();
+                settled(engine, instance_id).await
+            }
+        };
+        let stands = |url: &str, stood: &Arc<dyn Worker>| {
+            registry
+                .get_by_url(url)
+                .is_some_and(|entry| Arc::ptr_eq(&entry, stood))
+        };
+
+        // (the URL, the provider steps' end)
+        for (url, provider_steps) in [
+            (ours, StepStatus::Skipped),
+            (provider, StepStatus::Succeeded),
+        ] {
+            let stood = registry.get_by_url(url).unwrap();
+            let asked = tokio::time::Instant::now();
+            let state = removal(url).await;
+            assert_eq!(state.status, WorkflowStatus::Completed, "{url}");
+            let ended = |step: &str| state.step_states[&StepId::new(step)].status;
+            for step in ["drain_provider_workers", "remove_provider_workers"] {
+                assert_eq!(ended(step), provider_steps, "{url} {step}");
+            }
+            // The registry's drain waits the provider's own window.
+            assert_eq!(asked.elapsed() >= window, url == provider, "{url}");
+            assert!(!stands(url, &stood), "{url}");
+        }
+        assert!(store.by_key(ours).is_none());
+
+        // The API is not the maker of the row a provider made.
+        let stood = registry.get_by_url(theirs).unwrap();
+        let state = removal(theirs).await;
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        let drain = &state.step_states[&StepId::new(DRAIN_WORKERS_AT_DOOR_STEP)];
+        let refusal = drain.last_error.as_deref().unwrap_or_default();
+        assert!(
+            refusal.contains("its worker is changed at the provider's source"),
+            "{refusal}"
+        );
+        assert!(stands(theirs, &stood));
+        assert!(store.by_key(theirs).is_some());
+    }
+
+    /// A removal line under a feed over `registry`, with its engine and the
+    /// host its runs read.
+    fn at_the_door(
+        store: &Arc<MemoryStore>,
+        registry: &Arc<WorkerRegistry>,
+    ) -> (
+        Feed,
+        WorkflowEngine<WorkerRemovalWorkflowData>,
+        Arc<AppContext>,
+    ) {
+        let feed = feed(store, registry, BackendConnector::shared());
+        let host = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::clone(registry),
+            None,
+        );
+        let engine = WorkflowEngine::new();
+        let door = Some((&feed, UnhealthyRemovalScope::DiscoveryOwned));
+        engine.register_workflow(worker_removal_line(door)).unwrap();
+        (feed, engine, host)
+    }
+
+    /// A row's worker in service, removed under a feed. Through its drain
+    /// window the registry reads it `Draining`, as the store reads its row:
+    /// no reader of the registry sends to it, and the commit of a decision
+    /// made before the drain reads the same status. The feed's holder
+    /// copies no status, so the mark is the line's own. The window over,
+    /// the row and the worker are gone.
+    #[tokio::test(start_paused = true)]
+    async fn under_the_feed_a_drained_rows_worker_reads_draining_through_its_window() {
+        let store = Arc::new(MemoryStore::default());
+        let registry = Arc::new(WorkerRegistry::new());
+        let (feed, engine, host) = at_the_door(&store, &registry);
+
+        let url = "http://ours:8000";
+        let window = Duration::from_secs(7);
+        let built: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: window.as_secs(),
+                    ..HealthCheckConfig::default()
+                })
+                .build(),
+        );
+        feed.door
+            .found(&Maker::Control, Expect::Anything, url, &|standing| {
+                facts(built.as_ref(), standing)
+            })
+            .unwrap();
+        // In service by the gateway's own word, as a registration's
+        // activation leaves it.
+        let id = registry.get_id_by_url(url).unwrap();
+        registry.transition_status(&id, WorkerStatus::Ready);
+        let stood = registry.get_by_url(url).unwrap();
+        assert!(stood.is_healthy());
+
+        let instance_id = engine
+            .start_workflow(
+                WorkflowId::new("worker_removal"),
+                create_worker_removal_workflow_data(
+                    url.to_string(),
+                    None,
+                    Arc::clone(&host),
+                    WorkerJobAsker::Api,
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(window / 2).await;
+        let row = store.by_key(url).expect("the row, inside its window");
+        assert_eq!(row.status, RowStatus::Draining);
+        assert_eq!(stood.status(), WorkerStatus::Draining);
+        assert!(!stood.is_healthy());
+
+        let state = settled(&engine, instance_id).await;
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert!(store.by_key(url).is_none());
+        assert!(registry.get_by_url(url).is_none());
+    }
+
+    /// One removal that names workers of both kinds. An address selects
+    /// every rank registered under it: here two rows at its ranks, and a
+    /// provider's worker at the address itself. The door takes the rows,
+    /// the registry's two steps take the provider's worker, and the steps
+    /// behind them read the three as removed.
+    #[tokio::test(start_paused = true)]
+    async fn under_the_feed_a_removal_that_names_rows_and_a_providers_worker_takes_each() {
+        let store = Arc::new(MemoryStore::default());
+        let registry = Arc::new(WorkerRegistry::new());
+        let (feed, engine, host) = at_the_door(&store, &registry);
+
+        let address = "http://shared:8000";
+        for rank in 0..2 {
+            let ranked: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(address)
+                    .model(ModelCard::new("m"))
+                    .dp_config(rank, 2)
+                    .build(),
+            );
+            feed.door
+                .found(
+                    &Maker::Control,
+                    Expect::Anything,
+                    ranked.url(),
+                    &|standing| facts(ranked.as_ref(), standing),
+                )
+                .unwrap();
+        }
+        let provider: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(address)
+                .model(ModelCard::new("m"))
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        registry.register(provider).unwrap();
+        let mut named: Vec<_> = find_workers_by_url(&registry, address)
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        named.sort_unstable();
+        let three = [
+            address.to_string(),
+            format!("{address}@0"),
+            format!("{address}@1"),
+        ];
+        assert_eq!(named, three);
+
+        let instance_id = engine
+            .start_workflow(
+                WorkflowId::new("worker_removal"),
+                create_worker_removal_workflow_data(
+                    address.to_string(),
+                    None,
+                    Arc::clone(&host),
+                    WorkerJobAsker::Api,
+                ),
+            )
+            .await
+            .unwrap();
+        let state = settled(&engine, instance_id).await;
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        for step in [
+            "remove_workers_at_door",
+            "drain_provider_workers",
+            "remove_provider_workers",
+        ] {
+            let ended = state.step_states[&StepId::new(step)].status;
+            assert_eq!(ended, StepStatus::Succeeded, "{step}");
+        }
+        assert!(find_workers_by_url(&registry, address).is_empty());
+        for url in &three[1..] {
+            assert!(store.by_key(url).is_none(), "{url}");
+        }
+        let mut removed: Vec<_> = state
+            .context
+            .data
+            .removed_workers
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        removed.sort_unstable();
+        assert_eq!(removed, three);
     }
 }

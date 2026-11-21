@@ -31,7 +31,7 @@ use openai_protocol::{
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
     event_types::McpEvent,
-    responses::{ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesUsage},
+    responses::{ResponseUsage, ResponsesRequest},
 };
 use serde::{
     de::{Deserializer, IgnoredAny, SeqAccess, Visitor},
@@ -477,7 +477,7 @@ async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
 )]
 async fn record_departure(
     mut event_emitter: ResponseStreamEventEmitter,
-    usage: Option<ResponsesUsage>,
+    usage: Option<ResponseUsage>,
     original_request: &ResponsesRequest,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
@@ -495,8 +495,7 @@ async fn record_departure(
             event_emitter.set_finish_reason(Some("cancelled"));
         }
         event_emitter.close_items(tx).await?;
-        let mut final_response = event_emitter.finalize(None);
-        final_response.usage = usage;
+        let final_response = event_emitter.finalize(usage);
         if let Err(e) = persist_response_if_needed(
             conversation_storage,
             conversation_item_storage,
@@ -631,9 +630,7 @@ async fn process_and_transform_sse_stream(
     if client_left {
         return record_departure(
             event_emitter,
-            usage
-                .as_ref()
-                .map(|usage| ResponsesUsage::Modern(ResponseUsage::from(usage))),
+            usage.as_ref().map(ResponseUsage::from),
             &original_request,
             response_storage,
             conversation_storage,
@@ -654,6 +651,7 @@ async fn process_and_transform_sse_stream(
         event_emitter.set_finish_reason(Some("failed"));
     }
     event_emitter.close_items(&tx).await?;
+    let usage = usage.as_ref().map(ResponseUsage::from);
     let final_response = match terminal_error.as_ref() {
         Some(error) => event_emitter.finalize_failed(usage, error.clone()),
         None => event_emitter.finalize(usage),
@@ -1217,7 +1215,7 @@ async fn execute_tool_loop_streaming_internal(
             let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
             return record_departure(
                 emitter,
-                state.usage.clone().map(ResponsesUsage::Modern),
+                state.usage.clone(),
                 original_request,
                 ctx.response_storage.clone(),
                 ctx.conversation_storage.clone(),
@@ -1233,15 +1231,10 @@ async fn execute_tool_loop_streaming_internal(
     // The final object, read before the terminal event drains the emitter's
     // items; a background response needs its terminal record under the id
     // the client polls.
-    let mut final_response = emitter.finalize(None);
-    final_response.usage = state.usage.clone().map(ResponsesUsage::Modern);
-    if let Some(error) = terminal_error.clone() {
-        // The emitter learns of the failure from the terminal event, which
-        // now follows the final object: the stored record says failed itself.
-        final_response.status = ResponseStatus::Failed;
-        final_response.incomplete_details = None;
-        final_response.error = Some(error);
-    }
+    let final_response = match terminal_error.as_ref() {
+        Some(error) => emitter.finalize_failed(state.usage.clone(), error.clone()),
+        None => emitter.finalize(state.usage.clone()),
+    };
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
     let persist = persist_response_if_needed(
         ctx.conversation_storage.clone(),

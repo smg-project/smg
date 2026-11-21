@@ -112,12 +112,13 @@ mod handles {
     /// label, each built the first time a load has a figure for it, so the
     /// series that exist are exactly the ones recorded to: the core gauges
     /// with the rank's first load, the capacity gauge with the first that
-    /// carries the capacity, the PD gauges under the role the engine reports
-    /// with the first that carries a `disagg` section.
+    /// carries the capacity, both under the worker's registered role; the
+    /// PD gauges under the role the engine reports with the first that
+    /// carries a `disagg` section.
     #[derive(Default)]
     pub(super) struct EngineRankHandles {
         pub(super) core: Option<EngineCoreHandles>,
-        /// `smg_engine_kv_capacity_tokens`.
+        /// `smg_engine_kv_capacity_tokens`, under the core gauges' role.
         pub(super) kv_capacity: Option<Gauge>,
         /// The PD gauges, under the role label the engine last reported.
         pd: Option<EnginePdHandles>,
@@ -170,8 +171,11 @@ mod handles {
         slot.get_or_insert_with(|| EngineLabels::new(worker_url, model_id, dp_rank))
     }
 
-    /// The gauges every load sets for its rank.
+    /// The gauges every load sets for its rank, under one role label.
     pub(super) struct EngineCoreHandles {
+        /// The role these series carry, their worker's registered one,
+        /// interned once per role.
+        pub(super) role: Arc<str>,
         /// `smg_engine_running_requests`.
         pub(super) running: Gauge,
         /// `smg_engine_waiting_requests`.
@@ -215,14 +219,15 @@ mod handles {
     }
 
     impl EngineCoreHandles {
-        /// The five core series of the rank `labels` name.
-        pub(super) fn new(labels: &EngineLabels) -> Self {
+        /// The five core series of the rank `labels` name, under `role`.
+        pub(super) fn new(labels: &EngineLabels, role: Arc<str>) -> Self {
             Self {
-                running: engine_gauge("smg_engine_running_requests", labels),
-                waiting: engine_gauge("smg_engine_waiting_requests", labels),
-                token_usage: engine_gauge("smg_engine_token_usage", labels),
-                gen_throughput: engine_gauge("smg_engine_gen_throughput", labels),
-                cache_hit_rate: engine_gauge("smg_engine_cache_hit_rate", labels),
+                running: engine_gauge("smg_engine_running_requests", labels, &role),
+                waiting: engine_gauge("smg_engine_waiting_requests", labels, &role),
+                token_usage: engine_gauge("smg_engine_token_usage", labels, &role),
+                gen_throughput: engine_gauge("smg_engine_gen_throughput", labels, &role),
+                cache_hit_rate: engine_gauge("smg_engine_cache_hit_rate", labels, &role),
+                role,
             }
         }
     }
@@ -243,12 +248,17 @@ mod handles {
     /// engine-load record has always built: the series is the same one
     /// whether it is reached through a kept handle or a key built per call,
     /// and the scrape reads the same.
-    pub(super) fn engine_gauge(name: &'static str, labels: &EngineLabels) -> Gauge {
+    pub(super) fn engine_gauge(
+        name: &'static str,
+        labels: &EngineLabels,
+        role: &Arc<str>,
+    ) -> Gauge {
         metrics::gauge!(
             name,
             "worker" => Arc::clone(&labels.worker),
             "model" => Arc::clone(&labels.model),
             "dp_rank" => Arc::clone(&labels.dp_rank),
+            "role" => Arc::clone(role),
         )
     }
 
@@ -438,7 +448,7 @@ mod handles {
 pub fn describe_series() {
     describe_gauge!(
         "smg_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
+        "Current worker pool size by worker_type, connection_mode and the worker's primary model"
     );
     describe_counter!(
         "smg_pd_rendezvous_failures_total",
@@ -665,27 +675,27 @@ pub fn describe_series() {
     );
     describe_gauge!(
         "smg_engine_running_requests",
-        "Engine-reported running requests by worker, model, dp_rank"
+        "Engine-reported running requests by worker, model, dp_rank, role"
     );
     describe_gauge!(
         "smg_engine_waiting_requests",
-        "Engine-reported waiting requests by worker, model, dp_rank"
+        "Engine-reported waiting requests by worker, model, dp_rank, role"
     );
     describe_gauge!(
         "smg_engine_token_usage",
-        "Engine-reported KV token usage ratio (0.0-1.0) by worker, model, dp_rank"
+        "Engine-reported KV token usage ratio (0.0-1.0) by worker, model, dp_rank, role"
     );
     describe_gauge!(
         "smg_engine_gen_throughput",
-        "Engine-reported generation throughput (tokens/s) by worker, model, dp_rank"
+        "Engine-reported generation throughput (tokens/s) by worker, model, dp_rank, role"
     );
     describe_gauge!(
         "smg_engine_cache_hit_rate",
-        "Engine-reported prefix cache hit rate (0.0-1.0) by worker, model, dp_rank"
+        "Engine-reported prefix cache hit rate (0.0-1.0) by worker, model, dp_rank, role"
     );
     describe_gauge!(
         "smg_engine_kv_capacity_tokens",
-        "Engine-reported KV cache capacity in tokens by worker, model, dp_rank: the denominator of smg_engine_token_usage; absent while the engine has not reported it (a record that carries only the core figures keeps the last reported value); divided by smg_kv_block_size_tokens it is the engine's total KV blocks"
+        "Engine-reported KV cache capacity in tokens by worker, model, dp_rank, role: the denominator of smg_engine_token_usage; absent while the engine has not reported it (a record that carries only the core figures keeps the last reported value); divided by smg_kv_block_size_tokens it is the engine's total KV blocks"
     );
     describe_gauge!(
         "smg_kv_block_size_tokens",
@@ -1365,16 +1375,20 @@ impl Metrics {
     /// every rank the report carries, as a poll's does. A pushed record
     /// names one rank and goes through [`Self::record_engine_rank_load`].
     ///
-    /// Core gauges are per DP rank (`dp_rank` bounded by dp_size). PD gauges
-    /// are emitted only for ranks that carry a `disagg` section, labeled by the
-    /// engine-reported role (`prefill`/`decode`/`null`).
+    /// Core gauges are per DP rank (`dp_rank` bounded by dp_size) and carry
+    /// `role`, the role their worker is registered in
+    /// ([`registered_engine_role`]), so a pool's load splits by role whether
+    /// or not its engines report one. PD gauges are emitted only for ranks
+    /// that carry a `disagg` section, labeled by the engine-reported role
+    /// (`prefill`/`decode`/`null`).
     pub fn record_engine_load(
         worker_url: &str,
         model_id: &str,
+        role: &'static str,
         response: &crate::worker::WorkerLoadResponse,
     ) {
         for load in &response.loads {
-            Self::record_engine_rank_load(worker_url, model_id, load);
+            Self::record_engine_rank_load(worker_url, model_id, role, load);
         }
     }
 
@@ -1387,12 +1401,15 @@ impl Metrics {
     pub fn record_engine_rank_load(
         worker_url: &str,
         model_id: &str,
+        role: &'static str,
         load: &crate::worker::SchedulerLoadSnapshot,
     ) {
         if handles::keep_handles() {
             let recorded = handles::ENGINE_LOADS.with_borrow_mut(|kept| {
                 handles::engine_rank(kept.for_worker(worker_url), model_id, load.dp_rank)
-                    .map(|rank| Self::set_engine_rank_gauges(rank, worker_url, model_id, load))
+                    .map(|rank| {
+                        Self::set_engine_rank_gauges(rank, worker_url, model_id, role, load);
+                    })
                     .is_some()
             });
             if recorded {
@@ -1405,6 +1422,7 @@ impl Metrics {
             &mut handles::EngineRankHandles::default(),
             worker_url,
             model_id,
+            role,
             load,
         );
     }
@@ -1416,17 +1434,27 @@ impl Metrics {
         rank: &mut handles::EngineRankHandles,
         worker_url: &str,
         model_id: &str,
+        role: &'static str,
         load: &crate::worker::SchedulerLoadSnapshot,
     ) {
         let dp_rank = load.dp_rank;
+        // The role is the worker's, and a worker of another role at the URL
+        // is another registration, which drops the kept handles: one that
+        // still names another role here is not this writer's.
+        if rank
+            .core
+            .as_ref()
+            .is_some_and(|core| core.role.as_ref() != role)
+        {
+            rank.core = None;
+            rank.kv_capacity = None;
+        }
         let mut labels = None;
         let core = rank.core.get_or_insert_with(|| {
-            handles::EngineCoreHandles::new(handles::engine_labels(
-                &mut labels,
-                worker_url,
-                model_id,
-                dp_rank,
-            ))
+            handles::EngineCoreHandles::new(
+                handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                intern_string(role),
+            )
         });
         core.running.set(load.num_running_reqs as f64);
         core.waiting.set(load.num_waiting_reqs as f64);
@@ -1442,6 +1470,7 @@ impl Metrics {
                     handles::engine_gauge(
                         "smg_engine_kv_capacity_tokens",
                         handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &core.role,
                     )
                 })
                 .set(f64::from(load.max_total_num_tokens));
@@ -1557,12 +1586,17 @@ impl Metrics {
     /// the load gauges and under any (`None`) for the pair gauges? A load
     /// series carries its model's label, and two models share one past
     /// the label cap ([`intern_model_label`]). The tests are
-    /// [`Self::record_engine_rank_load`]'s own conditions: any entry for
-    /// the five core gauges, one that carries the capacity for the
-    /// capacity gauge, one that reports the role and carries the figure
-    /// for a pair gauge. The collector answers over every entry of the
-    /// rank its live writers hold: a rollup's row names a rank once a
-    /// downstream worker, and a poll writes each. The label sets must
+    /// [`Self::record_engine_rank_load`]'s own conditions: any entry of a
+    /// writer registered in the same role for the five core gauges, one
+    /// that carries the capacity for the capacity gauge, one that reports
+    /// the role and carries the figure for a pair gauge. A load series
+    /// carries its worker's registered role, so `role` is the ended
+    /// worker's and the test of a live writer's entry is told that
+    /// writer's ([`LoadTest`]): a successor registered in another role
+    /// writes other series and keeps no sentinel from these. The collector
+    /// answers over every entry of the rank its live writers hold: a
+    /// rollup's row names a rank once a downstream worker, and a poll
+    /// writes each. The label sets must
     /// match that writer's exactly, or a fresh series is created instead
     /// of overwriting the live one. One call a rank: no rank between two
     /// is written, and the rank's label is built once.
@@ -1570,14 +1604,17 @@ impl Metrics {
         worker_url: &str,
         models: &[String],
         dp_rank: i32,
+        role: &'static str,
         live: impl Fn(Option<&str>, &LoadTest<'_>) -> bool,
     ) {
         let worker = intern_string(worker_url);
         let dp_rank = rank_label(dp_rank);
         for model_id in models {
             let model = intern_model_label(model_id);
-            let core = live(Some(&model), &|_| true);
-            let capacity = live(Some(&model), &|load| load.max_total_num_tokens > 0);
+            let core = live(Some(&model), &|_, writer| writer == role);
+            let capacity = live(Some(&model), &|load, writer| {
+                writer == role && load.max_total_num_tokens > 0
+            });
             if core && capacity {
                 continue;
             }
@@ -1595,6 +1632,7 @@ impl Metrics {
                         "worker" => Arc::clone(&worker),
                         "model" => Arc::clone(&model),
                         "dp_rank" => Arc::clone(&dp_rank),
+                        "role" => role,
                     )
                     .set(-1.0);
                 }
@@ -1602,7 +1640,7 @@ impl Metrics {
         }
         for role in ["prefill", "decode", "null"] {
             let carries = |figure: fn(&crate::worker::SchedulerLoadSnapshot) -> bool| {
-                live(None, &|load| {
+                live(None, &|load, _writer| {
                     load.disagg_mode.as_deref() == Some(role) && figure(load)
                 })
             };
@@ -1640,8 +1678,26 @@ impl Metrics {
 
 /// A test of one entry of a load, for the sentinel's guard
 /// ([`Metrics::remove_engine_rank_metrics`]): whether the entry carries
-/// the figure of the series in question.
-pub(crate) type LoadTest<'t> = dyn Fn(&crate::worker::SchedulerLoadSnapshot) -> bool + 't;
+/// the figure of the series in question. The second argument is the
+/// registered role of the live writer that holds the entry
+/// ([`registered_engine_role`]), the role that writer's load series carry.
+pub(crate) type LoadTest<'t> =
+    dyn Fn(&crate::worker::SchedulerLoadSnapshot, &'static str) -> bool + 't;
+
+/// The `role` label of a worker's engine load series: the type the worker is
+/// registered under. `prefill` and `decode` for the two sides of a
+/// disaggregated pool, and `null`, the engines' own spelling of a worker
+/// that is neither, for any other, so the label reads as the pair series'
+/// does. It is the registration's and not the load's: every engine's load
+/// then splits by role, one that reports none included, and a worker's
+/// series stand under one role for as long as it is registered.
+pub fn registered_engine_role(worker_type: crate::worker::WorkerType) -> &'static str {
+    match worker_type {
+        crate::worker::WorkerType::Prefill => "prefill",
+        crate::worker::WorkerType::Decode => "decode",
+        crate::worker::WorkerType::Regular | crate::worker::WorkerType::Encode => "null",
+    }
+}
 
 #[cfg(test)]
 mod tests;

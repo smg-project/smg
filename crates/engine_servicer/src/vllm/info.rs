@@ -206,6 +206,8 @@ fn reported_entry(
         gen_throughput: estimate.gen_throughput,
         prefill_throughput: estimate.prefill_throughput,
         cache_hit_rate: estimate.cache_hit_rate,
+        // The engine's own report states no named value.
+        values: Vec::new(),
     }
 }
 

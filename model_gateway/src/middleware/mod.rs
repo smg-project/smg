@@ -63,12 +63,12 @@ pub use crate::tenant::{
 pub(crate) const SHED_RETRY_AFTER_SECS: u32 = 2;
 
 /// The admission queue's answer for a request it has no room for: its code
-/// and its status. The policy controller's host reuses both.
+/// and its status. The policy engine reuses both.
 pub(crate) const ADMISSION_QUEUE_FULL_CODE: &str = "admission_queue_full";
 pub(crate) const ADMISSION_QUEUE_FULL_STATUS: StatusCode = StatusCode::TOO_MANY_REQUESTS;
 
 /// The admission queue's answer for a request that outlives its wait: its
-/// code and its status. The policy controller's host reuses both.
+/// code and its status. The policy engine reuses both.
 pub(crate) const ADMISSION_QUEUE_TIMEOUT_CODE: &str = "admission_queue_timeout";
 pub(crate) const ADMISSION_QUEUE_TIMEOUT_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 

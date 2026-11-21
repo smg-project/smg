@@ -360,7 +360,8 @@ pub struct RouterConfig {
     /// places by its routing key, placing it by its policy). Off by
     /// default: a fleet that is uniformly over the thresholds is still a
     /// fleet, and the dispatch-time re-check that sheds a worker flagged
-    /// between selection and dispatch is part of the same opt-in.
+    /// between selection and dispatch is part of the same opt-in. A request
+    /// the policy controller placed is not re-checked.
     #[serde(default)]
     pub worker_overload_shed: bool,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
@@ -2169,6 +2170,23 @@ impl RouterConfig {
             RoutingMode::Anthropic { .. } => "anthropic",
             RoutingMode::Gemini { .. } => "gemini",
         }
+    }
+
+    /// The provider's name, where every router of the gateway is that
+    /// provider's: a provider mode without the multi-router setting
+    /// (`enable_igw`). Such a gateway places its requests by no routing
+    /// policy. A multi-router gateway mounts the routers of self-hosted
+    /// workers beside the provider's, and reads `None` here.
+    pub(crate) fn provider_alone(&self) -> Option<&'static str> {
+        let provider = match self.mode {
+            RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => true,
+            RoutingMode::Regular { .. }
+            | RoutingMode::PrefillDecode { .. }
+            | RoutingMode::EncodePrefillDecode { .. } => false,
+        };
+        (provider && !self.enable_igw).then(|| self.mode_type())
     }
 
     /// Check if service discovery is enabled

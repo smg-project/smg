@@ -136,17 +136,24 @@ use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
 use prost::Message as _;
 use smg_policy_controller::{
-    client::{self, blocking, Answer, Client, Link, Unanswered},
-    controller::{State, PROTOCOL_VERSION},
-    proto::{
-        busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
-        released, worker_event, Completed, DecideRequest, Decision, Hello, Identity, Lease,
-        OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
+    document::{
+        spec,
+        spec::{BindingSpec, Match},
     },
-    spec::{BindingSpec, Match},
+    engine::view::{Role, SignalSource, WireModes, WorkerId},
+    service::{
+        client::{self, blocking, Answer, Client, Link, Unanswered},
+        controller::{State, PROTOCOL_VERSION},
+        proto,
+        proto::{
+            busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
+            released, worker_event, Completed, DecideRequest, Decision, Dispatched, Hello,
+            Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
+            WatchWorkersRequest,
+        },
+        watcher::{Ended, Following, Watcher},
+    },
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
-    view::{Role, SignalSource, WireModes, WorkerId},
-    watcher::{Ended, Following, Watcher},
     PolicySpec, PowerOfTwoMetric, SpecError,
 };
 use tokio::{
@@ -249,6 +256,7 @@ fn ask(id: &[u8]) -> DecideRequest {
         }),
         constraints: None,
         again: false,
+        ..Default::default()
     }
 }
 
@@ -410,7 +418,7 @@ fn for_model(mut ask: DecideRequest, model: &str) -> DecideRequest {
 fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
     if let Some(facts) = &mut ask.facts {
         SIZED.clone_into(&mut facts.model);
-        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+        facts.phase = proto::Phase::Prefill.into();
         facts.prompt_tokens = tokens;
     }
     ask
@@ -421,12 +429,12 @@ fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
 fn by_size() -> Result<PolicySpec, SpecError> {
     let mut document = PolicySpec::preset("bucket")?;
     for profile in document.profiles.values_mut() {
-        let sizes = smg_policy_controller::spec::BucketParams {
+        let sizes = spec::BucketParams {
             abs_threshold: Some(u32::MAX),
             adjust_interval_s: Some(3_600),
             ..Default::default()
         };
-        profile.score = vec![smg_policy_controller::spec::ScoreStage::Bucket(sizes).into()];
+        profile.score = vec![spec::ScoreStage::Bucket(sizes).into()];
     }
     Ok(document)
 }
@@ -1209,7 +1217,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // returns to that failover.
         let away = |run: &str, n: u64| {
             let mut ask = keyed(nth(run, n), sticky);
-            ask.constraints = Some(smg_policy_controller::proto::Constraints {
+            ask.constraints = Some(proto::Constraints {
                 excluded: vec![sent.id],
                 ..Default::default()
             });
@@ -2313,7 +2321,7 @@ const PAIR_PLAN: &str = r#"{
 fn at_prefill(n: u64) -> DecideRequest {
     let mut ask = for_model(nth("pair", n), PAIRED);
     if let Some(facts) = &mut ask.facts {
-        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+        facts.phase = proto::Phase::Prefill.into();
     }
     ask
 }
@@ -2611,8 +2619,7 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
                 what: Some(released::What::LeaseId(lease_id)),
                 reason: released::Reason::ClientGone.into(),
                 side,
-            }))
-            .expect("the link takes the report");
+            }));
         }
         leases_before_expiry(&harness, &link, GATEWAY, 0, before)
             .await
@@ -2622,6 +2629,104 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A request can outlast the session its decision came over. The gateway
+/// dials its link again, and what the request reports then reaches the
+/// controller on the link's next session: a dispatched lease, which no
+/// deadline ends, ends at that report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
+    const GATEWAY: &str = "fleet-redial";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let endpoint =
+            Endpoint::from_shared(format!("http://{}", harness.gateway())).expect("a URI");
+        // A request in flight holds a clone of the link.
+        let held = link.clone();
+        let sent = |lease: Lease| {
+            gateway_frame::Frame::Dispatched(Dispatched {
+                lease_id: lease.id,
+                target_index: 0,
+                side: lease.side,
+                since_decision_micros: 0,
+            })
+        };
+        let ended = |lease: Lease| {
+            gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(lease.id)),
+                reason: released::Reason::ClientGone.into(),
+                side: lease.side,
+            })
+        };
+
+        // The controller ends the session under a dispatched request: a
+        // second hello on one stream is refused.
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        held.report(sent(first));
+        within("the store reads the first lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, first.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        tokio::time::timeout(ROOM, link.closed())
+            .await
+            .expect("the session ends");
+        assert!(!held.stands());
+
+        // The request ends with no session standing. Its report waits, and
+        // the link's next session says it.
+        held.report(ended(first));
+        assert_eq!(harness.leases(GATEWAY), 1, "no session said the end");
+        Box::pin(link.redial(endpoint.clone(), GATEWAY))
+            .await
+            .expect("the link's next session");
+        within("the report that waited ends the lease", ROOM, || {
+            harness.leases(GATEWAY) == 0
+        })
+        .await
+        .expect("the next session said the report");
+
+        // A redial over a session that stands: the next session takes its
+        // place, and the gateway's lease with it.
+        let second = linked_pick(&held, ask(b"second"))
+            .await
+            .expect("a pick on the next session");
+        held.report(sent(second));
+        within("the store reads the second lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, second.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        Box::pin(link.redial(endpoint, GATEWAY))
+            .await
+            .expect("the link's third session");
+        assert_eq!(
+            harness.leases(GATEWAY),
+            1,
+            "the lease stands through the redial"
+        );
+        held.report(ended(second));
+        within(
+            "the report on the third session ends the lease",
+            ROOM,
+            || harness.leases(GATEWAY) == 0,
+        )
+        .await
+        .expect("the third session said the report");
+        assert!(held.stands());
+        assert_eq!(held.reports_dropped(), 0);
+        drop((link, held));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }
@@ -2697,8 +2802,8 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
     use smg_policy_controller::{
-        door::{Door, Request},
-        handle::Handle,
+        engine::door::{Door, Request},
+        tracking::handle::Handle,
         Outcome, RequestFacts, Side, TransportClass,
     };
 
@@ -2873,8 +2978,8 @@ async fn follows(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
     use smg_policy_controller::{
-        lease::{Lease, LeaseId},
         store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, Picked},
+        tracking::lease::{Lease, LeaseId},
     };
 
     let case = async {
@@ -3036,8 +3141,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
             .open_on(&link)
             .await
             .expect("the link resumes the watch");
-        link.report(gateway_frame::Frame::Hello(Hello::default()))
-            .expect("the session takes the frame");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
         tokio::time::timeout(ROOM, link.closed())
             .await
             .expect("the second hello ends the link");
@@ -3116,9 +3220,11 @@ mod hosted {
     use std::{collections::HashSet, sync::Arc};
 
     use smg_policy_controller::{
-        grpc::{self, GrpcPluginSpec, GrpcScorer, Transport},
-        plugins::OpenDecisions,
-        wasm::{self, PluginSpec, WasmScorer},
+        plugins::{
+            grpc::{self, GrpcPluginSpec, GrpcScorer, Transport},
+            shared::OpenDecisions,
+            wasm::{self, PluginSpec, WasmScorer},
+        },
         Candidate, Catalog, Lifecycle, Scorer, TieBand,
     };
 
@@ -3562,10 +3668,12 @@ mod embedded {
     use std::{sync::Arc, time::Instant};
 
     use smg_policy_controller::{
-        door::{Door, Request},
-        handle::Handle,
+        engine::{
+            door::{Door, Request},
+            view::fingerprint,
+        },
         store::{GatewayId, HealthSink, LeaseState, LeasesStore},
-        view::fingerprint,
+        tracking::handle::Handle,
         Constraints, Outcome, PolicySpec, ReleaseReason, RequestFacts, Side, TransportClass,
         WorkerId,
     };

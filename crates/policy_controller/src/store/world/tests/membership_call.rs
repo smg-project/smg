@@ -3,8 +3,8 @@
 
 use super::{facts, member, MODEL};
 use crate::{
+    engine::view::{Role, Session, WorkerId},
     store::{MemoryStore, WorkerFacts, WorkersStore},
-    view::{Role, Session, WorkerId},
     SessionVerdict,
 };
 
@@ -13,11 +13,12 @@ fn revision(store: &MemoryStore, id: WorkerId) -> u64 {
     WorkersStore::get(store, id).expect("the row").revision
 }
 
-/// A worker that leaves by the store's doors leaves the engine's session
-/// table with it: a removal drops the id's pins, and so does the
-/// replacement of its incarnation.
+/// A worker that leaves by the store's doors keeps its pins in the
+/// engine's session table, and the worker it was takes them back under
+/// its new id: at a registration of its key again, and at a new life in
+/// place. Another worker under the key takes none.
 #[test]
-fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
+fn a_worker_that_leaves_by_the_store_s_doors_takes_its_engine_pins_back() {
     let store = MemoryStore::new();
     let removed = member(&store, "http://a:8000");
     let replaced = member(&store, "http://b:8000");
@@ -27,6 +28,7 @@ fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
             table.pins(Session::from_raw(key))
         })
     };
+    let first = |key: u64| pins(key).map(|pins| pins[0]);
     store.deciding(|world| {
         let table = world.spec().engine().sessions();
         table.dispatched(Session::from_raw(1), SessionVerdict::Pinned, removed);
@@ -36,12 +38,21 @@ fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
     store
         .remove(removed, revision(&store, removed))
         .expect("removed");
-    assert!(pins(1).is_none(), "the removed worker kept its pin");
-    store.upsert(WorkerFacts {
-        incarnation: 2,
-        ..facts("http://b:8000", Role::Single, &[MODEL])
-    });
-    assert!(pins(2).is_none(), "the replaced incarnation kept its pin");
+    assert_eq!(first(1), Some(removed), "the pin stands through the leave");
+    let life = |key: &str, incarnation: u64, role: Role| {
+        let registered = store.upsert(WorkerFacts {
+            incarnation,
+            ..facts(key, role, &[MODEL])
+        });
+        registered.id()
+    };
+    let again = life("http://a:8000", 2, Role::Single);
+    assert_ne!(again, removed);
+    assert_eq!(first(1), Some(again), "the pin follows the key");
+    let next = life("http://b:8000", 2, Role::Single);
+    assert_eq!(first(2), Some(next), "a new life of the same worker");
+    life("http://b:8000", 3, Role::Decode);
+    assert_eq!(pins(2), None, "another worker under the key");
 }
 
 /// The cases that hold a stage of their own: a generation over a host's
@@ -61,16 +72,18 @@ mod held {
         revision,
     };
     use crate::{
-        framework::{Scorer, TieBand},
-        lease::{Lifecycle, Membership},
-        spec::{BindingSpec, Needs},
+        document::spec::{BindingSpec, Needs},
+        engine::{
+            framework::{Scorer, TieBand},
+            view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
+        },
         store::{
             tests::{booking, in_flight},
             world::ViewBuffers,
             Kinds, LeasesStore, LoadSink, MembershipChange, MemoryStore, Position, WorkerFacts,
             WorkerPatch, WorkerStatus, WorkersStore,
         },
-        view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
+        tracking::lease::{Lifecycle, Membership},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
     };
 

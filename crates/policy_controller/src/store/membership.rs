@@ -91,20 +91,22 @@ impl WorkerFacts {
     /// never `Unmoved`.
     ///
     /// Another life starts where the facts change which requests the worker
-    /// can take at all: its role, its wires, its models, or what it states
-    /// for a request's hard demands. The store pays a publication at the
-    /// write of another life, so a decision that starts once the write is
-    /// answered reads none of the old life's facts. A decision that loaded
-    /// its publication before the write still decides over the old life.
+    /// can take at all: its role, its wires, its models, whether it takes
+    /// images, or what it states beside that for a request's hard demands.
+    /// The store pays a publication at the write of another life, so a
+    /// decision that starts once the write is answered reads none of the old
+    /// life's facts. A decision that loaded its publication before the write
+    /// still decides over the old life.
     ///
-    /// A life the demand facts alone start is handed the standing life's
-    /// status: the store hands a status on where role, models and wires
-    /// match, and it is the same reachable worker.
+    /// A life its vision or its demand facts alone start is handed the
+    /// standing life's status: the store hands a status on where role,
+    /// models and wires match, and it is the same reachable worker.
     pub fn laid_over(&self, standing: &Self) -> Laid {
         if self == standing {
             Laid::Unmoved
         } else if self.role != standing.role
             || self.wire_modes != standing.wire_modes
+            || self.vision != standing.vision
             || self.demand_facts != standing.demand_facts
             || !self.same_models(standing)
         {
@@ -275,9 +277,11 @@ mod tests {
 
     use super::{base, Laid, NotMaker, HALF};
     use crate::{
-        demands::DemandFacts,
+        engine::{
+            demands::DemandFacts,
+            view::{Role, WireModes, WorkerId},
+        },
         store::{Maker, Unmade, WorkerFacts, WorkerRow, WorkerStatus},
-        view::{Role, WireModes, WorkerId},
     };
 
     #[test]
@@ -396,7 +400,10 @@ mod tests {
     #[test]
     fn a_changed_demand_fact_is_another_life() {
         let stating = |runtime| WorkerFacts {
-            demand_facts: DemandFacts { runtime },
+            demand_facts: DemandFacts {
+                runtime,
+                ..DemandFacts::default()
+            },
             ..WorkerFacts::default()
         };
         for (standing, fresh) in [(7, 9), (7, 0), (0, 7)] {
@@ -407,6 +414,26 @@ mod tests {
             );
         }
         assert_eq!(stating(7).laid_over(&stating(7)), Laid::Unmoved);
+    }
+
+    /// Whether a worker takes images says which requests it can take at
+    /// all, as a demand fact does: the door reads the bit for a request
+    /// that needs vision. A registration that changes it starts another
+    /// life, whichever way it turns.
+    #[test]
+    fn a_changed_vision_is_another_life() {
+        let seeing = |vision| WorkerFacts {
+            vision,
+            ..WorkerFacts::default()
+        };
+        for (standing, fresh) in [(true, false), (false, true)] {
+            assert_eq!(
+                seeing(fresh).laid_over(&seeing(standing)),
+                Laid::Another,
+                "{standing} to {fresh}"
+            );
+        }
+        assert_eq!(seeing(true).laid_over(&seeing(true)), Laid::Unmoved);
     }
 
     #[test]

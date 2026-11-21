@@ -4,8 +4,8 @@
 
 use super::facts;
 use crate::{
+    engine::view::Role,
     store::{MemoryStore, WorkersStore},
-    view::Role,
 };
 
 #[test]

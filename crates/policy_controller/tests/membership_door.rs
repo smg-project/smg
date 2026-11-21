@@ -41,11 +41,13 @@ use net::{http_get, loopback};
 use openai_protocol::worker::RuntimeType;
 use replicas::{Lease, Record, Replica};
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, Listener, Scope, State, SERVICE_NAME},
-    elector::ElectionSettings,
-    proto::{
-        self, policy_controller_client::PolicyControllerClient, register_worker_request::Mode,
-        worker_event::Event,
+    service::{
+        controller::{Config, Controller, Election, Listener, Scope, State, SERVICE_NAME},
+        elector::ElectionSettings,
+        proto::{
+            self, policy_controller_client::PolicyControllerClient, register_worker_request::Mode,
+            worker_event::Event,
+        },
     },
     store::{WorkerStatus, WorkersStore},
 };
@@ -394,7 +396,7 @@ async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_g
 
     // A registration the store cannot hold whole is refused by its path.
     let wide = proto::WorkerSpec {
-        dp_size: 2,
+        dp_size: 65,
         ..spec(&phantom(9))
     };
     let refused = operator
@@ -644,6 +646,25 @@ async fn the_store_holds_the_rows_the_door_answered() {
             rows.iter().map(|row| row.status).collect::<Vec<_>>(),
             [WorkerStatus::Pending, WorkerStatus::Ready]
         );
+
+        // A registration that states two ranks is answered a row a rank.
+        let ranked = proto::WorkerSpec {
+            dp_size: 2,
+            ..spec("http://127.0.0.1:9/c")
+        };
+        let ranks = operator
+            .register_worker(stated(ask(ranked, Mode::Add)))
+            .await
+            .expect("registered")
+            .into_inner();
+        let Some(Event::Ranks(answer)) = ranks.event else {
+            panic!("no ranks in {ranks:?}");
+        };
+        assert_eq!(answer.rows.len(), 2);
+        for rank in 0..2 {
+            let url = format!("http://127.0.0.1:9/c@{rank}");
+            assert!(store.by_key(&url).is_some(), "{url}");
+        }
 
         // A removal through the door leaves the store without the row.
         let removal = proto::DeregisterWorkerRequest {

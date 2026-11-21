@@ -60,7 +60,7 @@ use criterion::{
 #[cfg(feature = "worker-host")]
 use smg_policy_controller::worker_host::{Members, Objects};
 use smg_policy_controller::{
-    replication::Log,
+    service::replication::Log,
     store::{
         Ask, GatewayId, Kinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position,
         ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
@@ -302,6 +302,7 @@ fn view_build(c: &mut Criterion) {
                 now: pool.opened + Duration::from_secs(1),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut out = ViewBuffers::default();
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {

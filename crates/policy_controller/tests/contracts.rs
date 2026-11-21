@@ -25,10 +25,10 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
-    Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
-    Pair, Phase, PolicySpec, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason,
-    Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    document::spec::DENIED_HEADERS, fingerprint, AffinityFacts, Candidate, Constraints, HashKind,
+    Health, Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome,
+    OverloadRegime, Pair, Phase, PolicySpec, PoolFacts, Queue, ReleaseReason, RequestFacts, Role,
+    Shed, ShedReason, Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -655,7 +655,6 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "named",
                 "model_fingerprint",
                 "signal_cells",
-                "client_key",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -678,6 +677,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("seed", Type::Fixed64),
                 ("prompt_text", Type::Bytes),
                 ("block_size", Type::Uint32),
+                ("client_key", Type::Fixed64),
             ],
             repeated: &["block_hashes", "tried", "headers"],
             optional: &[],
@@ -1107,7 +1107,14 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "relabelled",
             "needs",
             "snapshot_required",
+            "ranks",
         ],
+    ),
+    (
+        CONTROLLER_PROTO,
+        "RankRow",
+        "made",
+        &["registered", "replaced", "removed", "relabelled"],
     ),
     (
         CONTROLLER_PROTO,
@@ -1814,6 +1821,53 @@ fn the_watch_workers_resume_fields_are_pinned() {
             .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
             .collect();
         assert_eq!(found, expected, "{message_name}: a resume field moved");
+    }
+}
+
+/// What a gateway says to ask a pair's decode after its prefill, by name
+/// and number: the word on the pair's first request, and the lease whose
+/// decode side a later request asks.
+const DECODE_CALL_FIELDS: &[ResumeField] = &[
+    ("decode_later", 5, Type::Bool),
+    ("decode_of", 6, Type::Fixed64),
+];
+
+/// Why a decode call is refused, by name and number.
+const DECODE_CALL_REASONS: &[(&str, i32)] = &[
+    ("REASON_DECODE_NO_LEASE", 5),
+    ("REASON_DECODE_NOT_CHOSEN", 6),
+    ("REASON_DECODE_PREFILL_NOT_HELD", 7),
+    ("REASON_DECODE_STANDS", 8),
+];
+
+#[test]
+fn the_decode_call_fields_and_reasons_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let request = message(controller, "DecideRequest").expect("the request is a message");
+    let pinned = |name: &str| {
+        DECODE_CALL_FIELDS
+            .iter()
+            .any(|(field, _, _)| *field == name)
+    };
+    let found: Vec<(String, i32, Type, bool)> = fields(request)
+        .into_iter()
+        .filter(|(name, _, _, _, _)| pinned(name))
+        .map(|(name, number, kind, _, optional)| (name, number, kind, optional))
+        .collect();
+    // The lease's id is optional: its presence tells a call from a pair's
+    // first request.
+    let expected: Vec<(String, i32, Type, bool)> = DECODE_CALL_FIELDS
+        .iter()
+        .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind, *name == "decode_of"))
+        .collect();
+    assert_eq!(found, expected, "a decode call's field moved");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let reasons = enum_values(plugin, "Busy.Reason").expect("the reasons are an enum");
+    for (name, number) in DECODE_CALL_REASONS {
+        let reason = ((*name).to_owned(), *number);
+        assert!(reasons.contains(&reason), "{name} moved");
     }
 }
 

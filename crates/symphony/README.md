@@ -189,8 +189,9 @@ runs every target for a bounded time.
 Symphony's target is every checkpoint group bellwether has a manifest for; a group is the
 checkpoints that share a tokenizer and a template, recorded once by its primary. The table below
 lists the groups bellwether has recorded, and the groups it listed before bellwether's manifests
-outgrew it; it is written from `tests/readme.rs` and checked by `cargo test`, so it says what this
-branch holds, and a stale table fails the build. It runs newest first: **Released** is the day the
+outgrew it; its rows are edited by hand, and `tests/readme.rs` checks them against the registry on
+`cargo test`, so it says what this branch holds: a row that differs from the registry fails the
+build. It runs newest first: **Released** is the day the
 primary's Hugging Face repository was created. The registry behind `formats::for_model` keeps its
 groups as data, `src/formats/groups.json` (one group per line: the table, the group's own turn
 opener and its own text after the thought's close where its template differs from the table's;
@@ -327,6 +328,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-08-05 | [qwen3.8-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-27b) | Qwen/Qwen3.8-27B | JetBrains/Qwen3.8-3.6-27B-blend | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-02 | [ling-3.0-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/ling-3.0-flash) | inclusionAI/Ling-3.0-flash | Ling-3.0-flash-fp4, Ling-3.0-flash-Sante | `ling` | 589,298 | replaying the set | none |
 | 2026-08-01 | [nvidia-nemotron-3.5-lightning-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-lightning-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
+| 2026-07-31 | [deepseek-v4-flash-0731](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash-0731) | deepseek-ai/DeepSeek-V4-Flash-0731 |  | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
 | 2026-07-23 | [arex-base](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-base) | BAAI/AREX-Base |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
 | 2026-07-23 | [arex-turbo](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-turbo) | BAAI/AREX-Turbo |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
 | 2026-07-21 | [nanbeige4.2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.2-3b) | Nanbeige/Nanbeige4.2-3B |  | `qwen3`, tagged calls | 589,310 | replaying the set | none |

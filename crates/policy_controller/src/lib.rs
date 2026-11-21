@@ -10,22 +10,24 @@
 //! contracts, field for field, so a plugin host needs no second definition.
 //! Section by section:
 //!
-//! - 4.1, the view ([`view`]): [`RequestFacts`], [`Candidate`] rows with their
+//! - 4.1, the view ([`engine::view`]): [`RequestFacts`], [`Candidate`] rows with their
 //!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
 //!   and [`PoolFacts`]. Built once per decision by the host into a reused
 //!   buffer; no handle, no callback into the host. The values a report
 //!   states under a name the document declares stand beside the rows too
-//!   ([`signals`]): a stage reads one by its [`SignalColumn`].
-//! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
+//!   ([`load::signals`]): a stage reads one by its [`SignalColumn`].
+//! - 4.2, the decision ([`engine::decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
 //!   issues one yet). A decision books nothing by itself: its door files
 //!   the pick's lease at the issue, which books the first target, and the
-//!   host reports the lifecycle back.
-//! - 4.3, the lifecycle ([`lease`]): the [`Lease`] a decision carries and the
+//!   host reports the lifecycle back. One issue books another target: a
+//!   pair's decode asked for later and sent with no decode call is issued
+//!   at its dispatch, on the target that dispatch took.
+//! - 4.3, the lifecycle ([`tracking::lease`]): the [`Lease`] a decision carries and the
 //!   [`Lifecycle`] hooks a stateful stage learns from (issued, dispatched,
 //!   completed, released, membership, signal).
-//! - 4.4, the framework ([`framework`]): a [`Profile`] runs [`Filter`]s,
+//! - 4.4, the framework ([`engine::framework`]): a [`Profile`] runs [`Filter`]s,
 //!   weighted [`Scorer`]s and one [`Picker`]; a [`Plan`] sequences profiles for
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
@@ -33,14 +35,14 @@
 //!   prefixes sent to a model's workers without cache events are kept by
 //!   the sent-prefix predictor ([`predictor`]). A profile that reads sent
 //!   prefixes reads that record at the naming through the in-process door.
-//! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
+//! - 4.5, the stages in code ([`stages::catalog`]): the [`Catalog`] of the stages a
 //!   build knows by name, the stock build's and the ones a host registers.
 //!   A document names either kind the same way, and the validator resolves
 //!   every name once ([`PolicySpec::validate_in`]).
-//! - 4.6, the schema ([`spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
+//! - 4.6, the schema ([`document::spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists. A binding names where a request's
-//!   routing key comes from, and one function derives it ([`routing_key`]).
+//!   routing key comes from, and one function derives it ([`document::routing_key`]).
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
 //!   which the controller's store is fed (membership, health, loads, KV
@@ -53,11 +55,11 @@
 //!   ([`store::World`]: every pool as whole candidate rows) and builds one
 //!   decision's view from it through no lock; the service that calls the
 //!   build is a later step.
-//! - 10, the election ([`elector`]): one [`elector::Elector`] over a
-//!   [`elector::LeaseBackend`] (the lease file and the in-process record
+//! - 10, the election ([`service::elector`]): one [`service::elector::Elector`] over a
+//!   [`service::elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
-//!   [`elector::Fence`] a shard thread reads before every decision it sends.
-//! - 5.4, replication ([`replication`]): the log of the store's replicated
+//!   [`service::elector::Fence`] a shard thread reads before every decision it sends.
+//! - 5.4, replication ([`service::replication`]): the log of the store's replicated
 //!   writes (membership and status, load rows, a term's start), each at its
 //!   position under its term, told by the store through
 //!   [`store::Journal`], the watched kinds kept apart from the load
@@ -66,31 +68,31 @@
 //!   ([`store::MemoryStore::cut`]). The stream, the standby and the watch
 //!   are later steps.
 //!
-//! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
+//! - Section 9, the WebAssembly plugin host (the `plugins::wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
 //!   package, one kept instance per decider, every call under fuel,
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
-//!   `plugins` module.
+//!   `plugins::shared` module.
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
 //!   the metrics parser. The load driver and the worker host's load adapter
 //!   share the `load_report` conversion.
 //!
-//! - Behind the `operator` feature, `operator::SpecDoor` applies a
+//! - Behind the `operator` feature, `document::operator::SpecDoor` applies a
 //!   host's start document and serves its status, document and dry run.
 //!   The feature also serves worker snapshots over the host's store.
-//! - The door ([`door`]): the order of one decision's calls, written once
-//!   for every host. A host that embeds the engine asks [`door::Door`],
+//! - The door ([`engine::door`]): the order of one decision's calls, written once
+//!   for every host. A host that embeds the engine asks [`engine::door::Door`],
 //!   which runs the order on the caller's thread over a
 //!   [`store::MemoryStore`]: the lease is filed at the issue, the host says
-//!   what became of it ([`door::Door::report`]), itself or through a
-//!   handle, and its timer calls the door's clock ([`door::Door::sweep`]).
+//!   what became of it ([`engine::door::Door::report`]), itself or through a
+//!   handle, and its timer calls the door's clock ([`engine::door::Door::sweep`]).
 //!   The standalone controller runs the same order on its deciders'
 //!   threads.
-//! - The handle ([`handle`]): one decision held until its request ends.
-//!   A host that holds a [`handle::Handle`] says the target it took, the
+//! - The handle ([`tracking::handle`]): one decision held until its request ends.
+//!   A host that holds a [`tracking::handle::Handle`] says the target it took, the
 //!   dispatch, and the completion or the release. The handle reports to
 //!   the in-process door or, with the `client` feature, over a link.
 //! - Behind the `controller` feature, the standalone controller
@@ -99,9 +101,9 @@
 //!   the load driver over the store. The stock binary also requires the
 //!   `worker-host` feature so it can read cache events.
 //! - Behind the `client` feature, the gateway's side of the controller's
-//!   protocol (`client`). The reference client (`client::Client`) asks
+//!   protocol (`client`). The reference client (`service::client::Client`) asks
 //!   one request at a time, reports its lifecycle and watches workers'
-//!   rows, with a blocking form. A host's requests share `client::Link`
+//!   rows, with a blocking form. A host's requests share `service::client::Link`
 //!   for concurrent asks on one decide stream and reports on one session.
 //! - Behind the same feature, the watcher (`watcher`): a gateway's copy of
 //!   the controller's workers. It takes the watch's events in their order
@@ -128,86 +130,63 @@
 mod address;
 pub mod affinity;
 pub mod bucket;
-pub mod builtins;
-pub mod catalog;
-#[cfg(feature = "client")]
-pub mod client;
-#[cfg(feature = "controller")]
-pub mod controller;
-pub mod counts;
-pub mod decider;
-pub mod decision;
-pub mod demands;
-pub mod door;
-pub mod elector;
-pub mod framework;
-#[cfg(feature = "controller")]
-pub mod grpc;
-pub mod handle;
-#[cfg(feature = "ingest")]
-pub mod ingest;
-pub mod lease;
-#[cfg(any(feature = "ingest", feature = "worker-host"))]
-pub mod load_report;
-#[cfg(feature = "operator")]
-pub mod operator;
-#[cfg(any(feature = "wasm", feature = "controller"))]
+pub mod document;
+pub mod engine;
+pub mod load;
 pub mod plugins;
 pub mod predictor;
-#[cfg(feature = "controller")]
-pub mod proto;
-pub mod replication;
-pub mod reports;
 pub mod ring;
-pub mod routing_key;
-pub mod sent;
+pub mod service;
 pub mod sessions;
-pub mod signals;
-pub mod spec;
+pub mod stages;
 pub mod store;
-mod terms;
-pub mod view;
-#[cfg(feature = "wasm")]
-pub mod wasm;
-#[cfg(feature = "client")]
-pub mod watcher;
-pub mod wit;
+pub mod tracking;
 #[cfg(feature = "worker-host")]
 pub mod worker_host;
 
-pub use catalog::{Catalog, CatalogError, StageBuild, StageError, StageKind};
-pub use counts::{KeptCounts, LentCounts};
-pub use decision::{
-    Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
-    Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+pub use document::{
+    routing_key::{DerivedKey, KeySource, KeySources},
+    spec::{
+        AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION,
+        PRESETS,
+    },
 };
-pub use demands::{DemandFacts, Demands};
-pub use door::{DecisionRecord, Explained, Names};
-pub use framework::{
-    Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
-    Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
-    Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
+pub use engine::{
+    decision::{
+        Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
+        Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    },
+    demands::{DemandFacts, Demands, References, Unmet},
+    door::{DecisionRecord, Explained, Names},
+    framework::{
+        Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine,
+        Filter, Front, Narrowed, PairPools, PairSide, PairTable, PairTableError, Picker, Plan,
+        Profile, Scorer, Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM,
+        RANK_FROM,
+    },
+    view::{
+        fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
+        Identity, KeyedRow, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder,
+        OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource,
+        WireModes, WorkerId, ZoneCapacity,
+    },
 };
-pub use lease::{
-    EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
-    Side, Signal, TransportClass,
+pub use load::{
+    reports::{ReportReads, Reports},
+    signals::{SignalCell, SignalCells, SignalColumn},
 };
-pub use reports::{ReportReads, Reports};
 pub use ring::{ConsistentHash, Ring};
-pub use routing_key::{DerivedKey, KeySource, KeySources};
-pub use sent::{Sent, SentCredit};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };
-pub use signals::{SignalCell, SignalCells, SignalColumn};
-pub use spec::{
-    AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
-};
-pub use view::{
-    fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
-    Identity, KeyedRow, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder,
-    OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource,
-    WireModes, WorkerId, ZoneCapacity,
+pub use stages::catalog::{Catalog, CatalogError, StageBuild, StageError, StageKind};
+pub use tracking::{
+    counts::{KeptCounts, LentCounts},
+    lease::{
+        EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome,
+        ReleaseReason, Side, Signal, TransportClass,
+    },
+    sent::{Sent, SentCounts, SentCredit},
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
@@ -232,7 +211,11 @@ pub use view::{
 ///   decision's rows and cuts a list at the profile's sample, the holders'
 ///   draw and the warming rows' draw;
 /// - the first value of the holders' stream, and of each stream so seeded:
-///   the seed of each lookup a naming makes again, a stream a round.
+///   the seed of each lookup a naming makes again, a stream a round;
+/// - the first value of the seed under the store's mask for refused
+///   holders, and of each stream so seeded: the seed of each lookup a
+///   naming makes again past a cap of holders the pass refused, a stream a
+///   round.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

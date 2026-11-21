@@ -21,23 +21,26 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use smg_policy_controller::{
-    controller::{
-        Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, State, Tls,
-        TlsError, SERVICE_NAME,
-    },
-    elector::{ElectionSettings, FileLease, LeaseBackend},
-    lease::{Lease, LeaseId},
-    proto::{
-        busy, controller_frame, decide_answer, decision, gateway_frame,
-        policy_controller_client::PolicyControllerClient, Credit, DecideRequest, Decision,
-        GatewayFrame, GetPolicySpecRequest, Hello, LeaderRequest, RequestFacts,
-        WatchWorkersRequest,
+    engine::view::{fingerprint, LoadRow, Role, WorkerId},
+    service::{
+        controller::{
+            Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, State,
+            Tls, TlsError, SERVICE_NAME,
+        },
+        elector::{ElectionSettings, FileLease, LeaseBackend},
+        proto,
+        proto::{
+            busy, controller_frame, decide_answer, decision, gateway_frame,
+            policy_controller_client::PolicyControllerClient, Credit, DecideRequest, Decision,
+            GatewayFrame, GetPolicySpecRequest, Hello, LeaderRequest, RequestFacts,
+            WatchWorkersRequest,
+        },
     },
     store::{
         GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, Picked, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
-    view::{fingerprint, LoadRow, Role, WorkerId},
+    tracking::lease::{Lease, LeaseId},
     AppliedSpec, PolicySpec,
 };
 use tokio::{
@@ -219,7 +222,7 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
 
 /// `message` as a call that states `name`, or states none.
 fn stating<T>(name: Option<&'static str>, message: T) -> Request<T> {
-    use smg_policy_controller::controller::PRINCIPAL_ENTRY;
+    use smg_policy_controller::service::controller::PRINCIPAL_ENTRY;
 
     let mut request = Request::new(message);
     if let Some(name) = name {
@@ -696,6 +699,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                     }),
                     constraints: None,
                     again: false,
+                    ..Default::default()
                 })
                 .await
                 .expect("the stream takes the request");
@@ -741,6 +745,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                 }),
                 constraints: None,
                 again: false,
+                ..Default::default()
             })
             .await
             .expect("the stream takes the request");
@@ -779,7 +784,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
 /// the loop's own case, under paused time.
 #[tokio::test]
 async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
-    use smg_policy_controller::proto::{
+    use smg_policy_controller::service::proto::{
         register_worker_request::Mode, worker_event::Event, RegisterWorkerRequest, WireMode,
         WorkerSpec,
     };
@@ -860,7 +865,7 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
             spec: Some(WorkerSpec {
                 url: "http://w.fleet:8000".to_owned(),
                 wire: WireMode::Grpc as i32,
-                role: smg_policy_controller::proto::Role::Single as i32,
+                role: proto::Role::Single as i32,
                 models: vec![MODEL.to_owned()],
                 ..WorkerSpec::default()
             }),
@@ -895,6 +900,7 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
                     }),
                     constraints: None,
                     again: false,
+                    ..Default::default()
                 })
                 .await
                 .expect("the stream takes the request");
@@ -1008,6 +1014,7 @@ async fn a_drain_ends_the_open_decide_streams_and_returns_inside_its_grace_perio
                 }),
                 constraints: None,
                 again: false,
+                ..Default::default()
             })
             .await
             .expect("the stream takes the request");
@@ -1494,7 +1501,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
     use std::sync::{Arc, Mutex};
 
     use smg_policy_controller::{
-        proto::{Dispatched, Side},
+        service::proto::{Dispatched, Side},
         Candidate, Catalog, Lifecycle, Scorer, Sent, SentCredit, TieBand, API_VERSION,
     };
 
@@ -1645,6 +1652,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
                             }),
                             constraints: None,
                             again: false,
+                            ..Default::default()
                         })
                         .await
                         .expect("a request");

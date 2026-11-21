@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import pkgutil
+import re
 from array import array
 from typing import Any
 
@@ -113,8 +114,9 @@ def attributes_grammar_aborts() -> bool:
     return active() or os.environ.get(GRAMMAR_ATTRIBUTION_ENV, "").strip() not in ("", "0")
 
 
-# Diagnostic only: no token text, image bytes, tensor transfers or extra requests.
-_QWENVL_TRACE_SLOTS = iter(range(12))
+# Diagnostic only: correlated public CI requests; no GPU transfers or extra requests.
+_QWENVL_TRACE_SLOTS = iter(range(40))
+_QWENVL_OUTPUTS = {}
 
 
 def _trace_qwenvl(event, scheduler=None, req=None, **facts):
@@ -122,6 +124,15 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
         return
     try:
         if req is not None:
+            rid = getattr(req, "rid", None)
+            match = (
+                re.match(r"^(smg-qwenvl-[0-9a-f]{32})(?:-|$)", rid)
+                if isinstance(rid, str) and len(rid) <= 512
+                else None
+            )
+            if match is None:
+                return
+            facts["client_trace_id"] = match.group(1)
             model = getattr(getattr(scheduler, "server_args", None), "model_path", None)
             mm = getattr(req, "multimodal_inputs", None)
             canonical = "Qwen/Qwen3-VL-8B-Instruct"
@@ -150,7 +161,7 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                     result["hash_omitted_over_32768"] = True
                 return result
 
-            def tensor_metadata(value):
+            def tensor_metadata(value, *, integer_values=False):
                 if value is None:
                     return None
                 if type(value) is int:
@@ -161,12 +172,25 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                     )
                 dims = getattr(value, "shape", None)
                 device = getattr(getattr(value, "device", None), "type", None)
-                return {
+                result = {
                     "shape": [dim if type(dim) is int else None for dim in dims]
                     if isinstance(dims, (list, tuple)) and len(dims) <= 8
                     else None,
                     "device_type": device if device in ("cpu", "cuda", "meta") else None,
+                    "dtype": str(getattr(value, "dtype", ""))[:32],
                 }
+                # Only small CPU integer metadata; never .cpu(), numpy or feature copies.
+                if integer_values:
+                    result["values_status"] = "OMITTED_NOT_SMALL_CPU_INTEGER"
+                    if (
+                        device == "cpu"
+                        and result["dtype"] in ("torch.int32", "torch.int64")
+                        and value.numel() <= 4096
+                    ):
+                        values = value.reshape(-1).tolist()
+                        summary = ids(values)
+                        result.update(values_status="CAPTURED", values=summary, first12=values[:12])
+                return result
 
             def item_metadata(item):
                 modality = getattr(getattr(item, "modality", None), "name", None)
@@ -175,7 +199,9 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                     "modality": modality if modality in ("IMAGE", "VIDEO", "AUDIO") else None,
                     "model_specific_data_is_dict": isinstance(data, dict),
                     "image_grid_thw_present": isinstance(data, dict) and "image_grid_thw" in data,
-                    "image_grid_thw": tensor_metadata(data.get("image_grid_thw"))
+                    "image_grid_thw": tensor_metadata(
+                        data.get("image_grid_thw"), integer_values=True
+                    )
                     if isinstance(data, dict)
                     else None,
                     "feature": tensor_metadata(getattr(item, "feature", None)),
@@ -185,7 +211,20 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
             unpadded = ids(getattr(req, "origin_input_ids_unpadded", None))
             items = getattr(mm, "mm_items", None)
             rid = getattr(req, "rid", None)
+            processor = getattr(scheduler, "_mm_processor", None)
+            config = getattr(processor, "config", None)
+            revision = getattr(config, "_commit_hash", None)
             facts.update(
+                mrope_processor_class=(
+                    type(processor).__module__ + "." + type(processor).__qualname__
+                )[:192]
+                if processor is not None
+                else None,
+                mrope_processor_config_commit=revision[:128] if isinstance(revision, str) else None,
+                processor_revision_scope=(
+                    "Direct live mrope processor config only; "
+                    "None means unavailable, not cached-snapshot proof"
+                ),
                 request_id_sha256=hashlib.sha256(rid.encode()).hexdigest()
                 if isinstance(rid, str) and len(rid) <= 512
                 else None,
@@ -200,14 +239,59 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                 if isinstance(items, (list, tuple))
                 else None,
                 mm_items_summary_truncated=isinstance(items, (list, tuple)) and len(items) > 4,
-                mrope_positions=tensor_metadata(getattr(mm, "mrope_positions", None)),
-                mrope_position_delta=tensor_metadata(getattr(mm, "mrope_position_delta", None)),
+                mrope_positions=tensor_metadata(
+                    getattr(mm, "mrope_positions", None), integer_values=True
+                ),
+                mrope_position_delta=tensor_metadata(
+                    getattr(mm, "mrope_position_delta", None), integer_values=True
+                ),
             )
         record = json.dumps({"event": event, "slot": slot, **facts}, sort_keys=True)
-        if len(record) <= 4096:
+        if len(record) <= 8192:
             logger.warning("SMG_QWENVL_REQUEST_DIAGNOSTIC %s", record)
     except Exception:
         # Diagnostic metadata must not change engine success/failure semantics.
+        return
+
+
+def trace_qwenvl_output(output):
+    """Observe the existing emitted token rows; bounded12 requests/512 IDs each."""
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    try:
+        for index in range(min(len(output.rids), 16)):
+            rid = output.rids[index]
+            match = (
+                re.match(r"^(smg-qwenvl-[0-9a-f]{32})(?:-|$)", rid)
+                if isinstance(rid, str) and len(rid) <= 512
+                else None
+            )
+            if match is None:
+                continue
+            if rid not in _QWENVL_OUTPUTS and len(_QWENVL_OUTPUTS) >= 12:
+                continue
+            row = output.output_ids[index]
+            if not isinstance(row, list) or not all(
+                type(v) is int and 0 <= v < 2**63 for v in row[:513]
+            ):
+                continue
+            tokens, truncated = _QWENVL_OUTPUTS.get(rid, ([], False))
+            room = 512 - len(tokens)
+            truncated = truncated or len(row) > room
+            tokens.extend(row[:room])
+            _QWENVL_OUTPUTS[rid] = (tokens, truncated)
+            reason = output.finished_reasons[index]
+            if reason:
+                del _QWENVL_OUTPUTS[rid]
+                _trace_qwenvl(
+                    "output",
+                    client_trace_id=match.group(1),
+                    request_id_sha256=hashlib.sha256(rid.encode()).hexdigest(),
+                    emitted_token_ids=tokens,
+                    truncated=truncated,
+                    finish_reason=reason if reason in ("stop", "length", "abort") else "other",
+                )
+    except Exception:
         return
 
 
