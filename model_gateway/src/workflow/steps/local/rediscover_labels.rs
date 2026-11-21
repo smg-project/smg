@@ -8,8 +8,6 @@
 //! engine) are handed to the update step, which rebuilds the worker only
 //! when they change anything. Without a refresh request the step is skipped.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use smg_worker::{
     identity::basic::ConnectionMode,
@@ -69,14 +67,16 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
             };
             // The seed is the worker's record, kept in rank space
             // (`report_for_rank`); the update step passes the report
-            // through that rule again, which is the identity here only
-            // because the record holds neither a running-window label
-            // (`WINDOW_LABELS`) nor a width (`DP_WIDTH_LABELS`): sampling
-            // defaults, the grammar start and the context window, which no
-            // rank shares. A record that gains a running window needs a
-            // report read in engine space instead.
-            let mut fresh = HashMap::clone(&worker.metadata().discovered_labels);
-            fresh.extend(zmq_client::link_labels(client));
+            // through that rule again. That is the identity for what the
+            // record holds besides the link's own labels: sampling defaults
+            // and the grammar start, which no rank shares. The link's labels
+            // replace the record's in engine space: the context window, and
+            // a TokenSpeed group's running window with the width its ranks
+            // share it by (`refreshed_labels`).
+            let fresh = zmq_client::refreshed_labels(
+                &worker.metadata().discovered_labels,
+                zmq_client::link_labels(client),
+            );
             debug!(
                 worker_url = %worker.redacted_url(),
                 labels = fresh.len(),
@@ -127,7 +127,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
     use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker};
