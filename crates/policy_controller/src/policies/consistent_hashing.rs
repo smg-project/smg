@@ -20,7 +20,9 @@
 //!
 //! A host that keeps its workers in lists of its own can hold the ring of
 //! one list as a value of its own ([`PoolRing`]): the same positions for the
-//! same members, built once and never changed.
+//! same members, built once and never changed. It lends that ring to each
+//! decision of the list ([`RequestFacts::ring`]), and the scorer then reads
+//! it in place of its own, with no lock.
 //!
 //! The key is the decision's session key: an encode item's content hash under
 //! the `epd` plan, the request's routing key elsewhere. One ring serves every
@@ -525,16 +527,49 @@ impl Ring {
 
     /// Walk clockwise from the key's position, showing `visit` each entry's
     /// member until it takes one or stops; the walk goes once around.
-    pub fn walk<T>(&self, key: u64, mut visit: impl FnMut(u32) -> WalkStep<T>) -> Option<T> {
-        for member in self.around(key) {
-            match visit(member) {
-                WalkStep::Take(value) => return Some(value),
-                WalkStep::Skip => {}
-                WalkStep::Stop => return None,
-            }
-        }
-        None
+    pub fn walk<T>(&self, key: u64, visit: impl FnMut(u32) -> WalkStep<T>) -> Option<T> {
+        walk(self.around(key), visit)
     }
+}
+
+/// A ring a decision's walk goes round: the scorer's own, whose members are
+/// named by their place among its members, or the ring of one list a host
+/// lent, whose members are named by their rows' places in the list.
+trait Around {
+    /// The members at the ring's positions clockwise from the key's, once
+    /// around.
+    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_;
+}
+
+impl Around for Ring {
+    #[inline(always)]
+    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
+        Ring::around(self, key)
+    }
+}
+
+impl Around for PoolRing {
+    #[inline(always)]
+    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
+        PoolRing::around(self, key)
+    }
+}
+
+/// The walk of a ring: `visit` is shown each of `members` in turn until it
+/// takes one or stops.
+#[inline(always)]
+fn walk<T>(
+    members: impl Iterator<Item = u32>,
+    mut visit: impl FnMut(u32) -> WalkStep<T>,
+) -> Option<T> {
+    for member in members {
+        match visit(member) {
+            WalkStep::Take(value) => return Some(value),
+            WalkStep::Skip => {}
+            WalkStep::Stop => return None,
+        }
+    }
+    None
 }
 
 thread_local! {
@@ -606,6 +641,12 @@ impl Iterator for Keys<'_> {
 /// The owner must be among the rows scored, so the scorer answers for the
 /// pool whole and never row by row ([`Scorer::row_wise`]): a profile that
 /// names it runs its whole pass, with no rows drawn first and no sample.
+///
+/// The ring is the scorer's own, behind a lock its decisions share, unless
+/// the request's host lent the ring of the list the candidates are
+/// ([`RequestFacts::ring`], [`PoolRing`]). A decision under a lent ring
+/// reads that ring alone: it takes no lock, and the scorer's own ring
+/// holds no member for it and learns none. Both rings place a key alike.
 #[derive(Debug)]
 pub struct ConsistentHash {
     /// `(factor, abs_margin)` of the bounded-load rule, when the spec writes
@@ -661,14 +702,14 @@ impl ConsistentHash {
     /// `bound`. `slots` is as [`Self::fill`] left it.
     fn passed_over(
         facts: &RequestFacts<'_>,
-        ring: &Ring,
+        ring: &impl Around,
         key: u64,
         candidates: &[Candidate],
         kept: &[u32],
         slots: &[u32],
         bound: f64,
     ) -> bool {
-        ring.walk(key, |member| match slots[member as usize] {
+        walk(ring.around(key), |member| match slots[member as usize] {
             FREE => WalkStep::Skip,
             slot => {
                 let owner = &candidates[kept[slot as usize] as usize];
@@ -728,9 +769,9 @@ impl ConsistentHash {
     /// One walk from the key: the members that are survivors are ranked in
     /// ring order into `out`, the owner at `1.0` and each next member a step
     /// below, at most [`MAX_TARGETS`] of them.
-    fn rank(ring: &Ring, key: u64, survivors: usize, slots: &mut [u32], out: &mut [f32]) {
+    fn rank(ring: &impl Around, key: u64, survivors: usize, slots: &mut [u32], out: &mut [f32]) {
         let mut found = 0usize;
-        ring.walk(key, |member| {
+        walk(ring.around(key), |member| {
             let slot = slots[member as usize];
             if slot == FREE || slot & TAKEN != 0 {
                 return WalkStep::Skip;
@@ -744,6 +785,66 @@ impl ConsistentHash {
                 WalkStep::Skip
             }
         });
+    }
+}
+
+impl ConsistentHash {
+    /// The scores of a decision whose `slots` are filled, by `ring`: the
+    /// first of the decision's keys whose owner keeps it under the
+    /// bounded-load rule, with no rule the first, and that key's walk
+    /// ranked ([`Self::rank`]). One body for the scorer's own ring and for
+    /// a ring its host lent: built once for each, in the decision's path.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the scorer's inputs, with the ring, the slots and the keys still to try"
+    )]
+    #[inline(always)]
+    fn rank_by(
+        &self,
+        facts: &RequestFacts<'_>,
+        ring: &impl Around,
+        candidates: &[Candidate],
+        kept: &[u32],
+        slots: &mut [u32],
+        first: u64,
+        keys: &mut Option<Keys<'_>>,
+        out: &mut [f32],
+    ) {
+        let bound = self.bounded.map(|(factor, margin)| {
+            // Both margins over the mean, the request being placed
+            // counted in it: the larger of the two is the bound. The
+            // product is taken as written, in 64-bit floats: an owner
+            // at the bound's edge stands or falls by its last bit.
+            let total: u64 = with_counts!(facts, |counts| kept
+                .iter()
+                .map(|&k| u64::from(counts(&candidates[k as usize])))
+                .sum());
+            let mean = (total as f64 + 1.0) / kept.len() as f64;
+            (mean * factor).max(mean + f64::from(margin))
+        });
+        // The first key whose owner keeps it: with no rule, the first.
+        let mut key = Some(first);
+        if let Some(bound) = bound {
+            while let Some(tried) = key {
+                if !Self::passed_over(facts, ring, tried, candidates, kept, slots, bound) {
+                    break;
+                }
+                key = keys.as_mut().and_then(Iterator::next);
+            }
+        }
+        if let Some(key) = key {
+            Self::rank(ring, key, kept.len(), slots, out);
+        }
+    }
+
+    /// The key the scorer places a request by where it places it by itself
+    /// ([`Scorer::own`]), `0` for none. A client's key is the plain ring's:
+    /// the prefix form places a request with no routing key by its prefix.
+    fn own_key(&self, facts: &RequestFacts<'_>) -> u64 {
+        match &self.prefix {
+            Some(_) => facts.session_key.hash,
+            None => facts.ring_key(),
+        }
     }
 }
 
@@ -900,6 +1001,12 @@ impl Scorer for ConsistentHash {
     /// that another pool showed by one read of its mark, as the whole pass
     /// passes it by one slot, so a pool is walked whatever its share of
     /// the ring.
+    ///
+    /// Where the request's host lent the ring of the list the rows are
+    /// ([`RequestFacts::ring`]), the walk is over that ring and takes no
+    /// word of the pool on trust: the ring names a member by its row's
+    /// place, in whatever order the rows stand, and holds no other pool's
+    /// members. This stage's own ring is not read and learns nothing.
     fn own(
         &self,
         facts: &RequestFacts<'_>,
@@ -908,14 +1015,24 @@ impl Scorer for ConsistentHash {
         keep: &mut dyn FnMut(&Candidate) -> bool,
         kept: &mut Vec<u32>,
     ) -> bool {
-        // A client's key is the plain ring's: the prefix form places a
-        // request with no routing key by its prefix.
-        let key = match &self.prefix {
-            Some(_) => facts.session_key.hash,
-            None => facts.ring_key(),
-        };
-        let unsaid = pool.membership_epoch == 0 || pool.engines.is_empty();
-        if key == 0 || unsaid || !self.owns() {
+        let key = self.own_key(facts);
+        if key == 0 || !self.owns() {
+            return false;
+        }
+        // The ring of the list the candidates are, where their host lent
+        // one, names each member by its row's place: no pool is shown to
+        // this stage's own ring, which learns nothing.
+        if let Some(lent) = facts.ring {
+            if lent.len() != candidates.len() {
+                return false;
+            }
+            let mut places = [0; MAX_TARGETS];
+            let by_place = |place: u32| candidates.get(place as usize).is_some_and(&mut *keep);
+            let handed = lent.walk(key, by_place, &mut places);
+            kept.extend_from_slice(&places[..handed]);
+            return handed != 0;
+        }
+        if pool.membership_epoch == 0 || pool.engines.is_empty() {
             return false;
         }
         let (epoch, number) = (pool.membership_epoch, pool.engines.pool());
@@ -941,6 +1058,28 @@ impl Scorer for ConsistentHash {
         }
     }
 
+    /// The walk of [`Self::own`] over the ring the request's host lent
+    /// ([`RequestFacts::ring`]), for a host that reads a row when the walk
+    /// asks about it. The ring names a member by its row's place, so the
+    /// walk reads no row itself. Nothing is placed where no ring is lent,
+    /// where the lent ring is of another length than the pool, or where
+    /// [`Self::own`] would place nothing.
+    fn own_by_place(
+        &self,
+        facts: &RequestFacts<'_>,
+        rows: usize,
+        keep: &mut dyn FnMut(u32) -> bool,
+        out: &mut [u32; MAX_TARGETS],
+    ) -> usize {
+        let key = self.own_key(facts);
+        match facts.ring {
+            Some(lent) if key != 0 && self.owns() && lent.len() == rows => {
+                lent.walk(key, keep, out)
+            }
+            _ => 0,
+        }
+    }
+
     fn score(
         &self,
         facts: &RequestFacts<'_>,
@@ -963,6 +1102,16 @@ impl Scorer for ConsistentHash {
         };
         SLOTS.with(|slots| {
             let mut slots = slots.borrow_mut();
+            // The ring of the list the candidates are, where their host
+            // lent one: read with no lock, and this stage's own ring is
+            // neither read nor taught.
+            if let Some(lent) = facts.ring.filter(|lent| lent.len() == candidates.len()) {
+                lent.fill(kept, &mut slots);
+                self.rank_by(
+                    facts, lent, candidates, kept, &mut slots, first, &mut keys, out,
+                );
+                return;
+            }
             let mut ring = self.ring.read();
             if !Self::fill(&ring, candidates, kept, &mut slots) {
                 // A survivor the feed never named joins at its first
@@ -981,31 +1130,9 @@ impl Scorer for ConsistentHash {
                 ring = self.ring.read();
                 Self::fill(&ring, candidates, kept, &mut slots);
             }
-            let bound = self.bounded.map(|(factor, margin)| {
-                // Both margins over the mean, the request being placed
-                // counted in it: the larger of the two is the bound. The
-                // product is taken as written, in 64-bit floats: an owner
-                // at the bound's edge stands or falls by its last bit.
-                let total: u64 = with_counts!(facts, |counts| kept
-                    .iter()
-                    .map(|&k| u64::from(counts(&candidates[k as usize])))
-                    .sum());
-                let mean = (total as f64 + 1.0) / kept.len() as f64;
-                (mean * factor).max(mean + f64::from(margin))
-            });
-            // The first key whose owner keeps it: with no rule, the first.
-            let mut key = Some(first);
-            if let Some(bound) = bound {
-                while let Some(tried) = key {
-                    if !Self::passed_over(facts, &ring, tried, candidates, kept, &slots, bound) {
-                        break;
-                    }
-                    key = keys.as_mut().and_then(Iterator::next);
-                }
-            }
-            if let Some(key) = key {
-                Self::rank(&ring, key, kept.len(), &mut slots, out);
-            }
+            self.rank_by(
+                facts, &*ring, candidates, kept, &mut slots, first, &mut keys, out,
+            );
         });
         TieBand::NORMALIZED
     }
@@ -2265,5 +2392,220 @@ mod tests {
             assert!(!ring.marks().1, "drop {epoch}");
         }
         assert_eq!(by(&ring, 8), NO_POOL, "a member the snapshot kept");
+    }
+
+    /// A pool in an order of its host's own, as a gateway lists its
+    /// workers: the ids rise and fall along it, each row's stable key is
+    /// its id's low half, and a row holds up to five requests.
+    fn listed(count: u32, shape: u64) -> Vec<Candidate> {
+        let mut draw = Draw::new(shape);
+        (0..count)
+            .map(|position| {
+                let id = draw.next_u64() | 1;
+                Candidate {
+                    id: WorkerId(id),
+                    key: id as u32,
+                    in_flight: draw.below(6) as u32,
+                    ..candidate(position, 0)
+                }
+            })
+            .collect()
+    }
+
+    /// The ring of the list `rows` are.
+    fn ring_of_list(rows: &[Candidate]) -> PoolRing {
+        PoolRing::new(rows.iter().map(|row| (row.id, row.key)))
+    }
+
+    /// The forms of the scorer a document writes: the plain ring, the ring
+    /// under a bounded-load rule tight enough to pass owners over, the
+    /// prefix form, and the prefix form under boundaries and that rule.
+    fn forms() -> [fn() -> ConsistentHash; 4] {
+        [
+            || ConsistentHash::new(None),
+            || bounded(1.0, 1),
+            || prefixed(64),
+            || {
+                levelled(Some(&BoundedLoadParams {
+                    factor: Some(1.0),
+                    abs_margin: Some(1),
+                }))
+            },
+        ]
+    }
+
+    /// A scorer lent the ring of the list its rows are scores them as a
+    /// scorer that learns its own ring does: under every form, over lists
+    /// in an order of the host's own, with the rows kept whole and in part,
+    /// for a session's key, a client's key and a prefix. The scorer under
+    /// the lent ring holds no member of its own at the end.
+    #[test]
+    fn a_lent_ring_scores_the_rows_as_the_scorers_own_ring_does() {
+        let hashes: Vec<u64> = (1..=40).collect();
+        for form in forms() {
+            for (count, shape) in [(1, 1), (3, 2), (8, 3), (64, 4), (200, 5)] {
+                let rows = listed(count, shape);
+                let ring = ring_of_list(&rows);
+                let (own, lent) = (form(), form());
+                let mut draw = Draw::new(shape + 100);
+                for turn in 0..300_u64 {
+                    // Every row kept, or two rows in three.
+                    let kept: Vec<u32> = (0..count)
+                        .filter(|_| turn.is_multiple_of(2) || draw.below(3) != 0)
+                        .collect();
+                    let key = draw.next_u64() | 1;
+                    let request = match turn % 3 {
+                        0 => keyed(key),
+                        1 => RequestFacts {
+                            model: "m",
+                            client_key: key,
+                            ..RequestFacts::default()
+                        },
+                        _ => hashed(&hashes[..=(key % 40) as usize]),
+                    };
+                    let with_ring = RequestFacts {
+                        ring: Some(&ring),
+                        ..request
+                    };
+                    assert_eq!(
+                        scored_among(&lent, &with_ring, &rows, &kept),
+                        scored_among(&own, &request, &rows, &kept),
+                        "turn {turn} over {count} rows"
+                    );
+                }
+                assert!(lent.ring().is_empty(), "{count} rows: no member learned");
+            }
+        }
+    }
+
+    /// Under a lent ring the scorer's own ring holds no member, whatever is
+    /// asked of the scorer: its pass over the rows, its walk over rows
+    /// written for the decision, its walk by place, and the membership's
+    /// words, which find no member to take away. The walks hand out the
+    /// pass's best rows in its order, with the pool's engines listed or
+    /// not. A ring of another list is not the rows', and is not read.
+    #[test]
+    fn a_scorer_under_lent_rings_keeps_no_ring_of_its_own() {
+        let rows = listed(64, 9);
+        let ring = ring_of_list(&rows);
+        let scorer = ConsistentHash::new(None);
+        let facts = RequestFacts {
+            ring: Some(&ring),
+            ..keyed(77)
+        };
+        let kept: Vec<u32> = (0..64).collect();
+        let by_pass = scored_among(&scorer, &facts, &rows, &kept);
+        let best = [1.0, 0.75, 0.5, 0.25];
+        let (places, ends): (Vec<u32>, Vec<u32>) = ((0..64).collect(), (1..=64).collect());
+        for engines in [
+            view::Engines::default(),
+            view::Engines::new(1, &places, &ends),
+        ] {
+            let pool = PoolFacts {
+                membership_epoch: 3,
+                engines,
+                ..PoolFacts::default()
+            };
+            let mut walked = Vec::new();
+            assert!(scorer.own(&facts, &pool, &rows, &mut |_: &Candidate| true, &mut walked));
+            let ranked: Vec<f32> = walked.iter().map(|&row| by_pass[row as usize]).collect();
+            assert_eq!(ranked, best);
+        }
+        let mut walked = [0; MAX_TARGETS];
+        assert_eq!(
+            scorer.own_by_place(&facts, 64, &mut |_| true, &mut walked),
+            MAX_TARGETS
+        );
+        assert_eq!(walked.map(|row| by_pass[row as usize]), best);
+        for word in [
+            Membership::Removed(rows[3].id),
+            Membership::Added(rows[3].id),
+            Membership::Snapshot(&[rows[0].id]),
+        ] {
+            scorer.on_membership(&word);
+        }
+        assert!(
+            scorer.ring().is_empty(),
+            "no member learned, none taken away"
+        );
+
+        // A ring of another list: no walk goes by it, and the pass is the
+        // scorer's own ring's, which learns the rows as it does with no
+        // ring lent, and scores them alike.
+        let other = ring_of_list(&rows[..63]);
+        let astray = RequestFacts {
+            ring: Some(&other),
+            ..keyed(77)
+        };
+        assert_eq!(
+            scorer.own_by_place(&astray, 64, &mut |_| true, &mut walked),
+            0
+        );
+        let unsaid = PoolFacts::default();
+        assert!(!scorer.own(
+            &astray,
+            &unsaid,
+            &rows,
+            &mut |_: &Candidate| true,
+            &mut Vec::new()
+        ));
+        assert!(scorer.ring().is_empty());
+        assert_eq!(scored_among(&scorer, &astray, &rows, &kept), by_pass);
+        assert_eq!(scorer.ring().len(), 64);
+    }
+
+    /// A list where two rows carry one id holds one member twice over. The
+    /// pass gives the member's score to the last of the two that is kept,
+    /// by a lent ring as by the scorer's own, and no walk hands a row out.
+    #[test]
+    fn two_rows_of_one_id_are_scored_alike_by_either_ring() {
+        let mut rows = listed(8, 13);
+        rows.push(Candidate {
+            position: 8,
+            ..rows[2]
+        });
+        let ring = ring_of_list(&rows);
+        assert!(!ring.is_distinct());
+        let sets: [&[u32]; 5] = [
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+            &[0, 1, 2, 3],
+            &[3, 4, 8],
+            &[2, 8],
+            &[8],
+        ];
+        for kept in sets {
+            let (own, lent) = (ConsistentHash::new(None), ConsistentHash::new(None));
+            for key in 1..=200 {
+                let request = keyed(key);
+                let with_ring = RequestFacts {
+                    ring: Some(&ring),
+                    ..request
+                };
+                assert_eq!(
+                    scored_among(&lent, &with_ring, &rows, kept),
+                    scored_among(&own, &request, &rows, kept),
+                    "key {key} over {kept:?}"
+                );
+            }
+            assert!(lent.ring().is_empty());
+        }
+        let facts = RequestFacts {
+            ring: Some(&ring),
+            ..keyed(5)
+        };
+        let mut walked = [0; MAX_TARGETS];
+        let scorer = ConsistentHash::new(None);
+        assert_eq!(
+            scorer.own_by_place(&facts, 9, &mut |_| true, &mut walked),
+            0
+        );
+        let unsaid = PoolFacts::default();
+        assert!(!scorer.own(
+            &facts,
+            &unsaid,
+            &rows,
+            &mut |_: &Candidate| true,
+            &mut Vec::new()
+        ));
     }
 }
