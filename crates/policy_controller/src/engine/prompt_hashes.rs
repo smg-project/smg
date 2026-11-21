@@ -42,18 +42,21 @@ impl HashSeeds {
 /// A stage that reads a cache reads the prompt as block hashes
 /// ([`RequestFacts::block_hashes`]): one hash for each block of the prompt's
 /// token ids, or for each window of its text where the caller holds no token
-/// ids. Three entries compute them, each over the one before it:
+/// ids. Two entries compute them:
 ///
-/// - [`PromptHashes::of_tokens`] and [`PromptHashes::of_text`] hash by the
-///   block size, the depth and the seeds they are handed. They read no
-///   document and no store.
 /// - [`PromptHashes::under_document`] hashes a prompt as a policy document
-///   says. Token ids win over a text. A block is the model's block size of
-///   record, and the document's where the caller has none. The document
-///   bounds how many blocks are hashed ([`AppliedSpec::block_hashes_read`]).
+///   says, and reads no store. Token ids win over a text. A block is the
+///   model's block size of record, and the document's where the caller has
+///   none. The document bounds how many blocks are hashed
+///   ([`AppliedSpec::block_hashes_read`]).
 /// - [`MemoryStore::prompt_hashes`](crate::store::MemoryStore::prompt_hashes)
 ///   does the same for a caller that decides over a store. The block size
 ///   of record and the document in force are the store's.
+///
+/// Both run the same hashing, which takes a block size, a depth and the
+/// seeds and reads neither a document nor a store. It is private: a window
+/// of text is sized by a rule of this crate, which a caller with no
+/// document would have to repeat.
 ///
 /// The caller names the seeds ([`HashSeeds`]). What separates one request's
 /// cache from another's is the caller's own rule.
@@ -73,7 +76,7 @@ impl PromptHashes {
     /// `block_size` tokens, `depth` blocks at most, under
     /// [`HashSeeds::event`]. A prompt that holds no whole block is one
     /// block.
-    pub fn of_tokens(tokens: &[u32], block_size: u32, depth: usize, seeds: HashSeeds) -> Self {
+    fn of_tokens(tokens: &[u32], block_size: u32, depth: usize, seeds: HashSeeds) -> Self {
         let size = block_size as usize;
         let end = tokens.len().min(depth.saturating_mul(size));
         // A prompt under one block is one block of what it has: the
@@ -95,7 +98,7 @@ impl PromptHashes {
     /// window of `window` bytes, `depth` windows at most. The text is hashed
     /// as it stands, under [`HashSeeds::partition`]. No worker hashes text,
     /// so the event seed is not read.
-    pub fn of_text(text: &str, window: u32, depth: usize, seeds: HashSeeds) -> Self {
+    fn of_text(text: &str, window: u32, depth: usize, seeds: HashSeeds) -> Self {
         let bytes = text.as_bytes();
         let size = window as usize;
         let end = bytes.len().min(depth.saturating_mul(size));
