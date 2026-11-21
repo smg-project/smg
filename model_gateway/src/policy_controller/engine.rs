@@ -51,9 +51,9 @@ use smg_policy_controller::{
     engine::{
         Constraints, DecideOutcome, Decision, DecisionEngine, DecisionRefused, EncodeItems,
         EncodePlaced, HashSeeds, HeldDecision, Identity, LiftedVeto, MediaCounts, Pair, Phase,
-        PolicyEngine as OwnEngine, PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind,
-        ShedReason, StoreBackedEngine, SweepOutcome, Targets, Trace, WireModes, WorkerId,
-        WorkerLists, MAX_TARGETS,
+        Plain, PolicyEngine as OwnEngine, PoolMembers, Request, RequestFacts, RequestMaker,
+        ShadowKind, ShedReason, StoreBackedEngine, SweepOutcome, Targets, Trace, WireModes,
+        WorkerId, WorkerLists, MAX_TARGETS,
     },
     store::{pairing::Refusal, GatewayId, MemoryStore, Said},
     tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
@@ -328,6 +328,22 @@ impl RequestMaker for Made<'_, '_> {
         // that decides.
         request.constraints.decode_later = self.ask.decode_later(spec);
         request
+    }
+
+    // An ask states no subset hint, no hard demand and no lifted veto, and
+    // its host writes its standing vetoes into no mask: a first attempt
+    // that names nothing tried or missed and asks no decode again is plain.
+    // The size is the one the request made would state.
+    fn plain(&self) -> Option<Plain> {
+        let ask = self.ask;
+        let first = ask.tried.is_empty() && self.missed.is_empty() && ask.attempt.unwrap_or(0) == 0;
+        (first && !ask.decode_again).then(|| Plain {
+            phase: ask.phase,
+            wires: ask.wires,
+            prompt_tokens: ask.hashes.map_or(ask.prompt_tokens, |hashes| {
+                hashes.prompt_tokens_or(ask.prompt_tokens)
+            }),
+        })
     }
 
     fn workers(&self) -> WorkerLists<'_> {

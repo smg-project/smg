@@ -382,6 +382,15 @@ impl DecisionEngine for PolicyEngine {
         now: Instant,
     ) -> Result<(DecideOutcome, bool), DecisionRefused> {
         self.caught(|| {
+            // A plain request of a place one pick decides is decided ahead
+            // of its making: the pick reads no fact of it.
+            if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
+                let place = single::alone(self, maker.model(), plain, members);
+                let noted = place.and_then(|place| single::noted(self, place, members, plain, now));
+                if let Some(decided) = noted {
+                    return Ok((decided, false));
+                }
+            }
             let mut request = maker.make(&self.spec);
             let later = request.constraints.decode_later;
             let decided = match (request.facts.phase, maker.workers()) {

@@ -39,7 +39,7 @@ use super::{
     store_backed_engine::{
         self, DecideOutcome, DecisionRefused, Request, StoreBackedEngine, SweepOutcome,
     },
-    view::{Session, WireModes},
+    view::{Phase, Session, WireModes},
 };
 use crate::{
     document::AppliedSpec,
@@ -68,6 +68,18 @@ pub trait RequestMaker {
     /// asks the engine again can wait on the seat it holds.
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>;
 
+    /// What the request states where it is plain ([`Plain`]): `None` for
+    /// every other request, and from a maker that does not say.
+    ///
+    /// An engine that decides over its host's lists asks this ahead of
+    /// [`RequestMaker::make`]. A place one pick of a picker decides reads
+    /// no fact of a request, so a plain request of such a place is decided
+    /// with none made: its routing key is not derived and no seed is drawn
+    /// for it. The answer is cheap: it reads the document nowhere.
+    fn plain(&self) -> Option<Plain> {
+        None
+    }
+
     /// The workers the request may be sent to, where its host holds them:
     /// the lists the decision's targets name by position
     /// ([`Target::position`], [`Pair::decode_position`](super::decision::Pair::decode_position)).
@@ -88,6 +100,46 @@ impl RequestMaker for Request<'_> {
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
         *self
     }
+
+    fn plain(&self) -> Option<Plain> {
+        let (facts, cx) = (&self.facts, &self.constraints);
+        let plain = facts.tried.is_empty()
+            && cx.excluded.is_empty()
+            && cx.subset_hint.is_none()
+            && cx.demands.is_none()
+            && !cx.overload_lifted
+            && !cx.decode_later
+            && cx.stalled.is_empty();
+        plain.then_some(Plain {
+            phase: facts.phase,
+            wires: cx.wire_modes,
+            prompt_tokens: facts.prompt_tokens,
+        })
+    }
+}
+
+/// What a plain request states ([`RequestMaker::plain`]): all that a pick
+/// which reads no fact of a request still needs of it.
+///
+/// A request is plain where it is a first attempt that asks nothing beyond
+/// a worker of its list: it names no worker tried or just missed, states no
+/// subset hint, no hard demand and no later decode, lifts no veto, and no
+/// standing veto of its host masks a row.
+///
+/// A lease issued for a plain request that was never made states no
+/// session: no rule of a place picked by its picker alone reads one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plain {
+    /// The request's phase
+    /// ([`RequestFacts::phase`](super::view::RequestFacts::phase)).
+    pub phase: Phase,
+    /// The wires its host dials for it
+    /// ([`Constraints::wire_modes`](super::view::Constraints::wire_modes)).
+    pub wires: WireModes,
+    /// The size of its prompt in tokens, as the request made would state it
+    /// ([`RequestFacts::prompt_tokens`](super::view::RequestFacts::prompt_tokens)):
+    /// a lease issued for it states the size.
+    pub prompt_tokens: u32,
 }
 
 /// The workers a request may be sent to, as its host holds them for one

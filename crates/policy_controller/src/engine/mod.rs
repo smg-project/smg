@@ -36,7 +36,7 @@ pub use decision::{
 };
 #[cfg(feature = "in-process")]
 pub use decision_engine::WorkerLists;
-pub use decision_engine::{DecisionEngine, HeldDecision, RequestMaker};
+pub use decision_engine::{DecisionEngine, HeldDecision, Plain, RequestMaker};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{

@@ -1,18 +1,21 @@
 //! A single request's whole decision in a gateway's own process.
 //!
-//! **The short path, in front.** Where the document decides the request's
-//! place by one pick of its picker ([`Place::Alone`](crate::engine::Place::Alone)),
-//! the decision is that pick: one turn of the list's own rotation and one
-//! read of the worker the turn lands on. It writes no record and takes no
-//! lock. It answers a request's first attempt over a list that holds an
-//! eligible worker where the picker's turns land.
+//! **The short path, in front** ([`alone`]). Where the document decides the
+//! request's place by one pick of its picker
+//! ([`Place::Alone`](crate::engine::Place::Alone)), the decision is that
+//! pick: one turn of the list's own rotation and one read of the worker the
+//! turn lands on. It writes no record and takes no lock. It answers a plain
+//! request ([`Plain`]) over a list that holds an eligible worker where the
+//! picker's turns land, and it reads no fact of a request: the engine asks
+//! it before the request is made, so such a request is never made.
 //!
-//! **The whole pass, behind it.** Every other request is put to the engine's
-//! whole decision over records written for it from the gateway's own data
-//! ([`records::decide`]): a retry that names the workers it tried, a list
-//! the picker's turns find no eligible worker of, and a place whose profile
-//! scores. The binding's rule for a pool every worker of which is vetoed,
-//! and the test of a tried worker, so have one home.
+//! **The whole pass, behind it** ([`decide`]). Every other request is made
+//! and put to the engine's whole decision over records written for it from
+//! the gateway's own data ([`records::decide`]): a retry that names the
+//! workers it tried, a list the picker's turns find no eligible worker of,
+//! and a place whose profile scores. The binding's rule for a pool every
+//! worker of which is vetoed, and the test of a tried worker, so have one
+//! home.
 //!
 //! **What is refused by name.** The list a host hands is its request's own:
 //! every worker of it is dialed on a wire the request states. A list that is
@@ -27,12 +30,12 @@ use super::{PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace},
-        decision_engine::HeldDecision,
+        decision_engine::{HeldDecision, Plain},
         framework::{AloneProfile, Engine},
         records,
         sticky_sessions::SessionVerdict,
         store_backed_engine::{DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
-        view::Session,
+        view::{Phase, Session},
     },
     stages::Lifecycle,
     store::{leases::DISPATCH_TTL, Said},
@@ -46,8 +49,102 @@ const DEMANDS: &str = "demands";
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
 
-/// One single request's decision over `members`, the list its host handed,
-/// at `now`.
+/// The short path: the place in `members`, the list its host handed, of
+/// the worker picked for a plain single request of `model`, and the profile
+/// whose picker picked it. `None` where the request takes the whole pass
+/// ([`decide`]): it is no single request, its place is not decided by one
+/// pick of a picker, a worker of the list is not dialed on a wire it
+/// states, or the picker's turns land on no eligible worker.
+///
+/// It ends in the place picked. It reads no fact of a request, so none is
+/// made ahead of it, and nothing a host is handed of a pick is built here
+/// ([`noted`]).
+pub(super) fn alone(
+    own: &PolicyEngine,
+    model: &str,
+    plain: Plain,
+    members: &PoolMembers,
+) -> Option<(AloneProfile, usize)> {
+    if plain.phase != Phase::Single {
+        return None;
+    }
+    // The whole pass declines such a list by name.
+    if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
+        return None;
+    }
+    let profile = members.alone(&own.spec, model)?;
+    let position = own.pick(profile, members, |state: RoutingState| state.eligible())?;
+    Some((profile, position))
+}
+
+/// The short path's pick as its host takes it: the decision that names the
+/// worker at the place picked, alone, and its lease, issued here as a whole
+/// pass's is ([`issued`]). The trace is a drawn pick's: no pass over the
+/// pool ran, so it counts no survivor, and no seed was drawn for it. The
+/// lease states the size `plain` states and no session, and is dated at
+/// `now` on the engine's clock. `None` where the list holds no worker at
+/// the place.
+pub(super) fn noted(
+    own: &PolicyEngine,
+    (profile, position): (AloneProfile, usize),
+    members: &PoolMembers,
+    plain: Plain,
+    now: Instant,
+) -> Option<DecideOutcome> {
+    let worker = members.workers().get(position)?;
+    // The list's records name each worker once a list: a pick reads the id
+    // there and hashes no address.
+    let id = *members.records(&own.spec, &own.clock).ids().get(position)?;
+    let mut targets = Targets::new();
+    targets.push(Target {
+        position: u32::try_from(position).ok()?,
+        id,
+        dp_rank: u16::try_from(worker.dp_rank().unwrap_or(0)).unwrap_or(u16::MAX),
+        pair: None,
+    });
+    let generation = own.spec.generation();
+    let mut trace = Trace {
+        profile: profile.0,
+        survivors: Survivors::NOT_COUNTED,
+        top_len: 1,
+        generation,
+        ..Trace::default()
+    };
+    trace.top[0] = (id, 0.0);
+    let lease = Lease {
+        id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
+        kind: LeaseKind::Credit,
+        side: Side::Single,
+        target_index: 0,
+        booked: id,
+        generation,
+        session: Session::NONE,
+        session_verdict: SessionVerdict::None,
+        issued_micros: own.clock.micros(now),
+        tokens: plain.prompt_tokens,
+    };
+    let decided = DecideOutcome {
+        decision: Decision::Pick(Pick {
+            targets,
+            trace,
+            session_verdict: SessionVerdict::None,
+        }),
+        lease: Some(Leased {
+            lease,
+            due: now + DISPATCH_TTL,
+        }),
+        decode_session: Session::NONE,
+    };
+    own.spec
+        .engine()
+        .on_decision_issued(&lease, &decided.decision);
+    Some(decided)
+}
+
+/// One single request's whole pass over `members`, the list its host
+/// handed, at `now`: the engine's whole decision over records written for
+/// the request from the list's workers. A request that states what no
+/// stage here runs is declined under that stage's name.
 pub(super) fn decide(
     own: &PolicyEngine,
     request: &mut Request<'_>,
@@ -65,67 +162,12 @@ pub(super) fn decide(
     if !cx.wire_modes.is_empty() && !cx.wire_modes.contains(members.wires()) {
         return declined(own, request, WIRES);
     }
-    let facts = &mut request.facts;
-    if facts.tried.is_empty() && cx.excluded.is_empty() {
-        if let Some(profile) = members.alone(spec, facts.model) {
-            let lifted = cx.overload_lifted;
-            let admits = move |state: RoutingState| {
-                if lifted {
-                    state.eligible_ignoring_overload()
-                } else {
-                    state.eligible()
-                }
-            };
-            if let Some(position) = own.pick(profile, members, admits) {
-                facts.now_micros = own.clock.micros(now);
-                if let Some(pick) = picked(own, profile, facts.seed, members, position) {
-                    return pick;
-                }
-            }
-        }
-    }
     let records = members.records(spec, &own.clock);
     // No load snapshot and no session key's text are handed to this call
     // yet: a record carries no report and no count of a key's requests.
     let live = records::Live::at(spec.engine(), &own.clock, now, None, None);
+    let facts = &mut request.facts;
     records::decide(spec.engine(), records, members.workers(), &live, facts, &cx)
-}
-
-/// The short path's pick as a decision: the worker at `position` of the
-/// list, alone. Its trace is a drawn pick's: no pass over the pool ran, so
-/// it counts no survivor. `None` where the list holds no worker there.
-fn picked(
-    own: &PolicyEngine,
-    profile: AloneProfile,
-    seed: u64,
-    members: &PoolMembers,
-    position: usize,
-) -> Option<Decision> {
-    let worker = members.workers().get(position)?;
-    // The list's records name each worker once a list: a pick reads the id
-    // there and hashes no address.
-    let id = *members.records(&own.spec, &own.clock).ids().get(position)?;
-    let mut targets = Targets::new();
-    targets.push(Target {
-        position: u32::try_from(position).ok()?,
-        id,
-        dp_rank: u16::try_from(worker.dp_rank().unwrap_or(0)).unwrap_or(u16::MAX),
-        pair: None,
-    });
-    let mut trace = Trace {
-        profile: profile.0,
-        survivors: Survivors::NOT_COUNTED,
-        top_len: 1,
-        seed,
-        generation: own.spec.generation(),
-        ..Trace::default()
-    };
-    trace.top[0] = (id, 0.0);
-    Some(Decision::Pick(Pick {
-        targets,
-        trace,
-        session_verdict: SessionVerdict::None,
-    }))
 }
 
 /// The answer for a request whose host handed no list: a pool of no worker,
@@ -237,7 +279,7 @@ pub(super) fn said(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{cell::Cell, sync::Arc};
 
     use parking_lot::Mutex;
     use smg_worker::{identity::basic::Worker, test_support::ready_worker};
@@ -251,7 +293,7 @@ mod tests {
             framework::{Picker, TieBand},
             records::worker_id,
             store_backed_engine::DecisionRefused,
-            view::{Candidate, Constraints, Phase, RequestFacts, WireModes, WorkerId},
+            view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
         },
         policies::random::Random,
         stages::registry::StageRegistry,
@@ -288,10 +330,22 @@ mod tests {
         }
     }
 
-    /// A request stated ahead, with the list its host hands for it.
+    /// A request stated ahead, with the list its host hands for it, and how
+    /// many times the engine made it.
     struct Asks<'a> {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
+        made: Cell<u32>,
+    }
+
+    impl<'a> Asks<'a> {
+        fn of(request: Request<'a>, members: Option<&'a PoolMembers>) -> Self {
+            Self {
+                request,
+                members,
+                made: Cell::new(0),
+            }
+        }
     }
 
     impl RequestMaker for Asks<'_> {
@@ -300,7 +354,12 @@ mod tests {
         }
 
         fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
+            self.made.set(self.made.get() + 1);
             self.request
+        }
+
+        fn plain(&self) -> Option<Plain> {
+            self.request.plain()
         }
 
         fn workers(&self) -> WorkerLists<'_> {
@@ -322,10 +381,7 @@ mod tests {
         let engine = preset("round_robin");
         let list = pool(4);
         let members = engine.pool_members(&list);
-        let asks = Asks {
-            request: request(),
-            members: Some(&members),
-        };
+        let asks = Asks::of(request(), Some(&members));
         let (mut seen, mut last) = ([0_u32; 4], 0);
         for _ in 0..8 {
             let decided = decided(&engine, &asks);
@@ -348,6 +404,100 @@ mod tests {
         assert_eq!(seen, [2; 4], "every worker takes its turn");
     }
 
+    /// A plain request of a place one pick decides is decided with no
+    /// request made: the engine asks the maker's plain word and nothing
+    /// else of it. Its lease states the size the word states and no
+    /// session, dated on the engine's clock, and its trace no seed. A
+    /// request that is not plain, and a plain one the turn finds no worker
+    /// for, is made once and put to the whole pass.
+    #[test]
+    fn a_plain_request_of_a_place_one_pick_decides_is_never_made() {
+        let engine = preset("round_robin");
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let mut sized = request();
+        sized.facts.prompt_tokens = 321;
+        sized.facts.session_key = Identity::plain("a-key");
+        let asks = Asks::of(sized, Some(&members));
+        for _ in 0..8 {
+            let decided = decided(&engine, &asks);
+            let pick = decided.decision.pick().expect("a pick");
+            assert!(pick.trace.drew_first(), "no pass over the pool ran");
+            assert_eq!(pick.trace.seed, 0, "no seed was drawn");
+            let lease = decided.lease.expect("a lease").lease;
+            assert_eq!((lease.tokens, lease.session), (321, Session::NONE));
+            assert_eq!(lease.session_verdict, SessionVerdict::None);
+        }
+        assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+
+        // A retry is not plain: it is made, once a decision.
+        let tried = [worker_id(list[0].as_ref())];
+        let mut retry = request();
+        retry.facts.tried = &tried;
+        let asks = Asks::of(retry, Some(&members));
+        assert!(decided(&engine, &asks).decision.pick().is_some());
+        assert_eq!(asks.made.get(), 1);
+
+        // A plain request whose turns land on no eligible worker is made
+        // for the whole pass, which answers by the binding's own rule.
+        for worker in list.iter() {
+            worker.set_overloaded(true);
+        }
+        let asks = Asks::of(request(), Some(&members));
+        let _ = decided(&engine, &asks);
+        assert_eq!(asks.made.get(), 1);
+    }
+
+    /// A place whose profile scores is never picked ahead of its request:
+    /// the request is made for every decision, plain or not.
+    #[test]
+    fn a_place_that_scores_makes_its_request() {
+        let engine = preset("least_load");
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        for made in 1..=3 {
+            assert!(decided(&engine, &asks).decision.pick().is_some());
+            assert_eq!(asks.made.get(), made);
+        }
+    }
+
+    /// A request stated ahead is plain where it is a first attempt that
+    /// asks nothing beyond a worker of its list, and says what a pick with
+    /// no request made needs: its phase, its wires and its size. Each thing
+    /// it states beyond that makes it a request the whole pass reads.
+    #[test]
+    fn a_request_stated_ahead_says_whether_it_is_plain() {
+        let mut stated = request();
+        stated.facts.prompt_tokens = 9;
+        stated.constraints.wire_modes = WireModes::GRPC;
+        assert_eq!(
+            stated.plain(),
+            Some(Plain {
+                phase: Phase::Single,
+                wires: WireModes::GRPC,
+                prompt_tokens: 9,
+            })
+        );
+        let tried = [WorkerId(1)];
+        let rows = [0_u32];
+        let mut retried = request();
+        retried.facts.tried = &tried;
+        let mut missed = request();
+        missed.constraints.excluded = &tried;
+        let mut hinted = request();
+        hinted.constraints.subset_hint = Some(2);
+        let mut lifted = request();
+        lifted.constraints.overload_lifted = true;
+        let mut later = request();
+        later.constraints.decode_later = true;
+        let mut masked = request();
+        masked.constraints.stalled = &rows;
+        for request in [retried, missed, hinted, lifted, later, masked] {
+            assert_eq!(request.plain(), None);
+        }
+    }
+
     /// What the one turn does not decide goes to the whole pass over
     /// records: a retry never meets the worker it tried, and a pool whose
     /// every worker is overloaded is answered by the binding's own rule.
@@ -360,10 +510,7 @@ mod tests {
         let mut retry = request();
         retry.facts.tried = &tried;
         retry.facts.attempt = 1;
-        let asks = Asks {
-            request: retry,
-            members: Some(&members),
-        };
+        let asks = Asks::of(retry, Some(&members));
         for _ in 0..8 {
             let decided = decided(&engine, &asks);
             let pick = decided.decision.pick().expect("a pick");
@@ -372,10 +519,7 @@ mod tests {
         for worker in list.iter() {
             worker.set_overloaded(true);
         }
-        let asks = Asks {
-            request: request(),
-            members: Some(&members),
-        };
+        let asks = Asks::of(request(), Some(&members));
         match decided(&engine, &asks).decision {
             Decision::Pick(pick) => assert_eq!(pick.trace.lifted, LiftedVeto::Overload),
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "not-overloaded"),
@@ -392,7 +536,7 @@ mod tests {
         let list = pool(2);
         let members = engine.pool_members(&list);
         let shed = |request: Request<'_>, members: Option<&PoolMembers>| {
-            let asks = Asks { request, members };
+            let asks = Asks::of(request, members);
             match decided(&engine, &asks).decision {
                 Decision::Shed(shed) => (shed.reason, shed.emptied_by),
                 other => panic!("a shed, not {other:?}"),
@@ -413,17 +557,11 @@ mod tests {
             (ShedReason::PolicyDeclined, WIRES)
         );
         dialed.constraints.wire_modes = WireModes::HTTP.union(WireModes::GRPC);
-        let asks = Asks {
-            request: dialed,
-            members: Some(&members),
-        };
+        let asks = Asks::of(dialed, Some(&members));
         assert!(decided(&engine, &asks).decision.pick().is_some());
         let mut side = request();
         side.facts.phase = Phase::Decode;
-        let asks = Asks {
-            request: side,
-            members: Some(&members),
-        };
+        let asks = Asks::of(side, Some(&members));
         assert_eq!(
             engine
                 .decide_under(GatewayId::LOCAL, &asks, Instant::now())
@@ -519,10 +657,7 @@ mod tests {
         let (engine, heard) = hearing(false);
         let list = pool(4);
         let members = engine.pool_members(&list);
-        let asks = Asks {
-            request: request(),
-            members: Some(&members),
-        };
+        let asks = Asks::of(request(), Some(&members));
         let now = Instant::now();
         let mut handle =
             DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
@@ -570,10 +705,7 @@ mod tests {
         let (engine, heard) = hearing(true);
         let list = pool(2);
         let members = engine.pool_members(&list);
-        let asks = Asks {
-            request: request(),
-            members: Some(&members),
-        };
+        let asks = Asks::of(request(), Some(&members));
         for faults in 1..=2 {
             assert_eq!(
                 engine

@@ -2,19 +2,21 @@
 //! decided over the list the registry publishes for its route's pool, and a
 //! target is the worker at its place in that list.
 
-use std::{sync::Arc, time::Instant};
+use std::{cell::Cell, sync::Arc, time::Instant};
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
-    engine::{PolicyEngine as OwnEngine, ShedReason},
+    engine::{
+        Phase, Plain, PolicyEngine as OwnEngine, RequestMaker, ShedReason, WireModes, WorkerId,
+    },
 };
 use smg_worker::{
     identity::basic::{ConnectionMode, Worker},
     test_support::no_health_check,
 };
 
-use super::{mark, Ask, PolicyEngine, Unplaced};
+use super::{mark, Ask, Made, PolicyEngine, Prompt, Unplaced};
 use crate::routers::{
     common::snapshot::{RoutingPool, WorkerRegistry},
     grpc::backend_client::BasicWorkerBuilder,
@@ -72,6 +74,65 @@ async fn a_regular_attempt_is_placed_over_the_registrys_own_list() {
     }
     assert_eq!(placed_on, [2, 2, 2]);
     assert_eq!(policy_engine.faults(), 0);
+}
+
+/// An ask is plain where it is a first attempt that names nothing tried
+/// or missed and asks no decode again. Its plain word states its phase, its
+/// wires and the size its request would state: the ask's own, and the
+/// hashing's count where the ask states none. No request is made for it.
+#[test]
+fn a_first_ask_is_plain_and_states_the_size_its_request_would() {
+    let (policy_engine, _workers) = own("round_robin", 1);
+    let id = mark();
+    let tokens: Vec<u32> = (0..40).collect();
+    let hashes = policy_engine.hashes(MODEL, &Prompt::of(Some(&tokens), None));
+    let ask = Ask {
+        wires: WireModes::HTTP,
+        hashes: Some(&hashes),
+        ..Ask::of(&id, MODEL)
+    };
+    let plain = |ask: &Ask<'_>, missed: &[WorkerId]| {
+        let made = Made {
+            ask,
+            missed,
+            members: None,
+            source: Cell::new(None),
+        };
+        made.plain()
+    };
+    assert_eq!(
+        plain(&ask, &[]),
+        Some(Plain {
+            phase: Phase::Single,
+            wires: WireModes::HTTP,
+            prompt_tokens: 40,
+        })
+    );
+    let stated = Ask {
+        prompt_tokens: 7,
+        ..ask
+    };
+    assert_eq!(
+        plain(&stated, &[]).map(|plain| plain.prompt_tokens),
+        Some(7)
+    );
+    let tried = [WorkerId(1)];
+    let retry = Ask {
+        tried: &tried,
+        ..ask
+    };
+    assert_eq!(plain(&retry, &[]), None);
+    assert_eq!(plain(&ask, &tried), None, "a target missed at this attempt");
+    let numbered = Ask {
+        attempt: Some(1),
+        ..ask
+    };
+    assert_eq!(plain(&numbered, &[]), None);
+    let again = Ask {
+        decode_again: true,
+        ..ask
+    };
+    assert_eq!(plain(&again, &[]), None);
 }
 
 /// An ask that states no pool is decided over no worker. A retry names the
