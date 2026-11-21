@@ -48,12 +48,12 @@ use crate::{
             release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
             KEEPS_DECIDERS, SAMPLES_DECISIONS, SHADOWS,
         },
+        sticky_sessions::{Forgets, SessionVerdict},
         view::{
             fingerprint, AffinityFacts, Candidate, Constraints, HashKind, KeyedRow, NamedAffinity,
             Phase, PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
         },
     },
-    sessions::{Forgets, SessionVerdict},
     store::{
         leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeIssue, DecodeRefused, DecodeSide, Dispatch,
         EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
@@ -1896,8 +1896,8 @@ type Read<'a> = (
     &'a [Candidate],
     (&'a [u32], &'a [u32]),
     &'a [AffinityFacts],
-    Option<&'a crate::SignalCells>,
-    Option<crate::LentCounts<'a>>,
+    Option<&'a crate::load::SignalCells>,
+    Option<crate::tracking::LentCounts<'a>>,
     Option<Built>,
 );
 
@@ -2388,7 +2388,7 @@ pub(crate) struct Viewed<'a> {
     /// What the leases on file book on each row, by position, where the
     /// candidates are a publication's own rows; `None` where they were
     /// written for the decision and carry their counts.
-    pub(crate) in_flight: Option<crate::LentCounts<'a>>,
+    pub(crate) in_flight: Option<crate::tracking::LentCounts<'a>>,
     /// How many of the request's block hashes the deciding generation
     /// reads.
     pub(crate) max_block_hashes: usize,
@@ -2398,7 +2398,7 @@ pub(crate) struct Viewed<'a> {
     /// The candidates' signal cells, as the view handed them: `None` for
     /// a profile that reads no signal, and for a pair, whose cells ride
     /// its pools.
-    pub(crate) signal_cells: Option<&'a crate::SignalCells>,
+    pub(crate) signal_cells: Option<&'a crate::load::SignalCells>,
 }
 
 /// Tells the engine what was said of a lease: one function of the record
@@ -3484,7 +3484,7 @@ impl Door {
     /// gateway's completed dispatch on the worker that served is the
     /// host's to write ([`HealthSink::completed`]). A host that holds a
     /// handle over this door says one completion and the handle writes both
-    /// ([`crate::tracking::handle::Handle::completed`]).
+    /// ([`crate::tracking::Handle::completed`]).
     pub fn report(&self, gateway: GatewayId, lease: LeaseId, said: Said) {
         let at = self.store.file_of(lease);
         let hand = Hand::new(gateway);
@@ -4521,18 +4521,16 @@ pub(crate) mod tests {
             decider::Decider,
             decision::{Decision, Lifted, ShedReason, Target, Targets},
             demands::{DemandFacts, Demands},
-            framework,
-            framework::{DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
+            framework::{self, DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
+            sticky_sessions::SessionVerdict,
             view::{
                 Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts,
                 RequestFacts, Role, Session, WireModes, WorkerId,
             },
+            DecisionRecord, References, Unmet,
         },
-        sessions::SessionVerdict,
-        stages::{
-            builtins::{Best, Random},
-            catalog::Catalog,
-        },
+        policies::random::Random,
+        stages::{builtins::Best, catalog::Catalog},
         store::{
             Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
             HealthSink, HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink,
@@ -4542,7 +4540,6 @@ pub(crate) mod tests {
         tracking::lease::{
             Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass,
         },
-        DecisionRecord, References, Unmet,
     };
 
     mod shadow;
@@ -5031,7 +5028,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_door_explains_a_sampled_decision_with_its_names() {
-        use crate::{Explained, Names};
+        use crate::engine::{Explained, Names};
 
         let store = fleet(1);
         sampling(&store, 2, 1);
@@ -5093,9 +5090,9 @@ pub(crate) mod tests {
         assert_eq!(explained.record.binding, Some(0));
         assert_eq!(
             explained.names,
-            Some(crate::Names {
+            Some(crate::engine::Names {
                 plan: "single",
-                ..crate::Names::default()
+                ..crate::engine::Names::default()
             }),
         );
         assert_eq!(shed.trace.made_under(), None);
@@ -8182,7 +8179,7 @@ pub(crate) mod tests {
         let rule = document.bindings[0].sessions.as_mut();
         let rule = rule.expect("the preset's rule");
         rule.inflight_cap = cap;
-        rule.assignment = crate::Assignment::MinLoad;
+        rule.assignment = crate::document::Assignment::MinLoad;
         document
     }
 
@@ -8363,7 +8360,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("manual");
         profile.expect("the preset's profile").pick = "counted".into();
         let rule = document.bindings[0].sessions.as_mut();
-        rule.expect("the preset's rule").assignment = crate::Assignment::Delegate;
+        rule.expect("the preset's rule").assignment = crate::document::Assignment::Delegate;
         let digest = document.digest().expect("the document digests");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         let applied = store.apply(spec.expect("the catalog holds the stage"));
@@ -8467,13 +8464,13 @@ pub(crate) mod tests {
     /// Reads one signal of every row it scores and keeps what it read.
     #[derive(Debug)]
     struct ReadsHeld {
-        held: crate::SignalColumn,
+        held: crate::load::SignalColumn,
         read: Arc<Mutex<Vec<Option<f64>>>>,
     }
 
     impl Lifecycle for ReadsHeld {}
 
-    impl crate::Scorer for ReadsHeld {
+    impl crate::engine::Scorer for ReadsHeld {
         fn name(&self) -> &'static str {
             "reads-held"
         }
@@ -8529,11 +8526,11 @@ pub(crate) mod tests {
         let applied = store.apply(spec.expect("the catalog holds the stage"));
         applied.expect("a later generation");
         let door = Door::new(Arc::clone(&store));
-        let cells = [crate::SignalCell {
+        let cells = [crate::load::SignalCell {
             value: 7.0,
             sampled_at_micros: 0,
         }; 8];
-        let cells = crate::SignalCells::new(cells.to_vec(), 1);
+        let cells = crate::load::SignalCells::new(cells.to_vec(), 1);
         let mut hosted = request(b"r-1", 1);
         hosted.facts.signal_cells = Some(&cells);
         placed(&door, &hosted);
@@ -8658,9 +8655,13 @@ pub(crate) mod tests {
 
         /// The holders of `named` by their members in `rows`, the deepest
         /// first.
-        fn by_depth(named: &[crate::NamedHolder], rows: &[Candidate]) -> Vec<(WorkerId, u32)> {
-            let held =
-                |holder: &crate::NamedHolder| (rows[holder.row as usize].id, holder.overlap_blocks);
+        fn by_depth(
+            named: &[crate::engine::NamedHolder],
+            rows: &[Candidate],
+        ) -> Vec<(WorkerId, u32)> {
+            let held = |holder: &crate::engine::NamedHolder| {
+                (rows[holder.row as usize].id, holder.overlap_blocks)
+            };
             let mut holders: Vec<(WorkerId, u32)> = named.iter().map(held).collect();
             holders.sort_by_key(|&(_, blocks)| Reverse(blocks));
             holders
@@ -8747,7 +8748,7 @@ pub(crate) mod tests {
         /// shallow one in its place.
         #[test]
         fn a_filter_that_reads_the_naming_is_asked_by_its_pass_alone() {
-            use crate::{Catalog, Filter, Needs};
+            use crate::{document::Needs, engine::Filter, stages::Catalog};
 
             /// Keeps one worker only where the naming says it holds a block.
             #[derive(Debug)]
@@ -8812,9 +8813,12 @@ pub(crate) mod tests {
             use std::sync::Arc;
 
             use crate::{
-                document::spec::{PrefixAffinityParams, ScoreStage},
-                engine::{door::Door, view::Identity},
-                Catalog, Filter, Needs,
+                document::{
+                    spec::{PrefixAffinityParams, ScoreStage},
+                    Needs,
+                },
+                engine::{door::Door, view::Identity, Filter},
+                stages::Catalog,
             };
 
             /// Keeps one worker for a streaming request only where its key
@@ -9655,13 +9659,13 @@ pub(crate) mod tests {
         /// worker with what it read.
         #[derive(Debug)]
         struct ReadsEach {
-            held: crate::SignalColumn,
+            held: crate::load::SignalColumn,
             read: Arc<Mutex<Read>>,
         }
 
         impl Lifecycle for ReadsEach {}
 
-        impl crate::Scorer for ReadsEach {
+        impl crate::engine::Scorer for ReadsEach {
             fn name(&self) -> &'static str {
                 "reads-each"
             }

@@ -5,13 +5,12 @@ use std::{collections::HashSet, error::Error, time::Duration};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::spec::DecodePick,
-    engine::view::{LoadRow, Role, WireModes, TEXT_BYTES_PER_TOKEN},
+    document::{AppliedSpec, DecodePick, PolicySpec},
+    engine::{LoadRow, Role, WireModes, TEXT_BYTES_PER_TOKEN},
     store::{
         GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MemoryStore, PairingDescriptor,
         WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
-    AppliedSpec, PolicySpec,
 };
 use smg_worker::identity::basic::{ConnectionMode, MORIIO_CONNECTOR};
 

@@ -41,19 +41,15 @@ use axum::{
 use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
-    document::spec::DecodePick,
+    document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
     engine::{
-        decision::{Decision, Lifted, Pair, ShadowKind, ShedReason, Targets, Trace, MAX_TARGETS},
-        door::{Door, Maker, Refused, Request, Swept},
-        view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
+        Constraints, Decision, Door, Identity, Lifted, Maker, MediaCounts, Pair, Phase, Refused,
+        Request, RequestFacts, ShadowKind, ShedReason, Swept, Targets, Trace, WireModes, WorkerId,
+        MAX_TARGETS,
     },
     store::{GatewayId, MemoryStore, World},
-    tracking::{
-        handle::Handle,
-        lease::{Outcome, ReleaseReason, Side, TransportClass},
-    },
+    tracking::{Handle, Outcome, ReleaseReason, Side, TransportClass},
     worker_host::Objects,
-    AppliedSpec, DerivedKey, KeySource, MediaCounts, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
 
@@ -194,10 +190,10 @@ impl<'a> Ask<'a> {
     /// The request's two keys by the sources its binding names in `spec`.
     /// Its routing key is the first session source that holds a value, with
     /// the source it came from
-    /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)):
+    /// ([`KeySources::derive`](smg_policy_controller::document::KeySources::derive)):
     /// `None` where the binding names no source, or none of them holds a
     /// value. Its client's key is read where it has no routing key
-    /// ([`KeySources::derive_client`](smg_policy_controller::KeySources::derive_client)),
+    /// ([`KeySources::derive_client`](smg_policy_controller::document::KeySources::derive_client)),
     /// and is `0` where it carries none.
     ///
     /// The routing key borrows the document. The door hands the ask the

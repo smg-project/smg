@@ -77,7 +77,7 @@
 //! most, but behind a thread that left its work by an unwind or rested
 //! on its watch: what it left is the next take's.
 //!
-//! A door in process has no deciding thread ([`crate::engine::door::Door`]): each
+//! A door in process has no deciding thread ([`crate::engine::Door`]): each
 //! caller is at work at its seat's file for its one decision and rests
 //! as it leaves ([`AtWork::rest`]). No caller looks at a file again, so
 //! a door's file shows no watch: what is said of a lease is applied at

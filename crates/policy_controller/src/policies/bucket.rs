@@ -1,4 +1,5 @@
-//! The bucket scorer: prefill placement by request size.
+//! The `bucket` policy: how it is composed, and its scorer: prefill placement
+//! by request size.
 //!
 //! For each model the scorer keeps a partition of the request sizes among
 //! the pool's workers. Each listed worker owns a range of sizes, in the
@@ -40,7 +41,8 @@
 //! model alone. A handle a view listed before the word of its replacement
 //! keeps its own place and takes its predecessor's load and bookings, and
 //! the predecessor's place leaves as a removed worker's does. A pruned
-//! worker is fenced for a while ([`FENCE`](crate::ring::FENCE)): a view
+//! worker is fenced for a while
+//! ([`FENCE`](crate::policies::consistent_hashing::FENCE)): a view
 //! captured before its leave still shows it, and a decision over such a
 //! view lists it nowhere, seats it nowhere and places the others. The feed
 //! naming the worker again lifts the fence at once. A worker that left a
@@ -71,15 +73,30 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    document::spec::BucketParams,
+    document::spec::{BucketParams, ProfileSpec},
     engine::{
         decision::{Decision, Target},
         framework::{Scorer, TieBand},
         view::{Candidate, Phase, RequestFacts, WorkerId},
     },
-    ring::Fence,
+    policies::{consistent_hashing::Fence, standard_filters},
     tracking::lease::{Lease, Lifecycle, Membership, Side},
 };
+
+/// How the `bucket` policy is composed: its filters, its scorers and its
+/// picker.
+pub(crate) fn profile() -> ProfileSpec {
+    // Prefill placement by request size: the worker whose range of
+    // sizes holds the prompt, the least booked survivor when the
+    // balance rule spills, each at the stage's defaults; any other
+    // phase is the picker's draw.
+    ProfileSpec {
+        filter: standard_filters(),
+        score: vec!["bucket".into()],
+        pick: "best".into(),
+        sent_ttl_ms: None,
+    }
+}
 
 /// The span of sizes a changed listing splits evenly among its workers, in
 /// tokens. The last range is open-ended whatever the span, and the next cut
@@ -998,13 +1015,14 @@ impl Scorer for Bucket {
 mod tests {
     use super::*;
     use crate::{
+        document::{PolicySpec, SpecError},
         engine::{
             decision::{Pair, Pick, Target, Targets},
-            view,
-            view::Health,
+            view::{self, Health},
+            Constraints, PoolFacts, Scratch,
         },
-        ring::FENCE,
-        Catalog, Constraints, PolicySpec, PoolFacts, Scratch, SpecError,
+        policies::consistent_hashing::FENCE,
+        stages::Catalog,
     };
 
     const SECOND: u64 = 1_000_000;

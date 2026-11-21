@@ -7,8 +7,9 @@ use super::{
 };
 use crate::{
     document::spec::{AcrossRanks, SignalSpec},
+    engine::{EncodeItems, EncodePlaced, EncoderFacts, Identity},
+    load::SignalCells,
     store::{world::EncodePairBuffers, EncodeHandoff, EncodeOffer, SignalSink, Taken},
-    EncodeItems, EncodePlaced, EncoderFacts, Identity, SignalCells,
 };
 
 /// A worker of the model that pairs over one transport and states `offer`

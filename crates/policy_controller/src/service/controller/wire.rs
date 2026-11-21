@@ -890,7 +890,7 @@ pub(super) fn unix_micros(at: SystemTime) -> i64 {
 
 /// What a host must feed for these rows, as the contract writes it: a row
 /// for each of the engine's rows that has a flag to set
-/// ([`crate::Engine::needs_rows`]), in their order. A need the contract's row has
+/// ([`crate::engine::Engine::needs_rows`]), in their order. A need the contract's row has
 /// no flag for is not told here: a worker's requests in flight, the
 /// sessions in flight, a key's in-flight count, the affinity column and
 /// the signal cells are the controller's own to hold.
@@ -967,11 +967,9 @@ mod tests {
 
         use prost::Message as _;
 
-        use crate::{
-            document::{
-                operator::{Document, Format, NeedsRow, Status},
-                spec::PolicySpec,
-            },
+        use crate::document::{
+            operator::{Document, Format, NeedsRow, Status},
+            spec::PolicySpec,
             Needs,
         };
 
@@ -1107,7 +1105,8 @@ mod tests {
             operator::{needs_rows, test_support::LEAST_LOAD},
             spec::PolicySpec,
         },
-        Candidate, Catalog, Filter,
+        engine::{Candidate, Filter},
+        stages::Catalog,
     };
 
     /// A need the contract's row has no flag for writes no row: the engine
@@ -1127,10 +1126,10 @@ mod tests {
                 true
             }
 
-            fn needs(&self) -> crate::Needs {
-                crate::Needs {
+            fn needs(&self) -> crate::document::Needs {
+                crate::document::Needs {
                     affinity: true,
-                    ..crate::Needs::default()
+                    ..crate::document::Needs::default()
                 }
             }
         }
@@ -1166,7 +1165,7 @@ mod tests {
     fn the_summary_tells_each_role_and_each_flag_apart() {
         /// Keeps every worker and reads what it is built to read.
         #[derive(Debug)]
-        struct Reads(&'static str, crate::Needs);
+        struct Reads(&'static str, crate::document::Needs);
 
         impl Filter for Reads {
             fn name(&self) -> &'static str {
@@ -1177,18 +1176,18 @@ mod tests {
                 true
             }
 
-            fn needs(&self) -> crate::Needs {
+            fn needs(&self) -> crate::document::Needs {
                 self.1
             }
         }
 
-        let tokens = crate::Needs {
+        let tokens = crate::document::Needs {
             token_hashes: true,
-            ..crate::Needs::default()
+            ..crate::document::Needs::default()
         };
-        let media = crate::Needs {
+        let media = crate::document::Needs {
             media: true,
-            ..crate::Needs::default()
+            ..crate::document::Needs::default()
         };
         let mut stages = Catalog::builtin();
         stages

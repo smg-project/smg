@@ -9,7 +9,7 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg_policy_controller::{PolicySpec, SpecError, PRESETS};
+use smg_policy_controller::document::{PolicySpec, SpecError, PRESETS};
 
 use super::{
     super::{url_port::CommandLine, Cli, CliArgs, Commands},

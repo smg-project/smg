@@ -9,7 +9,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
-use smg_policy_controller::PolicySpec;
+use smg_policy_controller::document::PolicySpec;
 use smg_service_discovery::Roles;
 pub use smg_service_discovery::{
     deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,

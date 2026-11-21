@@ -10,7 +10,7 @@
 //! A kind (the WebAssembly host in the `wasm` module) implements
 //! `BoundPlugin`, a trait of this crate alone, for the plugin it bound and
 //! builds on these: the engine sees stages and a
-//! [`DecisionScope`](crate::DecisionScope), never a kind. The module is built
+//! [`DecisionScope`](crate::engine::DecisionScope), never a kind. The module is built
 //! when a kind is.
 
 pub(crate) mod breaker;

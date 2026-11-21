@@ -105,11 +105,12 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use placed::page_start_buffer;
 use smg_policy_controller::{
+    document::{AppliedSpec, PolicySpec},
+    engine::{LoadRow, Role, SignalSource, WorkerId},
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, LoadRow, PolicySpec, Role, SignalSource, WorkerId,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

@@ -1,6 +1,9 @@
 //! The scorer the signal benches register: it reads two signals of every row.
 use smg_policy_controller::{
-    Candidate, Lifecycle, Needs, RequestFacts, Scorer, SignalColumn, TieBand,
+    document::Needs,
+    engine::{Candidate, RequestFacts, Scorer, TieBand},
+    load::SignalColumn,
+    tracking::Lifecycle,
 };
 
 /// Scores a row by the two values it reads: the less of both, the better.

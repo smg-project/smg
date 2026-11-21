@@ -7,13 +7,13 @@ use std::{sync::Arc, time::Instant};
 use kv_index::{chain_prefix_hash, ContentHash, SequenceHash, StoredBlock};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus, UNKNOWN_MODEL_ID};
 use smg_policy_controller::{
-    document::spec::DecodePick,
-    engine::view::{LoadRow, Role, WorkerId},
+    document::{AppliedSpec, DecodePick, PolicySpec},
+    engine::{LoadRow, Role, WireModes, WorkerId},
     store::{
         Ask as StoreAsk, BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource,
         MemoryStore, PairBuffers, Signals, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
-    AppliedSpec, LeaseId, PolicySpec, WireModes,
+    tracking::LeaseId,
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
 

@@ -6,8 +6,9 @@ use arc_swap::Guard;
 use rustc_hash::FxHashMap;
 
 use crate::{
+    engine::{Candidate, RequestFacts, Target, WorkerId},
     stages::builtins::{Credits, SinceReport},
-    Candidate, Lease, Membership, RequestFacts, Side, Target, WorkerId,
+    tracking::{Lease, Membership, Side},
 };
 
 /// What the deciding host sent a row that no report of the row reflects.
@@ -47,7 +48,7 @@ pub struct SentCounts {
 ///
 /// A new document's count takes over the rows' entries of the standing
 /// profile of the same name and shares them with it
-/// ([`Engine::succeed`](crate::Engine::succeed)). Each count reads them
+/// ([`Engine::succeed`](crate::engine::Engine::succeed)). Each count reads them
 /// under its own time limit, and a send that one read releases has left
 /// the other count too.
 ///

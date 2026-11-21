@@ -4,8 +4,12 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    Assignment, Candidate, Constraints, Engine, Health, Identity, Lease, Lifecycle, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, Side, WorkerId,
+    document::{Assignment, PolicySpec},
+    engine::{
+        Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
+        WorkerId,
+    },
+    tracking::{Lease, Lifecycle, Side},
 };
 
 use crate::{Outcome, Recorded, Replayed};

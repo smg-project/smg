@@ -20,8 +20,8 @@ use engines::{cpu_seconds, eventually, mock_engine};
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
-    document::spec::{BindingSpec, OverloadSpec},
-    engine::view::{Role, SignalSource, WireModes, WorkerId},
+    document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
+    engine::{Role, SignalSource, WireModes, WorkerId},
     service::{
         controller::{Config, Controller, Election, Listener, Scope},
         ingest::{
@@ -30,7 +30,6 @@ use smg_policy_controller::{
         },
     },
     store::{LoadSink, LoadSource, MemoryStore, Signals, WorkerFacts, WorkerStatus, WorkersStore},
-    AppliedSpec, PolicySpec,
 };
 use tokio::{
     net::TcpListener,

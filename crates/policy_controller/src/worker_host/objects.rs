@@ -1177,7 +1177,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{BindingSpec, Match, OverloadSpec},
+        document::{
+            spec::{BindingSpec, Match, OverloadSpec},
+            AppliedSpec, PolicySpec,
+        },
         store::{
             GatewayId, HealthSink, Kinds, LoadSink as _, LoadSource, Maker, MemoryStore,
             WorkerFacts, WorkerPatch, WorkerStatus,
@@ -1186,7 +1189,6 @@ mod tests {
             facts as stated, object, Expect, HealthAdapter, KeptCredential, Membership, Over,
             SoleLead, StoreDoor,
         },
-        AppliedSpec, PolicySpec,
     };
 
     const A: &str = "http://a:8000";

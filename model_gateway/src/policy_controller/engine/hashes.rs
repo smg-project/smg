@@ -5,9 +5,9 @@ use kv_index::{
     XXH3_SEED,
 };
 use smg_policy_controller::{
-    engine::view::{HashKind, TEXT_BYTES_PER_TOKEN},
+    document::AppliedSpec,
+    engine::{HashKind, TEXT_BYTES_PER_TOKEN},
     store::{KvEventSink, MemoryStore},
-    AppliedSpec,
 };
 
 use crate::policies::CacheNamespace;
@@ -156,9 +156,9 @@ mod tests {
     };
     use openai_protocol::common::CachePartition;
     use smg_policy_controller::{
-        engine::view::{HashKind, Identity, RequestFacts, Role, TEXT_BYTES_PER_TOKEN},
+        document::{AppliedSpec, PolicySpec},
+        engine::{HashKind, Identity, RequestFacts, Role, TEXT_BYTES_PER_TOKEN},
         store::{Ask as ViewAsk, BatchOutcome, KvEventSink, Named, Naming, ViewBuffers},
-        AppliedSpec, PolicySpec,
     };
 
     use super::{prompt_token_count, Hashes};

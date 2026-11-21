@@ -40,7 +40,7 @@ use openai_protocol::{
     UNKNOWN_MODEL_ID,
 };
 use reqwest::multipart::{Form, Part};
-use smg_policy_controller::engine::view::WorkerId;
+use smg_policy_controller::engine::WorkerId;
 use smg_worker::{
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},

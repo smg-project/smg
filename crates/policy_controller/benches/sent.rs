@@ -17,8 +17,13 @@ use std::{hint::black_box, sync::Arc};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, PolicySpec, PoolFacts, RequestFacts,
-    Scorer, Scratch, SentCredit, Side, Target, TieBand, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scorer, Scratch, Target, TieBand,
+        WorkerId,
+    },
+    stages::Catalog,
+    tracking::{Lease, Lifecycle, SentCredit, Side},
 };
 
 const TTL_MS: u32 = 53;

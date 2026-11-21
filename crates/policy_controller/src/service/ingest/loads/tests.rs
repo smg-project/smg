@@ -20,14 +20,16 @@ use super::{
     now, peer, Failures, LoadDriver, LoadDriverConfig, LoadProbe, Read, ReadError, Schedule, Target,
 };
 use crate::{
-    document::spec::{AcrossRanks, BindingSpec, OverloadSpec, SignalSpec},
+    document::{
+        spec::{AcrossRanks, BindingSpec, OverloadSpec, SignalSpec},
+        AppliedSpec, PolicySpec,
+    },
     engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     store::{
         Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
         Reachability, Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         PUBLISH_WINDOW,
     },
-    AppliedSpec, PolicySpec,
 };
 
 /// A metrics body of the first gauge family: three running, five waiting,
@@ -2085,7 +2087,7 @@ fn cells(store: &MemoryStore) -> HashMap<WorkerId, Vec<Option<(f64, u64)>>> {
             .view("m", Role::Single, &ask, false, &mut out)
             .expect("the pool");
         let block = view.signal_cells.expect("the publication's block");
-        let held = |cell: &crate::SignalCell| {
+        let held = |cell: &crate::load::SignalCell| {
             (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
         };
         let cells = block.cells().chunks(block.signals());

@@ -18,13 +18,14 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use serde::{de::DeserializeOwned, Deserialize};
 use smg_policy_controller::{
-    document::spec::{BindingSpec, OverloadSpec},
-    engine::door::{Door, Request},
+    document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
+    engine::{
+        Constraints, Decision, DemandFacts, Door, LoadRow, Request, RequestFacts, ShedReason,
+        WireModes, WorkerId,
+    },
     store::{
         GatewayId, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Constraints, Decision, DemandFacts, LoadRow, PolicySpec, RequestFacts, ShedReason,
-    WireModes, WorkerId,
 };
 
 const MODEL: &str = "m";

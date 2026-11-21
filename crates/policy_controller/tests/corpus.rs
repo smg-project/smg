@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use smg_policy_controller::{PolicySpec, SpecError};
+use smg_policy_controller::document::{PolicySpec, SpecError};
 
 /// The fenced YAML document under the item's `## Expected spec` heading.
 fn expected_document(item: &str) -> Option<&str> {

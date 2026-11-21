@@ -48,7 +48,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
-use smg_policy_controller::Catalog;
+use smg_policy_controller::stages::Catalog;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -4084,7 +4084,7 @@ mod tests {
         use std::time::Instant;
 
         use smg_policy_controller::{
-            engine::view::{Role, WireModes},
+            engine::{Role, WireModes},
             store::{Ask, GatewayId, HealthPolicy, Maker, ViewBuffers, WorkerFacts},
             worker_host::Expect,
         };

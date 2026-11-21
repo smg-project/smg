@@ -16,7 +16,7 @@ use std::{
 use openai_protocol::model_card::ModelCard;
 use parking_lot::Mutex;
 use smg_policy_controller::{
-    engine::view::{Role, WireModes, WorkerId},
+    engine::{Role, WireModes, WorkerId},
     store::{
         Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore,
         Overload, ViewBuffers, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,

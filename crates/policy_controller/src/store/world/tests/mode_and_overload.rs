@@ -9,10 +9,12 @@ use super::{
     REPORT_PERIOD,
 };
 use crate::{
-    document::spec::{BindingSpec, OverloadSpec, Pairing},
+    document::{
+        spec::{BindingSpec, OverloadSpec, Pairing},
+        AppliedSpec, PolicySpec,
+    },
     engine::view::Role,
     store::{LoadSink, LoadSource, MemoryStore, WorkersStore},
-    AppliedSpec, PolicySpec,
 };
 
 /// A generation whose pair plan names the pairing `mode` and whose one

@@ -78,8 +78,8 @@ use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    affinity::{WarmRule, Warming},
     engine::view::{Candidate, HashKind, NamedAffinity, NamedHolder, Role, WorkerId},
+    policies::cache_aware::{WarmRule, Warming},
     predictor::Predictor,
     store::{
         kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
@@ -532,7 +532,7 @@ impl Default for RecordRead {
 
 impl Named {
     /// The lists as a request carries them
-    /// ([`RequestFacts::named`](crate::RequestFacts::named)).
+    /// ([`RequestFacts::named`](crate::engine::RequestFacts::named)).
     pub fn affinity(&self) -> NamedAffinity<'_> {
         NamedAffinity {
             holders: &self.holders,

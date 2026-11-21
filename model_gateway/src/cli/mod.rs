@@ -2310,11 +2310,14 @@ mod tests {
     fn policy_file(
         name: &str,
     ) -> Result<
-        (tempfile::NamedTempFile, smg_policy_controller::PolicySpec),
+        (
+            tempfile::NamedTempFile,
+            smg_policy_controller::document::PolicySpec,
+        ),
         Box<dyn std::error::Error>,
     > {
         let file = tempfile::NamedTempFile::new()?;
-        let document = smg_policy_controller::PolicySpec::preset(name)?;
+        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
         serde_yaml::to_writer(file.as_file(), &document)?;
         Ok((file, document))
     }

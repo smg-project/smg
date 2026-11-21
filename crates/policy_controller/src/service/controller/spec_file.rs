@@ -571,8 +571,8 @@ pub(crate) mod tests {
             },
             elector::{Elector, Tick},
         },
+        stages::Catalog,
         store::MemoryStore,
-        Catalog,
     };
 
     /// A directory with a `policy.yaml`, and the generations of a store of

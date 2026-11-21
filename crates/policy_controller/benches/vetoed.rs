@@ -25,7 +25,7 @@ use common::{build_view, engine_of, fleet};
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
-use smg_policy_controller::{
+use smg_policy_controller::engine::{
     Candidate, Constraints, Decision, Engine, Identity, Lifted, PoolFacts, RequestFacts, Scratch,
 };
 

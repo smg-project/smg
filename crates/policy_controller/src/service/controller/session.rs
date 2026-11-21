@@ -695,7 +695,7 @@ mod tests {
             &elector,
             stood,
             journaled_for(&LeasePlace::Process, 0, 2),
-            Arc::new(crate::Catalog::builtin()),
+            Arc::new(crate::stages::Catalog::builtin()),
             2,
         )
         .expect("the deciders start");

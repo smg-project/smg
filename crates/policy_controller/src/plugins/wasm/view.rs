@@ -1498,7 +1498,7 @@ mod tests {
         ];
         let facts = RequestFacts {
             model: "twelve-bytes",
-            model_fingerprint: crate::ModelFingerprint::NONE,
+            model_fingerprint: crate::engine::ModelFingerprint::NONE,
             namespace_seed: 1,
             tenant: Identity::plain("acme"),
             priority: -7,
@@ -1641,7 +1641,7 @@ mod tests {
     fn a_session_key_the_plugin_is_not_shown_makes_no_session() {
         let facts = RequestFacts {
             model: "model-a",
-            model_fingerprint: crate::ModelFingerprint::of("model-b"),
+            model_fingerprint: crate::engine::ModelFingerprint::of("model-b"),
             session_key: Identity::plain("conversation-7"),
             ..RequestFacts::default()
         };

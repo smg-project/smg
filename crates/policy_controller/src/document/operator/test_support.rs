@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 
 use crate::{
     document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+    stages::Catalog,
     store::MemoryStore,
-    Catalog,
 };
 
 /// A document in the form of the design's example: no `generation` line.

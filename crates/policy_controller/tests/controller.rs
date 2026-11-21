@@ -21,16 +21,16 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use smg_policy_controller::{
-    engine::view::{fingerprint, LoadRow, Role, WorkerId},
+    document::{AppliedSpec, PolicySpec},
+    engine::{fingerprint, LoadRow, Role, WorkerId},
     service::{
         controller::{
             Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, State,
             Tls, TlsError, SERVICE_NAME,
         },
         elector::{ElectionSettings, FileLease, LeaseBackend},
-        proto,
         proto::{
-            busy, controller_frame, decide_answer, decision, gateway_frame,
+            self, busy, controller_frame, decide_answer, decision, gateway_frame,
             policy_controller_client::PolicyControllerClient, Credit, DecideRequest, Decision,
             GatewayFrame, GetPolicySpecRequest, Hello, LeaderRequest, RequestFacts,
             WatchWorkersRequest,
@@ -40,8 +40,7 @@ use smg_policy_controller::{
         GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, Picked, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
-    tracking::lease::{Lease, LeaseId},
-    AppliedSpec, PolicySpec,
+    tracking::{Lease, LeaseId},
 };
 use tokio::{
     net::TcpStream,
@@ -1501,8 +1500,11 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
     use std::sync::{Arc, Mutex};
 
     use smg_policy_controller::{
+        document::API_VERSION,
+        engine::{Candidate, Scorer, TieBand},
         service::proto::{Dispatched, Side},
-        Candidate, Catalog, Lifecycle, Scorer, Sent, SentCredit, TieBand, API_VERSION,
+        stages::Catalog,
+        tracking::{Lifecycle, Sent, SentCredit},
     };
 
     #[derive(Debug)]
@@ -1520,7 +1522,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
 
         fn score(
             &self,
-            facts: &smg_policy_controller::RequestFacts<'_>,
+            facts: &smg_policy_controller::engine::RequestFacts<'_>,
             candidates: &[Candidate],
             kept: &[u32],
             out: &mut [f32],
