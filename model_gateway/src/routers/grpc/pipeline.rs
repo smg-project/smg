@@ -843,6 +843,9 @@ impl RequestPipeline {
                 // queued behind its own predecessor's bootstrap rooms.
                 dctx.release_attempt(&failure, Instant::now());
                 dctx.pd_prefill_guard = None;
+                // A stream that failed after its call was taken is the worker's
+                // failure too: charged here, where the request's ledger is.
+                dctx.ledger.charge_pending(&failure);
                 // A worker's definitive answer closes the retry window on that
                 // worker: the next attempt goes to another available worker, or
                 // the answer stands as the client's response.
