@@ -107,6 +107,33 @@ Preprocessing is CPU-bound, and the crate never touches rayon's global pool. A h
 or inline execution on the calling thread. A host that configures nothing gets a small
 dedicated pool on first use, sized by `SMG_MM_THREADS` where that is set.
 
+## Environment variables
+
+The crate reads fifteen variables. Each is read once, on first use, and kept for the life
+of the process, so a change takes a restart. A number that is unset, unreadable or zero
+falls back to its default.
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `SMG_IMAGE_MAX_INPUT_BYTES` | 256 MiB | The most bytes one image may have as it arrives (fetched, read from a file or decoded from base64), before it is decoded. |
+| `SMG_VIDEO_MAX_INPUT_BYTES` | 256 MiB | The same for one video. |
+| `SMG_AUDIO_MAX_INPUT_BYTES` | 256 MiB | The same for one audio clip. |
+| `SMG_IMAGE_MAX_COUNT`, `SMG_VIDEO_MAX_COUNT`, `SMG_AUDIO_MAX_COUNT` | the model family's own limit | How many images, videos or audio clips one request may carry. It replaces the family's limit, up or down, and never enables a modality the family does not serve. |
+| `SMG_VIDEO_DECODE_BACKEND` | `auto` | The video decoder: `auto`, `opencv` or `ffmpeg` (see Media decoding). `opencv` needs the `opencv-video` feature. Any other value fails every video decode with an error that names it. |
+| `SMG_VIDEO_PROCESS_TIMEOUT_SECS` | 30 | The time one decoder run may spend on a clip, in seconds; a fraction is allowed. With the `opencv-video` feature, a clip the buffered OpenCV pass fails on, a timeout included, gets the same budget again in OpenCV from a temporary file, and under `auto` once more in `ffmpeg`. |
+| `SMG_VIDEO_MAX_DECODED_BYTES` | 1 GiB | The most bytes the decoded frames of one clip may take. |
+| `SMG_VIDEO_MAX_DECODE_PIXELS` | 10^12 | The most pixels one video decode may run through: the source frames it has to decode, times the clip's width and height. A decode past it is refused before a decoder starts. |
+| `SMG_AUDIO_DECODE_BACKEND` | `auto` | The audio decoder: `auto` (the in-process decoder first, then `ffmpeg`), `symphonia` or `ffmpeg`. Any other value fails every audio decode with an error that names it. |
+| `SMG_AUDIO_PROCESS_TIMEOUT_SECS` | 30 | The time one decoder may spend on a clip, in seconds; a fraction is allowed. Under `auto` a clip the in-process decoder fails on, a timeout included, gets the same budget again in `ffmpeg`. |
+| `SMG_AUDIO_MAX_DECODED_BYTES` | 256 MiB | The most bytes the decoded samples of one clip may take. |
+| `SMG_MM_THREADS` | the machine's parallelism, at most 8 | The threads of the dedicated pool where the host names no size (see Parallelism). |
+| `SMG_LOG_MM_TIMING` | off | `1`, `true`, `yes` or `on` logs how long each video decode took. A host that calls `init_log_video_decode_timing` before the first decode decides instead. |
+
+The gateway is such a host: its `--log-mm-timing` flag wins over `SMG_LOG_MM_TIMING`, and
+the media pipeline it runs worker-side preprocesses inline unless `SMG_MM_THREADS` is set.
+The test run has two settings of its own (`SMG_REQUIRE_TURBOJPEG` and
+`SMG_REQUIRE_VIDEO_TOOLS`, see Testing), and so has the concurrency bench (see Benchmarks).
+
 ## Cargo features
 
 - `hf-hub` (default) – the `hub` module: `config.json` and the processor configs of a
