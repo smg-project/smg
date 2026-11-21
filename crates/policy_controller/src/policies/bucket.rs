@@ -80,7 +80,10 @@ use crate::{
         view::{Candidate, Phase, RequestFacts, WorkerId},
     },
     policies::standard_filters,
-    stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
+    stages::{
+        lifecycle::{Lifecycle, Words},
+        retired_workers::RetiredWorkers,
+    },
     tracking::lease::{Lease, Membership, Side},
 };
 
@@ -913,6 +916,16 @@ impl Lifecycle for Bucket {
     /// listed.
     fn needs_lifecycle(&self) -> bool {
         true
+    }
+
+    /// The issue books and the dispatch books again where the request went
+    /// elsewhere. A booking ages off: no end is taken.
+    fn hears(&self) -> Words {
+        Words {
+            issue: true,
+            dispatch: true,
+            end: false,
+        }
     }
 }
 

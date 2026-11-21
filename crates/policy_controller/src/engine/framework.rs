@@ -29,7 +29,7 @@ use crate::{
     policies::random::Random,
     stages::{
         filters::RowTests,
-        lifecycle::Lifecycle,
+        lifecycle::{Lifecycle, Words},
         pickers::{target_of, Best},
         scorers::{FewestSessions, LeastRequests},
     },
@@ -3295,6 +3295,11 @@ pub struct Engine {
     /// profiles' names: a later engine finds a profile's by its name
     /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
+    /// The words on a lease the document takes, but for its counts of
+    /// sends ([`Lifecycle::hears`] adds those): each stage's answer, asked
+    /// once at the build, with the engine's own. A word of a request is
+    /// told to every profile's stages, so the answer is the document's.
+    words: Words,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -4391,6 +4396,21 @@ impl Engine {
             .map(|(profile, &folded)| profile.named_by(folded))
             .collect();
         let keepers = Keeper::of(&profiles);
+        // The engine's own words: the session table follows a dispatch
+        // where a binding states a sessions rule, and the record of
+        // dispatched prefixes is written at an issue.
+        let own = Words {
+            issue: needs.sent_prefixes,
+            dispatch: bindings.iter().any(|binding| binding.sessions.is_some()),
+            end: false,
+        };
+        let words = profiles.iter().fold(own, |words, profile| {
+            let stages = profile
+                .scorers
+                .iter()
+                .map(|weighted| weighted.scorer.hears());
+            stages.fold(words.union(profile.picker.hears()), Words::union)
+        });
         let shadows = bindings
             .iter()
             .any(|binding| binding.shadow.is_some() || binding.decode_shadow.is_some());
@@ -4494,6 +4514,7 @@ impl Engine {
             keepers,
             stating,
             sent_credits: Vec::new(),
+            words,
         }
     }
 
@@ -6914,6 +6935,17 @@ impl Lifecycle for Engine {
             profile.picker.needs_lifecycle()
                 || profile.scorers.iter().any(|w| w.scorer.needs_lifecycle())
         })
+    }
+
+    /// The words the document takes: a stage's, the session table's at a
+    /// dispatch under a sessions rule, the record of dispatched prefixes
+    /// at an issue, and a count of sends at a dispatch. Folded at the
+    /// build: one read here.
+    fn hears(&self) -> Words {
+        Words {
+            dispatch: self.words.dispatch || !self.sent_credits.is_empty(),
+            ..self.words
+        }
     }
 }
 

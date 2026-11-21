@@ -29,7 +29,7 @@ use crate::{
     load::signals::{SignalSums, SignalTerm},
     stages::{
         cost_terms::{Coefficients, CostTerm},
-        lifecycle::Lifecycle,
+        lifecycle::{Lifecycle, Words},
     },
     tracking::{
         dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit},
@@ -128,6 +128,10 @@ impl<S: ReadsLoad> Lifecycle for WithLoadReportAgeLimit<S> {
 
     fn needs_lifecycle(&self) -> bool {
         self.stage.needs_lifecycle()
+    }
+
+    fn hears(&self) -> Words {
+        self.stage.hears()
     }
 }
 
@@ -1677,6 +1681,14 @@ impl Lifecycle for ResidentWork {
 
     fn keeps_loads(&self) -> bool {
         true
+    }
+
+    /// The dispatch: a credit is counted from it.
+    fn hears(&self) -> Words {
+        Words {
+            dispatch: true,
+            ..Words::NONE
+        }
     }
 }
 

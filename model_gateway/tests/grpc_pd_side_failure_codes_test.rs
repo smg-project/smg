@@ -62,6 +62,11 @@ const OUTPUT_TOKENS: u32 = 3;
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The words the failing engines put on their status.
 const REASON: &str = "the engine says no";
+/// More chats than a rotation over two workers needs to start one on each:
+/// the bound of a case that sends chats until one starts on a given worker.
+/// Where a rotation starts is its policy's own: classic starts at the first
+/// worker registered, the policy engine at a drawn one.
+const CHATS: usize = 4;
 
 /// What a mock engine does with a generate call.
 #[derive(Clone, Copy, Debug)]
@@ -670,8 +675,6 @@ async fn a_decode_workers_own_500_fails_over_to_the_free_decode_worker_on_both_s
         let (answering_port, answering_calls) =
             start_engine_of(runtime, RefusesStart(Code::Internal)).await;
         let (free_port, free_calls) = start_engine_of(runtime, Completes).await;
-        // Round robin: the first request's decode side is the first decode
-        // worker registered, the one that answers 500.
         let router = build_retrying_pd_router(
             &[
                 (prefill_port, WorkerType::Prefill),
@@ -682,9 +685,19 @@ async fn a_decode_workers_own_500_fails_over_to_the_free_decode_worker_on_both_s
         )
         .await;
 
-        let (status, body) = one_chat(router.as_ref(), false).await;
+        // Round robin: chats go out until one starts its decode side on
+        // the worker that answers 500. Each is answered.
+        let mut chats = 0;
+        while answering_calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                chats < CHATS,
+                "{runtime:?}: none of {CHATS} chats started on the decode worker that answers 500"
+            );
+            let (status, body) = one_chat(router.as_ref(), false).await;
+            assert_eq!(status, http::StatusCode::OK, "{runtime:?}: {body}");
+            chats += 1;
+        }
 
-        assert_eq!(status, http::StatusCode::OK, "{runtime:?}: {body}");
         assert_eq!(
             answering_calls.load(Ordering::SeqCst),
             1,
@@ -692,8 +705,8 @@ async fn a_decode_workers_own_500_fails_over_to_the_free_decode_worker_on_both_s
         );
         assert_eq!(
             free_calls.load(Ordering::SeqCst),
-            1,
-            "{runtime:?}: the free decode worker takes the request"
+            chats,
+            "{runtime:?}: the free decode worker takes the request, as it took each chat before it"
         );
     }
 }

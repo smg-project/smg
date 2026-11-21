@@ -23,7 +23,10 @@ use crate::{
         framework::{DecisionScope, Filter, Picker, Scorer, TieBand},
         view::{Candidate, Constraints, RequestFacts},
     },
-    stages::{lifecycle::Lifecycle, pickers::Best},
+    stages::{
+        lifecycle::{Lifecycle, Words},
+        pickers::Best,
+    },
     tracking::lease::{
         EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal,
     },
@@ -400,6 +403,19 @@ macro_rules! forward_lifecycle {
                         .fallback
                         .as_ref()
                         .is_some_and(|fallback| fallback.needs_lifecycle())
+            }
+
+            // The events the plugin observes, and its fallback's words.
+            fn hears(&self) -> Words {
+                let own = Words {
+                    issue: self.observes.contains(EventKind::Issued),
+                    dispatch: self.observes.contains(EventKind::Dispatched),
+                    end: self.observes.contains(EventKind::Completed)
+                        || self.observes.contains(EventKind::Released),
+                };
+                self.fallback
+                    .as_ref()
+                    .map_or(own, |fallback| own.union(fallback.hears()))
             }
         }
     };
