@@ -736,7 +736,7 @@ fn run_phi_vision_golden_test<P: VisionPreProcessor>(
     println!("{family} - {image_name} image - Max pixel diff: {pixel_diff:.6}");
 
     // If there's a large difference, print detailed info
-    if pixel_diff > 0.1 {
+    if pixel_diff >= tolerance {
         let (max_diff, max_pos) =
             find_max_diff_location_5d(&golden_pixels, &rust_pixels, image_name);
         println!("{family} - {image_name} image - Max diff {max_diff:.4} at position {max_pos:?}");
