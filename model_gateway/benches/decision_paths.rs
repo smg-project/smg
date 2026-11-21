@@ -1,5 +1,5 @@
 //! One request's routing, head to head, over one fleet of workers a model,
-//! every one ready unless the cell says otherwise. Two paths:
+//! every one ready unless the cell says otherwise. Four paths:
 //!
 //! - `classic`: the classic policies over the worker registry.
 //! - `object`: the policy engine asked where the classic placement's pass
@@ -15,6 +15,11 @@
 //!   settings give for the policy decides, and its stages are told the
 //!   request's issue, its dispatch and its end. Every policy the `--policy`
 //!   flag accepts is asked by its name.
+//! - `engine`: the gateway's own engine object, which a router's arm asks
+//!   for the whole decision where the gateway decides in its own process:
+//!   the ask over the route's pool, the commit, the lease's guard with its
+//!   dispatch and its end. What a served request runs under the setting,
+//!   for a policy the engine decides whole.
 //!
 //! A cell is one path, one route, one policy, one fleet size and one count
 //! of callers. Each caller routes requests back to back: the placement, the
@@ -56,8 +61,8 @@
 //! publishes pushed reports at most once in 20 milliseconds. `0`, the
 //! default, publishes once before the first request. The result line counts
 //! the snapshots published while the callers ran (`publications`), and on
-//! the `records` path the times the engine converted a pool's reports
-//! (`conversions`: at most one a snapshot a pool).
+//! the `records` and `engine` paths the times the engine converted a pool's
+//! reports (`conversions`: at most one a snapshot a pool).
 //!
 //! The result line's `alloc_bytes_per_decision` is what the callers'
 //! threads allocated in their timed decisions, by the allocator's own count
@@ -108,8 +113,9 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, route_pair, route_records,
-                set_pair_sides, thread_allocated_bytes, EngineOverRecords, Route,
+                attach_loads, policies_asking_the_engine, route_classic, route_engine, route_pair,
+                route_records, set_pair_sides, thread_allocated_bytes, EngineObject,
+                EngineOverRecords, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -410,11 +416,13 @@ fn prompts(prompts: usize) -> Vec<Vec<u32>> {
 }
 
 /// Who decides a cell's requests: the classic placement over a registry's
-/// policies (the classic ones, or the objects that ask the engine), or the
-/// policy engine's whole decision over records.
+/// policies (the classic ones, or the objects that ask the engine), the
+/// policy engine's whole decision over records, or the gateway's own engine
+/// object, which the routers ask for the whole decision.
 enum Decider {
     Policies(Arc<PolicyRegistry>),
     Records(EngineOverRecords),
+    Engine(EngineObject),
 }
 
 /// The load feed of a cell and the reports it publishes: one a worker.
@@ -464,8 +472,8 @@ fn build(cell: &Cell) -> Built {
             Some(Arc::new(policies))
         }
         "object" => Some(Arc::new(policies_asking_the_engine(&config).unwrap())),
-        "records" => {
-            assert!(!cell.pair, "the records path places single requests");
+        "records" | "engine" => {
+            assert!(!cell.pair, "this path places single requests");
             None
         }
         other => panic!("no path {other}"),
@@ -516,6 +524,9 @@ fn build(cell: &Cell) -> Built {
             }
             Decider::Policies(policies)
         }
+        None if cell.path == "engine" => {
+            Decider::Engine(EngineObject::of(&config, &registry, receiver).unwrap())
+        }
         None => Decider::Records(EngineOverRecords::of(&config, receiver).unwrap()),
     });
     let conversions: Box<dyn Fn() -> u64 + Send + Sync> = {
@@ -526,6 +537,10 @@ fn build(cell: &Cell) -> Built {
             Decider::Records(engine) => models
                 .iter()
                 .map(|model| engine.conversions(&registry, model, route))
+                .sum(),
+            Decider::Engine(_) => models
+                .iter()
+                .map(|model| EngineObject::conversions(&registry, model, route))
                 .sum(),
             Decider::Policies(_) => 0,
         })
@@ -552,6 +567,7 @@ fn build(cell: &Cell) -> Built {
             Decider::Records(engine) => {
                 route_records(&registry, engine, model, route, Some(tokens), headers)
             }
+            Decider::Engine(object) => route_engine(&registry, object, model, route, Some(tokens)),
         }
     });
     Built {
