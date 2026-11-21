@@ -274,6 +274,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   a URL or with a null one, and the `incomplete` status. The crate refused each as an unknown
   variant or a missing field. Breaking: `WebSearchCallStatus` gains `Incomplete`, and
   `WebSearchAction::OpenPage.url` is `Option<String>`.
+- A Realtime session or client secret request keeps what the public API takes, so the
+  `/v1/realtime/sessions`, `/client_secrets` and `/transcription_sessions` routes, which write the
+  typed request back for the upstream, forward it: the session's `tools` as a list (an empty one
+  clears them), where any list was refused; a `turn_detection` of `null`, which turns voice
+  activity detection off, where it was dropped and so left server VAD on; and the client secret's
+  `expires_after`, where it was dropped and so every secret lived the default 600 seconds.
+  Breaking: `RealtimeSessionCreateRequest.tools` is a `Vec`, `RealtimeAudioConfigInput.turn_detection`
+  is an `Option<Option<TurnDetection>>`, and `RealtimeClientSecretCreateRequest` gains
+  `expires_after`.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
