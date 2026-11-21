@@ -11,9 +11,13 @@
 
 use std::sync::Arc;
 
+use ::symphony::formats::json::required_calls_schema;
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::{common::Tool, profile::ProviderProfile};
+use openai_protocol::{
+    common::{Tool, ToolChoice},
+    profile::ProviderProfile,
+};
 use smg_worker::identity::basic::Worker;
 use tool_parser::ToolConstraint;
 use tracing::{debug, error};
@@ -162,18 +166,14 @@ pub(crate) fn prepare(
     });
     let choice = asks.choice();
     // A table's tag that opens with free text does not hold the model to the
-    // call, so the older registry's JSON schema goes out in its place. No
+    // call, so the forced call's JSON schema goes out in its place. No
     // parser is named for it: a parser's own tag opens the same way and is
     // not spelled for the workers' vocabulary. A request that schema cannot
-    // spell keeps the table's tag: one the registry cannot build, or one
+    // spell keeps the table's tag: one that cannot be built, or one
     // that loses what a reference in the tools' parameters points at.
     let from_the_table = from_the_table.map(|found| {
         found.held_by(|| {
-            let schema = ctx
-                .components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(None, tools, choice.as_deref()?, reasoning)
+            let schema = forced_call_schema(tools, choice.as_deref()?)
                 .inspect_err(|e| {
                     debug!(
                         function = stage,
@@ -260,6 +260,26 @@ pub(crate) fn prepare(
         prompt_thought,
         reading: reading.ok(),
     })
+}
+
+/// The JSON schema a forced call is written under where no tag holds it: the
+/// named function's parameters as they are, or the list a `required` choice
+/// asks for. `None` when the choice forces no call.
+fn forced_call_schema(
+    tools: &[Tool],
+    choice: &ToolChoice,
+) -> Result<Option<ToolConstraint>, String> {
+    let Some(first) = tools.first() else {
+        return Ok(None);
+    };
+    if !choice.forces_call() {
+        return Ok(None);
+    }
+    let schema = match choice {
+        ToolChoice::Function { .. } => first.function.parameters_schema().to_string(),
+        _ => required_calls_schema(tools)?.to_string(),
+    };
+    Ok(Some(ToolConstraint::JsonSchema(schema)))
 }
 
 /// What the model's workers say together to a request, before one of them is
