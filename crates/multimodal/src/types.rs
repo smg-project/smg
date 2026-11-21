@@ -444,14 +444,6 @@ impl VideoClip {
             .to_dynamic_images()
             .map(Cow::Owned)
     }
-
-    pub fn raw_bytes(&self) -> &[u8] {
-        &self.raw_bytes
-    }
-
-    pub fn source(&self) -> &VideoSource {
-        &self.source
-    }
 }
 
 impl AudioClip {

@@ -764,10 +764,6 @@ impl<'a> EncoderInputView<'a> {
         }
     }
 
-    pub fn ndim(&self) -> usize {
-        self.shape().len()
-    }
-
     /// Elements in all.
     pub fn len(&self) -> usize {
         self.shape().iter().product()
@@ -775,14 +771,6 @@ impl<'a> EncoderInputView<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// The normalization bytes carry; `None` for floats, already normalized.
-    pub fn pixel_norm(&self) -> Option<PixelNorm> {
-        match self {
-            Self::F32(_) => None,
-            Self::U8 { norm, .. } | Self::Wire { norm, .. } => Some(*norm),
-        }
     }
 
     /// An owned copy, in the same form.

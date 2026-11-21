@@ -178,10 +178,6 @@ impl NemotronTranscribeAudioProcessor {
         })
     }
 
-    pub fn params(&self) -> &NemotronTranscribeAudioParams {
-        &self.params
-    }
-
     /// Batched waveforms right-padded to a common width. The native tower
     /// slices each row to its true post-minimum-pad `audio_signal_length`.
     /// Rejects batches exceeding [`NEMOTRON_MAX_PADDED_AUDIO_BYTES`] before
