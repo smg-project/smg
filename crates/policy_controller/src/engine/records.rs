@@ -158,6 +158,10 @@ pub struct Live<'a> {
     /// Whether a stage of the document reads a worker's count of session
     /// keys with a request in flight.
     sessions: bool,
+    /// The places of the decision's list the request may take, where its
+    /// host narrowed it ([`Self::keeping`]), ascending. `None` for a
+    /// decision over the whole list.
+    kept: Option<&'a [usize]>,
 }
 
 impl<'a> Live<'a> {
@@ -188,7 +192,47 @@ impl<'a> Live<'a> {
             loads,
             counted_key: session_key.filter(|_| needs.session_in_flight),
             sessions: needs.active_sessions,
+            kept: None,
         }
+    }
+
+    /// The same reads for a decision its host narrowed to a part of the
+    /// list: `places` are the places of the list the request may take,
+    /// ascending, as a placement pass names a narrowed list, and `None`
+    /// for the whole list. The decision's record of a worker at any other
+    /// place is written as that of a worker whose breaker refuses
+    /// execution: the stalled bit beside the breaker's, a veto that holds,
+    /// so no stage keeps the row and no rule lifts it.
+    ///
+    /// The records, the ring and the number a decision reads stay the
+    /// list's own: nothing is made for a part. The hold is written on the
+    /// decision's own rows and never on the list's converted rows, which
+    /// are every request's.
+    #[must_use]
+    pub fn keeping(self, places: Option<&'a [usize]>) -> Self {
+        Self {
+            kept: places,
+            ..self
+        }
+    }
+
+    /// Writes the host's hold into `row`, the decision's own record of the
+    /// worker at `position`, where the host narrowed the request to places
+    /// that place is not among ([`Self::keeping`]). Nothing where nothing
+    /// narrows the request: one test.
+    #[inline]
+    fn hold(&self, position: u32, row: &mut Candidate) {
+        let out = |kept: &[usize]| kept.binary_search(&(position as usize)).is_err();
+        if self.kept.is_some_and(out) {
+            Self::held(row);
+        }
+    }
+
+    /// Marks `row` as one a hold of the host stands on.
+    #[inline]
+    fn held(row: &mut Candidate) {
+        row.health.breaker_open = true;
+        row.health.stalled = true;
     }
 
     /// The decision's instant on the engine's clock: what the request's
@@ -641,6 +685,17 @@ impl PoolRecords {
                 self.fixed.is_empty()
             }
         };
+        // Where the decision's host narrowed the request, every place it
+        // may not take stands held on the decision's own rows: one walk of
+        // the rows beside the places kept, and none where nothing narrows.
+        if let Some(kept) = live.kept {
+            let mut kept = kept.iter().peekable();
+            for (place, row) in rows.iter_mut().enumerate() {
+                if kept.next_if(|&&at| at == place).is_none() {
+                    Live::held(row);
+                }
+            }
+        }
         (rows.as_mut_slice(), self.facts(live.clock, reported))
     }
 
@@ -810,6 +865,7 @@ impl<'a> Singly<'a> {
                 self.live.write(worker.as_ref(), row);
             }
         }
+        self.live.hold(fixed.position, row);
     }
 }
 

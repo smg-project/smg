@@ -108,6 +108,23 @@ pub trait RequestMaker {
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         None
     }
+
+    /// The places of the request's list ([`Self::workers`]) the request
+    /// may take, ascending, where its host narrowed it to a part of a pool:
+    /// the list and the positions kept, as a placement pass names a
+    /// narrowed list. An engine that decides over its host's lists reads
+    /// the pool's own records and its ring, and every other place as a
+    /// worker a hold of the host stands on, which no rule lifts
+    /// ([`Live::keeping`](super::Live::keeping)): nothing is made for a
+    /// part. `None`, the default, for a request that may take every worker
+    /// of the list.
+    ///
+    /// A maker that keeps a part says no plain request ([`Self::plain`]):
+    /// a place one pick decides is picked over the whole list.
+    #[cfg(feature = "in-process")]
+    fn kept(&self) -> Option<&[usize]> {
+        None
+    }
 }
 
 impl RequestMaker for Request<'_> {

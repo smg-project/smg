@@ -140,11 +140,6 @@ pub struct PoolMembers {
     /// The list's hash ring ([`Self::ring`]): built off the path of a
     /// request, and by no decision ([`PolicyEngine::fill_ring`]).
     ring: OnceLock<PoolRing>,
-    /// Whether the list is a part of a pool, one ask's value
-    /// ([`Self::part`]). Its turns are then its workers' set's own, kept
-    /// by the picker ([`PolicyEngine::pick_among`]): `rotation` counts
-    /// none, and nothing is kept in `alone`.
-    part: bool,
     /// What a decision whose stages read affinity keeps of the list
     /// ([`Self::affinity`]): read at the list's first such decision, and by
     /// no other.
@@ -159,34 +154,6 @@ pub struct PoolMembers {
 struct OwnWord(AtomicU64);
 
 impl PoolMembers {
-    /// The value of a part of a pool, for one ask: `part` is the workers a
-    /// host narrowed a request to, in their pool's order, as a list of
-    /// their own. The host keeps nothing of the value.
-    ///
-    /// A pick over it takes the part's own turn
-    /// ([`PolicyEngine::pick_among`]): the picker keeps a rotation for the
-    /// set of the part's workers that pass, so the requests narrowed to one
-    /// part take its workers in turn, whatever turns their pool takes
-    /// between them. Making the value reads no worker, draws nothing and
-    /// writes no word two requests share.
-    #[must_use]
-    pub fn part(part: &Arc<[Arc<dyn Worker>]>) -> Self {
-        Self {
-            workers: Arc::clone(part),
-            rotation: OwnWord(AtomicU64::new(0)),
-            records: OnceLock::new(),
-            wires: OnceLock::new(),
-            alone: OnceLock::new(),
-            // A part takes no ring: nothing fills one ask's value, and a
-            // request that reads a ring over it is placed as one that
-            // carries no key ([`RequestFacts::ring_awaited`]).
-            ring: OnceLock::new(),
-            part: true,
-            // So is what its affinity stages keep of it.
-            affinity: PoolAffinity::default(),
-        }
-    }
-
     /// The workers of the pool: the list the value was made from.
     #[must_use]
     pub fn workers(&self) -> &Arc<[Arc<dyn Worker>]> {
@@ -267,11 +234,6 @@ impl PoolMembers {
             let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
             (!ruled).then_some(profile)
         };
-        // A part is one ask's: its answer is kept nowhere, so nothing is
-        // allocated for it.
-        if self.part {
-            return find();
-        }
         let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
         if **named == *model {
             *alone
@@ -357,7 +319,6 @@ impl PolicyEngine {
             wires: OnceLock::new(),
             alone: OnceLock::new(),
             ring: OnceLock::new(),
-            part: false,
             affinity: PoolAffinity::default(),
         }
     }
@@ -449,8 +410,6 @@ impl PolicyEngine {
     /// home. No row is read, no table looked up, no lock taken and nothing
     /// allocated. Where the picker's turns all land on refused workers the
     /// pool is passed over once, as [`Self::pick_among`] passes over a list.
-    /// A part of a pool ([`PoolMembers::part`]) has no word of its own: the
-    /// pick over it is [`Self::pick_among`]'s.
     #[must_use]
     pub fn pick(
         &self,
@@ -459,9 +418,6 @@ impl PolicyEngine {
         admits: impl Fn(RoutingState) -> bool + Copy,
     ) -> Option<usize> {
         let picker = self.picker_of(profile)?;
-        if members.part {
-            return among(picker, &members.workers, admits);
-        }
         pick_by(picker, &members.workers, &members.rotation.0, admits)
     }
 
@@ -548,6 +504,10 @@ impl PolicyEngine {
         // of its making: the pick reads no fact of it.
         let mut picked = None;
         if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
+            debug_assert!(
+                maker.kept().is_none(),
+                "a request narrowed to a part of its list is not plain"
+            );
             if let Some(pick) = single::alone(self, maker.model(), plain, members) {
                 // No stage takes a word of the request: the place is
                 // the whole answer.
@@ -567,9 +527,14 @@ impl PolicyEngine {
         let mut request = maker.make(&self.spec);
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
-            (Phase::Single, WorkerLists::Single(members)) => {
-                single::decide(self, &mut request, members, maker.loads(), now)
-            }
+            (Phase::Single, WorkerLists::Single(members)) => single::decide(
+                self,
+                &mut request,
+                members,
+                maker.loads(),
+                maker.kept(),
+                now,
+            ),
             // A pair is decided at its prefill, over its host's two
             // lists.
             (Phase::Prefill, WorkerLists::Pair(lists)) => {
@@ -868,28 +833,6 @@ mod tests {
             again.rotation.0.load(Ordering::Relaxed),
             "each pool made draws the place its turns start at"
         );
-    }
-
-    /// A part of a pool takes turns of its own: the requests narrowed to
-    /// one part take its workers in turn, each over a value of the part
-    /// made for it, whatever turns the pool takes between them.
-    #[test]
-    fn a_part_of_a_pool_takes_its_workers_in_turn() {
-        let engine = preset("round_robin");
-        let profile = alone(&engine);
-        let list = pool(8);
-        let members = engine.pool_members(&list);
-        let part: Arc<[Arc<dyn Worker>]> = [1, 4, 6].map(|at| Arc::clone(&list[at])).into();
-        let mut seen = [0_u32; 3];
-        for _ in 0..9 {
-            let turn = engine.pick(profile, &members, RoutingState::eligible);
-            assert!(turn.is_some());
-            let narrowed = PoolMembers::part(&part);
-            assert!(Arc::ptr_eq(narrowed.workers(), &part));
-            let at = engine.pick(profile, &narrowed, RoutingState::eligible);
-            seen[at.expect("a worker of the part")] += 1;
-        }
-        assert_eq!(seen, [3; 3], "each worker of the part takes its turn");
     }
 
     /// A place is found by the document's bindings, a model and a phase. A
