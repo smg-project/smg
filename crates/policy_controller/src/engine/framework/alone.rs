@@ -188,14 +188,6 @@ impl Engine {
         self.bindings.iter().all(single) && self.places().all(decided)
     }
 
-    /// Whether every request of the document is a single request that one
-    /// pick of a picker decides: [`Self::single_and_fed`] for a host that
-    /// feeds nothing.
-    #[must_use]
-    pub fn single_and_alone(&self) -> bool {
-        self.single_and_fed(Needs::default())
-    }
-
     /// The first stage of `profile`, which stands at `index`, that asks
     /// more of a decision than one pick of its picker at a place of
     /// `phase`. `None` where no stage does.

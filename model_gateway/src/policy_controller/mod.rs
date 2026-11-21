@@ -61,7 +61,7 @@ pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
     document::{
         operator::{dry_run_against, DocumentManager, Format, SpecRejected},
-        AppliedSpec, IndexKind, PolicySpec, RoutingSettingsError,
+        AppliedSpec, IndexKind, Needs, PolicySpec, RoutingSettingsError,
     },
     stages::StageRegistry,
     store::MemoryStore,
@@ -216,12 +216,34 @@ impl InProcess {
     ///
     /// They do where the engine decides every request of the document in
     /// force whole today: single requests alone, under no sessions rule,
-    /// each place picked by its picker alone. Under any other document the
+    /// each place picked by its picker alone or decided by a profile that
+    /// reads who holds the prompt and asks nothing this process does not
+    /// feed a whole decision ([`fed`]). Under any other document the
     /// routers keep their classic placement pass, whose policies ask the
     /// engine for the pick. The set grows with what the engine decides
     /// whole, and this question goes when it decides every document.
     pub(crate) fn decides_whole(&self) -> bool {
-        self.engine.spec().engine().single_and_alone()
+        self.engine.spec().engine().single_and_fed(fed())
+    }
+}
+
+/// What this process feeds a whole decision of the engine from its own
+/// data, beyond the worker objects' live state.
+///
+/// The routers hash a request's prompt, by its tokens or its text, where
+/// the document's stages read the hashes. The engine reads the cache-event
+/// index this process keeps, and keeps its own record of the prefixes it
+/// sent: together they name a request's holders and a pool's warming
+/// workers. The workers' load reports are not handed to a whole decision
+/// yet, so a profile that reads them is not decided whole.
+fn fed() -> Needs {
+    Needs {
+        token_hashes: true,
+        text_hashes: true,
+        events: true,
+        sent_prefixes: true,
+        affinity: true,
+        ..Needs::default()
     }
 }
 
@@ -376,7 +398,11 @@ fn engine_for(
         DocumentOrigin::Supplied
     };
     if origin == DocumentOrigin::Supplied {
-        if let Some(place) = engine.not_alone() {
+        // A place the engine does not pick alone is decided by its whole
+        // pass where the routers ask the engine for every request of the
+        // document, and by nothing where they do not.
+        let whole = engine.spec().engine().single_and_fed(fed());
+        if let Some(place) = engine.not_alone().filter(|_| !whole) {
             return Err(StartError::NotAlone {
                 profile: place.profile.to_owned(),
                 stage: place.stage.to_string(),

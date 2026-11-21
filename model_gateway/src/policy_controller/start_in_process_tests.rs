@@ -6,14 +6,14 @@ use std::{error::Error, sync::Arc};
 
 use smg_policy_controller::{
     document::{
-        DecodePick, IndexKind, IndexSpec, OverloadSpec, Pairing, PlanName, PolicySpec, ShadowSpec,
-        PRESETS,
+        DecodePick, IndexKind, IndexSpec, Needs, OverloadSpec, Pairing, PlanName, PolicySpec,
+        ShadowSpec, PRESETS,
     },
     engine::Phase,
     stages::StageRegistry,
 };
 
-use super::{start_in_process, would_start, StartError};
+use super::{fed, start_in_process, would_start, InProcess, StartError};
 use crate::config::{
     CacheIndexKind, ManualAssignmentMode, PdPairingMode, PolicyConfig, PowerOfTwoLoadMetric,
     RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
@@ -685,5 +685,63 @@ fn a_hash_index_is_refused_by_its_key_whoever_wrote_the_document() -> Case {
     };
     document.index.insert("chat-*".to_owned(), hash);
     assert_eq!(refusal(&supplied(document))?, refused("chat-*"));
+    Ok(())
+}
+
+/// The routers ask the engine for every request of a document it decides
+/// whole. Round robin's is one: each of its places is picked alone. The
+/// default policy's is not yet: its profile reads who holds the prompt,
+/// which this process feeds a whole decision, and the workers' load
+/// reports, which it does not hand one yet. Nothing else stands between.
+#[test]
+fn the_engine_decides_whole_what_this_process_feeds() -> Case {
+    let started = |policy: PolicyConfig| -> Result<InProcess, Box<dyn Error>> {
+        let config = RouterConfig {
+            policy_controller: true,
+            policy,
+            ..RouterConfig::default()
+        };
+        Ok(start_in_process(&config, None)?.ok_or("the setting starts an engine")?)
+    };
+    assert!(started(PolicyConfig::RoundRobin)?.decides_whole());
+    let default = started(PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864))?;
+    assert!(!default.decides_whole());
+    let declared = default
+        .engine
+        .spec()
+        .engine()
+        .needs_for("a-model", Phase::Single);
+    assert!(declared.affinity && declared.loads);
+    let with_reports = Needs {
+        loads: true,
+        ..fed()
+    };
+    assert!(declared.within(with_reports));
+    assert!(default.engine.spec().engine().single_and_fed(with_reports));
+
+    // A supplied document whose profile reads who holds the prompt and no
+    // report is decided whole, so it starts: the prefix stage by itself.
+    // The warm-up slice reads a report beside it, so a profile that keeps
+    // the slice is refused by the first stage that asks more than a pick.
+    let mut held = PolicySpec::preset("cache_aware")?;
+    let profile = held.profiles.get_mut("cache_aware").ok_or("the profile")?;
+    profile
+        .score
+        .retain(|score| score.name() == "prefix-affinity");
+    let started = start_in_process(&supplied(held), None)?.ok_or("an engine")?;
+    assert!(started.decides_whole());
+    let mut loaded = PolicySpec::preset("cache_aware")?;
+    let profile = loaded
+        .profiles
+        .get_mut("cache_aware")
+        .ok_or("the profile")?;
+    profile
+        .score
+        .retain(|score| matches!(score.name(), "warmup-slice" | "prefix-affinity"));
+    let refused = refusal(&supplied(loaded))?;
+    assert!(
+        refused.starts_with("the policy document's profile `cache_aware` is not decided"),
+        "{refused}"
+    );
     Ok(())
 }

@@ -388,3 +388,47 @@ async fn a_pool_with_no_ready_worker_leaves_the_attempt_none() {
         assert_eq!(policy_engine.faults(), 0, "{name}");
     }
 }
+
+/// The place in `workers` of the worker a regular attempt with the prompt
+/// `tokens` is placed on.
+async fn placed_on(
+    policy_engine: &PolicyEngine,
+    workers: &[Arc<dyn Worker>],
+    tokens: &[u32],
+) -> usize {
+    let hashes = policy_engine.hashes(MODEL, &Prompt::of(Some(tokens), None));
+    let id = mark();
+    let ask = Ask {
+        pool: Some(RoutingPool::HttpRegular),
+        hashes: Some(&hashes),
+        ..Ask::of(&id, MODEL)
+    };
+    let placed = policy_engine.place(&ask, Instant::now()).await;
+    let placed = placed.expect("a worker");
+    let at = workers
+        .iter()
+        .position(|worker| Arc::ptr_eq(worker, placed.worker()));
+    at.expect("a worker the registry lists")
+}
+
+/// An attempt under the default policy is named the worker its prompt was
+/// sent to: the engine of this process reads its own record of sent
+/// prefixes at the whole decision and writes it behind the pick. The
+/// prompt's later attempts go back to that worker, and other prompts are
+/// not held to it.
+#[tokio::test]
+async fn the_default_policys_attempt_goes_back_to_the_worker_its_prompt_was_sent_to() {
+    let (policy_engine, workers) = own("cache_aware", 8);
+    let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+    let asked = prompt(0);
+    let first = placed_on(&policy_engine, &workers, &asked).await;
+    for _ in 0..32 {
+        assert_eq!(placed_on(&policy_engine, &workers, &asked).await, first);
+    }
+    let mut others = Vec::new();
+    for at in 1..=16 {
+        others.push(placed_on(&policy_engine, &workers, &prompt(at * 100_000)).await);
+    }
+    assert!(others.iter().any(|&at| at != others[0]));
+    assert_eq!(policy_engine.faults(), 0);
+}
