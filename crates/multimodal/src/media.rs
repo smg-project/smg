@@ -989,11 +989,12 @@ impl MediaConnector {
         // The header is enough to plan the request by; the pixels are decoded
         // when preprocessing first asks for them, which a pixel-cache hit
         // never does.
-        let size = encoded_image_size(&bytes, max_long_side_pixel)?;
+        let (size, orientation) = encoded_image_size(&bytes, max_long_side_pixel)?;
 
         Ok(Arc::new(
             ImageFrame::encoded(bytes, detail, source, hash, size, max_long_side_pixel)
-                .with_transparency(transparency),
+                .with_transparency(transparency)
+                .with_header_orientation(orientation),
         ))
     }
 
@@ -5064,10 +5065,15 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// (`ico_png_entry`). AVIF is not decoded: no decoder for it is among the
 /// crate's dependencies, and such a file is refused with a typed error that
 /// names the format.
-pub(crate) fn decode_image_bytes(
+///
+/// `header_orientation` is the tag [`encoded_image_size`] read from these
+/// bytes, when the caller holds it: the JPEG path then applies it without
+/// parsing the header again.
+pub(crate) fn decode_frame_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
     transparency: TransparencyPolicy,
+    header_orientation: Option<image::metadata::Orientation>,
 ) -> Result<image::DynamicImage, MediaConnectorError> {
     // An icon file whose chosen entry is a PNG is that PNG from here on
     // (`ico_png_entry`): the entry's own colour type and chunks then drive
@@ -5078,7 +5084,10 @@ pub(crate) fn decode_image_bytes(
     let mut image = match decode_jpeg_rgb(bytes) {
         Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
-            oriented(image, jpeg_orientation(bytes))
+            oriented(
+                image,
+                header_orientation.unwrap_or_else(|| jpeg_orientation(bytes)),
+            )
         }
         None => {
             // A JPEG that ends where the reference loader refuses it (a scan
@@ -5443,12 +5452,23 @@ fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     image::RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
 }
 
+/// [`decode_frame_bytes`] for bytes whose header nobody read first.
+#[cfg(test)]
+pub(crate) fn decode_image_bytes(
+    bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+    transparency: TransparencyPolicy,
+) -> Result<image::DynamicImage, MediaConnectorError> {
+    decode_frame_bytes(bytes, max_long_side_pixel, transparency, None)
+}
+
 /// The dimensions the decode will produce, from the header alone (after the
-/// orientation tag, which swaps the axes for the 90-degree rotations).
+/// orientation tag, which swaps the axes for the 90-degree rotations), and
+/// that tag.
 pub(crate) fn encoded_image_size(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
-) -> Result<ImageSize, MediaConnectorError> {
+) -> Result<(ImageSize, image::metadata::Orientation), MediaConnectorError> {
     // The same entry the decode reads, so the two agree on an icon.
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -5467,7 +5487,7 @@ pub(crate) fn encoded_image_size(
     let (width, height) = max_long_side_pixel
         .and_then(|cap| capped_dimensions(width, height, cap))
         .unwrap_or((width, height));
-    Ok(ImageSize::new(width, height))
+    Ok((ImageSize::new(width, height), orientation))
 }
 
 /// The EXIF orientation of a JPEG, from its header alone; absent or
