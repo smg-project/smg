@@ -572,11 +572,12 @@ pub(crate) async fn resolve_media(
 }
 
 /// Why a count could not be produced: the request does not render (the
-/// client's mistake, a 400 on `/v1/messages`) or the rendered prompt does
+/// client's mistake, a 400 on `/v1/messages`, or the template's own failure,
+/// a 500 there; the [`PromptError`] says which) or the rendered prompt does
 /// not encode (a gateway fault, a 500 there).
 #[derive(Debug)]
 pub(crate) enum CountError {
-    Render(String),
+    Render(PromptError),
     Encode(anyhow::Error),
 }
 
@@ -601,12 +602,14 @@ pub(crate) async fn count_input_tokens(
         placeholders,
         media_order,
     )
-    .map_err(|error| CountError::Render(error.into()))?;
+    .map_err(CountError::Render)?;
     let encoded = chat_utils::encode_prompt_blocking(tokenizer, &processed.text, encoding)
         .await
         .map_err(CountError::Encode)?;
     u32::try_from(encoded.token_ids().len()).map_err(|_| {
-        CountError::Render("the prompt has more tokens than a count can report".to_owned())
+        CountError::Render(PromptError::Failed(
+            "the prompt has more tokens than a count can report".to_owned(),
+        ))
     })
 }
 

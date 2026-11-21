@@ -1701,6 +1701,109 @@ impl std::fmt::Display for TemplateRefusal {
 
 impl std::error::Error for TemplateRefusal {}
 
+/// A render that failed on the template's own account, whatever its caller
+/// handed it: the compiled template is not there to render, or the engine
+/// stopped on something the template's source alone decides
+/// ([`is_the_templates_own`]: another template it asks for, a filter, a test,
+/// a function or a block the engine does not have). Output that is not UTF-8
+/// is typed the same: the engine writes text alone, so no value makes it.
+/// The model's template is the one to fix, which its deployment can and no
+/// caller can.
+///
+/// A failure a value can bring about (an operation on a value of the wrong
+/// kind, an undefined value, a bad argument) is not this one, though the
+/// template may be at fault there too: the render cannot tell a caller's
+/// value that broke a sound template from a template that breaks on some
+/// values, and it does not put a caller's mistake on the deployment. The
+/// text is the render failure's, as every render failure reads.
+#[derive(Debug)]
+pub struct TemplateFailure(String);
+
+impl TemplateFailure {
+    /// Whether `error` is this failure, at any depth of its chain.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for TemplateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateFailure {}
+
+/// Whether a render's error is the template's own, whatever its caller
+/// handed it ([`TemplateFailure`]).
+///
+/// The rule: a kind is the template's own only where the engine raises it
+/// from the template's source alone, so that no value of the caller's (a
+/// message, a tool, a template argument) decides whether it is raised. A kind
+/// a value can bring about stays the plain failure it was, and so does a kind
+/// not shown to be free of them: a caller's mistake never reads as the
+/// template's. The arms are read from the engine's sources at the release
+/// this crate pins; the enum is open, so a kind another release adds, or one
+/// behind an engine feature this crate does not enable, falls to the plain
+/// side until it is classed here.
+fn is_the_templates_own(error: &MinijinjaError) -> bool {
+    match error.kind() {
+        // The compiler's alone, over a template's source text: no render
+        // raises them, and a template that has them does not load.
+        ErrorKind::SyntaxError | ErrorKind::BadEscape => true,
+        // Another template asked for by name (`include`, `extends`,
+        // `import`). The environment a chat template renders in holds that
+        // one template and has no loader, so no name is another template,
+        // whether the source spells the name or reads it from a value.
+        ErrorKind::TemplateNotFound => true,
+        // A called name that nothing defines. A caller supplies values and
+        // never a callable, so no value defines the name. A value put under
+        // the name of a function the engine has does shadow it, and the call
+        // then fails as an operation on that value (not callable), another
+        // kind.
+        ErrorKind::UnknownFunction => true,
+        // `self.name()` for a block the template does not define: the name
+        // is in the source.
+        ErrorKind::UnknownBlock => true,
+        // A filter or a test the engine does not have. Named in the source
+        // (`value | name`, `value is name`), the engine says which in the
+        // error's detail, and Jinja2 refuses such a template when it compiles
+        // it. Looked up from an argument's value by `map`, `select` and
+        // their kin, the error has no detail, and the value may be the
+        // caller's.
+        ErrorKind::UnknownFilter | ErrorKind::UnknownTest => error.detail().is_some(),
+        // A write to the output failed, the one thing the engine makes this
+        // kind from. A render writes into memory, where a write does not
+        // fail, so no value brings it about.
+        ErrorKind::WriteFailure => true,
+        // An operation on values the engine or a function could not run: an
+        // operator over the wrong kinds, a value that is not callable or not
+        // iterable, a function's own refusal of its input.
+        ErrorKind::InvalidOperation => false,
+        // A method the value does not have: the value's kind decides.
+        ErrorKind::UnknownMethod => false,
+        // An undefined value was used: whether a name or an attribute is
+        // defined is the caller's data.
+        ErrorKind::UndefinedError => false,
+        // A call with the wrong arguments. A call can spread a value into
+        // its arguments, and a function can find one of them undefined.
+        ErrorKind::TooManyArguments | ErrorKind::MissingArgument => false,
+        // A value of the wrong shape was unpacked into names.
+        ErrorKind::CannotUnpack => false,
+        // A value did not serialize, or did not read as a function's
+        // argument type.
+        ErrorKind::BadSerialization | ErrorKind::CannotDeserialize => false,
+        // About a value where a primitive or a map key was expected; the
+        // engine at this release raises neither.
+        ErrorKind::NonPrimitive | ErrorKind::NonKey => false,
+        // Wrappers around the failure of an included template or a parent
+        // block, which may be of any kind.
+        ErrorKind::BadInclude | ErrorKind::EvalBlock => false,
+        // A kind this build does not name.
+        _ => false,
+    }
+}
+
 /// Transformers' `{% generation %}` ... `{% endgeneration %}` block marks the
 /// assistant tokens for a training mask and renders its body unchanged; the
 /// engine here has no such statement and would refuse the whole template. The
@@ -3699,7 +3802,7 @@ fn render_messages<'a>(
 ) -> Result<(String, bool)> {
     let tmpl = env
         .get_template("chat")
-        .map_err(|e| anyhow!("Failed to get template: {e}"))?;
+        .map_err(|e| TemplateFailure(format!("Failed to get template: {e}")))?;
 
     // transformers adds `strftime_now` to the template environment; here it is
     // a callable of the render context, bound to the render's instant. The
@@ -3765,17 +3868,27 @@ fn render_messages<'a>(
     tmpl.render_captured_to(&ctx, &mut rendered).map_err(|e| {
         let message = format!("Failed to render template: {e}");
         // The template's own refusal keeps its type, at any depth of the
-        // error's sources (a macro or an include wraps it).
+        // error's sources (a macro or an include wraps it), and so does a
+        // failure that is the template's own whatever the caller handed it.
+        // Any other stays the plain failure it was.
         let raised = iter::successors(std::error::Error::source(&e), |cause| cause.source())
             .any(|cause| cause.is::<RaisedByTemplate>());
         if raised {
             anyhow::Error::new(TemplateRefusal(message))
+        } else if is_the_templates_own(&e) {
+            anyhow::Error::new(TemplateFailure(message))
         } else {
             anyhow!(message)
         }
     })?;
-    let mut rendered = String::from_utf8(rendered)
-        .map_err(|e| anyhow!("Failed to render template: the output is not UTF-8: {e}"))?;
+    // The engine writes its output a `str` at a time (the template's text,
+    // and each value formatted to text), so no caller's value makes the
+    // whole anything but UTF-8: a failure here is the render's own.
+    let mut rendered = String::from_utf8(rendered).map_err(|e| {
+        TemplateFailure(format!(
+            "Failed to render template: the output is not UTF-8: {e}"
+        ))
+    })?;
     output_len.record(rendered.len());
     // The text travels with the request: a render much shorter than the hint
     // gives the slack back, or a short prompt after a long one would carry the

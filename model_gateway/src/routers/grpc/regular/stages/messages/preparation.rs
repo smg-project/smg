@@ -121,14 +121,16 @@ impl MessagePreparationStage {
             Err(e) => {
                 // As in the chat preparation: one WARN and the mark only for
                 // a refusal typed as the request's own; every other failure
-                // keeps ERROR and stays unmarked.
+                // keeps ERROR and stays unmarked, the one that is the
+                // template's own whatever the request holds answered in the
+                // server's class.
                 let refused = e.is_refusal();
                 if refused {
                     warn!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
                 } else {
                     error!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
                 }
-                let answer = error::bad_request("process_messages_failed", String::from(e));
+                let answer = e.answer();
                 return Err(if refused {
                     utils::reported(answer)
                 } else {

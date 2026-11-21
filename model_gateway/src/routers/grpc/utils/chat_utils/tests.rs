@@ -2958,3 +2958,160 @@ fn a_dropped_pool_call_holds_its_permit_until_the_blocking_work_ends() {
         );
     });
 }
+
+/// A chat request rendered through `template`, as the preparation stage
+/// renders it: the prompt's text, or why there is none.
+fn rendered(template: Option<&str>, request: Value) -> Result<String, PromptError> {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    if let Some(template) = template {
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+    }
+    let request: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+    process_chat_messages_with_placeholders(
+        &request,
+        &tokenizer,
+        None,
+        MediaPartOrder::MediaFirst,
+        ProviderProfile::for_model(&request.model),
+    )
+    .map(|(processed, _)| processed.text)
+}
+
+/// The status and the code of the answer to `error`.
+fn answered(error: PromptError) -> (http::StatusCode, String) {
+    let answer = error.answer();
+    let code = error::extract_error_code_from_response(&answer).to_string();
+    (answer.status(), code)
+}
+
+/// One user turn, with `kwargs` as the request's `chat_template_kwargs`.
+fn one_turn_with(kwargs: Value) -> Value {
+    json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_kwargs": kwargs
+    })
+}
+
+/// A failure that is the template's own whatever the request holds is the
+/// one cause of a failed render answered in the server's class: a 500
+/// `chat_template_render_failed` under the render failure's text, for a
+/// template that asks for another template and for one that names a filter
+/// the engine does not have.
+#[test]
+fn a_templates_own_failure_is_answered_in_the_servers_class() {
+    for template in [
+        "{% include 'tools.jinja' %}",
+        "{{ messages | no_such_filter }}",
+    ] {
+        let error = rendered(Some(template), one_turn_with(json!({}))).unwrap_err();
+        assert!(error.is_template_failure(), "{template}: {error:?}");
+        assert!(!error.is_refusal(), "{template}: {error:?}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to apply chat template: Failed to render template: "),
+            "{template}: {error}"
+        );
+        assert_eq!(
+            answered(error),
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "chat_template_render_failed".to_string()
+            ),
+            "{template}"
+        );
+    }
+}
+
+/// A render the request can break stays the 400 `process_messages_failed` it
+/// was, and is no refusal: a `chat_template_kwargs` entry under the name of
+/// a function the template calls (its own `raise_exception` among them) or
+/// of a kind the template does not expect. Each template is sound without
+/// the entry. A template that breaks on every conversation (it iterates over
+/// a number) fails with the same kind of error, which the render cannot tell
+/// from a request's value: it stays a 400 too, though the template is at
+/// fault. So do a model with no template, a continuation the render refuses
+/// because the message's reasoning would be lost, and a bare message of the
+/// gateway's own checks. The template's own refusal is the request's 400.
+#[test]
+fn a_render_the_request_can_break_stays_a_400() {
+    let still_a_400 = (
+        http::StatusCode::BAD_REQUEST,
+        "process_messages_failed".to_string(),
+    );
+    let calls_namespace = "{% set ns = namespace(found=false) %}{{ ns.found }}";
+    let refuses = "{{ raise_exception('the roles must alternate') }}";
+    let writes_a_date = "{{ 'Today Date: ' + date_string }}";
+
+    for (template, kwargs) in [
+        (calls_namespace, json!({"namespace": 0})),
+        (refuses, json!({"raise_exception": 0})),
+        (writes_a_date, json!({"date_string": 20_261_120})),
+        ("{% for part in 42 %}{{ part }}{% endfor %}", json!({})),
+    ] {
+        let error = rendered(Some(template), one_turn_with(kwargs.clone())).unwrap_err();
+        assert!(
+            matches!(error, PromptError::Failed(_)),
+            "{template} {kwargs}: {error:?}"
+        );
+        assert!(
+            error.to_string().starts_with(
+                "Failed to apply chat template: Failed to render template: invalid operation: "
+            ),
+            "{template} {kwargs}: {error}"
+        );
+        assert_eq!(answered(error), still_a_400, "{template} {kwargs}");
+    }
+    assert_eq!(
+        rendered(Some(calls_namespace), one_turn_with(json!({}))).unwrap(),
+        "False"
+    );
+    assert_eq!(
+        rendered(
+            Some(writes_a_date),
+            one_turn_with(json!({"date_string": "20 Nov 2026"}))
+        )
+        .unwrap(),
+        "Today Date: 20 Nov 2026"
+    );
+
+    let refused = rendered(Some(refuses), one_turn_with(json!({}))).unwrap_err();
+    assert!(refused.is_refusal(), "{refused:?}");
+    assert_eq!(answered(refused), still_a_400);
+
+    let no_template = rendered(None, one_turn_with(json!({}))).unwrap_err();
+    assert!(
+        matches!(no_template, PromptError::Failed(_)),
+        "{no_template:?}"
+    );
+    assert_eq!(answered(no_template), still_a_400);
+
+    let continued = rendered(
+        Some(
+            "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}\n{% endif %}\
+             {% endfor %}",
+        ),
+        json!({
+            "model": "m",
+            "continue_final_message": true,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Partial", "reasoning_content": "still thinking"}
+            ]
+        }),
+    )
+    .unwrap_err();
+    assert!(matches!(continued, PromptError::Failed(_)), "{continued:?}");
+    assert!(
+        continued
+            .to_string()
+            .ends_with("its reasoning_content would be lost"),
+        "{continued}"
+    );
+    assert_eq!(answered(continued), still_a_400);
+
+    let bare = PromptError::from("a check of the gateway's own".to_string());
+    assert_eq!(answered(bare), still_a_400);
+}

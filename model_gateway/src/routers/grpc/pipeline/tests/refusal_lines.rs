@@ -318,6 +318,223 @@ async fn a_conversation_the_template_refuses_is_one_warn_and_marked_on_both_door
     );
 }
 
+/// A chat template that fails on its own account whatever the request holds (here it asks for
+/// another template, and the model has this one alone) is the deployment's to fix, and answered
+/// in the server's class so that it alerts. Both doors answer a 500 `chat_template_render_failed`
+/// under the render failure's text, unmarked, with the stage's ERROR line and the pipeline's own
+/// after it.
+#[tokio::test]
+async fn a_template_that_fails_on_its_own_is_a_500_with_the_error_lines_on_both_doors() {
+    let tokenizer = Arc::new(
+        MockTokenizer::new()
+            .with_chat_template("{% include 'tools.jinja' %}")
+            .expect("a template that compiles and cannot render"),
+    ) as Arc<dyn Tokenizer>;
+    let (chat, messages, components) = both_doors_over(tokenizer).await;
+    let lines = LinesAtWarnOrAbove::default();
+    let _subscriber = test_subscriber(lines.clone());
+
+    let answers = one_turn_through_both_doors(&chat, &messages, components).await;
+
+    for response in &answers {
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(response),
+            "chat_template_render_failed"
+        );
+        assert!(!marked(response));
+    }
+    let lines = lines.lines();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(
+        [&lines[0], &lines[2]],
+        [
+            &(Level::ERROR, "Failed to process chat messages".to_string()),
+            &(Level::ERROR, "Failed to process messages".to_string()),
+        ]
+    );
+    for line in [&lines[1], &lines[3]] {
+        assert!(
+            line.0 == Level::ERROR && line.1.starts_with("Stage "),
+            "{lines:?}"
+        );
+    }
+    for response in answers {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the answer's body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(
+                "Failed to apply chat template: Failed to render template: template not found: "
+            ),
+            "{body}"
+        );
+    }
+}
+
+/// A render that stops on a value stays the 400 it was on both doors, unmarked, with the stage's
+/// ERROR line and none of the pipeline's: the request may be the cause. The first template reads
+/// a second message, which a conversation of one turn does not have. The second iterates over a
+/// number and fails on every conversation: the template is at fault there, but its error is of
+/// the kind a request's value brings about, which the render cannot tell apart, so it is not
+/// answered as the deployment's.
+#[tokio::test]
+async fn a_render_that_stops_on_a_value_stays_a_400_on_both_doors() {
+    for template in [
+        "{{ messages[1]['content'] }}",
+        "{% for part in 42 %}{{ part }}{% endfor %}",
+    ] {
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_chat_template(template)
+                .expect("a template that compiles"),
+        ) as Arc<dyn Tokenizer>;
+        let (chat, messages, components) = both_doors_over(tokenizer).await;
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let answers = one_turn_through_both_doors(&chat, &messages, components).await;
+
+        for response in &answers {
+            assert_eq!(
+                response.status(),
+                http::StatusCode::BAD_REQUEST,
+                "{template}"
+            );
+            assert_eq!(
+                error::extract_error_code_from_response(response),
+                "process_messages_failed",
+                "{template}"
+            );
+            assert!(!marked(response), "{template}");
+        }
+        assert_eq!(
+            lines.lines(),
+            [
+                (Level::ERROR, "Failed to process chat messages".to_string()),
+                (Level::ERROR, "Failed to process messages".to_string()),
+            ],
+            "{template}"
+        );
+    }
+}
+
+/// A `chat_template_kwargs` entry can break a sound template's render: one under the name of a
+/// function the template calls (its own `raise_exception` among them), one of a kind the
+/// template does not expect. The request is the cause, and the chat door answers the 400
+/// `process_messages_failed`, not the deployment's 500.
+#[tokio::test]
+async fn a_template_argument_that_breaks_the_render_stays_a_400() {
+    for (template, kwargs) in [
+        (
+            "{% set ns = namespace(found=false) %}{{ ns.found }}",
+            serde_json::json!({"namespace": 0}),
+        ),
+        (
+            "{{ raise_exception('the roles must alternate') }}",
+            serde_json::json!({"raise_exception": 0}),
+        ),
+        (
+            "{{ 'Today Date: ' + date_string }}",
+            serde_json::json!({"date_string": 20_261_120}),
+        ),
+    ] {
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_chat_template(template)
+                .expect("a template that compiles"),
+        ) as Arc<dyn Tokenizer>;
+        let (chat, _, components) = both_doors_over(tokenizer).await;
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let response = chat_response(
+            &chat,
+            components,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": kwargs
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::BAD_REQUEST,
+            "{template}"
+        );
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "process_messages_failed",
+            "{template}"
+        );
+        assert!(!marked(&response), "{template}");
+        assert_eq!(
+            lines.lines(),
+            [(Level::ERROR, "Failed to process chat messages".to_string())],
+            "{template}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the answer's body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(
+                "Failed to apply chat template: Failed to render template: invalid operation: "
+            ),
+            "{template}: {body}"
+        );
+    }
+}
+
+/// A continuation the render refuses is the request's and stays a 400: a final assistant message
+/// the template does not write cannot be continued, and its reasoning would be lost after the
+/// generation prompt. Nobody types that check, so the stage keeps its ERROR line and the answer
+/// is unmarked.
+#[tokio::test]
+async fn a_continuation_the_render_refuses_stays_a_400() {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+            .expect("a tokenizer");
+    tokenizer
+        .set_chat_template(
+            "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}\n{% endif %}\
+             {% endfor %}"
+                .to_string(),
+        )
+        .expect("a template that writes the user turns alone");
+    let (chat, _, components) = both_doors_over(Arc::new(tokenizer)).await;
+    let lines = LinesAtWarnOrAbove::default();
+    let _subscriber = test_subscriber(lines.clone());
+
+    let response = chat_response(
+        &chat,
+        components,
+        serde_json::json!({
+            "model": MODEL,
+            "continue_final_message": true,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Partial", "reasoning_content": "still thinking"}
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error::extract_error_code_from_response(&response),
+        "process_messages_failed"
+    );
+    assert!(!marked(&response));
+    assert_eq!(
+        lines.lines(),
+        [(Level::ERROR, "Failed to process chat messages".to_string())]
+    );
+}
+
 /// A tokenizer with no chat template fails every request at the render, whatever the request
 /// holds: the deployment's to fix. Both doors keep the stage's ERROR line, leave the answer
 /// unmarked and say in it what the model lacks and that no request can supply it.

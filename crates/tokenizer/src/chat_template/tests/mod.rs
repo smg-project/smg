@@ -1705,6 +1705,361 @@ fn a_templates_own_refusal_is_typed_and_another_render_failure_is_not() {
     );
 }
 
+/// The classes of the engine's error kinds, a kind at a time: the template's
+/// own where the template's source alone raises the kind, a plain failure
+/// where a value can. A filter or a test the engine does not have is the
+/// template's own only where the source names it: looked up from an
+/// argument's value, the error has no detail and stays plain.
+#[test]
+fn each_error_kind_is_classed_by_whether_a_value_can_raise_it() {
+    let own = |kind: ErrorKind| is_the_templates_own(&MinijinjaError::new(kind, "a detail"));
+    for kind in [
+        ErrorKind::SyntaxError,
+        ErrorKind::BadEscape,
+        ErrorKind::TemplateNotFound,
+        ErrorKind::UnknownFunction,
+        ErrorKind::UnknownBlock,
+        ErrorKind::UnknownFilter,
+        ErrorKind::UnknownTest,
+        ErrorKind::WriteFailure,
+    ] {
+        assert!(own(kind), "{kind:?}");
+    }
+    for kind in [
+        ErrorKind::InvalidOperation,
+        ErrorKind::UnknownMethod,
+        ErrorKind::UndefinedError,
+        ErrorKind::TooManyArguments,
+        ErrorKind::MissingArgument,
+        ErrorKind::CannotUnpack,
+        ErrorKind::BadSerialization,
+        ErrorKind::CannotDeserialize,
+        ErrorKind::NonPrimitive,
+        ErrorKind::NonKey,
+        ErrorKind::BadInclude,
+        ErrorKind::EvalBlock,
+    ] {
+        assert!(!own(kind), "{kind:?}");
+    }
+    for kind in [ErrorKind::UnknownFilter, ErrorKind::UnknownTest] {
+        assert!(
+            !is_the_templates_own(&MinijinjaError::from(kind)),
+            "{kind:?} without a detail"
+        );
+    }
+}
+
+/// The failure of rendering `conversation` through `template` with `kwargs`
+/// as the caller's template arguments.
+fn render_failure(
+    template: &str,
+    conversation: &[serde_json::Value],
+    kwargs: serde_json::Value,
+    continue_final_message: bool,
+) -> anyhow::Error {
+    let kwargs: HashMap<String, serde_json::Value> = serde_json::from_value(kwargs).unwrap();
+    ChatTemplateState::new(Some(template.to_string()))
+        .unwrap()
+        .apply(
+            conversation,
+            ChatTemplateParams {
+                template_kwargs: Some(&kwargs),
+                continue_final_message,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+}
+
+/// A render that stops on something the template's source alone decides is
+/// typed as the template's failure, under the text every render failure
+/// reads, a kind of the engine's at a time: another template it asks for,
+/// and a filter, a test, a function and a block the engine does not have. So
+/// is a template that is not there to look up. A continued render types it
+/// the same.
+#[test]
+fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates() {
+    let conversation = [
+        serde_json::json!({"role": "user", "content": "hi"}),
+        serde_json::json!({"role": "assistant", "content": "Partial"}),
+    ];
+    for (template, kind) in [
+        ("{% include 'tools.jinja' %}", "template not found"),
+        ("{% extends 'base.jinja' %}", "template not found"),
+        (
+            "{% import 'macros.jinja' as macros %}",
+            "template not found",
+        ),
+        ("{{ messages | no_such_filter }}", "unknown filter"),
+        (
+            "{% if messages is no_such_test %}x{% endif %}",
+            "unknown test",
+        ),
+        ("{{ no_such_function() }}", "unknown function"),
+        ("{{ self.no_such_block() }}", "unknown block"),
+    ] {
+        for continued in [false, true] {
+            let failed = render_failure(template, &conversation, serde_json::json!({}), continued);
+            assert!(TemplateFailure::is(&failed), "{template}: {failed:#}");
+            assert!(!TemplateRefusal::is(&failed), "{template}: {failed:#}");
+            assert!(
+                failed
+                    .to_string()
+                    .starts_with(&format!("Failed to render template: {kind}: ")),
+                "{template}: {failed}"
+            );
+        }
+    }
+
+    let unnamed = render_messages(
+        &Environment::new(),
+        conversation.iter(),
+        ChatTemplateParams::default(),
+        &RenderedLength::default(),
+    )
+    .unwrap_err();
+    assert!(TemplateFailure::is(&unnamed), "{unnamed:#}");
+    assert!(
+        unnamed
+            .to_string()
+            .starts_with("Failed to get template: template not found: "),
+        "{unnamed}"
+    );
+
+    // A template whose source does not compile is refused when it loads,
+    // under the compiler's two kinds: no render meets either.
+    for (template, kind) in [
+        ("{% if %}", "syntax error"),
+        (r#"{{ "\uzzzz" }}"#, "bad string escape"),
+    ] {
+        let refused = ChatTemplateState::new(Some(template.to_string()))
+            .expect_err("a template that does not compile");
+        assert!(
+            refused
+                .to_string()
+                .starts_with(&format!("Failed to add template: {kind}")),
+            "{template}: {refused}"
+        );
+    }
+}
+
+/// A render that stops on a value stays the plain failure it was, neither
+/// the template's failure nor its refusal, a kind of the engine's at a time.
+/// A caller's template argument can break a sound template this way: one of
+/// the wrong kind, or one that takes the name of a function the template
+/// calls, its own `raise_exception` among them. A template that breaks on
+/// every conversation (it iterates over a number) fails with the same kind,
+/// which the render cannot tell from a caller's value, and stays plain too.
+#[test]
+fn a_render_failure_a_value_can_bring_about_stays_plain() {
+    let one_turn = [serde_json::json!({"role": "user", "content": "hi"})];
+    let parts = [serde_json::json!({"role": "user", "content": []})];
+    let none = || serde_json::json!({});
+    let calls_namespace = "{% set ns = namespace(found=false) %}{{ ns.found }}";
+    let refuses = "{{ raise_exception('the roles must alternate') }}";
+    let writes_a_date = "{{ 'Today Date: ' + date_string }}";
+    let cases = [
+        // A caller's template argument under the name of a function.
+        (
+            calls_namespace,
+            &one_turn[..],
+            serde_json::json!({"namespace": 0}),
+            "invalid operation",
+        ),
+        (
+            calls_namespace,
+            &one_turn[..],
+            serde_json::json!({"namespace": null}),
+            "invalid operation",
+        ),
+        (
+            refuses,
+            &one_turn[..],
+            serde_json::json!({"raise_exception": 0}),
+            "invalid operation",
+        ),
+        // A caller's template argument of the wrong kind.
+        (
+            writes_a_date,
+            &one_turn[..],
+            serde_json::json!({"date_string": 20_261_120}),
+            "invalid operation",
+        ),
+        // Content of a shape the template does not take.
+        (
+            "{{ 'user: ' + messages[0]['content'] }}",
+            &parts[..],
+            none(),
+            "invalid operation",
+        ),
+        // The template's own bug, on every conversation.
+        (
+            "{% for part in 42 %}{{ part }}{% endfor %}",
+            &one_turn[..],
+            none(),
+            "invalid operation",
+        ),
+        (
+            "{{ messages[0]['content'].no_such_method() }}",
+            &one_turn[..],
+            none(),
+            "unknown method",
+        ),
+        // A second message the conversation does not have.
+        (
+            "{{ messages[1]['content'] }}",
+            &one_turn[..],
+            none(),
+            "undefined value",
+        ),
+        (
+            "{{ raise_exception() }}",
+            &one_turn[..],
+            none(),
+            "missing argument",
+        ),
+        (
+            "{{ raise_exception('a', 'b') }}",
+            &one_turn[..],
+            none(),
+            "too many arguments",
+        ),
+        (
+            "{% for a, b, c in messages %}{% endfor %}",
+            &one_turn[..],
+            none(),
+            "cannot unpack",
+        ),
+        // The template includes itself: the wrapper around whatever stopped
+        // the included render.
+        (
+            "{% include 'chat' %}",
+            &one_turn[..],
+            none(),
+            "could not render include",
+        ),
+        // A filter and a test named by an argument's value.
+        (
+            "{{ messages | map('no_such_filter') | list }}",
+            &one_turn[..],
+            none(),
+            "unknown filter",
+        ),
+        (
+            "{{ messages | select('no_such_test') | list }}",
+            &one_turn[..],
+            none(),
+            "unknown test",
+        ),
+    ];
+    for (template, conversation, kwargs, kind) in cases {
+        let failed = render_failure(template, conversation, kwargs.clone(), false);
+        assert!(
+            !TemplateFailure::is(&failed),
+            "{template} {kwargs}: {failed:#}"
+        );
+        assert!(
+            !TemplateRefusal::is(&failed),
+            "{template} {kwargs}: {failed:#}"
+        );
+        assert!(
+            failed
+                .to_string()
+                .starts_with(&format!("Failed to render template: {kind}")),
+            "{template} {kwargs}: {failed}"
+        );
+    }
+
+    // Without the argument that broke them, the templates above are sound:
+    // two render, and the third refuses in its own words.
+    let sound = |template: &str, kwargs: serde_json::Value| {
+        let kwargs: HashMap<String, serde_json::Value> = serde_json::from_value(kwargs).unwrap();
+        ChatTemplateState::new(Some(template.to_string()))
+            .unwrap()
+            .apply(
+                &one_turn,
+                ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                },
+            )
+    };
+    assert_eq!(sound(calls_namespace, none()).unwrap(), "False");
+    assert_eq!(
+        sound(
+            writes_a_date,
+            serde_json::json!({"date_string": "20 Nov 2026"})
+        )
+        .unwrap(),
+        "Today Date: 20 Nov 2026"
+    );
+    assert!(TemplateRefusal::is(&sound(refuses, none()).unwrap_err()));
+}
+
+/// The render's own checks of the request are not the template's failure,
+/// and not its refusal: a continuation asked for beside a generation prompt,
+/// one with no message to continue, and one of a message whose reasoning
+/// the fallback would lose, because the message has no text or because the
+/// template never writes it. A caller answers each as a request it could not
+/// render.
+#[test]
+fn the_renders_checks_of_the_request_are_not_typed_as_the_templates_failure() {
+    let state = |template: &str| ChatTemplateState::new(Some(template.to_string())).unwrap();
+    let every_turn = state("{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}");
+    let user_turns = state(
+        "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}\n{% endif %}{% endfor %}",
+    );
+    let continuing = || ChatTemplateParams {
+        continue_final_message: true,
+        ..Default::default()
+    };
+    let user = serde_json::json!({"role": "user", "content": "hi"});
+    let thinking = |content: serde_json::Value| {
+        serde_json::json!({
+            "role": "assistant",
+            "content": content,
+            "reasoning_content": "still thinking"
+        })
+    };
+    let lost = "only its text could follow the generation prompt, and its reasoning_content \
+                would be lost";
+    let cases = [
+        (
+            &every_turn,
+            vec![user.clone(), thinking("Partial".into())],
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                ..continuing()
+            },
+            "continue_final_message and add_generation_prompt are not compatible".to_string(),
+        ),
+        (
+            &every_turn,
+            vec![],
+            continuing(),
+            "no final message to continue".to_string(),
+        ),
+        (
+            &every_turn,
+            vec![user.clone(), thinking(serde_json::Value::Null)],
+            continuing(),
+            format!("the final message has no text to continue: {lost}"),
+        ),
+        (
+            &user_turns,
+            vec![user.clone(), thinking("Partial".into())],
+            continuing(),
+            format!("the final message does not appear in the rendered chat: {lost}"),
+        ),
+    ];
+    for (state, messages, params, expected) in cases {
+        let error = state.apply(&messages, params).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(!TemplateFailure::is(&error), "{expected}");
+        assert!(!TemplateRefusal::is(&error), "{expected}");
+    }
+}
+
 #[test]
 fn test_special_tokens_injected_into_context() {
     let template = "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}{{ eos_token }}";

@@ -16,8 +16,8 @@ use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{
-        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, TemplateRefusal,
-        ThinkingKeyName,
+        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, TemplateFailure,
+        TemplateRefusal, ThinkingKeyName,
     },
     traits::{Encoding, PromptEncoding, Tokenizer},
     StopRules, StopSequenceConfig, StopSequenceDecoder,
@@ -1197,12 +1197,29 @@ pub fn request_as_rendered(
 /// source the route does not take, a response format the renderer does not
 /// take with the request's other fields, a conversation the model's template
 /// rejects through its own `raise_exception`. A stage writes one WARN for it
-/// and marks its answer reported. Every other cause is [`Self::Failed`], which
-/// is also what a bare message converts into: a failure nobody typed as the
-/// request's is the deployment's, and the stage keeps its ERROR line for it.
+/// and marks its answer reported.
+///
+/// [`Self::TemplateFailed`] is a render the model's chat template failed on
+/// its own account, whatever the request holds ([`TemplateFailure`]): the
+/// template is not there to render, or it asks the engine for another
+/// template, a filter, a test or a function that the engine does not have. A
+/// template is its deployment's to fix, so this one cause is answered in the
+/// server's class ([`Self::answer`]) and a broken template alerts instead of
+/// reading as its clients' mistakes.
+///
+/// Every other cause is [`Self::Failed`], which is also what a bare message
+/// converts into: a failure nobody typed as the request's is the
+/// deployment's, and the stage keeps its ERROR line for it. Its answer keeps
+/// the 400 it had, because a request can be the cause of these: a render
+/// that stops on a value (a `chat_template_kwargs` entry of a kind the
+/// template does not expect, or one that takes the name of a function it
+/// calls), a continuation the render cannot make, a tool the template cannot
+/// be handed. A template that breaks on some values fails the same way, and
+/// the render does not tell the two apart.
 #[derive(Debug)]
 pub enum PromptError {
     Refused(String),
+    TemplateFailed(String),
     Failed(String),
 }
 
@@ -1212,22 +1229,47 @@ impl PromptError {
         matches!(self, Self::Refused(_))
     }
 
+    /// Whether the model's chat template failed on its own account.
+    pub fn is_template_failure(&self) -> bool {
+        matches!(self, Self::TemplateFailed(_))
+    }
+
     /// A template render's failure: the template's own refusal of the
-    /// conversation is the request's; any other (no template set, an
-    /// operation the template could not run) is not.
+    /// conversation is the request's, and a failure that is the template's
+    /// whatever the request holds is the template's; any other (no template
+    /// set, a render that stops on a value, a check of the request the render
+    /// makes) is neither.
     pub(crate) fn of_render(error: &anyhow::Error) -> Self {
         let message = format!("Failed to apply chat template: {error}");
         if TemplateRefusal::is(error) {
             Self::Refused(message)
+        } else if TemplateFailure::is(error) {
+            Self::TemplateFailed(message)
         } else {
             Self::Failed(message)
+        }
+    }
+
+    /// The answer to the client, under the failure's own text: a 500
+    /// `chat_template_render_failed` for the template's own failure, the 400
+    /// `process_messages_failed` for every other cause. The one mapping for
+    /// the chat stage, the Messages stage and the token count, so the three
+    /// answer a conversation alike.
+    pub(crate) fn answer(self) -> Response {
+        match self {
+            Self::TemplateFailed(message) => {
+                error::internal_error("chat_template_render_failed", message)
+            }
+            Self::Refused(message) | Self::Failed(message) => {
+                error::bad_request("process_messages_failed", message)
+            }
         }
     }
 }
 
 impl fmt::Display for PromptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (Self::Refused(message) | Self::Failed(message)) = self;
+        let (Self::Refused(message) | Self::TemplateFailed(message) | Self::Failed(message)) = self;
         f.write_str(message)
     }
 }
@@ -1240,7 +1282,9 @@ impl From<String> for PromptError {
 
 impl From<PromptError> for String {
     fn from(error: PromptError) -> Self {
-        let (PromptError::Refused(message) | PromptError::Failed(message)) = error;
+        let (PromptError::Refused(message)
+        | PromptError::TemplateFailed(message)
+        | PromptError::Failed(message)) = error;
         message
     }
 }
