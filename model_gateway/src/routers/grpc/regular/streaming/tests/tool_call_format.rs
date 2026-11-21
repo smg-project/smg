@@ -77,8 +77,8 @@ const SERVED: &str = "served-model";
 const CUT_BY_THE_LIMIT: &str = "{\"error\":{\"message\":\"Treat this response as failed. The model stopped due to max_tokens before it completed the tool call. Retry the request.\",\"type\":\"invalid_tool_call_format\",\"code\":\"invalid_tool_call_format\",\"finish_reason\":\"length\"}}";
 
 /// The spec of a chat request for `model`, read by `table`: with the `lookup`
-/// tool (one string parameter, `city`) and the `other` tool declared or
-/// none, asking for the usage or not, under `tool_choice` or none. The model
+/// tool (a string parameter, `city`, and an integer, `days`) and the `other`
+/// tool declared or none, asking for the usage or not, under `tool_choice` or none. The model
 /// id selects the provider profile, and so the wire.
 fn spec_of(
     model: &str,
@@ -94,8 +94,8 @@ fn spec_of(
     if tools {
         request["tools"] = json!([
             {"type": "function", "function": {
-                "name": "lookup", "parameters": {
-                    "type": "object", "properties": {"city": {"type": "string"}}}}},
+                "name": "lookup", "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"}, "days": {"type": "integer"}}}}},
             {"type": "function", "function": {
                 "name": "other", "parameters": {"type": "object", "properties": {}}}},
         ]);
@@ -417,6 +417,53 @@ async fn the_output_after_a_malformed_block_streams_and_the_failure_ends_it() {
             events.last().is_some_and(|last| last["usage"].is_object()),
             "{events:?}"
         );
+    }
+}
+
+/// One block with one `lookup` invoke whose elements are `body`, the
+/// template's separator before every tag.
+fn lookup_block(body: &str) -> String {
+    format!("<tool_call>\n<invoke name=\"lookup\">{body}</invoke>\n</tool_call>")
+        .replace('<', "]<]minimax[>[<")
+}
+
+/// What the table cannot read as a call fails the request. The end of the
+/// output closes nothing for the model: an invoke the output ends in with a
+/// number's element open is an incomplete call, at the model's stop and at
+/// the limit. Text between a call's elements, the start of a tag the invoke's
+/// close cut short, and a number with the start of a tag inside it are
+/// malformed structure.
+#[tokio::test]
+async fn an_element_the_output_ends_in_and_text_between_elements_fail_the_request() {
+    let open = "<tool_call>\n<invoke name=\"lookup\"><days>3".replace('<', "]<]minimax[>[<");
+    for (finish, at_limit) in [("stop", false), ("length", true)] {
+        let failure = InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit);
+        let frames = vec![chunk(0, &open), complete(0, finish)];
+        let (result, events) = streamed(frames, spec(true, false)).await;
+        assert_eq!(the_contracts_failure(result), failure, "{finish}");
+        assert!(finish_reasons(&events).is_empty(), "{events:?}");
+        let read = whole_answer(M3, &open, finish, &spec(true, false)).await;
+        let Err(ChoiceFailure::ToolCallFormat(whole)) = read else {
+            panic!("the contract's failure under {finish}");
+        };
+        assert_eq!(whole, failure, "{finish}");
+    }
+    for body in [
+        "<city>Paris</city> and <days>3</days>",
+        "<city>Paris</city><da",
+        "<days>3<b</day>",
+    ] {
+        let output = lookup_block(body);
+        let failure = InvalidToolCallFormat::new(UnreadableCall::Malformed, false);
+        let frames = by_character(&output, "stop");
+        let (result, events) = streamed(frames, spec(true, false)).await;
+        assert_eq!(the_contracts_failure(result), failure, "{body}");
+        assert!(finish_reasons(&events).is_empty(), "{events:?}");
+        let read = whole_answer(M3, &output, "stop", &spec(true, false)).await;
+        let Err(ChoiceFailure::ToolCallFormat(whole)) = read else {
+            panic!("the contract's failure for {body}");
+        };
+        assert_eq!(whole, failure, "{body}");
     }
 }
 
