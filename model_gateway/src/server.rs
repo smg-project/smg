@@ -1939,9 +1939,8 @@ async fn start_workflow_engines(
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize typed workflow engines. Where the gateway decides in its
-    // own process, the worker workflows write at its store's door.
-    let engines = WorkflowEngines::with_feed(&config.router_config, app_context.door_feed());
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
 
     // Subscribe logging to all workflow engines
     engines.subscribe_all(Arc::new(LoggingSubscriber)).await;

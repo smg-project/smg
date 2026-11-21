@@ -6,12 +6,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use smg_policy_controller::worker_host::Objects;
 use smg_worker::{
     health::bootstrap_probe,
     identity::basic::Worker,
     registry::{worker_model_ids, WorkerId},
-    workflow::WorkerKind,
 };
 use tracing::debug;
 use wfaas::{
@@ -22,15 +20,10 @@ use wfaas::{
 use crate::{
     app_context::AppContext,
     routers::{
-        common::{
-            pd_admission,
-            snapshot::{ModelWorkerSnapshot, WorkerRegistry},
-        },
+        common::{pd_admission, snapshot::WorkerRegistry},
         grpc::regular::symphony::telemetry,
     },
-    workflow::data::{
-        require_app_context, WorkerRegistrationData, WorkerRegistrationMode, WorkerWorkflowData,
-    },
+    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
 };
 
 /// Unified step to register workers in the registry.
@@ -42,29 +35,6 @@ pub struct RegisterWorkersStep;
 
 /// The step's id in the registration DAGs.
 pub(crate) const REGISTER_WORKERS_STEP: &str = "register_workers";
-
-/// The register step of a line whose local workers are rows of the policy
-/// controller's store.
-///
-/// The holder lays a row's object in the registry, the one the job built,
-/// so the step writes no local worker: it keeps what a registration does
-/// beside that write. A
-/// provider's workers stay outside the store: the step writes them, and
-/// refuses one at a URL a row's object holds. It writes no classic policy,
-/// which decides nothing there.
-pub(crate) struct RegisterBesideRowsStep {
-    rows: Arc<Objects<ModelWorkerSnapshot>>,
-}
-
-/// The name of the refusal of a provider's worker at a URL a row holds.
-const WORKER_URL_TAKEN: &str = "POLICY_CONTROLLER_WORKER_URL_TAKEN";
-
-impl RegisterBesideRowsStep {
-    /// The step beside the rows whose objects `rows` holds.
-    pub(crate) fn new(rows: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
-        Self { rows }
-    }
-}
 
 /// Whether the registry step of `state` completed: the registration's workers
 /// are in the registry, whatever the workflow did after it (a cancellation or
@@ -82,10 +52,6 @@ pub fn registered_in<D: WorkflowData>(state: &WorkflowState<D>) -> bool {
 /// registration whose registry step the state does not record as succeeded
 /// (a cancellation written while the step ran) is still read from the
 /// registry itself.
-///
-/// A row's worker is read the same way: the holder lays the object the job
-/// built and handed in at the door, so the registry's entry is the job's
-/// own. A row laid with no object handed in holds another, and is left.
 pub fn registered_entries<D: WorkerRegistrationData>(
     registry: &WorkerRegistry,
     state: &WorkflowState<D>,
@@ -387,80 +353,13 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
     }
 }
 
-#[async_trait]
-impl StepExecutor<WorkerWorkflowData> for RegisterBesideRowsStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WorkerWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.get_app_context())?.clone();
-        let Some(kind) = context.data.worker_kind else {
-            return Ok(StepResult::Skip);
-        };
-        let workers = context
-            .data
-            .get_actual_workers()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
-        let symphony_table = context.data.symphony_table();
-
-        match kind {
-            // The door wrote these workers' rows, and the holder laid these
-            // objects in the registry as the rows'.
-            WorkerKind::Local => {
-                for worker in workers {
-                    pd_admission::announce_decode_window(worker.as_ref());
-                }
-                after_write(&app_context, workers, symphony_table);
-            }
-            WorkerKind::External => {
-                let registry = &app_context.worker_registry;
-                for worker in workers {
-                    let row_holds_url = registry
-                        .get_id_by_url(worker.url())
-                        .is_some_and(|id| self.rows.standing(&id).is_some());
-                    if row_holds_url {
-                        return Err(step_failed(format!(
-                            "{WORKER_URL_TAKEN}: worker {} is a row of the policy \
-                             controller's store",
-                            worker.redacted_url()
-                        )));
-                    }
-                }
-                write_batch(
-                    &app_context,
-                    workers,
-                    &context.data.registration_mode(),
-                    symphony_table,
-                )?;
-            }
-        }
-
-        Ok(StepResult::Success)
-    }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use openai_protocol::{model_card::ModelCard, worker::WorkerSpec};
-    use smg_policy_controller::{
-        store::{Maker, MemoryStore},
-        worker_host::{facts, Expect},
-    };
+    use openai_protocol::model_card::ModelCard;
     use smg_worker::jobs::WorkerJobAsker;
-    use wfaas::WorkflowInstanceId;
 
     use super::*;
-    use crate::{
-        app_context::testing::app_context_for_tests,
-        config::RouterConfig,
-        policy_controller::feed::{feed, Feed},
-        routers::grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
-        workflow::steps::create_worker_workflow_data,
-    };
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker_at(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -472,90 +371,6 @@ mod tests {
 
     fn worker(model_id: &str) -> Arc<dyn Worker> {
         worker_at("http://worker:8080", model_id)
-    }
-
-    /// A registry with a feed over it, and a host that reads the registry.
-    fn beside_rows() -> (Arc<WorkerRegistry>, Feed, Arc<AppContext>) {
-        let registry = Arc::new(WorkerRegistry::new());
-        let feed = feed(
-            &Arc::new(MemoryStore::default()),
-            &registry,
-            BackendConnector::shared(),
-        );
-        let host = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
-        (registry, feed, host)
-    }
-
-    /// The step's context once a registration of `kind` built `worker`.
-    fn built(
-        host: &Arc<AppContext>,
-        kind: WorkerKind,
-        worker: &Arc<dyn Worker>,
-    ) -> WorkflowContext<WorkerWorkflowData> {
-        let mut data = create_worker_workflow_data(
-            WorkerSpec::new(worker.url()),
-            WorkerRegistrationMode::Upsert,
-            Arc::clone(host),
-            WorkerJobAsker::Api,
-        );
-        data.worker_kind = Some(kind);
-        data.actual_workers = Some(vec![Arc::clone(worker)]);
-        WorkflowContext::new(WorkflowInstanceId::new(), data)
-    }
-
-    /// A local worker is its row's to lay in the registry: the step writes
-    /// no entry for it and keeps what follows a registration, here the
-    /// retry settings of its model. A provider's worker stays outside the
-    /// store: the step registers it.
-    #[tokio::test]
-    async fn beside_rows_the_step_registers_a_providers_worker_and_no_local_one() {
-        let (registry, feed, host) = beside_rows();
-        let step = RegisterBesideRowsStep::new(Arc::clone(&feed.objects));
-
-        let mut spec = WorkerSpec::new("http://local:8000");
-        spec.models = vec![ModelCard::new("m")].into();
-        spec.resilience.max_retries = Some(7);
-        let local: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::from_spec(spec).build());
-        let mut context = built(&host, WorkerKind::Local, &local);
-        assert_eq!(
-            step.execute(&mut context).await.unwrap(),
-            StepResult::Success
-        );
-        assert!(registry.is_empty());
-        assert!(registry.get_retry_config("m").is_some());
-
-        let provider = worker_at("https://provider.example/v1", "p");
-        let mut context = built(&host, WorkerKind::External, &provider);
-        assert_eq!(
-            step.execute(&mut context).await.unwrap(),
-            StepResult::Success
-        );
-        let id = registry.get_id_by_url(provider.url()).unwrap();
-        assert!(registry
-            .get(&id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry, &provider)));
-        assert!(feed.objects.standing(&id).is_none());
-    }
-
-    #[tokio::test]
-    async fn a_provider_at_a_url_a_row_holds_is_refused_by_name() {
-        let (registry, feed, host) = beside_rows();
-        let url = "http://worker:8080";
-        let row = worker("m");
-        feed.door
-            .found(&Maker::Control, Expect::Anything, url, &|standing| {
-                facts(row.as_ref(), standing)
-            })
-            .unwrap();
-        let laid = registry.get_by_url(url).unwrap();
-
-        let step = RegisterBesideRowsStep::new(Arc::clone(&feed.objects));
-        let mut context = built(&host, WorkerKind::External, &worker("p"));
-        let error = step.execute(&mut context).await.unwrap_err().to_string();
-        assert!(error.contains(WORKER_URL_TAKEN), "{error}");
-        assert!(registry
-            .get_by_url(url)
-            .is_some_and(|entry| Arc::ptr_eq(&entry, &laid)));
     }
 
     /// The registry names what a registration left in it: its own workers

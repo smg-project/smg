@@ -1453,45 +1453,17 @@ mod tests {
         ]
     }
 
-    /// The steps of a worker workflow, by id and in order.
-    fn step_ids<D: wfaas::WorkflowData>(line: &wfaas::WorkflowDefinition<D>) -> Vec<String> {
-        line.steps.iter().map(|step| step.id.to_string()).collect()
-    }
-
-    /// The three worker workflows as the server builds them from `context`
-    /// (registration, removal, update), each by its steps.
-    fn worker_lines(context: &AppContext) -> [Vec<String>; 3] {
-        use crate::workflow::steps::{
-            worker_registration_line, worker_removal_line, worker_update_line,
-        };
-
-        let config = &context.router_config;
-        let feed = context.door_feed();
-        let door = feed.map(|feed| (feed, config.unhealthy_removal_scope()));
-        [
-            step_ids(&worker_registration_line(config, feed)),
-            step_ids(&worker_removal_line(door)),
-            step_ids(&worker_update_line(feed)),
-        ]
-    }
-
     /// A gateway that decides in its own process is built as a gateway with
     /// the setting off is: the same storage, and the same objects handed to
     /// the same places. Under one configuration, the setting off against
     /// on: the context holds and leaves out the same parts, but for what
-    /// the start left (the policy engine); a classic policy is handed the
-    /// load feed and the cache-event monitor under both; and the worker
-    /// workflows the server builds from the context run the same steps, by
-    /// name and in order.
+    /// the start left (the policy engine); and a classic policy is handed
+    /// the load feed and the cache-event monitor under both. The worker
+    /// workflows read nothing of the context: the server builds the one
+    /// line of each under both.
     #[tokio::test]
     async fn a_context_in_process_is_built_as_with_the_setting_off() {
-        use crate::{
-            policies::as_cache_aware,
-            workflow::{
-                create_worker_registration_workflow, create_worker_removal_workflow,
-                create_worker_update_workflow,
-            },
-        };
+        use crate::policies::as_cache_aware;
 
         // Cache-aware is a policy the engine does not pick by itself yet:
         // the classic policy of the setting decides under both, with what
@@ -1518,14 +1490,6 @@ mod tests {
             assert!(cache_aware.has_load_receiver_for_test());
             assert!(cache_aware.kv_event_monitor_is_set_for_test());
         }
-
-        let classic = [
-            step_ids(&create_worker_registration_workflow(&off.router_config)),
-            step_ids(&create_worker_removal_workflow()),
-            step_ids(&create_worker_update_workflow()),
-        ];
-        assert_eq!(worker_lines(&off), classic);
-        assert_eq!(worker_lines(&on), classic);
     }
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
