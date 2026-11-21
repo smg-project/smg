@@ -22,7 +22,7 @@ use smg_policy_controller::{
 };
 
 use super::feed::Feed;
-use crate::config::RouterConfig;
+use crate::config::{validation::ConfigValidator, RouterConfig};
 
 /// What the follower has reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,35 +39,31 @@ pub(crate) enum Followed {
 pub(crate) struct Settings(WorkerFollowerSettings);
 
 impl Settings {
-    pub(crate) fn new(address: String, config: &RouterConfig) -> Self {
-        let pem = |setting, path: &Option<String>| {
-            let path = path.clone()?;
-            Some(PemFile { setting, path })
+    /// The follower's settings as `config` states them, or the refusal of
+    /// TLS files that do not go together, in the words the configuration's
+    /// check gives. That check and this map read one rule
+    /// ([`ConfigValidator::policy_controller_tls_files`]), so a program that
+    /// builds the gateway without the check meets the same refusal here: a
+    /// certificate with no authority fails the start and never dials plain.
+    pub(crate) fn new(address: String, config: &RouterConfig) -> Result<Self, String> {
+        let files = ConfigValidator::policy_controller_tls_files(config)
+            .map_err(|refusal| refusal.to_string())?;
+        let pem = |setting, path: &str| PemFile {
+            setting,
+            path: path.to_owned(),
         };
-        // The configuration's check lets three pairings of these files
-        // through: none, the authority alone, and all three. It runs before
-        // the start, so no certificate or key comes here without the rest.
-        let ca_cert = pem(
-            "--policy-controller-tls-ca-cert",
-            &config.policy_controller_tls_ca_cert,
-        );
-        let cert = pem(
-            "--policy-controller-tls-cert",
-            &config.policy_controller_tls_cert,
-        );
-        let key = pem(
-            "--policy-controller-tls-key",
-            &config.policy_controller_tls_key,
-        );
-        let identity = cert.zip(key);
-        Self(WorkerFollowerSettings {
-            address,
-            tls: ca_cert.map(|ca_cert| Tls {
-                ca_cert,
-                identity: identity.map(|(cert, key)| ClientIdentity { cert, key }),
+        let tls = files.map(|(ca_cert, identity)| Tls {
+            ca_cert: pem("--policy-controller-tls-ca-cert", ca_cert),
+            identity: identity.map(|(cert, key)| ClientIdentity {
+                cert: pem("--policy-controller-tls-cert", cert),
+                key: pem("--policy-controller-tls-key", key),
             }),
+        });
+        Ok(Self(WorkerFollowerSettings {
+            address,
+            tls,
             gateway_id: gateway_id(std::env::var("HOSTNAME").ok()),
-        })
+        }))
     }
 }
 
@@ -133,6 +129,7 @@ pub(crate) mod tests {
 
     use super::{gateway_id, Followed, Follower, Settings};
     use crate::{
+        app_context::AppContext,
         config::RouterConfig,
         policy_controller::{
             engine::{Ask, PolicyEngine},
@@ -463,7 +460,12 @@ pub(crate) mod tests {
             ..authority.clone()
         };
 
-        let Settings(settings) = Settings::new("controller:30100".to_owned(), &mutual);
+        let settings_of = |config: &RouterConfig| {
+            let Settings(settings) = Settings::new("controller:30100".to_owned(), config)
+                .expect("TLS files that go together");
+            settings
+        };
+        let settings = settings_of(&mutual);
         assert_eq!(settings.address, "controller:30100");
         let Tls { ca_cert, identity } = settings.tls.expect("the authority's file makes TLS");
         let identity = identity.expect("a certificate and its key");
@@ -476,17 +478,40 @@ pub(crate) mod tests {
             ]
         );
 
-        let Settings(settings) = Settings::new("controller:30100".to_owned(), &authority);
-        let tls = settings.tls.expect("the authority's file makes TLS");
+        let tls = settings_of(&authority)
+            .tls
+            .expect("the authority's file makes TLS");
         assert_eq!(
             named(tls.ca_cert),
             ("--policy-controller-tls-ca-cert", "ca.pem".to_owned())
         );
         assert!(tls.identity.is_none());
 
-        let Settings(plain) =
-            Settings::new("controller:30100".to_owned(), &RouterConfig::default());
-        assert!(plain.tls.is_none());
+        assert!(settings_of(&RouterConfig::default()).tls.is_none());
+    }
+
+    /// A program that builds the gateway's context itself runs no check of
+    /// the configuration. A certificate and its key with no authority still
+    /// fail its start, in the words the flags give, and start no follower
+    /// that would dial plain.
+    #[tokio::test]
+    async fn a_context_built_with_no_check_refuses_a_certificate_with_no_authority() {
+        let mut config = RouterConfig {
+            policy_controller: true,
+            policy_controller_address: Some("127.0.0.1:1".to_owned()),
+            policy_controller_tls_cert: Some("gateway.pem".to_owned()),
+            policy_controller_tls_key: Some("gateway-key.pem".to_owned()),
+            ..RouterConfig::default()
+        };
+        config.health_check.disable_health_check = true;
+        let refusal = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect_err("a certificate with no authority");
+        assert!(
+            refusal
+                .contains("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert"),
+            "{refusal}"
+        );
     }
 
     #[test]

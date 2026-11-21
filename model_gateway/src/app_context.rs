@@ -997,7 +997,8 @@ impl AppContextBuilder {
             let controller = config
                 .policy_controller_address
                 .as_ref()
-                .map(|address| Settings::new(address.clone(), config));
+                .map(|address| Settings::new(address.clone(), config))
+                .transpose()?;
             let connector = Arc::clone(&self.engine_connector);
             let (feed, follower) =
                 policy_controller::feeds(&store, registry, connector, controller);
