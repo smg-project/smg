@@ -827,15 +827,28 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// The block buffer of `tile_blocks` is the pool's and goes back to it.
+    /// The block buffer of `tile_blocks` is the pool's and goes back to it,
+    /// and no byte of it reaches `run` unwritten: a debug build hands the
+    /// buffer out filled with the pool's sentinel.
     #[test]
     fn the_tile_blocks_buffer_goes_back_to_the_pool() {
         static MINE: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
         let tile = 336;
-        let rgb = vec![1u8; tile * tile * 3];
+        let (width, height) = (tile + 64, tile);
+        let rgb = vec![1u8; width * height * 3];
+        let mut blocks = Vec::new();
         buffer_pool::with_pool(&MINE, || {
-            tile_blocks(&rgb, (tile, tile), (1, 1), tile, |_, _| {});
+            tile_blocks(&rgb, (width, height), (1, 2), tile, |_, bytes| {
+                blocks.push(bytes.to_vec());
+            });
         });
+        // The full tile: every byte the image's.
+        assert!(blocks[..3].iter().flatten().all(|&byte| byte == 1));
+        // The partial tile: 64 image columns, then black.
+        for row in blocks[3..].iter().flat_map(|block| block.chunks(tile)) {
+            assert!(row[..64].iter().all(|&byte| byte == 1));
+            assert!(row[64..].iter().all(|&byte| byte == 0));
+        }
         // Three channels of a 336x336 tile, 338,688 bytes: the 512 KiB class.
         assert_eq!(MINE.held(), 512 << 10);
     }
