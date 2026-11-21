@@ -11,7 +11,7 @@ use axum::response::Response;
 use crate::{
     observability::metrics::metrics_labels,
     routers::grpc::{
-        common::stages::RateLimitCell,
+        common::{response_formatting::TokenCounts, stages::RateLimitCell},
         context::{stage_output, wrong_response_spec, DispatchContext, FinalResponse},
         regular::{processor, streaming},
         spec::ResponseSpec,
@@ -100,7 +100,7 @@ impl ChatResponseProcessingStage {
 
         let stop_decoder = stage_output(ctx.response.stop_decoder.as_mut(), FUNCTION)?;
 
-        let (response, counts) = self
+        let answered = self
             .processor
             .process_non_streaming_chat_response(
                 execution_result,
@@ -110,7 +110,25 @@ impl ChatResponseProcessingStage {
                 stop_decoder,
                 request_logprobs,
             )
-            .await?;
+            .await;
+        let (response, counts) = match answered {
+            Ok(answered) => answered,
+            Err(failure) => {
+                // A failure that carries the engine's counters ends a request
+                // whose answer the engine completed (a tool call the reader
+                // could not read): the reservation is settled with them here,
+                // as the stream settles them, so the close of an unsettled
+                // reservation that follows a failed answer finds it settled
+                // and keeps no estimate in their place.
+                if let (Some(counts), Some(cell)) = (
+                    TokenCounts::carried_by(&failure),
+                    ctx.rate_limit_cell.as_deref(),
+                ) {
+                    cell.settle(counts.settlement()).await;
+                }
+                return Err(failure);
+            }
+        };
 
         // Store the final response, and the engine's counters for the settlement
         ctx.response.final_response = Some(FinalResponse::Chat(response));

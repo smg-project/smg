@@ -29,19 +29,23 @@ use super::{
         processor, response_processor, scripted_stream, CharacterTokenizer,
     },
 };
-use crate::routers::{
-    error::HEADER_X_SMG_ERROR_CODE,
-    grpc::{
-        context::test_support::assert_end,
-        proto_wrapper::ProtoGenerateComplete,
-        regular::{
-            processor::{ChoiceFailure, ResponseProcessor},
-            stages::chat::ChatResponseProcessingStage,
-            symphony::{assign_for, Asks, Reading, UnreadableCall},
+use crate::{
+    rate_limit::{test_support::RecordingBackend, UsageSettlement},
+    routers::{
+        common::rate_limit_cell::{RateLimitCell, RateLimitOutcome},
+        error::HEADER_X_SMG_ERROR_CODE,
+        grpc::{
+            context::test_support::assert_end,
+            proto_wrapper::ProtoGenerateComplete,
+            regular::{
+                processor::{ChoiceFailure, ResponseProcessor},
+                stages::chat::ChatResponseProcessingStage,
+                symphony::{assign_for, Asks, Reading, UnreadableCall},
+            },
+            spec::ResponseSpec,
+            utils::{StreamFailure, StreamSource},
+            wire::minimax::InvalidToolCallFormat,
         },
-        spec::ResponseSpec,
-        utils::{StreamFailure, StreamSource},
-        wire::minimax::InvalidToolCallFormat,
     },
 };
 
@@ -344,6 +348,129 @@ async fn a_block_the_output_ended_inside_before_its_call_started_is_incomplete()
         );
         assert_eq!(content(&events), BEFORE, "{events:?}");
         assert!(call_deltas(&events).is_empty(), "{events:?}");
+    }
+}
+
+/// An invoke the output ended in right after its opener, before any byte of
+/// its name, is a call the model began: the request fails as for the invoke
+/// one byte further, incomplete, blamed on the limit where the limit cut it,
+/// and nothing of it is shown. On another wire the same output ends as it
+/// did, with the engine's finish and no call.
+#[tokio::test]
+async fn an_invoke_the_output_ended_in_before_any_byte_of_its_name_is_incomplete() {
+    const OPENED: &str = "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"";
+    for (finish, at_limit) in [("length", true), ("stop", false)] {
+        for frames in [
+            vec![chunk(0, BEFORE), chunk(0, OPENED), complete(0, finish)],
+            by_character(&format!("{BEFORE}{OPENED}"), finish),
+        ] {
+            let (result, events) = streamed(frames.clone(), spec(true, false)).await;
+            assert_eq!(
+                the_contracts_failure(result),
+                InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit),
+                "{finish}"
+            );
+            assert_eq!(content(&events), BEFORE, "{events:?}");
+            assert!(finish_reasons(&events).is_empty(), "{events:?}");
+            assert_nothing_of_the_call(&events);
+
+            let served = spec_of(SERVED, Table::MinimaxM3, true, false, None);
+            let (result, events) = streamed(frames, served).await;
+            assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
+            assert_eq!(content(&events), BEFORE, "{events:?}");
+            assert_eq!(finish_reasons(&events), vec![finish]);
+            assert!(call_deltas(&events).is_empty(), "{events:?}");
+        }
+        let read = whole_answer(M3, &format!("{BEFORE}{OPENED}"), finish, &spec(true, false)).await;
+        let Err(ChoiceFailure::ToolCallFormat(failure)) = read else {
+            panic!("the contract's failure under {finish}");
+        };
+        assert_eq!(
+            failure,
+            InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit)
+        );
+    }
+}
+
+/// The spec of a MiniMax M3 request that names `lookup`, whose one parameter
+/// schema is a bare integer, read as the gateway's JSON schema makes the M3
+/// table read a forced call: the output is the call's arguments alone, from
+/// its first byte, with no marker to close them.
+fn forced_spec() -> ChatResponseSpec {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": M3, "messages": [{"role": "user", "content": "hi"}], "stream": true,
+        "tools": [{"type": "function", "function": {
+            "name": "lookup", "parameters": {"type": "integer"}}}],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+    }))
+    .expect("a chat request");
+    let schema = (
+        "json_schema".to_string(),
+        "{\"type\":\"integer\"}".to_string(),
+    );
+    let mut spec = ChatResponseSpec::from(&request);
+    spec.symphony = assign_for(
+        Reading::Table(Table::MinimaxM3.shared(), false),
+        Asks::Chat(&request),
+        Some(&schema),
+        "",
+        ProviderProfile::for_model(&request.model),
+        || GrammarStart::FirstToken,
+    );
+    assert!(spec.fails_on_unreadable_call(), "the M3 table reads");
+    spec
+}
+
+/// A forced call whose arguments are a bare scalar has no byte to close it:
+/// the value is whole where the output ends, and the call is delivered, at
+/// the model's stop and where the limit ended the output alike, streamed and
+/// whole. A forced value the output ended inside is the incomplete call, as
+/// any other: the request fails and nothing of it is shown.
+#[tokio::test]
+async fn a_forced_scalar_whole_where_the_output_ends_is_delivered_and_an_unfinished_value_fails() {
+    for finish in ["stop", "length"] {
+        for whole in ["7", "-12", "true"] {
+            for frames in [
+                vec![chunk(0, whole), complete(0, finish)],
+                by_character(whole, finish),
+            ] {
+                let (result, events) = streamed(frames, forced_spec()).await;
+                assert!(
+                    result.is_ok(),
+                    "{whole} under {finish}: {:?}",
+                    result.err().map(|e| e.to_string())
+                );
+                assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+                assert_eq!(tool_arguments(&events), whole, "{events:?}");
+            }
+            let choice = whole_answer(M3, whole, finish, &forced_spec())
+                .await
+                .unwrap_or_else(|failure| panic!("{whole} under {finish}: {failure}"));
+            let calls = choice.message.tool_calls.expect("the call");
+            assert_eq!(calls[0].function.name, "lookup");
+            assert_eq!(calls[0].function.arguments.as_deref(), Some(whole));
+        }
+    }
+    for (finish, at_limit) in [("stop", false), ("length", true)] {
+        for unfinished in ["{\"city\": \"Par", "[1, 2", "tru"] {
+            let frames = vec![chunk(0, unfinished), complete(0, finish)];
+            let (result, events) = streamed(frames, forced_spec()).await;
+            assert_eq!(
+                the_contracts_failure(result),
+                InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit),
+                "{unfinished} under {finish}"
+            );
+            assert!(call_deltas(&events).is_empty(), "{events:?}");
+            assert!(finish_reasons(&events).is_empty(), "{events:?}");
+            let read = whole_answer(M3, unfinished, finish, &forced_spec()).await;
+            let Err(ChoiceFailure::ToolCallFormat(failure)) = read else {
+                panic!("the contract's failure for {unfinished} under {finish}");
+            };
+            assert_eq!(
+                failure,
+                InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit)
+            );
+        }
     }
 }
 
@@ -903,6 +1030,79 @@ async fn the_whole_request_is_answered_with_the_400() {
         .expect("the body")
         .to_bytes();
     assert_eq!(std::str::from_utf8(&body).expect("UTF-8"), CUT_BY_THE_LIMIT);
+}
+
+/// The engine's counters of an answer it completed are what the request
+/// used, whether the request then fails or not: the whole request's 400
+/// settles the reservation with them, as the stream that fails the same way
+/// does, and the close of an unsettled reservation that follows a failed
+/// answer finds it settled.
+#[tokio::test]
+async fn a_failed_requests_reservation_is_settled_with_the_engines_counts() {
+    let output = format!("{BEFORE}{CUT_CALL}");
+    let tokens = output.chars().count() as u32;
+    let settled = vec![UsageSettlement {
+        actual_input_tokens: 11,
+        completion_tokens: tokens,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+    }];
+
+    // Streamed: the stream's own settlement, at its end.
+    let frames = vec![chunk(0, &output), complete_with_prompt(0, "length", 11)];
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let (tx, rx) = sse_channel();
+    let (handle, backend) = RecordingBackend::reservation();
+    let result = processor(true)
+        .process_streaming_chunks(
+            stream,
+            dispatch(M3),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec(true, false),
+            &tx,
+            Some(handle),
+        )
+        .await;
+    drop(tx);
+    collect_events(rx).await;
+    server.abort();
+    the_contracts_failure(result);
+    assert_eq!(backend.settlements(), settled);
+    assert_eq!(backend.closes(), 0);
+
+    // Whole: the chat stage settles before it answers the failure.
+    let mut answer = complete_with_prompt(0, "length", 11);
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut answer.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = tokens;
+    }
+    let (stream, server) = scripted_stream(vec![answer], "0").await;
+    let (mut ctx, _store) = placed_stream_context(stream, dispatch(M3)).await;
+    ctx.streaming = false;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    ctx.response.stop_decoder = Some(utils::create_stop_decoder(
+        &tokenizer, None, None, false, false, false,
+    ));
+    let (handle, backend) = RecordingBackend::reservation();
+    let cell = Arc::new(RateLimitCell::new());
+    cell.set_for_test(RateLimitOutcome::Admitted(handle));
+    ctx.rate_limit_cell = Some(Arc::clone(&cell));
+    let answered =
+        ChatResponseProcessingStage::new(response_processor(), Arc::new(processor(true)))
+            .process_result(&mut ctx, ResponseSpec::Chat(Box::new(spec(true, false))))
+            .await;
+    server.abort();
+    let Err(response) = answered else {
+        panic!("the request's failure");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(backend.settlements(), settled);
+    assert_eq!(backend.closes(), 0);
+    // What the router does after a failed answer: the reservation is settled already.
+    cell.close_unsettled().await;
+    assert_eq!(backend.settlements(), settled);
+    assert_eq!(backend.closes(), 0);
 }
 
 /// Another wire with the same output ends as before: the M3 table under a
