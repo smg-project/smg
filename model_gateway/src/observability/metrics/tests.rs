@@ -860,7 +860,8 @@ fn router_stream_families_name_the_attempt_anchor() {
 /// entry at the edge to the answering attempt's RPC dispatch, where the TTFT
 /// clock starts), which requests it observes (those the TTFT observes, under
 /// the same labels) and that the two add up to the time to first token from
-/// the request's receipt.
+/// the request's receipt. It says where a later turn of a streamed tool loop
+/// counts from: that turn's start.
 #[test]
 fn the_dispatch_wait_help_names_its_clock_its_requests_and_its_sum_with_the_ttft() {
     let (rendered, ()) = with_test_recorder(|| {
@@ -889,6 +890,8 @@ fn the_dispatch_wait_help_names_its_clock_its_requests_and_its_sum_with_the_ttft
         "a refused attempt's wait and its backoff are here",
         "observed with smg_router_ttft_seconds, once per observation of it and under the same labels",
         "the two add up to the time to first token from the request's receipt",
+        "a streamed Responses tool loop observes one per turn",
+        "a later turn's from that turn's start",
     ] {
         assert!(help.contains(phrase), "{phrase:?} is not in: {help}");
     }

@@ -357,7 +357,8 @@ pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
 /// request's entry at the edge to the answering attempt's RPC dispatch.
 /// Observed with `smg_router_ttft_seconds`, for the same requests and under
 /// the same labels, so the two add up to the time to first token from the
-/// request's receipt.
+/// request's receipt. A streamed Responses tool loop observes one per turn,
+/// a later turn's from that turn's start.
 pub(crate) const DISPATCH_WAIT_SECONDS: &str = "smg_router_dispatch_wait_seconds";
 
 /// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
@@ -698,7 +699,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         DISPATCH_WAIT_SECONDS,
-        "Dispatch wait of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no wait): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed with smg_router_ttft_seconds, once per observation of it and under the same labels, so the two add up to the time to first token from the request's receipt; a generation dispatched outside the request's own task (a turn of a streamed Responses tool loop) has no entry to count from and records none"
+        "Dispatch wait of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no wait): from the request's entry at the edge to the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), where the clock of smg_router_ttft_seconds starts, so the body read, admission, tokenizing, templating, worker selection, a refused attempt's wait and its backoff are here; observed with smg_router_ttft_seconds, once per observation of it and under the same labels, so the two add up to the time to first token from the request's receipt; a streamed Responses tool loop observes one per turn, as it observes smg_router_ttft_seconds: the first turn's from the request's entry, a later turn's from that turn's start, after the generations and tool calls before it, so a later turn's two add up to the time to first token from the turn's start"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1444,8 +1445,9 @@ pub struct StreamingMetricsParams<'a> {
     /// Time to first token (None if no tokens were generated)
     pub ttft: Option<Duration>,
     /// The request's wait ahead of the dispatch `ttft` runs from: its entry
-    /// at the edge to that dispatch. Recorded only with `ttft`. None for a
-    /// generation dispatched outside the request's entry stamp, and for a
+    /// at the edge to that dispatch (for a later turn of a streamed tool
+    /// loop, that turn's start to its dispatch). Recorded only with `ttft`.
+    /// None for a generation dispatched under no entry stamp, and for a
     /// collected answer.
     pub dispatch_wait: Option<Duration>,
     /// Total generation time

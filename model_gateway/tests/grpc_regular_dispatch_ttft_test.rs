@@ -10,6 +10,10 @@
 //! time to first token: once, under its labels, counted from the entry stamp
 //! the request's handler runs under, so a failed attempt is inside it. The
 //! body is read outside the stamp, as the connection reads it.
+//!
+//! A streamed Responses tool loop dispatches one chat generation per turn,
+//! from a task of its own. Every turn records a wait with its TTFT: the first
+//! from the request's entry stamp, a later one from where that turn starts.
 
 use std::{
     sync::{
@@ -27,6 +31,8 @@ use common::{
         grpc_workers, serve_engine,
     },
     metrics_capture::{self, render_after},
+    mock_mcp_server::MockMCPServer,
+    scripted_tokenizer::ScriptedTokenizer,
 };
 use http_body_util::BodyExt;
 use llm_tokenizer::{
@@ -530,13 +536,20 @@ fn count_labels<'a>(rendered: &'a str, family: &str, labels: &[&str]) -> Option<
 
 /// The dispatch wait of the one stamped stream whose series carry `labels`,
 /// in seconds: recorded once, as its TTFT is, and under the TTFT's labels.
-#[expect(clippy::expect_used, reason = "test helper")]
 fn dispatch_wait_beside_the_ttft(rendered: &str, labels: &[&str]) -> f64 {
+    dispatch_waits_beside_the_ttfts(rendered, labels, 1)
+}
+
+/// The dispatch waits of the `streams` stamped streams whose series carry
+/// `labels`, summed, in seconds: one per stream, as the TTFT has, and under
+/// the TTFT's labels.
+#[expect(clippy::expect_used, reason = "test helper")]
+fn dispatch_waits_beside_the_ttfts(rendered: &str, labels: &[&str], streams: u32) -> f64 {
     for family in [DISPATCH_WAIT, "smg_router_ttft_seconds"] {
         assert_eq!(
             metrics_capture::sample(rendered, family, "count", labels),
-            Some(1.0),
-            "{labels:?}: one {family} observation:\n{rendered}"
+            Some(f64::from(streams)),
+            "{labels:?}: {streams} {family} observation(s):\n{rendered}"
         );
     }
     assert_eq!(
@@ -835,4 +848,166 @@ fn a_client_leaving_after_the_first_chunk_records_no_stream_metrics() {
             "a client that left recorded {family}:\n{rendered}"
         );
     }
+}
+
+/// The tool-loop engine's first generation, as its tokenizer decodes it: a
+/// call of the MCP server's search tool. The generation after the tool's
+/// result decodes to `FINAL_ANSWER`.
+const TOOL_CALL: &str =
+    "<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>";
+const FINAL_ANSWER: &str = "Final answer after tools";
+/// The ids the tool-loop engine answers every generation with: the scripted
+/// tokenizer reads the generation's text off id 100, which arrives with the
+/// headers.
+const TOOL_LOOP_IDS: [u32; 2] = [100, 101];
+
+/// A regular router over one held-headers engine whose tokenizer decodes a
+/// request's first generation to a call of the MCP server's search tool and
+/// the generation after one tool result to a plain answer, under the `qwen`
+/// tool-call parser: a Responses request with that server as its tool runs a
+/// loop of two turns, each a generation the engine holds and stretches as it
+/// does any other.
+async fn tool_loop_router() -> Box<dyn RouterTrait> {
+    let engine = held_headers_engine(Some(TOOL_LOOP_IDS.to_vec()));
+    let port = serve_engine(engine.into_server()).await;
+    let tokenizer = ScriptedTokenizer::new(TOOL_CALL).with_final_answer(1, FINAL_ANSWER);
+    let mut config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .build_unchecked();
+    config.tool_call_parser = Some("qwen".into());
+    let app_context = grpc_test_context_with_tokenizer(config, MODEL, Arc::new(tokenizer)).await;
+    grpc_router(
+        &app_context,
+        grpc_workers(&[(port, WorkerType::Regular)], RuntimeType::Vllm, MODEL),
+    )
+    .await
+}
+
+/// One streamed Responses request, read to its end: the body. Its handler
+/// runs under the entry stamp `entered`, and the body is read outside it, as
+/// the connection reads it. With `mcp_server` the request names the MCP
+/// server at that URL as its tool, which makes it a tool loop.
+#[expect(clippy::expect_used, reason = "test helper")]
+async fn streamed_responses(
+    router: &dyn RouterTrait,
+    mcp_server: Option<&str>,
+    entered: RequestStarted,
+) -> String {
+    let mut request = serde_json::json!({
+        "model": MODEL,
+        "input": "Hello",
+        "stream": true,
+        "max_output_tokens": 16,
+    });
+    if let Some(server_url) = mcp_server {
+        request["tools"] = serde_json::json!([{
+            "type": "mcp",
+            "server_label": "test-tools",
+            "server_url": server_url,
+            "require_approval": "never",
+        }]);
+    }
+    let request = serde_json::from_value(request).expect("Responses request");
+    let tenant = tenant();
+    let response = entered
+        .scope(router.route_responses(None, &tenant, request, MODEL))
+        .await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("response body");
+    let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 body");
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    assert!(body.contains("event: response.completed"), "{body}");
+    body
+}
+
+/// One streamed Responses tool loop of two turns against `mcp`, read to its
+/// end: the first generation calls the server's tool once, the second answers.
+async fn streamed_tool_loop(
+    router: &dyn RouterTrait,
+    mcp: &MockMCPServer,
+    entered: RequestStarted,
+) {
+    let calls = mcp.call_count();
+    let body = streamed_responses(router, Some(&mcp.url()), entered).await;
+    assert_eq!(
+        mcp.call_count(),
+        calls + 1,
+        "one tool call between the two turns: {body}"
+    );
+    assert!(
+        body.contains(FINAL_ANSWER),
+        "the turn after the tool call answers: {body}"
+    );
+}
+
+/// A streamed Responses request whose tool loop runs two turns records a
+/// dispatch wait with each turn's TTFT, under the TTFT's labels, though the
+/// loop dispatches from a task of its own. The first turn's wait counts from
+/// the request's entry stamp. The second turn's counts from where that turn
+/// starts: counted from the request's entry it would hold the whole first
+/// generation and the tool call, and the two waits together stay under the
+/// first generation alone.
+#[expect(
+    clippy::print_stderr,
+    reason = "report the measured intervals alongside the regression result"
+)]
+#[test]
+fn a_streamed_tool_loop_records_a_dispatch_wait_with_every_turn_s_ttft() {
+    let rendered = render_after(|| async {
+        let router = tool_loop_router().await;
+        let mut mcp = MockMCPServer::start().await.expect("the MCP server");
+        streamed_tool_loop(router.as_ref(), &mcp, entered_a_lead_ago()).await;
+        mcp.stop().await;
+    });
+    // A turn of the loop is a chat generation: it records under the chat
+    // route's labels.
+    let labels = ["backend_type=\"regular\"", "endpoint=\"chat\""];
+    let waits = dispatch_waits_beside_the_ttfts(&rendered, &labels, 2);
+    let ttfts = metrics_capture::sample(&rendered, "smg_router_ttft_seconds", "sum", &labels)
+        .expect("histogram sum");
+    eprintln!("tool loop, two turns: dispatch waits={waits} ttfts={ttfts}");
+    assert!(
+        ttfts >= (2 * HELD_HEADERS_DELAY).as_secs_f64(),
+        "both turns' TTFTs ({ttfts}) carry the engine's hold"
+    );
+    let lead = ENTRY_LEAD.as_secs_f64();
+    assert!(
+        waits >= lead,
+        "the first turn's dispatch wait runs from the request's entry stamp ({ENTRY_LEAD:?} before the handler): {waits}"
+    );
+    // The first turn's wait is the stamp's lead at least, so the rest of the
+    // sum bounds the second turn's from above.
+    let second_turn_at_most = waits - lead;
+    let first_generation = (HELD_HEADERS_DELAY + POST_FIRST_DELAY).as_secs_f64();
+    assert!(
+        second_turn_at_most < first_generation,
+        "the second turn's dispatch wait (at most {second_turn_at_most}) runs from that turn's start, not from the request's entry: the first generation alone took {first_generation}"
+    );
+}
+
+/// A chat stream, a streamed Responses answer and a turn of a streamed tool
+/// loop are all chat generations and record under the same labels. On a
+/// router that served one of each (the loop two turns), the dispatch wait
+/// has as many observations as the TTFT: four.
+#[test]
+fn chat_and_responses_streams_record_as_many_dispatch_waits_as_ttfts() {
+    let rendered = render_after(|| async {
+        let router = tool_loop_router().await;
+        let mut mcp = MockMCPServer::start().await.expect("the MCP server");
+        request_entered(
+            router.as_ref(),
+            Route::Chat,
+            true,
+            Some(entered_a_lead_ago()),
+        )
+        .await;
+        streamed_responses(router.as_ref(), None, entered_a_lead_ago()).await;
+        streamed_tool_loop(router.as_ref(), &mcp, entered_a_lead_ago()).await;
+        mcp.stop().await;
+    });
+    let labels = ["backend_type=\"regular\"", "endpoint=\"chat\""];
+    dispatch_waits_beside_the_ttfts(&rendered, &labels, 4);
 }
