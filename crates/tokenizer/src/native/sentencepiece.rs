@@ -74,13 +74,13 @@ pub(super) struct CharSymbols {
     ascii: [u32; 128],
     /// The token of each other character the vocabulary has, by scalar value.
     beyond: FxHashMap<u32, u32>,
-    /// One at [`pair_entry`] of `prev` and `cur`: no piece cut goes between the
+    /// `true` at [`pair_entry`] of `prev` and `cur`: no piece cut goes between the
     /// raw bytes `prev` and `cur`: some vocabulary token holds them adjacent
     /// (a space read as the marker, its last byte before the cut and its
     /// first byte after it), or `cur` continues a UTF-8 character. Read
     /// from the tokens' text, then rewritten for the raw text by
     /// [`Self::bridge_raw_text`].
-    bridge: Box<[u8; BRIDGE_PAIRS]>,
+    bridge: Box<[bool; BRIDGE_PAIRS]>,
     marker: Marker,
     /// The model's merges over its own ids.
     merges: MergeTable,
@@ -119,7 +119,7 @@ impl CharSymbols {
         let mut symbols = Self {
             ascii: [NO_ID; 128],
             beyond: FxHashMap::default(),
-            bridge: Box::new([0; BRIDGE_PAIRS]),
+            bridge: Box::new([false; BRIDGE_PAIRS]),
             marker,
             merges,
         };
@@ -150,7 +150,7 @@ impl CharSymbols {
             )));
         }
         for pair in token.as_bytes().array_windows() {
-            self.bridge[pair_entry(*pair)] = 1;
+            self.bridge[pair_entry(*pair)] = true;
         }
         let mut chars = token.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -170,13 +170,13 @@ impl CharSymbols {
     /// one is its first byte), and no cut goes before a byte that continues
     /// a character.
     fn bridge_raw_text(&mut self) {
-        let mut raw = Box::new([0u8; BRIDGE_PAIRS]);
+        let mut raw = Box::new([false; BRIDGE_PAIRS]);
         for prev in 0..=255u8 {
             for cur in 0..=255u8 {
                 let before = if prev == b' ' { MARKER_BYTES[2] } else { prev };
                 let after = if cur == b' ' { MARKER_BYTES[0] } else { cur };
                 if is_continuation(cur) || self.bridged(before, after) {
-                    raw[pair_entry([prev, cur])] = 1;
+                    raw[pair_entry([prev, cur])] = true;
                 }
             }
         }
@@ -240,7 +240,7 @@ impl CharSymbols {
     /// field).
     #[inline(always)]
     fn bridged(&self, prev: u8, cur: u8) -> bool {
-        self.bridge[pair_entry([prev, cur])] != 0
+        self.bridge[pair_entry([prev, cur])]
     }
 
     /// The token of `c`, or [`NO_ID`].
