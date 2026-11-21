@@ -1848,9 +1848,12 @@ def test_supervise_passes_its_linger_to_the_drain():
         )
         await asyncio.sleep(0.02)
         stop.set()
-        started = time.monotonic()
+        # On the loop's clock, which keeps the linger: a loop clock of whole milliseconds
+        # (uvloop's) ends it up to a tick early by `time.monotonic()`.
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         await task
-        return started, time.monotonic()
+        return started, loop.time()
 
     started, finished = asyncio.run(run())
     assert finished >= started + 0.3
