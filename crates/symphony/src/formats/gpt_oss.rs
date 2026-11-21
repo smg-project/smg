@@ -204,12 +204,14 @@ mod tests {
             // A header that names no channel.
             ("<|message|>Plain.".into(), None, Some("Plain."), vec![]),
         ];
-        // The model's own tools, under either order of the header and on either channel.
+        // The model's own tools, under either order of the header and on every channel.
         for tool in ["python", "browser", "container"] {
             for header in [
                 format!(" to={tool}<|channel|>analysis<|message|>"),
                 format!("<|channel|>analysis to={tool} code<|message|>"),
                 format!(" to={tool}<|channel|>commentary code<|message|>"),
+                format!(" to={tool}<|channel|>commentary<|message|>"),
+                format!(" to={tool}<|channel|>final<|message|>"),
             ] {
                 turns.push((
                     format!(
