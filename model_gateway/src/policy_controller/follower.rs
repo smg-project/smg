@@ -1,6 +1,6 @@
-//! A single task follows the controller's workers into the policy store.
-//! A watch may reopen or a connection may fail. The same watcher keeps its
-//! place and the store keeps its last fleet until a new snapshot replaces it.
+//! A single task follows the controller's workers into the policy store:
+//! the policy crate's worker follower ([`WorkerFollower`]), started with
+//! the settings of the gateway's configuration.
 //!
 //! After each event the store takes at a place, the task settles the
 //! gateway's feed: the registry gets the rows' worker objects, and the
@@ -12,29 +12,15 @@
 //! its settle a decision can name a row whose worker the registry does
 //! not hold yet. The policy engine passes that target over and asks again.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use anyhow::Context as _;
 use smg_policy_controller::{
-    service::{
-        client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
-        watcher::{Ended, Watcher},
-    },
+    service::worker_follower::{PemFile, WorkerFollower, WorkerFollowerSettings},
     store::token,
 };
-use tokio::{
-    sync::{oneshot, watch},
-    task::JoinHandle,
-    time::sleep,
-};
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
-use tracing::warn;
 
 use super::feed::Feed;
 use crate::config::RouterConfig;
-
-const FIRST_RETRY: Duration = Duration::from_millis(250);
-const MAX_RETRY: Duration = Duration::from_secs(5);
 
 /// What the follower has reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,57 +32,32 @@ pub(crate) enum Followed {
     Fleet,
 }
 
-pub(crate) struct Settings {
-    address: String,
-    ca_cert: Option<String>,
-    cert: Option<String>,
-    key: Option<String>,
-    gateway_id: String,
-}
+/// How the gateway's follower reaches its controller, as the
+/// configuration states it.
+pub(crate) struct Settings(WorkerFollowerSettings);
 
 impl Settings {
     pub(crate) fn new(address: String, config: &RouterConfig) -> Self {
-        Self {
+        let file = |setting, path: Option<&String>| {
+            let path = path?.clone();
+            Some(PemFile { setting, path })
+        };
+        Self(WorkerFollowerSettings {
             address,
-            ca_cert: config.policy_controller_tls_ca_cert.clone(),
-            cert: config.policy_controller_tls_cert.clone(),
-            key: config.policy_controller_tls_key.clone(),
+            ca_cert: file(
+                "--policy-controller-tls-ca-cert",
+                config.policy_controller_tls_ca_cert.as_ref(),
+            ),
+            cert: file(
+                "--policy-controller-tls-cert",
+                config.policy_controller_tls_cert.as_ref(),
+            ),
+            key: file(
+                "--policy-controller-tls-key",
+                config.policy_controller_tls_key.as_ref(),
+            ),
             gateway_id: gateway_id(std::env::var("HOSTNAME").ok()),
-        }
-    }
-
-    async fn connect(&self, address: &str) -> anyhow::Result<Client> {
-        if self.ca_cert.is_none() && self.cert.is_none() {
-            return Ok(Client::connect(&format!("http://{address}"), &self.gateway_id).await?);
-        }
-
-        let mut tls = ClientTlsConfig::new();
-        if let Some(path) = &self.ca_cert {
-            let pem = tokio::fs::read(path)
-                .await
-                .with_context(|| format!("reading --policy-controller-tls-ca-cert {path:?}"))?;
-            tls = tls.ca_certificate(Certificate::from_pem(pem));
-        }
-        if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
-            let cert = tokio::fs::read(cert)
-                .await
-                .with_context(|| format!("reading --policy-controller-tls-cert {cert:?}"))?;
-            let key = tokio::fs::read(key)
-                .await
-                .with_context(|| format!("reading --policy-controller-tls-key {key:?}"))?;
-            tls = tls.identity(Identity::from_pem(cert, key));
-        }
-        // The watch's next event waits with no bound, so the channel is kept
-        // alive as the client's own dial keeps it: a controller gone silent
-        // ends the wait.
-        let endpoint = Endpoint::from_shared(format!("https://{address}"))?
-            .http2_keep_alive_interval(KEEPALIVE)
-            .keep_alive_timeout(ANSWER_WAIT)
-            .keep_alive_while_idle(true);
-        if let Some(host) = endpoint.uri().host() {
-            tls = tls.domain_name(host.trim_matches(['[', ']']));
-        }
-        Ok(Client::connect_with(endpoint.tls_config(tls)?, &self.gateway_id).await?)
+        })
     }
 }
 
@@ -111,154 +72,32 @@ fn gateway_id(hostname: Option<String>) -> String {
         })
 }
 
-/// The gateway's side of a controller's watch: one task that keeps the
-/// process's policy store as the controller tells it.
-pub(crate) struct Follower {
-    task: JoinHandle<()>,
-    stop: oneshot::Sender<()>,
-    followed: watch::Receiver<Followed>,
-}
+/// The gateway's side of a controller's watch: the policy crate's follower
+/// over the gateway's feed.
+pub(crate) struct Follower(WorkerFollower);
 
 impl Follower {
     /// Starts the task. The watch alone writes the store of `feed` from
     /// here, and the task settles `feed` after each event the store takes.
     pub(crate) fn start(settings: Settings, feed: Feed) -> Self {
-        let (stop, stopped) = oneshot::channel();
-        let (progress, followed) = watch::channel(Followed::Nothing);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "shutdown signals and joins the follower task"
-        )]
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = stopped => {}
-                () = run(settings, feed, progress) => {}
-            }
-        });
-        Self {
-            task,
-            stop,
-            followed,
-        }
+        let store = Arc::clone(feed.store());
+        Self(WorkerFollower::start(settings.0, store, move || {
+            feed.settle();
+        }))
     }
 
     /// What the follower has reached.
     pub(crate) fn followed(&self) -> Followed {
-        *self.followed.borrow()
+        if self.0.has_first_snapshot() {
+            Followed::Fleet
+        } else {
+            Followed::Nothing
+        }
     }
 
     /// Ends the task and waits for it.
     pub(crate) async fn stop(self) {
-        let _ = self.stop.send(());
-        if let Err(error) = self.task.await {
-            warn!(%error, "Worker follower task ended");
-        }
-    }
-}
-
-fn next_delay(delay: Duration) -> Duration {
-    (delay * 2).min(MAX_RETRY)
-}
-
-/// The leaders followed at once, one after another, before the watch holds a
-/// place again. Two replicas that name each other would else be dialed in a
-/// loop with no wait.
-const REDIRECTS: u32 = 2;
-
-/// The leader `error` names, where the next dial goes to it at once: a
-/// replica that does not lead named one, and fewer than [`REDIRECTS`] were
-/// followed since the watch last held a place.
-fn named_leader(error: &anyhow::Error, followed: u32) -> Option<&str> {
-    match error.downcast_ref() {
-        Some(Error::NotLeader(leader)) if !leader.is_empty() && followed < REDIRECTS => {
-            Some(leader)
-        }
-        _ => None,
-    }
-}
-
-async fn run(settings: Settings, feed: Feed, progress: watch::Sender<Followed>) {
-    let mut watcher = Watcher::new(Arc::clone(feed.store()));
-    let mut delay = FIRST_RETRY;
-    let mut redirect: Option<String> = None;
-    // The leaders followed at once since the watch last held a place.
-    let mut followed = 0;
-    loop {
-        let address = redirect.as_deref().unwrap_or(&settings.address);
-        let error = match settings.connect(address).await {
-            Ok(mut client) => follow(
-                &mut client,
-                &mut watcher,
-                &feed,
-                &progress,
-                &mut delay,
-                &mut followed,
-            )
-            .await
-            .into(),
-            Err(error) => error,
-        };
-        if let Some(leader) = named_leader(&error, followed) {
-            followed += 1;
-            redirect = Some(leader.to_owned());
-            continue;
-        }
-        warn!(address, error = %format_args!("{error:#}"), ?delay, "Retrying the controller's worker watch");
-        sleep(delay).await;
-        delay = next_delay(delay);
-        redirect = None;
-        followed = 0;
-    }
-}
-
-async fn follow(
-    client: &mut Client,
-    watcher: &mut Watcher,
-    feed: &Feed,
-    progress: &watch::Sender<Followed>,
-    delay: &mut Duration,
-    followed: &mut u32,
-) -> Error {
-    loop {
-        let mut following = match watcher.open(client).await {
-            Ok(following) => following,
-            Err(error) => return error,
-        };
-        // Whether this stream brought the watcher to a place. One that ends
-        // before it does is opened again after the wait, so a snapshot that
-        // cannot land does not spin.
-        let mut placed = false;
-        loop {
-            match following.next().await {
-                Ok(true) => {}
-                // The controller ended the stream with no error: the next
-                // one goes on after the place.
-                Ok(false) => break,
-                Err(Ended::Lost(lost)) => {
-                    warn!(?lost, "Lost the controller's worker watch position");
-                    break;
-                }
-                Err(Ended::Client(error)) => return error,
-            }
-            if following.watcher().at().is_some() {
-                // The store holds the fleet as of a place. The registry
-                // takes the rows' objects and the store publishes what its
-                // build still owes. Only then does readiness hear of a
-                // fleet.
-                feed.settle();
-                placed = true;
-                *delay = FIRST_RETRY;
-                *followed = 0;
-                if *progress.borrow() == Followed::Nothing {
-                    progress.send_replace(Followed::Fleet);
-                }
-            }
-        }
-        if !placed {
-            sleep(*delay).await;
-            *delay = next_delay(*delay);
-        }
+        self.0.stop().await;
     }
 }
 
@@ -270,25 +109,19 @@ pub(crate) mod tests {
         time::{Duration, Instant},
     };
 
-    use openssl::{
-        pkey::{PKey, Private},
-        x509::X509,
-    };
     use smg_policy_controller::{
         engine::WorkerId,
         service::{
             controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
+            worker_follower::{PemFile, WorkerFollowerSettings},
         },
         store::{MemoryStore, WorkerStatus, WorkersStore},
     };
     use tokio::{sync::oneshot, time};
     use tonic::{transport::Channel, Request};
 
-    use super::{
-        gateway_id, named_leader, next_delay, Error, Followed, Follower, Settings, FIRST_RETRY,
-        REDIRECTS,
-    };
+    use super::{gateway_id, Followed, Follower, Settings};
     use crate::{
         config::RouterConfig,
         policy_controller::{
@@ -343,23 +176,17 @@ pub(crate) mod tests {
     }
 
     fn settings(address: SocketAddr) -> Settings {
-        Settings {
+        Settings(WorkerFollowerSettings {
             address: address.to_string(),
             ca_cert: None,
             cert: None,
             key: None,
             gateway_id: "test-gateway".to_owned(),
-        }
+        })
     }
 
     fn url(port: u16) -> String {
         format!("http://127.0.0.1:{port}")
-    }
-
-    /// The feed of a gateway under an address over `store`, with a registry
-    /// of its own.
-    fn fed(store: &Arc<MemoryStore>) -> Feed {
-        followed(store, &Arc::new(WorkerRegistry::new()))
     }
 
     /// The feed of a gateway under an address over `store`, for the workers
@@ -610,440 +437,34 @@ pub(crate) mod tests {
         controller.stop().await;
     }
 
-    #[tokio::test]
-    async fn an_unreachable_controller_leaves_nothing_and_the_follower_stops() {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket
-            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .unwrap();
-        let store = Arc::new(MemoryStore::new());
-        let follower = Follower::start(settings(socket.local_addr().unwrap()), fed(&store));
-        let progress = follower.followed.clone();
-        time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(follower.followed(), Followed::Nothing);
-        assert!(rows(&store).is_empty());
-        time::timeout(Duration::from_secs(1), follower.stop())
-            .await
-            .unwrap();
-        assert!(progress.has_changed().is_err());
-    }
-
-    #[tokio::test]
-    async fn a_stopped_controller_leaves_its_last_rows_and_fleet_state() {
-        let mut controller = Serving::start().await;
-        let row = time::timeout(WAIT, register(&mut controller.control, 31001, false))
-            .await
-            .unwrap();
-        let expected = rows(&controller.store);
-        let store = Arc::new(MemoryStore::new());
-        let follower = Follower::start(settings(controller.address), fed(&store));
-        until("the first snapshot", || {
-            follower.followed() == Followed::Fleet
-        })
-        .await;
-        assert!(store.get(WorkerId(row.id)).is_some());
-
-        controller.stop().await;
-        time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(follower.followed(), Followed::Fleet);
-        assert_eq!(rows(&store), expected);
-        time::timeout(Duration::from_secs(1), follower.stop())
-            .await
-            .unwrap();
-    }
-
-    /// A leader a replica names is dialed at once, and so is the leader that
-    /// one names. A third in a row waits: replicas that name each other
-    /// are not dialed in a loop.
+    /// Each TLS file of the configuration is named by the flag that sets
+    /// it, so a file that cannot be read is reported under that flag.
     #[test]
-    fn a_named_leader_is_followed_at_once_twice_and_then_waited_for() {
-        let named = |leader: &str| anyhow::Error::from(Error::NotLeader(leader.to_owned()));
-        for followed in 0..REDIRECTS {
-            assert_eq!(named_leader(&named("b:30100"), followed), Some("b:30100"));
-        }
-        assert_eq!(named_leader(&named("b:30100"), REDIRECTS), None);
+    fn the_settings_name_each_tls_file_by_its_flag() {
+        let config = RouterConfig {
+            policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
+            policy_controller_tls_cert: Some("gateway.pem".to_owned()),
+            policy_controller_tls_key: Some("gateway-key.pem".to_owned()),
+            ..RouterConfig::default()
+        };
+        let Settings(settings) = Settings::new("controller:30100".to_owned(), &config);
+        assert_eq!(settings.address, "controller:30100");
+        let named = |file: Option<PemFile>| file.map(|file| (file.setting, file.path));
         assert_eq!(
-            named_leader(&named(""), 0),
-            None,
-            "a replica that names none"
+            [
+                named(settings.ca_cert),
+                named(settings.cert),
+                named(settings.key)
+            ],
+            [
+                Some(("--policy-controller-tls-ca-cert", "ca.pem".to_owned())),
+                Some(("--policy-controller-tls-cert", "gateway.pem".to_owned())),
+                Some(("--policy-controller-tls-key", "gateway-key.pem".to_owned())),
+            ]
         );
-        assert_eq!(named_leader(&anyhow::Error::from(Error::NoCredit), 0), None);
-    }
-
-    #[test]
-    fn the_retry_wait_doubles_from_a_quarter_second_to_five_seconds() {
-        let mut delay = FIRST_RETRY;
-        for millis in [250, 500, 1000, 2000, 4000, 5000, 5000] {
-            assert_eq!(delay, Duration::from_millis(millis));
-            delay = next_delay(delay);
-        }
-    }
-
-    fn make_certificate(
-        name: &str,
-        serial: u32,
-        issuer: Option<(&X509, &PKey<Private>)>,
-    ) -> (X509, PKey<Private>) {
-        use openssl::{
-            asn1::Asn1Time,
-            bn::BigNum,
-            ec::{EcGroup, EcKey},
-            hash::MessageDigest,
-            nid::Nid,
-            x509::{
-                extension::{BasicConstraints, SubjectAlternativeName},
-                X509Name,
-            },
-        };
-
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
-        let mut subject = X509Name::builder().unwrap();
-        subject.append_entry_by_nid(Nid::COMMONNAME, name).unwrap();
-        let subject = subject.build();
-        let mut cert = X509::builder().unwrap();
-        cert.set_version(2).unwrap();
-        cert.set_serial_number(&BigNum::from_u32(serial).unwrap().to_asn1_integer().unwrap())
-            .unwrap();
-        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
-            .unwrap();
-        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
-            .unwrap();
-        cert.set_subject_name(&subject).unwrap();
-        cert.set_pubkey(&key).unwrap();
-        if let Some((ca, ca_key)) = issuer {
-            cert.set_issuer_name(ca.subject_name()).unwrap();
-            let san = SubjectAlternativeName::new()
-                .ip("127.0.0.1")
-                .build(&cert.x509v3_context(Some(ca), None))
-                .unwrap();
-            cert.append_extension(san).unwrap();
-            cert.sign(ca_key, MessageDigest::sha256()).unwrap();
-        } else {
-            cert.set_issuer_name(&subject).unwrap();
-            cert.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
-                .unwrap();
-            cert.sign(&key, MessageDigest::sha256()).unwrap();
-        }
-        (cert.build(), key)
-    }
-
-    #[tokio::test]
-    async fn the_follower_authenticates_with_the_configured_tls_files() {
-        use axum::{extract::Request, Router};
-        use tokio::{net::TcpListener, task::JoinSet};
-        use tonic::{
-            service::Routes,
-            transport::{server::TcpIncoming, Certificate, Identity, Server, ServerTlsConfig},
-        };
-
-        use crate::config::RouterConfig;
-
-        time::timeout(WAIT, async {
-            crate::server::install_crypto_provider();
-            let paths = tempfile::tempdir().unwrap();
-            let write = |name, pem| {
-                let path = paths.path().join(name);
-                std::fs::write(&path, pem).unwrap();
-                path
-            };
-            let (ca, key) = make_certificate("controller-ca", 1, None);
-            let (server, server_key) = make_certificate("controller", 2, Some((&ca, &key)));
-            let (client, client_key) = make_certificate("test-gateway", 3, Some((&ca, &key)));
-            let ca = ca.to_pem().unwrap();
-            let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let settings = Settings::new(
-                socket.local_addr().unwrap().to_string(),
-                &RouterConfig {
-                    policy_controller_tls_ca_cert: Some(
-                        write("ca.pem", ca.clone()).to_str().unwrap().to_owned(),
-                    ),
-                    policy_controller_tls_cert: Some(
-                        write("gateway.pem", client.to_pem().unwrap())
-                            .to_str()
-                            .unwrap()
-                            .to_owned(),
-                    ),
-                    policy_controller_tls_key: Some(
-                        write(
-                            "gateway-key.pem",
-                            client_key.private_key_to_pem_pkcs8().unwrap(),
-                        )
-                        .to_str()
-                        .unwrap()
-                        .to_owned(),
-                    ),
-                    ..Default::default()
-                },
-            );
-            let tls = ServerTlsConfig::new()
-                .identity(Identity::from_pem(
-                    server.to_pem().unwrap(),
-                    server_key.private_key_to_pem_pkcs8().unwrap(),
-                ))
-                .client_ca_root(Certificate::from_pem(ca));
-            let routes = Router::new().fallback(|request: Request| async move {
-                let path = request.uri().path();
-                if path.ends_with("/Leader") {
-                    grpc(
-                        [proto::LeaderInfo {
-                            term: 1,
-                            ..Default::default()
-                        }],
-                        "0",
-                    )
-                } else if path.ends_with("/Session") {
-                    grpc([welcome()], "0")
-                } else {
-                    assert!(path.ends_with("/WatchWorkers"));
-                    grpc([snapshot(1, true)], "")
-                }
-            });
-            let mut serving = JoinSet::new();
-            serving.spawn(
-                Server::builder()
-                    .tls_config(tls)
-                    .unwrap()
-                    .add_routes(Routes::from(routes))
-                    .serve_with_incoming(TcpIncoming::from(socket)),
-            );
-            let follower = Follower::start(settings, fed(&Arc::new(MemoryStore::new())));
-            until("the first snapshot over mutual TLS", || {
-                follower.followed() == Followed::Fleet
-            })
-            .await;
-            follower.stop().await;
-        })
-        .await
-        .expect("the follower takes a snapshot over mutual TLS within five seconds");
-    }
-
-    fn grpc<T: prost::Message>(
-        messages: impl IntoIterator<Item = T>,
-        status: &'static str,
-    ) -> axum::response::Response {
-        use std::convert::Infallible;
-
-        use axum::body::{Body, Bytes};
-        use http::{HeaderMap, HeaderValue};
-        use http_body::Frame;
-        use http_body_util::StreamBody;
-        use tokio_stream::StreamExt as _;
-
-        let mut bytes = Vec::new();
-        for message in messages {
-            bytes.push(0);
-            bytes.extend_from_slice(&u32::try_from(message.encoded_len()).unwrap().to_be_bytes());
-            message.encode(&mut bytes).unwrap();
-        }
-        let data = Ok::<_, Infallible>(Frame::data(Bytes::from(bytes)));
-        let body = if status.is_empty() {
-            Body::new(StreamBody::new(
-                tokio_stream::once(data).chain(tokio_stream::pending()),
-            ))
-        } else {
-            let mut trailers = HeaderMap::new();
-            trailers.insert("grpc-status", HeaderValue::from_static(status));
-            Body::new(StreamBody::new(tokio_stream::iter([
-                data,
-                Ok(Frame::trailers(trailers)),
-            ])))
-        };
-        axum::response::Response::builder()
-            .header("content-type", "application/grpc")
-            .body(body)
-            .unwrap()
-    }
-
-    fn snapshot(seq: u64, last: bool) -> proto::WorkerEvent {
-        proto::WorkerEvent {
-            seq,
-            term: 1,
-            event: Some(Event::Snapshot(proto::WorkerSnapshot {
-                last,
-                ..Default::default()
-            })),
-            ..Default::default()
-        }
-    }
-
-    fn welcome() -> proto::ControllerFrame {
-        proto::ControllerFrame {
-            term: 1,
-            frame: Some(proto::controller_frame::Frame::Welcome(
-                proto::Welcome::default(),
-            )),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn the_follower_reopens_a_watch_and_redials_after_a_stream_error() {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-
-        use axum::{body::to_bytes, extract::Request, Router};
-        use prost::Message as _;
-        use tokio::{
-            net::TcpListener,
-            sync::{mpsc, Notify},
-            task::JoinSet,
-        };
-        use tonic::{
-            service::Routes,
-            transport::{server::TcpIncoming, Server},
-        };
-
-        time::timeout(WAIT, async {
-            let lead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let leader_address = lead.local_addr().unwrap().to_string();
-            let seed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let seed_address = seed.local_addr().unwrap();
-            let seeds = Arc::new(AtomicUsize::new(0));
-            let seed_routes = Router::new().fallback({
-                let seeds = seeds.clone();
-                move |request: Request| {
-                    let leader_address = leader_address.clone();
-                    let seeds = seeds.clone();
-                    async move {
-                        if request.uri().path().ends_with("/Leader") {
-                            return grpc(
-                                [proto::LeaderInfo {
-                                    term: 1,
-                                    ..Default::default()
-                                }],
-                                "0",
-                            );
-                        }
-                        assert!(request.uri().path().ends_with("/Session"));
-                        let attempt = seeds.fetch_add(1, Relaxed);
-                        grpc(
-                            [proto::ControllerFrame {
-                                term: 1,
-                                frame: Some(proto::controller_frame::Frame::NotLeader(
-                                    proto::NotLeader {
-                                        leader_address: if matches!(attempt, 0 | 2) {
-                                            String::new()
-                                        } else {
-                                            leader_address
-                                        },
-                                        ..Default::default()
-                                    },
-                                )),
-                                ..Default::default()
-                            }],
-                            "0",
-                        )
-                    }
-                }
-            });
-            let (told, mut calls) = mpsc::channel(8);
-            let next = Arc::new(Notify::new());
-            let leader_routes = Router::new().fallback({
-                let next = next.clone();
-                let sessions = Arc::new(AtomicUsize::new(0));
-                let watches = Arc::new(AtomicUsize::new(0));
-                move |request: Request| {
-                    let (sessions, watches, told, next) = (
-                        sessions.clone(),
-                        watches.clone(),
-                        told.clone(),
-                        next.clone(),
-                    );
-                    async move {
-                        let path = request.uri().path();
-                        if path.ends_with("/Leader") {
-                            return grpc(
-                                [proto::LeaderInfo {
-                                    term: 1,
-                                    ..Default::default()
-                                }],
-                                "0",
-                            );
-                        }
-                        if path.ends_with("/Session") {
-                            sessions.fetch_add(1, Relaxed);
-                            return grpc([welcome()], "0");
-                        }
-                        assert!(path.ends_with("/WatchWorkers"));
-                        let body = to_bytes(request.into_body(), 4096).await.unwrap();
-                        let watch = proto::WatchWorkersRequest::decode(&body[5..]).unwrap();
-                        let turn = watches.fetch_add(1, Relaxed);
-                        told.send((watch.resume_seq, watch.resume_term, sessions.load(Relaxed)))
-                            .await
-                            .unwrap();
-                        match turn {
-                            0 => grpc([snapshot(1, false)], "0"),
-                            1 => {
-                                next.notified().await;
-                                grpc([snapshot(2, true)], "0")
-                            }
-                            2 => grpc(
-                                [
-                                    proto::WorkerEvent {
-                                        event: Some(Event::SnapshotRequired(
-                                            proto::SnapshotRequired::default(),
-                                        )),
-                                        ..Default::default()
-                                    },
-                                    snapshot(9, true),
-                                ],
-                                "",
-                            ),
-                            3 => {
-                                next.notified().await;
-                                grpc([snapshot(3, true)], "14")
-                            }
-                            _ => std::future::pending().await,
-                        }
-                    }
-                }
-            });
-            let mut servers = JoinSet::new();
-            for (socket, routes) in [(seed, seed_routes), (lead, leader_routes)] {
-                servers.spawn(
-                    Server::builder()
-                        .add_routes(Routes::from(routes))
-                        .serve_with_incoming(TcpIncoming::from(socket)),
-                );
-            }
-            let follower =
-                Follower::start(settings(seed_address), fed(&Arc::new(MemoryStore::new())));
-            let mut progress = follower.followed.clone();
-            assert_eq!(calls.recv().await, Some((0, 0, 1)));
-            assert_eq!(calls.recv().await, Some((0, 0, 1)));
-            assert_eq!(follower.followed(), Followed::Nothing);
-            next.notify_one();
-            assert_eq!(calls.recv().await, Some((2, 1, 1)));
-            assert_eq!(calls.recv().await, Some((0, 0, 1)));
-            assert_eq!(*progress.borrow_and_update(), Followed::Fleet);
-            let retried = time::Instant::now();
-            next.notify_one();
-            assert_eq!(calls.recv().await, Some((3, 1, 2)));
-            assert!(!progress.has_changed().unwrap());
-            assert!(retried.elapsed() >= Duration::from_millis(750));
-            assert_eq!(seeds.load(Relaxed), 4);
-            assert!(logs_contain("Lost the controller's worker watch position"));
-            logs_assert(|lines| {
-                let retries: Vec<_> = lines
-                    .iter()
-                    .filter(|line| line.contains("Retrying the controller's worker watch"))
-                    .collect();
-                if retries.len() == 3
-                    && retries[0].contains("delay=250ms")
-                    && retries[1].contains("delay=250ms")
-                    && retries[2].contains("delay=500ms")
-                    && retries.iter().all(|line| !line.contains("address=\"\""))
-                {
-                    Ok(())
-                } else {
-                    Err(format!("unexpected retries: {retries:?}"))
-                }
-            });
-            follower.stop().await;
-        })
-        .await
-        .expect("the watch reopens and reconnects within five seconds");
+        let Settings(plain) =
+            Settings::new("controller:30100".to_owned(), &RouterConfig::default());
+        assert!(plain.ca_cert.is_none() && plain.cert.is_none() && plain.key.is_none());
     }
 
     #[test]

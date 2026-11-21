@@ -245,6 +245,10 @@ criterion = "0.8"
 # the same stand-in served over HTTP.
 axum = { workspace = true }
 http = { workspace = true }
+# The follower's tests answer as a controller would: a body of frames that
+# ends with trailers, or never ends.
+http-body = "1.0"
+http-body-util = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # The spec store cases collect the lines the source logs.

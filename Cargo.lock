@@ -8106,6 +8106,8 @@ dependencies = [
  "criterion",
  "crossbeam-queue",
  "http",
+ "http-body",
+ "http-body-util",
  "hyper-util",
  "k8s-openapi",
  "kube",
