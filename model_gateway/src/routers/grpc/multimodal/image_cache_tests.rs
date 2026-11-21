@@ -915,6 +915,59 @@ async fn bf16_batch_cache_reuses_large_batches_across_image_families() {
     }
 }
 
+/// A budget between a wire's length and its pooled class stores the batch
+/// once: the replay views the allocation of the fill, without a gather.
+#[tokio::test]
+async fn a_batch_whose_pooled_class_is_over_the_budget_is_cached_as_one_exact_copy() {
+    let batch = MediaBatch::Images(
+        (0..8u8)
+            .map(|id| {
+                Arc::new(ImageFrame::new(
+                    image::RgbImage::from_pixel(224, 224, image::Rgb([id, 21, 203])).into(),
+                    Default::default(),
+                    Default::default(),
+                    ImageSource::InlineBytes,
+                    id.to_string(),
+                ))
+            })
+            .collect(),
+    );
+    let model = "qwen3_vl";
+    let (mut components, _, _) = setup(true, false);
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": model, "image_token_id": 100}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let registry = Arc::clone(&components.model_registry);
+    let spec = registry
+        .lookup(&ModelMetadata {
+            model_id: model,
+            tokenizer: &NoTokenizer,
+            config: &config.config,
+        })
+        .unwrap();
+    let wire = Some(EncoderDtype::BFloat16);
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+    let uncached = preprocess_batch(&batch, &ctx).await.unwrap();
+    let len = uncached.encoder_input.nbytes();
+    // Room for the entries' metadata beside the bytes, still under the class.
+    let budget = len + 64 * 1024;
+    assert!(llm_multimodal::buffer_pool::allocation_capacity(len) > budget);
+    components.pixel_cache = Some(Arc::new(PixelCache::new(budget)));
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+
+    let fill = preprocess_modality(&batch, &ctx).await.unwrap();
+    let replay = preprocess_modality(&batch, &ctx).await.unwrap();
+    let stored = fill.encoder_input.shared_allocation();
+    assert_eq!(stored.map(|(_, capacity)| capacity), Some(len));
+    assert_eq!(replay.encoder_input.shared_allocation(), stored);
+    assert_eq!(
+        replay.encoder_input.write_as(EncoderDtype::BFloat16),
+        fill.encoder_input.write_as(EncoderDtype::BFloat16),
+    );
+}
+
 /// Keep newly computed images when an overlapping request cannot replace its old backing.
 #[tokio::test]
 async fn bf16_recompute_caches_misses_without_replacing_a_partial_backing() {
