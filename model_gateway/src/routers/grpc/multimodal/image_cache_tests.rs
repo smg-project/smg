@@ -962,10 +962,11 @@ async fn a_batch_whose_pooled_class_is_over_the_budget_is_cached_as_one_exact_co
     let stored = fill.encoder_input.shared_allocation();
     assert_eq!(stored.map(|(_, capacity)| capacity), Some(len));
     assert_eq!(replay.encoder_input.shared_allocation(), stored);
-    assert_eq!(
-        replay.encoder_input.write_as(EncoderDtype::BFloat16),
-        fill.encoder_input.write_as(EncoderDtype::BFloat16),
-    );
+    let expected = uncached.encoder_input.write_as(EncoderDtype::BFloat16);
+    for output in [fill, replay] {
+        let bytes = output.encoder_input.write_as(EncoderDtype::BFloat16);
+        assert_eq!(bytes, expected);
+    }
 }
 
 /// Keep newly computed images when an overlapping request cannot replace its old backing.
