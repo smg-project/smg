@@ -42,6 +42,27 @@
 //! two side policies the classic ones or the objects that ask the engine.
 //! `--not-ready` and `--ready` then hold for each side.
 //!
+//! `--keys N` gives each request one of `N` routing keys in turn, in the
+//! header `x-smg-routing-key`: a policy that places by a key places by it,
+//! on both paths. `0`, the default, sends no key.
+//!
+//! `--prompts N` gives each request one of `N` prompts in turn, each of
+//! 1,024 tokens: the first 32 are the same in every prompt, as a chat
+//! template's head is, and the rest are the prompt's own. `1`, the default,
+//! sends one prompt over and over.
+//!
+//! `--publish-ms N` publishes the fleet's reports again, as a new load
+//! snapshot, every `N` milliseconds while the callers run: the load monitor
+//! publishes pushed reports at most once in 20 milliseconds. `0`, the
+//! default, publishes once before the first request. The result line counts
+//! the snapshots published while the callers ran (`publications`), and on
+//! the `records` path the times the engine converted a pool's reports
+//! (`conversions`: at most one a snapshot a pool).
+//!
+//! The result line's `alloc_bytes_per_decision` is what the callers'
+//! threads allocated in their timed decisions, by the allocator's own count
+//! of each thread, over the decisions made.
+//!
 //! `--models N` serves `N` models, each with a fleet of its own of the
 //! cell's size: a caller's requests name the models in turn, as the
 //! requests of a gateway that serves many models do, so no two requests in
@@ -65,13 +86,14 @@ use std::{
     collections::HashMap,
     hint::black_box,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Barrier,
     },
     thread,
     time::{Duration, Instant},
 };
 
+use axum::http::{HeaderMap, HeaderValue};
 use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerLoadResponse, WorkerStatus},
@@ -87,7 +109,7 @@ use smg::{
         common::{
             bench_support::{
                 attach_loads, policies_asking_the_engine, route_classic, route_pair, route_records,
-                set_pair_sides, EngineOverRecords, Route,
+                set_pair_sides, thread_allocated_bytes, EngineOverRecords, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -139,6 +161,14 @@ struct Cell {
     /// A pair gateway: `workers` prefill workers and as many decode
     /// workers a model, and a request placed as a pair.
     pair: bool,
+    /// The routing keys the requests carry in turn; `0` for none.
+    keys: usize,
+    /// The prompts the requests carry in turn.
+    prompts: usize,
+    /// Milliseconds between two publications of the fleet's reports while
+    /// the callers run; `0` for the one publication before the first
+    /// request.
+    publish_ms: u64,
 }
 
 fn cell() -> Cell {
@@ -155,6 +185,9 @@ fn cell() -> Cell {
         overloaded: false,
         models: 1,
         pair: false,
+        keys: 0,
+        prompts: 1,
+        publish_ms: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -184,6 +217,9 @@ fn cell() -> Cell {
             "--overloaded" => cell.overloaded = value.parse().unwrap(),
             "--models" => cell.models = value.parse().unwrap(),
             "--pair" => cell.pair = value.parse().unwrap(),
+            "--keys" => cell.keys = value.parse().unwrap(),
+            "--prompts" => cell.prompts = value.parse().unwrap(),
+            "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             other => panic!("no flag {other}"),
         }
     }
@@ -191,6 +227,20 @@ fn cell() -> Cell {
 }
 
 fn policy_config(name: &str) -> PolicyConfig {
+    // The cache-aware policy has no form of one word: its thresholds are
+    // the ones the command line gives it with every switch left out.
+    if name == "cache_aware" {
+        return PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 67_108_864);
+    }
+    // Nor has the bucket policy: the command line's two spill thresholds
+    // and its seconds between two adjustments of the boundaries.
+    if name == "bucket" {
+        return PolicyConfig::Bucket {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            bucket_adjust_interval_secs: 5,
+        };
+    }
     serde_json::from_value(serde_json::json!({ "type": name }))
         .unwrap_or_else(|error| panic!("no policy {name}: {error}"))
 }
@@ -319,8 +369,45 @@ fn reports(fleet: &[Arc<dyn Worker>]) -> Vec<(Arc<dyn Worker>, WorkerLoadRespons
 }
 
 /// A path's one routing call, shared by the callers: the request's tokens
-/// and its turn among its caller's requests, which names its model.
+/// and its turn among its caller's requests, which names its model and its
+/// routing key.
 type Routing = Box<dyn Fn(&[u32], u64) -> bool + Send + Sync>;
+
+/// The header a routing key travels in.
+const ROUTING_KEY: &str = "x-smg-routing-key";
+
+/// The headers of `keys` requests, each with a routing key of its own.
+fn keyed_headers(keys: usize) -> Vec<HeaderMap> {
+    (0..keys)
+        .map(|key| {
+            let mut headers = HeaderMap::new();
+            let value = HeaderValue::from_str(&format!("session-{key:06}")).unwrap();
+            headers.insert(ROUTING_KEY, value);
+            headers
+        })
+        .collect()
+}
+
+/// The shared head of every prompt, in tokens.
+const PROMPT_HEAD: usize = 32;
+
+/// `prompts` prompts of 1,024 tokens: a head every prompt shares, then
+/// tokens of the prompt's own. One prompt is the tokens `0..1024`.
+fn prompts(prompts: usize) -> Vec<Vec<u32>> {
+    (0..prompts.max(1))
+        .map(|prompt| {
+            (0..1_024usize)
+                .map(|at| {
+                    if prompt == 0 || at < PROMPT_HEAD {
+                        at as u32
+                    } else {
+                        (mix((prompt * 1_024 + at) as u64) % 100_000) as u32
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
 
 /// Who decides a cell's requests: the classic placement over a registry's
 /// policies (the classic ones, or the objects that ask the engine), or the
@@ -330,6 +417,22 @@ enum Decider {
     Records(EngineOverRecords),
 }
 
+/// The load feed of a cell and the reports it publishes: one a worker.
+struct Feed {
+    feed: TestFeed,
+    loads: HashMap<String, WorkerLoadResponse>,
+}
+
+/// A cell's path as `build` leaves it: the routing call, the load feed
+/// where the cell publishes reports, and the count of the times the engine
+/// converted a pool's reports so far (zero on a path with no engine over
+/// records).
+struct Built {
+    routing: Routing,
+    feed: Option<Feed>,
+    conversions: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
 /// A cell's path, built: a registry with the fleet, the policies a
 /// registration leaves (the model's policy and each worker's completion
 /// sink), and the load feed the monitor would publish. On the `object` path
@@ -337,7 +440,7 @@ enum Decider {
 /// pair cell's registry holds the two side policies a pair gateway's start
 /// sets, and each model's fleet is its two sides. On the `records` path no
 /// policy registry is built: the engine reads the feed itself.
-fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
+fn build(cell: &Cell) -> Built {
     let registry = Arc::new(WorkerRegistry::new());
     let mut config = RouterConfig {
         policy_controller: true,
@@ -404,9 +507,9 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
             .map(|(worker, report)| (worker.url().to_owned(), report))
             .collect();
         feed.publish(&loads);
-        feed
+        Feed { feed, loads }
     });
-    let decider = match policies {
+    let decider = Arc::new(match policies {
         Some(policies) => {
             if cell.reports {
                 attach_loads(&policies, receiver);
@@ -414,36 +517,66 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
             Decider::Policies(policies)
         }
         None => Decider::Records(EngineOverRecords::of(&config, receiver).unwrap()),
+    });
+    let conversions: Box<dyn Fn() -> u64 + Send + Sync> = {
+        let (decider, registry, models) =
+            (Arc::clone(&decider), Arc::clone(&registry), models.clone());
+        let route = cell.route;
+        Box::new(move || match &*decider {
+            Decider::Records(engine) => models
+                .iter()
+                .map(|model| engine.conversions(&registry, model, route))
+                .sum(),
+            Decider::Policies(_) => 0,
+        })
     };
     let (route, pair) = (cell.route, cell.pair);
+    assert!(
+        !(pair && cell.keys != 0),
+        "a pair cell sends no routing key"
+    );
+    let keys = keyed_headers(cell.keys);
     let routing: Routing = Box::new(move |tokens, turn| {
         let model = &models[(turn % models.len() as u64) as usize];
-        match &decider {
+        let headers = match keys.len() {
+            0 => None,
+            count => keys.get((turn % count as u64) as usize),
+        };
+        match &*decider {
             Decider::Policies(policies) if pair => {
                 route_pair(&registry, policies, model, Some(tokens))
             }
             Decider::Policies(policies) => {
-                route_classic(&registry, policies, model, route, Some(tokens))
+                route_classic(&registry, policies, model, route, Some(tokens), headers)
             }
             Decider::Records(engine) => {
-                route_records(&registry, engine, model, route, Some(tokens))
+                route_records(&registry, engine, model, route, Some(tokens), headers)
             }
         }
     });
-    (routing, feed)
+    Built {
+        routing,
+        feed,
+        conversions,
+    }
 }
 
 fn main() {
     let cell = cell();
     let recorder = start_prometheus(PrometheusConfig::default());
-    let tokens: Vec<u32> = (0..1_024).collect();
-    let (routing, _feed) = build(&cell);
+    let prompts = prompts(cell.prompts);
+    let tokens_at = |turn: u64| &prompts[(turn % prompts.len() as u64) as usize][..];
+    let Built {
+        routing,
+        feed,
+        conversions,
+    } = build(&cell);
     // The path's first sight of the pool, untimed: what a registration and
     // the first request after it build once.
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;
     for turn in 0..warm {
         assert!(
-            routing(&tokens, turn),
+            routing(tokens_at(turn), turn),
             "a fleet with a ready worker takes every request"
         );
     }
@@ -458,12 +591,29 @@ fn main() {
     let done = Barrier::new(cell.callers + 1);
     let busy_nanos = AtomicU64::new(0);
     let placed = AtomicU64::new(0);
+    let allocated = AtomicU64::new(0);
+    let publications = AtomicU64::new(0);
+    let published = AtomicBool::new(false);
+    let converted_before = conversions();
     let mut wall = Duration::ZERO;
     thread::scope(|scope| {
+        // The monitor's side: the fleet's reports published again as a new
+        // snapshot, each sampled at its publication.
+        if let (Some(feed), true) = (&feed, cell.publish_ms > 0) {
+            let (publications, published) = (&publications, &published);
+            let every = Duration::from_millis(cell.publish_ms);
+            scope.spawn(move || {
+                while !published.load(Ordering::Relaxed) {
+                    thread::sleep(every);
+                    feed.feed.publish(&feed.loads);
+                    publications.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
         for _ in 0..cell.callers {
             scope.spawn(|| {
                 for turn in 0..CALLER_WARM * cell.models.max(1) as u64 {
-                    black_box(routing(black_box(&tokens), turn));
+                    black_box(routing(black_box(tokens_at(turn)), turn));
                 }
                 loop {
                     start.wait();
@@ -471,13 +621,21 @@ fn main() {
                     if decisions == 0 {
                         break;
                     }
+                    let allocated_before = thread_allocated_bytes();
                     let started = Instant::now();
                     let mut took_placed = 0u64;
                     for turn in 0..decisions {
-                        took_placed +=
-                            u64::from(black_box(routing(black_box(&tokens), black_box(turn))));
+                        took_placed += u64::from(black_box(routing(
+                            black_box(tokens_at(turn)),
+                            black_box(turn),
+                        )));
                     }
                     let took = started.elapsed();
+                    if let (Some(before), Some(after)) =
+                        (allocated_before, thread_allocated_bytes())
+                    {
+                        allocated.fetch_add(after - before, Ordering::Relaxed);
+                    }
                     busy_nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
                     placed.fetch_add(took_placed, Ordering::Relaxed);
                     done.wait();
@@ -497,6 +655,7 @@ fn main() {
         }
         stretch.store(0, Ordering::Relaxed);
         start.wait();
+        published.store(true, Ordering::Relaxed);
     });
     let busy = Duration::from_nanos(busy_nanos.into_inner());
     let placed = placed.into_inner();
@@ -507,8 +666,9 @@ fn main() {
     );
     let per_second = total as f64 / wall.as_secs_f64();
     let nanos = busy.as_nanos() as f64 / total as f64;
+    let allocated_each = allocated.into_inner() as f64 / total as f64;
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -520,6 +680,12 @@ fn main() {
         cell.overloaded,
         cell.models,
         cell.pair,
+        cell.keys,
+        cell.prompts,
+        cell.publish_ms,
+        publications.into_inner(),
+        conversions() - converted_before,
+        allocated_each,
         total,
         wall.as_secs_f64(),
         per_second,
