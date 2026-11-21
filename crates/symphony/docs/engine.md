@@ -154,7 +154,9 @@ is a later step).
   close its call, the forced arguments, which are the whole output: the output's end is that
   call's own end where its value is whole there (a number or a literal the bytes end on), which
   the assembler says when asked (`CallAssembler::ends_with_the_output`), and the end is then
-  `closed` at the stop and at a cut alike, as it is for the object that closed at its brace. The
+  `closed`, as it is for the object that closed at its brace: at the model's stop for either,
+  and at a cut for a literal alone, since a cut may have taken a number's next digit (`12` of
+  `123`), so a number the cut found is a call the cut found open, its bytes delivered. The
   events and their order are what they were, so a driver that does not read the field sees no
   change. One that fails its request on a call the model did not finish reads it there, beside
   `MalformedReason::loses_a_call` for a call the syntax could not read whole: the reason is the

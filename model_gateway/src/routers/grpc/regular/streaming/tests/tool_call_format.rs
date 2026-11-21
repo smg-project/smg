@@ -650,38 +650,51 @@ fn forced_spec() -> ChatResponseSpec {
 
 /// A forced call whose arguments are a bare scalar has no byte to close it:
 /// the value is whole where the output ends, and the call is delivered, at
-/// the model's stop and where the limit ended the output alike, streamed and
-/// whole. A forced value the output ended inside is the incomplete call, as
-/// any other: the request fails, and the stream has sent the call's name and
-/// the value as far as it went, as it does where the contract does not
-/// apply.
+/// the model's stop for a number and a literal, streamed and whole. Where the
+/// limit ended the output a literal is whole all the same, and a number is
+/// not: `12` may be what the limit left of `123`, so the request fails as for
+/// a call the limit cut, the digits sent as far as they went. A forced value
+/// the output ended inside is the incomplete call, as any other: the request
+/// fails, and the stream has sent the call's name and the value as far as it
+/// went, as it does where the contract does not apply.
 #[tokio::test]
 async fn a_forced_scalar_whole_where_the_output_ends_is_delivered_and_an_unfinished_value_fails() {
-    for finish in ["stop", "length"] {
-        for whole in ["7", "-12", "true"] {
-            for frames in [
-                vec![chunk(0, whole), complete(0, finish)],
-                by_character(whole, finish),
-            ] {
-                let (result, events) = streamed(frames, forced_spec()).await;
-                assert!(
-                    result.is_ok(),
-                    "{whole} under {finish}: {:?}",
-                    result.err().map(|e| e.to_string())
-                );
-                assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
-                assert_eq!(tool_arguments(&events), whole, "{events:?}");
-            }
-            let choice = whole_answer(M3, whole, finish, &forced_spec())
-                .await
-                .unwrap_or_else(|failure| panic!("{whole} under {finish}: {failure}"));
-            let calls = choice.message.tool_calls.expect("the call");
-            assert_eq!(calls[0].function.name, "lookup");
-            assert_eq!(calls[0].function.arguments.as_deref(), Some(whole));
+    for (whole, finish) in [
+        ("7", "stop"),
+        ("-12", "stop"),
+        ("true", "stop"),
+        ("true", "length"),
+        ("null", "length"),
+    ] {
+        for frames in [
+            vec![chunk(0, whole), complete(0, finish)],
+            by_character(whole, finish),
+        ] {
+            let (result, events) = streamed(frames, forced_spec()).await;
+            assert!(
+                result.is_ok(),
+                "{whole} under {finish}: {:?}",
+                result.err().map(|e| e.to_string())
+            );
+            assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+            assert_eq!(tool_arguments(&events), whole, "{events:?}");
         }
+        let choice = whole_answer(M3, whole, finish, &forced_spec())
+            .await
+            .unwrap_or_else(|failure| panic!("{whole} under {finish}: {failure}"));
+        let calls = choice.message.tool_calls.expect("the call");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(calls[0].function.arguments.as_deref(), Some(whole));
     }
-    for (finish, at_limit) in [("stop", false), ("length", true)] {
-        for unfinished in ["{\"city\": \"Par", "[1, 2", "tru"] {
+    for (finish, at_limit, values) in [
+        ("stop", false, &["{\"city\": \"Par", "[1, 2", "tru"][..]),
+        (
+            "length",
+            true,
+            &["{\"city\": \"Par", "[1, 2", "tru", "7", "-12"][..],
+        ),
+    ] {
+        for unfinished in values {
             let frames = vec![chunk(0, unfinished), complete(0, finish)];
             let (result, events) = streamed(frames.clone(), forced_spec()).await;
             assert_eq!(
