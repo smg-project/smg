@@ -134,7 +134,8 @@ pub(crate) struct ChatResponseSpec {
     /// Whether the request expects tool calls in the answer
     /// ([`expects_tool_calls`]): what a wire that fails a request on a tool
     /// call the reader could not read asks before it does
-    /// ([`Self::fails_on_unreadable_call`]).
+    /// ([`Self::fails_on_unreadable_call`]). Looked for only on such a wire
+    /// (`Wire::has_unreadable_tool_call_rule`), and `false` on every other.
     pub expects_tool_calls: bool,
 }
 
@@ -198,9 +199,10 @@ impl ChatResponseSpec {
     /// request's preparation derived it once; `From` derives the profile for
     /// a request that carries none.
     pub(crate) fn for_request(request: &ChatCompletionRequest, provider: ProviderProfile) -> Self {
+        let wire = Wire::of(provider);
         let history_tool_calls_count = request.history_tool_calls_count();
         Self {
-            wire: Wire::of(provider),
+            wire,
             separate_reasoning: request.separate_reasoning,
             json_mode: Self::json_mode_of(request),
             tool_choice: request.tool_choice.clone(),
@@ -229,12 +231,15 @@ impl ChatResponseSpec {
             reasoning_in_prefill: false,
             symphony: None,
             parser_names: None,
-            expects_tool_calls: expects_tool_calls(request, provider, history_tool_calls_count),
+            // Asked of the request only on a wire that has the rule: a
+            // request on any other wire pays nothing for it.
+            expects_tool_calls: wire.has_unreadable_tool_call_rule()
+                && expects_tool_calls(request, provider, history_tool_calls_count),
         }
     }
 
     /// Whether a tool call the reader could not read ends the request as a
-    /// failure in place of an answer (`wire::minimax::InvalidToolCallFormat`):
+    /// failure in place of an answer (`wire::UnreadableToolCallFailure`):
     /// the request expects tool calls, a Symphony table reads the answer, and
     /// the wire's contract fails a request on such a call for that table's
     /// answers ([`Wire::fails_on_unreadable_tool_call`]: MiniMax's, for its
@@ -467,9 +472,13 @@ pub(crate) enum HarmonyResponseSpec {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+    use symphony::{formats::Table, grammar::GrammarStart};
 
     use super::*;
-    use crate::routers::grpc::testing::tool;
+    use crate::routers::grpc::{
+        regular::symphony::{assign_for, Asks, Reading},
+        testing::tool,
+    };
 
     fn chat_request(value: Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("request deserializes")
@@ -527,14 +536,41 @@ mod tests {
             if let Some(tool_choice) = &tool_choice {
                 request["tool_choice"] = tool_choice.clone();
             }
-            let spec = ChatResponseSpec::from(&chat_request(request));
+            let on_another_wire = {
+                let mut request = request.clone();
+                request["model"] = json!("served-model");
+                ChatResponseSpec::from(&chat_request(request))
+            };
+            let request = chat_request(request);
+            let mut spec = ChatResponseSpec::from(&request);
             assert_eq!(
                 spec.expects_tool_calls, expected,
                 "tools {tools:?}, tool_choice {tool_choice:?}"
             );
-            // No table reads the answer of a spec built from the request
-            // alone, so nothing fails on an unreadable call yet.
-            assert!(!spec.fails_on_unreadable_call());
+            // The request fails on an unreadable call when it expects calls
+            // and the wire's rule covers the table that reads the answer:
+            // the M3 table's answers, not the M2 table's.
+            for (table, covered) in [(Table::MinimaxM3, true), (Table::MinimaxM2, false)] {
+                spec.symphony = assign_for(
+                    Reading::Table(table.shared(), false),
+                    Asks::Chat(&request),
+                    None,
+                    "",
+                    ProviderProfile::for_model(&request.model),
+                    || GrammarStart::Unknown,
+                );
+                assert_eq!(
+                    spec.fails_on_unreadable_call(),
+                    expected && covered,
+                    "{table:?}, tools {tools:?}, tool_choice {tool_choice:?}"
+                );
+            }
+            // A wire with no such rule does not look: the question is not
+            // asked of its requests.
+            assert!(
+                !on_another_wire.expects_tool_calls,
+                "tools {tools:?}, tool_choice {tool_choice:?}"
+            );
         }
     }
 

@@ -30,7 +30,7 @@
 //! event under `reader_panicked`, charged to no worker, counted under the
 //! table that read the output ([`Panicked::record`]).
 //! A tool call the reader could not read, on a wire whose contract fails the
-//! request on one ([`InvalidToolCallFormat`]), is the request's outcome as
+//! request on one ([`UnreadableToolCallFailure`]), is the request's outcome as
 //! well: counted under `invalid_tool_call_format`, charged to no worker, and
 //! ended by its own frame, the stream's last, with no `[DONE]` after it.
 
@@ -59,7 +59,7 @@ use crate::{
         error::error_type_for_status,
         grpc::{
             context::{DispatchMetadata, Placement, WorkerSelection},
-            wire::minimax::{InvalidToolCallFormat, INVALID_TOOL_CALL_FORMAT},
+            wire::UnreadableToolCallFailure,
         },
     },
 };
@@ -244,10 +244,10 @@ pub(crate) enum StreamFailure {
     /// The answer ended with a tool call the reader could not read, under a
     /// request that fails on one (`ChatResponseSpec::fails_on_unreadable_call`):
     /// the request's outcome, ended as the wire's contract ends it
-    /// ([`InvalidToolCallFormat`]): after the answer as it was read, the
+    /// ([`UnreadableToolCallFailure`]): after the answer as it was read, the
     /// usage chunk when asked for, then the contract's event as the last
     /// frame, no finish chunk and no `[DONE]`.
-    ToolCallFormat(InvalidToolCallFormat),
+    ToolCallFormat(UnreadableToolCallFailure),
 }
 
 impl StreamFailure {
@@ -286,8 +286,8 @@ impl StreamFailure {
     /// failure of the gateway's own processing, the contract's own type for
     /// a tool call the reader could not read.
     pub(crate) fn error_type(&self) -> &'static str {
-        if let Self::ToolCallFormat(_) = self {
-            return INVALID_TOOL_CALL_FORMAT;
+        if matches!(self, Self::ToolCallFormat(_)) {
+            return UnreadableToolCallFailure::CODE;
         }
         self.class().map_or(INTERNAL_ERROR_TYPE, |class| {
             class.client_type(STREAM_ERROR_TYPE)
@@ -319,7 +319,7 @@ impl StreamFailure {
                 Some(REQUEST_TIMEOUT_CODE)
             }
             Self::Panicked(_) => Some(READER_PANICKED_CODE),
-            Self::ToolCallFormat(_) => Some(INVALID_TOOL_CALL_FORMAT),
+            Self::ToolCallFormat(_) => Some(UnreadableToolCallFailure::CODE),
             Self::Upstream { .. } | Self::Internal(_) => None,
         }
     }
@@ -1611,7 +1611,9 @@ mod tests {
     /// ends a completed answer.
     #[test]
     fn a_tool_call_the_reader_could_not_read_is_the_requests_outcome() {
-        use crate::routers::grpc::regular::symphony::UnreadableCall;
+        use crate::routers::grpc::{
+            regular::symphony::UnreadableCall, wire::minimax::InvalidToolCallFormat,
+        };
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -1649,7 +1651,9 @@ mod tests {
     /// failure names no status of the worker's.
     #[tokio::test]
     async fn a_tool_call_the_reader_could_not_read_says_no_end_of_its_own() {
-        use crate::routers::grpc::regular::symphony::UnreadableCall;
+        use crate::routers::grpc::{
+            regular::symphony::UnreadableCall, wire::minimax::InvalidToolCallFormat,
+        };
 
         let (source, placement, store) = placed_source().await;
         source.account(&StreamFailure::ToolCallFormat(InvalidToolCallFormat::new(
@@ -1668,7 +1672,9 @@ mod tests {
     async fn a_tool_call_the_reader_could_not_read_ends_the_stream_with_the_contracts_frame() {
         use tokio::sync::mpsc;
 
-        use crate::routers::grpc::regular::symphony::UnreadableCall;
+        use crate::routers::grpc::{
+            regular::symphony::UnreadableCall, wire::minimax::InvalidToolCallFormat,
+        };
 
         let source = StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_CHAT);
         let contract = InvalidToolCallFormat::new(UnreadableCall::Incomplete, false);

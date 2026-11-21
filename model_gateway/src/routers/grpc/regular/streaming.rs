@@ -70,7 +70,7 @@ use crate::{
             },
             utils,
             utils::{isolation::isolated, message_utils},
-            wire::{minimax::InvalidToolCallFormat, StreamShape},
+            wire::{StreamShape, UnreadableToolCallFailure},
         },
     },
 };
@@ -775,7 +775,7 @@ impl StreamingProcessor {
                 // chunks are withheld, the usage chunk still goes out when
                 // the request asked for one (so a client accounts the
                 // tokens), and the failure ends the stream
-                // (`InvalidToolCallFormat`).
+                // (`UnreadableToolCallFailure`).
                 if let Some(failure) = stream.unreadable_call() {
                     stream.write_usage_chunk(final_usage.as_ref());
                     // The failure is the stream's outcome whatever the
@@ -4761,16 +4761,16 @@ impl<'a> ChatStream<'a> {
     /// fails the same way, with the token limit blamed only where that
     /// choice's finish says it cut the output. One such choice fails the
     /// whole request. `None` for every other stream, at one test.
-    fn unreadable_call(&self) -> Option<InvalidToolCallFormat> {
+    fn unreadable_call(&self) -> Option<UnreadableToolCallFailure> {
         if !self.spec.fails_on_unreadable_call() {
             return None;
         }
         self.choices.iter().find_map(|choice| {
             let unreadable = choice.reader.as_ref()?.unreadable_call()?;
-            Some(InvalidToolCallFormat::new(
+            self.spec.wire.unreadable_tool_call_failure(
                 unreadable,
                 choice.finish_reason.as_deref() == Some("length"),
-            ))
+            )
         })
     }
 

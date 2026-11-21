@@ -42,7 +42,7 @@ use crate::{
                 self,
                 isolation::{isolated, isolated_sync, Panicked, READER_PANICKED_CODE},
             },
-            wire::minimax::InvalidToolCallFormat,
+            wire::UnreadableToolCallFailure,
         },
     },
 };
@@ -55,8 +55,8 @@ pub(crate) enum ChoiceFailure {
     /// The answer ended with a tool call the reader could not read, under a
     /// request that fails on one
     /// (`ChatResponseSpec::fails_on_unreadable_call`): the request's 400
-    /// ([`InvalidToolCallFormat`]).
-    ToolCallFormat(InvalidToolCallFormat),
+    /// ([`UnreadableToolCallFailure`]).
+    ToolCallFormat(UnreadableToolCallFailure),
 }
 
 impl std::fmt::Display for ChoiceFailure {
@@ -262,7 +262,7 @@ impl ResponseProcessor {
     ///
     /// Under a request that fails on a tool call the reader could not read
     /// (`ChatResponseSpec::fails_on_unreadable_call`), such a call is the
-    /// choice's failure in place of a message ([`InvalidToolCallFormat`]);
+    /// choice's failure in place of a message ([`UnreadableToolCallFailure`]);
     /// the token limit is blamed only where the finish says it cut the
     /// output.
     #[expect(clippy::too_many_arguments)]
@@ -304,11 +304,13 @@ impl ResponseProcessor {
             choice: index as u32,
         };
         reader.end(engine_finish(reason), who, &mut events)?;
-        if let Some(unreadable) = reader.unreadable_call() {
-            return Err(ChoiceFailure::ToolCallFormat(InvalidToolCallFormat::new(
-                unreadable,
-                reason == "length",
-            )));
+        let failure = reader.unreadable_call().and_then(|unreadable| {
+            original_request
+                .wire
+                .unreadable_tool_call_failure(unreadable, reason == "length")
+        });
+        if let Some(failure) = failure {
+            return Err(ChoiceFailure::ToolCallFormat(failure));
         }
         let reasoning_tokens =
             finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);

@@ -98,7 +98,7 @@ pub(crate) fn error_type_for_response(response: &Response) -> &'static str {
         return metrics_labels::ERROR_CONSTRAINT;
     }
     // A tool call the reader could not read, on a wire whose contract fails
-    // the request on one (`wire::minimax::InvalidToolCallFormat`): the
+    // the request on one (`wire::UnreadableToolCallFailure`): the
     // request's outcome, whose code is the label itself.
     if code == metrics_labels::ERROR_INVALID_TOOL_CALL_FORMAT {
         return metrics_labels::ERROR_INVALID_TOOL_CALL_FORMAT;
