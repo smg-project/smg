@@ -40,9 +40,9 @@ use crate::{
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
     policy_controller::{
         self,
+        engine::PolicyEngine,
         feed::Feed,
         follower::{Follower, Settings},
-        host::Host,
         operators::Operators,
         Started,
     },
@@ -151,9 +151,9 @@ pub struct AppContext {
     pub(crate) policy_operators: Option<Arc<Operators>>,
     /// The worker watch, owned by the context until server teardown.
     pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
-    /// The policy controller's host. Routers ask it for placement wherever
+    /// The policy engine. Routers ask it for placement wherever
     /// the policy store is present.
-    pub(crate) policy_host: Option<Arc<Host>>,
+    pub(crate) policy_engine: Option<Arc<PolicyEngine>>,
     /// The membership feed over [`Self::policy_store`], present wherever the store is.
     pub(crate) policy_feed: Option<Feed>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
@@ -253,8 +253,8 @@ pub struct AppContextBuilder {
     policy_operators: Option<Arc<Operators>>,
     /// The membership feed, built with the policy store.
     policy_feed: Option<Feed>,
-    /// The host over the feed's holder, built with the feed.
-    policy_host: Option<Arc<Host>>,
+    /// The policy engine over the feed's holder, built with the feed.
+    policy_engine: Option<Arc<PolicyEngine>>,
     policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -423,7 +423,7 @@ impl AppContextBuilder {
             policy_store: None,
             policy_operators: None,
             policy_feed: None,
-            policy_host: None,
+            policy_engine: None,
             policy_follower: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -748,7 +748,7 @@ impl AppContextBuilder {
             policy_store: self.policy_store,
             policy_operators: self.policy_operators,
             policy_follower: self.policy_follower,
-            policy_host: self.policy_host,
+            policy_engine: self.policy_engine,
             policy_feed: self.policy_feed,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
@@ -980,9 +980,9 @@ impl AppContextBuilder {
     }
 
     /// Start the policy store with its operators' door, its membership feed,
-    /// its host with the host's timer and, under a controller's address, the
-    /// follower of that controller's workers. A start the door refuses stops
-    /// this one, by name.
+    /// its policy engine with the engine's timer and, under a controller's
+    /// address, the follower of that controller's workers. A start the door
+    /// refuses stops this one, by name.
     fn with_policy_controller(
         mut self,
         config: &RouterConfig,
@@ -1001,12 +1001,15 @@ impl AppContextBuilder {
             let connector = Arc::clone(&self.engine_connector);
             let (feed, follower) =
                 policy_controller::feeds(&store, registry, connector, controller);
-            let host = Arc::new(Host::new(Arc::clone(&store), Arc::clone(&feed.objects)));
+            let policy_engine = Arc::new(PolicyEngine::new(
+                Arc::clone(&store),
+                Arc::clone(&feed.objects),
+            ));
             // The door's clock runs from here on. The timer ends behind
-            // the host, so its handle detaches.
-            let _timer = policy_controller::upkeep::start(&host);
+            // the policy engine, so its handle detaches.
+            let _timer = policy_controller::upkeep::start(&policy_engine);
             self.policy_feed = Some(feed);
-            self.policy_host = Some(host);
+            self.policy_engine = Some(policy_engine);
             self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
             self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
             self.policy_store = Some(store);
@@ -1520,8 +1523,8 @@ mod tests {
     #[tokio::test]
     async fn under_the_feed_the_collectors_sink_is_the_feeds() {
         use smg_policy_controller::{
+            engine::view::{Role, WireModes},
             store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
-            view::{Role, WireModes},
             worker_host::{Expect, Wrote},
         };
         use smg_worker::common_proto::EngineLoad;
@@ -2059,7 +2062,7 @@ pub(crate) mod testing {
             policy_store: None,
             policy_operators: None,
             policy_follower: None,
-            policy_host: None,
+            policy_engine: None,
             policy_feed: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),

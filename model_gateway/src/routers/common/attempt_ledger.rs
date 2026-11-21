@@ -81,7 +81,7 @@ pub(crate) fn is_definitive_failure(response: &Response) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct AttemptLedger {
     inner: Mutex<Ledger>,
-    /// Whether the policy controller's host places the request's attempts.
+    /// Whether the policy engine places the request's attempts.
     hosted: bool,
 }
 
@@ -95,7 +95,7 @@ struct Ledger {
 }
 
 impl AttemptLedger {
-    /// The ledger of a request whose attempts the policy controller's host
+    /// The ledger of a request whose attempts the policy engine
     /// places where `hosted`, and the classic policies otherwise.
     pub(crate) fn of(hosted: bool) -> Self {
         Self {
@@ -106,10 +106,10 @@ impl AttemptLedger {
 
     /// Whether `worker` could take the request's next attempt, as the
     /// selection of that attempt judges a worker. The classic policies pass
-    /// over a worker that is not available. A host reads the overload veto
-    /// from the controller's rows, and the flag on the object mirrors a
-    /// verdict of any row of the worker: under a host it closes no retry
-    /// window, and the retry's placement answers for the worker.
+    /// over a worker that is not available. A policy engine reads the overload
+    /// veto from the controller's rows, and the flag on the object mirrors a
+    /// verdict of any row of the worker: under a policy engine it closes no
+    /// retry window, and the retry's placement answers for the worker.
     pub(crate) fn takes(&self, worker: &dyn Worker) -> bool {
         if self.hosted {
             worker.routing_state().eligible_ignoring_overload()
@@ -285,8 +285,8 @@ mod tests {
         AttemptLedger::default().settle(&mut classic, [&w1], pool.iter());
         assert!(!is_retryable_response(&classic));
 
-        // A host reads the veto from the controller's rows: the retry is
-        // left to its placement.
+        // A policy engine reads the veto from the controller's rows: the retry
+        // is left to its placement.
         let mut hosted = answered(StatusCode::INTERNAL_SERVER_ERROR);
         AttemptLedger::of(true).settle(&mut hosted, [&w1], pool.iter());
         assert!(is_retryable_response(&hosted));

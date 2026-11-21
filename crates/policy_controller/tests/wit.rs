@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+use smg_policy_controller::plugins::wit;
+
 fn contracts() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("contracts")
 }
@@ -16,7 +18,7 @@ fn contracts() -> PathBuf {
 fn the_committed_wit_is_the_rendering_of_its_template() {
     let template =
         std::fs::read_to_string(contracts().join("smg-policy.wit.in")).expect("the template");
-    let rendered = smg_policy_controller::wit::render(&template).expect("the template renders");
+    let rendered = wit::render(&template).expect("the template renders");
     let committed = contracts().join("smg-policy.wit");
     let current = std::fs::read_to_string(&committed).expect("the committed WIT");
     if rendered == current {
@@ -34,7 +36,7 @@ fn the_committed_wit_is_the_rendering_of_its_template() {
         + 1;
     panic!(
         "the committed WIT differs from its rendering at line {first}. The file is rendered: edit \
-         contracts/smg-policy.wit.in for the prose or src/wit/types.rs for the types, then run \
+         contracts/smg-policy.wit.in for the prose or src/plugins/wit/types.rs for the types, then run \
          `SMG_POLICY_WIT_WRITE=1 cargo test -p smg-policy-controller --test wit` and commit \
          contracts/smg-policy.wit (a hand edit of the committed file is rendered away)"
     );
@@ -45,7 +47,7 @@ fn the_committed_wit_is_the_rendering_of_its_template() {
 /// the descriptor's, held by the byte-for-byte test).
 #[test]
 fn the_records_are_the_engines_types_field_for_field() {
-    let drift = smg_policy_controller::wit::drift();
+    let drift = wit::drift();
     assert!(drift.is_empty(), "{}", drift.join("\n"));
 }
 
@@ -55,7 +57,7 @@ fn the_records_are_the_engines_types_field_for_field() {
 fn the_rendering_resolves_as_the_package_with_both_worlds() {
     let template =
         std::fs::read_to_string(contracts().join("smg-policy.wit.in")).expect("the template");
-    let rendered = smg_policy_controller::wit::render(&template).expect("the template renders");
+    let rendered = wit::render(&template).expect("the template renders");
     let mut resolve = wit_parser::Resolve::new();
     let package = resolve
         .push_str("smg-policy.wit", &rendered)
@@ -81,7 +83,7 @@ fn measure_the_rendering() {
     let rounds = 1_000u32;
     let started = std::time::Instant::now();
     for _ in 0..rounds {
-        let rendered = smg_policy_controller::wit::render(&template).expect("the template renders");
+        let rendered = wit::render(&template).expect("the template renders");
         assert!(rendered.len() > 1_000);
     }
     let each = started.elapsed() / rounds;

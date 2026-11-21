@@ -19,13 +19,17 @@ use super::{
     WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
-    decider::Decider,
-    decision::{Target, Targets},
-    demands::DemandFacts,
-    lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
-    replication::Log,
+    document::spec,
+    engine::{
+        decider::Decider,
+        decision,
+        decision::{Target, Targets},
+        demands::DemandFacts,
+        view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
+    },
+    service::replication::Log,
     sessions::SessionVerdict,
-    view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
+    tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -1534,8 +1538,8 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
 
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
 /// every `sweep_s`.
-fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::AppliedSpec {
-    use crate::spec::{AppliedSpec, PolicySpec};
+fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> spec::AppliedSpec {
+    use crate::document::spec::{AppliedSpec, PolicySpec};
 
     let mut document = PolicySpec::preset("manual").expect("a preset of this build");
     document.generation = generation;
@@ -1635,7 +1639,7 @@ fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
 /// leaves at its own end, and a pin with none stays.
 #[test]
 fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
-    use crate::spec::{AppliedSpec, PolicySpec};
+    use crate::document::spec::{AppliedSpec, PolicySpec};
 
     let store = MemoryStore::new();
     let now = Instant::now();
@@ -2198,7 +2202,7 @@ fn pair(
 ) -> (LeaseRecord, DecodeSide) {
     let mut targets = Targets::new();
     for &decode_id in decodes {
-        let pair = crate::decision::Pair {
+        let pair = decision::Pair {
             decode_id,
             ..Default::default()
         };
@@ -3521,7 +3525,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
 #[test]
 fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     use crate::{
-        view::{Candidate, RequestFacts},
+        engine::view::{Candidate, RequestFacts},
         AppliedSpec, Catalog, Lifecycle, PolicySpec, Scorer, TieBand,
     };
 
@@ -5281,6 +5285,22 @@ fn dispatch_and_completion_each_look_up_the_lease_once() {
     let dispatch = Said::Dispatched(Dispatch::default(), now);
     let complete = Said::Completed(done(Side::Single));
     assert_eq!((hashes(dispatch), hashes(complete)), (1, 1));
+}
+
+#[cfg(feature = "controller")]
+#[test]
+fn a_decode_take_back_looks_up_the_lease_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    store.set_term(1);
+    issue_pair(&store, chosen_pair(id.0, p, &[d], now)).expect("the key is free");
+    assert!(store.dispatched(gateway, id, on(Side::Prefill, 0), now));
+    assert_eq!(store.issue_decode(gateway, id, decode_side(d), now), Ok(()));
+
+    LEASE_HASHES.set(0);
+    assert!(store.take_back_decode(gateway, id, ReleaseReason::Abandoned));
+    assert_eq!(LEASE_HASHES.get(), 1);
 }
 
 #[test]

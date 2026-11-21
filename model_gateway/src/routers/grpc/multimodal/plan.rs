@@ -1442,6 +1442,8 @@ pub(crate) mod tests {
         for config in [
             serde_json::json!({"model_type": "inkling2"}),
             serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+            serde_json::json!({"model_type": "inkling2_loop"}),
+            serde_json::json!({"architectures": ["Inkling2LoopForConditionalGeneration"]}),
         ] {
             let components = image_components(config);
             for cap in [0, 504, u32::MAX] {
@@ -1462,6 +1464,8 @@ pub(crate) mod tests {
         for config in [
             serde_json::json!({"model_type": "inkling2"}),
             serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+            serde_json::json!({"model_type": "inkling2_loop"}),
+            serde_json::json!({"architectures": ["Inkling2LoopForConditionalGeneration"]}),
         ] {
             let components = image_components(config);
             for cap in [None, Some(serde_json::Value::Null)] {

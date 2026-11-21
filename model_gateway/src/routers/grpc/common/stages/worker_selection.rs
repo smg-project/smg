@@ -12,7 +12,7 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
-use smg_policy_controller::{lease::ReleaseReason, view::Phase, WireModes};
+use smg_policy_controller::{engine::view::Phase, tracking::lease::ReleaseReason, WireModes};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tracing::{debug, error, warn};
 
@@ -33,7 +33,7 @@ use crate::{
     },
     policy_controller::{
         self,
-        host::{self, Ask, Host, Placed},
+        engine::{self, Ask, Placed, PolicyEngine},
     },
     routers::{
         common::{
@@ -135,7 +135,7 @@ pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_tim
 pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    host: Option<Arc<Host>>,
+    policy_engine: Option<Arc<PolicyEngine>>,
     /// Whether the pair's policy settings keep a request to the worker it
     /// names ([`placement::pair_keeps_target`]). No role policy is built
     /// under the policy controller, so the stage is told.
@@ -167,7 +167,7 @@ impl WorkerSelectionStage {
         Self {
             worker_registry,
             policy_registry,
-            host: None,
+            policy_engine: None,
             pair_keeps_target: false,
             mode,
             prefill_admission,
@@ -175,9 +175,9 @@ impl WorkerSelectionStage {
         }
     }
 
-    /// Use the controller's host for regular selection when configured.
-    pub(crate) fn with_host(mut self, host: Option<Arc<Host>>) -> Self {
-        self.host = host;
+    /// Use the policy engine for regular selection when configured.
+    pub(crate) fn with_policy_engine(mut self, policy_engine: Option<Arc<PolicyEngine>>) -> Self {
+        self.policy_engine = policy_engine;
         self
     }
 
@@ -382,8 +382,9 @@ struct SelectionInputs<'a> {
     headers: Option<&'a HeaderMap>,
     rid_key: Option<String>,
     /// The body's `rid`, where the routing snapshot keeps it for the
-    /// retries: the classic sticky key derives from it, or a host stands,
-    /// whose asks state it. Elsewhere no retry reads it and none is copied.
+    /// retries: the classic sticky key derives from it, or a policy engine
+    /// stands, whose asks state it. Elsewhere no retry reads it and none is
+    /// copied.
     rid: Option<&'a str>,
     /// Whether the routing snapshot keeps a copy of the text: always without
     /// token ids, and with them only for a policy that reads text next to
@@ -434,7 +435,7 @@ impl<'a> SelectionInputs<'a> {
             .policy_registry
             .derive_rid_key(rid)
             .map(str::to_string);
-        let rid = rid.filter(|_| rid_key.is_some() || stage.host.is_some());
+        let rid = rid.filter(|_| rid_key.is_some() || stage.policy_engine.is_some());
 
         // Text is copied only when a configured policy would actually read it
         // (see the `keep_text` field).
@@ -632,10 +633,11 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
-        // Under a host the controller places no encode stage yet: a request
-        // with encode items is refused by name, and one with none is a pair.
+        // Under a policy engine the controller places no encode stage yet: a
+        // request with encode items is refused by name, and one with none is a
+        // pair.
         let mode = match self.mode {
-            WorkerSelectionMode::EncodePrefillDecode if self.host.is_some() => {
+            WorkerSelectionMode::EncodePrefillDecode if self.policy_engine.is_some() => {
                 if inputs.media_refs || inputs.intermediate.is_some() {
                     return Err(policy_controller::refused("encode items"));
                 }
@@ -1244,8 +1246,8 @@ impl Shape {
 
     /// The answer to an attempt of this shape: the refusal by name. A
     /// context demand no window holds is the client's to fix, so there the
-    /// classic's 400 answers, as with no host. `unheld` gives it, and gives
-    /// none where a window holds the demand: such a request could be
+    /// classic's 400 answers, as with no policy engine. `unheld` gives it, and
+    /// gives none where a window holds the demand: such a request could be
     /// served, and the controller cannot place by its demand yet.
     fn refusal(self, unheld: impl FnOnce() -> Option<Response>) -> Response {
         (self == Self::Window)
@@ -1267,7 +1269,7 @@ impl<'a> Attempt<'a> {
     /// client sent names an ask. The request's headers and its own `rid`
     /// are the sources of its routing key: a first attempt states both, and
     /// a retry states the two as the request left them behind.
-    fn ask(self, model: &'a str, id: &'a [u8], hashes: &'a host::Hashes) -> Ask<'a> {
+    fn ask(self, model: &'a str, id: &'a [u8], hashes: &'a engine::Hashes) -> Ask<'a> {
         let (streaming, headers, rid, tried) = match self {
             Self::First(ctx) => (
                 ctx.is_streaming(),
@@ -2006,11 +2008,11 @@ impl WorkerSelectionStage {
     }
 
     /// Whether a retry of `ctx` can be placed at all. Under the controller's
-    /// host a retry of a shape the stage refuses by name has no next
+    /// policy engine a retry of a shape the stage refuses by name has no next
     /// attempt: the refusal must not stand where a worker's failure does.
     /// The classic selection answers every retry itself.
     pub(crate) fn places_retry(&self, ctx: &DispatchContext) -> bool {
-        if self.host.is_none() {
+        if self.policy_engine.is_none() {
             return true;
         }
         let media = retry_media(ctx) != MediaDemands::NONE;
@@ -2033,7 +2035,8 @@ impl WorkerSelectionStage {
         .is_none()
     }
 
-    /// Place a regular attempt through the configured host or the classic policies.
+    /// Place a regular attempt through the configured policy engine or the classic
+    /// policies.
     async fn select_regular_attempt(
         &self,
         model_id: &str,
@@ -2044,7 +2047,7 @@ impl WorkerSelectionStage {
         attempt: Attempt<'_>,
     ) -> Result<(Arc<dyn Worker>, Option<Placed>), Response> {
         let no_worker = || self.context_selection_failure(model_id, wire, media, context);
-        let Some(host) = self.host.as_ref() else {
+        let Some(policy_engine) = self.policy_engine.as_ref() else {
             return self
                 .select_regular(
                     model_id,
@@ -2082,15 +2085,15 @@ impl WorkerSelectionStage {
             }));
         }
 
-        let prompt = host::Prompt::of(inputs.tokens, inputs.cache_namespace);
-        let hashes = host.hashes(model_id, &prompt);
-        let id = host::mark();
+        let prompt = engine::Prompt::of(inputs.tokens, inputs.cache_namespace);
+        let hashes = policy_engine.hashes(model_id, &prompt);
+        let id = engine::mark();
         let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
         let ask = Ask {
             wires: route_wires(wire),
             ..attempt.ask(model_id, &id, &hashes)
         };
-        let placed = host
+        let placed = policy_engine
             .place_where(&ask, rule, Instant::now())
             .await
             .map_err(|unplaced| unplaced.answer(model_id))?;
@@ -2098,8 +2101,8 @@ impl WorkerSelectionStage {
     }
 
     /// A pair attempt's workers with the prefill's admission guard: placed
-    /// by the policy controller where the stage holds a host, else selected
-    /// by [`Self::admit_pd_pair`] with the same arguments as before.
+    /// by the policy controller where the stage holds a policy engine, else
+    /// selected by [`Self::admit_pd_pair`] with the same arguments as before.
     ///
     /// Returned as a future, as [`Self::admit_within_budget`] is: the
     /// arguments move into the one arm that runs and are kept once. The
@@ -2120,9 +2123,16 @@ impl WorkerSelectionStage {
         demand: PairDemands,
         attempt: Attempt<'a>,
     ) -> impl Future<Output = Result<(PdAttempt, PrefillLoadGuard), Response>> + 'a {
-        match self.host.as_deref() {
-            Some(host) => Either::Left(Box::pin(self.place_pd_pair(
-                host, model_id, inputs, sticky_key, wire, media, demand, attempt,
+        match self.policy_engine.as_ref() {
+            Some(policy_engine) => Either::Left(Box::pin(self.place_pd_pair(
+                policy_engine,
+                model_id,
+                inputs,
+                sticky_key,
+                wire,
+                media,
+                demand,
+                attempt,
             ))),
             None => Either::Right(
                 self.admit_pd_pair(model_id, inputs, sticky_key, wire, media, demand)
@@ -2131,8 +2141,8 @@ impl WorkerSelectionStage {
         }
     }
 
-    /// A pair attempt placed by the controller through `host`, with the
-    /// prefill's admission guard. The checks ahead of the ask are the
+    /// A pair attempt placed by the controller through `policy_engine`, with
+    /// the prefill's admission guard. The checks ahead of the ask are the
     /// regular helper's, in the pair's words. The ask states the prefill
     /// phase, and the prompt's size is its hashes' count. The pair's
     /// runtime is its prefill worker's.
@@ -2150,7 +2160,7 @@ impl WorkerSelectionStage {
     )]
     async fn place_pd_pair(
         &self,
-        host: &Host,
+        policy_engine: &Arc<PolicyEngine>,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
@@ -2186,19 +2196,22 @@ impl WorkerSelectionStage {
 
         // Named a fact at a time over the default, so a prompt that learns
         // another fact still builds here with that fact unstated.
-        let prompt = host::Prompt {
+        let prompt = engine::Prompt {
             tokens: inputs.tokens,
-            ..host::Prompt::default()
+            ..engine::Prompt::default()
         };
-        let prompt = host::Prompt {
+        let prompt = engine::Prompt {
             namespace: inputs.cache_namespace,
             ..prompt
         };
-        let hashes = host.hashes(model_id, &prompt);
-        let id = host::mark();
+        let hashes = policy_engine.hashes(model_id, &prompt);
+        let id = engine::mark();
         let ledger = attempt.ledger();
         let ask = Ask {
             phase: Phase::Prefill,
+            // The sequential dispatch asks the decode again behind its
+            // prefill's answer.
+            decode_again: true,
             attempt: Some(attempt.number()),
             wires: route_wires(wire),
             ..attempt.ask(model_id, &id, &hashes)
@@ -2207,7 +2220,7 @@ impl WorkerSelectionStage {
         // type alone.
         let on_prefill = on_route(prefill_pool, wire, ledger);
         let on_decode = on_route(decode_pool, wire, ledger);
-        let (mut placed, guard) = host
+        let (mut placed, guard) = policy_engine
             .place_pair_where(
                 &ask,
                 |worker| on_prefill(worker) || on_decode(worker),
@@ -2224,8 +2237,21 @@ impl WorkerSelectionStage {
             .cloned();
         let Some(decode) = decode else {
             placed.released(ReleaseReason::CommitFailed, Instant::now());
-            return Err(host::Unplaced::NoTargetHolds.answer(model_id));
+            return Err(engine::Unplaced::NoTargetHolds.answer(model_id));
         };
+        // Under a document that picks the decode after the prefill the
+        // decode stands chosen, and the dispatch asks it again stages from
+        // here. The placement keeps the ask for that, with the route's rule
+        // of this commit for a decode: its pool, its wire, the prefill's
+        // runtime. The request's ledger is read at the second ask.
+        if placed.decode_waits() {
+            let on_decode_route = move |worker: &dyn Worker| {
+                on_route(decode_pool, wire, None)(worker)
+                    && worker.metadata().spec.runtime_type == runtime
+            };
+            let kept = engine::KeptAsk::of(policy_engine, &ask, on_decode_route);
+            placed.keep_ask(kept.with_hashes(hashes));
+        }
         Ok((((prefill, decode, runtime), Some(placed)), guard))
     }
 

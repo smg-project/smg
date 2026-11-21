@@ -7,8 +7,9 @@ use std::time::Instant;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    load_report, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PolicySpec,
-    PoolFacts, PowerOfTwoMetric, RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
+    load::load_report, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
+    PolicySpec, PoolFacts, PowerOfTwoMetric, RequestFacts, Role, Scratch, Side, SignalSource,
+    WorkerId,
 };
 
 use crate::{Outcome, Recorded, Replayed};

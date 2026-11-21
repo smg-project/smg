@@ -6,7 +6,7 @@ use super::{
     *,
 };
 use crate::{
-    spec::{AcrossRanks, SignalSpec},
+    document::spec::{AcrossRanks, SignalSpec},
     store::{world::EncodePairBuffers, EncodeHandoff, EncodeOffer, SignalSink, Taken},
     EncodeItems, EncodePlaced, EncoderFacts, Identity, SignalCells,
 };

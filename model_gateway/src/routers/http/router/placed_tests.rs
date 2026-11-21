@@ -13,7 +13,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    spec::{KeySourceSpec, RoutingKeySpec},
+    document::spec::{KeySourceSpec, RoutingKeySpec},
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
     },
@@ -29,7 +29,7 @@ use super::{
 use crate::{
     config::{PolicyConfig, RouterConfig},
     middleware::ReportedRefusal,
-    policy_controller::host::testing::{bed_over, bed_over_models, record_bed_over, MODEL},
+    policy_controller::engine::testing::{bed_over, bed_over_models, record_bed_over, MODEL},
     routers::{
         common::{
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
@@ -51,11 +51,11 @@ const GENERATE_BODY: &[u8] = br#"{"text":"hi"}"#;
 const TRANSCRIBE: &str = "/v1/audio/transcriptions";
 const AUDIO_TYPE: &str = "audio/wav";
 
-fn router(worker_registry: Arc<WorkerRegistry>, host: Option<Host>) -> Router {
+fn router(worker_registry: Arc<WorkerRegistry>, policy_engine: Option<PolicyEngine>) -> Router {
     Router {
         worker_registry,
         policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-        host: host.map(Arc::new),
+        policy_engine: policy_engine.map(Arc::new),
         retry_config: fast_retry_config(1),
         max_payload_size: 1 << 20,
         stream_stall_timeout: None,
@@ -86,10 +86,10 @@ async fn chat_with_stream(router: &dyn RouterTrait, streaming: bool) -> Case<Res
 /// Two registry workers, with only the overloaded worker in the store.
 async fn one_store_row(
     registry: &Arc<WorkerRegistry>,
-) -> Case<(Host, Arc<MemoryStore>, [Arc<AtomicUsize>; 2])> {
+) -> Case<(PolicyEngine, Arc<MemoryStore>, [Arc<AtomicUsize>; 2])> {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
     let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
-    let (host, store, workers) = bed_over(Arc::clone(registry), &[&a, &b]);
+    let (policy_engine, store, workers) = bed_over(Arc::clone(registry), &[&a, &b]);
     let row = store.by_key(&a).ok_or("worker A had no row to remove")?;
     store
         .remove(row.id, row.revision)
@@ -97,14 +97,14 @@ async fn one_store_row(
     // Only the store decides overload for a hosted attempt.
     registry.set_overload_shed(true);
     assert!(registry.set_worker_overloaded(&workers[1], true));
-    Ok((host, store, [hits_a, hits_b]))
+    Ok((policy_engine, store, [hits_a, hits_b]))
 }
 
 /// Six chats with two registry workers and one row in the store.
 async fn six_chats(hosted: bool) -> Case<(usize, usize)> {
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _, [hits_a, hits_b]) = one_store_row(&registry).await?;
-    let router = router(registry, hosted.then_some(host));
+    let (policy_engine, _, [hits_a, hits_b]) = one_store_row(&registry).await?;
+    let router = router(registry, hosted.then_some(policy_engine));
     for _ in 0..6 {
         assert_eq!(chat(&router).await?.status(), StatusCode::OK);
     }
@@ -112,7 +112,7 @@ async fn six_chats(hosted: bool) -> Case<(usize, usize)> {
 }
 
 #[tokio::test]
-async fn an_attempt_under_the_host_goes_to_the_worker_the_controller_placed() -> Case {
+async fn an_attempt_under_the_policy_engine_goes_to_the_worker_the_controller_placed() -> Case {
     assert_eq!(six_chats(true).await?, (0, 6));
     Ok(())
 }
@@ -125,8 +125,8 @@ async fn a_chat_request_through_the_gateway_object_reaches_the_placed_worker() -
     };
     config.health_check.disable_health_check = true;
     let mut context = AppContext::from_config(config.clone(), 30, None, None).await?;
-    let (host, store, [hits_a, hits_b]) = one_store_row(&context.worker_registry).await?;
-    context.policy_host = Some(Arc::new(host));
+    let (policy_engine, store, [hits_a, hits_b]) = one_store_row(&context.worker_registry).await?;
+    context.policy_engine = Some(Arc::new(policy_engine));
     context.policy_store = Some(store);
     let gateway = Gateway::from_config(&ServerConfig::minimal(config), &Arc::new(context)).await?;
 
@@ -137,7 +137,7 @@ async fn a_chat_request_through_the_gateway_object_reaches_the_placed_worker() -
 }
 
 #[tokio::test]
-async fn the_same_bed_with_no_host_is_placed_by_the_classic_policy() -> Case {
+async fn the_same_bed_with_no_policy_engine_is_placed_by_the_classic_policy() -> Case {
     let (a, b) = six_chats(false).await?;
     assert!(a > 0);
     assert_eq!(a + b, 6);
@@ -145,7 +145,7 @@ async fn the_same_bed_with_no_host_is_placed_by_the_classic_policy() -> Case {
 }
 
 /// A repeated prompt keeps its worker over plain HTTP. The route states the
-/// request's text, the host hashes its windows, and the record of sent
+/// request's text, the policy engine hashes its windows, and the record of sent
 /// prefixes places by them: the workers publish no cache events and state no
 /// block size.
 #[tokio::test]
@@ -156,8 +156,8 @@ async fn a_repeated_prompt_keeps_its_worker_over_http() -> Case {
     }
     let urls: Vec<&str> = workers.iter().map(|(url, _)| url.as_str()).collect();
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _store) = record_bed_over(Arc::clone(&registry), &urls);
-    let router = router(registry, Some(host));
+    let (policy_engine, _store) = record_bed_over(Arc::clone(&registry), &urls);
+    let router = router(registry, Some(policy_engine));
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     // Five windows of text at the document's block size.
     let prompt = "the same long prompt, ".repeat(16);
@@ -185,7 +185,7 @@ async fn an_attempt_is_never_placed_on_a_worker_of_another_wire() -> Case {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
     let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let (policy_engine, _store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
     // A's row stands in the store, and the gateway's worker at A speaks
     // another wire.
     registry.register_or_replace(Arc::new(
@@ -195,7 +195,7 @@ async fn an_attempt_is_never_placed_on_a_worker_of_another_wire() -> Case {
             .connection_mode(ConnectionMode::Grpc)
             .build(),
     ));
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     for _ in 0..16 {
         assert_eq!(chat(&router).await?.status(), StatusCode::OK);
     }
@@ -212,8 +212,8 @@ async fn a_placed_attempt_says_its_dispatch_and_its_lease_ends_with_it() -> Case
     let gate = Arc::clone(&probe);
     let (url, released) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
-    let router = router(registry, Some(host));
+    let (policy_engine, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
+    let router = router(registry, Some(policy_engine));
     let request = router.route_typed_request(
         None,
         None,
@@ -250,7 +250,8 @@ async fn a_placed_attempt_says_its_dispatch_and_its_lease_ends_with_it() -> Case
 }
 
 /// A prompt under one window is pinned as the classic's prefix policy pins
-/// it: the host keys it by what it has, so its sends land on one worker.
+/// it: the policy engine keys it by what it has, so its sends land on one
+/// worker.
 #[tokio::test]
 async fn a_prompt_under_one_window_lands_on_one_worker_under_the_prefix_ring() -> Case {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
@@ -260,11 +261,11 @@ async fn a_prompt_under_one_window_lands_on_one_worker_under_the_prefix_ring() -
     }
     let urls: Vec<&str> = upstreams.iter().map(|(url, _)| url.as_str()).collect();
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &urls);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &urls);
     let mut doc = PolicySpec::preset("prefix_hash")?;
     doc.generation += 1;
     store.apply(AppliedSpec::validate(&doc)?)?;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     for _ in 0..6 {
         let request = serde_json::from_value(json!({"text": "a prompt of 26 bytes, once"}))?;
         let response = router.route_generate(None, &meta, request, MODEL).await;
@@ -283,7 +284,7 @@ async fn a_retry_names_the_row_of_its_failed_attempt() -> Case {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::SERVICE_UNAVAILABLE).await;
     let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
     let mut doc = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)?;
     doc.generation += 1;
     store.apply(AppliedSpec::validate(&doc)?)?;
@@ -294,14 +295,14 @@ async fn a_retry_names_the_row_of_its_failed_attempt() -> Case {
         tried: &[a_row],
         ..Ask::of(b"other request", MODEL)
     };
-    let mut booking = host
+    let mut booking = policy_engine
         .place(&other, Instant::now())
         .await
         .map_err(|why| format!("worker B could not be booked: {why:?}"))?;
     assert_eq!(booking.id(), b_row);
     booking.dispatched(Instant::now());
 
-    let mut router = router(registry, Some(host));
+    let mut router = router(registry, Some(policy_engine));
     router.retry_config = fast_retry_config(2);
     let response = chat(&router).await?;
     assert_eq!(
@@ -322,9 +323,9 @@ async fn a_retry_names_the_row_of_its_failed_attempt() -> Case {
 async fn a_whole_answer_completes_its_lease_as_ok() -> Case {
     let (url, hits) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
-    let mut router = router(registry, Some(host));
+    let mut router = router(registry, Some(policy_engine));
     let start = Instant::now();
 
     let response = chat(&router).await?;
@@ -350,7 +351,7 @@ async fn a_workers_failure_completes_its_lease_before_the_retry_asks() -> Case {
     let a = format!("http://{}", first.local_addr()?);
     let b = format!("http://{}", retry.local_addr()?);
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
     let a_row = store.by_key(&a).ok_or("worker A has no row")?.id;
     let b_row = store.by_key(&b).ok_or("worker B has no row")?;
     store
@@ -387,7 +388,7 @@ async fn a_workers_failure_completes_its_lease_before_the_retry_asks() -> Case {
         }),
     );
 
-    let mut router = router(registry, Some(host));
+    let mut router = router(registry, Some(policy_engine));
     router.retry_config = fast_retry_config(2);
     let start = Instant::now();
     assert_eq!(chat(&router).await?.status(), StatusCode::OK);
@@ -403,9 +404,9 @@ async fn a_send_that_reaches_no_worker_completes_as_a_failed_connection() -> Cas
     let refused = RefusedAddress::reserve();
     let url = refused.http_url();
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     let start = Instant::now();
 
     let response = chat(&router).await?;
@@ -464,9 +465,9 @@ async fn next_frame(body: &mut BodyDataStream) -> Case<Bytes> {
 async fn a_stream_holds_its_lease_to_its_last_frame() -> Case {
     let (url, frames) = gated_stream(CHAT).await?;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
 
     let response = timeout(FRAME_WAIT, chat_with_stream(&router, true)).await??;
     assert_eq!(response.status(), StatusCode::OK);
@@ -492,9 +493,9 @@ async fn a_stream_holds_its_lease_to_its_last_frame() -> Case {
 async fn a_stream_dropped_before_its_end_is_cancelled() -> Case {
     let (url, frames) = gated_stream(CHAT).await?;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     let start = Instant::now();
 
     let response = timeout(FRAME_WAIT, chat_with_stream(&router, true)).await??;
@@ -516,9 +517,9 @@ async fn a_stream_the_worker_cuts_ends_its_lease_as_a_failure() -> Case {
     const BODY: &str = "data: a\n\ndata: b\n\ndata: [DONE]\n\n";
     let url = spawn_sized_sse_worker_cut_after(BODY, FIRST_FRAME.len()).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     let start = Instant::now();
 
     let response = chat_with_stream(&router, true).await?;
@@ -539,8 +540,8 @@ async fn a_worker_that_answered_definitively_takes_no_later_attempt() -> Case {
     let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::INTERNAL_SERVER_ERROR).await;
     let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::SERVICE_UNAVAILABLE).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
-    let mut router = router(registry, Some(host));
+    let (policy_engine, _store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let mut router = router(registry, Some(policy_engine));
     // Eight attempts: with no rule at the commit a later one goes back to
     // A in all but one run of sixty.
     router.retry_config = fast_retry_config(8);
@@ -555,8 +556,8 @@ async fn a_worker_that_answered_definitively_takes_no_later_attempt() -> Case {
 fn a_failed_placement_adds_its_row_each_time() -> Case {
     let url = "http://127.0.0.1:1";
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, workers) = bed_over(Arc::clone(&registry), &[url]);
-    let router = router(registry, Some(host));
+    let (policy_engine, store, workers) = bed_over(Arc::clone(&registry), &[url]);
+    let router = router(registry, Some(policy_engine));
     let row = store.by_key(url).ok_or("the worker has no row")?.id;
     let lease = RequestLease::new(
         (),
@@ -600,17 +601,17 @@ fn a_failed_placement_adds_its_row_each_time() -> Case {
 }
 
 #[tokio::test]
-async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() -> Case {
+async fn an_attempt_the_controller_does_not_place_reads_the_policy_engines_answer() -> Case {
     let (url, hits) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store
         .by_key(&url)
         .ok_or("the worker had no row to remove")?;
     store
         .remove(row.id, row.revision)
         .ok_or("the worker's row stood")?;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     let response = chat(&router).await?;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
@@ -622,12 +623,12 @@ async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() -> Ca
     Ok(())
 }
 
-/// Under the host a request that names its worker is refused by name where
-/// the model's classic policy holds it to that worker, on the typed line
+/// Under the policy engine a request that names its worker is refused by name
+/// where the model's classic policy holds it to that worker, on the typed line
 /// and on the transcription line, and no worker is asked. Under a policy
 /// that reads no target the header changes nothing.
 #[tokio::test]
-async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> Case {
+async fn a_request_that_names_its_worker_is_refused_by_name_under_the_policy_engine() -> Case {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let mut headers = HeaderMap::new();
     headers.insert("x-smg-target-worker", HeaderValue::from_static("0"));
@@ -637,8 +638,8 @@ async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> 
     ] {
         let (url, hits) = fixed_status_upstream(&[GENERATE, TRANSCRIBE], StatusCode::OK).await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, ..) = bed_over(Arc::clone(&registry), &[&url]);
-        let mut router = router(registry, Some(host));
+        let (policy_engine, ..) = bed_over(Arc::clone(&registry), &[&url]);
+        let mut router = router(registry, Some(policy_engine));
         router.policy_registry = Arc::new(PolicyRegistry::new(policy));
         let request = serde_json::from_value(json!({"text": "hi"}))?;
         let generated = router
@@ -703,18 +704,19 @@ async fn transcription(
 }
 
 /// A proxied GET and a realtime session pick their worker by no routing
-/// policy. Under the host each reads as it reads without one.
+/// policy. Under the policy engine each reads as it reads without one.
 #[tokio::test]
-async fn a_proxied_get_and_a_realtime_session_read_as_on_the_classic_line_under_the_host() -> Case {
+async fn a_proxied_get_and_a_realtime_session_read_as_on_the_classic_line_under_the_policy_engine(
+) -> Case {
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _, _) = bed_over(Arc::clone(&registry), &[]);
+    let (policy_engine, _, _) = bed_over(Arc::clone(&registry), &[]);
     let session = serde_json::from_value(json!({"type": "realtime", "model": MODEL}))?;
 
     for router in [
-        router(Arc::clone(&registry), Some(host)),
+        router(Arc::clone(&registry), Some(policy_engine)),
         router(registry, None),
     ] {
-        let hosted = router.host.is_some();
+        let hosted = router.policy_engine.is_some();
         let get = router.health_generate(Request::new(Body::empty())).await;
         assert_eq!(get.status(), StatusCode::SERVICE_UNAVAILABLE, "{hosted}");
         assert_eq!(extract_error_code_from_response(&get), "no_workers");
@@ -733,12 +735,12 @@ async fn a_request_that_names_no_model_is_asked_under_the_one_model_served() -> 
     assert_unnamed_model([Some(MODEL); 2], Some(MODEL));
     let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let mut doc = PolicySpec::preset("round_robin")?;
     doc.generation += 1;
     doc.bindings[0].matcher.model = MODEL.into();
     store.apply(AppliedSpec::validate(&doc)?)?;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
 
     let row = store.by_key(&url).ok_or("the worker has no row")?;
@@ -759,8 +761,9 @@ async fn a_request_that_names_no_model_is_asked_under_the_one_model_served() -> 
 fn assert_unnamed_model(models: [Option<&str>; 2], expected: Option<&str>) {
     let registry = Arc::new(WorkerRegistry::new());
     let urls = ["http://127.0.0.1:1", "http://127.0.0.1:2"];
-    let (host, _, _) = bed_over_models(Arc::clone(&registry), urls.into_iter().zip(models), None);
-    let router = router(registry, Some(host));
+    let (policy_engine, _, _) =
+        bed_over_models(Arc::clone(&registry), urls.into_iter().zip(models), None);
+    let router = router(registry, Some(policy_engine));
     assert_eq!(router.model_of_an_unnamed_request().as_deref(), expected);
 }
 
@@ -784,12 +787,12 @@ async fn a_request_that_names_no_model_is_not_found_where_several_are_served() -
     let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over_models(
+    let (policy_engine, store, _) = bed_over_models(
         Arc::clone(&registry),
         [a.as_str(), b.as_str()].into_iter().zip(models),
         None,
     );
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     assert_model_not_found(no_model(&router).await?, UNKNOWN_MODEL_ID).await?;
     assert_eq!(hits_a.load(Ordering::SeqCst), 0);
     assert_eq!(hits_b.load(Ordering::SeqCst), 0);
@@ -804,12 +807,12 @@ async fn one_model_beside_a_worker_with_none_takes_the_unnamed_request_alone() -
     let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _, _) = bed_over_models(
+    let (policy_engine, _, _) = bed_over_models(
         Arc::clone(&registry),
         [a.as_str(), b.as_str()].into_iter().zip(models),
         None,
     );
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
     for _ in 0..6 {
         assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
     }
@@ -823,8 +826,9 @@ async fn workers_with_no_model_are_asked_under_the_no_model_id() -> Case {
     assert_unnamed_model([None; 2], Some(UNKNOWN_MODEL_ID));
     let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _, _) = bed_over_models(Arc::clone(&registry), [(url.as_str(), None)], None);
-    let router = router(registry, Some(host));
+    let (policy_engine, _, _) =
+        bed_over_models(Arc::clone(&registry), [(url.as_str(), None)], None);
+    let router = router(registry, Some(policy_engine));
     assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     Ok(())
@@ -833,8 +837,8 @@ async fn workers_with_no_model_are_asked_under_the_no_model_id() -> Case {
 #[tokio::test]
 async fn a_named_model_no_worker_serves_is_not_found_and_asks_nothing() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
-    let router = router(registry, Some(host));
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let router = router(registry, Some(policy_engine));
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let model = "unserved-model";
     let request = serde_json::from_value(json!({
@@ -850,14 +854,14 @@ async fn a_named_model_no_worker_serves_is_not_found_and_asks_nothing() -> Case 
 }
 
 #[tokio::test]
-async fn a_transcription_under_the_host_goes_to_the_placed_worker() -> Case {
+async fn a_transcription_under_the_policy_engine_goes_to_the_placed_worker() -> Case {
     let (url, hits) = fixed_status_upstream(&[TRANSCRIBE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
     registry.set_overload_shed(true);
     assert!(registry.set_worker_overloaded(&workers[0], true));
-    let mut router = router(registry, Some(host));
+    let mut router = router(registry, Some(policy_engine));
     let start = Instant::now();
 
     let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
@@ -891,8 +895,9 @@ fn ranked_transcription_bed(ranked: &str, plain: Option<&str>) -> (Router, Arc<M
     let urls_and_models = std::iter::once(ranked)
         .chain(plain)
         .map(|url| (url, Some(MODEL)));
-    let (host, store, _) = bed_over_models(Arc::clone(&registry), urls_and_models, Some(ranked));
-    (router(registry, Some(host)), store)
+    let (policy_engine, store, _) =
+        bed_over_models(Arc::clone(&registry), urls_and_models, Some(ranked));
+    (router(registry, Some(policy_engine)), store)
 }
 
 #[tokio::test]
@@ -954,7 +959,7 @@ async fn a_pool_of_data_parallel_workers_alone_reads_the_routes_400() -> Case {
     );
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
 
-    router.host = None;
+    router.policy_engine = None;
     let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(to_bytes(response.into_body(), 1024).await?, hosted);
@@ -964,8 +969,8 @@ async fn a_pool_of_data_parallel_workers_alone_reads_the_routes_400() -> Case {
 #[tokio::test]
 async fn a_transcription_for_a_model_no_worker_serves_is_not_found() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
-    let router = router(registry, Some(host));
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let router = router(registry, Some(policy_engine));
     let model = "unserved-model";
     let recorder = PrometheusBuilder::new().build_recorder();
     let _guard = metrics::set_default_local_recorder(&recorder);
@@ -990,9 +995,9 @@ async fn a_transcription_for_a_model_no_worker_serves_is_not_found() -> Case {
 async fn a_streamed_transcription_holds_its_lease_to_its_last_frame() -> Case {
     let (url, frames) = gated_stream(TRANSCRIBE).await?;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
-    let router = router(registry, Some(host));
+    let router = router(registry, Some(policy_engine));
 
     let response = timeout(FRAME_WAIT, transcription(&router, MODEL, true, AUDIO_TYPE)).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1011,10 +1016,10 @@ async fn a_streamed_transcription_holds_its_lease_to_its_last_frame() -> Case {
 }
 
 #[tokio::test]
-async fn a_body_that_would_stream_takes_the_buffered_path_under_the_host() -> Case {
+async fn a_body_that_would_stream_takes_the_buffered_path_under_the_policy_engine() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
-    let hosted = router(registry, Some(host));
+    let (policy_engine, _, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let hosted = router(registry, Some(policy_engine));
     let recorder = PrometheusBuilder::new().build_recorder();
     let request = {
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -1035,7 +1040,7 @@ async fn a_body_that_would_stream_takes_the_buffered_path_under_the_host() -> Ca
 }
 
 #[tokio::test]
-async fn the_classic_policy_serves_the_three_shapes_without_a_host() -> Case {
+async fn the_classic_policy_serves_the_three_shapes_without_a_policy_engine() -> Case {
     let (url, hits) = fixed_status_upstream(&[GENERATE, TRANSCRIBE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
     let (_, store, _) = bed_over(Arc::clone(&registry), &[&url]);
@@ -1060,13 +1065,13 @@ async fn the_classic_policy_serves_the_three_shapes_without_a_host() -> Case {
 #[tokio::test]
 async fn a_request_for_a_model_no_binding_covers_reads_declined_with_a_line() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
     let mut doc = PolicySpec::preset("random")?;
     doc.generation += 1;
     doc.bindings[0].matcher.model = "other-model".into();
     store.apply(AppliedSpec::validate(&doc)?)?;
 
-    let answer = chat(&router(registry, Some(host))).await?;
+    let answer = chat(&router(registry, Some(policy_engine))).await?;
     assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(answer.extensions().get::<ReportedRefusal>().is_some());
     assert_eq!(
@@ -1091,7 +1096,7 @@ async fn a_keyed_request_keeps_its_worker_through_the_router() -> Case {
         let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
         let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
         let registry = Arc::new(WorkerRegistry::new());
-        let (host, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+        let (policy_engine, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
         let config = RouterConfig {
             policy_controller: true,
             policy: PolicyConfig::ConsistentHashing,
@@ -1108,7 +1113,7 @@ async fn a_keyed_request_keeps_its_worker_through_the_router() -> Case {
             strip_lineage: false,
         });
         store.apply(config.hosted_policy(&document)?)?;
-        let router = router(registry, Some(host));
+        let router = router(registry, Some(policy_engine));
         let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
         let hits = || [hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst)];
 

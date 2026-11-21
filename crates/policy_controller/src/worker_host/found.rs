@@ -9,11 +9,11 @@ use smg_worker::{
 
 use super::{door::Over, object::role};
 use crate::{
+    engine::view::{threshold_permille, WireModes},
     store::{
         pairing::{PairingDescriptor, LAYOUT_FACTS},
         HealthPolicy, Overload, WorkerFacts,
     },
-    view::{threshold_permille, WireModes},
 };
 
 /// The engine a worker's rows stand under: the address its ranks share, or
@@ -197,8 +197,11 @@ mod tests {
 
     use super::{facts, paired, pairing};
     use crate::{
-        demands::DemandFacts,
-        spec::Pairing,
+        document::spec::Pairing,
+        engine::{
+            demands::DemandFacts,
+            view::{LoadRow, Role, WireModes, WorkerId},
+        },
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::{mismatch, Member, PairingDescriptor, LAYOUT_FACTS},
@@ -206,7 +209,6 @@ mod tests {
             Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
             WorkersStore as _,
         },
-        view::{LoadRow, Role, WireModes, WorkerId},
         worker_host::object,
     };
 

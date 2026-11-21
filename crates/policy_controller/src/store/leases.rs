@@ -6,12 +6,14 @@ use std::time::Instant;
 /// The table of counts the leases on file book and a member's place in
 /// it, named here for the store's files that write it: their home is the
 /// counts' own module.
-pub(super) use crate::counts::{Counts, Slot};
+pub(super) use crate::tracking::counts::{Counts, Slot};
 use crate::{
-    decision::{Targets, MAX_TARGETS},
-    lease::{Lease, LeaseId, Outcome, ReleaseReason, Side},
+    engine::{
+        decision::{Targets, MAX_TARGETS},
+        view::{Session, WorkerId},
+    },
     store::GatewayId,
-    view::{Session, WorkerId},
+    tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side},
 };
 
 /// The time a gateway has to name a lease's dispatch: the design's default.

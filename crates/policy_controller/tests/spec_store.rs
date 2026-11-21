@@ -47,7 +47,7 @@ use std::{
 };
 
 use replicas::{Lease, Replica, ROOM};
-use smg_policy_controller::{
+use smg_policy_controller::service::{
     elector::ElectionSettings,
     proto::{
         controller_frame, decide_answer, decision, gateway_frame,

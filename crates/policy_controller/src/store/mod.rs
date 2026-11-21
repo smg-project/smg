@@ -63,7 +63,7 @@
 //! generation the store holds, which [`MemoryStore::apply`] alone replaces:
 //! a decision reads its rows and its engine in one load.
 //!
-//! [`LoadRow`]: crate::view::LoadRow
+//! [`LoadRow`]: crate::engine::view::LoadRow
 
 pub mod encoding;
 pub mod health;

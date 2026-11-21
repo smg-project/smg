@@ -19,8 +19,8 @@ use std::{
 };
 
 use smg_policy_controller::{
-    catalog::Catalog,
-    spec::{BindingSpec, OverloadSpec},
+    document::spec::{BindingSpec, OverloadSpec},
+    stages::catalog::Catalog,
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore, PUBLISH_WINDOW,

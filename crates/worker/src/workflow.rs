@@ -39,7 +39,6 @@ mod find_workers_to_remove;
 mod host;
 mod metadata;
 mod model_list;
-mod pool;
 mod reach;
 mod registration;
 mod removal;
@@ -64,7 +63,6 @@ pub use drain_workers::{pin, DrainWorkersStep, Pin, SettleDrainedWorkersStep};
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 pub use host::{require_host, WorkflowHost};
 pub use metadata::discover_engine_labels;
-pub use pool::{pool_group, refresh_worker_pool_sizes, PoolGroup, PoolGroups};
 pub use reach::{
     grpc_health_answer, grpc_reachable_url, http_base_url, http_health_url, try_grpc_reachable,
     try_http_reachable,

@@ -17,7 +17,7 @@
 //! apart from a token request's.
 //!
 //! This is the `tree` kind of the document's index settings
-//! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.
+//! ([`IndexKind`](crate::document::spec::IndexKind)). The `hash` kind is not built.
 //!
 //! Nothing here is locked or ordered against another thread. A read takes
 //! the predictor by a shared reference and writes nothing, so an owner may
@@ -26,7 +26,7 @@
 //! ([`Predictor::fold_into`]), and hands them to the read and to the write
 //! behind it.
 //!
-//! The in-process door ([`Door`](crate::door::Door)) seats a request by
+//! The in-process door ([`Door`](crate::engine::door::Door)) seats a request by
 //! its calling thread unless the generation holds a stage that keeps
 //! state a decider (`Engine::keeps_deciders`). A stage that reads a
 //! predictor there joins that fact, or the predictor takes a shared
@@ -80,7 +80,7 @@ use std::{mem, slice};
 
 use rustc_hash::FxHashMap;
 
-use crate::view::{fold_block, WorkerId};
+use crate::engine::view::{fold_block, WorkerId};
 
 /// No block: the end of a list, and the block before a request's first.
 const NONE: u32 = u32::MAX;

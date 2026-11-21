@@ -115,7 +115,8 @@ def test_the_probe_s_own_verdict_answers_when_nothing_was_pushed():
 def test_neither_by_the_deadline_is_none_and_the_probe_is_left_to_the_caller():
     verdict, took, probe = _awaited(lambda started, probe: started - 1.0, timeout=0.05)
     assert verdict is None
-    assert took >= 0.05
+    # 1e-6: a wait timed on a large monotonic clock can come out a rounding step short.
+    assert took >= 0.05 - 1e-6
     assert not probe.done()
 
 

@@ -10,8 +10,8 @@ use super::{
     view, MODEL,
 };
 use crate::{
+    engine::view::{Role, WorkerId},
     store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
-    view::{Role, WorkerId},
 };
 
 const ENGINE: &str = "grpc://e:9000";

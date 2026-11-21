@@ -146,7 +146,7 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The pair router asks the controller's host where this gateway
+        // The pair router asks the policy engine where this gateway
         // decides pairs in its own process. Its family refuses by name
         // elsewhere.
         if let Some(router) =
@@ -184,11 +184,11 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The regular router and the pair router ask the controller's host
+        // The regular router and the pair router ask the policy engine
         // in their selection stage. The pair router serves where the
         // document in force plans pairs, and its family refuses by name
-        // elsewhere. The encode mode places no request through the host
-        // yet.
+        // elsewhere. The encode mode places no request through the policy
+        // engine yet.
         let refusing = match mode {
             Mode::Regular => None,
             Mode::PrefillDecode => {
@@ -214,7 +214,7 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        if ctx.policy_host.is_some() {
+        if ctx.policy_engine.is_some() {
             return;
         }
         let prefill_policy =
@@ -237,7 +237,7 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        if ctx.policy_host.is_some() {
+        if ctx.policy_engine.is_some() {
             return;
         }
         let default_encode_policy = PolicyConfig::ConsistentHashing;

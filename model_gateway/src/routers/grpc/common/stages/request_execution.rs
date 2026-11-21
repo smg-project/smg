@@ -279,7 +279,6 @@ pub(crate) async fn execute_plan(
     // controller placed is committed ahead of the wait, so its bookings
     // outlast it.
     let admission = ctx.admit(sub_requests).await?;
-
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers a rendezvous plan's encode jobs and
     // their SHM Drop guards here: dispatch consumes them, while an early
@@ -458,10 +457,22 @@ pub(crate) async fn execute_plan(
     let result = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
             Ok(result) => result,
-            Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
+            Err(_) => {
+                // The timeout is the decode's that was waited on: the one a
+                // second ask moved the pair to, where it moved.
+                let moved = placement.and_then(|placement| placement.moved(workers));
+                let waited_on = moved.as_ref().unwrap_or(workers);
+                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
+            }
         },
         None => dispatch.await,
     };
+    // A pair's decode that was asked again behind its prefill's answer and
+    // moved: the attempt's selection names the decode that was sent, for
+    // the response's stages and for a retry.
+    if let Some(moved) = placement.and_then(|placement| placement.moved(workers)) {
+        ctx.workers = Some(moved);
+    }
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
     // replay would send it again.

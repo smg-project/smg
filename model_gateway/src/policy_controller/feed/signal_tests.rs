@@ -1,12 +1,12 @@
 //! Cases of a document's declared signals under the gateway's feed: the
 //! values a worker's load reports state by name reach the decisions the
-//! host asks. The store starts as a gateway's does, with a document given
-//! and one stage of the host's own. The reports go through the feed's load
-//! sink, polled and pushed. The host places by them. The server's cases
-//! of a host's own connection borrow the stage and the document.
+//! policy engine asks. The store starts as a gateway's does, with a document
+//! given and one stage of the host's own. The reports go through the feed's
+//! load sink, polled and pushed. The policy engine places by them. The server's
+//! cases of a host's own connection borrow the stage and the document.
 //!
 //! A placement alone can pass by a tie's draw: where no row has a value
-//! every row scores the same, and the host draws a fresh seed for each
+//! every row scores the same, and the policy engine draws a fresh seed for each
 //! placement. So the stage keeps what each decision read of each row, and
 //! each step says it beside the placement.
 
@@ -21,10 +21,12 @@ use std::{
 use parking_lot::Mutex;
 use serde::Deserialize;
 use smg_policy_controller::{
-    framework::{Scorer, TieBand},
-    lease::Lifecycle,
+    engine::{
+        framework::{Scorer, TieBand},
+        view::{Candidate, Phase, RequestFacts, Role, WireModes, WorkerId},
+    },
     store::{HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
-    view::{Candidate, Phase, RequestFacts, Role, WireModes, WorkerId},
+    tracking::lease::Lifecycle,
     worker_host::{Expect, Membership, Wrote},
     Catalog, CatalogError, Needs, PolicySpec, SignalColumn,
 };
@@ -38,7 +40,7 @@ use super::{feed, Feed};
 use crate::{
     config::RouterConfig,
     policy_controller::{
-        host::{Ask, Host},
+        engine::{Ask, PolicyEngine},
         start_with,
     },
     routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
@@ -170,12 +172,12 @@ pub(crate) fn values_read(read: &Read) -> Vec<Option<f64>> {
 }
 
 /// A gateway's store started with a document given and the host's stage
-/// registered, the feed over it with its load sink, and the host.
+/// registered, the feed over it with its load sink, and the policy engine.
 struct Bed {
     store: Arc<MemoryStore>,
     registry: Arc<WorkerRegistry>,
     feed: Feed,
-    host: Host,
+    policy_engine: PolicyEngine,
     sink: Arc<dyn LoadSink>,
     read: Read,
 }
@@ -196,13 +198,13 @@ impl Bed {
         let store = started.store;
         let registry = Arc::new(WorkerRegistry::new());
         let feed = feed(&store, &registry, BackendConnector::shared());
-        let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+        let policy_engine = PolicyEngine::new(Arc::clone(&store), Arc::clone(&feed.objects));
         let sink = feed.load_sink(PERIOD);
         Ok(Self {
             store,
             registry,
             feed,
-            host,
+            policy_engine,
             sink,
             read,
         })
@@ -301,7 +303,7 @@ impl Bed {
     /// The row a regular request is placed on at `now`, and what its
     /// decision read of each row.
     async fn placed(&self, id: &[u8], now: Instant) -> Result<(WorkerId, Rows), Box<dyn Error>> {
-        let placed = self.host.place(&Ask::of(id, MODEL), now).await;
+        let placed = self.policy_engine.place(&Ask::of(id, MODEL), now).await;
         let placed = placed.map_err(|unplaced| format!("not placed: {unplaced:?}"))?;
         Ok((placed.id(), last_read(&self.read)))
     }
@@ -423,7 +425,7 @@ async fn each_side_of_a_placed_pair_follows_its_own_pools_declared_values() -> C
         prompt_tokens: 37,
         ..Ask::of(b"pair", MODEL)
     };
-    let placed = bed.host.place_pair(&ask, None, None).await;
+    let placed = bed.policy_engine.place_pair(&ask, None, None).await;
     let (placed, _guard) = placed.map_err(|unplaced| format!("not placed: {unplaced:?}"))?;
     // Each side read its own pool's rows, each row its own value.
     let handed = read([

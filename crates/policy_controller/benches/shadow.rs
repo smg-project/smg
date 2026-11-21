@@ -12,8 +12,8 @@ use std::hint::black_box;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    decision::ShadowKind, spec::ShadowSpec, Constraints, Engines, PolicySpec, PoolFacts,
-    RequestFacts, Scratch,
+    document::spec::ShadowSpec, engine::decision::ShadowKind, Constraints, Engines, PolicySpec,
+    PoolFacts, RequestFacts, Scratch,
 };
 
 /// An iteration's client key is its seed times this odd number, so no

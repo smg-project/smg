@@ -1,7 +1,7 @@
 //! A document supplies the parameters of a picker registered by its host.
 
 use smg_policy_controller::{
-    builtins::Best, Candidate, Catalog, Constraints, Health, Lifecycle, Picker, PolicySpec,
+    stages::builtins::Best, Candidate, Catalog, Constraints, Health, Lifecycle, Picker, PolicySpec,
     PoolFacts, RequestFacts, Scratch, StageBuild, StageError, Targets, TieBand, WorkerId,
     API_VERSION,
 };

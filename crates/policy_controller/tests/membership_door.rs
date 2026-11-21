@@ -41,11 +41,13 @@ use net::{http_get, loopback};
 use openai_protocol::worker::RuntimeType;
 use replicas::{Lease, Record, Replica};
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, Listener, Scope, State, SERVICE_NAME},
-    elector::ElectionSettings,
-    proto::{
-        self, policy_controller_client::PolicyControllerClient, register_worker_request::Mode,
-        worker_event::Event,
+    service::{
+        controller::{Config, Controller, Election, Listener, Scope, State, SERVICE_NAME},
+        elector::ElectionSettings,
+        proto::{
+            self, policy_controller_client::PolicyControllerClient, register_worker_request::Mode,
+            worker_event::Event,
+        },
     },
     store::{WorkerStatus, WorkersStore},
 };

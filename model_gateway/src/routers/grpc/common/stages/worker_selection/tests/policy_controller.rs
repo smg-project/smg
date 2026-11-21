@@ -6,12 +6,12 @@ use kv_index::{salt::request_content_hashes_with_seed, XXH3_SEED};
 use llm_multimodal::MediaContentPart;
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::{KeySourceSpec, RoutingKeySpec},
+    document::spec::{DecodePick, KeySourceSpec, RoutingKeySpec},
+    engine::view::{fingerprint, LoadRow, WorkerId},
     store::{
         BatchOutcome, GatewayId, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
         WorkersStore,
     },
-    view::{fingerprint, LoadRow, WorkerId},
     worker_host, AppliedSpec, PolicySpec,
 };
 
@@ -19,7 +19,7 @@ use super::*;
 use crate::{
     config::{PolicyConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode},
     middleware::request_id::RequestId,
-    policy_controller::host::testing::MODEL,
+    policy_controller::engine::testing::MODEL,
     routers::grpc::context::LoadGuards,
 };
 
@@ -29,7 +29,7 @@ const BLOCK_SIZE: u32 = 4;
 const TOKENS: [u32; BLOCK_SIZE as usize] = [1, 2, 3, 4];
 const PLACEMENTS: usize = 8;
 
-fn stage_with_host(urls: &[&str]) -> (WorkerSelectionStage, Arc<MemoryStore>) {
+fn stage_with_policy_engine(urls: &[&str]) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     let workers: Vec<_> = urls
         .iter()
         .map(|url| {
@@ -44,13 +44,13 @@ fn stage_with_host(urls: &[&str]) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     stage_with_workers(&workers)
 }
 
-/// The stage over a host whose rows have one worker a URL, each of the
+/// The stage over a policy engine whose rows have one worker a URL, each of the
 /// type, on the connection and of the runtime beside it.
 fn stage_with_workers(
     workers: &[(&str, WorkerType, ConnectionMode, RuntimeType)],
 ) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     let urls: Vec<&str> = workers.iter().map(|(url, ..)| *url).collect();
-    let (_, store, rows) = host::testing::bed(&urls);
+    let (_, store, rows) = engine::testing::bed(&urls);
     (stage_on_rows(workers, &store, &rows), store)
 }
 
@@ -70,12 +70,12 @@ fn stage_on_rows(
         state_wire(store, &worker);
         assert!(registry.register(Arc::new(worker)).is_some());
     }
-    let host = Host::at_keys(Arc::clone(store), Arc::clone(&registry));
-    regular_stage(registry).with_host(Some(Arc::new(host)))
+    let policy_engine = PolicyEngine::at_keys(Arc::clone(store), Arc::clone(&registry));
+    regular_stage(registry).with_policy_engine(Some(Arc::new(policy_engine)))
 }
 
-/// The stage over a host whose document places by consistent hashing, with
-/// the body's `rid` as the one source of the key.
+/// The stage over a policy engine whose document places by consistent hashing,
+/// with the body's `rid` as the one source of the key.
 fn stage_keyed_by_the_rid(
     urls: &[&str],
 ) -> anyhow::Result<(WorkerSelectionStage, Arc<MemoryStore>)> {
@@ -84,7 +84,7 @@ fn stage_keyed_by_the_rid(
         policy: PolicyConfig::ConsistentHashing,
         ..RouterConfig::default()
     };
-    let (_, store, rows) = host::testing::bed_under(PolicyConfig::ConsistentHashing, urls);
+    let (_, store, rows) = engine::testing::bed_under(PolicyConfig::ConsistentHashing, urls);
     let mut document = config.policy_document()?;
     document.generation += 1;
     document.bindings[0].routing_key = Some(RoutingKeySpec {
@@ -118,7 +118,7 @@ fn stage_with_cached_prompt(
     store.apply(AppliedSpec::validate(&document)?)?;
     let rows = URLS.map(|url| (url, Some(MODEL)));
     let (_, store, rows) =
-        host::testing::bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
+        engine::testing::bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
     let workers = URLS.map(|url| (url, WorkerType::Regular, ConnectionMode::Grpc, runtime));
     let stage = stage_on_rows(&workers, &store, &rows);
 
@@ -130,7 +130,7 @@ fn stage_with_cached_prompt(
     for (id, tokens, running) in [(other, [2; BLOCK_SIZE as usize], 0), (holder, TOKENS, 1)] {
         let blocks = request_content_hashes_with_seed(&tokens, BLOCK_SIZE as usize, seed);
         assert_eq!(
-            host::testing::store_blocks(&store, id, &blocks),
+            engine::testing::store_blocks(&store, id, &blocks),
             BatchOutcome::Applied
         );
         store.record(
@@ -181,10 +181,10 @@ async fn assert_named_refusal(
     Ok(())
 }
 
-/// `refused` is the host's answer for an attempt no target holds, it is not
-/// retried in process, and no lease is left.
+/// `refused` is the policy engine's answer for an attempt no target holds, it
+/// is not retried in process, and no lease is left.
 fn assert_no_target_holds(refused: &Response, store: &MemoryStore) {
-    let answer = host::Unplaced::NoTargetHolds.answer(MODEL);
+    let answer = engine::Unplaced::NoTargetHolds.answer(MODEL);
     assert_eq!(refused.status(), answer.status());
     assert_eq!(
         error::extract_error_code_from_response(refused),
@@ -212,9 +212,9 @@ fn state_runtime(store: &MemoryStore, worker: &dyn Worker) {
     store.publish_now();
 }
 
-/// `refused` is the host's answer for an ask no row serves on its wires:
-/// the controller shed it at its wires, the answer is final, and no lease
-/// was issued.
+/// `refused` is the policy engine's answer for an ask no row serves on its
+/// wires: the controller shed it at its wires, the answer is final, and no
+/// lease was issued.
 fn assert_shed_by_wires(refused: &Response, store: &MemoryStore) {
     assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
@@ -236,7 +236,7 @@ fn assert_the_lease_is_named_by_none_of(store: &MemoryStore, ids: &[&str]) {
 }
 
 #[tokio::test]
-async fn a_stage_built_with_no_host_holds_none() {
+async fn a_stage_built_with_no_policy_engine_holds_none() {
     let registry = Arc::new(WorkerRegistry::new());
     let worker = regular_worker(URLS[0], MODEL, UNLABELED);
     assert!(registry.register(Arc::clone(&worker)).is_some());
@@ -262,8 +262,8 @@ async fn a_stage_built_with_no_host_holds_none() {
 }
 
 #[tokio::test]
-async fn a_first_attempt_under_the_host_lands_on_the_placed_worker() {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+async fn a_first_attempt_under_the_policy_engine_lands_on_the_placed_worker() {
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     let mut ctx = ingress(&stage.worker_registry);
     let RequestType::Generate(request) = &mut ctx.input.request_type else {
         panic!("a generate request");
@@ -277,8 +277,8 @@ async fn a_first_attempt_under_the_host_lands_on_the_placed_worker() {
     let mut headers = HeaderMap::new();
     headers.insert("x-session", HeaderValue::from_static("s1"));
     ctx.input.headers = Some(headers);
-    let id = host::mark();
-    let hashes = host::Hashes::default();
+    let id = engine::mark();
+    let hashes = engine::Hashes::default();
     let ask = Attempt::First(&ctx).ask(MODEL, &id, &hashes);
     assert_eq!(ask.id, id);
     assert!(ask.streaming);
@@ -357,7 +357,7 @@ async fn a_prompt_under_a_cache_partition_hashes_under_its_seed() -> anyhow::Res
 
 #[tokio::test]
 async fn each_ask_carries_a_mark_of_its_own() {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     let mut first = ingress(&stage.worker_registry);
     stage.execute(&mut first).await.expect("a placed worker");
     let mut second = ingress(&stage.worker_registry);
@@ -368,8 +368,8 @@ async fn each_ask_carries_a_mark_of_its_own() {
 }
 
 #[tokio::test]
-async fn media_under_the_host_is_refused_by_name() -> anyhow::Result<()> {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+async fn media_under_the_policy_engine_is_refused_by_name() -> anyhow::Result<()> {
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     let mut ctx = ingress(&stage.worker_registry);
     ctx.state.multimodal_intermediate = Some(image_intermediate(None));
     let refused = stage.execute(&mut ctx).await.expect_err("pixel input");
@@ -418,8 +418,8 @@ async fn answer_of(response: Response) -> anyhow::Result<(StatusCode, Value)> {
 }
 
 #[tokio::test]
-async fn a_bound_context_window_under_the_host_is_refused_by_name() -> anyhow::Result<()> {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+async fn a_bound_context_window_under_the_policy_engine_is_refused_by_name() -> anyhow::Result<()> {
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     // A second worker states no window, so it may hold the prompt. The
     // demand binds one window of two, and the controller cannot place by it
     // yet.
@@ -433,8 +433,8 @@ async fn a_bound_context_window_under_the_host_is_refused_by_name() -> anyhow::R
     assert_named_refusal(refused, "a context demand a worker's window binds", &store).await
 }
 
-/// `stage`'s workers and host under consistent hashing, the classic policy
-/// that reads an explicit target.
+/// `stage`'s workers and policy engine under consistent hashing, the classic
+/// policy that reads an explicit target.
 fn under_consistent_hashing(stage: &WorkerSelectionStage) -> WorkerSelectionStage {
     WorkerSelectionStage::new(
         Arc::clone(&stage.worker_registry),
@@ -442,7 +442,7 @@ fn under_consistent_hashing(stage: &WorkerSelectionStage) -> WorkerSelectionStag
         stage.mode,
         None,
     )
-    .with_host(stage.host.clone())
+    .with_policy_engine(stage.policy_engine.clone())
 }
 
 /// A request that names the first candidate as its target.
@@ -489,7 +489,7 @@ fn a_pairs_settings_keep_a_target_under_consistent_hashing_on_a_role() {
 /// Under a policy that reads no target the request is placed as before.
 #[tokio::test]
 async fn an_explicit_target_the_classic_keeps_is_refused_by_name() -> anyhow::Result<()> {
-    let (plain, store) = stage_with_host(&URLS);
+    let (plain, store) = stage_with_policy_engine(&URLS);
     let hashing = under_consistent_hashing(&plain);
     let mut ctx = naming_its_worker(&hashing.worker_registry);
     let refused = hashing
@@ -503,8 +503,8 @@ async fn an_explicit_target_the_classic_keeps_is_refused_by_name() -> anyhow::Re
     assert!(!hashing.places_retry(&retry));
     assert!(plain.places_retry(&retry));
 
-    // A pair asks its settings. No role policy is built under the host, so
-    // the registry's main policy says nothing of a pair.
+    // A pair asks its settings. No role policy is built under the policy
+    // engine, so the registry's main policy says nothing of a pair.
     let (pair, pair_store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
     let unkept = under_consistent_hashing(&pair);
     let mut ctx = naming_its_worker(&unkept.worker_registry);
@@ -524,12 +524,13 @@ async fn an_explicit_target_the_classic_keeps_is_refused_by_name() -> anyhow::Re
     Ok(())
 }
 
-/// A prompt no worker's window holds is the client's to fix. Under the host
-/// it reads the classic's 400, the answer of the classic stage over the
+/// A prompt no worker's window holds is the client's to fix. Under the policy
+/// engine it reads the classic's 400, the answer of the classic stage over the
 /// same workers, and no ask is made.
 #[tokio::test]
-async fn a_prompt_no_window_holds_reads_the_classic_400_under_the_host() -> anyhow::Result<()> {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+async fn a_prompt_no_window_holds_reads_the_classic_400_under_the_policy_engine(
+) -> anyhow::Result<()> {
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     let mut ctx = past_the_window(&stage.worker_registry);
     let refused = stage
         .execute(&mut ctx)
@@ -552,7 +553,7 @@ async fn a_prompt_no_window_holds_reads_the_classic_400_under_the_host() -> anyh
 
 #[tokio::test]
 async fn a_retry_under_a_decoding_rule_is_refused_by_name() -> anyhow::Result<()> {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     ctx.constraint_decided_on = Some(utils::WorkerDecoding::of(None));
     let refused = stage
@@ -647,8 +648,8 @@ async fn a_worker_outside_the_regular_pool_is_passed_over() {
 }
 
 #[tokio::test]
-async fn an_attempt_with_no_worker_on_its_wire_reads_the_hosts_answer() {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+async fn an_attempt_with_no_worker_on_its_wire_reads_the_policy_engines_answer() {
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     let off_the_pool = WireConstraint {
         connection: ConnectionMode::Zmq,
         ..grpc_wire(RuntimeType::Vllm)
@@ -748,7 +749,7 @@ fn an_unpinned_ask_states_the_wires_of_the_pipelines_connections() {
 
 #[tokio::test]
 async fn a_retry_of_a_shape_refused_by_name_has_no_next_attempt() -> anyhow::Result<()> {
-    let (stage, store) = stage_with_host(&URLS[..1]);
+    let (stage, store) = stage_with_policy_engine(&URLS[..1]);
     // A plain retry is placed, so a next attempt may follow.
     let plain = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     assert!(stage.places_retry(&plain));
@@ -776,14 +777,14 @@ async fn a_retry_of_a_shape_refused_by_name_has_no_next_attempt() -> anyhow::Res
 
 #[tokio::test]
 async fn a_retry_names_the_rows_of_its_failed_attempts() {
-    let (stage, store) = stage_with_host(&URLS);
+    let (stage, store) = stage_with_policy_engine(&URLS);
     let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     ctx.request_id = Some("retry-id".to_owned());
     ctx.streaming = true;
     ctx.headers = Some(HeaderMap::new());
     ctx.routing.rid = Some("retained-rid".to_owned());
-    let id = host::mark();
-    let hashes = host::Hashes::default();
+    let id = engine::mark();
+    let hashes = engine::Hashes::default();
     let ask = Attempt::Retry(&ctx).ask(MODEL, &id, &hashes);
     assert!(ask.streaming);
     // A retry states the headers and the `rid` the request left behind.
@@ -832,8 +833,8 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
 
 /// A binding keyed by the body's `rid` keeps its key across a retry. The
 /// first selection retains the `rid` and the retry's ask states it, so each
-/// retry lands where the host places an ask of the same key with the same
-/// tried row. An ask with no key does not land there for every key.
+/// retry lands where the policy engine places an ask of the same key with the
+/// same tried row. An ask with no key does not land there for every key.
 #[tokio::test]
 async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyhow::Result<()> {
     const WORKERS: [&str; 4] = [
@@ -843,7 +844,10 @@ async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyh
         "http://w3:8000",
     ];
     let (stage, store) = stage_keyed_by_the_rid(&WORKERS)?;
-    let host = stage.host.as_ref().expect("the stage's host");
+    let policy_engine = stage
+        .policy_engine
+        .as_ref()
+        .expect("the stage's policy engine");
     let plan = retained_plan(&[1]);
     for turn in 0..8 {
         let rid = format!("conv-{turn}");
@@ -861,14 +865,14 @@ async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyh
         ctx.release_attempt(&failure, Instant::now());
         assert_eq!(*ctx.tried_rows, [first_row]);
 
-        // Where the host places the key with that row tried.
-        let id = host::mark();
+        // Where the policy engine places the key with that row tried.
+        let id = engine::mark();
         let keyed = Ask {
             rid: Some(&rid),
             tried: &ctx.tried_rows,
             ..Ask::of(&id, MODEL)
         };
-        let by_key = host
+        let by_key = policy_engine
             .place(&keyed, Instant::now())
             .await
             .expect("the key's next worker")
@@ -884,9 +888,9 @@ async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyh
 }
 
 /// The routing snapshot keeps the body's `rid` only where a retry reads it.
-/// Under a host the retry's ask states it. On the classic line it stays
-/// where the sticky key derives from it, and a retry derives that key from
-/// it again. Elsewhere the classic line keeps no copy.
+/// Under a policy engine the retry's ask states it. On the classic line it
+/// stays where the sticky key derives from it, and a retry derives that key
+/// from it again. Elsewhere the classic line keeps no copy.
 #[tokio::test]
 async fn the_snapshot_keeps_the_rid_only_where_a_retry_reads_it() {
     const RID: &str = "conv_t2_r1";
@@ -899,7 +903,7 @@ async fn the_snapshot_keeps_the_rid_only_where_a_retry_reads_it() {
         stage.execute(&mut ctx).await.expect("a selection");
         ctx.state.routing_snapshot.expect("the snapshot").rid
     }
-    let (hosted, _store) = stage_with_host(&URLS[..1]);
+    let (hosted, _store) = stage_with_policy_engine(&URLS[..1]);
     assert_eq!(kept(&hosted).await.as_deref(), Some(RID));
 
     let registry = Arc::clone(&hosted.worker_registry);
@@ -930,7 +934,7 @@ async fn the_snapshot_keeps_the_rid_only_where_a_retry_reads_it() {
 
 #[tokio::test]
 async fn a_retry_never_returns_to_a_worker_that_answered_definitively() {
-    let (stage, store) = stage_with_host(&URLS);
+    let (stage, store) = stage_with_policy_engine(&URLS);
     let plan = retained_plan(&[1]);
     let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
 
@@ -974,7 +978,7 @@ async fn a_retry_never_returns_to_a_worker_that_answered_definitively() {
 
 #[tokio::test]
 async fn a_failed_attempt_lets_its_worker_go_and_names_its_row() {
-    let (stage, store) = stage_with_host(&URLS);
+    let (stage, store) = stage_with_policy_engine(&URLS);
     let plan = retained_plan(&[1]);
     let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
 
@@ -1015,8 +1019,8 @@ async fn a_failed_attempt_lets_its_worker_go_and_names_its_row() {
 }
 
 #[tokio::test]
-async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() {
-    let (stage, store) = stage_with_host(&[]);
+async fn an_attempt_the_controller_does_not_place_reads_the_policy_engines_answer() {
+    let (stage, store) = stage_with_policy_engine(&[]);
     let mut ctx = ingress(&stage.worker_registry);
     let unplaced = stage.execute(&mut ctx).await.expect_err("no store rows");
     assert_eq!(unplaced.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1052,7 +1056,7 @@ fn pair_stage(
     pair_stage_on(mode, &on_grpc(prefills), &on_grpc(decodes))
 }
 
-/// The stage in `mode` over a host whose rows are a prefill pool and a
+/// The stage in `mode` over a policy engine whose rows are a prefill pool and a
 /// decode pool under a pair document: one worker a URL, on the connection
 /// and of the runtime beside it. Each row states its worker's wire.
 fn pair_stage_on(
@@ -1060,7 +1064,7 @@ fn pair_stage_on(
     prefills: &[(&str, ConnectionMode, RuntimeType)],
     decodes: &[(&str, ConnectionMode, RuntimeType)],
 ) -> (WorkerSelectionStage, Arc<MemoryStore>) {
-    let (_, store, rows) = host::testing::pair_bed(&urls_of(prefills), &urls_of(decodes));
+    let (_, store, rows) = engine::testing::pair_bed(&urls_of(prefills), &urls_of(decodes));
     let registry = Arc::new(WorkerRegistry::new());
     for (row, (_, connection, runtime)) in rows.iter().zip(prefills.iter().chain(decodes)) {
         let worker = BasicWorkerBuilder::carrying(row)
@@ -1071,14 +1075,14 @@ fn pair_stage_on(
         state_wire(&store, &worker);
         assert!(registry.register(Arc::new(worker)).is_some());
     }
-    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
+    let policy_engine = PolicyEngine::at_keys(Arc::clone(&store), Arc::clone(&registry));
     let stage = WorkerSelectionStage::new(
         registry,
         Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
         mode,
         None,
     )
-    .with_host(Some(Arc::new(host)));
+    .with_policy_engine(Some(Arc::new(policy_engine)));
     (stage, store)
 }
 
@@ -1134,6 +1138,55 @@ async fn a_hosted_pair_selection_is_the_controllers_prefill_and_decode() {
     let leases = store.expire(Instant::now() + Duration::from_secs(60));
     assert!(!leases.is_empty());
     assert!(leases.iter().all(|sides| sides.record.lease.tokens == 3));
+}
+
+/// Under a document that picks the decode after the prefill, the stage's
+/// pair ask states that its route can ask again, and the placement keeps
+/// that ask with the route's rule for a decode. The second ask is made by
+/// it stages later: it reads the loads of its own instant, and it takes a
+/// decode of the prefill's runtime alone. Where the loads name a decode of
+/// another runtime alone, the request stays on the first decode.
+#[tokio::test]
+async fn the_pair_stage_keeps_its_ask_for_a_decode_that_waits() {
+    const OTHER: &str = "http://d1:8000";
+    for (other_runtime, moved_to) in [
+        (RuntimeType::Vllm, Some(OTHER)),
+        (RuntimeType::Sglang, None),
+    ] {
+        let (stage, store) = pair_stage(
+            WorkerSelectionMode::PrefillDecode,
+            &[(PREFILL, RuntimeType::Vllm)],
+            &[(DECODE, RuntimeType::Vllm), (OTHER, other_runtime)],
+        );
+        let document = PolicySpec::pair_presets("least_load", "least_load");
+        let mut document = document.expect("the pair presets");
+        document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+        document.generation = store.with_world(|world| world.spec().generation()) + 1;
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(applied).expect("a later generation");
+        // The other decode reports a deep queue: the first decision names
+        // the first one.
+        engine::testing::report_loads(&store, OTHER, DECODE);
+        let mut ctx = ingress(&stage.worker_registry);
+        stage.execute(&mut ctx).await.expect("a placed pair");
+        let placed = ctx.state.placed.as_mut().expect("the pair's placement");
+        assert!(placed.decode_waits(), "the ask stated no later decode");
+        assert_eq!(placed.decode().map(|decode| decode.url()), Some(DECODE));
+
+        // The prefill is sent, and the loads turn over while it runs.
+        placed.dispatched(Instant::now());
+        let answered = engine::testing::report_loads(&store, DECODE, OTHER);
+        let moved = placed
+            .decode_again_kept(|_| true, answered)
+            .map(|decode| decode.url().to_owned());
+        assert_eq!(moved.as_deref(), moved_to, "{other_runtime:?}");
+        // The second ask was made by what the stage kept: its decision
+        // ended the decode's wait, on the worker it took or with the
+        // side's lease given up.
+        assert!(!placed.decode_waits(), "the stage kept no ask");
+        let decode = placed.decode().map(|decode| decode.url());
+        assert_eq!(decode, Some(moved_to.unwrap_or(DECODE)));
+    }
 }
 
 #[tokio::test]
@@ -1204,12 +1257,12 @@ async fn a_pair_ask_states_the_wires_its_pipeline_dials() {
     }
 }
 
-/// A prompt no pair's windows hold reads the classic's 400 under the host,
-/// the answer of the classic pair stage over the same workers, and no ask
-/// is made.
+/// A prompt no pair's windows hold reads the classic's 400 under the policy
+/// engine, the answer of the classic pair stage over the same workers, and no
+/// ask is made.
 #[tokio::test]
-async fn a_pair_prompt_no_window_holds_reads_the_classic_400_under_the_host() -> anyhow::Result<()>
-{
+async fn a_pair_prompt_no_window_holds_reads_the_classic_400_under_the_policy_engine(
+) -> anyhow::Result<()> {
     let (stage, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
     let mut ctx = past_the_window(&stage.worker_registry);
     let refused = stage
@@ -1312,7 +1365,8 @@ async fn a_pinned_retry_passes_over_a_pair_of_another_runtime() {
 }
 
 #[tokio::test]
-async fn a_request_with_encode_items_is_refused_by_name_under_a_host() -> anyhow::Result<()> {
+async fn a_request_with_encode_items_is_refused_by_name_under_a_policy_engine() -> anyhow::Result<()>
+{
     let (stage, store) = one_pair_stage(WorkerSelectionMode::EncodePrefillDecode);
     let mut ctx = ingress(&stage.worker_registry);
     ctx.state.multimodal_intermediate = Some(image_intermediate(None));
@@ -1356,11 +1410,11 @@ async fn a_request_with_encode_items_is_refused_by_name_under_a_host() -> anyhow
 
 /// A prefill and a decode of two runtimes pair nothing on this wire: the
 /// store keeps known runtimes apart, as the classic pair index does. Both
-/// judge the fleet from membership alone, and under the host the answer is
-/// the classic stage's own, its code and its message whole.
+/// judge the fleet from membership alone, and under the policy engine the
+/// answer is the classic stage's own, its code and its message whole.
 #[tokio::test]
-async fn a_fleet_that_pairs_nothing_reads_the_classic_refusal_under_the_host() -> anyhow::Result<()>
-{
+async fn a_fleet_that_pairs_nothing_reads_the_classic_refusal_under_the_policy_engine(
+) -> anyhow::Result<()> {
     let (stage, store) = pair_stage(
         WorkerSelectionMode::PrefillDecode,
         &[(PREFILL, RuntimeType::Vllm)],
@@ -1409,7 +1463,7 @@ fn a_pair_attempt_states_the_retry_loops_number() {
 }
 
 #[tokio::test]
-async fn the_classic_pair_stage_is_unmoved_without_a_host() {
+async fn the_classic_pair_stage_is_unmoved_without_a_policy_engine() {
     let (hosted, store) = one_pair_stage(WorkerSelectionMode::PrefillDecode);
     let classic = round_robin_pd_stage(Arc::clone(&hosted.worker_registry));
     let mut ctx = ingress(&classic.worker_registry);

@@ -2,7 +2,7 @@
 
 A routing policy written as a WebAssembly component: a filter, a scorer and a
 picker for the policy controller's plugin host
-(`crates/policy_controller/src/wasm`).
+(`crates/policy_controller/src/plugins/wasm`).
 
 The policy: among the healthy workers that have capacity, prefer the one with
 the fewest requests in flight, with a bonus for the worker that already holds
@@ -116,8 +116,8 @@ stages of a profile:
 use std::sync::Arc;
 
 use smg_policy_controller::{
-    plugins::OpenDecisions,
-    wasm::{EventKind, EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+    plugins::shared::OpenDecisions,
+    plugins::wasm::{EventKind, EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
 };
 
 // One for the process: every plugin runtime is built over it, so a

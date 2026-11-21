@@ -3,8 +3,8 @@
 
 use super::{facts, member, MODEL};
 use crate::{
+    engine::view::{Role, Session, WorkerId},
     store::{MemoryStore, WorkerFacts, WorkersStore},
-    view::{Role, Session, WorkerId},
     SessionVerdict,
 };
 
@@ -72,16 +72,18 @@ mod held {
         revision,
     };
     use crate::{
-        framework::{Scorer, TieBand},
-        lease::{Lifecycle, Membership},
-        spec::{BindingSpec, Needs},
+        document::spec::{BindingSpec, Needs},
+        engine::{
+            framework::{Scorer, TieBand},
+            view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
+        },
         store::{
             tests::{booking, in_flight},
             world::ViewBuffers,
             Kinds, LeasesStore, LoadSink, MembershipChange, MemoryStore, Position, WorkerFacts,
             WorkerPatch, WorkerStatus, WorkersStore,
         },
-        view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
+        tracking::lease::{Lifecycle, Membership},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
     };
 

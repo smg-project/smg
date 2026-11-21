@@ -5,9 +5,9 @@
 use std::time::Instant;
 
 use crate::{
-    lease::TransportClass,
+    engine::view::WorkerId,
     store::{workers::WorkerStatus, GatewayId},
-    view::WorkerId,
+    tracking::lease::TransportClass,
 };
 
 /// What a noted write of a gateway's veto found

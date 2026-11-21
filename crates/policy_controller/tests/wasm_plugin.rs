@@ -24,13 +24,15 @@ use std::{
 };
 
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests, PowerOfTwo, SessionAffinity},
-    decider::Decider,
-    plugins::OpenDecisions,
-    wasm::{
-        Abi, Bound, BreakerSpec, EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec,
-        Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
+    engine::{decider, decider::Decider},
+    plugins::{
+        shared::OpenDecisions,
+        wasm::{
+            Abi, Bound, BreakerSpec, EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec,
+            Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
+        },
     },
+    stages::builtins::{Best, Healthy, LeastRequests, PowerOfTwo, SessionAffinity},
     Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Identity, Lease, Lifecycle,
     Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch,
     ShedReason, Side, Target, Weighted, WorkerId,
@@ -1224,7 +1226,7 @@ impl tracing::Subscriber for Said {
         (*metadata.level() <= tracing::Level::WARN
             && metadata.target().starts_with("smg_policy_controller"))
             || (*metadata.level() == tracing::Level::INFO
-                && metadata.target() == "smg_policy_controller::wasm::bindings")
+                && metadata.target() == "smg_policy_controller::plugins::wasm::bindings")
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -8925,7 +8927,7 @@ enum Inside {
 
 thread_local! {
     /// The name a case's thread holds, where a scope of the host can end it.
-    static HELD_NAME: std::cell::RefCell<Option<smg_policy_controller::decider::Acting>> =
+    static HELD_NAME: std::cell::RefCell<Option<decider::Acting>> =
         const { std::cell::RefCell::new(None) };
 }
 
