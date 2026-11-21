@@ -448,6 +448,10 @@ fn minimax_m2() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MinimaxM2.format(), recorded_tools()))
 }
 
+fn steptml() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Steptml.format(), recorded_tools()))
+}
+
 fn minicpm5() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MiniCpm5.format(), recorded_tools()))
 }
@@ -1017,6 +1021,12 @@ const FORMATS: &[Subject] = &[
         new: minimax_m2,
         outputs: MINIMAX_M2_OUTPUTS,
         table: Some(Table::MinimaxM2),
+    },
+    Subject {
+        name: "steptml",
+        new: steptml,
+        outputs: STEPTML_OUTPUTS,
+        table: Some(Table::Steptml),
     },
     Subject {
         name: "minicpm5",
@@ -2212,6 +2222,15 @@ const MINIMAX_M2_OUTPUTS: &[&str] = &[
     "<think>\n</think>\n<minimax:tool_call>\n<invoke name=\"get_stock_price\">\n</invoke>\n</minimax:tool_call>",
     "<think>\nplan\n</think>\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Par",
     "<think>\nplan\n</think>\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Par</minimax:tool_call>",
+];
+
+/// Step 3's turn as its template spells it (the thought the prompt opens written here): two
+/// calls in the block, the answer alone, a call in the older parser's spelling, and one cut short.
+const STEPTML_OUTPUTS: &[&str] = &[
+    "<think>\nThe user asks about Paris.\n</think>\n<｜tool_calls_begin｜>\n<｜tool_call_begin｜>\nfunction<｜tool_sep｜><steptml:invoke name=\"get_weather\"><steptml:parameter name=\"city\">Paris</steptml:parameter><steptml:parameter name=\"unit\">celsius</steptml:parameter></steptml:invoke><｜tool_call_end｜>\n<｜tool_call_begin｜>\nfunction<｜tool_sep｜><steptml:invoke name=\"get_stock_price\"><steptml:parameter name=\"ticker\">AAPL</steptml:parameter></steptml:invoke><｜tool_call_end｜>\n<｜tool_calls_end｜>",
+    "<think>\nNo tool is needed.\n</think>\nHello!",
+    "<think>\nShort.\n</think>\nLet me check.\n<｜tool_calls_begin｜>\n<｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name=\"get_weather\">\n<steptml:parameter name=\"city\">Paris</steptml:parameter>\n</steptml:invoke><｜tool_call_end｜>\n<｜tool_calls_end｜>",
+    "<think>\nShort.\n</think>\n<｜tool_calls_begin｜>\n<｜tool_call_begin｜>\nfunction<｜tool_sep｜><steptml:invoke name=\"get_weather\"><steptml:parameter name=\"city\">Par",
 ];
 
 /// The outputs bellwether's common set records for MiniCPM5, and one cut short.

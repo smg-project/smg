@@ -393,6 +393,26 @@ What this table says beyond the DSML one:
   (`tagged::xml`); a second invoke before the first closed ends the first,
   and the block's close ends an invoke still open.
 
+## Step 3 (`steptml`)
+
+The prompt opens the thought (`<|BOT|>assistant\n<think>\n`, whatever the request says: the template
+reads no thinking switch), and a turn opens with `<|BOT|>assistant\n`, so the prompt's replay starts
+there. The template's system text spells the calls to the model as `<｜tool_calls_begin｜>\n`, each
+call as `<｜tool_call_begin｜>\nfunction<｜tool_sep｜>`, one `<steptml:invoke name="NAME">` with each
+parameter as `<steptml:parameter name="KEY">`, the value and `</steptml:parameter>` on the same line,
+`</steptml:invoke><｜tool_call_end｜>\n`, and the block's close. The table reads a call's opener as
+one terminal up to the quote of the name, in the template's spelling and with `function` right
+behind `<｜tool_call_begin｜>`, as the tests of the older `step3` parser write it; white space between
+the tags and between the calls is the block's wrapping. A value is typed by what the request's tool
+declares, as MiniMax M2's is: the older parser typed a value by its look, so a declared string
+`75001` came out as a number.
+
+What it leaves open: bellwether records the group's renders and no output of the model, so the
+table stands on the template and on the older parser's tests, not on a recorded turn. The template
+renders an earlier call's opener as `<｜tool_call_begin>｜>`, a spelling the table does not read. The
+structural tag derived from the table writes no newline after a `<｜tool_call_end｜>`, between the
+calls or before `<｜tool_calls_end｜>`, where the template writes one after each.
+
 ## Kimi K3 (`kimi_k3`)
 
 What this table says beyond the DeepSeek one:

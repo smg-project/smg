@@ -980,7 +980,7 @@ impl Recorded for Table {
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a
             // call inside its block alone), the DSML tables, Kimi K2, LFM2.5,
-            // MiniMax M2, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
+            // MiniMax M2, Step 3, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
             // `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
@@ -993,6 +993,7 @@ impl Recorded for Table {
             | Self::KimiK2
             | Self::Lfm2_5
             | Self::MinimaxM2
+            | Self::Steptml
             | Self::MiniCpm5
             | Self::Dots3
             | Self::LlamaNemotron => KNOWN_REASONING_PROBE,
