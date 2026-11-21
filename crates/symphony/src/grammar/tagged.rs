@@ -278,12 +278,11 @@ mod tests {
             {"type": "const_string", "value": "c"},
             {"type": "const_string", "value": "f"},
         ]});
+        // The calls repeat, the template's newline allowed after each.
         assert_eq!(
             payload,
-            value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<tool_call>"],
-                "tags": [
+            value!({"format": {"type": "plus", "content": {"type": "sequence", "elements": [
+                {"type": "or", "elements": [
                     {
                         "type": "tag",
                         "begin": "<tool_call>\n<function=get_weather>\n",
@@ -305,9 +304,9 @@ mod tests {
                         )},
                         "end": "</function>\n</tool_call>",
                     },
-                ],
-                "at_least_one": true,
-            }})
+                ]},
+                {"type": "optional", "content": {"type": "const_string", "value": "\n"}},
+            ]}}})
         );
     }
 
@@ -371,7 +370,7 @@ mod tests {
                     "t",
                     value!({"type": "object", "properties": {"nothing": {"type": "null"}}}),
                 )],
-                true,
+                false,
                 false,
             )
             .expect("a grammar")
@@ -416,6 +415,6 @@ mod tests {
             payload["format"]["elements"][1],
             value!({"type": "const_string", "value": "\n\n"})
         );
-        assert_eq!(payload["format"]["elements"][2]["type"], "triggered_tags");
+        assert_eq!(payload["format"]["elements"][2]["type"], "plus");
     }
 }

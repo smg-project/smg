@@ -606,24 +606,29 @@ mod tests {
 
     #[test]
     fn a_forced_call_is_written_as_the_template_writes_a_calls_message() {
+        // Each call is a message of its own: its lead, then the invoke. Between two calls the
+        // template closes one message and opens the next.
         let payload = required_payload(false);
-        assert_eq!(
-            payload["format"]["elements"][0],
-            value!({"type": "or", "elements": [
-                {"type": "const_string", "value": " to=get_weather<|message|><atem:function_calls>\n"},
-                {"type": "const_string", "value": " to=lookup<|message|><atem:function_calls>\n"},
-            ]})
-        );
-        let calls = &payload["format"]["elements"][1];
-        assert_eq!(calls["type"], "triggered_tags");
-        assert_eq!(calls["triggers"], value!(["<atem:invoke"]));
+        let calls = &payload["format"]["elements"][0];
+        assert_eq!(calls["type"], "tags_with_separator");
         assert_eq!(calls["at_least_one"], true);
         assert_eq!(
+            calls["separator"],
+            "\n</atem:function_calls><|eom|><|start|>assistant"
+        );
+        assert_eq!(
             calls["tags"][0]["begin"],
-            "<atem:invoke name=\"get_weather\">\n"
+            " to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n"
         );
         assert_eq!(calls["tags"][0]["end"], "</atem:invoke>");
-        assert_eq!(calls["tags"][1]["begin"], "<atem:invoke name=\"lookup\">\n");
+        assert_eq!(
+            calls["tags"][1]["begin"],
+            " to=lookup<|message|><atem:function_calls>\n<atem:invoke name=\"lookup\">\n"
+        );
+        assert_eq!(
+            payload["format"]["elements"][1],
+            value!({"type": "const_string", "value": "\n</atem:function_calls>"})
+        );
         let city = calls["tags"][0]["content"].to_string();
         assert!(
             city.contains("<atem:parameter name=\\\"city\\\">"),
@@ -643,6 +648,13 @@ mod tests {
             )
             .expect("a tag")
             .payload();
+        assert_eq!(
+            one["format"]["elements"][0],
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": " to=get_weather<|message|><atem:function_calls>\n"},
+                {"type": "const_string", "value": " to=lookup<|message|><atem:function_calls>\n"},
+            ]})
+        );
         assert_eq!(one["format"]["elements"][1]["stop_after_first"], true);
         // With the thought left open by the prompt, free text leads the call.
         let open = required_payload(true);
