@@ -3834,6 +3834,35 @@ mod tests {
     }
 
     #[test]
+    fn test_chunked_incremental_decode_keeps_split_character_intact() {
+        // The gRPC /generate streaming path feeds each backend chunk to one
+        // per-choice `Sequence`. A character that spans two chunks must not
+        // turn into U+FFFD in any emitted piece.
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap());
+        let text = "界😀";
+        let ids = tokenizer.encode(text, false).unwrap().token_ids().to_vec();
+        // Split inside the emoji: its UTF-8 bytes span the last two token IDs.
+        let (first, rest) = ids.split_at(ids.len() - 1);
+
+        let mut sequence = Sequence::new_with_options(Arc::clone(&tokenizer), true);
+        let mut pieces = Vec::new();
+        for chunk in [first, rest] {
+            let piece: String = chunk
+                .iter()
+                .map(|&id| sequence.append_token(id).unwrap())
+                .collect();
+            pieces.push(piece);
+        }
+        pieces.push(sequence.finish().unwrap());
+        assert!(
+            pieces.iter().all(|p| !p.contains('\u{FFFD}')),
+            "piece contains U+FFFD: {pieces:?}"
+        );
+        assert_eq!(pieces.concat(), text);
+    }
+
+    #[test]
     fn test_decode_valid_utf8_does_not_use_fallback() {
         // Ensure that valid UTF-8 round-trips through the happy path unchanged.
         let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
