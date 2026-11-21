@@ -519,6 +519,42 @@ async fn an_element_the_output_ends_in_and_text_between_elements_fail_the_reques
     }
 }
 
+/// Prose inside a call block is text where a call should be, beside calls the
+/// table read whole as well as alone: the request fails as malformed
+/// structure. After a whole invoke before the block's close, after one in a
+/// block that never closes, and between two whole invokes. The calls had gone
+/// out as they were read.
+#[tokio::test]
+async fn prose_inside_a_call_block_fails_the_request_beside_whole_calls_too() {
+    let call = "<invoke name=\"lookup\"><city>Paris</city></invoke>".replace('<', "]<]minimax[>[<");
+    for (output, calls) in [
+        (
+            format!("]<]minimax[>[<tool_call>\n{call}\nDone.\n]<]minimax[>[</tool_call>"),
+            1,
+        ),
+        (
+            format!("]<]minimax[>[<tool_call>\n{call}\nI have saved the file."),
+            1,
+        ),
+        (
+            format!("]<]minimax[>[<tool_call>\n{call}\nNext:\n{call}\n]<]minimax[>[</tool_call>"),
+            2,
+        ),
+    ] {
+        let failure = InvalidToolCallFormat::new(UnreadableCall::Malformed, false);
+        let frames = by_character(&output, "stop");
+        let (result, events) = streamed(frames, spec(true, false)).await;
+        assert_eq!(the_contracts_failure(result), failure, "{output}");
+        assert_eq!(tool_names(&events).len(), calls, "{output}");
+        assert!(finish_reasons(&events).is_empty(), "{output}");
+        let read = whole_answer(M3, &output, "stop", &spec(true, false)).await;
+        let Err(ChoiceFailure::ToolCallFormat(whole)) = read else {
+            panic!("the contract's failure for {output}");
+        };
+        assert_eq!(whole, failure, "{output}");
+    }
+}
+
 /// An invoke the output ended inside before its name closed starts no call:
 /// the block is the one the output ended in, so the failure is the
 /// incomplete one, blamed on the limit where the limit cut it. No call delta
