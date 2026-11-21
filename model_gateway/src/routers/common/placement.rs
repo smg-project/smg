@@ -559,13 +559,7 @@ fn select_pass(
     } else {
         untried = available
             .iter()
-            .filter(|worker| {
-                eligible(worker)
-                    && !inputs
-                        .tried
-                        .iter()
-                        .any(|engine| engine == worker.base_url())
-            })
+            .filter(|worker| eligible(worker) && !was_tried(worker.as_ref(), inputs.tried))
             .cloned()
             .collect::<Vec<_>>();
         if untried.is_empty() {
@@ -1517,6 +1511,10 @@ fn pair_pass(
             ));
         }
     }
+    // The open prefills as a part of the index's own list: the policy is
+    // told the list, so what it keeps for the pool does not move with the
+    // workers that are open for this request.
+    let mut prefill = Narrowed::at(&pairs.prefill, open);
     // A retry steps aside from the prefill engines the request already
     // tried while another open prefill is left: a policy that places the
     // request the same way every time (a cached prefix, a routing key)
@@ -1524,18 +1522,9 @@ fn pair_pass(
     // tried they all stay. A strict target indexes this set and is never
     // narrowed, as in a single placement. A first attempt has tried nobody
     // and pays the one comparison.
-    if !inputs.tried.is_empty()
-        && !strict_target(prefill_policy.as_ref(), inputs.headers)
-        && open
-            .iter()
-            .any(|&i| !was_tried(pairs.prefill[i].as_ref(), inputs.tried))
-    {
-        open.retain(|&i| !was_tried(pairs.prefill[i].as_ref(), inputs.tried));
+    if !inputs.tried.is_empty() && !strict_target(prefill_policy.as_ref(), inputs.headers) {
+        prefill.narrow_to(|p| !was_tried(p, inputs.tried));
     }
-    // The open prefills as a part of the index's own list: the policy is
-    // told the list, so what it keeps for the pool does not move with the
-    // workers that are open for this request.
-    let prefill = Narrowed::at(&pairs.prefill, open);
     // As for a single placement: the ring is read for the policies that walk
     // it alone. No other pair pays the registry's keyed read and the ring's
     // shared count, or fills the ring of a generation it never reads.
