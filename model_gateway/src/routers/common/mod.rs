@@ -265,6 +265,40 @@ pub mod bench_support {
         Grpc,
     }
 
+    impl Route {
+        /// The pool the route's router places a single request over.
+        fn pool(self) -> RoutingPool {
+            match self {
+                Self::Http => RoutingPool::HttpRegular,
+                Self::Grpc => RoutingPool::GrpcPipelineRegular,
+            }
+        }
+    }
+
+    /// Bytes the calling thread has allocated since it started, by the
+    /// allocator's own count of the thread: a free does not subtract.
+    /// `None` in a build that links no such count.
+    pub fn thread_allocated_bytes() -> Option<u64> {
+        #[cfg(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        ))]
+        {
+            tikv_jemalloc_ctl::thread::allocatedp::read()
+                .ok()
+                .map(|allocated| allocated.get())
+        }
+        #[cfg(not(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        )))]
+        {
+            None
+        }
+    }
+
     /// Hands the classic policies the load feed the monitor would publish.
     pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
         policies.set_load_receiver(loads);
@@ -341,10 +375,7 @@ pub mod bench_support {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
     ) -> bool {
-        let pool = match route {
-            Route::Http => RoutingPool::HttpRegular,
-            Route::Grpc => RoutingPool::GrpcPipelineRegular,
-        };
+        let pool = route.pool();
         let inputs = PlacementInputs {
             tokens,
             headers,
@@ -426,6 +457,22 @@ pub mod bench_support {
                 loads,
             })
         }
+
+        /// How many times the reports of `model`'s workers on `route` were
+        /// converted for the engine's records: once for each load snapshot
+        /// a decision wrote every record under. Zero for a pool no request
+        /// was routed over.
+        pub fn conversions(&self, registry: &WorkerRegistry, model: &str, route: Route) -> u64 {
+            registry
+                .get_routing_snapshot(model)
+                .pool_members_cell(route.pool())
+                .get()
+                .map_or(0, |members| {
+                    members
+                        .records(self.engine.spec(), &self.clock)
+                        .conversions()
+                })
+        }
     }
 
     /// One request's routing by the policy engine's whole decision on
@@ -449,10 +496,10 @@ pub mod bench_support {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
     ) -> bool {
-        let pool = match route {
-            Route::Http => RoutingPool::HttpRegular,
-            Route::Grpc => RoutingPool::GrpcPipelineRegular,
-        };
+        let pool = route.pool();
+        // The decision's instant is read before its snapshot is borrowed: a
+        // decision that began later holds a snapshot no older.
+        let now = Instant::now();
         let snapshot = registry.get_routing_snapshot(model);
         let workers = snapshot.pool(pool);
         let members = snapshot
@@ -485,13 +532,7 @@ pub mod bench_support {
             seed: rand::rng().random(),
             ..RequestFacts::default()
         };
-        let live = Live::at(
-            spec.engine(),
-            &engine.clock,
-            Instant::now(),
-            loads.as_ref(),
-            key.plain,
-        );
+        let live = Live::at(spec.engine(), &engine.clock, now, loads.as_ref(), key.plain);
         let decision = decide(
             spec.engine(),
             records,

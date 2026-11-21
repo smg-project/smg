@@ -395,13 +395,17 @@ fn mixed_fleet(workers: usize) -> (Vec<Arc<dyn Worker>>, Arc<LoadSnapshot>) {
 /// record when its draw asks about the worker ([`decide`]) hands out the
 /// targets of the decision over every worker's record written first, under
 /// two engines of `document` asked the same requests in the same order.
-/// Returns how many of the decisions were a draw's.
+/// `converted` says whether the drawing side's list holds its snapshot's
+/// rows before the draws: a draw then copies a worker's report from them,
+/// and looks the report up itself where the list holds none. Returns how
+/// many of the decisions were a draw's.
 fn assert_drawn_as_written(
     document: &PolicySpec,
     workers: &[Arc<dyn Worker>],
     loads: &Arc<LoadSnapshot>,
     named: Option<AffinityRows<'_>>,
     seeds: u64,
+    converted: bool,
 ) -> usize {
     let (drawing, writing) = (applied_of(document.clone()), applied_of(document.clone()));
     let clock = DecisionClock::new();
@@ -409,6 +413,11 @@ fn assert_drawn_as_written(
     let written_pool = PoolRecords::new(workers, &writing, &clock);
     let cx = Constraints::default();
     let mut rows = Vec::new();
+    if converted {
+        let live = Live::at(drawing.engine(), &clock, Instant::now(), Some(loads), None);
+        let _ = drawn_pool.write(workers, &live, &mut rows);
+    }
+    assert_eq!(held(&drawn_pool).is_some(), converted);
     let mut scratch = Scratch::default();
     let mut draws = 0;
     for seed in 0..seeds {
@@ -455,6 +464,11 @@ fn assert_drawn_as_written(
             matches!(whole, Decision::Shed(_))
         );
     }
+    // A draw converts no list's reports: where every decision was a draw's,
+    // the list holds what it held.
+    if draws as u64 == seeds {
+        assert_eq!(drawn_pool.conversions(), u64::from(converted));
+    }
     draws
 }
 
@@ -473,8 +487,10 @@ fn a_draw_before_the_records_hands_out_the_whole_writes_targets() {
         ("passthrough", preset("passthrough")),
         ("round_robin", preset("round_robin")),
     ] {
-        let draws = assert_drawn_as_written(&document, &workers, &loads, None, 400);
-        assert_eq!(draws, 400, "{name}: every decision is its draw's");
+        for converted in [false, true] {
+            let draws = assert_drawn_as_written(&document, &workers, &loads, None, 400, converted);
+            assert_eq!(draws, 400, "{name}: every decision is its draw's");
+        }
     }
 
     // The sampled best draws for a request that names rows, and the rows
@@ -497,14 +513,17 @@ fn a_draw_before_the_records_hands_out_the_whole_writes_targets() {
         ..AffinityRows::default()
     };
     let document = preset("cache_aware");
-    let draws = assert_drawn_as_written(&document, &workers, &loads, Some(named), 400);
-    assert_eq!(
-        draws, 400,
-        "cache_aware: a request that names rows is drawn for"
-    );
+    for converted in [false, true] {
+        let draws =
+            assert_drawn_as_written(&document, &workers, &loads, Some(named), 400, converted);
+        assert_eq!(
+            draws, 400,
+            "cache_aware: a request that names rows is drawn for"
+        );
+    }
     // A request that names none is the whole pass's, and decides the same.
     assert_eq!(
-        assert_drawn_as_written(&document, &workers, &loads, None, 50),
+        assert_drawn_as_written(&document, &workers, &loads, None, 50, false),
         0
     );
 }
@@ -520,7 +539,8 @@ fn a_draw_that_keeps_nobody_widens_to_every_record() {
         }
     }
     let document = PolicySpec::preset("power_of_two").expect("a built-in preset");
-    assert_drawn_as_written(&document, &workers, &loads, None, 200);
+    assert_drawn_as_written(&document, &workers, &loads, None, 200, false);
+    assert_drawn_as_written(&document, &workers, &loads, None, 200, true);
 
     let spec = applied_of(document);
     let clock = DecisionClock::new();
@@ -589,4 +609,244 @@ fn a_pick_of_two_writes_the_records_of_the_two_workers_it_draws() {
         .engine()
         .drawn_for(&facts, &unsaid, pool.len())
         .is_none());
+}
+
+/// The rows the list holds of one load snapshot, where it holds any.
+fn held(pool: &PoolRecords) -> Option<Arc<Reported>> {
+    pool.reported.load_full()
+}
+
+/// A record as its every field reads: two records of one worker at one
+/// instant are the same text.
+fn text(row: &Candidate) -> String {
+    format!("{row:?}")
+}
+
+#[test]
+fn a_lists_reports_are_converted_once_a_snapshot_by_the_decision_that_holds_it() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(3);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let mut rows = Vec::new();
+    let begun = Instant::now();
+    let at = |millis: u64| begun + Duration::from_millis(millis);
+    assert!(held(&pool).is_none() && pool.conversions() == 0);
+
+    // A decision that holds no snapshot converts nothing.
+    let live = Live::at(spec.engine(), &clock, at(0), None, None);
+    let _ = pool.write(&workers, &live, &mut rows);
+    assert!(held(&pool).is_none() && pool.conversions() == 0);
+
+    // The first decision under a snapshot converts the list's reports, and
+    // the list holds them under the snapshot's name.
+    let (first, _) = reports(&[100, 200, 300], Duration::from_millis(40));
+    let live = Live::at(spec.engine(), &clock, at(1), Some(&first), None);
+    let (written, facts) = pool.write(&workers, &live, &mut rows);
+    assert!(facts.reported);
+    assert_eq!(
+        written[1].load.expect("a report").waiting_uncached_tokens,
+        200
+    );
+    let converted = held(&pool).expect("the rows of the first snapshot");
+    assert!(converted.is_of(&first));
+    assert_eq!(pool.conversions(), 1);
+
+    // The decisions behind it under the same snapshot read those rows: no
+    // report is converted again, and the rows are the same value.
+    for millis in 2..6 {
+        let live = Live::at(spec.engine(), &clock, at(millis), Some(&first), None);
+        let (written, _) = pool.write(&workers, &live, &mut rows);
+        assert_eq!(
+            written[2].load.expect("a report").waiting_uncached_tokens,
+            300
+        );
+    }
+    assert_eq!(pool.conversions(), 1);
+    assert!(Arc::ptr_eq(
+        &converted,
+        &held(&pool).expect("the same rows")
+    ));
+
+    // The next snapshot replaces the rows whole: one conversion more.
+    let (second, _) = reports(&[900, 800], Duration::from_millis(10));
+    let live = Live::at(spec.engine(), &clock, at(10), Some(&second), None);
+    let (written, facts) = pool.write(&workers, &live, &mut rows);
+    assert_eq!(
+        written[0].load.expect("a report").waiting_uncached_tokens,
+        900
+    );
+    assert!(written[2].load.is_none() && !facts.reported);
+    let replaced = held(&pool).expect("the rows of the second snapshot");
+    assert!(replaced.is_of(&second) && !replaced.is_of(&first));
+    assert_eq!(pool.conversions(), 2);
+
+    // The rows name their snapshot and do not hold it: the first snapshot
+    // is gone with its last holder.
+    let name = Arc::downgrade(&first);
+    drop(first);
+    assert!(name.upgrade().is_none());
+    drop(second);
+    assert_eq!(replaced.snapshot.strong_count(), 0);
+}
+
+#[test]
+fn a_decision_that_holds_another_snapshot_reads_its_own_reports() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(2);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let mut rows = Vec::new();
+    let begun = Instant::now();
+    let at = |millis: u64| begun + Duration::from_millis(millis);
+    let (old, _) = reports(&[100, 200], Duration::from_millis(40));
+    let (new, _) = reports(&[900], Duration::from_millis(10));
+
+    // The list holds the new snapshot's rows, converted by a decision that
+    // began at the tenth millisecond.
+    let live = Live::at(spec.engine(), &clock, at(10), Some(&new), None);
+    let _ = pool.write(&workers, &live, &mut rows);
+    let converted = held(&pool).expect("the rows of the new snapshot");
+    assert!(converted.is_of(&new));
+
+    // A decision that began before it still holds the old snapshot. It
+    // reads the old snapshot's reports, every one, never the list's rows,
+    // and it leaves the rows in place: its snapshot is no newer.
+    let live = Live::at(spec.engine(), &clock, at(9), Some(&old), None);
+    let (written, facts) = pool.write(&workers, &live, &mut rows);
+    assert_eq!(
+        written[0].load.expect("a report").waiting_uncached_tokens,
+        100
+    );
+    assert_eq!(
+        written[1].load.expect("a report").waiting_uncached_tokens,
+        200
+    );
+    assert!(facts.reported, "the old snapshot holds a report of each");
+    assert!(Arc::ptr_eq(
+        &converted,
+        &held(&pool).expect("the same rows")
+    ));
+    assert_eq!(pool.conversions(), 1);
+    // One record read alone under the old snapshot is the old report too.
+    let alone = pool.read(&workers, &live, 1).expect("a worker");
+    assert_eq!(text(&alone), text(&written[1]));
+
+    // The decision under the new snapshot still reads the new rows.
+    let live = Live::at(spec.engine(), &clock, at(11), Some(&new), None);
+    let (written, facts) = pool.write(&workers, &live, &mut rows);
+    assert_eq!(
+        written[0].load.expect("a report").waiting_uncached_tokens,
+        900
+    );
+    assert!(written[1].load.is_none() && !facts.reported);
+    assert_eq!(pool.conversions(), 1);
+}
+
+#[test]
+fn a_decision_that_meets_a_conversion_under_way_converts_nothing_and_waits_for_nothing() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(2);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let mut rows = Vec::new();
+    let (loads, _) = reports(&[100, 200], Duration::from_millis(40));
+
+    // Another decision holds the list's claim: it is converting.
+    let claim = Claim::take(&pool.converting).expect("the claim is free");
+    assert!(
+        Claim::take(&pool.converting).is_none(),
+        "one decision holds it"
+    );
+    let live = Live::at(spec.engine(), &clock, Instant::now(), Some(&loads), None);
+    let (written, facts) = pool.write(&workers, &live, &mut rows);
+    // This one wrote its own records from its own snapshot, and left
+    // nothing behind.
+    assert_eq!(
+        written[1].load.expect("a report").waiting_uncached_tokens,
+        200
+    );
+    assert!(facts.reported);
+    assert!(held(&pool).is_none() && pool.conversions() == 0);
+
+    // The claim is given back at its drop, and the next decision converts.
+    drop(claim);
+    let live = Live::at(spec.engine(), &clock, Instant::now(), Some(&loads), None);
+    let _ = pool.write(&workers, &live, &mut rows);
+    assert!(held(&pool).is_some_and(|converted| converted.is_of(&loads)));
+    assert_eq!(pool.conversions(), 1);
+    assert!(Claim::take(&pool.converting).is_some(), "given back");
+}
+
+#[test]
+fn what_a_worker_object_says_and_a_reports_age_are_read_at_every_decision() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(2);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let (loads, _) = reports(&[100, 200], Duration::from_millis(40));
+    let mut rows = Vec::new();
+    let now = Instant::now();
+    let live = Live::at(spec.engine(), &clock, now, Some(&loads), None);
+    let (written, _) = pool.write(&workers, &live, &mut rows);
+    let age = written[0].load.expect("a report").report_age_ms;
+    assert!(written[0].health.routable() && written[1].in_flight == 0);
+
+    // The list holds the snapshot's rows now. A worker leaves, another
+    // takes a request, and a quarter of a second passes: the next decision
+    // under the same snapshot reads all three, and converts nothing.
+    workers[0].set_status(WorkerStatus::NotReady);
+    workers[1].increment_load();
+    let later = now + Duration::from_millis(250);
+    let live = Live::at(spec.engine(), &clock, later, Some(&loads), None);
+    let (written, _) = pool.write(&workers, &live, &mut rows);
+    assert!(!written[0].health.healthy);
+    assert_eq!(written[1].in_flight, 1);
+    assert_eq!(written[0].load.expect("a report").report_age_ms, age + 250);
+    assert_eq!(pool.conversions(), 1);
+
+    // The rows the list holds carry none of it: no word of a worker object
+    // and no age.
+    let converted = held(&pool).expect("the snapshot's rows");
+    for row in &converted.rows {
+        assert!(!row.health.healthy && row.in_flight == 0);
+        assert_eq!(row.load.expect("a report").report_age_ms, 0);
+    }
+
+    // One record read alone is the whole write's record, from the list's
+    // rows and from a list that holds none.
+    let alone = pool.read(&workers, &live, 1).expect("a worker");
+    assert_eq!(text(&alone), text(&written[1]));
+    let cold = PoolRecords::new(&workers, &spec, &clock);
+    let alone = cold.read(&workers, &live, 1).expect("a worker");
+    assert_eq!(text(&alone), text(&written[1]));
+    assert!(
+        held(&cold).is_none() && cold.conversions() == 0,
+        "a read of one record converts no other worker's report"
+    );
+}
+
+#[test]
+fn a_workers_place_is_found_by_its_id_and_by_no_id_two_rows_carry() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(5);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    for (place, worker) in (0u32..).zip(&workers) {
+        assert_eq!(pool.place_of(worker_id(worker.as_ref())), Some(place));
+    }
+    let stranger = ready_worker("http://stranger:8000", MODEL);
+    assert_eq!(pool.place_of(worker_id(stranger.as_ref())), None);
+
+    // One address listed twice: a pin names neither row, and no id of the
+    // list has a place.
+    let twice = vec![
+        ready_worker(&url(0), MODEL),
+        ready_worker(&url(1), MODEL),
+        ready_worker(&url(0), MODEL),
+    ];
+    let pool = PoolRecords::new(&twice, &spec, &clock);
+    for worker in &twice {
+        assert_eq!(pool.place_of(worker_id(worker.as_ref())), None);
+    }
 }

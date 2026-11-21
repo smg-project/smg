@@ -15,14 +15,21 @@
 //!   lists them. It lists the pool's engines and numbers the pool. The
 //!   gateway keeps the value beside the list it was made from. No live
 //!   value of a worker is in it.
-//! - **Once a decision.** A record's live half is read where the gateway
-//!   keeps it, at the decision's instant ([`Live`]): what the worker object
-//!   says (ready, breaker, overload, stall, requests in flight) and the
-//!   worker's report in the load snapshot with its sample instant.
-//!   [`PoolRecords::write`] writes every worker's record into a buffer of
-//!   its caller, and [`PoolRecords::read`] one worker's. Neither takes a
-//!   lock of its own, and a write allocates nothing once the buffer has
-//!   grown to the pool.
+//! - **Once a load snapshot.** A snapshot is published whole and never
+//!   changed, so a worker's report reads the same at every decision that
+//!   holds the snapshot. One decision that writes every record of a list
+//!   under a snapshot converts the list's reports, and the list keeps
+//!   those rows for the decisions behind it that hold the same snapshot
+//!   ([`Reported`]). A decision that holds another snapshot never reads
+//!   them: it reads its own snapshot's reports.
+//! - **Once a decision.** What a worker object says is read where the
+//!   gateway keeps it, at the decision's instant ([`Live`]): ready,
+//!   breaker, overload, stall, requests in flight. So is the age of the
+//!   worker's report. [`PoolRecords::write`] writes every worker's record
+//!   into a buffer of its caller, and [`PoolRecords::read`] one worker's.
+//!   Neither takes a lock. A write allocates nothing once the buffer has
+//!   grown to the pool, but for the one decision a snapshot that converts
+//!   the list's reports.
 //!
 //! [`decide`] is one single decision over such records, in the calling
 //! thread's own buffer. It writes the records the decision reads: every
@@ -37,13 +44,15 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
+    ptr,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Weak,
     },
     time::{Duration, Instant},
 };
 
+use arc_swap::{ArcSwapOption, Guard};
 use rustc_hash::FxHashMap;
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, worker::WorkerStatus};
 
@@ -184,27 +193,20 @@ impl<'a> Live<'a> {
 
     /// Writes the live half of `worker`'s record into `row`, whose fixed
     /// half stands, and says whether the worker carries a report: what the
-    /// worker object says ([`Self::object`]), then the worker's report from
-    /// the load snapshot, by one look-up of its address.
+    /// worker object says ([`Self::object`]), the worker's report from the
+    /// load snapshot by one look-up of its address ([`report_into`]), and
+    /// the report's age at the decision ([`Self::age`]).
     ///
-    /// The report's age is the decision's instant less the sample's, both
-    /// on the engine's clock: the two values a stage is handed
-    /// ([`RequestFacts::now_micros`], [`Candidate::load_sampled_at_micros`]).
+    /// For a record written alone, where its list holds no rows of the
+    /// decision's snapshot ([`Reported`]).
     #[inline]
     fn write(&self, worker: &dyn Worker, row: &mut Candidate) -> bool {
         self.object(worker, row);
-        let Some((report, sampled_at)) = self.loads.and_then(|loads| loads.report(worker.url()))
-        else {
-            return false;
-        };
-        let sampled_micros = self.clock.micros(sampled_at);
-        // The conversion is asked the age of a report at its own sample:
-        // the decision's age is written beside it, from the clock's values.
-        let mut load = load_row(report, row.role, sampled_at, sampled_at, SignalSource::Poll);
-        load.report_age_ms = age_ms(self.now_micros, sampled_micros);
-        row.load = Some(load);
-        row.load_sampled_at_micros = sampled_micros;
-        true
+        let reported = self
+            .loads
+            .is_some_and(|loads| report_into(worker, loads, self.clock, row));
+        self.age(row);
+        reported
     }
 
     /// Writes what `worker`'s object says into `row`: one read of the
@@ -214,6 +216,8 @@ impl<'a> Live<'a> {
     /// worker whose breaker refuses execution carries the stalled bit
     /// beside the breaker's, as a veto that holds is written: no rule
     /// lifts it.
+    ///
+    /// Read at every decision and kept nowhere.
     #[inline]
     fn object(&self, worker: &dyn Worker, row: &mut Candidate) {
         let state = worker.routing_state();
@@ -236,23 +240,109 @@ impl<'a> Live<'a> {
             row.active_sessions = u16::try_from(worker.routing_key_load()).unwrap_or(u16::MAX);
         }
     }
+
+    /// Writes the age of `row`'s report at the decision: the decision's
+    /// instant less the sample's, both on the engine's clock, the two
+    /// values a stage is handed ([`RequestFacts::now_micros`],
+    /// [`Candidate::load_sampled_at_micros`]). Milliseconds, saturating at
+    /// `u32::MAX` and at zero; never wrapping.
+    #[inline]
+    fn age(&self, row: &mut Candidate) {
+        if let Some(load) = &mut row.load {
+            let micros = self.now_micros.saturating_sub(row.load_sampled_at_micros);
+            load.report_age_ms = u32::try_from(micros / 1_000).unwrap_or(u32::MAX);
+        }
+    }
 }
 
-/// Milliseconds from `at_micros` to `now_micros` on one clock, saturating at
-/// `u32::MAX` and at zero; never wrapping.
+/// Writes `worker`'s report of `loads` into `row`, with the sample's
+/// instant on `clock`, and says whether the snapshot holds a report of the
+/// worker: one look-up of the worker's address, one conversion
+/// ([`load_row`]). The report's age is left at rest: it is a decision's to
+/// state ([`Live::age`]).
 #[inline]
-fn age_ms(now_micros: u64, at_micros: u64) -> u32 {
-    u32::try_from(now_micros.saturating_sub(at_micros) / 1_000).unwrap_or(u32::MAX)
+fn report_into(
+    worker: &dyn Worker,
+    loads: &LoadSnapshot,
+    clock: &DecisionClock,
+    row: &mut Candidate,
+) -> bool {
+    let Some((report, sampled_at)) = loads.report(worker.url()) else {
+        return false;
+    };
+    // The conversion is asked the age of a report at its own sample.
+    row.load = Some(load_row(
+        report,
+        row.role,
+        sampled_at,
+        sampled_at,
+        SignalSource::Poll,
+    ));
+    row.load_sampled_at_micros = clock.micros(sampled_at);
+    true
 }
+
+/// The records of one list with each worker's report written, as one load
+/// snapshot holds the reports: the half of a record that stands for as
+/// long as the snapshot does.
+///
+/// A load snapshot is published whole and never changed, so a report's
+/// conversion is the same at every decision that holds the snapshot. A
+/// list keeps the rows of one snapshot (`PoolRecords::reported`): one
+/// decision that writes every record of the list and finds the list holds
+/// none of its snapshot converts the list's reports, and leaves the rows
+/// for the decisions behind it ([`PoolRecords::convert`]).
+///
+/// The rows are of one snapshot and one list, and are read by a decision
+/// that holds that snapshot and that list and by no other
+/// ([`Self::is_of`]). They are replaced whole, never changed, and they die
+/// with their list. Nothing a worker object says is in them: that is read
+/// at every decision ([`Live::object`]), and so is the report's age
+/// ([`Live::age`]).
+#[derive(Debug)]
+struct Reported {
+    /// The snapshot the reports were read from, named and not held. The
+    /// name keeps the snapshot's place in memory from any later snapshot,
+    /// so the rows are never taken for another snapshot's.
+    snapshot: Weak<LoadSnapshot>,
+    /// The instant of the decision that converted the rows, on the
+    /// engine's clock. A decision that began no later holds a snapshot no
+    /// newer than theirs, and leaves them in place.
+    since_micros: u64,
+    /// Each worker's record by position: its fixed half, and where the
+    /// snapshot holds a report of the worker, the report with its sample's
+    /// instant on the engine's clock. The report's age is at rest, and so
+    /// is every value a worker object says.
+    rows: Box<[Candidate]>,
+    /// Whether every worker carries a report ([`PoolFacts::reported`]).
+    all: bool,
+}
+
+impl Reported {
+    /// Whether the rows are those of `loads`.
+    #[inline]
+    fn is_of(&self, loads: &Arc<LoadSnapshot>) -> bool {
+        ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(loads))
+    }
+}
+
+/// The rows a list holds, as one decision read the slot: held for the
+/// decision through the calling thread's own protection, with no lock and
+/// no write another thread reads.
+type Held = Guard<Option<Arc<Reported>>>;
 
 /// One list of a gateway's worker objects as the engine reads it: what is
-/// built once a membership.
+/// built once a membership, and the list's reports as one load snapshot
+/// holds them.
 ///
 /// It holds the half of each worker's record that no request changes, the
 /// pool's engines and the pool's number. It holds no worker object and no
-/// live value: a worker's health, its count of requests in flight and its
-/// load report are read where the gateway keeps them, at each decision
-/// ([`Live`]).
+/// value a worker object says: a worker's health and its count of requests
+/// in flight are read on the object at each decision ([`Live`]). A
+/// worker's load report is read from the load snapshot the decision holds:
+/// converted once for the list, by the first decision that writes every
+/// record under that snapshot, and read by the decisions behind it that
+/// hold the same snapshot.
 ///
 /// Made from one list and good for that list alone: the list a gateway's
 /// registry publishes at a membership change is a new list, and takes new
@@ -264,6 +354,10 @@ pub struct PoolRecords {
     fixed: Box<[Candidate]>,
     /// Each worker's id, by position.
     ids: Box<[WorkerId]>,
+    /// The ids in their own order, each with its worker's position
+    /// ([`Self::place_of`]). Empty where two rows of the list carry one
+    /// id.
+    places: Box<[(WorkerId, u32)]>,
     /// The positions of the pool's rows engine after engine, and each
     /// engine's end among them ([`Engines::new`]). Both empty where no
     /// engine of the pool holds several rows.
@@ -274,6 +368,23 @@ pub struct PoolRecords {
     /// The generation of the document the records were read under: its
     /// lists name the engine kinds and the labels.
     generation: u64,
+    /// The list's rows with the reports of one load snapshot written
+    /// ([`Reported`]), and none before a decision wrote every record under
+    /// a snapshot.
+    ///
+    /// Read by one load of the slot through the calling thread's own
+    /// protection: no lock, and no write another thread reads. Written by
+    /// one atomic store of the whole value, by the one decision that holds
+    /// the claim ([`Self::convert`]).
+    reported: ArcSwapOption<Reported>,
+    /// The claim to convert the list's reports: set by one compare and
+    /// exchange, by the one decision that converts, and cleared when it is
+    /// done. A decision that finds it set converts nothing and waits for
+    /// nothing: it writes its own records from its own snapshot.
+    converting: AtomicBool,
+    /// How many times the list's reports were converted: once a snapshot
+    /// a decision wrote every record under.
+    conversions: AtomicU64,
 }
 
 impl PoolRecords {
@@ -330,7 +441,16 @@ impl PoolRecords {
                 }
             })
             .collect();
-        let ids = fixed.iter().map(|row| row.id).collect();
+        let ids: Box<[WorkerId]> = fixed.iter().map(|row| row.id).collect();
+        let mut places: Vec<(WorkerId, u32)> = ids.iter().copied().zip(0u32..).collect();
+        places.sort_unstable();
+        // An id two rows carry names neither of them.
+        if places
+            .windows(2)
+            .any(|pair| matches!(pair, [a, b] if a.0 == b.0))
+        {
+            places.clear();
+        }
         let (engine_rows, engine_ends) = engines_of(workers, &fixed);
         // The first pool is number one: an epoch of zero says no
         // membership.
@@ -338,10 +458,14 @@ impl PoolRecords {
         Self {
             fixed,
             ids,
+            places: places.into(),
             engine_rows,
             engine_ends,
             number: number as u32,
             generation: spec.generation(),
+            reported: ArcSwapOption::empty(),
+            converting: AtomicBool::new(false),
+            conversions: AtomicU64::new(0),
         }
     }
 
@@ -363,6 +487,26 @@ impl PoolRecords {
         &self.ids
     }
 
+    /// The place in the list of the worker whose id is `id`
+    /// ([`worker_id`]), and `None` where the list holds no such worker:
+    /// what finds the one record an id names ([`Self::read`]) with no walk
+    /// of the list.
+    ///
+    /// Where two rows of the list carry one id (one address listed twice,
+    /// or two addresses of one fingerprint), no id of the list has a
+    /// place: such an id names neither row.
+    ///
+    /// The ids are sorted once a list, when its records are made. A
+    /// question is one binary search and allocates nothing.
+    #[must_use]
+    pub fn place_of(&self, id: WorkerId) -> Option<u32> {
+        let at = self
+            .places
+            .binary_search_by_key(&id, |&(listed, _)| listed)
+            .ok()?;
+        self.places.get(at).map(|&(_, place)| place)
+    }
+
     /// The fixed half of each worker's record, by its place in the list:
     /// its position, id, key, role, rank, wire, engine kind and labels, and
     /// every live field at rest.
@@ -376,6 +520,15 @@ impl PoolRecords {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// How many times the list's reports were converted so far: once for
+    /// each load snapshot a decision wrote every record under
+    /// ([`Self::write`]). What a bench and a case count against the
+    /// snapshots published.
+    #[must_use]
+    pub fn conversions(&self) -> u64 {
+        self.conversions.load(Ordering::Relaxed)
     }
 
     /// The pool's facts beside its records: `reported` is whether every
@@ -399,18 +552,31 @@ impl PoolRecords {
     /// is the worker's place in `workers`, which is the list these records
     /// were made from.
     ///
-    /// Read at this call and kept nowhere ([`Live`]): a worker's status,
-    /// its circuit breaker, its overload and liveness vetoes and its count
-    /// of requests in flight, from the worker object, and its load report
-    /// with the report's sample instant, from the load snapshot. A worker
-    /// the snapshot holds no report of carries none, and the pool facts say
-    /// whether every worker carries one ([`PoolFacts::reported`]).
+    /// Read on the worker object at this call and kept nowhere ([`Live`]):
+    /// a worker's status, its circuit breaker, its overload and liveness
+    /// vetoes and its count of requests in flight.
+    ///
+    /// A worker's load report with its sample's instant is the one the
+    /// decision's snapshot holds, and never another snapshot's. Where the
+    /// list holds the rows of that snapshot, the report is copied from
+    /// them. Where it does not, one decision converts the list's reports
+    /// and leaves the rows for the decisions behind it, and every other
+    /// decision looks up each worker's address in its own snapshot and
+    /// converts the report into `rows`, waiting for nothing: the list's
+    /// claim is taken by one compare and exchange, never waited for. A
+    /// decision that began no later than the one that converted the list's
+    /// rows leaves them in place. A worker the snapshot holds no report
+    /// of carries none, and the pool facts say whether every worker
+    /// carries one ([`PoolFacts::reported`]). The report's age is this
+    /// decision's.
     ///
     /// Left for the caller to write where it holds them: the pair class
     /// (zero), the two admission bits (open) and the session key's pin.
     ///
-    /// No lock is taken here beyond what a read of a worker object takes,
-    /// and nothing is allocated once `rows` has grown to the list.
+    /// No lock is taken here beyond what a read of a worker object takes.
+    /// Nothing is allocated once `rows` has grown to the list. The one
+    /// exception is the conversion: one allocation, by one decision, at
+    /// most once a published snapshot a list.
     pub fn write<'a>(
         &'a self,
         workers: &[Arc<dyn Worker>],
@@ -423,18 +589,129 @@ impl PoolRecords {
             "the records are those of the list they are written from"
         );
         rows.clear();
-        rows.extend_from_slice(&self.fixed);
-        let mut unreported = 0u32;
-        for (row, worker) in rows.iter_mut().zip(workers) {
-            unreported += u32::from(!live.write(worker.as_ref(), row));
+        let reported = match live.loads {
+            Some(loads) => {
+                let held = self.reported.load();
+                let converted;
+                let reported = match held.as_deref().filter(|reported| reported.is_of(loads)) {
+                    Some(reported) => Some(reported),
+                    None => {
+                        converted = self.convert(workers, loads, live, &held);
+                        converted.as_deref()
+                    }
+                };
+                match reported {
+                    Some(reported) => {
+                        rows.extend(reported.rows.iter().zip(workers).map(|(reported, worker)| {
+                            let mut row = *reported;
+                            live.object(worker.as_ref(), &mut row);
+                            live.age(&mut row);
+                            row
+                        }));
+                        reported.all
+                    }
+                    // Another decision is converting, or this one holds a
+                    // snapshot no newer than the list's rows: its own
+                    // snapshot's reports, read worker by worker.
+                    None => {
+                        let mut all = true;
+                        rows.extend(self.fixed.iter().zip(workers).map(|(fixed, worker)| {
+                            let mut row = *fixed;
+                            all &= live.write(worker.as_ref(), &mut row);
+                            row
+                        }));
+                        all
+                    }
+                }
+            }
+            // No snapshot: no worker carries a report.
+            None => {
+                rows.extend(self.fixed.iter().zip(workers).map(|(fixed, worker)| {
+                    let mut row = *fixed;
+                    live.object(worker.as_ref(), &mut row);
+                    row
+                }));
+                self.fixed.is_empty()
+            }
+        };
+        (rows.as_mut_slice(), self.facts(live.clock, reported))
+    }
+
+    /// The list's rows with the reports of `loads` written, where the
+    /// calling decision is the one that converts them: it found that the
+    /// list holds none of its snapshot (`held` is what it read of the
+    /// slot). `None` where it is not the one, and writes its own records
+    /// from its own snapshot.
+    ///
+    /// **One decision converts a snapshot.** The decision takes the
+    /// list's claim first, by one compare and exchange. Another decision
+    /// that meets the same snapshot meanwhile finds the claim taken,
+    /// converts nothing, allocates nothing and waits for nothing. The
+    /// claim is given back when the conversion ends, also where it
+    /// unwinds. Under the claim the slot is read again: where the rows of
+    /// this snapshot were left since `held` was read, they are taken as
+    /// they are.
+    ///
+    /// A decision that began no later than the decision that converted
+    /// the list's rows holds a snapshot no newer than theirs, and does not
+    /// replace them.
+    ///
+    /// The conversion is one look-up of each worker's address in the
+    /// snapshot, one conversion of each report, and one allocation of the
+    /// rows, left in the slot by one atomic store of the whole value. It
+    /// is the one allocation a decision over records makes once its
+    /// thread's buffer has grown: at most once a published snapshot a
+    /// list, by one decision.
+    #[inline(never)]
+    fn convert(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        loads: &Arc<LoadSnapshot>,
+        live: &Live<'_>,
+        held: &Held,
+    ) -> Option<Arc<Reported>> {
+        if held
+            .as_deref()
+            .is_some_and(|reported| live.now_micros <= reported.since_micros)
+        {
+            return None;
         }
-        (rows.as_mut_slice(), self.facts(live.clock, unreported == 0))
+        let claim = Claim::take(&self.converting)?;
+        let again = self.reported.load();
+        if let Some(reported) = again.as_ref().filter(|reported| reported.is_of(loads)) {
+            return Some(Arc::clone(reported));
+        }
+        let mut all = true;
+        let rows = self
+            .fixed
+            .iter()
+            .zip(workers)
+            .map(|(fixed, worker)| {
+                let mut row = *fixed;
+                all &= report_into(worker.as_ref(), loads, live.clock, &mut row);
+                row
+            })
+            .collect();
+        let converted = Arc::new(Reported {
+            snapshot: Arc::downgrade(loads),
+            since_micros: live.now_micros,
+            rows,
+            all,
+        });
+        self.reported.store(Some(Arc::clone(&converted)));
+        self.conversions.fetch_add(1, Ordering::Relaxed);
+        drop(claim);
+        Some(converted)
     }
 
     /// One worker's record for one decision: the record [`Self::write`]
-    /// writes at `position`, read the same way, for a caller that reads a
-    /// few workers of a pool and not the pool. `None` for a position past
-    /// the list.
+    /// writes at `position`, for a caller that reads a few workers of a
+    /// pool and not the pool. `None` for a position past the list.
+    ///
+    /// The worker's report is read from the list's rows where the list
+    /// holds those of the decision's snapshot, and by one look-up of the
+    /// worker's address in the snapshot where it does not. A read of one
+    /// record converts no other worker's report.
     #[must_use]
     pub fn read(
         &self,
@@ -442,9 +719,90 @@ impl PoolRecords {
         live: &Live<'_>,
         position: u32,
     ) -> Option<Candidate> {
-        let mut row = *self.fixed.get(position as usize)?;
-        live.write(workers.get(position as usize)?.as_ref(), &mut row);
+        let fixed = self.fixed.get(position as usize)?;
+        workers.get(position as usize)?;
+        let mut row = *fixed;
+        Singly::new(self, workers, live).write(fixed, &mut row);
         Some(row)
+    }
+}
+
+/// A list's claim to convert its reports, held by the one decision that
+/// converts and given back when it is dropped: at the conversion's end,
+/// and where the conversion unwinds.
+struct Claim<'a>(&'a AtomicBool);
+
+impl<'a> Claim<'a> {
+    /// The claim, where no other decision holds it: one compare and
+    /// exchange, never a wait.
+    #[inline]
+    fn take(word: &'a AtomicBool) -> Option<Self> {
+        word.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self(word))
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// One decision's writes of single records of a list: a draw's, and a
+/// read of one worker.
+///
+/// It holds the list's rows for the decision where they are of the
+/// decision's snapshot ([`Reported`]), read once.
+struct Singly<'a> {
+    workers: &'a [Arc<dyn Worker>],
+    live: &'a Live<'a>,
+    /// The list's rows, where they are of the decision's snapshot.
+    held: Option<Held>,
+}
+
+impl<'a> Singly<'a> {
+    fn new(pool: &PoolRecords, workers: &'a [Arc<dyn Worker>], live: &'a Live<'a>) -> Self {
+        let held = live.loads.and_then(|loads| {
+            let held = pool.reported.load();
+            held.as_deref()
+                .is_some_and(|reported| reported.is_of(loads))
+                .then_some(held)
+        });
+        Self {
+            workers,
+            live,
+            held,
+        }
+    }
+
+    /// Writes into `row` the record of the worker `fixed` is the fixed
+    /// half of: from the list's rows of the decision's snapshot where the
+    /// list holds them, and by a look-up of the worker's own report where
+    /// it does not. What the worker object says is read here either way.
+    #[inline]
+    fn write(&self, fixed: &Candidate, row: &mut Candidate) {
+        let at = fixed.position as usize;
+        let Some(worker) = self.workers.get(at) else {
+            *row = *fixed;
+            return;
+        };
+        let reported = self
+            .held
+            .as_deref()
+            .and_then(|held| held.as_deref())
+            .and_then(|reported| reported.rows.get(at));
+        match reported {
+            Some(reported) => {
+                *row = *reported;
+                self.live.object(worker.as_ref(), row);
+                self.live.age(row);
+            }
+            None => {
+                *row = *fixed;
+                self.live.write(worker.as_ref(), row);
+            }
+        }
     }
 }
 
@@ -535,12 +893,8 @@ pub fn decide(
                 rows.resize(pool.len(), Candidate::default());
             }
             let rows = &mut rows[..pool.len()];
-            let mut write = |fixed: &Candidate, row: &mut Candidate| {
-                *row = *fixed;
-                if let Some(worker) = workers.get(fixed.position as usize) {
-                    live.write(worker.as_ref(), row);
-                }
-            };
+            let singly = Singly::new(pool, workers, live);
+            let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
             return engine.decide_drawn(
                 drawn,
                 facts,
