@@ -5047,6 +5047,28 @@ fn a_thread_at_the_full_share_counts_its_packed_table_by_its_slots() {
     }
 }
 
+/// A thread's second call reads the merge table through; its first does
+/// not, unless its text has `READ_AT_ONCE_BYTES`.
+#[test]
+fn a_thread_reads_the_merge_table_at_its_second_call_or_before_a_long_first_text() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let tokenizer = tokenizer_of(&shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let native = seeded(&tokenizer);
+    let left_after = |text: &str| {
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids");
+        native.thread_piece_cache().borrow().calls_to_read
+    };
+    assert_eq!(left_after(" one more piece"), 1, "the first call");
+    assert_eq!(left_after(" one more piece"), 0, "the second call reads");
+    let long = " one more piece".repeat(READ_AT_ONCE_BYTES / 15 + 1);
+    let on_a_new_thread =
+        std::thread::scope(|scope| scope.spawn(|| left_after(&long)).join().expect("a thread"));
+    assert_eq!(on_a_new_thread, 0, "a long first text has the read first");
+}
+
 /// A thread whose share fell (threads joined) since it last read it is
 /// within the new share from the start of its next encode call, with no
 /// miss in that call.
