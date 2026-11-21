@@ -113,28 +113,38 @@ pub trait Lifecycle: Send + Sync {
         false
     }
 
-    /// The kinds of event the stage takes ([`EventSet`]): none by default.
-    /// A stage that implements [`Self::on_decision_issued`],
+    /// The kinds of event the stage takes ([`EventSet`]). By default a
+    /// stage that says it needs the lifecycle's calls
+    /// ([`Self::needs_lifecycle`]) takes every word on a lease
+    /// ([`EventSet::LEASE`]: the issue, the dispatch, the completion and
+    /// the release), and any other stage takes none.
+    ///
+    /// The engine cannot see an overridden method, and a host that decides
+    /// in its own process tells a word on a lease only where a stage of
+    /// the document takes it, and keeps nothing for a word nobody takes: a
+    /// document none of whose stages takes one costs a request no lease.
+    /// So a stage that implements [`Self::on_decision_issued`],
     /// [`Self::on_dispatched`], [`Self::on_completed`] or
-    /// [`Self::on_released`] names that call's kind here
-    /// ([`EventSet::LEASE`] holds the four). The engine cannot see an
-    /// overridden method, and a host that decides in its own process tells
-    /// a word on a lease only where a stage of the document takes it, and
-    /// keeps nothing for a word nobody takes: a stage that implements one
-    /// of those calls and does not name its kind is not told there, and a
-    /// document none of whose stages names one costs a request no lease.
-    /// The engine asks once, at its build: the answer is the stage's for
-    /// the engine's life.
+    /// [`Self::on_released`] and declares no need names that call's kind
+    /// here, or it is not told there. A stage that declares the need may
+    /// name the kinds it takes, and is then told no other: each kind left
+    /// out is a word its requests do not pay for. The engine asks once, at
+    /// its build: the answer is the stage's for the engine's life.
     ///
     /// A change of membership and a signal are told to every stage,
     /// whatever it answers: no host reads those two kinds of the answer
     /// yet. A plugin's stage answers every kind its plugin observes.
     ///
-    /// This is not [`Self::needs_lifecycle`]. A stage that takes a word
-    /// only to drop state early decides the same without the call, and
-    /// still takes the word: untold, it would keep that state.
+    /// The two answers part for a stage that takes a word only to drop
+    /// state early: it decides the same without the call and declares no
+    /// need, and it still names the word. Untold, it would keep that
+    /// state.
     fn hears(&self) -> EventSet {
-        EventSet::NONE
+        if self.needs_lifecycle() {
+            EventSet::LEASE
+        } else {
+            EventSet::NONE
+        }
     }
 }
 
@@ -234,10 +244,12 @@ mod tests {
         assert!(!Lifecycle::needs_lifecycle(&stateless));
     }
 
-    /// A stage takes no word unless it names one, and a box says what its
-    /// stage says. The two answers part: a stage that takes a release only
-    /// to drop state early needs no call, and takes the word. A release is
-    /// a word on a lease, and a signal is none.
+    /// A stage that declares no need takes no word unless it names one,
+    /// and a box says what its stage says. The two answers part: a stage
+    /// that takes a release only to drop state early needs no call, and
+    /// takes the word. A stage that needs the calls and names no word takes
+    /// every word on a lease. A release is a word on a lease, and a signal
+    /// is none.
     #[test]
     fn a_stage_takes_the_words_it_names_and_no_other() {
         use EventKind::{Completed, Dispatched, Issued, Released};
@@ -249,7 +261,8 @@ mod tests {
         assert!(ends.intersects(EventSet::LEASE) && !counting.needs_lifecycle());
         assert!(!EventSet::of([EventKind::Signal]).intersects(EventSet::LEASE));
         let kept: Box<dyn Lifecycle> = Box::new(Kept);
-        assert!(kept.needs_lifecycle() && kept.hears().is_empty());
+        assert!(kept.needs_lifecycle());
+        assert_eq!(kept.hears(), EventSet::LEASE);
         let both = ends.with(Issued);
         assert!(both.contains(Issued) && both.contains(Released) && !both.contains(Dispatched));
         assert_eq!(both.union(EventSet::ALL), EventSet::ALL);
