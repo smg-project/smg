@@ -39,10 +39,6 @@ use crate::{
     tracking::lease::{Lease, LeaseId, LeaseKind, Side},
 };
 
-/// The stage a request is declined under where its plan has no entry in
-/// this engine yet.
-pub(super) const PLAN: &str = "plan";
-
 /// The stage a request that states a hard demand is declined under: no
 /// stage of this engine reads a worker's facts for one.
 const DEMANDS: &str = "demands";
