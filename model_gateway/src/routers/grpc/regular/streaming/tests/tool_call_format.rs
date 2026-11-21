@@ -2,10 +2,12 @@
 //! (`wire::minimax::InvalidToolCallFormat`), on the chat stream and the whole
 //! answer, with the MiniMax M3 table reading the output. A request that
 //! expects tool calls fails on a call the token limit cut, on one the model
-//! stopped inside, and on a block with malformed structure; nothing of the
-//! call that failed reaches the client, and the text before it streams as it
-//! arrives. And the contract's limits: a request without tools, another wire,
-//! and another table on the same wire end as they did.
+//! stopped inside, and on a block with malformed structure. A stream has sent
+//! the answer as it was read by then, the call as far as it went, exactly as
+//! a request the contract does not cover is sent it: the contract changes how
+//! the stream ends, not what streams. And the contract's limits: a request
+//! without tools, another wire, and another table on the same wire end as
+//! they did.
 
 use std::{sync::Arc, time::Duration};
 
@@ -50,9 +52,9 @@ use crate::{
 };
 
 const BEFORE: &str = "Checking.";
-/// The content of an answer whose call the limit cut, where the contract
-/// does not apply: the text, then the newline the invoke held when the cut
-/// came, which the table returns as text, as it did.
+/// The content of an answer whose call the limit cut: the text, then the
+/// newline the invoke was holding when the cut came, which the table returns
+/// as text, the contract or not.
 const BEFORE_AND_THE_CUTS_NEWLINE: &str = "Checking.\n";
 /// A MiniMax M3 call to `lookup`, as the template writes it, ended after its
 /// one parameter.
@@ -75,8 +77,9 @@ const SERVED: &str = "served-model";
 const CUT_BY_THE_LIMIT: &str = "{\"error\":{\"message\":\"Treat this response as failed. The model stopped due to max_tokens before it completed the tool call. Retry the request.\",\"type\":\"invalid_tool_call_format\",\"code\":\"invalid_tool_call_format\",\"finish_reason\":\"length\"}}";
 
 /// The spec of a chat request for `model`, read by `table`: with the `lookup`
-/// tool declared or none, asking for the usage or not, under `tool_choice`
-/// or none. The model id selects the provider profile, and so the wire.
+/// tool (one string parameter, `city`) and the `other` tool declared or
+/// none, asking for the usage or not, under `tool_choice` or none. The model
+/// id selects the provider profile, and so the wire.
 fn spec_of(
     model: &str,
     table: Table,
@@ -91,7 +94,8 @@ fn spec_of(
     if tools {
         request["tools"] = json!([
             {"type": "function", "function": {
-                "name": "lookup", "parameters": {"type": "object", "properties": {}}}},
+                "name": "lookup", "parameters": {
+                    "type": "object", "properties": {"city": {"type": "string"}}}}},
             {"type": "function", "function": {
                 "name": "other", "parameters": {"type": "object", "properties": {}}}},
         ]);
@@ -204,9 +208,8 @@ fn tool_arguments(events: &[Value]) -> String {
         .collect()
 }
 
-/// The `lookup` call of [`CUT_CALL`] went out as far as the model wrote it,
-/// as a reader that holds nothing sends it: its name, and its arguments
-/// without their close.
+/// The `lookup` call of [`CUT_CALL`] went out as far as the model wrote it:
+/// its name, and its arguments without their close.
 fn assert_the_call_went_out_cut(events: &[Value]) {
     assert_eq!(tool_names(events), vec!["lookup"], "{events:?}");
     let arguments = tool_arguments(events);
@@ -224,21 +227,59 @@ fn the_contracts_failure(result: Result<(), StreamFailure>) -> InvalidToolCallFo
     }
 }
 
-/// Nothing of a call reached the client: no tool-call delta, and none of the
-/// call's bytes as content.
-fn assert_nothing_of_the_call(events: &[Value]) {
-    assert!(call_deltas(events).is_empty(), "{events:?}");
-    let shown = content(events);
-    for part in ["lookup", "Paris", "invoke", "minimax", "tool_call"] {
-        assert!(!shown.contains(part), "{part} in the content: {shown:?}");
-    }
+/// What the client was sent of the answer, chunk by chunk: each chunk's
+/// `choices`, without the finish chunks and the usage chunk, a call's id left
+/// out (every output draws its ids afresh).
+fn deliveries(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter_map(|event| event["choices"].as_array())
+        .filter(|choices| {
+            !choices.is_empty()
+                && choices
+                    .iter()
+                    .all(|choice| choice["finish_reason"].is_null())
+        })
+        .map(|choices| {
+            let mut choices = choices.clone();
+            let calls = choices
+                .iter_mut()
+                .filter_map(|choice| choice.get_mut("delta"))
+                .filter_map(|delta| delta.get_mut("tool_calls"))
+                .filter_map(Value::as_array_mut)
+                .flatten();
+            for call in calls {
+                if let Some(call) = call.as_object_mut() {
+                    call.remove("id");
+                }
+            }
+            Value::Array(choices)
+        })
+        .collect()
+}
+
+/// The events of the stream of `frames` where the contract does not apply,
+/// under the same tools and `tool_choice`: the M3 table reading for a served
+/// name on no vendor's wire, which ends with the engine's finish.
+async fn without_the_contract(
+    frames: Vec<proto::GenerateResponse>,
+    tool_choice: Option<Value>,
+) -> Vec<Value> {
+    let served = spec_of(SERVED, Table::MinimaxM3, true, false, tool_choice);
+    assert!(!served.fails_on_unreadable_call());
+    let (result, events) = streamed(frames, served).await;
+    assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
+    assert_eq!(finish_reasons(&events).len(), 1, "{events:?}");
+    events
 }
 
 /// A call the token limit cut, under a request that declares tools: the text
-/// before it went out and nothing of the call did; no finish chunk follows,
-/// the usage chunk does when the request asked for one, and the stream's
-/// outcome is the contract's failure with the `length` finish. One frame for
-/// the call, or a character a frame: the same.
+/// before it went out and so did the call, as far as it was read (its name,
+/// its arguments without their close), chunk for chunk what a request the
+/// contract does not cover is sent; no finish chunk follows, the usage chunk
+/// does when the request asked for one, and the stream's outcome is the
+/// contract's failure with the `length` finish. One frame for the call, or a
+/// character a frame: the same.
 #[tokio::test]
 async fn a_call_the_limit_cut_ends_the_stream_with_the_usage_frame_and_no_finish() {
     for usage in [true, false] {
@@ -246,16 +287,20 @@ async fn a_call_the_limit_cut_ends_the_stream_with_the_usage_frame_and_no_finish
             vec![chunk(0, BEFORE), chunk(0, CUT_CALL), complete(0, "length")],
             by_character(&format!("{BEFORE}{CUT_CALL}"), "length"),
         ] {
-            let (result, events) = streamed(frames, spec(true, usage)).await;
+            let (result, events) = streamed(frames.clone(), spec(true, usage)).await;
             let failure = the_contracts_failure(result);
             assert_eq!(
                 failure,
                 InvalidToolCallFormat::new(UnreadableCall::Incomplete, true)
             );
             assert_eq!(failure.finish_reason(), "length");
-            assert_eq!(content(&events), BEFORE, "{events:?}");
+            assert_eq!(content(&events), BEFORE_AND_THE_CUTS_NEWLINE, "{events:?}");
             assert!(finish_reasons(&events).is_empty(), "{events:?}");
-            assert_nothing_of_the_call(&events);
+            assert_the_call_went_out_cut(&events);
+            assert_eq!(
+                deliveries(&events),
+                deliveries(&without_the_contract(frames, None).await)
+            );
             let last = events.last().expect("the text went out");
             if usage {
                 assert!(
@@ -275,14 +320,16 @@ async fn a_call_the_limit_cut_ends_the_stream_with_the_usage_frame_and_no_finish
 
 /// The model's own stop inside a call is the `error` finish with the
 /// incomplete-call sentence: the token limit is blamed only for a cut. The
-/// call the reader would have closed for the model is not delivered.
+/// call went out as the table read it, which closes the arguments of a call
+/// the model stopped inside, as it does where the contract does not apply;
+/// the contract's failure stands where the `tool_calls` finish would.
 #[tokio::test]
 async fn the_models_own_stop_inside_a_call_is_an_error_finish() {
     for frames in [
         vec![chunk(0, CUT_CALL), complete(0, "stop")],
         by_character(CUT_CALL, "stop"),
     ] {
-        let (result, events) = streamed(frames, spec(true, false)).await;
+        let (result, events) = streamed(frames.clone(), spec(true, false)).await;
         let failure = the_contracts_failure(result);
         assert_eq!(
             failure,
@@ -294,14 +341,23 @@ async fn the_models_own_stop_inside_a_call_is_an_error_finish() {
             "Treat this response as failed. The model generated an incomplete tool call. Retry the request."
         );
         assert!(finish_reasons(&events).is_empty(), "{events:?}");
-        assert_nothing_of_the_call(&events);
+        assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_arguments(&events)).expect("closed for the model"),
+            json!({"city": "Paris"})
+        );
+        let as_before = without_the_contract(frames, None).await;
+        assert_eq!(finish_reasons(&as_before), vec!["tool_calls"]);
+        assert_eq!(deliveries(&events), deliveries(&as_before));
     }
 }
 
 /// A block with malformed structure is an `error` finish whatever the
 /// engine's: the invoke opened with its name, the reader met text where a
-/// parameter's tag goes, and the model closed the invoke. Nothing of it is
-/// shown, as a call or as content.
+/// parameter's tag goes, and the model closed the invoke. The call's name had
+/// gone out when the reader met the text; what follows it is what the table
+/// delivers of such a block where the contract does not apply, and the
+/// failure ends the stream.
 #[tokio::test]
 async fn a_block_with_malformed_structure_is_an_error_finish() {
     for finish in ["length", "stop"] {
@@ -313,7 +369,7 @@ async fn a_block_with_malformed_structure_is_an_error_finish() {
             ],
             by_character(&format!("{BEFORE}{MALFORMED_CALL}"), finish),
         ] {
-            let (result, events) = streamed(frames, spec(true, false)).await;
+            let (result, events) = streamed(frames.clone(), spec(true, false)).await;
             let failure = the_contracts_failure(result);
             assert_eq!(
                 failure,
@@ -325,37 +381,80 @@ async fn a_block_with_malformed_structure_is_an_error_finish() {
                 failure.message(),
                 "Treat this response as failed. The model generated a tool call with malformed structure. Retry the request."
             );
-            assert_eq!(content(&events), BEFORE, "{events:?}");
             assert!(finish_reasons(&events).is_empty(), "{events:?}");
-            assert_nothing_of_the_call(&events);
+            assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+            assert_eq!(
+                deliveries(&events),
+                deliveries(&without_the_contract(frames, None).await)
+            );
         }
+    }
+}
+
+/// The output goes on after a block with malformed structure: the text the
+/// model wrote after it streams as it does where the contract does not
+/// apply, a whole call after it goes out too, and the failure waits for the
+/// output's end, where it stands in place of the finish.
+#[tokio::test]
+async fn the_output_after_a_malformed_block_streams_and_the_failure_ends_it() {
+    const AFTER: &str = "Done.";
+    for (rest, names) in [
+        (AFTER.to_string(), vec!["lookup"]),
+        (format!("{CUT_CALL}{CLOSE}"), vec!["lookup", "lookup"]),
+    ] {
+        let output = format!("{BEFORE}{MALFORMED_CALL}{rest}");
+        let frames = by_character(&output, "stop");
+        let (result, events) = streamed(frames.clone(), spec(true, true)).await;
+        assert_eq!(
+            the_contracts_failure(result),
+            InvalidToolCallFormat::new(UnreadableCall::Malformed, false)
+        );
+        assert!(finish_reasons(&events).is_empty(), "{events:?}");
+        assert_eq!(tool_names(&events), names, "{events:?}");
+        let as_before = without_the_contract(frames, None).await;
+        assert_eq!(deliveries(&events), deliveries(&as_before));
+        assert!(
+            events.last().is_some_and(|last| last["usage"].is_object()),
+            "{events:?}"
+        );
     }
 }
 
 /// An invoke the output ended inside before its name closed starts no call:
 /// the block is the one the output ended in, so the failure is the
-/// incomplete one, blamed on the limit where the limit cut it.
+/// incomplete one, blamed on the limit where the limit cut it. No call delta
+/// went out, and the invoke's bytes went out as content before the failure,
+/// as they do where the contract does not apply.
 #[tokio::test]
 async fn a_block_the_output_ended_inside_before_its_call_started_is_incomplete() {
     const OPENED: &str = "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"look";
     for (finish, at_limit) in [("length", true), ("stop", false)] {
         let frames = vec![chunk(0, BEFORE), chunk(0, OPENED), complete(0, finish)];
-        let (result, events) = streamed(frames, spec(true, false)).await;
+        let (result, events) = streamed(frames.clone(), spec(true, false)).await;
         assert_eq!(
             the_contracts_failure(result),
             InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit),
             "{finish}"
         );
-        assert_eq!(content(&events), BEFORE, "{events:?}");
+        assert_eq!(
+            content(&events),
+            format!("{BEFORE}<invoke name=\"look"),
+            "{events:?}"
+        );
         assert!(call_deltas(&events).is_empty(), "{events:?}");
+        assert!(finish_reasons(&events).is_empty(), "{events:?}");
+        assert_eq!(
+            deliveries(&events),
+            deliveries(&without_the_contract(frames, None).await)
+        );
     }
 }
 
 /// An invoke the output ended in right after its opener, before any byte of
 /// its name, is a call the model began: the request fails as for the invoke
-/// one byte further, incomplete, blamed on the limit where the limit cut it,
-/// and nothing of it is shown. On another wire the same output ends as it
-/// did, with the engine's finish and no call.
+/// one byte further, incomplete, blamed on the limit where the limit cut it.
+/// On another wire the same output ends as it did, with the engine's finish
+/// and no call, and what went out is the same.
 #[tokio::test]
 async fn an_invoke_the_output_ended_in_before_any_byte_of_its_name_is_incomplete() {
     const OPENED: &str = "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"";
@@ -372,14 +471,13 @@ async fn an_invoke_the_output_ended_in_before_any_byte_of_its_name_is_incomplete
             );
             assert_eq!(content(&events), BEFORE, "{events:?}");
             assert!(finish_reasons(&events).is_empty(), "{events:?}");
-            assert_nothing_of_the_call(&events);
-
-            let served = spec_of(SERVED, Table::MinimaxM3, true, false, None);
-            let (result, events) = streamed(frames, served).await;
-            assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
-            assert_eq!(content(&events), BEFORE, "{events:?}");
-            assert_eq!(finish_reasons(&events), vec![finish]);
             assert!(call_deltas(&events).is_empty(), "{events:?}");
+
+            let as_before = without_the_contract(frames, None).await;
+            assert_eq!(content(&as_before), BEFORE, "{as_before:?}");
+            assert_eq!(finish_reasons(&as_before), vec![finish]);
+            assert!(call_deltas(&as_before).is_empty(), "{as_before:?}");
+            assert_eq!(deliveries(&events), deliveries(&as_before));
         }
         let read = whole_answer(M3, &format!("{BEFORE}{OPENED}"), finish, &spec(true, false)).await;
         let Err(ChoiceFailure::ToolCallFormat(failure)) = read else {
@@ -392,13 +490,13 @@ async fn an_invoke_the_output_ended_in_before_any_byte_of_its_name_is_incomplete
     }
 }
 
-/// The spec of a MiniMax M3 request that names `lookup`, whose one parameter
+/// The spec of a request for `model` that names `lookup`, whose one parameter
 /// schema is a bare integer, read as the gateway's JSON schema makes the M3
 /// table read a forced call: the output is the call's arguments alone, from
 /// its first byte, with no marker to close them.
-fn forced_spec() -> ChatResponseSpec {
+fn forced_spec_of(model: &str) -> ChatResponseSpec {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": M3, "messages": [{"role": "user", "content": "hi"}], "stream": true,
+        "model": model, "messages": [{"role": "user", "content": "hi"}], "stream": true,
         "tools": [{"type": "function", "function": {
             "name": "lookup", "parameters": {"type": "integer"}}}],
         "tool_choice": {"type": "function", "function": {"name": "lookup"}},
@@ -417,6 +515,13 @@ fn forced_spec() -> ChatResponseSpec {
         ProviderProfile::for_model(&request.model),
         || GrammarStart::FirstToken,
     );
+    assert!(spec.symphony.is_some(), "a table reads");
+    spec
+}
+
+/// The forced request on MiniMax's wire, which the contract covers.
+fn forced_spec() -> ChatResponseSpec {
+    let spec = forced_spec_of(M3);
     assert!(spec.fails_on_unreadable_call(), "the M3 table reads");
     spec
 }
@@ -425,7 +530,9 @@ fn forced_spec() -> ChatResponseSpec {
 /// the value is whole where the output ends, and the call is delivered, at
 /// the model's stop and where the limit ended the output alike, streamed and
 /// whole. A forced value the output ended inside is the incomplete call, as
-/// any other: the request fails and nothing of it is shown.
+/// any other: the request fails, and the stream has sent the call's name and
+/// the value as far as it went, as it does where the contract does not
+/// apply.
 #[tokio::test]
 async fn a_forced_scalar_whole_where_the_output_ends_is_delivered_and_an_unfinished_value_fails() {
     for finish in ["stop", "length"] {
@@ -454,14 +561,20 @@ async fn a_forced_scalar_whole_where_the_output_ends_is_delivered_and_an_unfinis
     for (finish, at_limit) in [("stop", false), ("length", true)] {
         for unfinished in ["{\"city\": \"Par", "[1, 2", "tru"] {
             let frames = vec![chunk(0, unfinished), complete(0, finish)];
-            let (result, events) = streamed(frames, forced_spec()).await;
+            let (result, events) = streamed(frames.clone(), forced_spec()).await;
             assert_eq!(
                 the_contracts_failure(result),
                 InvalidToolCallFormat::new(UnreadableCall::Incomplete, at_limit),
                 "{unfinished} under {finish}"
             );
-            assert!(call_deltas(&events).is_empty(), "{events:?}");
             assert!(finish_reasons(&events).is_empty(), "{events:?}");
+            assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+            assert_eq!(tool_arguments(&events), unfinished, "{events:?}");
+            let served = forced_spec_of(SERVED);
+            assert!(!served.fails_on_unreadable_call());
+            let (result, as_before) = streamed(frames, served).await;
+            assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
+            assert_eq!(deliveries(&events), deliveries(&as_before));
             let read = whole_answer(M3, unfinished, finish, &forced_spec()).await;
             let Err(ChoiceFailure::ToolCallFormat(failure)) = read else {
                 panic!("the contract's failure for {unfinished} under {finish}");
@@ -497,25 +610,11 @@ async fn without_tools_the_cut_call_ends_as_before() {
     assert!(call_deltas(&events).is_empty(), "{events:?}");
 }
 
-/// A whole call is delivered as before. The reader held it to its close, and
-/// what went out then is what a reader that holds nothing sends for the same
-/// output: the same deltas in the same order, the call's id aside, then the
-/// `tool_calls` finish.
+/// A whole call is delivered as before: what a request the contract covers
+/// is sent is what one it does not cover is sent for the same output, chunk
+/// for chunk, the call's id aside, then the `tool_calls` finish.
 #[tokio::test]
 async fn a_whole_call_is_delivered_as_before() {
-    /// A call's deltas without its id, which each output draws afresh.
-    fn without_ids(events: &[Value]) -> Vec<Value> {
-        call_deltas(events)
-            .into_iter()
-            .cloned()
-            .map(|mut delta| {
-                if let Some(delta) = delta.as_object_mut() {
-                    delta.remove("id");
-                }
-                delta
-            })
-            .collect()
-    }
     for frames in [
         vec![
             chunk(0, BEFORE),
@@ -525,9 +624,9 @@ async fn a_whole_call_is_delivered_as_before() {
         ],
         by_character(&format!("{BEFORE}{CUT_CALL}{CLOSE}"), "stop"),
     ] {
-        let held = spec(true, true);
-        assert!(held.fails_on_unreadable_call());
-        let (result, events) = streamed(frames.clone(), held).await;
+        let covered = spec(true, false);
+        assert!(covered.fails_on_unreadable_call());
+        let (result, events) = streamed(frames.clone(), covered).await;
         assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
         assert_eq!(content(&events), BEFORE, "{events:?}");
         assert_eq!(tool_names(&events), vec!["lookup"]);
@@ -538,58 +637,58 @@ async fn a_whole_call_is_delivered_as_before() {
         );
         assert_eq!(finish_reasons(&events), vec!["tool_calls"]);
 
-        let unheld = spec_of(SERVED, Table::MinimaxM3, true, true, None);
-        assert!(!unheld.fails_on_unreadable_call());
-        let (result, as_before) = streamed(frames, unheld).await;
-        assert!(result.is_ok());
-        assert_eq!(without_ids(&events), without_ids(&as_before));
-        assert_eq!(content(&as_before), BEFORE);
+        let as_before = without_the_contract(frames, None).await;
+        assert_eq!(deliveries(&events), deliveries(&as_before));
         assert_eq!(finish_reasons(&as_before), vec!["tool_calls"]);
     }
 }
 
-/// A call before the one that failed was whole and went out at its close;
-/// the failed one after it shows nothing, and the stream ends as the
-/// contract's failure.
+/// A call before the one that failed was whole and went out; the one the
+/// limit cut after it went out as far as it was read, and the stream ends as
+/// the contract's failure.
 #[tokio::test]
-async fn a_whole_call_before_the_failed_one_went_out_and_the_failed_one_shows_nothing() {
-    let second = "]<]minimax[>[<invoke name=\"other\">\n]<]minimax[>[<city>Rome";
+async fn a_whole_call_before_the_failed_one_went_out_and_the_failed_one_as_far_as_it_was_read() {
+    let second = "]<]minimax[>[<invoke name=\"lookup\">\n]<]minimax[>[<city>Rome";
     let output = format!("{CUT_CALL}]<]minimax[>[</invoke>\n{second}");
-    let (result, events) = streamed(by_character(&output, "length"), spec(true, false)).await;
+    let frames = by_character(&output, "length");
+    let (result, events) = streamed(frames.clone(), spec(true, false)).await;
     assert_eq!(
         the_contracts_failure(result),
         InvalidToolCallFormat::new(UnreadableCall::Incomplete, true)
     );
-    assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+    assert_eq!(tool_names(&events), vec!["lookup", "lookup"], "{events:?}");
     assert_eq!(
-        serde_json::from_str::<Value>(&tool_arguments(&events)).expect("the first call, closed"),
-        json!({"city": "Paris"})
+        tool_arguments(&events),
+        "{\"city\": \"Paris\"}{\"city\": \"Rome",
+        "{events:?}"
     );
     assert!(finish_reasons(&events).is_empty(), "{events:?}");
+    assert_eq!(
+        deliveries(&events),
+        deliveries(&without_the_contract(frames, None).await)
+    );
 }
 
 /// A call the request's own choice drops is a call the model failed to write
 /// all the same: under a choice that names another function, the cut call to
-/// `lookup` fails the request and shows nothing. Whole, the same call is
-/// dropped as before and the stream ends with the engine's finish.
+/// `lookup` fails the request, and it is dropped as the choice drops it where
+/// the contract does not apply. Whole, the same call is dropped as before
+/// and the stream ends with the engine's finish.
 #[tokio::test]
 async fn a_cut_call_the_choice_forbids_fails_the_request_all_the_same() {
-    let named = || {
-        spec_of(
-            M3,
-            Table::MinimaxM3,
-            true,
-            false,
-            Some(json!({"type": "function", "function": {"name": "other"}})),
-        )
-    };
+    let other = json!({"type": "function", "function": {"name": "other"}});
+    let named = || spec_of(M3, Table::MinimaxM3, true, false, Some(other.clone()));
     let frames = vec![chunk(0, CUT_CALL), complete(0, "length")];
-    let (result, events) = streamed(frames, named()).await;
+    let (result, events) = streamed(frames.clone(), named()).await;
     assert_eq!(
         the_contracts_failure(result),
         InvalidToolCallFormat::new(UnreadableCall::Incomplete, true)
     );
-    assert_nothing_of_the_call(&events);
+    assert!(call_deltas(&events).is_empty(), "{events:?}");
+    assert_eq!(
+        deliveries(&events),
+        deliveries(&without_the_contract(frames, Some(other.clone())).await)
+    );
 
     let frames = vec![chunk(0, CUT_CALL), chunk(0, CLOSE), complete(0, "stop")];
     let (result, events) = streamed(frames, named()).await;
@@ -600,25 +699,29 @@ async fn a_cut_call_the_choice_forbids_fails_the_request_all_the_same() {
 
 /// One failing choice fails the whole request: of two choices, the first
 /// whole and the second cut, the stream's outcome is the contract's failure
-/// and no choice gets a finish chunk.
+/// and no choice gets a finish chunk. Both choices' calls went out as they
+/// were read, the second's without its close.
 #[tokio::test]
 async fn one_failing_choice_fails_the_whole_stream() {
-    let mut request = json!({
-        "model": M3, "messages": [{"role": "user", "content": "hi"}], "stream": true, "n": 2,
-        "tools": [{"type": "function", "function": {
-            "name": "lookup", "parameters": {"type": "object", "properties": {}}}}],
-    });
-    request["separate_reasoning"] = json!(true);
-    let request: ChatCompletionRequest = serde_json::from_value(request).expect("a chat request");
-    let mut two = ChatResponseSpec::from(&request);
-    two.symphony = assign_for(
-        Reading::Table(Table::MinimaxM3.shared(), false),
-        Asks::Chat(&request),
-        None,
-        "",
-        ProviderProfile::for_model(&request.model),
-        || GrammarStart::Unknown,
-    );
+    let two = |model: &str| {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": model, "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            "n": 2, "separate_reasoning": true,
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "parameters": {"type": "object", "properties": {}}}}],
+        }))
+        .expect("a chat request");
+        let mut two = ChatResponseSpec::from(&request);
+        two.symphony = assign_for(
+            Reading::Table(Table::MinimaxM3.shared(), false),
+            Asks::Chat(&request),
+            None,
+            "",
+            ProviderProfile::for_model(&request.model),
+            || GrammarStart::Unknown,
+        );
+        two
+    };
     let frames = vec![
         chunk(0, CUT_CALL),
         chunk(1, CUT_CALL),
@@ -626,19 +729,27 @@ async fn one_failing_choice_fails_the_whole_stream() {
         complete(0, "stop"),
         complete(1, "length"),
     ];
-    let (result, events) = streamed(frames, two).await;
+    let (result, events) = streamed(frames.clone(), two(M3)).await;
     assert_eq!(
         the_contracts_failure(result),
         InvalidToolCallFormat::new(UnreadableCall::Incomplete, true)
     );
     assert!(finish_reasons(&events).is_empty(), "{events:?}");
-    assert!(
+    let arguments_of = |index: u64| -> String {
         events
             .iter()
             .flat_map(|event| event["choices"].as_array().into_iter().flatten())
-            .all(|choice| choice["index"] == 0 || choice["delta"]["tool_calls"].is_null()),
-        "nothing of the second choice's call: {events:?}"
-    );
+            .filter(|choice| choice["index"] == index)
+            .filter_map(|choice| choice["delta"]["tool_calls"][0]["function"]["arguments"].as_str())
+            .collect()
+    };
+    assert_eq!(arguments_of(0), "{\"city\": \"Paris\"}", "{events:?}");
+    assert_eq!(arguments_of(1), "{\"city\": \"Paris\"", "{events:?}");
+
+    let (result, as_before) = streamed(frames, two(SERVED)).await;
+    assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
+    assert_eq!(finish_reasons(&as_before), vec!["tool_calls", "length"]);
+    assert_eq!(deliveries(&events), deliveries(&as_before));
 }
 
 /// The stream's end: `[DONE]` after a read that ended well and after any
@@ -726,7 +837,7 @@ async fn a_placed_dispatch_is_told_the_answer_ended_whole() {
 }
 
 /// The body of the streamed response to `spec` over an engine stream, as the
-/// client reads it: MiniMax's re-chunker included.
+/// client reads it: the re-slicing of MiniMax's delta-size contract included.
 async fn response_of(stream: ProtoStream, spec: ChatResponseSpec) -> axum::body::Body {
     let dispatch = dispatch(M3);
     let source = StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
@@ -773,14 +884,15 @@ fn frames_and_events(body: &str) -> (Vec<&str>, Vec<Value>) {
     (frames, events)
 }
 
-/// Nothing of a failed call reaches the client, read off the bytes of the
+/// A failed call went out as far as it was read, read off the bytes of the
 /// response's body: for a call the limit cut, one the model stopped inside
-/// and a block with malformed structure, a character a frame, the body holds
-/// no tool-call delta and none of the call's bytes; the text before the call
-/// is there, the usage chunk follows it, and the contract's event is the last
-/// frame, with no finish chunk ahead of it and no `[DONE]` after it.
+/// and a block with malformed structure, a character a frame, the body
+/// carries the text before the call and the call's name in a tool-call
+/// delta; the usage chunk follows the last of the answer, and the contract's
+/// event is the last frame, with no finish chunk ahead of it and no `[DONE]`
+/// after it.
 #[tokio::test]
-async fn nothing_of_a_failed_call_reaches_the_client() {
+async fn a_failed_call_went_out_as_far_as_it_was_read_and_the_contracts_event_ends_the_body() {
     for (call, finish, failure) in [
         (
             CUT_CALL,
@@ -800,16 +912,7 @@ async fn nothing_of_a_failed_call_reaches_the_client() {
     ] {
         let frames = by_character(&format!("{BEFORE}{call}"), finish);
         let body = response_body(frames, spec(true, true)).await;
-        for part in [
-            "tool_calls",
-            "lookup",
-            "Paris",
-            "invoke",
-            "minimax",
-            "[DONE]",
-        ] {
-            assert!(!body.contains(part), "{part} in the body: {body}");
-        }
+        assert!(!body.contains("[DONE]"), "{body}");
         let (frames, events) = frames_and_events(&body);
         let contract = failure.sse_frame();
         assert_eq!(
@@ -817,40 +920,68 @@ async fn nothing_of_a_failed_call_reaches_the_client() {
             std::str::from_utf8(&contract).ok().map(str::trim_end),
             "{body}"
         );
-        assert_eq!(content(&events), BEFORE, "{body}");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.starts_with("event: "))
+                .count(),
+            1,
+            "{body}"
+        );
+        assert!(content(&events).starts_with(BEFORE), "{body}");
+        assert_eq!(tool_names(&events), vec!["lookup"], "{body}");
         assert!(finish_reasons(&events).is_empty(), "{body}");
+        let (last, answer) = events.split_last().expect("the answer's events");
         assert!(
-            events.last().is_some_and(|last| last["usage"].is_object()),
+            last["usage"].is_object() && last["choices"].as_array().is_some_and(Vec::is_empty),
             "the usage chunk ahead of the event: {body}"
+        );
+        assert!(
+            answer.iter().all(|event| !event["usage"].is_object()),
+            "{body}"
         );
     }
 }
 
-/// The text before the call still streams before the failure: with the
-/// engine silent after the text, the text is in the body's frames while the
-/// call has not come; the call and the limit's cut then end the body with
-/// the contract's event.
+/// A call streams as it is read, the contract or not: with the engine silent
+/// inside the call's value, the call's name and the value so far are in the
+/// body's frames already (all but the short tail MiniMax's delta-size
+/// contract keeps back from every stream of its wire), and no failure is; the
+/// rest of the value and the limit's cut then end the body with the
+/// contract's event.
 #[tokio::test]
-async fn text_before_the_call_still_streams_before_the_failure() {
+async fn a_call_streams_as_it_is_read_before_the_output_ends() {
     const PATIENCE: Duration = Duration::from_secs(10);
+    const OPENED: &str = "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"lookup\">\n]<]minimax[>[<city>Paris, France";
     let (resume, gate) = oneshot::channel();
     let (stream, server) = gated_stream(
-        vec![chunk(0, BEFORE), chunk(0, " One moment.")],
+        vec![chunk(0, BEFORE), chunk(0, OPENED)],
         gate,
-        vec![chunk(0, CUT_CALL), complete(0, "length")],
+        vec![chunk(0, " and on"), complete(0, "length")],
         "0",
     )
     .await;
     let mut body = response_of(stream, spec(true, false)).await;
     let mut early = String::new();
     timeout(PATIENCE, async {
-        while !early.contains("Checking.") {
+        loop {
+            let (_, events) = frames_and_events(&early);
+            if tool_arguments(&events).contains("Paris") {
+                break;
+            }
             let frame = body.frame().await.expect("a frame").expect("a body frame");
             early.push_str(std::str::from_utf8(frame.data_ref().expect("data")).expect("UTF-8"));
         }
     })
     .await
-    .expect("the text streams while the engine is silent");
+    .expect("the call streams while the engine is silent");
+    let (_, events) = frames_and_events(&early);
+    assert_eq!(content(&events), BEFORE, "{early}");
+    assert_eq!(tool_names(&events), vec!["lookup"], "{early}");
+    assert!(
+        tool_arguments(&events).starts_with("{\"city\": \"Paris"),
+        "{early}"
+    );
     assert!(!early.contains("event: error"), "{early}");
     resume.send(()).expect("the engine goes on");
     let rest = body.collect().await.expect("the body").to_bytes();
@@ -860,13 +991,15 @@ async fn text_before_the_call_still_streams_before_the_failure() {
         rest.ends_with(&format!("event: error\ndata: {CUT_BY_THE_LIMIT}\n\n")),
         "{rest}"
     );
-    assert!(
-        !rest.contains("lookup") && !rest.contains("[DONE]"),
-        "{rest}"
-    );
+    assert!(!rest.contains("[DONE]"), "{rest}");
     let whole = format!("{early}{rest}");
     let (_, events) = frames_and_events(&whole);
-    assert_eq!(content(&events), "Checking. One moment.", "{whole}");
+    assert_eq!(
+        tool_arguments(&events),
+        "{\"city\": \"Paris, France and on",
+        "{whole}"
+    );
+    assert!(finish_reasons(&events).is_empty(), "{whole}");
 }
 
 /// The whole answer of `model` whose output is `output`, ended by the engine

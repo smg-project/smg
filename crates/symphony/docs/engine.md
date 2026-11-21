@@ -156,7 +156,7 @@ is a later step).
   the assembler says when asked (`CallAssembler::ends_with_the_output`), and the end is then
   `closed` at the stop and at a cut alike, as it is for the object that closed at its brace. The
   events and their order are what they were, so a driver that does not read the field sees no
-  change. One that must not hand on a call the model did not finish reads it there, beside
+  change. One that fails its request on a call the model did not finish reads it there, beside
   `MalformedReason::loses_a_call` for a call the syntax could not read whole and
   `Dropped { MalformedCall }` for the bytes of a block it refused. A block that named no call
   has no end to carry the word: the output's end that found it open refuses its bytes in that

@@ -283,7 +283,7 @@ impl ResponseProcessor {
         let mut events = Events::new();
         let mut reader = Reader::new(assignment, tools, &mut events)?
             .first_call_only(original_request.first_tool_call_only)
-            .failing_unreadable_calls(original_request.fails_on_unreadable_call());
+            .noting_unreadable_calls(original_request.fails_on_unreadable_call());
         let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         // Complete token decoding, including bytes and a partial stop match, as
         // on the older path; the text it releases is the last token's.

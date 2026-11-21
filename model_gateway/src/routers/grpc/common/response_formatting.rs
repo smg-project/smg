@@ -363,7 +363,7 @@ mod tests {
     /// settles them, whole; a response nobody marked carries none.
     #[test]
     fn a_failed_answer_carries_the_engines_counters() {
-        use axum::response::IntoResponse;
+        use axum::{http::StatusCode, response::IntoResponse};
 
         let counts = TokenCounts {
             prompt: 11,
@@ -373,7 +373,7 @@ mod tests {
             spec_accepted: 1,
             spec_drafted: Some(4),
         };
-        let mut response = axum::http::StatusCode::BAD_REQUEST.into_response();
+        let mut response = StatusCode::BAD_REQUEST.into_response();
         assert_eq!(TokenCounts::carried_by(&response), None);
         counts.carry_on(&mut response);
         assert_eq!(TokenCounts::carried_by(&response), Some(counts));

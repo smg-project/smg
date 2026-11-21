@@ -770,10 +770,12 @@ impl StreamingProcessor {
                 stream.flush_parsers(usage.as_ref()).await?;
                 let final_usage = stream.final_usage();
                 // A tool call a choice's reader could not read, under a
-                // request that fails on one: the finish chunks are withheld,
-                // the usage chunk still goes out when the request asked for
-                // one (so a client accounts the tokens), and the failure
-                // ends the stream (`InvalidToolCallFormat`).
+                // request that fails on one. The answer has gone out as it
+                // was read, the call as far as it went; here the finish
+                // chunks are withheld, the usage chunk still goes out when
+                // the request asked for one (so a client accounts the
+                // tokens), and the failure ends the stream
+                // (`InvalidToolCallFormat`).
                 if let Some(failure) = stream.unreadable_call() {
                     stream.write_usage_chunk(final_usage.as_ref());
                     // The failure is the stream's outcome whatever the
@@ -4077,7 +4079,7 @@ impl<'a> ChatStream<'a> {
                             &mut events,
                         )?
                         .first_call_only(self.spec.first_tool_call_only)
-                        .failing_unreadable_calls(self.spec.fails_on_unreadable_call()),
+                        .noting_unreadable_calls(self.spec.fails_on_unreadable_call()),
                     ),
                 };
                 let stopped =
@@ -4334,7 +4336,7 @@ impl<'a> ChatStream<'a> {
                     &mut events,
                 )?
                 .first_call_only(self.spec.first_tool_call_only)
-                .failing_unreadable_calls(self.spec.fails_on_unreadable_call()),
+                .noting_unreadable_calls(self.spec.fails_on_unreadable_call()),
             ),
         };
         if let Some(text) = flushed {
