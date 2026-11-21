@@ -443,7 +443,9 @@ fn a_held_header_decode_side_stays_in_the_decode_phase() {
 
 /// Parallel dispatch sends both sides together: the decode phase is the TTFT
 /// itself, and the prefill and relay phases of the sequential shape are not
-/// recorded.
+/// recorded. The request's handler runs under an entry stamp taken
+/// `ENTRY_LEAD` ago, and its wait ahead of that one dispatch is recorded once,
+/// with the route's TTFT and under its labels.
 #[test]
 fn parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft() {
     let rendered = render_after(|| async {
