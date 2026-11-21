@@ -481,7 +481,8 @@ impl DecisionEngine for PolicyEngine {
 
     // No lease is filed, so no pass ends one: a lease ends at its guard's
     // word or drop. The session keys past their end leave the engine's
-    // table here, off the path of a request.
+    // table here, off the path of a request: from this pass's first run no
+    // read of a key sweeps the table.
     fn sweep(&self, now: Instant) -> SweepOutcome {
         let sessions = self.spec.engine().sessions();
         sessions.sweep_due(self.clock.micros(now));
