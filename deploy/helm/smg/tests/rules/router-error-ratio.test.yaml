@@ -64,3 +64,19 @@ tests:
       - eval_time: 15m
         alertname: SmgHighRouterErrorRatio
         exp_alerts: []
+
+  # An outcome that is the model's: one answer in five ends as the wire's
+  # contract ends a tool call that could not be read. The gateway and its
+  # workers served every request, so the ratio stays quiet: the class is out
+  # of the numerator.
+  - interval: 1m
+    name: answers a wire's contract fails on the model's output stay out of the router ratio
+    input_series:
+      - series: 'smg_router_requests_total{namespace="smg", job="smg-router", router_type="grpc", backend_type="regular", connection_mode="grpc", model="m", endpoint="chat", streaming="true"}'
+        values: '0+100x20'
+      - series: 'smg_router_request_errors_total{namespace="smg", job="smg-router", router_type="grpc", backend_type="regular", connection_mode="grpc", model="m", endpoint="chat", error_type="invalid_tool_call_format", reason="bad_response"}'
+        values: '0+20x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SmgHighRouterErrorRatio
+        exp_alerts: []
