@@ -517,7 +517,7 @@ mod tests {
     use llm_tokenizer::TokenizerRegistry;
     use openai_protocol::{
         chat::ChatCompletionRequest, messages::CreateMessageRequest, model_card::ModelCard,
-        worker::GrammarStart,
+        worker::GrammarStart as WorkerGrammarStart,
     };
     use serde_json::json;
     use smg_worker::identity::basic::WorkerType;
@@ -978,7 +978,7 @@ mod tests {
     /// tool-call parser. With no tool-call name the older registry has no tag of its own for a
     /// forced call, so the call takes its JSON schema where the table has no tag either.
     fn pool(table: &str, start: Option<&str>) -> Arc<SharedComponents> {
-        let start = start.map(|start| (GrammarStart::LABEL, start));
+        let start = start.map(|start| (WorkerGrammarStart::LABEL, start));
         pool_of(
             ModelCard::new(SERVED).with_reasoning_parser(table),
             start.as_slice(),
@@ -1557,7 +1557,7 @@ mod tests {
                     .with_tool_parser("json"),
             )
             .worker_type(WorkerType::Regular)
-            .label(GrammarStart::LABEL, "after_reasoning");
+            .label(WorkerGrammarStart::LABEL, "after_reasoning");
         components
             .worker_registry
             .register(Arc::new(joining.build()));
