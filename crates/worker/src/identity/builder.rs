@@ -62,6 +62,9 @@ pub struct BasicWorkerBuilder<D = NoConnector> {
     /// An engine connection that is already made (if not set, the worker
     /// connects on first use).
     engine_connection: Option<Arc<dyn EngineConnection>>,
+    /// The connection slot of the rank workers of one ZMQ engine group (if
+    /// not set, the worker has a slot of its own).
+    shared_engine_connection: Option<Arc<EngineConnectionCache>>,
     /// What makes the worker's engine connection (if not set, the default
     /// `D` names).
     engine_connector: Option<Arc<dyn EngineConnector>>,
@@ -108,6 +111,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             zmq_request_timeout: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             engine_connection: None,
+            shared_engine_connection: None,
             engine_connector: None,
             default_connector: PhantomData,
             http_client: None,
@@ -283,6 +287,15 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
+    /// Share one connection slot with the other rank workers of a ZMQ engine
+    /// group: the group's engines dial one socket set, so its rank workers
+    /// run one handshake between them and follow its reconnects together.
+    #[cfg(any(feature = "workflow", test))]
+    pub(crate) fn shared_engine_connection(mut self, slot: Arc<EngineConnectionCache>) -> Self {
+        self.shared_engine_connection = Some(slot);
+        self
+    }
+
     /// Set what makes the worker's engine connection, in place of the default
     /// `D` names. A gRPC or ZMQ worker with neither refuses its connect.
     pub fn engine_connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
@@ -446,7 +459,9 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
 
         // OnceCell for lock-free client access after initialization; ArcSwap so
         // the ZMQ health probe can evict a dead client (see BasicWorker docs).
-        let engine_connection = {
+        let engine_connection = if let Some(slot) = self.shared_engine_connection {
+            slot
+        } else {
             let cell = OnceCell::new();
             if let Some(connection) = self.engine_connection {
                 // Pre-set the connection if provided (set on a fresh cell cannot fail)

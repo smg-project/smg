@@ -189,8 +189,9 @@ runs every target for a bounded time.
 Symphony's target is every checkpoint group bellwether has a manifest for; a group is the
 checkpoints that share a tokenizer and a template, recorded once by its primary. The table below
 lists the groups bellwether has recorded, and the groups it listed before bellwether's manifests
-outgrew it; it is written from `tests/readme.rs` and checked by `cargo test`, so it says what this
-branch holds, and a stale table fails the build. It runs newest first: **Released** is the day the
+outgrew it; its rows are edited by hand, and `tests/readme.rs` checks them against the registry on
+`cargo test`, so it says what this branch holds: a row that differs from the registry fails the
+build. It runs newest first: **Released** is the day the
 primary's Hugging Face repository was created. The registry behind `formats::for_model` keeps its
 groups as data, `src/formats/groups.json` (one group per line: the table, the group's own turn
 opener and its own text after the thought's close where its template differs from the table's;

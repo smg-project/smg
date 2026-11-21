@@ -2832,7 +2832,9 @@ class RouterArgs:
                 "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes "
                 "a grouped worker whose handshake awaits this many engines on one "
                 "socket set (vLLM and TokenSpeed; default: as many as the first "
-                "engine to dial declares, one for an engine that declares none)"
+                "engine to dial declares, one for an engine that declares none). "
+                "Under --dp-aware a worker given this count registers as one worker "
+                "per engine, which share the socket set"
             ),
         )
         backend_group.add_argument(
