@@ -2576,6 +2576,47 @@ mod tests {
         }
     }
 
+    /// A tag held undecided when the output ends is accounted for, whichever end it is: every
+    /// byte of the output is in an event at the model's stop and at a cut, for a closing tag
+    /// held for what follows it and for an opening tag held for the bytes behind it, with and
+    /// without whitespace behind the tag. The call the output ended in is no call the model
+    /// ended.
+    #[test]
+    fn a_tag_held_undecided_when_the_output_ends_is_accounted_for() {
+        for body in [
+            "]<]minimax[>[<text>Paris]<]minimax[>[</town>",
+            "]<]minimax[>[<text>Paris]<]minimax[>[</town>\n ",
+            "]<]minimax[>[<text>Paris]<]minimax[>[<lines>",
+            "]<]minimax[>[<text>Paris]<]minimax[>[<lines> \n",
+            "]<]minimax[>[<text>Paris]<]minimax[>[<last>fal",
+            "]<]minimax[>[<lines>3]<]minimax[>[</line>",
+        ] {
+            let output =
+                format!("]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"save\">{body}");
+            for (finish, ended) in [
+                (EngineFinish::Stop, CallEnd::Stop),
+                (EngineFinish::Length, CallEnd::Cut),
+            ] {
+                for pieces in [
+                    vec![output.as_str()],
+                    output
+                        .char_indices()
+                        .map(|(at, c)| &output[at..at + c.len_utf8()])
+                        .collect(),
+                ] {
+                    let events = drive_to(
+                        &mut Engine::new(minimax_m3(), save()),
+                        "",
+                        &pieces,
+                        finish.clone(),
+                    );
+                    assert_eq!(bytes(&events), output, "{body} under {finish:?}");
+                    assert_eq!(endings(&events), [(0, ended)], "{body} under {finish:?}");
+                }
+            }
+        }
+    }
+
     /// What the reader holds back of a string value, in bytes of the model's output: one tag
     /// while it is read, from its `<` to its `>`; behind a closing tag that names nothing
     /// open, or an opening tag that names a parameter whose type constrains its text, at most

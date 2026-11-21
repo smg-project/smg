@@ -472,6 +472,10 @@ impl Assembler {
         if self.done {
             return;
         }
+        // A tag held undecided is read before the stop closes what is open, while the value
+        // it stands in still is: the stop is no value's first byte and no text.
+        self.candidate_is_text(out);
+        self.settle_stray_close(true, out);
         let string_closed = self.close_open_string(MalformedReason::OpenAtTheStop, out);
         // An element the stop found open before its first child or its text's close, or a tag it
         // found open between elements, is refused by the close below, and a call the syntax
@@ -976,6 +980,13 @@ impl Assembler {
             return;
         };
         let space = held.split_off(tag);
+        if self.between_elements() {
+            // No value is open for the tag to close or to stand in: it names nothing open
+            // where the syntax has tags, and is ignored as any such tag is.
+            self.refuse_stray_close(&held, out);
+            self.carried.push_str(&space);
+            return;
+        }
         self.slipped(out);
         if closes {
             self.close_left_open(MalformedReason::MisnamedClosingTag, &held, out);
