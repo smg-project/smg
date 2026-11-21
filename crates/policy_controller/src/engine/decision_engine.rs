@@ -137,7 +137,10 @@ pub struct HeldDecision<'a> {
     /// side's lease that the prefill side's does not give.
     pub decode_session: Session,
     /// The place in the pick of the target taken. An end and a release
-    /// carry no index of their own.
+    /// carry no index of their own. Behind a decode call that picked, it is
+    /// the place in that call's pick, for the prefill's later words too:
+    /// the guard keeps one index for both sides, and the worker a side
+    /// books stands.
     pub index: u8,
     /// The target its host took: the pick's first, or the one a take moved
     /// to. A pair's decode is in it.

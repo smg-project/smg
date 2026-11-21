@@ -198,6 +198,22 @@ pub(crate) struct InProcess {
     pub(crate) stages: Arc<StageRegistry>,
 }
 
+impl InProcess {
+    /// Whether the routers ask the policy engine for the whole decision of
+    /// each request, behind the arms they ask a followed controller's
+    /// engine through, and no classic policy places one.
+    ///
+    /// They do where the engine decides every request of the document in
+    /// force whole today: single requests alone, under no sessions rule,
+    /// each place picked by its picker alone. Under any other document the
+    /// routers keep their classic placement pass, whose policies ask the
+    /// engine for the pick. The set grows with what the engine decides
+    /// whole, and this question goes when it decides every document.
+    pub(crate) fn decides_whole(&self) -> bool {
+        self.engine.spec().engine().single_and_alone()
+    }
+}
+
 /// What a start leaves the process: the controller's store, and the
 /// operators' door over it, which holds the start's document as written.
 pub(crate) struct Started {

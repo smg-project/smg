@@ -25,30 +25,52 @@
 //!   list nothing is kept of (a part of a pool, as the pass narrowed it)
 //!   is passed over once ([`PolicyEngine::pick_among`]).
 //!
+//! **A whole decision.** A gateway whose routers ask the engine for the
+//! whole decision asks through [`DecisionEngine`], as it asks a controller's
+//! engine: the binding, its rules and the profile, over the list its
+//! request's maker hands ([`RequestMaker::workers`]), with a lease the
+//! request's guard holds to its end. The engine files no lease and keeps no
+//! note of a request: the guard lends back what a later word needs
+//! ([`HeldDecision`]). A single request is decided in [`single`].
+//!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation.
 
 pub mod overlap;
 pub(super) mod pair;
+mod single;
 
 use std::{
     cell::RefCell,
     hash::Hasher,
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
     },
+    time::Instant,
 };
 
 use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
 use super::{
-    framework::{AloneProfile, NotAlone, Picker, Place, PoolWord},
+    decision::ShadowKind,
+    decision_engine::{DecisionEngine, HeldDecision, RequestMaker, WorkerLists},
+    framework::{
+        release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
+    },
+    prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    view::Phase,
+    store_backed_engine::{DecideOutcome, DecisionRefused, Request, SweepOutcome},
+    view::{Phase, WireModes},
 };
-use crate::{document::spec::AppliedSpec, names::intern};
+use crate::{
+    document::spec::AppliedSpec,
+    names::intern,
+    store::{pairing::Refusal, DecodeRefused, GatewayId, Said},
+    tracking::lease::Side,
+};
 
 /// The engine of one policy document, for a gateway that decides in its own
 /// process.
@@ -61,6 +83,16 @@ pub struct PolicyEngine {
     /// The pools made so far: each draws the place its turns start at from
     /// its number.
     epochs: AtomicU64,
+    /// The one clock of the engine's decisions: a decision's instant and a
+    /// load report's sample instant are counted from its origin.
+    clock: DecisionClock,
+    /// How many whole decisions panicked ([`DecisionEngine::faults`]).
+    faults: AtomicU64,
+    /// How many words of a lease panicked in a stage that heard them.
+    unheard: AtomicU64,
+    /// The id of the last lease issued. Every pick writes it: one atomic
+    /// step, on cache lines of its own.
+    leases: OwnWord,
 }
 
 /// One pool of one model as the engine keeps it: the gateway's shared list
@@ -76,10 +108,17 @@ pub struct PoolMembers {
     /// The pool's own word, for the picker that places over the pool by
     /// itself ([`PolicyEngine::pick`]): a rotation counts its turns here.
     rotation: OwnWord,
-    /// What a decision of a profile that scores reads of the list beside
-    /// its workers' live state ([`Self::records`]): made at the first such
-    /// decision, and by no pick of a profile the engine picks alone.
+    /// What a whole decision reads of the list beside its workers' live
+    /// state ([`Self::records`]): made at the list's first whole decision,
+    /// and by no pick a placement pass asks ([`PolicyEngine::pick`]).
     records: OnceLock<PoolRecords>,
+    /// The wires the list's workers are dialed on ([`Self::wires`]): read
+    /// of their registrations at the first whole decision over the list.
+    wires: OnceLock<WireModes>,
+    /// The model of the list's first single request and the profile the
+    /// engine picks alone for it, where the document holds one
+    /// ([`Self::alone`]).
+    alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
 }
 
 /// A word every pick over a pool writes, on cache lines of its own: what
@@ -106,6 +145,45 @@ impl PoolMembers {
         self.records
             .get_or_init(|| PoolRecords::new(&self.workers, spec, clock))
     }
+
+    /// Every wire a worker of the list is dialed on, as the workers'
+    /// registrations state it: read once a list, at the first call. A
+    /// request that dials each of them may be sent to any worker of the
+    /// list. A host hands a whole decision such a list
+    /// ([`RequestMaker::workers`]): the pool of its request's route, or a
+    /// list of its own for a request held to one wire.
+    #[must_use]
+    pub fn wires(&self) -> WireModes {
+        *self.wires.get_or_init(|| {
+            self.workers.iter().fold(WireModes::NONE, |wires, worker| {
+                wires.union(WireModes::from(*worker.connection_mode()))
+            })
+        })
+    }
+
+    /// The profile the engine picks alone for a single request of `model`
+    /// over this list ([`Place::Alone`]), under a binding that states no
+    /// sessions rule: `None` where the place's decision asks more than one
+    /// pick. Found once a list, for the model of its first request: a
+    /// gateway's list is one model's. Another model's request is answered
+    /// by the document at its call.
+    fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+        let find = || {
+            let engine = spec.engine();
+            let Place::Alone(profile) = engine.place_for(model, Phase::Single) else {
+                return None;
+            };
+            // A sessions rule pins a keyed request ahead of the profile.
+            let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
+            (!ruled).then_some(profile)
+        };
+        let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
+        if **named == *model {
+            *alone
+        } else {
+            find()
+        }
+    }
 }
 
 impl PolicyEngine {
@@ -115,7 +193,27 @@ impl PolicyEngine {
         Self {
             spec,
             epochs: AtomicU64::new(0),
+            clock: DecisionClock::new(),
+            faults: AtomicU64::new(0),
+            unheard: AtomicU64::new(0),
+            leases: OwnWord(AtomicU64::new(0)),
         }
+    }
+
+    /// The clock of the engine's decisions. A caller that makes a list's
+    /// records ([`PoolMembers::records`]) makes them on it.
+    #[must_use]
+    pub fn clock(&self) -> &DecisionClock {
+        &self.clock
+    }
+
+    /// How many words of a lease (its dispatch, its end, its release)
+    /// panicked in a stage that heard them. The word stands as said: the
+    /// request it is of goes on, and the stages after the one that
+    /// panicked did not hear it.
+    #[must_use]
+    pub fn unheard(&self) -> u64 {
+        self.unheard.load(Ordering::Relaxed)
     }
 
     /// The document the engine decides under.
@@ -139,6 +237,8 @@ impl PolicyEngine {
             // membership keeps changing does not lean on its first one.
             rotation: OwnWord(AtomicU64::new(mixed(epoch) >> 32)),
             records: OnceLock::new(),
+            wires: OnceLock::new(),
+            alone: OnceLock::new(),
         }
     }
 
@@ -236,6 +336,131 @@ impl PolicyEngine {
     fn picker_of(&self, profile: AloneProfile) -> Option<&dyn Picker> {
         let profiles = self.spec.engine().profiles();
         Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
+    }
+}
+
+/// The engine of a gateway's own process, asked for whole decisions.
+///
+/// It decides over the lists the request's maker hands and reads a worker
+/// where the gateway keeps it. It files no lease: an id is one step of a
+/// counter, the stages hear the issue inside the decision, on the calling
+/// thread, and each later word is told from what the request's guard lends
+/// back ([`HeldDecision`]). A lease whose dispatch is never named ends at
+/// its guard's drop: no table holds it, and no pass looks for it.
+///
+/// What every pick shares is the id counter alone, one atomic step on cache
+/// lines of its own. No lock of the engine is taken: a stage's own lock is
+/// its stage's.
+///
+/// A panic in a decision costs that request its decision and is counted
+/// ([`DecisionEngine::faults`]). A panic in a stage that hears a word is
+/// held here too and counted ([`PolicyEngine::unheard`]): the request goes
+/// on.
+impl DecisionEngine for PolicyEngine {
+    fn decide_under(
+        &self,
+        _: GatewayId,
+        maker: &impl RequestMaker,
+        now: Instant,
+    ) -> Result<(DecideOutcome, bool), DecisionRefused> {
+        let decide = || {
+            let mut request = maker.make(&self.spec);
+            let later = request.constraints.decode_later;
+            let decided = match (request.facts.phase, maker.workers()) {
+                (Phase::Single, WorkerLists::Single(members)) => {
+                    single::decide(self, &mut request, members, now)
+                }
+                // A request that hands no list of its own is decided over
+                // no worker.
+                (Phase::Single, _) => single::over_none(self, &request),
+                // A pair is decided at its prefill, by the pair's own entry.
+                (Phase::Prefill, _) => single::declined(self, &request, single::PLAN),
+                (Phase::Decode | Phase::Encode, _) => return Err(DecisionRefused::PairSide),
+            };
+            Ok((single::issued(self, decided, &request, now), later))
+        };
+        match catch_unwind(AssertUnwindSafe(decide)) {
+            Ok(decided) => decided,
+            Err(payload) => {
+                release(payload);
+                self.faults.fetch_add(1, Ordering::Relaxed);
+                Err(DecisionRefused::Faulted)
+            }
+        }
+    }
+
+    // The guard asks only for a pair's decode that stands chosen, and this
+    // engine issues no pair yet.
+    fn decide_decode_under(
+        &self,
+        _: GatewayId,
+        _: &impl RequestMaker,
+        _: &HeldDecision<'_>,
+        _: Instant,
+    ) -> Result<DecideOutcome, DecisionRefused> {
+        Err(DecisionRefused::Decode(DecodeRefused::NotChosen))
+    }
+
+    // A side sent on its own: the encode family's pair has no entry here.
+    fn decide_encode_pair(
+        &self,
+        _: GatewayId,
+        _: &Request<'_>,
+        _: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        _: Instant,
+    ) -> Result<DecideOutcome, DecisionRefused> {
+        placed.clear();
+        Err(DecisionRefused::PairSide)
+    }
+
+    fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
+        let engine = self.spec.engine();
+        let tell = || match held.lease.side {
+            Side::Single => single::said(engine, held, said),
+            // No pair's lease is issued here yet.
+            Side::Prefill | Side::Decode | Side::Encode => {}
+        };
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(tell)) {
+            release(payload);
+            self.unheard.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Nothing is filed, so no pass ends anything: a lease ends at its
+    // guard's word or drop.
+    fn sweep(&self, _: Instant) -> SweepOutcome {
+        SweepOutcome::default()
+    }
+
+    fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {
+        read(&self.spec)
+    }
+
+    // The document's block size: no worker's reported size is read here.
+    fn prompt_hashes(
+        &self,
+        _: &str,
+        tokens: Option<&[u32]>,
+        text: Option<&str>,
+        seeds: HashSeeds,
+    ) -> PromptHashes {
+        PromptHashes::under_document(&self.spec, None, tokens, text, seeds)
+    }
+
+    // The host's own pair index says why a fleet pairs nothing: the engine
+    // keeps none.
+    fn pair_refusal(&self, _: &str, _: WireModes) -> Option<Refusal> {
+        None
+    }
+
+    fn faults(&self) -> u64 {
+        self.faults.load(Ordering::Relaxed)
+    }
+
+    // No shadow is asked here: a document that states one does not start.
+    fn shadowed(&self, _: u32, _: ShadowKind) -> u64 {
+        0
     }
 }
 

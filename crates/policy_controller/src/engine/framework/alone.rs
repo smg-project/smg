@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use super::{profile_index, Engine, Marks, Profile};
+use super::{profile_index, Engine, Marks, Plan, Profile};
 use crate::{engine::view::Phase, stages::filters::RowTests};
 
 /// A profile whose whole decision is one pick of its picker
@@ -147,6 +147,18 @@ impl Engine {
                 })
             })
         })
+    }
+
+    /// Whether every request of the document is a single request that one
+    /// pick of a picker decides: each binding plans single requests alone
+    /// and states no sessions rule, and no place of it asks more than that
+    /// pick ([`Self::not_alone`]).
+    #[must_use]
+    pub fn single_and_alone(&self) -> bool {
+        let single = |entry: &super::Entry| {
+            entry.binding.plan == Plan::Single && entry.binding.sessions.is_none()
+        };
+        self.bindings.iter().all(single) && self.not_alone().is_none()
     }
 
     /// The first stage of `profile`, which stands at `index`, that asks
