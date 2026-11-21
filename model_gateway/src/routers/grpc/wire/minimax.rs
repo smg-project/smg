@@ -4,9 +4,11 @@
 //! re-sliced on its way out by [`RECHUNK`] (`routers::common::sse_rechunk`):
 //! on the gRPC lane, where the gateway encodes the frames itself, and on the
 //! regular HTTP relay, where the worker's body passes through. And a MiniMax
-//! M3 answer whose tool call the reader could not read is not delivered: the
-//! request ends as [`InvalidToolCallFormat`]. Everything else is the OpenAI
-//! wire.
+//! M3 answer whose tool call the reader could not read fails its request
+//! ([`InvalidToolCallFormat`]): a whole answer is refused, and a stream,
+//! which has sent the answer as it was read, the call as far as the model
+//! wrote it, ends with the contract's error event in place of a finish.
+//! Everything else is the OpenAI wire.
 
 use std::time::Duration;
 
@@ -64,10 +66,12 @@ pub(crate) const INVALID_TOOL_CALL_FORMAT: &str = metrics_labels::ERROR_INVALID_
 /// "code":"invalid_tool_call_format","finish_reason":"length"|"error"}}`.
 ///
 /// A stream has sent the answer as it was read by then: the text, the
-/// reasoning, and the call's name and argument fragments as far as the call
-/// went, exactly as a request outside the contract is sent them. The reader
-/// only notes the verdict (`Reader::noting_unreadable_calls`); the contract
-/// changes how the stream ends, not what streams.
+/// reasoning, and the call's name and argument fragments as far as the model
+/// wrote them, exactly as a request outside the contract is sent them. The
+/// reader only notes the verdict (`Reader::noting_unreadable_calls`); the
+/// contract changes how the stream ends, not what streams. The end leaves
+/// one thing out: the close the table writes, for the model, on a call the
+/// model's own stop found open, so the arguments stop where the model did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InvalidToolCallFormat {
     /// The reader's verdict.

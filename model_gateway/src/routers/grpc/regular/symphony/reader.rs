@@ -11,8 +11,8 @@ use openai_protocol::{
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use symphony::{
-    grammar::GrammarStart, Declared, DropReason, Engine, EngineFinish, Event, Events, ForcedCall,
-    Format, Input, Parser as _, Text, TokenSpan,
+    grammar::GrammarStart, CallEnd, Declared, DropReason, Engine, EngineFinish, Event, Events,
+    ForcedCall, Format, Input, MalformedReason, Parser as _, Text, TokenSpan,
 };
 use tracing::{debug, Span};
 
@@ -760,7 +760,12 @@ impl Reader {
     /// for the driver ([`Self::unreadable_call`]), and delivers what it delivers without the
     /// rule. Text, reasoning and a call's name and argument fragments go out as the table reads
     /// them, so a call that ends unreadable has gone out as far as it was read; the verdict
-    /// changes how the driver ends the answer, not what the reader hands on.
+    /// changes how the driver ends the answer, not what the reader hands on. One thing is left
+    /// out, in the step that ends an output with a verdict: the fragments the table writes to
+    /// close, for the model, a call the model's own stop found open
+    /// ([`withhold_the_stops_closings`]), so the arguments the client holds stop where the
+    /// model stopped. Nothing the model wrote is held or dropped, and an output with no
+    /// verdict is delivered as it is.
     ///
     /// The first event that says a call was not read ([`unread`]: a call the model's stop found
     /// open or a cut ended, a reason that loses a call, bytes dropped as a malformed call's) is
@@ -981,6 +986,11 @@ impl Reader {
                 UnreadableCall::Malformed
             });
         }
+        // The end of an output that fails its request: the client gets the call as far as
+        // the model wrote it, without what the table wrote to close it for the model.
+        if ends && self.unreadable.is_some() {
+            withhold_the_stops_closings(fresh);
+        }
         // A step that adds no event ends here: nothing below acts on it.
         if fresh.is_empty() {
             return Ok(());
@@ -1185,6 +1195,48 @@ fn unread(event: &Event<'_>) -> bool {
     }
 }
 
+/// On an output that fails its request, in the step that ends it: the fragments the table wrote
+/// to close a call the model's own stop found open are not delivered, so the client holds the
+/// call as far as the model wrote it. They are the call's arguments fragments behind the stop's
+/// word (`Malformed { OpenAtTheStop }`, which stands before the fragment that closes what was
+/// open), up to the end of a call that says the stop found it open (`CallEnd::Stop`): a
+/// string's closing quote, a container's bracket, the arguments' brace. Each becomes a drop of
+/// the bytes it carried, which are the template's spacing after the call's last tag, or none;
+/// what the model wrote of a value the stop found open went out in the fragments before the
+/// word. A call a cut ended has no such fragment, and a call the model ended keeps all of its.
+fn withhold_the_stops_closings(fresh: &mut [Event<'_>]) {
+    let Some(end) = fresh.iter().position(|event| {
+        matches!(
+            event,
+            Event::ToolCallEnd {
+                ended: CallEnd::Stop,
+                ..
+            }
+        )
+    }) else {
+        return;
+    };
+    let Some(word) = fresh[..end].iter().position(|event| {
+        matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::OpenAtTheStop,
+                ..
+            }
+        )
+    }) else {
+        return;
+    };
+    for event in &mut fresh[word..end] {
+        if let Event::ToolCallArguments { source, .. } = event {
+            *event = Event::Dropped {
+                text: std::mem::take(source),
+                why: DropReason::Wrapper,
+            };
+        }
+    }
+}
+
 /// The calls of one output that the request's `tool_choice` forbids ([`Forbids`]), dropped as the
 /// reader meets them: every call under `none`; under a named function, an allowed list or
 /// `required`, each call to a function outside the tools the choice leaves callable; none under
@@ -1225,7 +1277,7 @@ impl ForbiddenCalls {
                         // The mark of a call to a function the request did not declare, which no
                         // choice leaves callable.
                         Event::Malformed {
-                            why: symphony::MalformedReason::UnknownTool,
+                            why: MalformedReason::UnknownTool,
                             ..
                         } => {
                             undeclared = true;
@@ -1444,6 +1496,17 @@ mod tests {
         pieces: &[&str],
         finish: EngineFinish,
     ) -> (Vec<Vec<Event<'static>>>, Option<UnreadableCall>) {
+        read_noting_with(tools(), format, forbids, pieces, finish)
+    }
+
+    /// [`read_noting`] under a request that declares `declared`.
+    fn read_noting_with(
+        declared: Vec<Tool>,
+        format: Format,
+        forbids: Forbids,
+        pieces: &[&str],
+        finish: EngineFinish,
+    ) -> (Vec<Vec<Event<'static>>>, Option<UnreadableCall>) {
         let assignment = Assignment {
             format: Arc::new(format),
             prompt: String::new(),
@@ -1458,7 +1521,7 @@ mod tests {
         };
         let mut steps = Vec::new();
         let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events)
+        let mut reader = Reader::new(&assignment, declared.into(), &mut events)
             .expect("a reader")
             .noting_unreadable_calls(true);
         steps.push(events.into_owned().drain());
@@ -1536,8 +1599,9 @@ mod tests {
     /// The first call the reader could not read is the output's verdict, and what the reader
     /// delivers is what it delivers without the rule: the call has gone out as far as it was
     /// read. A call the output ended inside is incomplete, by the token limit or by the model's
-    /// own stop (which closes the call for the model, as before); a block the model closed with
-    /// text where a tag goes is malformed, and the text after it is delivered as before.
+    /// own stop, where the fragments the table writes to close the call for the model are left
+    /// out; a block the model closed with text where a tag goes is malformed, and the text
+    /// after it is delivered as before.
     #[test]
     fn the_first_unread_call_is_the_verdict_and_the_delivery_is_what_it_was() {
         use symphony::formats::minimax_m3;
@@ -1556,10 +1620,84 @@ mod tests {
             assert_eq!(call_events(&steps[2]), ["start 0 lookup"], "{finish:?}");
             let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
             let unnoted = read_pieces(minimax_m3(), "", &M3_PIECES[..2], finish.clone());
-            assert_eq!(call_events(&delivered), call_events(&unnoted), "{finish:?}");
             assert_eq!(content_of(&delivered), content_of(&unnoted), "{finish:?}");
             assert!(matches!(delivered.last(), Some(Event::Finish { .. })));
+            assert_eq!(call_events(&delivered), call_events(&unnoted), "{finish:?}");
         }
+        // The model's own stop inside a call whose members it had closed: the table closes
+        // the arguments for the model, and the reader that notes the failure leaves that
+        // fragment out. Every other event stands, so the arguments stop where the model did.
+        let stopped = [
+            "Checking.",
+            "<tool_call>\n<invoke name=\"lookup\">\n<city>Paris</city>\n",
+        ];
+        let unnoted = read_pieces(minimax_m3(), "", &stopped, EngineFinish::Stop);
+        assert_eq!(
+            call_events(&unnoted),
+            [
+                "start 0 lookup",
+                "arguments 0 {\"city\": \"Paris\"",
+                "arguments 0 }",
+                "end 0 Stop",
+            ]
+        );
+        let (steps, verdict) =
+            read_noting(minimax_m3(), Forbids::Nothing, &stopped, EngineFinish::Stop);
+        assert_eq!(verdict, Some(UnreadableCall::Incomplete));
+        let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
+        assert_eq!(
+            call_events(&delivered),
+            [
+                "start 0 lookup",
+                "arguments 0 {\"city\": \"Paris\"",
+                "end 0 Stop",
+            ]
+        );
+        assert_eq!(delivered.len(), unnoted.len());
+        assert_eq!(content_of(&delivered), content_of(&unnoted));
+        // The same output the limit cut has no such fragment: nothing is left out.
+        let (steps, _) = read_noting(
+            minimax_m3(),
+            Forbids::Nothing,
+            &stopped,
+            EngineFinish::Length,
+        );
+        let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
+        assert_eq!(
+            call_events(&delivered),
+            call_events(&read_pieces(
+                minimax_m3(),
+                "",
+                &stopped,
+                EngineFinish::Length
+            ))
+        );
+        // What the model wrote of a value its stop found open went out before the stop: a
+        // string that streams has its text on the wire, the start of a tag it ended on
+        // included, and only its closing quote and the arguments' brace are left out.
+        let declared: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function", "function": {"name": "lookup", "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}}}}
+        }]))
+        .expect("tools");
+        let streaming = ["<tool_call>\n<invoke name=\"lookup\">\n<city>Par", "is</ci"];
+        let (steps, verdict) = read_noting_with(
+            declared,
+            minimax_m3(),
+            Forbids::Nothing,
+            &streaming,
+            EngineFinish::Stop,
+        );
+        assert_eq!(verdict, Some(UnreadableCall::Incomplete));
+        let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
+        let written: String = delivered
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(written, "{\"city\": \"Paris</ci");
         let malformed = [
             "Checking.",
             "<tool_call>\n<invoke name=\"lookup\">\nParis\n</invoke>\n</tool_call>",
@@ -4167,12 +4305,12 @@ mod tests {
         assert!(all.iter().any(|event| matches!(
             event,
             Event::Malformed {
-                why: symphony::MalformedReason::OpenAtTheMarker,
+                why: MalformedReason::OpenAtTheMarker,
                 ..
             }
         )));
         assert_eq!(
-            telemetry::reason_label(symphony::MalformedReason::OpenAtTheMarker),
+            telemetry::reason_label(MalformedReason::OpenAtTheMarker),
             "open_at_the_marker"
         );
     }
@@ -4878,7 +5016,7 @@ mod tests {
                 matches!(
                     event,
                     Event::Malformed {
-                        why: symphony::MalformedReason::UnknownTool,
+                        why: MalformedReason::UnknownTool,
                         ..
                     }
                 )

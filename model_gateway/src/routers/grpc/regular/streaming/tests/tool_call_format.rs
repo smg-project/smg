@@ -3,11 +3,12 @@
 //! answer, with the MiniMax M3 table reading the output. A request that
 //! expects tool calls fails on a call the token limit cut, on one the model
 //! stopped inside, and on a block with malformed structure. A stream has sent
-//! the answer as it was read by then, the call as far as it went, exactly as
-//! a request the contract does not cover is sent it: the contract changes how
-//! the stream ends, not what streams. And the contract's limits: a request
-//! without tools, another wire, and another table on the same wire end as
-//! they did.
+//! the answer as it was read by then, the call as far as the model wrote it,
+//! exactly as a request the contract does not cover is sent it: the contract
+//! changes how the stream ends, not what streams (at the model's own stop
+//! the close the table would write for the model is left out). And the
+//! contract's limits: a request without tools, another wire, and another
+//! table on the same wire end as they did.
 
 use std::{sync::Arc, time::Duration};
 
@@ -320,9 +321,10 @@ async fn a_call_the_limit_cut_ends_the_stream_with_the_usage_frame_and_no_finish
 
 /// The model's own stop inside a call is the `error` finish with the
 /// incomplete-call sentence: the token limit is blamed only for a cut. The
-/// call went out as the table read it, which closes the arguments of a call
-/// the model stopped inside, as it does where the contract does not apply;
-/// the contract's failure stands where the `tool_calls` finish would.
+/// call went out as far as the model wrote it, its arguments without their
+/// close: where the contract does not apply the table closes them for the
+/// model at its stop, and that one fragment is what the failing stream leaves
+/// out. Everything else is sent chunk for chunk the same.
 #[tokio::test]
 async fn the_models_own_stop_inside_a_call_is_an_error_finish() {
     for frames in [
@@ -341,15 +343,64 @@ async fn the_models_own_stop_inside_a_call_is_an_error_finish() {
             "Treat this response as failed. The model generated an incomplete tool call. Retry the request."
         );
         assert!(finish_reasons(&events).is_empty(), "{events:?}");
-        assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+        assert_the_call_went_out_cut(&events);
         assert_eq!(
-            serde_json::from_str::<Value>(&tool_arguments(&events)).expect("closed for the model"),
-            json!({"city": "Paris"})
+            tool_arguments(&events),
+            "{\"city\": \"Paris\"",
+            "{events:?}"
         );
+
         let as_before = without_the_contract(frames, None).await;
         assert_eq!(finish_reasons(&as_before), vec!["tool_calls"]);
-        assert_eq!(deliveries(&events), deliveries(&as_before));
+        assert_eq!(
+            tool_arguments(&as_before),
+            "{\"city\": \"Paris\"}",
+            "closed for the model: {as_before:?}"
+        );
+        let (closing, before_it) = deliveries(&as_before)
+            .split_last()
+            .map(|(last, rest)| (last.clone(), rest.to_vec()))
+            .expect("the answer's chunks");
+        assert_eq!(
+            closing[0]["delta"]["tool_calls"][0]["function"]["arguments"], "}",
+            "{as_before:?}"
+        );
+        assert_eq!(deliveries(&events), before_it);
     }
+}
+
+/// A value the model's stop found open went out as far as the model wrote
+/// it: a string that streams has its text in the arguments, and neither its
+/// closing quote nor the arguments' brace follows, on the stream and in the
+/// body the client reads.
+#[tokio::test]
+async fn a_value_the_models_stop_found_open_goes_out_without_a_close() {
+    const OPEN: &str =
+        "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"lookup\">\n]<]minimax[>[<city>Paris, Fr";
+    let frames = vec![chunk(0, BEFORE), chunk(0, OPEN), complete(0, "stop")];
+    let (result, events) = streamed(frames.clone(), spec(true, false)).await;
+    assert_eq!(
+        the_contracts_failure(result),
+        InvalidToolCallFormat::new(UnreadableCall::Incomplete, false)
+    );
+    assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
+    assert_eq!(
+        tool_arguments(&events),
+        "{\"city\": \"Paris, Fr",
+        "{events:?}"
+    );
+    let as_before = without_the_contract(frames.clone(), None).await;
+    assert_eq!(tool_arguments(&as_before), "{\"city\": \"Paris, Fr\"}");
+
+    let body = response_body(frames, spec(true, true)).await;
+    let (frames, events) = frames_and_events(&body);
+    assert_eq!(tool_arguments(&events), "{\"city\": \"Paris, Fr", "{body}");
+    let contract = InvalidToolCallFormat::new(UnreadableCall::Incomplete, false).sse_frame();
+    assert_eq!(
+        frames.last().copied(),
+        std::str::from_utf8(&contract).ok().map(str::trim_end),
+        "{body}"
+    );
 }
 
 /// A block with malformed structure is an `error` finish whatever the
@@ -629,7 +680,7 @@ async fn a_forced_scalar_whole_where_the_output_ends_is_delivered_and_an_unfinis
             );
             assert!(finish_reasons(&events).is_empty(), "{events:?}");
             assert_eq!(tool_names(&events), vec!["lookup"], "{events:?}");
-            assert_eq!(tool_arguments(&events), unfinished, "{events:?}");
+            assert_eq!(tool_arguments(&events), *unfinished, "{events:?}");
             let served = forced_spec_of(SERVED);
             assert!(!served.fails_on_unreadable_call());
             let (result, as_before) = streamed(frames, served).await;

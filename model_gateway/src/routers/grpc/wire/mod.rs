@@ -77,10 +77,11 @@ impl Wire {
     }
 
     /// Whether the vendor's contract fails a request whose answer, read by
-    /// `table`, holds a tool call the reader could not read, instead of
-    /// delivering the call partial or repaired or showing it as content:
-    /// MiniMax's, for the answers its M3 table reads
-    /// ([`minimax::InvalidToolCallFormat`]). The spec asks once per choice's
+    /// `table`, holds a tool call the reader could not read, in place of
+    /// ending it as an answer: a whole answer is the contract's refusal, and
+    /// a stream, which has sent the call as far as the model wrote it, ends
+    /// with the contract's event and no finish. MiniMax's, for the answers
+    /// its M3 table reads ([`minimax::InvalidToolCallFormat`]). The spec asks once per choice's
     /// reader, for a request that expects tool calls
     /// (`ChatResponseSpec::fails_on_unreadable_call`).
     pub(crate) fn fails_on_unreadable_tool_call(self, table: &str) -> bool {
