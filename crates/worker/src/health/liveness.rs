@@ -754,7 +754,10 @@ pub fn on_contact(worker: &Arc<dyn Worker>) {
     if let Some(state) = state {
         state.note_contact();
     }
-    if worker.stall_reason() != Some(StallReason::Unreachable) {
+    // Read off the state in hand: the worker's own read loads it again.
+    if state.map_or_else(|| worker.stall_reason(), WorkerRuntime::stall_reason)
+        != Some(StallReason::Unreachable)
+    {
         return;
     }
     set(worker, state, None, "contact");
@@ -985,7 +988,9 @@ fn on_load_report_with(
     // The grace of a cold shape arms no veto and lifts none: a worker vetoed
     // before the longer prompt reached it is judged as before until it
     // produces, so the grace never reads as the engine producing again.
-    let standing = worker.stall_reason().is_some();
+    let standing = state
+        .map_or_else(|| worker.stall_reason(), WorkerRuntime::stall_reason)
+        .is_some();
     let grace = if standing {
         Duration::ZERO
     } else {
@@ -1013,7 +1018,7 @@ fn on_load_report_with(
     if let Some(state) = state {
         state.note_engine_stall(engine_stalled);
     }
-    match worker.stall_reason() {
+    match state.map_or_else(|| worker.stall_reason(), WorkerRuntime::stall_reason) {
         Some(StallReason::Wedged) => {
             // A clock that restarted with this gateway's first dispatch is
             // not progress while the engine still reports silence: a token
