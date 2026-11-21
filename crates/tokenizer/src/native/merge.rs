@@ -478,6 +478,12 @@ impl MergeTable {
             )));
         }
         // Every split of every token into two tokens, at the token's rank.
+        // `root[rank]` is where the token's splits start; the proof below
+        // turns it into the split the token's merge ends with.
+        const UNSET: u32 = u32::MAX - 2;
+        const BYTE: u32 = u32::MAX - 1;
+        const UNPROVEN: u32 = u32::MAX;
+        let mut root = vec![UNSET; ranks_end];
         let mut splits = Vec::with_capacity(ranks.len() * 2);
         for (token, &rank) in ranks {
             if token.len() < 2 {
@@ -502,6 +508,12 @@ impl MergeTable {
                     "token {rank} is no two tokens' concatenation"
                 )));
             }
+            // A rank two tokens share proves neither.
+            let slot = &mut root[rank as usize];
+            *slot = match (*slot, u32::try_from(before)) {
+                (UNSET, Ok(at)) if at < UNSET => at,
+                _ => UNPROVEN,
+            };
         }
         let mut table = Self::with_capacity(splits.len(), false, true);
         table.byte_ids = byte_ids;
@@ -509,9 +521,63 @@ impl MergeTable {
         for &(left, right, rank) in &splits {
             table.insert(left, right, Merge::new(rank, rank));
         }
+        // A token is the merge of its bytes when two halves that are join
+        // last: their own steps run in rising rank unless a pair across the
+        // cut merges first, and such a pair is a node of the left half's
+        // right spine beside one of the right half's left spine. A token no
+        // split proves keeps the full merge below.
+        for &id in &byte_ids {
+            let slot = &mut root[id as usize];
+            *slot = if *slot == UNSET { BYTE } else { UNPROVEN };
+        }
+        for rank in 0..ranks_end as u32 {
+            let start = root[rank as usize];
+            if start >= UNSET {
+                continue;
+            }
+            root[rank as usize] = UNPROVEN;
+            'split: for (at, &(a, b, of)) in splits.iter().enumerate().skip(start as usize) {
+                if of != rank {
+                    break;
+                }
+                let usable = |half: u32| {
+                    let state = root[half as usize];
+                    state == BYTE || (half < rank && state < UNSET)
+                };
+                if !usable(a) || !usable(b) {
+                    continue;
+                }
+                let (mut x, mut y) = (a, b);
+                loop {
+                    let (of_x, of_y) = (root[x as usize], root[y as usize]);
+                    if of_x == BYTE && of_y == BYTE {
+                        break;
+                    }
+                    // Undo the side formed last: the higher rank, the right
+                    // one on a tie. The pair that stood until that step
+                    // merges first if it ranks lower, or equal where the
+                    // step is the right side's (the leftmost of a tie wins).
+                    if of_y == BYTE || (of_x != BYTE && x > y) {
+                        let half = splits[of_x as usize].1;
+                        if table.merge_of(half, y).rank() < x {
+                            continue 'split;
+                        }
+                        x = half;
+                    } else {
+                        let half = splits[of_y as usize].0;
+                        if table.merge_of(x, half).rank() <= y {
+                            continue 'split;
+                        }
+                        y = half;
+                    }
+                }
+                root[rank as usize] = at as u32;
+                break;
+            }
+        }
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
-            if token.len() < 2 {
+            if token.len() < 2 || root[rank as usize] < UNSET {
                 continue;
             }
             ids.clear();
@@ -522,6 +588,8 @@ impl MergeTable {
                 )));
             }
         }
+        // The analysis below holds the load's heap peak: the index goes first.
+        drop(root);
         // The least rank of a merge that takes each id as an operand: every
         // split the table holds is such a merge, at the token's rank.
         let mut min_operand = vec![NO_RANK; ranks_end];
