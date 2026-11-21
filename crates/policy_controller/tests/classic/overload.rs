@@ -20,13 +20,13 @@ use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_policy_controller::{
-    load_report,
-    spec::{BindingSpec, OverloadSpec},
+    document::spec::{BindingSpec, OverloadSpec},
+    engine::view::permille,
+    load::load_report,
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
-    view::permille,
     AppliedSpec, LoadRow, PolicySpec, Role, SignalSource, WorkerId,
 };
 

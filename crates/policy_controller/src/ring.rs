@@ -53,12 +53,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     affinity::Gates,
-    counts::with_counts,
-    decision::MAX_TARGETS,
-    framework::{Scorer, TieBand, DRAW_BOUND},
-    lease::{Lifecycle, Membership},
-    spec::{BoundedLoadParams, Needs},
-    view::{fold_block, Candidate, PoolFacts, RequestFacts, WorkerId},
+    document::spec::{BoundedLoadParams, Needs},
+    engine::{
+        decision::MAX_TARGETS,
+        framework::{Scorer, TieBand, DRAW_BOUND},
+        view::{fold_block, Candidate, PoolFacts, RequestFacts, WorkerId},
+    },
+    tracking::{
+        counts::with_counts,
+        lease::{Lifecycle, Membership},
+    },
     Draw,
 };
 
@@ -97,7 +101,7 @@ pub enum Probe<T> {
 /// The ids a lifecycle pruned within [`FENCE`], fenced against relearning
 /// from a view older than the pruning. A stage that learns its members from
 /// a decision's view holds one. It keeps pruned workers out of a listing
-/// and is no kin of [`crate::elector::Fence`], which holds the term a
+/// and is no kin of [`crate::service::elector::Fence`], which holds the term a
 /// process leads under.
 #[derive(Debug, Default)]
 pub(crate) struct Fence {
@@ -1103,7 +1107,10 @@ impl Scorer for ConsistentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view::{Health, Identity};
+    use crate::engine::{
+        view,
+        view::{Health, Identity},
+    };
 
     fn ids(n: u64) -> Vec<WorkerId> {
         (0..n).map(|i| WorkerId(1_000 + i)).collect()
@@ -1808,7 +1815,7 @@ mod tests {
         // token: 64 tokens are 256 bytes, sixteen windows of sixteen.
         let windows: Vec<u64> = (1..=20).collect();
         let text = RequestFacts {
-            hash_kind: crate::view::HashKind::Text,
+            hash_kind: view::HashKind::Text,
             ..hashed(&windows)
         };
         assert_eq!(prefix_key(64, gates, &text), through(&windows[..16]));
@@ -1913,7 +1920,7 @@ mod tests {
     /// owner passed over leaves the decision scored as a keyless one, and
     /// an owner that keeps its key leaves it scored as with no rule.
     fn keeps(rule: &ConsistentHash, loads: &[u32]) -> bool {
-        use crate::counts::tests::Lent;
+        use crate::tracking::counts::tests::Lent;
         let plain = ConsistentHash::new(None);
         let mut pool: Vec<Candidate> = (0..loads.len() as u32).map(|i| candidate(i, 0)).collect();
         let ranks = scored(&plain, &keyed(5), &pool);
@@ -2050,8 +2057,8 @@ mod tests {
     #[test]
     fn a_request_hashed_as_deep_as_its_generation_reads_keeps_its_key() {
         use crate::{
-            spec::{AppliedSpec, PolicySpec},
-            view::HashKind,
+            document::spec::{AppliedSpec, PolicySpec},
+            engine::view::HashKind,
         };
         let mut document = PolicySpec::preset("prefix_hash").expect("a preset of this build");
         document.generation = 1;
@@ -2106,8 +2113,8 @@ mod tests {
     #[test]
     fn a_request_hashed_as_deep_as_its_generation_reads_keeps_its_boundary_keys() {
         use crate::{
-            spec::{AppliedSpec, PolicySpec},
-            view::HashKind,
+            document::spec::{AppliedSpec, PolicySpec},
+            engine::view::HashKind,
         };
         let document: PolicySpec = serde_json::from_str(
             r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[64,256]},"profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":128}}],"pick":"best"}}}"#,
@@ -2183,7 +2190,7 @@ mod tests {
         // characters a token: 64 tokens end with the 16th window, and 256
         // with the 64th, which this request does not carry.
         let text = RequestFacts {
-            hash_kind: crate::view::HashKind::Text,
+            hash_kind: view::HashKind::Text,
             ..hashed(&hashes)
         };
         assert_eq!(keys_of(&scorer, &text), [deep]);

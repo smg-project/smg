@@ -7,7 +7,9 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::{MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES},
+    document::spec::{
+        MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
+    },
     Catalog, PolicySpec,
 };
 

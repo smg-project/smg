@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use crate::{
+    engine::view::{LoadRow, SignalSource, WorkerId},
     store::GatewayId,
-    view::{LoadRow, SignalSource, WorkerId},
 };
 
 /// Where a load row came from, as the ingress knows it. The view's

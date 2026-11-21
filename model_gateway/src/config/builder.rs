@@ -3,7 +3,7 @@ use std::{collections::HashMap, io::Read};
 use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
-use smg_policy_controller::operator::{SpecRejected, MAX_DOCUMENT_BYTES};
+use smg_policy_controller::document::operator::{SpecRejected, MAX_DOCUMENT_BYTES};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::{

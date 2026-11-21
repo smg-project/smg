@@ -37,13 +37,15 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
-    controller::{
-        Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
-    },
-    elector::{ElectionSettings, Elector, FileLease, Tick},
-    proto::{
-        self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
-        replication_event::Event as Sent, worker_event::Event,
+    service::{
+        controller::{
+            Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+        },
+        elector::{ElectionSettings, Elector, FileLease, Tick},
+        proto::{
+            self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
+            replication_event::Event as Sent, worker_event::Event,
+        },
     },
     store::{
         HealthPolicy, Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,

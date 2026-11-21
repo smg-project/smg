@@ -7,14 +7,14 @@ use std::time::Instant;
 
 use super::{facts, generation_pairing, pair_facts, pair_rows, MODEL};
 use crate::{
-    counts::Slot,
-    spec::Pairing,
+    document::spec::Pairing,
+    engine::view::{Role, WireModes, WorkerId},
     store::{
         world::{Classes, Writer, PUBLISH_WINDOW},
         Kinds, LeaderBits, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch,
         WorkerRow, WorkerStatus, WorkersStore,
     },
-    view::{Role, WireModes, WorkerId},
+    tracking::counts::Slot,
 };
 
 /// A store fed the standing rows of `store`, each as a first registration.

@@ -41,13 +41,17 @@ use axum::{
 use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
-    decision::{Decision, Lifted, Pair, ShadowKind, ShedReason, Targets, Trace, MAX_TARGETS},
-    door::{Door, Maker, Refused, Request, Swept},
-    handle::Handle,
-    lease::{Outcome, ReleaseReason, Side, TransportClass},
-    spec::DecodePick,
+    document::spec::DecodePick,
+    engine::{
+        decision::{Decision, Lifted, Pair, ShadowKind, ShedReason, Targets, Trace, MAX_TARGETS},
+        door::{Door, Maker, Refused, Request, Swept},
+        view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
+    },
     store::{GatewayId, MemoryStore, World},
-    view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
+    tracking::{
+        handle::Handle,
+        lease::{Outcome, ReleaseReason, Side, TransportClass},
+    },
     worker_host::Objects,
     AppliedSpec, DerivedKey, KeySource, MediaCounts, WireModes,
 };

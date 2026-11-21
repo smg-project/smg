@@ -5,10 +5,12 @@
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{
-    demands::DemandFacts,
-    lease::Membership,
+    engine::{
+        demands::DemandFacts,
+        view::{fingerprint, Role, WireModes, WorkerId},
+    },
     store::{encoding::EncodeOffer, pairing::PairingDescriptor, GatewayId},
-    view::{fingerprint, Role, WireModes, WorkerId},
+    tracking::lease::Membership,
 };
 
 /// The stable identity of a registration: the key (the URL today) and the
@@ -152,7 +154,7 @@ pub struct WorkerFacts {
     pub encode: EncodeOffer,
     /// The worker takes images, as its registration states: an encoder
     /// encodes them and a decode attends to them. A request that needs
-    /// vision ([`Demands::vision`](crate::demands::Demands::vision)) takes
+    /// vision ([`Demands::vision`](crate::engine::demands::Demands::vision)) takes
     /// no other worker, so a registration that changes the bit starts
     /// another life ([`Self::laid_over`]).
     pub vision: bool,

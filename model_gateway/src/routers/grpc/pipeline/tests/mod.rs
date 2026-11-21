@@ -39,9 +39,9 @@ use smg_grpc_client::{
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
 use smg_policy_controller::{
-    lease::TransportClass,
+    engine::view::WorkerId,
     store::{GatewayId, HealthSink, LeasesStore, MemoryStore, WorkersStore},
-    view::WorkerId,
+    tracking::lease::TransportClass,
 };
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},

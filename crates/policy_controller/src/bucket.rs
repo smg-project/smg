@@ -71,12 +71,14 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    decision::{Decision, Target},
-    framework::{Scorer, TieBand},
-    lease::{Lease, Lifecycle, Membership, Side},
+    document::spec::BucketParams,
+    engine::{
+        decision::{Decision, Target},
+        framework::{Scorer, TieBand},
+        view::{Candidate, Phase, RequestFacts, WorkerId},
+    },
     ring::Fence,
-    spec::BucketParams,
-    view::{Candidate, Phase, RequestFacts, WorkerId},
+    tracking::lease::{Lease, Lifecycle, Membership, Side},
 };
 
 /// The span of sizes a changed listing splits evenly among its workers, in
@@ -996,9 +998,12 @@ impl Scorer for Bucket {
 mod tests {
     use super::*;
     use crate::{
-        decision::{Pair, Pick, Target, Targets},
+        engine::{
+            decision::{Pair, Pick, Target, Targets},
+            view,
+            view::Health,
+        },
         ring::FENCE,
-        view::Health,
         Catalog, Constraints, PolicySpec, PoolFacts, Scratch, SpecError,
     };
 
@@ -2359,7 +2364,7 @@ mod tests {
         let side = crate::store::DecodeSide {
             target: pool[1].id,
             picked,
-            session: crate::view::Session::NONE,
+            session: view::Session::NONE,
             state: crate::store::LeaseState::ISSUED,
             tokens: 300,
             target_index: 0,

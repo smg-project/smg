@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
-pub use crate::spec::{Assignment, Recovery};
-use crate::view::{Session, WorkerId};
+pub use crate::document::spec::{Assignment, Recovery};
+use crate::engine::view::{Session, WorkerId};
 
 /// A binding's sessions rule as the engine runs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

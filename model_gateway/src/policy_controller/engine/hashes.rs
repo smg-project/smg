@@ -5,8 +5,8 @@ use kv_index::{
     XXH3_SEED,
 };
 use smg_policy_controller::{
+    engine::view::{HashKind, TEXT_BYTES_PER_TOKEN},
     store::{KvEventSink, MemoryStore},
-    view::{HashKind, TEXT_BYTES_PER_TOKEN},
     AppliedSpec,
 };
 
@@ -156,8 +156,8 @@ mod tests {
     };
     use openai_protocol::common::CachePartition;
     use smg_policy_controller::{
+        engine::view::{HashKind, Identity, RequestFacts, Role, TEXT_BYTES_PER_TOKEN},
         store::{Ask as ViewAsk, BatchOutcome, KvEventSink, Named, Naming, ViewBuffers},
-        view::{HashKind, Identity, RequestFacts, Role, TEXT_BYTES_PER_TOKEN},
         AppliedSpec, PolicySpec,
     };
 

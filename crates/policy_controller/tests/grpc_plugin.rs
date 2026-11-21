@@ -36,17 +36,23 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+#[cfg(feature = "wasm")]
+use smg_policy_controller::plugins::wasm;
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
-    grpc::{
-        Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
-        GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls, Transport,
+    plugins::{
+        grpc::{
+            Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
+            GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls,
+            Transport,
+        },
+        shared::OpenDecisions,
     },
-    plugins::OpenDecisions,
-    proto, Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
-    Lease, Lifecycle, Membership, Needs, PairPools, Picker, Plan, PoolFacts, Profile,
-    ReleaseReason, RequestFacts, Scorer, Scratch, ShedReason, Side, Signal, Target, Targets,
-    TieBand, Weighted, WorkerId,
+    service::proto,
+    stages::builtins::{Best, Healthy, LeastRequests},
+    Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity, Lease,
+    Lifecycle, Membership, Needs, PairPools, Picker, Plan, PoolFacts, Profile, ReleaseReason,
+    RequestFacts, Scorer, Scratch, ShedReason, Side, Signal, Target, Targets, TieBand, Weighted,
+    WorkerId,
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
@@ -107,11 +113,8 @@ const GUEST_LOADS: u32 = 10;
 /// says. The WebAssembly plugin binary's loads that must succeed do the
 /// same.
 #[cfg(feature = "wasm")]
-fn guest_loaded(
-    runtime: &Arc<smg_policy_controller::wasm::Runtime>,
-    spec: &smg_policy_controller::wasm::PluginSpec,
-) -> Arc<smg_policy_controller::wasm::Plugin> {
-    use smg_policy_controller::wasm;
+fn guest_loaded(runtime: &Arc<wasm::Runtime>, spec: &wasm::PluginSpec) -> Arc<wasm::Plugin> {
+    use smg_policy_controller::plugins::wasm;
 
     let mut loads = 0;
     loop {
@@ -1170,7 +1173,7 @@ fn a_pick_only_frame_is_not_sent_once_the_plugin_failed_its_decision() {
 #[cfg(feature = "wasm")]
 #[test]
 fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
-    use smg_policy_controller::wasm;
+    use smg_policy_controller::plugins::wasm;
     use support::wasm_guest::{mode, record_guest};
 
     let open = OpenDecisions::new();

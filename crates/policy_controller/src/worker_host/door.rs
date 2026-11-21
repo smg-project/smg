@@ -10,13 +10,13 @@ use smg_worker::{
 
 use super::{found::paired, kv_feed::asks_events, Standing};
 use crate::{
+    engine::view::WorkerId,
     store::{
         membership::{self, NotMaker, Past},
         pairing::PairingDescriptor,
         HealthSink, Laid, Maker, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch,
         WorkerRow, WorkerStatus, WorkersStore,
     },
-    view::WorkerId,
 };
 
 /// What a write of the door made of the row.
@@ -935,12 +935,15 @@ pub(super) mod tests {
         Stated, StoreDoor, Turn, Wrote,
     };
     use crate::{
-        demands::{DemandFacts, Demands},
-        door::{
-            tests::{pair_request, request, GATEWAY, MODEL},
-            Door,
+        document::spec::{AppliedSpec, Pairing, PolicySpec},
+        engine::{
+            demands::{DemandFacts, Demands},
+            door::{
+                tests::{pair_request, request, GATEWAY, MODEL},
+                Door,
+            },
+            view::{Role, WireModes, WorkerId},
         },
-        spec::{AppliedSpec, Pairing, PolicySpec},
         store::{
             index::indexed_under,
             membership::{self, Past},
@@ -948,7 +951,6 @@ pub(super) mod tests {
             Maker, MembershipChange, MembershipTail, MemoryStore, Signals, WorkerFacts, WorkerRow,
             WorkerStatus, WorkersStore,
         },
-        view::{Role, WireModes, WorkerId},
         worker_host::facts,
     };
 

@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use super::{ask, block, facts, pressure, MODEL};
 use crate::{
-    spec::{BindingSpec, Match, OverloadSpec},
+    document::spec::{BindingSpec, Match, OverloadSpec},
+    engine::view::{Phase, Role},
     store::{world::ViewBuffers, LoadSink, LoadSource, MemoryStore, WorkersStore},
-    view::{Phase, Role},
     AppliedSpec, PolicySpec,
 };
 

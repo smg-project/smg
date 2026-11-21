@@ -32,10 +32,12 @@ use smg_worker::{
 
 use super::{object::role, Lead, Objects};
 use crate::{
-    load_report::{load_row, signal_values, RankValues, ReportOf},
-    signals::SignalColumn,
+    engine::view::{Role, SignalSource, WorkerId},
+    load::{
+        load_report::{load_row, signal_values, RankValues, ReportOf},
+        signals::SignalColumn,
+    },
     store::{LoadSink as StoreLoadSink, LoadSource, PollMode as StorePollMode, SignalSink},
-    view::{Role, SignalSource, WorkerId},
 };
 
 #[derive(Clone, Copy)]
@@ -546,13 +548,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        spec::{AcrossRanks, AppliedSpec, PolicySpec, SignalSpec},
+        document::spec::{AcrossRanks, AppliedSpec, PolicySpec, SignalSpec},
+        engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
         store::{
             Ask, GatewayId, LoadSample, LoadSource, MemoryStore, Overload,
             PollMode as StorePollMode, Taken, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
             WorkersStore,
         },
-        view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
         worker_host::{object, Members, SoleLead},
     };
 

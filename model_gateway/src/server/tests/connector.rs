@@ -9,8 +9,8 @@ use std::{
 use async_trait::async_trait;
 use mock_worker::config::SchedulerWire;
 use smg_policy_controller::{
+    engine::view::{Role, WireModes},
     store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
-    view::{Role, WireModes},
     worker_host::{Expect, Membership, Wrote},
 };
 use smg_worker::{

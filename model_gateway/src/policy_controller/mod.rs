@@ -45,9 +45,9 @@
 
 use std::sync::Arc;
 
-pub(crate) use smg_policy_controller::spec::PlanName;
+pub(crate) use smg_policy_controller::document::spec::PlanName;
 use smg_policy_controller::{
-    operator::{Format, SpecDoor, SpecRejected},
+    document::operator::{Format, SpecDoor, SpecRejected},
     store::MemoryStore,
     Catalog,
 };

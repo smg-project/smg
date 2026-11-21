@@ -25,12 +25,12 @@ use std::{
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
-    door::{Door, Request},
-    handle::Handle,
+    engine::door::{Door, Request},
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
+    tracking::handle::Handle,
     AffinityFacts, AppliedSpec, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
     NamedAffinity, NamedHolder, Outcome, PairPools, PolicySpec, PoolFacts, RequestFacts, Role,
     Scratch, Side, SignalSource, Target, TransportClass, WireModes, WorkerId, PRESETS,

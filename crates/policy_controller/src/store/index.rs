@@ -79,6 +79,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     affinity::{WarmRule, Warming},
+    engine::view::{Candidate, HashKind, NamedAffinity, NamedHolder, Role, WorkerId},
     predictor::Predictor,
     store::{
         kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
@@ -86,7 +87,6 @@ use crate::{
         world::Naming,
         GatewayId,
     },
-    view::{Candidate, HashKind, NamedAffinity, NamedHolder, Role, WorkerId},
     Draw,
 };
 

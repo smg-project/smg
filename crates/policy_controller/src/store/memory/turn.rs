@@ -77,7 +77,7 @@
 //! most, but behind a thread that left its work by an unwind or rested
 //! on its watch: what it left is the next take's.
 //!
-//! A door in process has no deciding thread ([`crate::door::Door`]): each
+//! A door in process has no deciding thread ([`crate::engine::door::Door`]): each
 //! caller is at work at its seat's file for its one decision and rests
 //! as it leaves ([`AtWork::rest`]). No caller looks at a file again, so
 //! a door's file shows no watch: what is said of a lease is applied at
@@ -177,14 +177,16 @@ use arc_swap::Guard;
 use parking_lot::{Mutex, MutexGuard};
 
 use super::{takes_dispatch, Key, Leases, MemoryStore};
+#[cfg(feature = "controller")]
+use crate::tracking::lease;
 use crate::{
-    decider::Decider,
-    lease::LeaseId,
+    engine::decider::Decider,
     store::{
         leases::{LeaseState, Said, Sides},
         world::World,
         GatewayId,
     },
+    tracking::lease::LeaseId,
 };
 
 /// What tells the engine of a frame applied to a lease on file: the world
@@ -226,7 +228,7 @@ enum Word {
     Said(Said),
     /// One issue of a decode call taken back, and the reason.
     #[cfg(feature = "controller")]
-    TakenBack(super::DecodeIssue, crate::lease::ReleaseReason),
+    TakenBack(super::DecodeIssue, lease::ReleaseReason),
 }
 
 // The door's own word rides the room a frame's word leaves: a slot of the
@@ -1044,7 +1046,7 @@ impl MemoryStore {
 
     /// Hands the file a lease's id names what a frame said of `lease`: a
     /// session's own hand. A host in process says the same through its
-    /// door ([`Door::report`](crate::door::Door::report)), which a full
+    /// door ([`Door::report`](crate::engine::door::Door::report)), which a full
     /// ring does not hold. The frame is written into the file's ring.
     /// Where the file's decider keeps its watch the hand leaves it there:
     /// the decider applies it at its next take, one period of its host
@@ -1087,7 +1089,7 @@ impl MemoryStore {
         hand: &Hand,
         lease: LeaseId,
         issue: super::DecodeIssue,
-        reason: crate::lease::ReleaseReason,
+        reason: lease::ReleaseReason,
     ) {
         self.hand_word(hand, lease, Word::TakenBack(issue, reason));
     }

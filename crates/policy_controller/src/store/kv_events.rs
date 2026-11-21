@@ -2,7 +2,7 @@
 //! (design 5.1, the KV index row; 5.4, a standby subscribes itself).
 
 use super::index::LaneWriter;
-use crate::view::WorkerId;
+use crate::engine::view::WorkerId;
 
 /// The header facts of one batch, read by the cursor; the batch itself (the
 /// servicer's message, with the blocks the index applies) rides beside them

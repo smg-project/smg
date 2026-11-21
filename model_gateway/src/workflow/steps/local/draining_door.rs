@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use openai_protocol::worker::WorkerStatus;
 use smg_policy_controller::{
+    engine::view::WorkerId,
     store::{Maker, WorkerFacts},
-    view::WorkerId,
     worker_host::{Expect, Membership, Objects, Over, Refused, Remover, Standing, Wrote},
 };
 use smg_worker::identity::basic::Worker;

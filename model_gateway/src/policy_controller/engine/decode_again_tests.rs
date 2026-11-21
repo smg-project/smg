@@ -9,9 +9,9 @@ use std::{
 };
 
 use smg_policy_controller::{
-    spec::DecodePick,
+    document::spec::DecodePick,
+    engine::view::{LoadRow, Phase, WorkerId},
     store::{LeasesStore, LoadSink, LoadSource, MemoryStore, WorkersStore},
-    view::{LoadRow, Phase, WorkerId},
     TransportClass,
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
