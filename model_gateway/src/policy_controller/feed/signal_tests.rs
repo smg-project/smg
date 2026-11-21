@@ -2,8 +2,7 @@
 //! values a worker's load reports state by name reach the decisions the
 //! policy engine asks. The store starts as a gateway's does, with a document
 //! given and one stage of the host's own. The reports go through the feed's
-//! load sink, polled and pushed. The policy engine places by them. The server's
-//! cases of a host's own connection borrow the stage and the document.
+//! load sink, polled and pushed. The policy engine places by them.
 //!
 //! A placement alone can pass by a tie's draw: where no row has a value
 //! every row scores the same, and the policy engine draws a fresh seed for each
@@ -11,7 +10,6 @@
 //! each step says it beside the placement.
 
 use std::{
-    cmp::Ordering,
     collections::BTreeMap,
     error::Error,
     sync::Arc,
@@ -157,17 +155,6 @@ pub(crate) fn stages() -> Result<(Catalog, Read), CatalogError> {
 pub(crate) fn last_read(read: &Read) -> Rows {
     let rows: BTreeMap<_, _> = read.lock().drain(..).collect();
     rows.into_iter().collect()
-}
-
-/// [`last_read`] as its values alone, the least first. A row read with no
-/// value stands ahead of every value.
-pub(crate) fn values_read(read: &Read) -> Vec<Option<f64>> {
-    let mut values: Vec<_> = last_read(read)
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    values
 }
 
 /// A gateway's store started with a document given and the host's stage
