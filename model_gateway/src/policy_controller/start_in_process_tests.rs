@@ -1,15 +1,17 @@
 //! The start of a gateway that decides in its own process: what it refuses
-//! of a document its operator supplied.
+//! of a document its operator supplied, and its answer for a document the
+//! gateway does not run.
 
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use smg_policy_controller::{
     document::{OverloadSpec, PlanName, PolicySpec, ShadowSpec},
     engine::Phase,
+    stages::Catalog,
 };
 
-use super::start_in_process;
-use crate::config::{RouterConfig, RoutingMode};
+use super::{start_in_process, would_start};
+use crate::config::{PolicyConfig, RouterConfig, RoutingMode};
 
 type Case = Result<(), Box<dyn Error>>;
 
@@ -110,13 +112,83 @@ fn a_supplied_document_that_says_what_the_settings_run_starts() -> Case {
     let mut config = RouterConfig {
         policy_controller: true,
         worker_overload_waiting_requests: Some(3),
-        policy: crate::config::PolicyConfig::RoundRobin,
+        policy: PolicyConfig::RoundRobin,
         ..RouterConfig::default()
     };
     let said = config.policy_document()?;
     assert!(said.bindings[0].overload.is_some());
     config.policy_spec = Some(said);
     assert!(start_in_process(&config, None)?.is_some());
+    Ok(())
+}
+
+/// A gateway is asked of a document it does not run, as the control plane's
+/// dry run asks. The answer is what a start under that document answers:
+/// each refusal is the start's own, word for word, and a document the start
+/// takes is taken. So a document that passes the dry run does not stop the
+/// next start.
+#[test]
+fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case {
+    // The gateway asked runs the document its settings mean.
+    let running = RouterConfig {
+        policy_controller: true,
+        ..RouterConfig::default()
+    };
+    let stages = Arc::new(Catalog::builtin());
+    let answer = |gateway: &RouterConfig, document: &PolicySpec| {
+        would_start(gateway, &stages, document)
+            .err()
+            .map(|refused| refused.to_string())
+    };
+
+    // A place the engine does not decide in this process yet.
+    let scored = PolicySpec::preset("least_load")?;
+    let words = answer(&running, &scored).ok_or("a scorer was taken")?;
+    assert!(
+        words.starts_with(
+            "the policy document's profile `least_load` is not decided in this process yet"
+        ),
+        "{words}"
+    );
+    assert_eq!(words, refusal(&supplied(scored))?);
+
+    // A rule nothing runs.
+    let mut ruled = PolicySpec::preset("round_robin")?;
+    ruled.bindings[0].overload = Some(OverloadSpec {
+        waiting_requests: Some(3),
+        ..OverloadSpec::default()
+    });
+    let words = not_run(1, "*", "overload", BY_SETTINGS);
+    assert_eq!(answer(&running, &ruled), Some(words.clone()));
+    assert_eq!(words, refusal(&supplied(ruled))?);
+
+    // A second pair binding.
+    let mut twice = PolicySpec::pair_presets("round_robin", "round_robin")?;
+    let again = twice.bindings[0].clone();
+    twice.bindings.push(again);
+    let words = not_run(2, "*", "plan", "an earlier binding plans the pair");
+    assert_eq!(answer(&running, &twice), Some(words.clone()));
+    assert_eq!(words, refusal(&supplied(twice))?);
+
+    // A document the start takes.
+    let taken = PolicySpec::preset("round_robin")?;
+    assert_eq!(answer(&running, &taken), None);
+    assert!(start_in_process(&supplied(taken), None)?.is_some());
+
+    // A gateway whose routing settings say another document than the one
+    // asked: a start under both stops at their first difference, and the
+    // answer is that refusal.
+    let other = RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        ..running.clone()
+    };
+    let asked = PolicySpec::preset("random")?;
+    let beside = RouterConfig {
+        policy_spec: Some(asked.clone()),
+        ..other.clone()
+    };
+    let words = answer(&other, &asked).ok_or("a document beside other settings was taken")?;
+    assert_eq!(words, refusal(&beside)?);
     Ok(())
 }
 

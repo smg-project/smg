@@ -224,9 +224,10 @@ pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
 ) -> Result<Option<Started>, StartError> {
-    let Some((document, stages)) = document_in_force(config, stages)? else {
+    let Some(document) = document_in_force(config)? else {
         return Ok(None);
     };
+    let stages = stages.unwrap_or_else(Catalog::builtin);
     // A given document may hold what its YAML does not say, a `kind` line.
     // The typed check refuses it by the door's own word before the door
     // reads the YAML, over the same stages and denied headers.
@@ -252,15 +253,70 @@ pub(crate) fn start_with(
 /// behind a place, so a place of it the engine does not pick by itself
 /// is refused here ([`StartError::NotAlone`]), and so is a rule of a
 /// binding that nothing in this process would run ([`rule_not_run`]).
+///
+/// Every check and refusal is [`engine_for`]'s, which answers for a
+/// document the gateway does not run as well ([`would_start`]). The start
+/// adds its one log line.
 pub(crate) fn start_in_process(
     config: &RouterConfig,
     stages: Option<Catalog>,
 ) -> Result<Option<InProcess>, StartError> {
+    let started = engine_for(config, stages.map(Arc::new))?;
+    if started.is_some() {
+        info!(
+            "The policy controller is picked for this gateway and runs in this process, over the gateway's own worker data: \
+             the policy engine decides each policy whose line says so"
+        );
+    }
+    Ok(started)
+}
+
+/// Whether a start of this gateway in its own process would run
+/// `document`, were it the document the gateway's operator supplies in the
+/// place of the one it runs. `config` is the gateway's own configuration
+/// and `stages` the ones its start validated over
+/// ([`InProcess::stages`]). The answer is the start's own
+/// ([`engine_for`]): a refusal comes in the start's words, and a document
+/// this takes is one the gateway starts under.
+///
+/// The control plane's dry run of a document asks it where the gateway
+/// decides in its own process, so a document that passes the dry run does
+/// not stop the next start.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the control plane's dry run of a document asks it"
+    )
+)]
+pub(crate) fn would_start(
+    config: &RouterConfig,
+    stages: &Arc<Catalog>,
+    document: &PolicySpec,
+) -> Result<(), StartError> {
+    let supplied = RouterConfig {
+        policy_spec: Some(document.clone()),
+        ..config.clone()
+    };
+    engine_for(&supplied, Some(Arc::clone(stages))).map(drop)
+}
+
+/// The policy engine a gateway of `config` decides by in its own process,
+/// with what its start keeps beside it: the one home of every check and
+/// refusal of a start there. `stages` are a host's own, and the stock ones
+/// where it hands none. `None` where the setting is off or moves nothing.
+/// It says nothing of a document in the log and leaves nothing behind, so
+/// it answers for a document the gateway does not run too.
+fn engine_for(
+    config: &RouterConfig,
+    stages: Option<Arc<Catalog>>,
+) -> Result<Option<InProcess>, StartError> {
     // The document comes under the number a gateway's first document
     // takes: its own, and 1 where it names none (the reader's rule).
-    let Some((document, stages)) = document_in_force(config, stages)? else {
+    let Some(document) = document_in_force(config)? else {
         return Ok(None);
     };
+    let stages = stages.unwrap_or_else(|| Arc::new(Catalog::builtin()));
     // The bound the operators' door holds a written document to.
     let written = serde_yaml::to_string(&document)?;
     let bytes = u64::try_from(written.len()).unwrap_or(u64::MAX);
@@ -286,16 +342,12 @@ pub(crate) fn start_in_process(
         }
         rule_not_run(config, &document)?;
     }
-    info!(
-        "The policy controller is picked for this gateway and runs in this process, over the gateway's own worker data: \
-         the policy engine decides each policy whose line says so"
-    );
     Ok(Some(InProcess {
         engine,
         origin,
         written,
         applied: SystemTime::now(),
-        stages: Arc::new(stages),
+        stages,
     }))
 }
 
@@ -376,14 +428,9 @@ fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), Star
     Ok(())
 }
 
-/// The document a start runs, and the stages it is validated over: the
-/// stock ones where a host hands none. `None` where the setting is off,
-/// and where it is on and moves nothing. The one site that reads the
-/// setting.
-fn document_in_force(
-    config: &RouterConfig,
-    stages: Option<Catalog>,
-) -> Result<Option<(PolicySpec, Catalog)>, StartError> {
+/// The document a start runs. `None` where the setting is off, and where
+/// it is on and moves nothing. The one site that reads the setting.
+fn document_in_force(config: &RouterConfig) -> Result<Option<PolicySpec>, StartError> {
     ConfigValidator::validate_policy_document(config)?;
     if !config.policy_controller {
         return Ok(None);
@@ -402,8 +449,7 @@ fn document_in_force(
         );
         return Ok(None);
     }
-    let document = config.policy_document_in_force()?;
-    Ok(Some((document, stages.unwrap_or_else(Catalog::builtin))))
+    Ok(Some(config.policy_document_in_force()?))
 }
 
 /// A new store and the operators' door over it, holding `written` as the
