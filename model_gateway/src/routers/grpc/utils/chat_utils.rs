@@ -1190,14 +1190,14 @@ pub fn request_as_rendered(
     }
 }
 
-/// Why a conversation did not become a prompt.
+/// Why a request's conversation or input did not become a prompt.
 ///
 /// [`Self::Refused`] is a cause the request itself brings and its client can
 /// fix: media for a template with no placeholder for it, a block or a document
 /// source the route does not take, a response format the renderer does not
 /// take with the request's other fields, a conversation the model's template
-/// rejects through its own `raise_exception`. A stage writes one WARN for it
-/// and marks its answer reported.
+/// rejects through its own `raise_exception`, a generate input the route does
+/// not take. A stage writes one WARN for it and marks its answer reported.
 ///
 /// [`Self::TemplateFailed`] is a render the model's chat template failed on
 /// its own account, whatever the request holds ([`TemplateFailure`]): the
