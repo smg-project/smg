@@ -142,7 +142,10 @@ impl BufferPool {
         let Some(capacity) = class_capacity(len) else {
             return vec![0u8; len];
         };
-        let mut buf = self.class_buffer(capacity);
+        // A fresh buffer is a zeroed allocation of the whole class: the pages
+        // past `len` stay untouched, the ones below it are faulted in by the
+        // producer's first write, once in the buffer's life.
+        let mut buf = self.kept(capacity).unwrap_or_else(|| vec![0u8; capacity]);
         buf.resize(len, 0);
         #[cfg(debug_assertions)]
         buf.fill(SENTINEL);
@@ -156,26 +159,25 @@ impl BufferPool {
         let Some(capacity) = class_capacity(len) else {
             return Vec::new();
         };
-        let mut buf = self.class_buffer(capacity);
-        buf.clear();
-        buf
+        match self.kept(capacity) {
+            Some(mut buf) => {
+                buf.clear();
+                buf
+            }
+            // Empty, so nothing to zero: the producer writes what it appends.
+            None => Vec::with_capacity(capacity),
+        }
     }
 
-    /// The idle buffer of the class of `capacity`, or a fresh one.
-    fn class_buffer(&self, capacity: usize) -> Vec<u8> {
+    /// The idle buffer of the class of `capacity`, when it keeps one.
+    fn kept(&self, capacity: usize) -> Option<Vec<u8>> {
         let index = (capacity / SMALLEST).trailing_zeros() as usize;
-        let kept = {
-            let mut idle = self.idle();
-            let kept = idle.classes[index].pop();
-            if kept.is_some() && capacity != LARGEST {
-                idle.held -= capacity;
-            }
-            kept
-        };
-        // A fresh buffer is a zeroed allocation of the whole class: the pages
-        // past `len` stay untouched, the ones below it are faulted in by the
-        // producer's first write, once in the buffer's life.
-        kept.unwrap_or_else(|| vec![0u8; capacity])
+        let mut idle = self.idle();
+        let kept = idle.classes[index].pop();
+        if kept.is_some() && capacity != LARGEST {
+            idle.held -= capacity;
+        }
+        kept
     }
 
     /// `buf` back for the next request: kept when it is a class's buffer and
