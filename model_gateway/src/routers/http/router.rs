@@ -191,8 +191,9 @@ pub struct Router {
     /// wait lasts this long. `None` disables.
     stream_stall_timeout: Option<Duration>,
     /// Cap on buffering a request only to keep it retryable; larger eligible
-    /// requests stream and forfeit router retries. `0` never buffers for
-    /// retries.
+    /// requests stream and forfeit router retries. It also bounds the
+    /// transcription audio held for one resend after a pre-response connection
+    /// failure. `0` disables both kinds of buffering.
     max_buffered_request_bytes: u64,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -1297,10 +1298,11 @@ impl Router {
     /// canonical model, the request counted under its labels), the worker and
     /// its dispatch-time overload re-check, the form's send and the relay of
     /// the worker's answer. Separate from `route_typed_request` because the
-    /// endpoint is not JSON-bodied: the form is sent once (no retry could
-    /// replay it) and never passes through `prepare_request`. Under the
-    /// policy engine the worker is the engine's placement, with no
-    /// re-check, and a streamed answer carries it to the end of its body.
+    /// endpoint is not JSON-bodied: the form never passes through
+    /// `prepare_request`, and its stream cannot be replayed (a resend builds
+    /// the form again). Under the policy engine the worker is the engine's
+    /// placement, with no re-check, and a streamed answer carries it to the
+    /// end of its body.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -1364,10 +1366,14 @@ impl Router {
             self.policy_registry.sticky_header_key(headers),
         );
 
+        // Endpoint input has nonempty audio: the multipart extractor rejects
+        // an empty file, so a zero limit cannot make a resend eligible.
+        let resend = audio.bytes.len() as u64 <= self.max_buffered_request_bytes;
         let res = match Self::send_transcription(
             headers,
             body,
             audio,
+            resend,
             worker.as_ref(),
             route,
             canonical_model.as_deref(),
@@ -1553,9 +1559,11 @@ impl Router {
 
     /// The send of a transcription to its worker: the trace headers, the
     /// request-sent event, the multipart form, the forwarded headers and the
-    /// one send (the form's streamed body cannot be cloned, so the
-    /// stale-connection retry never fires). A form the request cannot
-    /// build or a send that fails is the finalized error answer.
+    /// send. The form's streamed body cannot be cloned, so one resend after a
+    /// pre-response transport failure builds the request again from held
+    /// audio. Audio outside the configured bound is given to its one form and
+    /// sent once. A form the request cannot build or a send that fails is the
+    /// finalized error answer.
     #[expect(
         clippy::too_many_arguments,
         reason = "the form inputs and the dispatch accounting are passed separately"
@@ -1564,6 +1572,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         body: &TranscriptionRequest,
         audio: AudioFile,
+        resend: bool,
         worker: &dyn Worker,
         route: &'static str,
         canonical_model: Option<&str>,
@@ -1579,31 +1588,49 @@ impl Router {
         }
         .emit();
 
-        let form = match build_transcription_form(body, audio, canonical_model) {
-            Ok(f) => f,
+        let request = |audio: &AudioFile| {
+            let form = build_transcription_form(body, audio, canonical_model)?;
+            let endpoint_url = worker.endpoint_url(route);
+            // reqwest sets the multipart Content-Type (with boundary) itself; the
+            // forward allow-list already excludes Content-Type/Content-Length.
+            Ok::<_, String>(header_utils::apply_forwarded_request_headers(
+                worker.http_client().post(&endpoint_url).multipart(form),
+                headers,
+                worker.api_key(),
+            ))
+        };
+        let first = match request(&audio) {
+            Ok(first) => first,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
                 outcome.pre_send_error(&resp);
                 return Err(resp);
             }
         };
-
-        let endpoint_url = worker.endpoint_url(route);
-        let mut request_builder = worker.http_client().post(&endpoint_url).multipart(form);
-
-        // reqwest sets the multipart Content-Type (with boundary) itself; the
-        // forward allow-list already excludes Content-Type/Content-Length.
-        request_builder = header_utils::apply_forwarded_request_headers(
-            request_builder,
-            headers,
-            worker.api_key(),
-        );
+        // The first form owns its body from here on. Only audio eligible for a
+        // resend remains held until that send produces a response head.
+        let held = resend.then_some(audio);
 
         WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         if let Some(placed) = placed {
             placed.dispatched(Instant::now());
         }
-        match send_with_stale_conn_retry(request_builder).await {
+        let sent = match send_with_stale_conn_retry(first).await {
+            // The form's streamed body cannot be cloned, so the helper's own
+            // resend never fires for it: build the request again (the inputs
+            // that built the first form build the second).
+            Err(e) if is_pre_response_transport_error(&e) => {
+                match held.as_ref().and_then(|audio| request(audio).ok()) {
+                    Some(again) => {
+                        Metrics::record_upstream_send_retry(metrics_labels::ROUTER_HTTP);
+                        untraced(again.send()).await
+                    }
+                    None => Err(e),
+                }
+            }
+            sent => sent,
+        };
+        match sent {
             Ok(res) => Ok(res),
             Err(e) => {
                 error!(
@@ -2014,9 +2041,12 @@ impl From<&RerankRequest> for RerankResponseSpec {
 /// `canonical_model` is set only when the client addressed the model by an
 /// alias. The worker was registered under the canonical ID and has never heard
 /// of the alias, so that is the name the form carries.
+///
+/// The audio is borrowed so a second form can be built from it. Its bytes are
+/// shared, and each form takes a copy of its file name.
 fn build_transcription_form(
     body: &TranscriptionRequest,
-    audio: AudioFile,
+    audio: &AudioFile,
     canonical_model: Option<&str>,
 ) -> Result<Form, String> {
     let AudioFile {
@@ -2028,8 +2058,8 @@ fn build_transcription_form(
     // Wrap the already-buffered Bytes in a reqwest Body (Arc refcount, no
     // additional copy) instead of Part::bytes, which would force a Vec copy.
     let file_len = bytes.len() as u64;
-    let mut file_part =
-        Part::stream_with_length(reqwest::Body::from(bytes), file_len).file_name(file_name);
+    let mut file_part = Part::stream_with_length(reqwest::Body::from(bytes.clone()), file_len)
+        .file_name(file_name.clone());
     if let Some(ct) = content_type.as_deref() {
         file_part = file_part
             .mime_str(ct)
@@ -2402,7 +2432,8 @@ async fn untraced<F: Future>(future: F) -> F::Output {
 }
 
 /// Send with a single retry on pre-response transport failures. Requests
-/// whose body cannot be cloned (multipart streams) fail through unchanged.
+/// whose body cannot be cloned (multipart streams) fail through unchanged;
+/// the transcription route builds such a request again itself.
 pub(crate) async fn send_with_stale_conn_retry(
     builder: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, reqwest::Error> {
@@ -3304,6 +3335,46 @@ mod tests {
 
         send_with_stale_conn_retry(builder).await.unwrap_err();
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    /// A transcription whose connection the worker closes before any answer
+    /// is sent once more, as a typed request is: the client gets the
+    /// worker's answer and the worker's breaker is not charged.
+    #[tokio::test]
+    async fn a_transcription_is_sent_once_more_when_its_connection_closes_unanswered() {
+        let (addr, accepted) = flaky_upstream(1).await;
+        // One attempt, and a breaker that one failure opens: the answer can
+        // only be the resend's, and a charge would show.
+        let mut router = breaker_router(&[&format!("http://{addr}")], fast_retry_config(1), 1);
+        router.max_buffered_request_bytes = 1024;
+        let worker = router.worker_registry.get_all().remove(0);
+        let body = TranscriptionRequest {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"RIFF-clip"),
+            file_name: "clip.wav".to_string(),
+            content_type: Some("audio/wav".to_string()),
+        };
+
+        let response = router
+            .route_multipart_transcription(
+                None,
+                &body,
+                audio,
+                "/v1/audio/transcriptions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            2,
+            "one send and one resend reach the worker"
+        );
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
     }
 
     fn create_test_regular_router() -> Router {
