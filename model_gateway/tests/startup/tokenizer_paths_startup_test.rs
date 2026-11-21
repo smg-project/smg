@@ -37,8 +37,9 @@ struct Launch {
 }
 
 /// Runs the gateway with `args` on fresh ports, its output in `log_path`,
-/// until it exits, binds its port or `EXIT_TIMEOUT` passes. No network: a
-/// hub id is never fetched by this test.
+/// until it exits, binds its port or `EXIT_TIMEOUT` passes. No network: the
+/// gateway's hub address is a loopback port with no listener and it takes
+/// no proxy, so its fetch of a hub id fails on this host.
 fn launch(args: &[&str], log_path: &Path) -> Launch {
     // The binary's launches run one at a time: the ports picked here are
     // for this gateway to bind, and another test's pick or listener must
@@ -47,12 +48,16 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
     let [port, metrics_port] = free_ports();
     let ip = IP.to_string();
     let log = File::create(log_path).expect("log file");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_smg"))
+    let mut gateway = Command::new(env!("CARGO_BIN_EXE_smg"));
+    for proxy in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+        gateway.env_remove(proxy).env_remove(proxy.to_lowercase());
+    }
+    let mut child = gateway
         .args(["--host", &ip, "--port", &port.to_string()])
         .args(["--prometheus-host", &ip])
         .args(["--prometheus-port", &metrics_port.to_string()])
         .args(args)
-        .env("HF_HUB_OFFLINE", "1")
+        .env("HF_ENDPOINT", "http://127.0.0.1:9")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().expect("log handle")))
         .stderr(Stdio::from(log))
