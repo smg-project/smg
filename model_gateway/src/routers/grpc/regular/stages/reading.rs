@@ -488,7 +488,7 @@ pub(crate) fn decide(
     // table reads with its forced call), never the table's, whatever kind the
     // backend's spelling gave it.
     let tabled = decided.constraint.map(|constraint| constraint.to_tuple());
-    let registry = if decided.table { None } else { tabled.as_ref() };
+    let untabled = if decided.table { None } else { tabled.as_ref() };
     let provider = ctx
         .state
         .provider
@@ -506,7 +506,7 @@ pub(crate) fn decide(
     // A forced call's reader starts where the model's workers start a grammar together, the
     // start preparation built the constraint for, kept with it (`together`); the assignment
     // asks under a forced call's JSON schema alone, so no other request reads it here.
-    let assignment = symphony::assign_for(read, asks, registry, processed_text, provider, || {
+    let assignment = symphony::assign_for(read, asks, untabled, processed_text, provider, || {
         together(ctx, model, |labels| labels.grammar_start)
     });
     ctx.state.parser = Some(match assignment {
