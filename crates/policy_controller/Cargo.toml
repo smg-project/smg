@@ -188,9 +188,9 @@ controller = [
 ]
 
 # The gateway's side of the controller's protocol: the reference client, the
-# link a host's requests share and the watcher. It adds no dependency to the
-# controller's. The gateway builds it on the targets the controller builds
-# on, to follow a controller.
+# link a host's requests share, the watcher and the worker follower. It adds
+# no dependency to the controller's. The gateway builds it on the targets
+# the controller builds on, to follow a controller.
 client = ["controller"]
 
 # The Kubernetes Lease backend of the elector.
@@ -245,8 +245,8 @@ criterion = "0.8"
 # the same stand-in served over HTTP.
 axum = { workspace = true }
 http = { workspace = true }
-# The follower's tests answer as a controller would: a body of frames that
-# ends with trailers, or never ends.
+# The worker follower's tests answer as a controller would: a body of frames
+# that ends with trailers, or never ends.
 http-body = "1.0"
 http-body-util = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.

@@ -111,6 +111,11 @@
 //!   into a [`store::MemoryStore`] of its own, through the door a
 //!   standby's applier writes a followed row by, and names the place a
 //!   watch opened again goes on from.
+//! - Behind the same feature, the worker follower
+//!   (`service::worker_follower::WorkerFollower`): the task a gateway
+//!   follows a controller's worker list with. It dials the controller,
+//!   keeps the watcher's watch open, waits and dials again after an error,
+//!   and goes to the leader a replica names.
 //! - Behind the `worker-host` feature, a replica's worker objects
 //!   (`worker_host`): one object of the worker crate for every row of the
 //!   membership store, in a registry the host hands in, built, replaced and

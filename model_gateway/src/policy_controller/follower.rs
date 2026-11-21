@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use smg_policy_controller::{
-    service::worker_follower::{PemFile, WorkerFollower, WorkerFollowerSettings},
+    service::worker_follower::{
+        ClientIdentity, PemFile, Tls, WorkerFollower, WorkerFollowerSettings,
+    },
     store::token,
 };
 
@@ -38,24 +40,32 @@ pub(crate) struct Settings(WorkerFollowerSettings);
 
 impl Settings {
     pub(crate) fn new(address: String, config: &RouterConfig) -> Self {
-        let file = |setting, path: Option<&String>| {
-            let path = path?.clone();
+        let pem = |setting, path: &Option<String>| {
+            let path = path.clone()?;
             Some(PemFile { setting, path })
         };
+        // The configuration's check lets three pairings of these files
+        // through: none, the authority alone, and all three. It runs before
+        // the start, so no certificate or key comes here without the rest.
+        let ca_cert = pem(
+            "--policy-controller-tls-ca-cert",
+            &config.policy_controller_tls_ca_cert,
+        );
+        let cert = pem(
+            "--policy-controller-tls-cert",
+            &config.policy_controller_tls_cert,
+        );
+        let key = pem(
+            "--policy-controller-tls-key",
+            &config.policy_controller_tls_key,
+        );
+        let identity = cert.zip(key);
         Self(WorkerFollowerSettings {
             address,
-            ca_cert: file(
-                "--policy-controller-tls-ca-cert",
-                config.policy_controller_tls_ca_cert.as_ref(),
-            ),
-            cert: file(
-                "--policy-controller-tls-cert",
-                config.policy_controller_tls_cert.as_ref(),
-            ),
-            key: file(
-                "--policy-controller-tls-key",
-                config.policy_controller_tls_key.as_ref(),
-            ),
+            tls: ca_cert.map(|ca_cert| Tls {
+                ca_cert,
+                identity: identity.map(|(cert, key)| ClientIdentity { cert, key }),
+            }),
             gateway_id: gateway_id(std::env::var("HOSTNAME").ok()),
         })
     }
@@ -114,7 +124,7 @@ pub(crate) mod tests {
         service::{
             controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
-            worker_follower::{PemFile, WorkerFollowerSettings},
+            worker_follower::{PemFile, Tls, WorkerFollowerSettings},
         },
         store::{MemoryStore, WorkerStatus, WorkersStore},
     };
@@ -178,9 +188,7 @@ pub(crate) mod tests {
     fn settings(address: SocketAddr) -> Settings {
         Settings(WorkerFollowerSettings {
             address: address.to_string(),
-            ca_cert: None,
-            cert: None,
-            key: None,
+            tls: None,
             gateway_id: "test-gateway".to_owned(),
         })
     }
@@ -437,34 +445,48 @@ pub(crate) mod tests {
         controller.stop().await;
     }
 
-    /// Each TLS file of the configuration is named by the flag that sets
-    /// it, so a file that cannot be read is reported under that flag.
+    /// The three pairings of TLS files the configuration's check lets
+    /// through, as the follower's settings hold them: no file dials plain,
+    /// the authority alone is TLS, and all three add the gateway's own
+    /// certificate. Each file is named by the flag that sets it, so a file
+    /// that cannot be read is reported under that flag.
     #[test]
     fn the_settings_name_each_tls_file_by_its_flag() {
-        let config = RouterConfig {
+        let named = |file: PemFile| (file.setting, file.path);
+        let authority = RouterConfig {
             policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
-            policy_controller_tls_cert: Some("gateway.pem".to_owned()),
-            policy_controller_tls_key: Some("gateway-key.pem".to_owned()),
             ..RouterConfig::default()
         };
-        let Settings(settings) = Settings::new("controller:30100".to_owned(), &config);
+        let mutual = RouterConfig {
+            policy_controller_tls_cert: Some("gateway.pem".to_owned()),
+            policy_controller_tls_key: Some("gateway-key.pem".to_owned()),
+            ..authority.clone()
+        };
+
+        let Settings(settings) = Settings::new("controller:30100".to_owned(), &mutual);
         assert_eq!(settings.address, "controller:30100");
-        let named = |file: Option<PemFile>| file.map(|file| (file.setting, file.path));
+        let Tls { ca_cert, identity } = settings.tls.expect("the authority's file makes TLS");
+        let identity = identity.expect("a certificate and its key");
         assert_eq!(
+            [named(ca_cert), named(identity.cert), named(identity.key)],
             [
-                named(settings.ca_cert),
-                named(settings.cert),
-                named(settings.key)
-            ],
-            [
-                Some(("--policy-controller-tls-ca-cert", "ca.pem".to_owned())),
-                Some(("--policy-controller-tls-cert", "gateway.pem".to_owned())),
-                Some(("--policy-controller-tls-key", "gateway-key.pem".to_owned())),
+                ("--policy-controller-tls-ca-cert", "ca.pem".to_owned()),
+                ("--policy-controller-tls-cert", "gateway.pem".to_owned()),
+                ("--policy-controller-tls-key", "gateway-key.pem".to_owned()),
             ]
         );
+
+        let Settings(settings) = Settings::new("controller:30100".to_owned(), &authority);
+        let tls = settings.tls.expect("the authority's file makes TLS");
+        assert_eq!(
+            named(tls.ca_cert),
+            ("--policy-controller-tls-ca-cert", "ca.pem".to_owned())
+        );
+        assert!(tls.identity.is_none());
+
         let Settings(plain) =
             Settings::new("controller:30100".to_owned(), &RouterConfig::default());
-        assert!(plain.ca_cert.is_none() && plain.cert.is_none() && plain.key.is_none());
+        assert!(plain.tls.is_none());
     }
 
     #[test]

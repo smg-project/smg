@@ -54,15 +54,31 @@ pub struct PemFile {
 pub struct WorkerFollowerSettings {
     /// The controller's address, as `host:port`.
     pub address: String,
-    /// The certificate authority the controller's certificate is checked
-    /// against. With neither this nor `cert` the dial is plain.
-    pub ca_cert: Option<PemFile>,
-    /// The gateway's own certificate, sent with `key` where both are set.
-    pub cert: Option<PemFile>,
-    /// The key of `cert`.
-    pub key: Option<PemFile>,
-    /// The name the gateway states to the controller.
+    /// TLS to the controller. Without it the dial is plain.
+    pub tls: Option<Tls>,
+    /// The name the gateway states to the controller. The controller holds
+    /// one session under a name: a newer session replaces the one before
+    /// it.
     pub gateway_id: String,
+}
+
+/// The TLS files of a follower's dial.
+#[derive(Clone, Debug)]
+pub struct Tls {
+    /// The certificate authority the controller's certificate is checked
+    /// against: the one root the dial trusts.
+    pub ca_cert: PemFile,
+    /// The gateway's own certificate and its key, sent where they are set.
+    pub identity: Option<ClientIdentity>,
+}
+
+/// A gateway's own certificate and the key of it.
+#[derive(Clone, Debug)]
+pub struct ClientIdentity {
+    /// The certificate.
+    pub cert: PemFile,
+    /// The certificate's key.
+    pub key: PemFile,
 }
 
 /// Why a dial of the controller failed.
@@ -109,17 +125,15 @@ async fn read(file: &PemFile) -> Result<Vec<u8>, DialError> {
 
 impl WorkerFollowerSettings {
     async fn connect(&self, address: &str) -> Result<Client, DialError> {
-        if self.ca_cert.is_none() && self.cert.is_none() {
+        let Some(files) = &self.tls else {
             return Ok(Client::connect(&format!("http://{address}"), &self.gateway_id).await?);
-        }
+        };
 
-        let mut tls = ClientTlsConfig::new();
-        if let Some(file) = &self.ca_cert {
-            tls = tls.ca_certificate(Certificate::from_pem(read(file).await?));
-        }
-        if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
-            let cert = read(cert).await?;
-            let key = read(key).await?;
+        let authority = Certificate::from_pem(read(&files.ca_cert).await?);
+        let mut tls = ClientTlsConfig::new().ca_certificate(authority);
+        if let Some(identity) = &files.identity {
+            let cert = read(&identity.cert).await?;
+            let key = read(&identity.key).await?;
             tls = tls.identity(Identity::from_pem(cert, key));
         }
         // The watch's next event waits with no bound, so the channel is kept
@@ -147,11 +161,15 @@ pub struct WorkerFollower {
 
 impl WorkerFollower {
     /// Starts the task. The watch alone writes `store` from here, and the
-    /// task calls `settle` after each event the store takes at a place.
+    /// task calls `after_event` after each event the store takes at a place.
+    ///
+    /// It spawns the task, so it is called inside a Tokio runtime. Dropping
+    /// the follower ends the task too, without the wait [`Self::stop`]
+    /// makes.
     pub fn start(
         settings: WorkerFollowerSettings,
         store: Arc<MemoryStore>,
-        settle: impl Fn() + Send + Sync + 'static,
+        after_event: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         let (stop, stopped) = oneshot::channel();
         let (progress, first_snapshot) = watch::channel(false);
@@ -163,7 +181,7 @@ impl WorkerFollower {
             tokio::select! {
                 biased;
                 _ = stopped => {}
-                () = run(settings, store, settle, progress) => {}
+                () = run(settings, store, after_event, progress) => {}
             }
         });
         Self {
@@ -211,7 +229,7 @@ fn named_leader(error: &DialError, followed: u32) -> Option<&str> {
 async fn run(
     settings: WorkerFollowerSettings,
     store: Arc<MemoryStore>,
-    settle: impl Fn(),
+    after_event: impl Fn(),
     progress: watch::Sender<bool>,
 ) {
     let mut watcher = Watcher::new(store);
@@ -225,7 +243,7 @@ async fn run(
             Ok(mut client) => follow(
                 &mut client,
                 &mut watcher,
-                &settle,
+                &after_event,
                 &progress,
                 &mut delay,
                 &mut followed,
@@ -250,7 +268,7 @@ async fn run(
 async fn follow(
     client: &mut Client,
     watcher: &mut Watcher,
-    settle: &impl Fn(),
+    after_event: &impl Fn(),
     progress: &watch::Sender<bool>,
     delay: &mut Duration,
     followed: &mut u32,
@@ -280,7 +298,7 @@ async fn follow(
                 // The store holds the fleet as of a place. The owner brings
                 // what it keeps beside the store up to date. Only then does
                 // readiness hear of a fleet.
-                settle();
+                after_event();
                 placed = true;
                 *delay = FIRST_RETRY;
                 *followed = 0;
@@ -322,8 +340,8 @@ mod tests {
     };
 
     use super::{
-        named_leader, next_delay, with_sources, DialError, Error, PemFile, WorkerFollower,
-        WorkerFollowerSettings, FIRST_RETRY, REDIRECTS,
+        named_leader, next_delay, with_sources, ClientIdentity, DialError, Error, PemFile, Tls,
+        WorkerFollower, WorkerFollowerSettings, FIRST_RETRY, REDIRECTS,
     };
     use crate::{
         document::operator::test_support::Logged,
@@ -341,9 +359,7 @@ mod tests {
     fn settings(address: SocketAddr) -> WorkerFollowerSettings {
         WorkerFollowerSettings {
             address: address.to_string(),
-            ca_cert: None,
-            cert: None,
-            key: None,
+            tls: None,
             gateway_id: "test-gateway".to_owned(),
         }
     }
@@ -549,9 +565,12 @@ mod tests {
         let missing = tempfile::tempdir().unwrap().path().join("ca.pem");
         let path = missing.to_str().unwrap().to_owned();
         let settings = WorkerFollowerSettings {
-            ca_cert: Some(PemFile {
-                setting: "--tls-ca-cert",
-                path: path.clone(),
+            tls: Some(Tls {
+                ca_cert: PemFile {
+                    setting: "--tls-ca-cert",
+                    path: path.clone(),
+                },
+                identity: None,
             }),
             ..settings(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)))
         };
@@ -600,19 +619,23 @@ mod tests {
             let file = |setting, name, pem: &str| {
                 let path = paths.path().join(name);
                 std::fs::write(&path, pem).unwrap();
-                Some(PemFile {
+                PemFile {
                     setting,
                     path: path.to_str().unwrap().to_owned(),
-                })
+                }
             };
             let authority = Authority::mint("controller-ca");
             let (server, server_key) = authority.issue("controller");
             let (client, client_key) = authority.issue("test-gateway");
             let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let settings = WorkerFollowerSettings {
-                ca_cert: file("--tls-ca-cert", "ca.pem", &authority.pem),
-                cert: file("--tls-cert", "gateway.pem", &client),
-                key: file("--tls-key", "gateway-key.pem", &client_key),
+                tls: Some(Tls {
+                    ca_cert: file("--tls-ca-cert", "ca.pem", &authority.pem),
+                    identity: Some(ClientIdentity {
+                        cert: file("--tls-cert", "gateway.pem", &client),
+                        key: file("--tls-key", "gateway-key.pem", &client_key),
+                    }),
+                }),
                 ..settings(socket.local_addr().unwrap())
             };
             let tls = ServerTlsConfig::new()
