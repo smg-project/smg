@@ -47,7 +47,10 @@ use std::sync::Arc;
 
 pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
-    document::operator::{Format, SpecDoor, SpecRejected},
+    document::{
+        operator::{Format, SpecDoor, SpecRejected},
+        RoutingSettingsError,
+    },
     stages::Catalog,
     store::MemoryStore,
 };
@@ -56,7 +59,7 @@ use tracing::info;
 
 use crate::{
     app_context::AppContext,
-    config::{validation::ConfigValidator, ConfigError, PolicyDocumentError, RouterConfig},
+    config::{validation::ConfigValidator, ConfigError, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, RouterTrait},
 };
 
@@ -102,7 +105,7 @@ pub(crate) enum StartError {
     /// The routing configuration holds a setting no policy document says, or
     /// one that disagrees with the document a user gave.
     #[error(transparent)]
-    Document(#[from] PolicyDocumentError),
+    Document(#[from] RoutingSettingsError),
     /// The document did not write as the YAML the door reads.
     #[error("the policy document did not write as YAML: {0}")]
     Unwritten(#[from] serde_yaml::Error),
