@@ -18,8 +18,8 @@ use crate::routers::{
     error,
     grpc::{
         context::RequestContext,
-        multimodal::{self, MediaPlan, MultimodalIntermediate},
-        utils::{self, MediaContext},
+        multimodal::{self, MediaContext, MediaPlan, MultimodalIntermediate},
+        utils,
     },
 };
 
@@ -261,13 +261,12 @@ mod tests {
                 backend_client::BasicWorkerBuilder,
                 context::RequestContext,
                 multimodal::{
-                    ensure_model_accepts_media, media_refs_pipeline_pin, MediaPlan,
+                    ensure_model_accepts_media, media_refs_pipeline_pin, MediaContext, MediaPlan,
                     MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
                     PlaceholderTokens, GATEWAY_PIPELINE_PROCESSOR, MM_PROCESSOR_LABEL,
                 },
                 regular::stages::testing::components_over,
                 testing::unreadable_model_dir,
-                utils::MediaContext,
             },
         },
     };

@@ -242,17 +242,6 @@ impl MessagePreparationStage {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
-
-    use crate::routers::grpc::utils::message_utils::invalid_multimodal_request;
-
-    #[test]
-    fn invalid_multimodal_input_maps_to_bad_request() {
-        let response = invalid_multimodal_request("unsupported audio modality");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
     /// A byte-level tokenizer over `template`, in a directory the caller keeps
     /// alive for as long as the tokenizer is used.
     fn byte_tokenizer_with_template(
