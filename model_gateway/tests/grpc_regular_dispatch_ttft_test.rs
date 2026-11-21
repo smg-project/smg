@@ -692,8 +692,11 @@ fn harmony_collected_chat_includes_the_held_header_delay() {
 /// Harmony pipeline's backend label.
 #[test]
 fn harmony_streaming_chat_records_its_dispatch_wait_with_its_ttft() {
+    // Read before the runtime starts: loading the encoding may fetch its vocabulary with a
+    // blocking client, which cannot be dropped inside the runtime.
+    let ids = harmony_output_ids();
     let rendered = render_after(|| async {
-        let engine = held_headers_engine(Some(harmony_output_ids()));
+        let engine = held_headers_engine(Some(ids));
         let port = serve_engine(engine.into_server()).await;
         let router = router_over(&[port], HARMONY_MODEL, None).await;
         let request =
