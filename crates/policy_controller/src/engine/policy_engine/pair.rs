@@ -1472,7 +1472,13 @@ mod tests {
         let mut undialed = host.asks(&classes, false);
         undialed.0.constraints.wire_modes = WireModes::ZMQ;
         let decided = host.engine.decide_under(GatewayId::LOCAL, &undialed, now);
-        match decided.expect("a decision").0.decision {
+        match decided
+            .expect("an answer")
+            .whole()
+            .expect("a whole decision")
+            .0
+            .decision
+        {
             Decision::Shed(shed) => assert_eq!(
                 (shed.reason, shed.emptied_by),
                 (ShedReason::PolicyDeclined, WIRES)

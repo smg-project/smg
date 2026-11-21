@@ -35,9 +35,9 @@ use smg_worker::runtime::RoutingState;
 use super::{keys, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
-        decision::{Decision, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace},
-        decision_engine::{HeldDecision, Plain},
-        framework::{AloneProfile, Engine},
+        decision::{Decision, Shed, ShedReason, Target, Trace},
+        decision_engine::{AlonePick, HeldDecision, Plain},
+        framework::Engine,
         records,
         sticky_sessions::SessionVerdict,
         store_backed_engine::{DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
@@ -57,20 +57,21 @@ const NO_STAGE: &str = "none";
 
 /// The short path: the place in `members`, the list its host handed, of
 /// the worker picked for a plain single request of `model`, and the profile
-/// whose picker picked it. `None` where the request takes the whole pass
-/// ([`decide`]): it is no single request, its place is not decided by one
-/// pick of a picker, a worker of the list is not dialed on a wire it
-/// states, or the picker's turns land on no eligible worker.
+/// whose picker picked it ([`AlonePick`]). `None` where the request takes
+/// the whole pass ([`decide`]): it is no single request, its place is not
+/// decided by one pick of a picker, a worker of the list is not dialed on a
+/// wire it states, or the picker's turns land on no eligible worker.
 ///
 /// It ends in the place picked. It reads no fact of a request, so none is
-/// made ahead of it, and nothing a host is handed of a pick is built here
-/// ([`noted`]).
+/// made ahead of it, and nothing a host is handed of a pick is built here.
+/// Under a document that takes no word on a lease the place is the whole
+/// answer. Under any other the pick is noted ([`noted`]).
 pub(super) fn alone(
     own: &PolicyEngine,
     model: &str,
     plain: Plain,
     members: &PoolMembers,
-) -> Option<(AloneProfile, usize)> {
+) -> Option<AlonePick> {
     if plain.phase != Phase::Single {
         return None;
     }
@@ -80,70 +81,58 @@ pub(super) fn alone(
     }
     let profile = members.alone(&own.spec, model)?;
     let position = own.pick(profile, members, |state: RoutingState| state.eligible())?;
-    Some((profile, position))
+    Some(AlonePick {
+        place: u32::try_from(position).ok()?,
+        profile: profile.0,
+        generation: own.spec.generation(),
+    })
 }
 
-/// The short path's pick as its host takes it: the decision that names the
-/// worker at the place picked, alone, and its lease, issued here as a whole
-/// pass's is ([`issued`]). The trace is a drawn pick's: no pass over the
-/// pool ran, so it counts no survivor, and no seed was drawn for it. The
-/// lease states the size `plain` states and no session, and is dated at
-/// `now` on the engine's clock. `None` where the list holds no worker at
+/// The short path's pick under a document that takes a word on a lease,
+/// as its host takes it: the decision that names the worker at the place
+/// picked, alone ([`AlonePick::decision`]), and its lease, issued here as a
+/// whole pass's is ([`issued`]). The lease states the size `plain` states
+/// and no session, and is dated at `now` on the engine's clock. The issue
+/// is told where a stage takes it. `None` where the list holds no worker at
 /// the place.
 pub(super) fn noted(
     own: &PolicyEngine,
-    (profile, position): (AloneProfile, usize),
+    pick: AlonePick,
     members: &PoolMembers,
     plain: Plain,
     now: Instant,
 ) -> Option<DecideOutcome> {
+    let position = pick.place as usize;
     let worker = members.workers().get(position)?;
     // The list's records name each worker once a list: a pick reads the id
     // there and hashes no address.
     let id = *members.records(&own.spec, &own.clock).ids().get(position)?;
-    let mut targets = Targets::new();
-    targets.push(Target {
-        position: u32::try_from(position).ok()?,
-        id,
-        dp_rank: u16::try_from(worker.dp_rank().unwrap_or(0)).unwrap_or(u16::MAX),
-        pair: None,
-    });
-    let generation = own.spec.generation();
-    let mut trace = Trace {
-        profile: profile.0,
-        survivors: Survivors::NOT_COUNTED,
-        top_len: 1,
-        generation,
-        ..Trace::default()
-    };
-    trace.top[0] = (id, 0.0);
+    let dp_rank = records::worker_rank(worker.as_ref());
     let lease = Lease {
         id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
         kind: LeaseKind::Credit,
         side: Side::Single,
         target_index: 0,
         booked: id,
-        generation,
+        generation: pick.generation,
         session: Session::NONE,
         session_verdict: SessionVerdict::None,
         issued_micros: own.clock.micros(now),
         tokens: plain.prompt_tokens,
     };
     let decided = DecideOutcome {
-        decision: Decision::Pick(Pick {
-            targets,
-            trace,
-            session_verdict: SessionVerdict::None,
-        }),
+        decision: pick.decision(id, dp_rank),
         lease: Some(Leased {
             lease,
             due: now + DISPATCH_TTL,
         }),
         decode_session: Session::NONE,
     };
-    own.spec
-        .engine()
-        .on_decision_issued(&lease, &decided.decision);
+    if own.hears.issue {
+        own.spec
+            .engine()
+            .on_decision_issued(&lease, &decided.decision);
+    }
     Some(decided)
 }
 
@@ -217,11 +206,15 @@ fn shed(
     })
 }
 
-/// The decision as its host takes it. A pick is issued before the answer
-/// leaves: its lease takes the next id, books the pick's first target and
-/// is dated at the decision's instant, and the stages hear of it here, on
-/// the calling thread and inside the decision's own catch. From the answer
-/// the lease is its guard's: nothing of it is filed.
+/// The decision as its host takes it. Under a document that takes a word
+/// on a lease a pick is issued before the answer leaves: its lease takes
+/// the next id, books the pick's first target and is dated at the
+/// decision's instant, and the stages that take the issue hear of it here,
+/// on the calling thread and inside the decision's own catch. From the
+/// answer the lease is its guard's: nothing of it is filed.
+///
+/// Under a document that takes no word a pick has no lease: no id is
+/// taken, and its guard owes the engine nothing.
 pub(super) fn issued(
     own: &PolicyEngine,
     decision: Decision,
@@ -229,7 +222,8 @@ pub(super) fn issued(
     now: Instant,
 ) -> DecideOutcome {
     let facts = &request.facts;
-    let lease = decision.pick().and_then(|pick| {
+    let noted = decision.pick().filter(|_| own.hears.any());
+    let lease = noted.and_then(|pick| {
         let first = pick.targets.first()?;
         Some(Lease {
             id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
@@ -244,7 +238,7 @@ pub(super) fn issued(
             tokens: facts.prompt_tokens,
         })
     });
-    if let Some(lease) = &lease {
+    if let Some(lease) = lease.as_ref().filter(|_| own.hears.issue) {
         own.spec.engine().on_decision_issued(lease, &decision);
     }
     DecideOutcome {
@@ -304,15 +298,15 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
         engine::{
-            decision::LiftedVeto,
-            decision_engine::{DecisionEngine, RequestMaker, WorkerLists},
-            framework::{Picker, TieBand},
+            decision::{LiftedVeto, Targets},
+            decision_engine::{Decided, DecisionEngine, RequestMaker, WorkerLists},
+            framework::{Picker, Place, PoolWord, TieBand},
             records::worker_id,
             store_backed_engine::DecisionRefused,
             view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
         },
         policies::random::Random,
-        stages::registry::StageRegistry,
+        stages::{registry::StageRegistry, Words},
         store::GatewayId,
         tracking::{
             lease::{Outcome, ReleaseReason, TransportClass},
@@ -383,27 +377,84 @@ mod tests {
         }
     }
 
-    fn decided(engine: &PolicyEngine, asks: &Asks<'_>) -> DecideOutcome {
+    /// What the one entry answers a request stated ahead.
+    fn answered(engine: &PolicyEngine, asks: &Asks<'_>) -> Decided {
         let decided = engine.decide_under(GatewayId::LOCAL, asks, Instant::now());
-        decided.expect("a decision").0
+        decided.expect("an answer")
     }
 
-    /// Round robin's single request is one turn of the list's rotation: one
-    /// target, the worker the turn lands on by its place in the list and
-    /// its id, with no pass over the pool. Each pick is issued under the
-    /// next id, on its target.
+    /// The whole decision the entry answers: no place.
+    fn decided(engine: &PolicyEngine, asks: &Asks<'_>) -> DecideOutcome {
+        answered(engine, asks).whole().expect("a whole decision").0
+    }
+
+    /// The place the entry answers: no whole decision.
+    fn placed(engine: &PolicyEngine, asks: &Asks<'_>) -> AlonePick {
+        match answered(engine, asks) {
+            Decided::Alone(pick) => pick,
+            Decided::Whole(decided, _) => panic!("a place, not {decided:?}"),
+        }
+    }
+
+    /// Round robin's plain single request is one turn of the list's
+    /// rotation, answered as the place in the list the turn lands on: no
+    /// pass over the pool ran, no request was made, and no lease took an
+    /// id, since no stage of the document takes a word of one. The decision
+    /// a host writes of the place names that worker alone.
     #[test]
-    fn round_robin_is_decided_by_one_turn_of_the_list_and_issued() {
+    fn round_robin_is_one_turn_of_the_list_answered_as_a_place() {
         let engine = preset("round_robin");
         let list = pool(4);
         let members = engine.pool_members(&list);
-        let asks = Asks::of(request(), Some(&members));
+        let mut sized = request();
+        sized.facts.prompt_tokens = 321;
+        sized.facts.session_key = Identity::plain("a-key");
+        let asks = Asks::of(sized, Some(&members));
+        let mut seen = [0_u32; 4];
+        for _ in 0..8 {
+            let pick = placed(&engine, &asks);
+            assert_eq!(pick.generation, 1);
+            seen[pick.place as usize] += 1;
+            let id = worker_id(list[pick.place as usize].as_ref());
+            let decision = pick.decision(id, 3);
+            let named = decision.pick().expect("a pick");
+            assert_eq!(named.targets.len(), 1);
+            assert!(named.trace.drew_first(), "no pass over the pool ran");
+            assert_eq!(named.trace.seed, 0, "no seed was drawn");
+            let target = named.targets.first().expect("the target");
+            assert_eq!(
+                (target.position, target.id, target.dp_rank),
+                (pick.place, id, 3)
+            );
+        }
+        assert_eq!(seen, [2; 4], "every worker takes its turn");
+        assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+    }
+
+    /// Under a document a stage of which takes a word on a lease, a plain
+    /// request of a place one pick decides is still never made, and its
+    /// pick is noted: a whole decision of one target under a lease that
+    /// takes the next id, states the size the plain word states and no
+    /// session, and is told to the stage that takes the issue.
+    #[test]
+    fn a_place_picked_under_a_document_that_takes_a_word_is_noted() {
+        let (engine, heard) = hearing_as(false, true, Words::ALL);
+        let place = engine.place(MODEL, Phase::Single);
+        assert!(matches!(place, Place::Alone(_)), "{place:?}");
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let mut sized = request();
+        sized.facts.prompt_tokens = 321;
+        sized.facts.session_key = Identity::plain("a-key");
+        let asks = Asks::of(sized, Some(&members));
         let (mut seen, mut last) = ([0_u32; 4], 0);
         for _ in 0..8 {
             let decided = decided(&engine, &asks);
             let pick = decided.decision.pick().expect("a pick");
             assert_eq!(pick.targets.len(), 1);
             assert!(pick.trace.drew_first(), "no pass over the pool ran");
+            assert_eq!(pick.trace.seed, 0, "no seed was drawn");
             let target = pick.targets.first().expect("the target");
             let worker = &list[target.position as usize];
             assert_eq!(target.id, worker_id(worker.as_ref()));
@@ -413,46 +464,37 @@ mod tests {
                 (lease.side, lease.booked, lease.target_index),
                 (Side::Single, target.id, 0)
             );
+            assert_eq!((lease.tokens, lease.session), (321, Session::NONE));
+            assert_eq!(lease.session_verdict, SessionVerdict::None);
             assert!(lease.id.0 > last, "each pick takes the next id");
             last = lease.id.0;
             assert_eq!(decided.decode_session, Session::NONE);
+            assert_eq!(heard.lock().last(), Some(&("issued", target.id, 0)));
         }
         assert_eq!(seen, [2; 4], "every worker takes its turn");
+        assert_eq!(heard.lock().len(), 8, "one issue a pick");
+        assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
     }
 
-    /// A plain request of a place one pick decides is decided with no
-    /// request made: the engine asks the maker's plain word and nothing
-    /// else of it. Its lease states the size the word states and no
-    /// session, dated on the engine's clock, and its trace no seed. A
-    /// request that is not plain, and a plain one the turn finds no worker
-    /// for, is made once and put to the whole pass.
+    /// A request that is not plain, and a plain one the turn finds no
+    /// worker for, is made once and put to the whole pass. Under a document
+    /// that takes no word its pick has no lease either.
     #[test]
-    fn a_plain_request_of_a_place_one_pick_decides_is_never_made() {
+    fn a_request_the_one_pick_does_not_decide_is_made_once() {
         let engine = preset("round_robin");
         let list = pool(4);
         let members = engine.pool_members(&list);
-        let mut sized = request();
-        sized.facts.prompt_tokens = 321;
-        sized.facts.session_key = Identity::plain("a-key");
-        let asks = Asks::of(sized, Some(&members));
-        for _ in 0..8 {
-            let decided = decided(&engine, &asks);
-            let pick = decided.decision.pick().expect("a pick");
-            assert!(pick.trace.drew_first(), "no pass over the pool ran");
-            assert_eq!(pick.trace.seed, 0, "no seed was drawn");
-            let lease = decided.lease.expect("a lease").lease;
-            assert_eq!((lease.tokens, lease.session), (321, Session::NONE));
-            assert_eq!(lease.session_verdict, SessionVerdict::None);
-        }
-        assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
 
         // A retry is not plain: it is made, once a decision.
         let tried = [worker_id(list[0].as_ref())];
         let mut retry = request();
         retry.facts.tried = &tried;
         let asks = Asks::of(retry, Some(&members));
-        assert!(decided(&engine, &asks).decision.pick().is_some());
+        let whole = decided(&engine, &asks);
+        assert!(whole.decision.pick().is_some());
+        assert!(whole.lease.is_none(), "no stage takes a word of it");
         assert_eq!(asks.made.get(), 1);
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
 
         // A plain request whose turns land on no eligible worker is made
         // for the whole pass, which answers by the binding's own rule.
@@ -574,7 +616,7 @@ mod tests {
         );
         dialed.constraints.wire_modes = WireModes::HTTP.union(WireModes::GRPC);
         let asks = Asks::of(dialed, Some(&members));
-        assert!(decided(&engine, &asks).decision.pick().is_some());
+        assert!(matches!(answered(&engine, &asks), Decided::Alone(_)));
         let mut side = request();
         side.facts.phase = Phase::Decode;
         let asks = Asks::of(side, Some(&members));
@@ -590,15 +632,22 @@ mod tests {
     /// books (the target's own at a dispatch), and the lease's index.
     type Heard = Arc<Mutex<Vec<(&'static str, WorkerId, u8)>>>;
 
-    /// The `random` picker, keeping what it hears. `panics` makes its pick
-    /// panic.
+    /// The `random` picker, keeping what it hears of the words it names
+    /// (`takes`). `panics` makes its pick panic. `alone` makes it place a
+    /// request over a pool by itself, by the pool's own turn.
     #[derive(Debug)]
     struct Hears {
         heard: Heard,
         panics: bool,
+        alone: bool,
+        takes: Words,
     }
 
     impl Lifecycle for Hears {
+        fn hears(&self) -> Words {
+            self.takes
+        }
+
         fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
             let heard = ("issued", lease.booked, lease.target_index);
             self.heard.lock().push(heard);
@@ -625,6 +674,24 @@ mod tests {
             "hears"
         }
 
+        // A picker that places by itself refuses by no report.
+        fn refuses_by_reports(&self) -> bool {
+            !self.alone
+        }
+
+        fn picks_alone(&self) -> bool {
+            self.alone
+        }
+
+        fn pick_alone(
+            &self,
+            pool: &PoolWord<'_>,
+            keep: &mut dyn FnMut(usize) -> bool,
+        ) -> Option<usize> {
+            let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % pool.rows.max(1);
+            keep(turn).then_some(turn)
+        }
+
         fn pick(
             &self,
             facts: &RequestFacts<'_>,
@@ -640,8 +707,14 @@ mod tests {
     }
 
     /// The engine of the `random` preset with [`Hears`] in its pick's place,
-    /// and what it heard.
+    /// taking every word of a lease, and what it heard.
     fn hearing(panics: bool) -> (PolicyEngine, Heard) {
+        hearing_as(panics, false, Words::ALL)
+    }
+
+    /// [`hearing`] with a picker that places by itself where `alone`, and
+    /// that names the words `takes`.
+    fn hearing_as(panics: bool, alone: bool, takes: Words) -> (PolicyEngine, Heard) {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let mut stages = StageRegistry::builtin();
@@ -649,6 +722,8 @@ mod tests {
             Box::new(Hears {
                 heard: Arc::clone(&kept),
                 panics,
+                alone,
+                takes,
             })
         });
         added.expect("a free name");
@@ -712,6 +787,46 @@ mod tests {
                 ("released", given_up.id, 0),
             ]
         );
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+    }
+
+    /// A word of a lease is told where a stage takes it and to nobody
+    /// where none does: under a document whose one stage takes the dispatch
+    /// alone, the issue, the end and the release of its leases are not
+    /// told.
+    #[test]
+    fn a_word_no_stage_takes_is_told_to_nobody() {
+        let takes = Words {
+            dispatch: true,
+            ..Words::NONE
+        };
+        let (engine, heard) = hearing_as(false, false, takes);
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        let now = Instant::now();
+        let mut handle =
+            DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+        let first = handle.take(0).expect("the first target");
+        handle.dispatched(now);
+        handle.completed(
+            &Outcome {
+                side: Side::Single,
+                served: first.id,
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+            now,
+        );
+        drop(handle);
+        let unsent =
+            DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+        drop(unsent);
+        assert_eq!(*heard.lock(), [("dispatched", first.id, 0)]);
         assert_eq!((engine.faults(), engine.unheard()), (0, 0));
     }
 

@@ -586,7 +586,7 @@ fn a_failed_placement_adds_its_row_each_time() -> Case {
         &workers[0],
         StatusCode::OK.into_response(),
         false,
-        Some(row),
+        || Some(row),
     );
     assert!(tried_rows.lock().is_empty());
     for _ in 0..2 {
@@ -595,7 +595,7 @@ fn a_failed_placement_adds_its_row_each_time() -> Case {
             &workers[0],
             StatusCode::SERVICE_UNAVAILABLE.into_response(),
             false,
-            Some(row),
+            || Some(row),
         );
     }
     assert_eq!(*tried_rows.lock(), [row, row]);

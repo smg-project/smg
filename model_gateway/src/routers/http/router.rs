@@ -780,13 +780,10 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        let response = self.account_attempt_outcome(
-            attempt,
-            &worker,
-            response,
-            head_success_recorded,
-            placed.as_ref().map(|sent| sent.id()),
-        );
+        let response =
+            self.account_attempt_outcome(attempt, &worker, response, head_success_recorded, || {
+                placed.as_ref().map(|sent| sent.id())
+            });
 
         match placed {
             None => response,
@@ -1133,7 +1130,7 @@ impl Router {
         worker: &Arc<dyn Worker>,
         mut response: Response,
         head_success_recorded: bool,
-        row: Option<WorkerId>,
+        row: impl FnOnce() -> Option<WorkerId>,
     ) -> Response {
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
@@ -1153,7 +1150,7 @@ impl Router {
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
-            if let Some(row) = row {
+            if let Some(row) = row() {
                 attempt.tried_rows.lock().push(row);
             }
             let mut tried = attempt.tried.lock();

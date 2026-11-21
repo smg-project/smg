@@ -78,6 +78,13 @@ pub fn worker_id(worker: &dyn Worker) -> WorkerId {
     WorkerId(fingerprint(worker.url().as_bytes()))
 }
 
+/// The data-parallel rank a pick that reads no record names for `worker`:
+/// the rank its registration states, and the first where it states none.
+#[must_use]
+pub fn worker_rank(worker: &dyn Worker) -> u16 {
+    u16::try_from(worker.dp_rank().unwrap_or(0)).unwrap_or(u16::MAX)
+}
+
 /// The clock of one engine's decisions over a gateway's own data, and its
 /// count of the pools made.
 ///

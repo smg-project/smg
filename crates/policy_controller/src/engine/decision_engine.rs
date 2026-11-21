@@ -33,13 +33,14 @@
 use std::time::Instant;
 
 use super::{
-    decision::{Decision, ShadowKind, Target},
+    decision::{Decision, Pick, ShadowKind, Survivors, Target, Targets, Trace},
     framework::{EncodeItems, EncodePlaced},
     prompt_hashes::{HashSeeds, PromptHashes},
+    sticky_sessions::SessionVerdict,
     store_backed_engine::{
         self, DecideOutcome, DecisionRefused, Request, StoreBackedEngine, SweepOutcome,
     },
-    view::{Phase, Session, WireModes},
+    view::{Phase, Session, WireModes, WorkerId},
 };
 use crate::{
     document::AppliedSpec,
@@ -204,17 +205,107 @@ pub struct HeldDecision<'a> {
     pub decode_chosen: bool,
 }
 
+/// What the one entry answers its host ([`DecisionEngine::decide_under`]).
+///
+/// The answer is written where its host reads it and matched at once: it
+/// is not kept, so the two forms differ in size freely. A whole decision in
+/// a box would be an allocation a decision.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "matched where it is returned; a boxed decision would allocate at each one"
+)]
+pub enum Decided {
+    /// A pick of which nothing is owed ([`AlonePick`]): the host sends to
+    /// the worker at the place and tells the engine no more.
+    Alone(AlonePick),
+    /// A decision as a guard holds it
+    /// ([`DecisionGuard::holding`](crate::tracking::DecisionGuard::holding)),
+    /// and whether the request its maker made stated the later decode
+    /// ([`Constraints::decode_later`](super::view::Constraints::decode_later)).
+    Whole(DecideOutcome, bool),
+}
+
+impl Decided {
+    /// The whole decision, for a host that handed no single list of its
+    /// own. No place answers such a host ([`AlonePick`]), so `None` there
+    /// is its engine's fault.
+    #[must_use]
+    pub fn whole(self) -> Option<(DecideOutcome, bool)> {
+        match self {
+            Self::Whole(decided, later) => Some((decided, later)),
+            Self::Alone(_) => None,
+        }
+    }
+}
+
+/// A plain single request's pick, where the document decides the request's
+/// place by one pick of its picker and no stage of the document takes a
+/// word on a lease ([`Lifecycle::hears`](crate::stages::Lifecycle::hears)).
+///
+/// The worker is the one at `place` of the list its host handed
+/// ([`WorkerLists::Single`]): the picker's turn landed on it and read it
+/// eligible at this call. No request was made for the pick, no lease is
+/// issued, no id is taken and nothing is dated. The host sends to the
+/// worker and owes the engine no word of the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlonePick {
+    /// The worker's place in the list.
+    pub place: u32,
+    /// The profile whose picker picked, by its position in the document:
+    /// with `generation`, what a host counts the decision under.
+    pub profile: u16,
+    /// The document's generation.
+    pub generation: u64,
+}
+
+impl AlonePick {
+    /// The pick as a decision that names its one worker, by `id` and
+    /// `dp_rank`: what a lease is issued for where a stage takes a word,
+    /// and what a host's trace of the pick shows. The trace is a drawn
+    /// pick's: no pass over the pool ran, so it counts no survivor, and no
+    /// seed was drawn for it.
+    #[must_use]
+    pub fn decision(self, id: WorkerId, dp_rank: u16) -> Decision {
+        let mut targets = Targets::new();
+        targets.push(Target {
+            position: self.place,
+            id,
+            dp_rank,
+            pair: None,
+        });
+        let mut trace = Trace {
+            profile: self.profile,
+            survivors: Survivors::NOT_COUNTED,
+            top_len: 1,
+            generation: self.generation,
+            ..Trace::default()
+        };
+        trace.top[0] = (id, 0.0);
+        Decision::Pick(Pick {
+            targets,
+            trace,
+            session_verdict: SessionVerdict::None,
+        })
+    }
+}
+
 /// An engine a host asks for whole decisions and tells of each lease.
 pub trait DecisionEngine {
     /// One decision for `gateway`'s request at `now`, on the calling
     /// thread: the binding, its rules, the plan and the profile, for the
-    /// request `maker` makes under the document in force. A pick comes
-    /// with its lease, issued before the answer leaves: the stages have
-    /// heard of the request, and its booking stands on the first target.
+    /// request `maker` makes under the document in force.
     ///
-    /// The flag beside the decision says whether the request the maker
-    /// made stated the later decode
+    /// The answer is whole ([`Decided::Whole`]) or a place alone
+    /// ([`Decided::Alone`]). A whole pick comes with its lease where a
+    /// stage of the document takes a word on one, issued before the answer
+    /// leaves: the stages that take the issue have heard of the request,
+    /// and its booking stands on the first target. The flag beside it says
+    /// whether the request the maker made stated the later decode
     /// ([`Constraints::decode_later`](super::view::Constraints::decode_later)).
+    /// A place answers only a maker that hands a single list
+    /// ([`RequestMaker::workers`]) and says its request plain
+    /// ([`RequestMaker::plain`]).
     ///
     /// # Errors
     ///
@@ -224,7 +315,7 @@ pub trait DecisionEngine {
         gateway: GatewayId,
         maker: &impl RequestMaker,
         now: Instant,
-    ) -> Result<(DecideOutcome, bool), DecisionRefused>;
+    ) -> Result<Decided, DecisionRefused>;
 
     /// [`Self::decide_under`] for a request its host stated ahead.
     ///
@@ -237,7 +328,9 @@ pub trait DecisionEngine {
         request: &Request<'_>,
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
-        let (decided, _) = self.decide_under(gateway, request, now)?;
+        // A request stated ahead hands no list: no place answers it.
+        let decided = self.decide_under(gateway, request, now)?;
+        let (decided, _) = decided.whole().ok_or(DecisionRefused::Faulted)?;
         Ok(decided)
     }
 
@@ -340,8 +433,9 @@ impl DecisionEngine for StoreBackedEngine {
         gateway: GatewayId,
         maker: &impl RequestMaker,
         now: Instant,
-    ) -> Result<(DecideOutcome, bool), DecisionRefused> {
-        self.decide_under_stated(gateway, maker, now)
+    ) -> Result<Decided, DecisionRefused> {
+        let (decided, later) = self.decide_under_stated(gateway, maker, now)?;
+        Ok(Decided::Whole(decided, later))
     }
 
     // A request stated ahead of the load pays nothing for a maker's form.

@@ -8,15 +8,17 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        Phase, Plain, PolicyEngine as OwnEngine, RequestMaker, ShedReason, WireModes, WorkerId,
+        worker_id, Phase, Plain, PolicyEngine as OwnEngine, RequestMaker, ShedReason, WireModes,
+        WorkerId,
     },
+    tracking::TransportClass,
 };
 use smg_worker::{
     identity::basic::{ConnectionMode, Worker},
     test_support::no_health_check,
 };
 
-use super::{mark, Ask, Made, PolicyEngine, Prompt, Unplaced};
+use super::{mark, Ask, End, Made, PolicyEngine, Prompt, Unplaced};
 use crate::routers::{
     common::snapshot::{RoutingPool, WorkerRegistry},
     grpc::backend_client::BasicWorkerBuilder,
@@ -27,16 +29,24 @@ const MODEL: &str = "model-a";
 /// The object over the engine of the preset `name`, with `workers` ready
 /// HTTP workers of [`MODEL`] in its registry.
 fn own(name: &str, workers: usize) -> (PolicyEngine, Vec<Arc<dyn Worker>>) {
+    own_dialed(name, &vec![ConnectionMode::Http; workers])
+}
+
+/// [`own`] with one ready worker a connection mode of `modes`, in their
+/// order.
+fn own_dialed(name: &str, modes: &[ConnectionMode]) -> (PolicyEngine, Vec<Arc<dyn Worker>>) {
     let mut document = PolicySpec::preset(name).expect("a built-in preset");
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     let registry = Arc::new(WorkerRegistry::new());
-    let listed = (0..workers)
-        .map(|at| {
+    let listed = modes
+        .iter()
+        .enumerate()
+        .map(|(at, &mode)| {
             let worker: Arc<dyn Worker> = Arc::new(
                 BasicWorkerBuilder::new(format!("http://worker-{at}:8000"))
                     .model(ModelCard::new(MODEL))
-                    .connection_mode(ConnectionMode::Http)
+                    .connection_mode(mode)
                     .health_config(no_health_check())
                     .build(),
             );
@@ -178,5 +188,203 @@ async fn an_ask_with_no_pool_has_no_worker_and_a_retry_passes_the_worker_it_trie
             .await
             .expect("another worker");
         assert!(!Arc::ptr_eq(placed.worker(), &failed));
+    }
+}
+
+/// Under round robin no stage takes a word of a request, so a first attempt
+/// is answered a place. Its placement holds no lease and its reports say
+/// nothing. It names its worker where a route asks: by the id a whole
+/// decision names the same worker by, which a retry states as tried, and by
+/// the rank the worker's registration states. A retry's whole decision is
+/// leased nothing either.
+#[tokio::test]
+async fn a_place_holds_no_lease_and_names_its_worker_where_asked() {
+    let (policy_engine, _workers) = own("round_robin", 3);
+    let id = mark();
+    let ask = Ask {
+        pool: Some(RoutingPool::HttpRegular),
+        prompt_tokens: 9,
+        ..Ask::of(&id, MODEL)
+    };
+    let now = Instant::now();
+    let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
+    assert!(placed.lease().is_none());
+    assert_eq!(placed.id(), worker_id(placed.worker().as_ref()));
+    assert_eq!(placed.rank(), 0);
+    placed.dispatched(now);
+    placed.completed(
+        End {
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        },
+        now,
+    );
+    let tried = [placed.id()];
+    let retry = Ask {
+        tried: &tried,
+        ..ask
+    };
+    let again = policy_engine
+        .place(&retry, now)
+        .await
+        .expect("another worker");
+    assert!(again.lease().is_none(), "no stage takes a word of it");
+    assert_eq!(again.id(), worker_id(again.worker().as_ref()));
+    assert_ne!(again.id(), placed.id());
+    assert_eq!(policy_engine.faults(), 0);
+}
+
+/// Under a document a stage of which takes a word of a request, as least
+/// load takes the dispatch, a placement holds its decision's lease, which
+/// states the request's size.
+#[tokio::test]
+async fn a_placement_is_leased_where_a_stage_takes_a_word() {
+    let (policy_engine, _workers) = own("least_load", 3);
+    let id = mark();
+    let ask = Ask {
+        pool: Some(RoutingPool::HttpRegular),
+        prompt_tokens: 9,
+        ..Ask::of(&id, MODEL)
+    };
+    let now = Instant::now();
+    let mut placed = policy_engine.place(&ask, now).await.expect("a worker");
+    assert_eq!(placed.lease_tokens(), Some(9));
+    assert_eq!(placed.id(), worker_id(placed.worker().as_ref()));
+    placed.dispatched(now);
+}
+
+/// A route's rule that refuses a worker picked narrows the attempt to the
+/// workers it holds: the request is placed on one of them while one stands,
+/// however few of the pool they are, and they take such requests in turn.
+/// Of 64 requests over 16 workers each worker is picked four times; the two
+/// the rule holds keep theirs and share the other 56 evenly. A rule that
+/// holds no worker leaves the attempt none.
+#[tokio::test]
+async fn a_routes_rule_narrows_the_attempt_to_the_workers_it_holds() {
+    let (policy_engine, workers) = own("round_robin", 16);
+    let held = [Arc::clone(&workers[3]), Arc::clone(&workers[11])];
+    let holds = |worker: &dyn Worker| held.iter().any(|held| held.url() == worker.url());
+    let mut placed_on = [0_u32; 2];
+    for _ in 0..64 {
+        let id = mark();
+        let ask = Ask {
+            pool: Some(RoutingPool::HttpRegular),
+            ..Ask::of(&id, MODEL)
+        };
+        let placed = policy_engine
+            .place_where(&ask, &holds, Instant::now())
+            .await
+            .expect("a worker the rule holds");
+        let at = held
+            .iter()
+            .position(|held| Arc::ptr_eq(held, placed.worker()));
+        placed_on[at.expect("a worker the rule holds")] += 1;
+    }
+    assert_eq!(placed_on, [32, 32]);
+    assert_eq!(policy_engine.faults(), 0);
+    // Under a document that leases its decisions too: the lease of the
+    // decision whose targets the rule refused is given up within the
+    // attempt.
+    for name in ["round_robin", "least_load"] {
+        let (policy_engine, _workers) = own(name, 3);
+        let id = mark();
+        let ask = Ask {
+            pool: Some(RoutingPool::HttpRegular),
+            ..Ask::of(&id, MODEL)
+        };
+        let unplaced = policy_engine
+            .place_where(&ask, |_| false, Instant::now())
+            .await
+            .err();
+        assert!(
+            matches!(unplaced, Some(Unplaced::NoTargetHolds)),
+            "{name}: {unplaced:?}"
+        );
+        assert_eq!(policy_engine.faults(), 0, "{name}");
+    }
+}
+
+/// An ask that states the workers it may take is decided over them alone,
+/// whatever pool it names, and they take its requests in turn.
+#[tokio::test]
+async fn an_ask_that_states_its_workers_is_decided_over_them_alone() {
+    let (policy_engine, workers) = own("round_robin", 8);
+    let among: Arc<[Arc<dyn Worker>]> = [Arc::clone(&workers[1]), Arc::clone(&workers[6])].into();
+    let mut placed_on = [0_u32; 2];
+    for _ in 0..32 {
+        let id = mark();
+        let ask = Ask {
+            pool: Some(RoutingPool::HttpRegular),
+            among: Some(&among),
+            ..Ask::of(&id, MODEL)
+        };
+        let placed = policy_engine
+            .place(&ask, Instant::now())
+            .await
+            .expect("a worker of the list");
+        let at = among
+            .iter()
+            .position(|listed| Arc::ptr_eq(listed, placed.worker()));
+        placed_on[at.expect("a worker of the list")] += 1;
+    }
+    assert_eq!(placed_on, [16, 16]);
+}
+
+/// An ask held to one wire, over a pool whose workers are dialed on two, is
+/// decided over the pool's workers on that wire alone, and they take its
+/// requests in turn. An ask that dials both wires is decided over the pool.
+#[tokio::test]
+async fn an_ask_held_to_one_wire_is_decided_over_the_workers_on_it() {
+    use ConnectionMode::{Grpc, Zmq};
+    let (policy_engine, workers) = own_dialed("round_robin", &[Grpc, Zmq, Grpc, Zmq]);
+    let mut placed_on = [0_u32; 4];
+    for wires in [WireModes::GRPC, WireModes::GRPC.union(WireModes::ZMQ)] {
+        for _ in 0..8 {
+            let id = mark();
+            let ask = Ask {
+                pool: Some(RoutingPool::GrpcPipelineRegular),
+                wires,
+                ..Ask::of(&id, MODEL)
+            };
+            let placed = policy_engine
+                .place(&ask, Instant::now())
+                .await
+                .expect("a worker on the wire");
+            let at = workers
+                .iter()
+                .position(|worker| Arc::ptr_eq(worker, placed.worker()));
+            placed_on[at.expect("a worker the registry lists")] += 1;
+        }
+    }
+    assert_eq!(placed_on, [6, 2, 6, 2]);
+}
+
+/// A pool none of whose workers is ready leaves the attempt no worker,
+/// under a document that leases its decisions and under one that does not.
+#[tokio::test]
+async fn a_pool_with_no_ready_worker_leaves_the_attempt_none() {
+    for name in ["round_robin", "least_load"] {
+        let (policy_engine, workers) = own(name, 3);
+        for worker in &workers {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let id = mark();
+        let ask = Ask {
+            pool: Some(RoutingPool::HttpRegular),
+            ..Ask::of(&id, MODEL)
+        };
+        let unplaced = policy_engine.place(&ask, Instant::now()).await.err();
+        assert!(
+            matches!(
+                unplaced,
+                Some(Unplaced::Shed { .. } | Unplaced::NoTargetHolds)
+            ),
+            "{name}: {unplaced:?}"
+        );
+        assert_eq!(policy_engine.faults(), 0, "{name}");
     }
 }

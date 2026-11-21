@@ -82,7 +82,8 @@ fn keyed(key: u64, members: &PoolMembers) -> Asks<'_> {
 
 fn decided(engine: &PolicyEngine, asks: &Asks<'_>) -> DecideOutcome {
     let decided = engine.decide_under(GatewayId::LOCAL, asks, Instant::now());
-    decided.expect("a decision").0
+    let whole = decided.expect("an answer").whole();
+    whole.expect("a whole decision").0
 }
 
 /// The whole decision of `asks`' request over every worker's record, by

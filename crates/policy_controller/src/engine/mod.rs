@@ -36,7 +36,7 @@ pub use decision::{
 };
 #[cfg(feature = "in-process")]
 pub use decision_engine::WorkerLists;
-pub use decision_engine::{DecisionEngine, HeldDecision, Plain, RequestMaker};
+pub use decision_engine::{AlonePick, Decided, DecisionEngine, HeldDecision, Plain, RequestMaker};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{
@@ -57,7 +57,7 @@ pub use policy_engine::pair::{prefills_full, PairAdmission, PairLists};
 pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
-pub use records::{decide, worker_id, DecisionClock, Live, PoolRecords};
+pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
 pub use sticky_sessions::{
     SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,

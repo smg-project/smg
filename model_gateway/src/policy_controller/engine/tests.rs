@@ -2068,7 +2068,7 @@ async fn a_pair_that_finds_no_room_queues_and_is_decided_again_at_its_admission(
     let Ok((placed, _guard)) = attempt.await else {
         panic!("a new decision is admitted");
     };
-    let second = placed.handle.lease().expect("a lease").lease.id;
+    let second = placed.lease().expect("a lease").lease.id;
     assert_eq!(
         bed.issued(Side::Prefill)
             .iter()
@@ -2296,7 +2296,7 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
         .commit_pair(asked, None, &mut Vec::new(), now)
         .expect("a placement");
     let (prefill, decode) = (bed.prefills[0].0, bed.decodes[0].0);
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     bed.calls.lock().clear();
     placed.dispatched(now + Duration::from_micros(5));
     placed.decode_dispatched(now + Duration::from_micros(8));
@@ -2464,7 +2464,7 @@ async fn the_routes_rule_passes_over_a_pair_at_its_commit() {
 async fn a_sent_pairs_prefill_ends_ahead_of_its_answer() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let placed = bed.commit().await.expect("a placement");
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     let mut sent = Sent::from(placed);
     let now = Instant::now();
     bed.calls.lock().clear();
@@ -2496,7 +2496,7 @@ async fn a_sent_pairs_prefill_ends_ahead_of_its_answer() {
 async fn a_prefill_that_was_not_sent_hears_no_dispatch_and_no_end() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let placed = bed.commit().await.expect("a placement");
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     let decode = bed.decodes[0].0;
     let mut sent = Sent::from(placed);
     let now = Instant::now();
@@ -2519,7 +2519,7 @@ async fn a_prefill_that_was_not_sent_hears_no_dispatch_and_no_end() {
 async fn releasing_the_decode_leaves_the_prefill_on_file() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let mut placed = bed.commit().await.expect("a placement");
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     placed.decode_released(ReleaseReason::ClientGone, Instant::now());
     let sides = bed.store.sides(GATEWAY, lease).expect("the prefill stands");
     assert_eq!(sides.record.state, LeaseState::ISSUED);

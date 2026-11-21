@@ -21,7 +21,10 @@
 //! A router speaks to [`Placed`] and [`Held`], never to the controller's
 //! handle. [`Placed`] holds the workers and the decision's lease. Each
 //! side reports its dispatch, then its end or a release. The handle says
-//! any reports still owed at the drop. [`Held`] carries a regular
+//! any reports still owed at the drop. A placement the engine of this
+//! process made under a document no stage of which takes a word of a
+//! request holds no lease and no handle: nothing is owed of it, and each
+//! report says nothing. [`Held`] carries a regular
 //! worker's load guard with the placement to the response's end. The
 //! regular HTTP router holds its placement over the body that carries the
 //! guard.
@@ -49,11 +52,12 @@ use rand::RngExt;
 use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
     engine::{
-        Constraints, DecideOutcome, Decision, DecisionEngine, DecisionRefused, EncodeItems,
-        EncodePlaced, HashSeeds, HeldDecision, Identity, LiftedVeto, MediaCounts, Pair, Phase,
-        Plain, PolicyEngine as OwnEngine, PoolMembers, Request, RequestFacts, RequestMaker,
-        ShadowKind, ShedReason, StoreBackedEngine, SweepOutcome, Targets, Trace, WireModes,
-        WorkerId, WorkerLists, MAX_TARGETS,
+        worker_id, worker_rank, AlonePick, Constraints, DecideOutcome, Decided, Decision,
+        DecisionEngine, DecisionRefused, EncodeItems, EncodePlaced, HashSeeds, HeldDecision,
+        Identity, LiftedVeto, MediaCounts, Pair, Phase, Plain, PolicyEngine as OwnEngine,
+        PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind, ShedReason,
+        StoreBackedEngine, SweepOutcome, Target, Targets, Trace, WireModes, WorkerId, WorkerLists,
+        MAX_TARGETS,
     },
     store::{pairing::Refusal, GatewayId, MemoryStore, Said},
     tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
@@ -188,13 +192,21 @@ pub(crate) struct Ask<'a> {
     /// states none is decided over no worker there. A followed controller's
     /// engine reads its own rows and nothing here.
     pub pool: Option<RoutingPool>,
+    /// The workers the request may take, where its route narrowed them
+    /// ahead of the ask by the test its classic arm asks of a candidate: a
+    /// part of the pool's list, in the list's order. The engine of this
+    /// process decides over them alone and keeps nothing of the list. A
+    /// route that narrows nothing states none, and its ask is decided over
+    /// the pool. A followed controller's engine reads nothing here.
+    pub among: Option<&'a Arc<[Arc<dyn Worker>]>>,
 }
 
 impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
     /// input of a routing key, no media, no stated wire, nothing tried, no
-    /// stated attempt, no hashes, no second ask of a decode, no pool.
+    /// stated attempt, no hashes, no second ask of a decode, no pool and no
+    /// narrowed list.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -211,6 +223,7 @@ impl<'a> Ask<'a> {
             attempt: None,
             hashes: None,
             pool: None,
+            among: None,
         }
     }
 
@@ -564,7 +577,7 @@ impl DecisionEngine for Decider {
         gateway: GatewayId,
         maker: &impl RequestMaker,
         now: Instant,
-    ) -> Result<(DecideOutcome, bool), DecisionRefused> {
+    ) -> Result<Decided, DecisionRefused> {
         match self {
             Self::Followed(door) => DecisionEngine::decide_under(door, gateway, maker, now),
             Self::Own(engine) => engine.decide_under(gateway, maker, now),
@@ -803,11 +816,17 @@ impl PolicyEngine {
     }
 
     fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
+        self.profile_named(trace.generation, trace.profile)
+    }
+
+    /// The name of the profile at `profile` of the document of
+    /// `generation`: `None` where another generation is in force.
+    fn profile_named(&self, generation: u64, profile: u16) -> Option<Arc<str>> {
         self.door.with_spec(|spec| {
-            if spec.generation() != trace.generation {
+            if spec.generation() != generation {
                 return None;
             }
-            let profile = spec.engine().profiles().get(usize::from(trace.profile))?;
+            let profile = spec.engine().profiles().get(usize::from(profile))?;
             Some(Arc::from(profile.name.as_str()))
         })
     }
@@ -858,42 +877,63 @@ impl PolicyEngine {
     }
 
     fn trace_decision(&self, decision: &Decision, worker: Option<&Arc<dyn Worker>>) {
+        cache_trace::decided(|| self.traced(decision, worker));
+    }
+
+    /// The cache trace's line of a place the engine of this process
+    /// answered ([`Decided::Alone`]), with `worker` the worker at the
+    /// place: `taken`, or passed over by its route's rule. The decision the
+    /// line shows is written here, where the process captures the trace:
+    /// nothing else reads one of a place.
+    fn trace_place(&self, pick: AlonePick, worker: &Arc<dyn Worker>, taken: bool) {
         cache_trace::decided(|| {
-            let trace = decision.trace();
-            let shed = match decision {
-                Decision::Shed(shed) => {
-                    let reason = match shed.reason {
-                        ShedReason::Saturated => "saturated",
-                        ShedReason::FlowLimit => "flow_limit",
-                        ShedReason::NoEndpoints => "no_endpoints",
-                        ShedReason::PolicyDeclined => "policy_declined",
-                        ShedReason::Deadline => "deadline",
-                    };
-                    Some((reason, shed.emptied_by))
-                }
-                Decision::Pick(_) | Decision::Queue(_) => None,
-            };
-            cache_trace::Decided {
-                profile: profile_of(decision).and_then(|_| self.profile_name(trace)),
-                outcome: outcome(decision),
-                generation: trace.generation,
-                survivors: trace.survivors.get(),
-                top: trace
-                    .top
-                    .iter()
-                    .take(usize::from(trace.top_len))
-                    .map(|&(id, score)| (self.worker(id), score))
-                    .collect(),
-                seed: trace.seed,
-                lifted: match trace.lifted {
-                    LiftedVeto::None => "none",
-                    LiftedVeto::Overload => "overload",
-                    LiftedVeto::Liveness => "liveness",
-                },
-                shed,
-                worker: worker.cloned(),
-            }
+            let id = worker_id(worker.as_ref());
+            let decision = pick.decision(id, worker_rank(worker.as_ref()));
+            self.traced(&decision, taken.then_some(worker))
         });
+    }
+
+    /// What the cache trace shows of `decision` and of the `worker` taken
+    /// for it.
+    fn traced(
+        &self,
+        decision: &Decision,
+        worker: Option<&Arc<dyn Worker>>,
+    ) -> cache_trace::Decided {
+        let trace = decision.trace();
+        let shed = match decision {
+            Decision::Shed(shed) => {
+                let reason = match shed.reason {
+                    ShedReason::Saturated => "saturated",
+                    ShedReason::FlowLimit => "flow_limit",
+                    ShedReason::NoEndpoints => "no_endpoints",
+                    ShedReason::PolicyDeclined => "policy_declined",
+                    ShedReason::Deadline => "deadline",
+                };
+                Some((reason, shed.emptied_by))
+            }
+            Decision::Pick(_) | Decision::Queue(_) => None,
+        };
+        cache_trace::Decided {
+            profile: profile_of(decision).and_then(|_| self.profile_name(trace)),
+            outcome: outcome(decision),
+            generation: trace.generation,
+            survivors: trace.survivors.get(),
+            top: trace
+                .top
+                .iter()
+                .take(usize::from(trace.top_len))
+                .map(|&(id, score)| (self.worker(id), score))
+                .collect(),
+            seed: trace.seed,
+            lifted: match trace.lifted {
+                LiftedVeto::None => "none",
+                LiftedVeto::Overload => "overload",
+                LiftedVeto::Liveness => "liveness",
+            },
+            shed,
+            worker: worker.cloned(),
+        }
     }
 
     /// The ask: one decision for `ask` at `now` through the controller's
@@ -1030,10 +1070,9 @@ impl PolicyEngine {
                 self.trace_decision(handle.decision(), Some(&worker));
                 return Some(Placed {
                     worker,
-                    id: target.id,
-                    rank: target.dp_rank,
+                    named: Named::of(target),
                     pair: None,
-                    handle,
+                    handle: Some(handle),
                 });
             }
         }
@@ -1100,8 +1139,7 @@ impl PolicyEngine {
             handle.take(index);
             return Ok(Placed {
                 worker: Arc::clone(worker),
-                id: target.id,
-                rank: target.dp_rank,
+                named: Named::of(target),
                 pair: Some(Box::new(PlacedPair {
                     kept: None,
                     decode: Arc::clone(decode),
@@ -1109,7 +1147,7 @@ impl PolicyEngine {
                     targets,
                     index,
                 })),
-                handle,
+                handle: Some(handle),
             });
         }
         handle.released(ReleaseReason::CommitFailed, now);
@@ -1285,14 +1323,29 @@ impl PolicyEngine {
     /// Each ask reads the list the registry publishes for the ask's pool
     /// once: the membership a classic arm reads. What the engine keeps of
     /// the list stands in the snapshot's cell beside it, made by the list's
-    /// first ask. An ask that states no pool is decided over no worker.
+    /// first ask. An ask that states no pool is decided over no worker. An
+    /// ask that states the workers it may take ([`Ask::among`]) is decided
+    /// over them alone, and the registry is not read for it.
     ///
-    /// The decision stays where its guard holds it. Its targets are walked
-    /// there, best first: a target's worker is the one at the target's
-    /// place in the list, and the first the gateway can send to is taken on
-    /// one read of the worker's state. Nothing of the decision is copied
-    /// before a worker is taken. Where no target holds, the lease is given
-    /// up by name and the targets join the next ask's missed.
+    /// The engine answers one of two things ([`Decided`]). A place is a
+    /// worker of the list and nothing else: no stage of the document takes
+    /// a word of the request, so the placement holds no guard, names no id
+    /// and reads no clock, and its decision is counted and not timed. A
+    /// whole decision is timed from the instant its ask was handed, and its
+    /// targets are walked best first: a target's worker is the one at the
+    /// target's place in the list, and the first the gateway can send to is
+    /// taken on one read of the worker's state. It rides in a guard where
+    /// it is leased, and where it is not, nothing is owed of it. Where no
+    /// target holds, the lease is given up by name and the targets join the
+    /// next ask's missed.
+    ///
+    /// The route's rule (`holds`) is asked of a worker picked. The first
+    /// time it refuses one, the attempt's later asks are decided over the
+    /// workers of the list the rule holds, and over no other: the engine
+    /// picks among what the route can send to, as a classic pass narrows
+    /// its candidates ahead of its policy. Such a list is a part of its
+    /// pool ([`PoolMembers::part`]): nothing is kept of it, and the
+    /// requests narrowed to one part take its workers in turn.
     fn place_listed(
         &self,
         registry: &WorkerRegistry,
@@ -1302,21 +1355,37 @@ impl PolicyEngine {
         now: Instant,
     ) -> Result<Placed, Unplaced> {
         let mut missed: Vec<WorkerId> = Vec::new();
-        for _ in 0..ASKS {
-            let snapshot = ask
-                .pool
-                .map(|pool| (registry.get_routing_snapshot(ask.model), pool));
+        // The workers the route's rule holds, from its first refusal of a
+        // worker picked.
+        let mut ruled: Option<Arc<[Arc<dyn Worker>]>> = None;
+        for asked in 0..ASKS {
+            let first = asked == 0;
+            // An attempt's first ask is timed from the instant it was
+            // handed: a place reads no clock.
+            let started = if first { now } else { Instant::now() };
+            let among = ruled.as_ref().or(ask.among);
+            let snapshot = match among {
+                Some(_) => None,
+                None => ask
+                    .pool
+                    .map(|pool| (registry.get_routing_snapshot(ask.model), pool)),
+            };
             let kept = snapshot.as_ref().map(|(snapshot, pool)| {
                 let list = snapshot.pool(*pool);
                 &**snapshot
                     .pool_members_cell(*pool)
                     .get_or_init(|| Box::new(engine.pool_members(list)))
             });
-            // An ask held to wires the pool's workers do not all serve (a
+            // A list its route or its route's rule narrowed is a part of
+            // its pool, and the engine's for this ask alone: its turns are
+            // its set's own.
+            let narrowed = among.map(PoolMembers::part);
+            let whole = narrowed.as_ref().or(kept);
+            // An ask held to wires the list's workers do not all serve (a
             // retry pinned to its retained plan's wire, over a pool of two
-            // wires) is made over a list of its own, the pool's workers on
-            // those wires, as the classic arm makes one. Nothing is kept of it.
-            let dialed = kept
+            // wires) is made over a list of its own, the workers on those
+            // wires, as the classic arm makes one. Nothing is kept of it.
+            let dialed = whole
                 .filter(|pool| !ask.wires.is_empty() && !ask.wires.contains(pool.wires()))
                 .map(|pool| {
                     let dialed: Arc<[Arc<dyn Worker>]> = pool
@@ -1327,42 +1396,101 @@ impl PolicyEngine {
                         })
                         .cloned()
                         .collect();
-                    engine.pool_members(&dialed)
+                    PoolMembers::part(&dialed)
                 });
-            let members = dialed.as_ref().or(kept);
+            let members = dialed.as_ref().or(whole);
+            let list = members.map(PoolMembers::workers);
             let made = Made {
                 ask,
                 missed: &missed,
                 members,
                 source: Cell::new(None),
             };
-            let started = Instant::now();
-            let decided = DecisionGuard::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
-            let seconds = started.elapsed().as_secs_f64();
+            let decided = engine.decide_under(GATEWAY, &made, now);
             // A key's source counts once an attempt, at its first ask, as
             // an ask of a followed controller counts it.
-            if let Some(source) = made.source.get().filter(|_| missed.is_empty()) {
+            if let Some(source) = made.source.get().filter(|_| first) {
                 Metrics::record_routing_key_source(source);
             }
-            let decision = decided.as_ref().ok().map(DecisionGuard::decision);
+            let (decided, later) = match decided {
+                Ok(Decided::Alone(pick)) => {
+                    Metrics::count_policy_decision(
+                        ask.model,
+                        PolicyDecision {
+                            generation: pick.generation,
+                            profile: Some(pick.profile),
+                            outcome: "pick",
+                            mode: "embedded",
+                        },
+                        || self.profile_named(pick.generation, pick.profile),
+                    );
+                    // The engine picked the place in this list, on the
+                    // read of the worker that found it eligible: the
+                    // worker is read no second time.
+                    let Some(worker) = list.and_then(|list| list.get(pick.place as usize)) else {
+                        continue;
+                    };
+                    if holds(worker.as_ref()) {
+                        self.trace_place(pick, worker, true);
+                        return Ok(Placed {
+                            worker: Arc::clone(worker),
+                            named: Named::ByWorker,
+                            pair: None,
+                            handle: None,
+                        });
+                    }
+                    self.trace_place(pick, worker, false);
+                    match list.filter(|_| ruled.is_none()) {
+                        Some(list) => ruled = Some(held_by(list, holds)?),
+                        // A rule that refuses a worker it held.
+                        None => missed.push(worker_id(worker.as_ref())),
+                    }
+                    continue;
+                }
+                Ok(Decided::Whole(decided, later)) => (decided, later),
+                Err(refused) => {
+                    let seconds = started.elapsed().as_secs_f64();
+                    Metrics::record_policy_decision(ask.model, labels(None), || None, seconds);
+                    return Err(Unplaced::Refused(refused));
+                }
+            };
+            let seconds = started.elapsed().as_secs_f64();
             Metrics::record_policy_decision(
                 ask.model,
-                labels(decision),
-                || self.named(decision),
+                labels(Some(&decided.decision)),
+                || self.named(Some(&decided.decision)),
                 seconds,
             );
-            let mut handle = decided.map_err(Unplaced::Refused)?;
-            let taken = match handle.decision() {
+            // A decision is leased where a stage takes a word of its
+            // request, and rides in its guard from here: a walk that ends
+            // early gives the lease up at the guard's drop. One that is
+            // not leased owes the engine nothing, and no guard is made.
+            let mut handle = None;
+            let decision = if decided.lease.is_some() {
+                let door = Arc::clone(&self.door);
+                handle
+                    .insert(DecisionGuard::holding(door, GATEWAY, decided, later, now))
+                    .decision()
+            } else {
+                &decided.decision
+            };
+            let mut refused = false;
+            let taken = match decision {
                 Decision::Pick(pick) => {
-                    let list = members.map(PoolMembers::workers);
                     let taken = pick.targets.iter().enumerate().find_map(|(index, target)| {
                         let worker = list?.get(target.position as usize)?;
                         // Ready and let through by its circuit breaker, as
                         // a commit over a store's rows asks
                         // (`routable_but_for_veto`), on one read.
                         let state = worker.routing_state();
-                        (state.healthy && state.can_execute && holds(worker.as_ref()))
-                            .then(|| (index, Arc::clone(worker), target.id, target.dp_rank))
+                        if !(state.healthy && state.can_execute) {
+                            return None;
+                        }
+                        if !holds(worker.as_ref()) {
+                            refused = true;
+                            return None;
+                        }
+                        Some((index, Arc::clone(worker), Named::of(target)))
                     });
                     if taken.is_none() {
                         missed.extend(pick.targets.iter().map(|target| target.id));
@@ -1378,28 +1506,53 @@ impl PolicyEngine {
                     let unpaired = (shed.reason == ShedReason::NoEndpoints)
                         .then(|| self.unpaired(ask))
                         .flatten();
-                    self.trace_decision(handle.decision(), None);
+                    self.trace_decision(decision, None);
                     return Err(unpaired.unwrap_or(verdict));
                 }
                 Decision::Queue(_) => return Err(Unplaced::Queued),
             };
-            let Some((index, worker, id, rank)) = taken else {
-                handle.released(ReleaseReason::CommitFailed, now);
-                self.trace_decision(handle.decision(), None);
+            let Some((index, worker, named)) = taken else {
+                self.trace_decision(decision, None);
+                if let Some(handle) = &mut handle {
+                    handle.released(ReleaseReason::CommitFailed, now);
+                }
+                if let Some(list) = list.filter(|_| refused && ruled.is_none()) {
+                    ruled = Some(held_by(list, holds)?);
+                }
                 continue;
             };
-            handle.take(index);
-            self.trace_decision(handle.decision(), Some(&worker));
+            self.trace_decision(decision, Some(&worker));
+            if let Some(handle) = &mut handle {
+                handle.take(index);
+            }
             return Ok(Placed {
                 worker,
-                id,
-                rank,
+                named,
                 pair: None,
                 handle,
             });
         }
         Err(Unplaced::NoTargetHolds)
     }
+}
+
+/// The workers of `list` a route's rule `holds`, as a list of their own in
+/// the list's order: what an attempt's later asks are decided over once the
+/// rule refused a worker picked. A rule that holds no worker of the list
+/// leaves the attempt none.
+fn held_by(
+    list: &[Arc<dyn Worker>],
+    holds: &impl Fn(&dyn Worker) -> bool,
+) -> Result<Arc<[Arc<dyn Worker>]>, Unplaced> {
+    let held: Arc<[Arc<dyn Worker>]> = list
+        .iter()
+        .filter(|worker| holds(worker.as_ref()))
+        .cloned()
+        .collect();
+    if held.is_empty() {
+        return Err(Unplaced::NoTargetHolds);
+    }
+    Ok(held)
 }
 
 /// A request's end, as its router read it.
@@ -1470,17 +1623,39 @@ fn elapsed_micros(now: Instant, sent: Instant) -> u32 {
 }
 
 /// An attempt's workers, with its decision's lease held to the request's
-/// end.
+/// end where the decision is leased.
 pub(crate) struct Placed {
     worker: Arc<dyn Worker>,
-    /// The store's row of the worker, from the target taken.
-    id: WorkerId,
-    /// The rank that target names for the worker.
-    rank: u16,
+    /// The worker's id and its rank, as the placement names them.
+    named: Named,
     /// A pair's own part, behind one pointer: a regular placement rides in
     /// its router's request context, whose size a case pins.
     pair: Option<Box<PlacedPair>>,
-    handle: DecisionGuard<Arc<Decider>>,
+    /// The guard of the decision's lease: the words of the request are
+    /// said through it. `None` where the engine of this process leased
+    /// nothing, under a document no stage of which takes a word of a
+    /// request: nothing is owed of the placement then, and each report
+    /// below says nothing. A pair's placement holds one.
+    handle: Option<DecisionGuard<Arc<Decider>>>,
+}
+
+/// How a placement names its worker's id and data-parallel rank.
+#[derive(Clone, Copy, Debug)]
+enum Named {
+    /// As the target taken names them: the worker's row and the rank the
+    /// decision picked.
+    ByTarget(WorkerId, u16),
+    /// By nothing kept. A place the engine of this process answered names
+    /// neither: each is read of the worker where a route asks it, a retry
+    /// for the id and a dispatch that pins a rank for the rank.
+    ByWorker,
+}
+
+impl Named {
+    /// The id and the rank `target` names.
+    const fn of(target: &Target) -> Self {
+        Self::ByTarget(target.id, target.dp_rank)
+    }
 }
 
 /// A route's rule for a decode its second commit may take, as a kept ask
@@ -1560,6 +1735,7 @@ impl KeptAsk {
             // A pair is placed over its family's two lists, and no pool
             // of a regular route.
             pool: None,
+            among: None,
         }
     }
 }
@@ -1582,43 +1758,66 @@ impl Placed {
         &self.worker
     }
 
-    /// The store's row of that worker: what a retry names as tried.
+    /// The worker's id: the store's row of it, and what a retry names as
+    /// tried. A place kept none, and the id is read of the worker here.
     pub(crate) fn id(&self) -> WorkerId {
-        self.id
+        match self.named {
+            Named::ByTarget(id, _) => id,
+            Named::ByWorker => worker_id(self.worker.as_ref()),
+        }
     }
 
     /// The data-parallel rank the decision named for the worker: what a
-    /// dispatch that pins a rank sends.
+    /// dispatch that pins a rank sends. A place kept none, and the rank is
+    /// the one the worker's registration states.
     pub(crate) fn rank(&self) -> u16 {
-        self.rank
+        match self.named {
+            Named::ByTarget(_, rank) => rank,
+            Named::ByWorker => worker_rank(self.worker.as_ref()),
+        }
+    }
+
+    /// The placement's lease, for a case that reads it: `None` where the
+    /// placement holds no guard.
+    #[cfg(test)]
+    pub(crate) fn lease(&self) -> Option<&smg_policy_controller::engine::Leased> {
+        self.handle.as_ref()?.lease()
     }
 
     /// The size the placement's lease states, for a case that reads it.
     #[cfg(test)]
     pub(crate) fn lease_tokens(&self) -> Option<u32> {
-        self.handle.lease().map(|leased| leased.lease.tokens)
+        self.lease().map(|leased| leased.lease.tokens)
     }
 
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
-        self.handle.dispatched(now);
+        if let Some(handle) = &mut self.handle {
+            handle.dispatched(now);
+        }
     }
 
     /// The request ended with `end`, as the router read it at `now`. Said
     /// once.
     pub(crate) fn completed(&mut self, end: End, now: Instant) {
-        let side = self
-            .handle
-            .lease()
-            .map_or(Side::Single, |leased| leased.lease.side);
-        let outcome = end.outcome(side, self.id());
-        self.handle.completed(&outcome, now);
+        if self.handle.is_none() {
+            return;
+        }
+        let served = self.id();
+        if let Some(handle) = &mut self.handle {
+            let side = handle
+                .lease()
+                .map_or(Side::Single, |leased| leased.lease.side);
+            handle.completed(&end.outcome(side, served), now);
+        }
     }
 
     /// The request is given up under `reason` at `now`: before a send the
     /// lease is released, and after one it completes as cancelled.
     pub(crate) fn released(&mut self, reason: ReleaseReason, now: Instant) {
-        self.handle.released(reason, now);
+        if let Some(handle) = &mut self.handle {
+            handle.released(reason, now);
+        }
     }
 
     /// The decode worker of a pair. A regular attempt has none.
@@ -1638,31 +1837,35 @@ impl Placed {
 
     /// The decode request was sent at `now`. Said once.
     pub(crate) fn decode_dispatched(&mut self, now: Instant) {
-        self.handle.dispatched_decode(now);
+        if let Some(handle) = &mut self.handle {
+            handle.dispatched_decode(now);
+        }
     }
 
     /// The decode request ended with `end`. Said once.
     pub(crate) fn decode_completed(&mut self, end: End, now: Instant) {
-        if let Some(worker) = self.decode_id() {
-            self.handle
-                .completed(&end.outcome(Side::Decode, worker), now);
+        if let (Some(worker), Some(handle)) = (self.decode_id(), &mut self.handle) {
+            handle.completed(&end.outcome(Side::Decode, worker), now);
         }
     }
 
     /// The decode side is given up under `reason`.
     pub(crate) fn decode_released(&mut self, reason: ReleaseReason, now: Instant) {
-        self.handle.released_decode(reason, now);
+        if let Some(handle) = &mut self.handle {
+            handle.released_decode(reason, now);
+        }
     }
 
     /// After the prefill is sent, take the next sendable decode of that
     /// prefill. Returns `false` when the pick holds none or the decode has
     /// already been sent or released.
     pub(crate) fn next_decode(&mut self, policy_engine: &PolicyEngine) -> bool {
-        let Some(placed) = self.pair.as_deref_mut() else {
+        let prefill = self.id();
+        let (Some(placed), Some(handle)) = (self.pair.as_deref_mut(), &mut self.handle) else {
             return false;
         };
         for (index, target) in placed.targets.iter().enumerate().skip(placed.index + 1) {
-            if target.id != self.id {
+            if target.id != prefill {
                 continue;
             }
             let Some(pair) = target.pair else {
@@ -1674,7 +1877,7 @@ impl Placed {
             else {
                 continue;
             };
-            if self.handle.take_decode(index).is_some() {
+            if handle.take_decode(index).is_some() {
                 placed.decode = worker;
                 placed.side = pair;
                 placed.index = index;
@@ -1689,7 +1892,9 @@ impl Placed {
     /// The route asks it again behind its prefill's answer
     /// ([`Self::decode_again`]), or sends the first pick's.
     pub(crate) fn decode_waits(&self) -> bool {
-        self.handle.decode_chosen()
+        self.handle
+            .as_ref()
+            .is_some_and(DecisionGuard::decode_chosen)
     }
 
     /// Keeps `kept` for the second ask of the pair's decode
@@ -1756,8 +1961,10 @@ impl Placed {
         holds: impl Fn(&Arc<dyn Worker>) -> bool,
         now: Instant,
     ) -> Option<&Arc<dyn Worker>> {
+        let prefill = self.id();
         let placed = self.pair.as_deref_mut()?;
-        if !self.handle.decode_chosen() {
+        let handle = self.handle.as_mut()?;
+        if !handle.decode_chosen() {
             return None;
         }
         let made = Made {
@@ -1767,7 +1974,6 @@ impl Placed {
             members: None,
             source: Cell::new(None),
         };
-        let handle = &mut self.handle;
         let started = Instant::now();
         // The call's request is made as the first ask's was: from the
         // world the door decides it under, by the sources of that document.
@@ -1786,7 +1992,7 @@ impl Placed {
             return None;
         };
         for (index, target) in pick.targets.iter().enumerate() {
-            let Some(pair) = target.pair.filter(|_| target.id == self.id) else {
+            let Some(pair) = target.pair.filter(|_| target.id == prefill) else {
                 continue;
             };
             let sendable =
@@ -1795,7 +2001,7 @@ impl Placed {
                 continue;
             };
             // The call took its first target. A later one is taken by name.
-            if index == 0 || self.handle.take_decode(index).is_some() {
+            if index == 0 || handle.take_decode(index).is_some() {
                 placed.decode = worker;
                 placed.side = pair;
                 placed.targets = pick.targets;
@@ -1803,8 +2009,7 @@ impl Placed {
                 return Some(&placed.decode);
             }
         }
-        self.handle
-            .released_decode(ReleaseReason::CommitFailed, now);
+        handle.released_decode(ReleaseReason::CommitFailed, now);
         None
     }
 }
@@ -1813,8 +2018,7 @@ impl fmt::Debug for Placed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Placed")
             .field("worker", &self.worker.url())
-            .field("id", &self.id)
-            .field("rank", &self.rank)
+            .field("named", &self.named)
             .field("handle", &self.handle)
             .finish()
     }

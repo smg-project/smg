@@ -191,7 +191,11 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     }
 
     /// [`DecisionGuard::decide`] for a request its host makes from the world
-    /// the door decides under ([`DecisionEngine::decide_under`]).
+    /// the door decides under ([`DecisionEngine::decide_under`]), where the
+    /// host hands no single list of its own: the door's answer is then
+    /// whole. A host that hands one asks its door itself, since a place
+    /// may answer it with nothing to hold, and holds a whole answer by
+    /// [`DecisionGuard::holding`].
     ///
     /// # Errors
     ///
@@ -202,13 +206,22 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<Self, DecisionRefused> {
-        let (decided, later) = door.decide_under(gateway, maker, now)?;
-        Ok(Self::hold(
-            Arm::Engine { door, gateway },
-            decided,
-            later,
-            now,
-        ))
+        let decided = door.decide_under(gateway, maker, now)?;
+        let (decided, later) = decided.whole().ok_or(DecisionRefused::Faulted)?;
+        Ok(Self::holding(door, gateway, decided, later, now))
+    }
+
+    /// Holds `decided`, a whole answer its host asked of `door` itself at
+    /// `now` ([`Decided::Whole`](crate::engine::Decided::Whole)), with what
+    /// the answer said of the later decode.
+    pub fn holding(
+        door: D,
+        gateway: GatewayId,
+        decided: DecideOutcome,
+        later: bool,
+        now: Instant,
+    ) -> Self {
+        Self::hold(Arm::Engine { door, gateway }, decided, later, now)
     }
 
     /// Holds the decision made with the request's encode items
@@ -769,7 +782,7 @@ mod tests {
         document::spec::AppliedSpec,
         engine::{
             decision::{Decision, ShadowKind, Target, Targets},
-            decision_engine::{DecisionEngine, HeldDecision, RequestMaker},
+            decision_engine::{Decided, DecisionEngine, HeldDecision, RequestMaker},
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
             prompt_hashes::{HashSeeds, PromptHashes},
             store_backed_engine::{
@@ -1695,7 +1708,7 @@ mod tests {
             gateway: GatewayId,
             maker: &impl RequestMaker,
             now: Instant,
-        ) -> Result<(DecideOutcome, bool), DecisionRefused> {
+        ) -> Result<Decided, DecisionRefused> {
             DecisionEngine::decide_under(self.0, gateway, maker, now)
         }
 
