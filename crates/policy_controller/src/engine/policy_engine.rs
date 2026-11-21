@@ -48,6 +48,8 @@ use super::{
 };
 use crate::{document::spec::AppliedSpec, names::intern};
 
+pub mod overlap;
+
 /// The engine of one policy document, for a gateway that decides in its own
 /// process.
 ///

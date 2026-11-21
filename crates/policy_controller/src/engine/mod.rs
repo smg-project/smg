@@ -47,6 +47,8 @@ pub use pair_classes::PartnerClasses;
 #[cfg(feature = "in-process")]
 pub use policy_engine::pair::{prefills_full, PairAdmission};
 #[cfg(feature = "in-process")]
+pub use policy_engine::overlap::{self, Affinity, CacheIndex, CacheIndexes, PoolAffinity};
+#[cfg(feature = "in-process")]
 pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use sticky_sessions::{
