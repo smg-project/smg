@@ -231,7 +231,7 @@ impl InProcess {
 /// data, beyond the worker objects' live state.
 ///
 /// The routers hash a request's prompt, by its tokens or its text, where
-/// the document's stages read the hashes, and state the media it carries.
+/// the document's stages read the hashes.
 /// They count the prompt's size where they read the prompt: a typed route
 /// reads it for each request it asks the engine about, and a route that
 /// sends a body on unread must read it where a stage declares the size
@@ -245,7 +245,10 @@ impl InProcess {
 /// keys in flight on the worker object, with the rest of its record.
 ///
 /// Not fed yet, so a profile that reads one keeps the classic placement
-/// pass: a hash ring, a header of the request, a named signal's cells.
+/// pass: a hash ring, a header of the request, a named signal's cells, and
+/// the media a request carries. No route states a request's media counts
+/// to the engine: a stage that declared them would read none for every
+/// request, with no error.
 fn fed() -> Needs {
     Needs {
         token_hashes: true,
@@ -254,7 +257,6 @@ fn fed() -> Needs {
         loads: true,
         events: true,
         sent_prefixes: true,
-        media: true,
         active_sessions: true,
         affinity: true,
         ..Needs::default()

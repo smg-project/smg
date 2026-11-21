@@ -6,11 +6,11 @@ use std::{error::Error, sync::Arc};
 
 use smg_policy_controller::{
     document::{
-        DecodePick, IndexKind, IndexSpec, OverloadSpec, Pairing, PlanName, PolicySpec, ShadowSpec,
-        PRESETS,
+        DecodePick, IndexKind, IndexSpec, Needs, OverloadSpec, Pairing, PlanName, PolicySpec,
+        ShadowSpec, PRESETS,
     },
-    engine::Phase,
-    stages::StageRegistry,
+    engine::{Candidate, Phase, RequestFacts, Scorer, TieBand},
+    stages::{Lifecycle, StageRegistry},
 };
 
 use super::{fed, start_in_process, would_start, InProcess, StartError};
@@ -686,6 +686,65 @@ fn a_hash_index_is_refused_by_its_key_whoever_wrote_the_document() -> Case {
     };
     document.index.insert("chat-*".to_owned(), hash);
     assert_eq!(refusal(&supplied(document))?, refused("chat-*"));
+    Ok(())
+}
+
+/// A scorer of a host's own build that places by the media a request
+/// carries, and declares it.
+#[derive(Debug)]
+struct ByMedia;
+
+impl Lifecycle for ByMedia {}
+
+impl Scorer for ByMedia {
+    fn name(&self) -> &'static str {
+        "by-media"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(1.0);
+        TieBand(0.0)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            media: true,
+            ..Needs::default()
+        }
+    }
+}
+
+/// The gate vouches only for what a route states. No route states a
+/// request's media counts to the engine, so this process does not feed
+/// them: a host's document whose stage declares them is not decided whole,
+/// and its start is refused by that stage's name. The same document with a
+/// stage that declares nothing starts.
+#[test]
+fn a_stage_that_reads_media_is_not_decided_whole_while_no_route_states_it() -> Case {
+    assert!(!fed().media);
+    let stages = || -> Result<StageRegistry, Box<dyn Error>> {
+        let mut stages = StageRegistry::builtin();
+        stages.scorer("by-media", || Box::new(ByMedia))?;
+        Ok(stages)
+    };
+    let scored_by = |scorer: &str| -> Result<RouterConfig, Box<dyn Error>> {
+        let mut document = PolicySpec::preset("random")?;
+        let profile = document.profiles.get_mut("random").ok_or("the profile")?;
+        profile.score = vec![scorer.into()];
+        profile.pick = "best".into();
+        Ok(supplied(document))
+    };
+    let refused = start_in_process(&scored_by("by-media")?, Some(stages()?))
+        .err()
+        .ok_or("the start took a document that reads media")?
+        .to_string();
+    assert!(
+        refused.starts_with("the policy document's profile `random` is not decided"),
+        "{refused}"
+    );
+    assert!(refused.contains("the scorer `by-media`"), "{refused}");
+    let started = start_in_process(&scored_by("least-load")?, Some(stages()?))?;
+    assert!(started.ok_or("an engine")?.decides_whole());
     Ok(())
 }
 
