@@ -825,21 +825,27 @@ fn the_gateways_tenant_header_is_denied_with_a_host_catalog() -> Case {
     Ok(())
 }
 
+/// A host's stages reach the start through the context: a document that
+/// holds a host's own scorer is read over the host's catalog, where the
+/// stock start does not know the scorer. In its own process the engine does
+/// not decide by a scorer yet, so the start that knows the scorer stops at
+/// it by name, as it stops at a stock scorer.
 #[tokio::test]
-async fn a_hosts_catalog_and_document_reach_the_store_through_the_context() -> Case {
-    let document = scorer_document(&quiet(), SCORER)?;
-    let digest = document.digest()?;
-    let config = running(quiet(), document);
+async fn a_hosts_catalog_and_document_reach_the_start_through_the_context() -> Case {
+    let config = running(quiet(), scorer_document(&quiet(), SCORER)?);
 
     let stages = Some(host_stages()?);
-    let hosted =
+    let refusal =
         AppContext::from_config_with_extensions(config.clone(), 30, None, None, stages, None)
-            .await?;
-    let store = hosted
-        .policy_store
-        .as_ref()
-        .ok_or("the controller was picked and no store started")?;
-    assert_eq!(store.world().spec().digest(), Some(digest));
+            .await
+            .err();
+    assert_eq!(
+        refusal,
+        Some(format!(
+            "the policy document's profile `random` is not decided in this process yet: \
+             it holds the scorer `{SCORER}` (binding `*`, phase single)"
+        ))
+    );
 
     // The stock start holds no stage of a host, and says so by name.
     let refusal = AppContext::from_config(config, 30, None, None).await.err();

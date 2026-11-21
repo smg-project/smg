@@ -1427,6 +1427,107 @@ mod tests {
         assert!(refused.contains("it holds the scorer `"), "{refused}");
         assert!(refused.contains("(binding `*`, phase single)"), "{refused}");
     }
+
+    /// The parts a start builds for a context or leaves out, by name, and
+    /// whether this one holds each.
+    fn parts(context: &AppContext) -> Vec<(&'static str, bool)> {
+        vec![
+            ("rate_limiter", context.rate_limiter.is_some()),
+            ("rate_limit_manager", context.rate_limit_manager.is_some()),
+            (
+                "reasoning_parser_factory",
+                context.reasoning_parser_factory.is_some(),
+            ),
+            ("tool_parser_factory", context.tool_parser_factory.is_some()),
+            ("prefill_admission", context.prefill_admission.is_some()),
+            ("gateway", context.gateway.is_some()),
+            ("worker_monitor", context.worker_monitor.is_some()),
+            ("wasm_manager", context.wasm_manager.is_some()),
+            ("kv_event_monitor", context.kv_event_monitor.is_some()),
+            ("policy_store", context.policy_store.is_some()),
+            ("policy_operators", context.policy_operators.is_some()),
+            ("policy_follower", context.policy_follower.is_some()),
+            ("policy_engine", context.policy_engine.is_some()),
+            ("policy_feed", context.policy_feed.is_some()),
+            ("rl", context.rl.is_some()),
+        ]
+    }
+
+    /// The steps of a worker workflow, by id and in order.
+    fn step_ids<D: wfaas::WorkflowData>(line: &wfaas::WorkflowDefinition<D>) -> Vec<String> {
+        line.steps.iter().map(|step| step.id.to_string()).collect()
+    }
+
+    /// The three worker workflows as the server builds them from `context`
+    /// (registration, removal, update), each by its steps.
+    fn worker_lines(context: &AppContext) -> [Vec<String>; 3] {
+        use crate::workflow::steps::{
+            worker_registration_line, worker_removal_line, worker_update_line,
+        };
+
+        let config = &context.router_config;
+        let feed = context.door_feed();
+        let door = feed.map(|feed| (feed, config.unhealthy_removal_scope()));
+        [
+            step_ids(&worker_registration_line(config, feed)),
+            step_ids(&worker_removal_line(door)),
+            step_ids(&worker_update_line(feed)),
+        ]
+    }
+
+    /// A gateway that decides in its own process is built as a gateway with
+    /// the setting off is: the same storage, and the same objects handed to
+    /// the same places. Under one configuration, the setting off against
+    /// on: the context holds and leaves out the same parts, but for what
+    /// the start left (the policy engine); a classic policy is handed the
+    /// load feed and the cache-event monitor under both; and the worker
+    /// workflows the server builds from the context run the same steps, by
+    /// name and in order.
+    #[tokio::test]
+    async fn a_context_in_process_is_built_as_with_the_setting_off() {
+        use crate::{
+            policies::as_cache_aware,
+            workflow::{
+                create_worker_registration_workflow, create_worker_removal_workflow,
+                create_worker_update_workflow,
+            },
+        };
+
+        // Cache-aware is a policy the engine does not pick by itself yet:
+        // the classic policy of the setting decides under both, with what
+        // a context hands a classic policy.
+        let built = |policy_controller: bool| async move {
+            let config = RouterConfig {
+                policy_controller,
+                ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
+            };
+            AppContext::from_config(config, 10, None, None)
+                .await
+                .expect("a context")
+        };
+        let (off, on) = (built(false).await, built(true).await);
+
+        assert_eq!(parts(&off), parts(&on));
+        assert!(off.in_process.is_none());
+        assert!(on.in_process.is_some());
+
+        for context in [&off, &on] {
+            let policy = context.policy_registry.get_default_policy();
+            let cache_aware =
+                as_cache_aware(policy.as_ref()).expect("the classic cache-aware policy");
+            assert!(cache_aware.has_load_receiver_for_test());
+            assert!(cache_aware.kv_event_monitor_is_set_for_test());
+        }
+
+        let classic = [
+            step_ids(&create_worker_registration_workflow(&off.router_config)),
+            step_ids(&create_worker_removal_workflow()),
+            step_ids(&create_worker_update_workflow()),
+        ];
+        assert_eq!(worker_lines(&off), classic);
+        assert_eq!(worker_lines(&on), classic);
+    }
+
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
     async fn spawn_echo_server() -> String {
