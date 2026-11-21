@@ -33,7 +33,7 @@ use crate::{
     audio::decode_audio_mono_f32,
     buffer_pool,
     data_url::{base64_payload, data_url_payload},
-    fetch_policy::{MediaHostPolicy, MediaHostResolver},
+    fetch_policy::{MediaHostPolicy, MediaHostResolver, FETCHED_SCHEMES},
     hasher::{hash_audio, hash_image_with_transparency, hash_video_with_sampling},
     jpeg_turbo::{decode_jpeg_rgb, end_is_served, is_jpeg},
     types::{ImageSize, TransparencyPolicy},
@@ -518,6 +518,13 @@ impl MediaConnector {
             fetch_timeout: config.fetch_timeout,
             video_fetch_timeout: config.video_fetch_timeout,
         })
+    }
+
+    /// The host policy's verdict on a media URL this connector does not
+    /// fetch but hands on as written: read from the URL's text alone, with
+    /// no lookup, in the words a fetch here refuses the same host with.
+    pub fn check_as_written(&self, url: &str) -> Result<(), MediaConnectorError> {
+        self.policy.check_as_written(url)
     }
 
     /// Fetch encoded image bytes without parsing the image header or pixels.
@@ -1197,7 +1204,7 @@ async fn collect_http_body_with_limit(
 /// Whether the connector fetches URLs of `scheme`: the request's own URL and
 /// every redirect target are held to the same two.
 fn fetched_scheme(scheme: &str) -> bool {
-    matches!(scheme, "http" | "https")
+    FETCHED_SCHEMES.contains(&scheme)
 }
 
 fn checked_payload_length(

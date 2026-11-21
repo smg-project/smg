@@ -410,12 +410,17 @@ pub struct RouterConfig {
     pub mm_pixel_rdma: bool,
     /// Hosts the router's own media pipeline may fetch client-supplied media
     /// URLs from, by name, every redirect hop included; unset (or empty)
-    /// allows any host the address policy passes.
+    /// allows any host the address policy passes. A URL the gRPC router
+    /// forwards to a worker under worker-side processing is held to the
+    /// list by the host it names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_allowed_media_domains: Option<Vec<String>>,
     /// Allow client-supplied media URLs that name or resolve to a loopback,
     /// link-local or private address (a deployment whose media origin is
-    /// internal); off, such URLs are refused before anything is connected.
+    /// internal); off, such URLs are refused before anything is connected,
+    /// and a URL the gRPC router forwards to a worker under worker-side
+    /// processing is refused by what it names (an address literal, a
+    /// loopback name).
     /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
     #[serde(default)]
     pub mm_allow_private_media_hosts: bool,

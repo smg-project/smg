@@ -1875,7 +1875,9 @@ class RouterArgs:
             help=(
                 "Hosts the router fetches client-supplied media URLs from when it"
                 " processes media itself, comma-separated; a redirect to any other"
-                " host is refused. Unset allows any host the address policy passes"
+                " host is refused. Unset allows any host the address policy passes."
+                " A URL the gRPC router forwards to a worker under worker-side"
+                " processing is held to the list by the host it names"
             ),
         )
         parser.add_argument(
@@ -1885,7 +1887,10 @@ class RouterArgs:
             help=(
                 "Allow client-supplied media URLs that name or resolve to a loopback,"
                 " link-local or private address (an internal media origin); by default"
-                " such URLs are refused. Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
+                " such URLs are refused, a URL the gRPC router forwards to a worker"
+                " under worker-side processing by what it names"
+                " (an address literal, a loopback name)."
+                " Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
             ),
         )
         parser.add_argument(
