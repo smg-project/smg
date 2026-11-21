@@ -813,15 +813,19 @@ impl PolicyRegistry {
     /// to detach.
     ///
     /// The mesh shares the classic policy's trees and nothing else. Where
-    /// the policy engine of this process decides, no decision reads those
-    /// trees, so an attach says once, as a warning, that the gateways of the
-    /// mesh do not share which worker holds a prompt's prefix.
+    /// the routers ask the policy engine of this process for every
+    /// request's decision, no decision reads those trees, so an attach says
+    /// once, as a warning, that the gateways of the mesh do not share which
+    /// worker holds a prompt's prefix. Where a classic policy still places
+    /// (a pair's sides, a policy the engine does not decide whole yet), its
+    /// trees are shared as ever and nothing is said.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
         {
             let mut guard = self.mesh_tree_sync.write();
             guard.clone_from(&adapter);
         }
-        if adapter.is_some() && self.policy_engine.is_some() {
+        let engine_decides = self.policy_engine.as_ref().is_some_and(|asked| asked.whole);
+        if adapter.is_some() && engine_decides {
             warn!(
                 "A mesh is attached and the policy controller decides in this process: the \
                  gateways of the mesh do not share which worker holds a prompt's prefix while \

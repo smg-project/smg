@@ -483,10 +483,11 @@ mod tests {
         );
     }
 
-    /// The mesh shares the classic policy's trees alone. Where the policy
-    /// engine of this process decides, no decision reads them, and the
-    /// attach says so once, as a warning. A registry that keeps no policy
-    /// engine says nothing.
+    /// The mesh shares the classic policy's trees alone. Where the routers
+    /// ask the policy engine of this process for every request's decision,
+    /// no decision reads them, and the attach says so once, as a warning. A
+    /// registry that keeps no policy engine says nothing, and neither does
+    /// one whose classic policies still place: their trees are shared.
     #[tokio::test]
     #[traced_test]
     async fn an_attach_warns_once_where_the_policy_engine_of_this_process_decides() {
@@ -502,18 +503,25 @@ mod tests {
             );
             (mesh, adapters)
         };
+        // A registry that asks the policy engine: `whole` says whether the
+        // routers ask the engine for every request's decision.
+        let asking = |whole: bool| {
+            let document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            PolicyRegistry::with_policy_engine(
+                cache_aware_policy_config(),
+                RoutingKeyOverrideConfig::default(),
+                Arc::new(PolicyEngine::new(spec)),
+                DocumentOrigin::Settings,
+                whole,
+            )
+        };
         let _classic = attached(PolicyRegistry::new(cache_aware_policy_config()));
         assert!(!logs_contain(SAID), "no policy engine decides here");
+        let _beside = attached(asking(false));
+        assert!(!logs_contain(SAID), "a classic policy still places here");
 
-        let document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-        let spec = AppliedSpec::validate(&document).expect("the document validates");
-        let _asked = attached(PolicyRegistry::with_policy_engine(
-            cache_aware_policy_config(),
-            RoutingKeyOverrideConfig::default(),
-            Arc::new(PolicyEngine::new(spec)),
-            DocumentOrigin::Settings,
-            true,
-        ));
+        let _asked = attached(asking(true));
         logs_assert(|lines: &[&str]| {
             let said = lines.iter().filter(|line| line.contains(SAID)).count();
             (said == 1)
