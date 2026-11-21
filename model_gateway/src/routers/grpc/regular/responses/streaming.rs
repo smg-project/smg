@@ -272,7 +272,7 @@ fn chat_sse_events<'a, C: Deserialize<'a>>(
         }
         // A data event, or the one named event a chat stream ends with: the
         // `event: error` of a tool call the reader could not read
-        // (`wire::minimax::InvalidToolCallFormat`), whose data line is the
+        // (`wire::UnreadableToolCallFailure`), whose data line is the
         // turn's error.
         let data = event
             .strip_prefix("data: ")

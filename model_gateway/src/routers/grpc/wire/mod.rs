@@ -21,10 +21,16 @@
 
 use openai_protocol::{common::StreamOptions, profile::ProviderProfile};
 
-use crate::routers::common::sse_rechunk::RechunkPolicy;
+use crate::routers::{common::sse_rechunk::RechunkPolicy, grpc::regular::symphony::UnreadableCall};
 
 pub(crate) mod deepseek;
 pub(crate) mod minimax;
+
+/// How a wire's contract ends a request whose answer holds a tool call the
+/// reader could not read ([`Wire::unreadable_tool_call_failure`]): the
+/// failure's status, body and stream frame. One wire has such a contract and
+/// defines the type; the code every wire shares names it by this.
+pub(crate) type UnreadableToolCallFailure = minimax::InvalidToolCallFormat;
 
 /// The vendor whose shapes a request's successful answer takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +94,34 @@ impl Wire {
         match self {
             Self::Minimax => minimax::fails_on_unreadable_tool_call(table),
             Self::OpenAi | Self::DeepSeek => false,
+        }
+    }
+
+    /// Whether the wire's contract has that rule for any table: what the
+    /// spec asks before it looks at a request for the tool calls it expects,
+    /// so a request on a wire with no rule pays nothing for it.
+    pub(crate) fn has_unreadable_tool_call_rule(self) -> bool {
+        match self {
+            Self::Minimax => true,
+            Self::OpenAi | Self::DeepSeek => false,
+        }
+    }
+
+    /// The failure the wire's contract ends such a request with
+    /// ([`UnreadableToolCallFailure`]), for the reader's verdict on an output
+    /// the engine ended at the token limit or elsewhere. `None` on a wire
+    /// whose contract has no such rule.
+    pub(crate) fn unreadable_tool_call_failure(
+        self,
+        unreadable: UnreadableCall,
+        ended_at_limit: bool,
+    ) -> Option<UnreadableToolCallFailure> {
+        match self {
+            Self::Minimax => Some(minimax::InvalidToolCallFormat::new(
+                unreadable,
+                ended_at_limit,
+            )),
+            Self::OpenAi | Self::DeepSeek => None,
         }
     }
 }

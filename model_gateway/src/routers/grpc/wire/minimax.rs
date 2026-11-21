@@ -109,6 +109,10 @@ impl InvalidToolCallFormat {
         }
     }
 
+    /// The failure's `type` and `code`, the `X-SMG-Error-Code` of its whole
+    /// response and the `error_type` label the request counts under.
+    pub(crate) const CODE: &'static str = INVALID_TOOL_CALL_FORMAT;
+
     /// `error.finish_reason`: `length` for a call the token limit cut, where
     /// the request may succeed with room for the call; `error` otherwise.
     pub(crate) const fn finish_reason(self) -> &'static str {
