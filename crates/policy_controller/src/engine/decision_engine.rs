@@ -79,10 +79,30 @@ pub trait RequestMaker {
     ///
     /// An engine that decides over its host's lists asks this ahead of
     /// [`RequestMaker::make`]. A place one pick of a picker decides reads
-    /// no fact of a request, so a plain request of such a place is decided
-    /// with none made: its routing key is not derived and no seed is drawn
-    /// for it. The answer is cheap: it reads the document nowhere.
+    /// no fact of a request but its seed, where the picker draws
+    /// ([`RequestMaker::seed`]): a plain request of such a place is decided
+    /// with none made, and its routing key is not derived. The answer is
+    /// cheap: it reads the document nowhere.
     fn plain(&self) -> Option<Plain> {
+        None
+    }
+
+    /// The request's seed
+    /// ([`RequestFacts::seed`](super::view::RequestFacts::seed)), for a
+    /// pick that reads nothing else of the request. An engine that decides
+    /// over its host's lists asks it ahead of [`RequestMaker::make`], where
+    /// the place's picker draws alone
+    /// ([`Picker::draws_alone`](super::framework::Picker::draws_alone)),
+    /// and at no other pick: a rotation's request draws none.
+    ///
+    /// A maker that says it states a seed drawn for the request, as the
+    /// request it makes states one: under a constant seed a picker that
+    /// draws names the same worker of an unchanged pool every time. A
+    /// request stated ahead says its own, so its pick alone is the one its
+    /// whole decision would draw first. `None` from a maker that does not
+    /// say: its request is then made, and the whole decision draws by the
+    /// seed that request states.
+    fn seed(&self) -> Option<u64> {
         None
     }
 
@@ -133,6 +153,10 @@ impl RequestMaker for Request<'_> {
             wires: cx.wire_modes,
             prompt_tokens: facts.prompt_tokens,
         })
+    }
+
+    fn seed(&self) -> Option<u64> {
+        Some(self.facts.seed)
     }
 }
 
@@ -261,10 +285,10 @@ impl Decided {
 /// word on a lease ([`Lifecycle::hears`](crate::stages::Lifecycle::hears)).
 ///
 /// The worker is the one at `place` of the list its host handed
-/// ([`WorkerLists::Single`]): the picker's turn landed on it and read it
-/// eligible at this call. No request was made for the pick, no lease is
-/// issued, no id is taken and nothing is dated. The host sends to the
-/// worker and owes the engine no word of the request.
+/// ([`WorkerLists::Single`]): the picker's turn or its draw landed on it
+/// and read it eligible at this call. No request was made for the pick, no
+/// lease is issued, no id is taken and nothing is dated. The host sends to
+/// the worker and owes the engine no word of the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlonePick {
     /// The worker's place in the list.
@@ -274,14 +298,18 @@ pub struct AlonePick {
     pub profile: u16,
     /// The document's generation.
     pub generation: u64,
+    /// The seed the picker drew by ([`RequestMaker::seed`]): the pick
+    /// replays from it. Zero under a picker that draws nothing, for which
+    /// none was asked.
+    pub seed: u64,
 }
 
 impl AlonePick {
     /// The pick as a decision that names its one worker, by `id` and
     /// `dp_rank`: what a lease is issued for where a stage takes a word,
     /// and what a host's trace of the pick shows. The trace is a drawn
-    /// pick's: no pass over the pool ran, so it counts no survivor, and no
-    /// seed was drawn for it.
+    /// pick's: no pass over the pool ran, so it counts no survivor, and it
+    /// states the seed the pick drew by.
     #[must_use]
     pub fn decision(self, id: WorkerId, dp_rank: u16) -> Decision {
         let mut targets = Targets::new();
@@ -296,6 +324,7 @@ impl AlonePick {
             survivors: Survivors::NOT_COUNTED,
             top_len: 1,
             generation: self.generation,
+            seed: self.seed,
             ..Trace::default()
         };
         trace.top[0] = (id, 0.0);

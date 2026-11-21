@@ -3,11 +3,12 @@
 //! **The short path, in front** ([`alone`]). Where the document decides the
 //! request's place by one pick of its picker
 //! ([`Place::Alone`](crate::engine::Place::Alone)), the decision is that
-//! pick: one turn of the list's own rotation and one read of the worker the
-//! turn lands on. It writes no record and takes no lock. It answers a plain
-//! request ([`Plain`]) over a list that holds an eligible worker where the
-//! picker's turns land, and it reads no fact of a request: the engine asks
-//! it before the request is made, so such a request is never made.
+//! pick: one turn of the list's own rotation, or one draw by the request's
+//! seed, and one read of the worker it lands on. It writes no record and
+//! takes no lock. It answers a plain request ([`Plain`]) over a list that
+//! holds an eligible worker where the picker lands, and it reads no fact of
+//! a request but that seed: the engine asks it before the request is made,
+//! so such a request is never made.
 //!
 //! **A key's rows, between** ([`keys::decide`]). A request that is made,
 //! under a sessions rule or a ring, is decided by the rows its key names:
@@ -39,7 +40,7 @@ use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Target, Trace},
-        decision_engine::{AlonePick, HeldDecision, Plain},
+        decision_engine::{AlonePick, HeldDecision, Plain, RequestMaker},
         framework::Engine,
         records,
         sticky_sessions::SessionVerdict,
@@ -59,19 +60,21 @@ const DEMANDS: &str = "demands";
 const NO_STAGE: &str = "none";
 
 /// The short path: the place in `members`, the list its host handed, of
-/// the worker picked for a plain single request of `model`, and the profile
-/// whose picker picked it ([`AlonePick`]). `None` where the request takes
-/// the whole pass ([`decide`]): it is no single request, its place is not
-/// decided by one pick of a picker, a worker of the list is not dialed on a
-/// wire it states, or the picker's turns land on no eligible worker.
+/// the worker picked for the plain single request `maker` would make, and
+/// the profile whose picker picked it ([`AlonePick`]). `None` where the
+/// request takes the whole pass ([`decide`]): it is no single request, its
+/// place is not decided by one pick of a picker, a worker of the list is
+/// not dialed on a wire it states, or the picker lands on no eligible
+/// worker.
 ///
-/// It ends in the place picked. It reads no fact of a request, so none is
-/// made ahead of it, and nothing a host is handed of a pick is built here.
+/// It ends in the place picked. It reads no fact of a request but the seed
+/// a picker that draws picks by ([`RequestMaker::seed`]), so none is made
+/// ahead of it, and nothing a host is handed of a pick is built here.
 /// Under a document that takes no word on a lease the place is the whole
 /// answer. Under any other the pick is noted ([`noted`]).
 pub(super) fn alone(
     own: &PolicyEngine,
-    model: &str,
+    maker: &impl RequestMaker,
     plain: Plain,
     members: &PoolMembers,
 ) -> Option<AlonePick> {
@@ -82,12 +85,17 @@ pub(super) fn alone(
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
         return None;
     }
-    let profile = members.alone(&own.spec, model)?;
-    let position = own.pick(profile, members, |state: RoutingState| state.eligible())?;
+    let profile = members.alone(&own.spec, maker.model())?;
+    // A rotation reads no draw: no seed is asked for its pick. A maker
+    // that says none for a draw has its request made.
+    let seed = if profile.draws() { maker.seed()? } else { 0 };
+    let admits = |state: RoutingState| state.eligible();
+    let position = own.pick(profile, members, seed, admits)?;
     Some(AlonePick {
         place: u32::try_from(position).ok()?,
-        profile: profile.0,
+        profile: profile.index,
         generation: own.spec.generation(),
+        seed,
     })
 }
 
@@ -336,6 +344,7 @@ mod tests {
             lease::{Outcome, ReleaseReason, TransportClass},
             DecisionGuard,
         },
+        Draw,
     };
 
     const MODEL: &str = "model-a";
@@ -364,13 +373,16 @@ mod tests {
         }
     }
 
-    /// A request stated ahead, with the list its host hands for it, and how
-    /// many times the engine made it.
+    /// A request stated ahead, with the list its host hands for it, how
+    /// many times the engine made it and how many times it asked its seed
+    /// alone, which it says unless `says_seed` is off.
     struct Asks<'a> {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
         loads: Option<Arc<LoadSnapshot>>,
         made: Cell<u32>,
+        seeds: Cell<u32>,
+        says_seed: bool,
     }
 
     impl<'a> Asks<'a> {
@@ -380,6 +392,8 @@ mod tests {
                 members,
                 loads: None,
                 made: Cell::new(0),
+                seeds: Cell::new(0),
+                says_seed: true,
             }
         }
     }
@@ -396,6 +410,11 @@ mod tests {
 
         fn plain(&self) -> Option<Plain> {
             self.request.plain()
+        }
+
+        fn seed(&self) -> Option<u64> {
+            self.seeds.set(self.seeds.get() + 1);
+            self.says_seed.then_some(self.request.facts.seed)
         }
 
         fn workers(&self) -> WorkerLists<'_> {
@@ -459,7 +478,78 @@ mod tests {
         }
         assert_eq!(seen, [2; 4], "every worker takes its turn");
         assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+        assert_eq!(asks.seeds.get(), 0, "a rotation asks no seed");
         assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+    }
+
+    /// Random's plain single request is one draw by the request's seed,
+    /// answered as a place: the seed is asked once and nothing else of the
+    /// request is, so none is made, and the decision a host writes of the
+    /// place states the seed. The place is the worker the whole decision
+    /// names first by the same seed, at every pool size: a maker that says
+    /// no seed ahead has its request made, and is answered that decision.
+    #[test]
+    fn random_is_one_draw_of_the_seed_answered_as_a_place() {
+        let engine = preset("random");
+        for workers in [1, 2, 3, 8, 16, 64] {
+            let list = pool(workers);
+            let members = engine.pool_members(&list);
+            let mut seen = vec![false; workers];
+            for seed in 0..16 * workers as u64 {
+                let mut drawn = request();
+                drawn.facts.seed = seed;
+                let asks = Asks::of(drawn, Some(&members));
+                let pick = placed(&engine, &asks);
+                assert_eq!((pick.seed, pick.generation), (seed, 1));
+                assert_eq!((asks.made.get(), asks.seeds.get()), (0, 1));
+                seen[pick.place as usize] = true;
+                let id = worker_id(list[pick.place as usize].as_ref());
+                let decision = pick.decision(id, 0);
+                let named = decision.pick().expect("a pick");
+                assert!(named.trace.drew_first(), "no pass over the pool ran");
+                assert_eq!(named.trace.seed, seed, "the trace states the seed");
+
+                let unsaid = Asks {
+                    says_seed: false,
+                    ..Asks::of(drawn, Some(&members))
+                };
+                let whole = decided(&engine, &unsaid);
+                assert_eq!((unsaid.made.get(), unsaid.seeds.get()), (1, 1));
+                assert!(whole.lease.is_none(), "no stage takes a word of it");
+                let first = whole.decision.pick().expect("a pick").targets.first();
+                let first = first.expect("the first target");
+                assert_eq!(
+                    (first.position, first.id),
+                    (pick.place, id),
+                    "{workers} workers, seed {seed}"
+                );
+            }
+            assert!(seen.iter().all(|&picked| picked), "{workers}: {seen:?}");
+        }
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+    }
+
+    /// Passthrough's plain single request is the first worker of the list
+    /// that is eligible, answered as a place: no seed is asked, no request
+    /// is made, and the whole decision names the same worker first.
+    #[test]
+    fn passthrough_is_the_first_eligible_worker_answered_as_a_place() {
+        let engine = preset("passthrough");
+        let list = pool(12);
+        let members = engine.pool_members(&list);
+        for refused in 0..12 {
+            let asks = Asks::of(request(), Some(&members));
+            let pick = placed(&engine, &asks);
+            assert_eq!((pick.place, pick.seed), (refused, 0));
+            assert_eq!((asks.made.get(), asks.seeds.get()), (0, 0));
+            let tried = [WorkerId(u64::MAX)];
+            let mut retry = request();
+            retry.facts.tried = &tried;
+            let whole = decided(&engine, &Asks::of(retry, Some(&members)));
+            let first = whole.decision.pick().expect("a pick").targets.first();
+            assert_eq!(first.map(|target| target.position), Some(refused));
+            list[refused as usize].set_overloaded(true);
+        }
     }
 
     /// Under a document a stage of which takes a word on a lease, a plain
@@ -830,6 +920,7 @@ mod tests {
         fn pick_alone(
             &self,
             pool: &PoolWord<'_>,
+            _: &mut Draw,
             keep: &mut dyn FnMut(usize) -> bool,
         ) -> Option<usize> {
             let turn = pool.word.fetch_add(1, Ordering::Relaxed) as usize % pool.rows.max(1);

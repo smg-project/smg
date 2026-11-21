@@ -680,29 +680,45 @@ pub trait Picker: Lifecycle + Debug {
         false
     }
 
+    /// Whether the picker's pick alone reads its draw
+    /// ([`Picker::pick_alone`], [`Picker::pick_among`]): the caller then
+    /// states the request's seed, and the pick is the one the whole
+    /// decision would draw first by that seed. The default is no: a
+    /// rotation reads no draw, and no seed is drawn for its pick. The
+    /// engine reads it where it finds a place's profile, not at a decision.
+    fn draws_alone(&self) -> bool {
+        false
+    }
+
     /// One pick over `pool` by the picker's own rule alone
     /// ([`Picker::picks_alone`]). `keep` asks the caller's test of the
     /// worker at a position of the pool: one read of that worker. `Some`
     /// is the position picked, which `keep` kept. `None` where the rule's
     /// own bound ran out before a worker was kept, as a rotation's turns
     /// past a refused worker do: the caller then reads the pool whole and
-    /// asks [`Picker::pick_among`] of the workers that pass. The default
-    /// picks nobody.
+    /// asks [`Picker::pick_among`] of the workers that pass. `draw` is the
+    /// stream of the request's seed, for a picker that draws alone
+    /// ([`Picker::draws_alone`]): it takes its values from it and from
+    /// nowhere else, and [`Picker::pick_among`] reads the stream past
+    /// them. The default picks nobody.
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
+        draw: &mut Draw,
         keep: &mut dyn FnMut(usize) -> bool,
     ) -> Option<usize> {
-        let _ = (pool, keep);
+        let _ = (pool, draw, keep);
         None
     }
 
     /// The pick among the `passed` workers a whole pass left, as a place in
     /// their list, which stands in the pool's order. `set` names the set
     /// of them: a picker that keeps a rotation a set turns that set's own.
-    /// Asked with one worker or more. The default takes the first.
-    fn pick_among(&self, set: u64, passed: usize) -> usize {
-        let _ = (set, passed);
+    /// `draw` is the stream [`Picker::pick_alone`] was handed, past the
+    /// values it read. Asked with one worker or more. The default takes
+    /// the first.
+    fn pick_among(&self, set: u64, passed: usize, draw: &mut Draw) -> usize {
+        let _ = (set, passed, draw);
         0
     }
 }

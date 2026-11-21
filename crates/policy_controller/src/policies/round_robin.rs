@@ -241,6 +241,7 @@ impl Picker for RoundRobin {
     fn pick_alone(
         &self,
         pool: &PoolWord<'_>,
+        _: &mut Draw,
         keep: &mut dyn FnMut(usize) -> bool,
     ) -> Option<usize> {
         let rows = pool.rows;
@@ -257,7 +258,7 @@ impl Picker for RoundRobin {
     }
 
     /// The set's own turn, in the table every rotation of a set lives in.
-    fn pick_among(&self, set: u64, passed: usize) -> usize {
+    fn pick_among(&self, set: u64, passed: usize, _: &mut Draw) -> usize {
         self.advance(set) as usize % passed.max(1)
     }
 

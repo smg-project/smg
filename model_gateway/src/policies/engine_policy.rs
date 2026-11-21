@@ -24,6 +24,7 @@
 
 use std::{any::Any, sync::Arc};
 
+use rand::RngExt as _;
 use smg_policy_controller::engine::{AloneProfile, PolicyEngine};
 use smg_worker::identity::basic::Worker;
 
@@ -66,9 +67,18 @@ impl EnginePolicy {
 
 impl LoadBalancingPolicy for EnginePolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        // A profile that draws is handed a seed drawn for this pick, as a
+        // classic policy that draws reads its thread's generator. A
+        // rotation reads none, and none is drawn for it.
+        let seed = if self.profile.draws() {
+            rand::rng().random()
+        } else {
+            0
+        };
         // A snapshot's list named whole: what the engine keeps of it is in
         // the cell beside it, built by the list's first pick. The pick is
-        // one turn of the list's own rotation and one read of that worker.
+        // one turn of the list's own rotation, or one draw, and one read of
+        // that worker.
         if let Some(named) = info.named {
             if let (None, Some(cell)) = (named.positions, named.members) {
                 debug_assert!(
@@ -78,13 +88,13 @@ impl LoadBalancingPolicy for EnginePolicy {
                 let members = cell.get_or_init(|| Box::new(self.engine.pool_members(named.list)));
                 return self
                     .engine
-                    .pick(self.profile, members, |state| info.admits(state));
+                    .pick(self.profile, members, seed, |state| info.admits(state));
             }
         }
         // Workers nothing is kept of (a narrowed list, a part of a pair's
         // list): one read of each, and the pick among those that pass.
         self.engine
-            .pick_among(self.profile, workers, |state| info.admits(state))
+            .pick_among(self.profile, workers, seed, |state| info.admits(state))
     }
 
     fn name(&self) -> &'static str {
@@ -291,6 +301,14 @@ mod tests {
         assert_eq!(other.name(), "random");
         assert!(!other.as_any().is::<EnginePolicy>());
 
+        // Random's place and passthrough's are picked alone too: the
+        // object, under each classic name.
+        for name in ["random", "passthrough"] {
+            let policy = asking(name).get_default_policy();
+            assert!(policy.as_any().is::<EnginePolicy>(), "{name}");
+            assert_eq!(policy.name(), name);
+        }
+
         // A profile that scores is not picked so yet: the classic policy.
         let by_load = asking("least_load");
         let policy = by_load.get_default_policy();
@@ -328,6 +346,35 @@ mod tests {
                 members.workers(),
                 snapshot.pool(RoutingPool::HttpRegular)
             ));
+        }
+    }
+
+    /// Under a profile that draws, the object hands the engine a seed drawn
+    /// for each pick: its picks spread over the pool's ready workers and
+    /// none lands on a worker that is not ready. Under passthrough it takes
+    /// the first ready worker of the pool, every time.
+    #[test]
+    fn the_object_draws_under_random_and_takes_the_first_under_passthrough() {
+        let (registry, fleet) = fleet(8);
+        fleet[3].set_status(WorkerStatus::NotReady);
+        let pick = |policies: &PolicyRegistry| {
+            placed(&registry, policies, &fleet, PlacementInputs::default()).expect("a worker")
+        };
+        let random = asking("random");
+        let mut times = [0usize; 8];
+        for _ in 0..800 {
+            times[pick(&random)] += 1;
+        }
+        for (at, &times) in times.iter().enumerate() {
+            assert_eq!(times > 40, at != 3, "worker {at} took {times} of 800");
+        }
+        let passthrough = asking("passthrough");
+        for _ in 0..4 {
+            assert_eq!(pick(&passthrough), 0);
+        }
+        fleet[0].set_status(WorkerStatus::NotReady);
+        for _ in 0..4 {
+            assert_eq!(pick(&passthrough), 1);
         }
     }
 

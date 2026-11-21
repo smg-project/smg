@@ -1378,14 +1378,16 @@ mod tests {
     async fn a_setting_the_engine_does_not_pick_yet_starts_on_its_classic_policy() {
         let config = RouterConfig {
             policy_controller: true,
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::PowerOfTwo {
+                load_metric: Default::default(),
+            },
             ..Default::default()
         };
         let context = AppContext::from_config(config, 10, None, None)
             .await
             .unwrap();
         let default = context.policy_registry.get_default_policy();
-        assert_eq!(default.name(), "random");
+        assert_eq!(default.name(), "power_of_two");
         assert!(!default.as_any().is::<EnginePolicy>());
 
         // What the control plane's read of the document answers from, with
@@ -1399,7 +1401,7 @@ mod tests {
         assert_eq!(started.origin, DocumentOrigin::Settings);
         assert_eq!(started.engine.spec().generation(), 1);
         let read: PolicySpec = serde_yaml::from_str(&started.written).expect("YAML");
-        assert!(read.profiles.contains_key("random"));
+        assert!(read.profiles.contains_key("power_of_two"));
         assert!(started.applied <= std::time::SystemTime::now());
         assert!(Arc::strong_count(&started.stages) >= 1);
     }

@@ -388,6 +388,12 @@ impl RequestMaker for Made<'_, '_> {
         })
     }
 
+    // Drawn anew for the ask, as the request made states one
+    // ([`Ask::request`]).
+    fn seed(&self) -> Option<u64> {
+        Some(rand::rng().random())
+    }
+
     fn workers(&self) -> WorkerLists<'_> {
         self.members.map_or(WorkerLists::None, WorkerLists::Single)
     }

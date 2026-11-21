@@ -19,11 +19,12 @@
 //!   request.
 //! - **Once a request.** [`PolicyEngine::pick`] asks for one pick over the
 //!   pool, under a profile the engine picks by its picker alone
-//!   ([`Place::Alone`]). The pick turns the pool's own word and reads the
-//!   worker the turn lands on, by the pass's own test of a worker: no
-//!   row, no table, no request fact, no lock, and nothing allocated. A
-//!   list nothing is kept of (a part of a pool, as the pass narrowed it)
-//!   is passed over once ([`PolicyEngine::pick_among`]).
+//!   ([`Place::Alone`]). The pick turns the pool's own word, or draws by
+//!   the request's seed, and reads the worker it lands on, by the pass's
+//!   own test of a worker: no row, no table, no other request fact, no
+//!   lock, and nothing allocated. A list nothing is kept of (a part of a
+//!   pool, as the pass narrowed it) is passed over once
+//!   ([`PolicyEngine::pick_among`]).
 //!
 //! **A whole decision.** A gateway whose routers ask the engine for the
 //! whole decision asks through [`DecisionEngine`], as it asks a controller's
@@ -79,6 +80,7 @@ use crate::{
     stages::Lifecycle,
     store::{pairing::Refusal, GatewayId, Said},
     tracking::lease::{EventKind, EventSet, Side},
+    Draw,
 };
 
 /// The engine of one policy document, for a gateway that decides in its own
@@ -419,7 +421,7 @@ impl PolicyEngine {
     pub fn profile_label(&self, profile: AloneProfile) -> &'static str {
         let profiles = self.spec.engine().profiles();
         profiles
-            .get(usize::from(profile.0))
+            .get(usize::from(profile.index))
             .map_or("", |profile| intern(&profile.name))
     }
 
@@ -443,26 +445,40 @@ impl PolicyEngine {
     /// itself, as a gateway's classic placement pass does: which workers a
     /// request may take, what a retry skips, and what becomes of a pool no
     /// worker of which passes. The picker turns the pool's own word, kept
-    /// in `members`, and the worker a turn lands on is read once and tested
-    /// by `admits`, the caller's own test of a worker's read: the one its
-    /// pass asks of every candidate, so the rule of a lifted veto has one
-    /// home. No row is read, no table looked up, no lock taken and nothing
-    /// allocated. Where the picker's turns all land on refused workers the
-    /// pool is passed over once, as [`Self::pick_among`] passes over a list.
-    /// A part of a pool ([`PoolMembers::part`]) has no word of its own: the
-    /// pick over it is [`Self::pick_among`]'s.
+    /// in `members`, or draws by `seed`, and the worker it lands on is read
+    /// once and tested by `admits`, the caller's own test of a worker's
+    /// read: the one its pass asks of every candidate, so the rule of a
+    /// lifted veto has one home. No row is read, no table looked up, no
+    /// lock taken and nothing allocated. Where the picker's turns all land
+    /// on refused workers the pool is passed over once, as
+    /// [`Self::pick_among`] passes over a list. A part of a pool
+    /// ([`PoolMembers::part`]) has no word of its own: the pick over it is
+    /// [`Self::pick_among`]'s.
+    ///
+    /// `seed` is the request's seed, read where the profile's pick draws
+    /// ([`AloneProfile::draws`]) and by no other: under one seed such a
+    /// pick names one worker of an unchanged pool, so its caller draws a
+    /// seed a request.
     #[must_use]
     pub fn pick(
         &self,
         profile: AloneProfile,
         members: &PoolMembers,
+        seed: u64,
         admits: impl Fn(RoutingState) -> bool + Copy,
     ) -> Option<usize> {
         let picker = self.picker_of(profile)?;
+        let mut draw = Draw::new(seed);
         if members.part {
-            return among(picker, &members.workers, admits);
+            return among(picker, &members.workers, &mut draw, admits);
         }
-        pick_by(picker, &members.workers, &members.rotation.0, admits)
+        pick_by(
+            picker,
+            &members.workers,
+            &members.rotation.0,
+            &mut draw,
+            admits,
+        )
     }
 
     /// One pick under `profile` among `workers`, a list this engine keeps
@@ -472,7 +488,8 @@ impl PolicyEngine {
     /// The list is passed over once, a read and the caller's test
     /// (`admits`) each, and the picker picks among the workers that pass: a
     /// rotation turns
-    /// the one their set keeps, named by the workers' handles. The list of
+    /// the one their set keeps, named by the workers' handles, and a draw
+    /// is made by `seed`, the request's ([`Self::pick`]). The list of
     /// them is the calling thread's own: nothing is allocated after a
     /// thread's first picks.
     #[must_use]
@@ -480,16 +497,18 @@ impl PolicyEngine {
         &self,
         profile: AloneProfile,
         workers: &[Arc<dyn Worker>],
+        seed: u64,
         admits: impl Fn(RoutingState) -> bool + Copy,
     ) -> Option<usize> {
-        among(self.picker_of(profile)?, workers, admits)
+        let mut draw = Draw::new(seed);
+        among(self.picker_of(profile)?, workers, &mut draw, admits)
     }
 
     /// The picker of `profile`.
     #[inline]
     fn picker_of(&self, profile: AloneProfile) -> Option<&dyn Picker> {
         let profiles = self.spec.engine().profiles();
-        Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
+        Some(profiles.get(usize::from(profile.index))?.picker.as_ref())
     }
 
     /// A whole decision under the engine's catch: a panic in it costs its
@@ -545,10 +564,11 @@ impl PolicyEngine {
         whole: &mut Option<(DecideOutcome, bool)>,
     ) -> Result<Option<AlonePick>, DecisionRefused> {
         // A plain request of a place one pick decides is decided ahead
-        // of its making: the pick reads no fact of it.
+        // of its making: the pick reads no fact of it but the seed a draw
+        // is made by.
         let mut picked = None;
         if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
-            if let Some(pick) = single::alone(self, maker.model(), plain, members) {
+            if let Some(pick) = single::alone(self, maker, plain, members) {
                 // No stage takes a word of the request: the place is
                 // the whole answer.
                 if !self.hears.intersects(EventSet::LEASE) {
@@ -721,19 +741,21 @@ impl DecisionEngine for PolicyEngine {
 }
 
 /// [`PolicyEngine::pick`] by one test of a worker's read, compiled once a
-/// test: the picker's own pick over the pool's word, then the pass.
+/// test: the picker's own pick over the pool's word or by `draw`, then the
+/// pass, which reads the draw past the pick's values.
 #[inline(always)]
 fn pick_by(
     picker: &dyn Picker,
     workers: &[Arc<dyn Worker>],
     word: &AtomicU64,
+    draw: &mut Draw,
     admits: impl Fn(RoutingState) -> bool + Copy,
 ) -> Option<usize> {
     let pool = PoolWord {
         rows: workers.len(),
         word,
     };
-    let picked = picker.pick_alone(&pool, &mut |at| {
+    let picked = picker.pick_alone(&pool, draw, &mut |at| {
         workers
             .get(at)
             .is_some_and(|worker| admits(worker.routing_state()))
@@ -741,7 +763,7 @@ fn pick_by(
     if picked.is_some() {
         return picked;
     }
-    among(picker, workers, admits)
+    among(picker, workers, draw, admits)
 }
 
 /// [`PolicyEngine::pick_among`] by one test of a worker's read: the workers
@@ -752,9 +774,10 @@ fn pick_by(
 fn among(
     picker: &dyn Picker,
     workers: &[Arc<dyn Worker>],
+    draw: &mut Draw,
     admits: impl Fn(RoutingState) -> bool,
 ) -> Option<usize> {
-    let pass = |passed: &mut Vec<u32>| {
+    let mut pass = |passed: &mut Vec<u32>| {
         passed.clear();
         let mut set = FxHasher::default();
         for (worker, at) in workers.iter().zip(0u32..) {
@@ -766,7 +789,7 @@ fn among(
         if passed.is_empty() {
             return None;
         }
-        let at = picker.pick_among(set.finish(), passed.len());
+        let at = picker.pick_among(set.finish(), passed.len(), draw);
         passed.get(at).map(|&position| position as usize)
     };
     PASSED.with(|passed| match passed.try_borrow_mut() {
@@ -882,11 +905,11 @@ mod tests {
         let part: Arc<[Arc<dyn Worker>]> = [1, 4, 6].map(|at| Arc::clone(&list[at])).into();
         let mut seen = [0_u32; 3];
         for _ in 0..9 {
-            let turn = engine.pick(profile, &members, RoutingState::eligible);
+            let turn = engine.pick(profile, &members, 0, RoutingState::eligible);
             assert!(turn.is_some());
             let narrowed = PoolMembers::part(&part);
             assert!(Arc::ptr_eq(narrowed.workers(), &part));
-            let at = engine.pick(profile, &narrowed, RoutingState::eligible);
+            let at = engine.pick(profile, &narrowed, 0, RoutingState::eligible);
             seen[at.expect("a worker of the part")] += 1;
         }
         assert_eq!(seen, [3; 3], "each worker of the part takes its turn");
@@ -925,17 +948,20 @@ mod tests {
 
     /// The places one pick decides: the picker places by itself, no stage
     /// scores, and the filters are the two tests of a worker's health.
-    /// Round robin's preset is one. No other preset is one yet, and each
-    /// names its own profile and the stage of it that asks more.
+    /// Three presets are such places: round robin's by the pool's turn,
+    /// random's by a draw of the request's seed, and passthrough's by the
+    /// pool's order. Random's alone asks its caller for a seed. Every other
+    /// preset names its own profile and the stage of it that asks more.
     #[test]
     fn a_place_is_picked_alone_where_its_picker_decides_by_itself() {
-        assert!(matches!(
-            preset("round_robin").place(MODEL, Phase::Single),
-            Place::Alone(_)
-        ));
+        for (name, draws) in [
+            ("round_robin", false),
+            ("random", true),
+            ("passthrough", false),
+        ] {
+            assert_eq!(alone(&preset(name)).draws(), draws, "{name}");
+        }
         for name in [
-            "random",
-            "passthrough",
             "power_of_two",
             "least_load",
             "consistent_hashing",
@@ -952,10 +978,10 @@ mod tests {
             assert!(!stage.to_string().is_empty(), "{name}: {stage}");
         }
         assert_eq!(
-            preset("random").place(MODEL, Phase::Single),
+            preset("manual").place(MODEL, Phase::Single),
             Place::NotAlone {
-                profile: "random",
-                stage: InTheWay::Picker("random"),
+                profile: "manual",
+                stage: InTheWay::Picker("manual"),
             }
         );
         assert!(matches!(
@@ -965,6 +991,111 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Random's pick is one draw over the pool by the request's seed: the
+    /// first value of the seed's stream, so one seed names one worker of an
+    /// unchanged pool and the seeds spread over it. A draw that lands on a
+    /// refused worker is made again, and a pool the draws find nobody in is
+    /// passed over once, with a draw among the workers that pass. The pick
+    /// writes no word of the pool. A part of a pool is drawn among too.
+    #[test]
+    fn a_random_pick_is_a_draw_of_the_requests_seed() {
+        let engine = preset("random");
+        let profile = alone(&engine);
+        for workers in [1, 2, 3, 8, 16, 64] {
+            let list = pool(workers);
+            let members = engine.pool_members(&list);
+            let word = members.rotation.0.load(Ordering::Relaxed);
+            let mut seen = vec![0_u32; workers];
+            for seed in 0..64 * workers as u64 {
+                let at = engine.pick(profile, &members, seed, RoutingState::eligible);
+                let at = at.expect("a ready worker");
+                assert_eq!(at, Draw::new(seed).below(workers), "{workers}, seed {seed}");
+                seen[at] += 1;
+            }
+            assert!(seen.iter().all(|&picks| picks > 16), "{workers}: {seen:?}");
+            assert_eq!(members.rotation.0.load(Ordering::Relaxed), word);
+        }
+
+        // Half the pool refused: every pick is a worker that passes, and
+        // each of them is picked.
+        let list = pool(16);
+        for worker in list.iter().step_by(2) {
+            worker.set_overloaded(true);
+        }
+        let members = engine.pool_members(&list);
+        let mut seen = [0_u32; 16];
+        for seed in 0..1_024 {
+            let at = engine.pick(profile, &members, seed, RoutingState::eligible);
+            seen[at.expect("a worker that passes")] += 1;
+        }
+        for (at, &picks) in seen.iter().enumerate() {
+            assert_eq!(picks > 64, at % 2 == 1, "worker {at}: {seen:?}");
+        }
+
+        // One worker in 64 passes: the draws' bound runs out for most
+        // seeds, and the pass finds the worker.
+        let list = pool(64);
+        for worker in list.iter() {
+            worker.set_overloaded(true);
+        }
+        list[37].set_overloaded(false);
+        let members = engine.pool_members(&list);
+        for seed in 0..64 {
+            let at = engine.pick(profile, &members, seed, RoutingState::eligible);
+            assert_eq!(at, Some(37), "seed {seed}");
+        }
+        list[37].set_overloaded(true);
+        assert_eq!(
+            engine.pick(profile, &members, 7, RoutingState::eligible),
+            None
+        );
+
+        // A part of a pool: a draw among its workers that pass.
+        let list = pool(8);
+        let part: Arc<[Arc<dyn Worker>]> = [1, 4, 6].map(|at| Arc::clone(&list[at])).into();
+        part[1].set_overloaded(true);
+        let mut seen = [0_u32; 3];
+        for seed in 0..256 {
+            let narrowed = PoolMembers::part(&part);
+            let at = engine.pick(profile, &narrowed, seed, RoutingState::eligible);
+            let among = engine.pick_among(profile, &part, seed, RoutingState::eligible);
+            assert_eq!(at, among, "seed {seed}");
+            seen[at.expect("a worker of the part")] += 1;
+        }
+        assert!(seen[0] > 64 && seen[2] > 64, "{seen:?}");
+        assert_eq!(seen[1], 0, "the refused worker of the part");
+    }
+
+    /// Passthrough's pick is the first worker of the pool that passes, in
+    /// the pool's order, whatever the seed: past the workers its walk steps
+    /// over the pool is passed over once, and the first that passes there
+    /// is the same worker. It writes no word of the pool.
+    #[test]
+    fn a_passthrough_pick_is_the_first_worker_that_passes() {
+        let engine = preset("passthrough");
+        let profile = alone(&engine);
+        let list = pool(32);
+        let members = engine.pool_members(&list);
+        let word = members.rotation.0.load(Ordering::Relaxed);
+        let pick = |seed| engine.pick(profile, &members, seed, RoutingState::eligible);
+        for refused in 0..32 {
+            for seed in [0, 7, u64::MAX] {
+                assert_eq!(pick(seed), Some(refused), "{refused} refused, seed {seed}");
+            }
+            list[refused].set_overloaded(true);
+        }
+        assert_eq!(pick(0), None);
+        assert_eq!(members.rotation.0.load(Ordering::Relaxed), word);
+        // A part of a pool: the first of its workers that passes.
+        let part: Arc<[Arc<dyn Worker>]> = [3, 9, 20].map(|at| Arc::clone(&list[at])).into();
+        part[2].set_overloaded(false);
+        let narrowed = PoolMembers::part(&part);
+        assert_eq!(
+            engine.pick(profile, &narrowed, 0, RoutingState::eligible),
+            Some(2)
+        );
     }
 
     /// A side of a pair holds one test beyond a worker's health: the prefill
@@ -1012,9 +1143,9 @@ mod tests {
 
     /// Every request of a document is decided whole where each of its
     /// places is picked alone or its stages read nothing the host does not
-    /// feed. Round robin asks nothing of a host. Random and passthrough
-    /// read a worker's record and no more. Least load reads the workers'
-    /// reports, and the default policy who holds the prompt beside them.
+    /// feed. Round robin, random and passthrough are picked alone and ask
+    /// nothing of a host. Least load reads the workers' reports, and the
+    /// default policy who holds the prompt beside them.
     /// A host that feeds less than a profile declares, a profile that
     /// reads a hash ring, one under a sessions rule and a pair's plan are
     /// not decided so.
@@ -1087,10 +1218,10 @@ mod tests {
             let profile = alone(&engine);
             let members = engine.pool_members(&pool(workers));
             let first = engine
-                .pick(profile, &members, RoutingState::eligible)
+                .pick(profile, &members, 0, RoutingState::eligible)
                 .expect("a worker");
             for step in 1..2 * workers {
-                let at = engine.pick(profile, &members, RoutingState::eligible);
+                let at = engine.pick(profile, &members, 0, RoutingState::eligible);
                 assert_eq!(at, Some((first + step) % workers), "{workers} workers");
             }
         }
@@ -1105,18 +1236,18 @@ mod tests {
         let (one, other) = (pool(5), pool(5));
         let (one, other) = (engine.pool_members(&one), engine.pool_members(&other));
         let first = engine
-            .pick(profile, &one, RoutingState::eligible)
+            .pick(profile, &one, 0, RoutingState::eligible)
             .expect("a worker");
         let apart = engine
-            .pick(profile, &other, RoutingState::eligible)
+            .pick(profile, &other, 0, RoutingState::eligible)
             .expect("a worker");
         for step in 1..=10 {
             assert_eq!(
-                engine.pick(profile, &one, RoutingState::eligible),
+                engine.pick(profile, &one, 0, RoutingState::eligible),
                 Some((first + step) % 5)
             );
             assert_eq!(
-                engine.pick(profile, &other, RoutingState::eligible),
+                engine.pick(profile, &other, 0, RoutingState::eligible),
                 Some((apart + step) % 5)
             );
         }
@@ -1136,7 +1267,7 @@ mod tests {
             let mut times = vec![0usize; members.workers().len()];
             for _ in 0..picks {
                 times[engine
-                    .pick(profile, members, RoutingState::eligible)
+                    .pick(profile, members, 0, RoutingState::eligible)
                     .expect("a worker")] += 1;
             }
             times
@@ -1200,31 +1331,47 @@ mod tests {
         let members = engine.pool_members(&list);
         for _ in 0..8 {
             assert_eq!(
-                engine.pick(profile, &members, RoutingState::eligible),
+                engine.pick(profile, &members, 0, RoutingState::eligible),
                 Some(3)
             );
         }
         let lifted: BTreeSet<usize> = (0..8)
             .filter_map(|_| {
-                engine.pick(profile, &members, RoutingState::eligible_ignoring_overload)
+                engine.pick(
+                    profile,
+                    &members,
+                    0,
+                    RoutingState::eligible_ignoring_overload,
+                )
             })
             .collect();
         assert_eq!(lifted, BTreeSet::from([1, 3]));
 
         list[3].set_overloaded(true);
-        assert_eq!(engine.pick(profile, &members, RoutingState::eligible), None);
         assert_eq!(
-            engine.pick_among(profile, &list, RoutingState::eligible),
+            engine.pick(profile, &members, 0, RoutingState::eligible),
+            None
+        );
+        assert_eq!(
+            engine.pick_among(profile, &list, 0, RoutingState::eligible),
             None
         );
         assert!(engine
-            .pick(profile, &members, RoutingState::eligible_ignoring_overload)
+            .pick(
+                profile,
+                &members,
+                0,
+                RoutingState::eligible_ignoring_overload
+            )
             .is_some());
         // A pool that holds no worker.
         let empty = engine.pool_members(&pool(0));
-        assert_eq!(engine.pick(profile, &empty, RoutingState::eligible), None);
         assert_eq!(
-            engine.pick_among(profile, &[], RoutingState::eligible),
+            engine.pick(profile, &empty, 0, RoutingState::eligible),
+            None
+        );
+        assert_eq!(
+            engine.pick_among(profile, &[], 0, RoutingState::eligible),
             None
         );
     }
@@ -1247,7 +1394,7 @@ mod tests {
         let mut times = [0usize; 6];
         for _ in 0..5 * 7 {
             times[engine
-                .pick_among(profile, &part, RoutingState::eligible)
+                .pick_among(profile, &part, 0, RoutingState::eligible)
                 .expect("a worker")] += 1;
         }
         assert_eq!(times, [7, 7, 0, 7, 7, 7]);

@@ -13,7 +13,24 @@ use crate::{document::spec::Needs, engine::view::Phase, stages::filters::RowTest
 /// A profile whose whole decision is one pick of its picker
 /// ([`Engine::place_for`]), by its place in the document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AloneProfile(pub(crate) u16);
+pub struct AloneProfile {
+    /// The profile's place in the document.
+    pub(crate) index: u16,
+    /// Whether the picker's pick reads its draw
+    /// ([`Picker::draws_alone`](super::Picker::draws_alone)).
+    pub(crate) draws: bool,
+}
+
+impl AloneProfile {
+    /// Whether the profile's pick reads the request's seed
+    /// ([`Picker::draws_alone`](super::Picker::draws_alone)). A caller that
+    /// asks the pick states a seed drawn for the request under such a
+    /// profile, and draws none under any other: a rotation reads no draw.
+    #[must_use]
+    pub const fn draws(self) -> bool {
+        self.draws
+    }
+}
 
 /// What a document holds for one place a caller builds a policy for: a
 /// model and a phase ([`Engine::place_for`]).
@@ -113,7 +130,10 @@ impl Engine {
             return Place::NoSide;
         };
         match self.in_the_way(index, profile, phase) {
-            None => Place::Alone(AloneProfile(index)),
+            None => Place::Alone(AloneProfile {
+                index,
+                draws: profile.picker.draws_alone(),
+            }),
             Some(stage) => Place::NotAlone {
                 profile: &profile.name,
                 stage,

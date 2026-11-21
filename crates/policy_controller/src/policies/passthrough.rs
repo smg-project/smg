@@ -4,7 +4,7 @@ use crate::{
     document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
-        framework::{Picker, TieBand, DRAW_BOUND},
+        framework::{Picker, PoolWord, TieBand, DRAW_BOUND},
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
@@ -41,6 +41,25 @@ impl Picker for Passthrough {
 
     fn draws_first(&self) -> bool {
         true
+    }
+
+    // The pool's order is its whole rule: it reads no word and no draw.
+    fn picks_alone(&self) -> bool {
+        true
+    }
+
+    /// The first worker of the pool the caller's test keeps, in the pool's
+    /// order. A walk that meets [`DRAW_BOUND`] refused workers stops there,
+    /// as [`Picker::draw_first`] stops: the caller then reads the pool
+    /// whole, and the first worker that passes is the pick
+    /// ([`Picker::pick_among`]'s default).
+    fn pick_alone(
+        &self,
+        pool: &PoolWord<'_>,
+        _: &mut Draw,
+        keep: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        (0..pool.rows.min(DRAW_BOUND as usize)).find(|&at| keep(at))
     }
 
     /// The pick is the first row every filter keeps, in the host's order,
