@@ -12,6 +12,7 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
+use smg_policy_controller::engine::PolicyEngine;
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -189,7 +190,7 @@ pub struct PolicyRegistry {
     /// lock-free reads via OnceLock). Empty unless the `policy_controller`
     /// setting is on with no controller address: the placement asks it
     /// where it stands, and the policies above where it does not.
-    policy_engine: Arc<OnceLock<Arc<smg_policy_controller::engine::policy_engine::PolicyEngine>>>,
+    policy_engine: Arc<OnceLock<Arc<PolicyEngine>>>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
@@ -955,19 +956,14 @@ impl PolicyRegistry {
     /// registry's stead from then on (set once at startup). Nothing else
     /// of the registry changes: its policies stay built, and the workers'
     /// completions still reach them.
-    pub fn set_policy_engine(
-        &self,
-        engine: Arc<smg_policy_controller::engine::policy_engine::PolicyEngine>,
-    ) {
+    pub fn set_policy_engine(&self, engine: Arc<PolicyEngine>) {
         debug!("set policy engine");
         let _ = self.policy_engine.set(engine);
     }
 
     /// The policy engine that places requests, where one was set
     /// ([`Self::set_policy_engine`]): one read, no count taken.
-    pub(crate) fn policy_engine(
-        &self,
-    ) -> Option<&smg_policy_controller::engine::policy_engine::PolicyEngine> {
+    pub(crate) fn policy_engine(&self) -> Option<&PolicyEngine> {
         self.policy_engine.get().map(|engine| &**engine)
     }
 

@@ -281,38 +281,41 @@ impl<'a> LentCounts<'a> {
 /// Runs a walk of rows with the reader of the rows' requests in flight, a
 /// function of a row. The walk is written once and compiled for each kind
 /// of rows: over rows that carry their counts the reader returns the row's
-/// field, beside a lent table it asks the table's [`LentRun`], and beside a
-/// host's reader of live rows
-/// ([`RequestFacts::live`](crate::engine::RequestFacts::live)) it asks that. The
+/// field, beside a lent table it asks the table's [`LentRun`], and beside
+/// rows that carry no live fact it asks their reader
+/// ([`RequestFacts::live_rows`](crate::engine::RequestFacts::live_rows)). The
 /// request's facts are asked which once a walk, so no read tests it and
 /// the lent table's parts are found once. A walk reads what the one reader
 /// reads ([`RequestFacts::in_flight`](crate::engine::RequestFacts::in_flight)),
 /// and a stage that reads a row or two asks that. The form
 /// `|counts, written|` also binds `written`: true over rows that carry
-/// their counts, false beside a lent table.
+/// their counts, false beside a lent table and beside a reader.
 macro_rules! with_counts {
     ($facts:expr, |$counts:ident| $walk:expr) => {
         $crate::tracking::counts::with_counts!($facts, |$counts, _written| $walk)
     };
     ($facts:expr, |$counts:ident, $written:ident| $walk:expr) => {
-        match ($facts.live, $facts.lent_in_flight) {
-            (Some(live), _) => {
-                let $counts =
-                    move |row: &$crate::engine::view::Candidate| live.read(row.position).in_flight;
-                let $written = false;
-                $walk
-            }
-            (None, Some(lent)) => {
+        match $facts.lent_in_flight {
+            Some(lent) => {
                 let run = lent.run();
                 let $counts = move |row: &$crate::engine::view::Candidate| run.of(row);
                 let $written = false;
                 $walk
             }
-            (None, None) => {
-                let $counts = |row: &$crate::engine::view::Candidate| row.in_flight;
-                let $written = true;
-                $walk
-            }
+            None => match $facts.live_rows {
+                None => {
+                    let $counts = |row: &$crate::engine::view::Candidate| row.in_flight;
+                    let $written = true;
+                    $walk
+                }
+                Some(live) => {
+                    let $counts = move |row: &$crate::engine::view::Candidate| {
+                        live.read(row.position).in_flight()
+                    };
+                    let $written = false;
+                    $walk
+                }
+            },
         }
     };
 }

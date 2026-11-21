@@ -41,7 +41,6 @@ mod handles {
         cell::{OnceCell, RefCell},
         collections::HashMap,
         hash::Hash,
-        sync::Arc,
         thread::LocalKey,
     };
 
@@ -50,7 +49,8 @@ mod handles {
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        keep_handles, kept, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
+        is_sentinel, keep_handles, kept, nested, recorder_installed, with_handle,
+        with_model_handle, ByLabels,
     };
 
     /// Handles by the matched path (the only label a request computes: the
@@ -166,10 +166,6 @@ mod handles {
         /// Decision counters for the newest generation seen on this thread,
         /// by static labels, then by the bounded set of interned models.
         pub(super) static POLICY_DECISIONS: RefCell<(u64, ByLabels<DecisionLabels, Counter>)> = RefCell::new((0, FxHashMap::default()));
-        /// The decision counter the last counted decision went through, with
-        /// its labels and its model, where `POLICY_DECISIONS` keeps it: a run
-        /// of decisions for one model under one profile hashes no label.
-        pub(super) static LAST_POLICY_DECISION: RefCell<Option<(DecisionLabels, Arc<str>, Counter)>> = const { RefCell::new(None) };
         /// Decision times by mode and outcome.
         pub(super) static POLICY_DECISION_SECONDS: RefCell<FxHashMap<(&'static str, &'static str), Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
@@ -210,7 +206,6 @@ mod handles {
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         POLICY_DECISIONS.set((0, FxHashMap::default()));
-        LAST_POLICY_DECISION.set(None);
         POLICY_DECISION_SECONDS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -1418,6 +1413,58 @@ pub(crate) mod allocator_stats {
 /// - Static labels use the metrics crate's internal caching
 pub struct Metrics;
 
+/// `smg_policy_decisions_total` under one set of labels.
+fn policy_decisions(
+    model: Arc<str>,
+    profile: Option<Arc<str>>,
+    outcome: &'static str,
+    mode: &'static str,
+) -> metrics::Counter {
+    let profile = profile.map_or_else(|| "".into(), metrics::SharedString::from);
+    counter!(
+        POLICY_DECISIONS_TOTAL,
+        "model" => model,
+        "profile" => profile,
+        "outcome" => outcome,
+        "mode" => mode
+    )
+}
+
+/// The handles the picks of one routing pool count through
+/// ([`Metrics::count_engine_pick`]), kept by the placement with the pool:
+/// the registry's snapshot holds one for each of its pools, and a new
+/// snapshot starts with none. The value is a short chain, one link for each
+/// model id as a request spelled it and each profile that picked, built by
+/// the first pick that needed it. The ids that reach one pool are the
+/// model's own and its aliases, so the chain is as long as the spellings an
+/// operator gave the model.
+#[derive(Debug, Default)]
+pub struct KeptPicks {
+    first: std::sync::OnceLock<Box<PickHandles>>,
+}
+
+impl KeptPicks {
+    /// How many links the chain holds.
+    #[cfg(test)]
+    pub(crate) fn links(&self) -> usize {
+        std::iter::successors(self.first.get(), |handles| handles.next.get()).count()
+    }
+}
+
+/// One link of [`KeptPicks`]: the handle of the picks under one model id
+/// and one profile.
+#[derive(Debug)]
+struct PickHandles {
+    /// The model id the handle was built for, as the request spelled it.
+    model: Box<str>,
+    generation: u64,
+    profile: Option<u16>,
+    /// `smg_policy_decisions_total` of the picks.
+    decided: metrics::Counter,
+    /// The handle of another spelling of the model, or of another profile.
+    next: std::sync::OnceLock<Box<PickHandles>>,
+}
+
 /// A decision of the policy controller as its series label it.
 #[derive(Clone, Copy, Debug)]
 pub struct PolicyDecision {
@@ -2339,7 +2386,8 @@ impl Metrics {
     }
 
     /// Count and time one policy decision for `model_id`
-    /// ([`Self::count_policy_decision`], [`Self::time_policy_decision`]).
+    /// ([`Self::count_policy_decision`], [`Self::time_policy_decision`]):
+    /// one body, the two inlined into it.
     pub fn record_policy_decision(
         model_id: &str,
         decision: PolicyDecision,
@@ -2350,14 +2398,12 @@ impl Metrics {
         Self::time_policy_decision(decision.mode, decision.outcome, seconds);
     }
 
-    /// Count one policy decision for `model_id`: every decision, through a
-    /// handle the calling thread keeps. A decision that shares its model and
-    /// labels with the one this thread counted before it uses that
-    /// decision's handle and hashes nothing. The counter asks `profile_name`
-    /// only when it needs a handle for a profile. A decision no profile
-    /// made counts under an empty `profile` label and keeps its handle
-    /// under no generation. Where a profile's generation is gone, the empty
-    /// label is used and that handle is discarded after counting.
+    /// Count one policy decision for `model_id`. The counter asks
+    /// `profile_name` only when it needs a handle for a profile. A decision
+    /// no profile made counts under an empty `profile` label and keeps its
+    /// handle under no generation. Where a profile's generation is gone, the
+    /// empty label is used and that handle is discarded after counting.
+    #[inline]
     pub fn count_policy_decision(
         model_id: &str,
         decision: PolicyDecision,
@@ -2370,14 +2416,7 @@ impl Metrics {
             mode,
         } = decision;
         let build = |model: Arc<str>, profile: Option<Arc<str>>| {
-            let profile = profile.map_or_else(|| "".into(), metrics::SharedString::from);
-            counter!(
-                POLICY_DECISIONS_TOTAL,
-                "model" => model,
-                "profile" => profile,
-                "outcome" => outcome,
-                "mode" => mode
-            )
+            policy_decisions(model, profile, outcome, mode)
         };
         if handles::keep_handles() {
             // A decision no profile made names nothing a new document can
@@ -2388,36 +2427,15 @@ impl Metrics {
                 outcome,
                 mode,
             };
-            // A run of decisions for one model under one profile counts
-            // through the handle the last of them used: two compares, and
-            // no label hashed.
-            let counted = handles::LAST_POLICY_DECISION.with_borrow(|last| {
-                last.as_ref()
-                    .filter(|(kept, model, _)| *kept == labels && **model == *model_id)
-                    .map(|(_, _, count)| count.increment(1))
-                    .is_some()
-            });
-            if counted {
-                return;
-            }
             handles::POLICY_DECISIONS.with_borrow_mut(|(newest, by_labels)| {
                 if profile.is_some() && generation > *newest {
                     by_labels.clear();
-                    handles::LAST_POLICY_DECISION.set(None);
                     *newest = generation;
                 }
                 let models = (profile.is_none() || generation == *newest)
                     .then(|| by_labels.entry(labels).or_default());
-                let kept = models
-                    .as_ref()
-                    .and_then(|models| models.get_key_value(model_id));
-                if let Some((model, count)) = kept {
+                if let Some(count) = models.as_ref().and_then(|models| models.get(model_id)) {
                     count.increment(1);
-                    handles::LAST_POLICY_DECISION.set(Some((
-                        labels,
-                        Arc::clone(model),
-                        count.clone(),
-                    )));
                     return;
                 }
                 let model = intern_model_label(model_id);
@@ -2430,11 +2448,6 @@ impl Metrics {
                 let count = build(Arc::clone(&model), name);
                 count.increment(1);
                 if let Some(models) = models {
-                    handles::LAST_POLICY_DECISION.set(Some((
-                        labels,
-                        Arc::clone(&model),
-                        count.clone(),
-                    )));
                     models.insert(model, count);
                 }
             });
@@ -2444,10 +2457,58 @@ impl Metrics {
         }
     }
 
+    /// Count one pick of the policy engine in this process, a worker of
+    /// one routing pool for `model_id` (`smg_policy_decisions_total`),
+    /// through the handle `kept` holds for the pool, found with no lookup:
+    /// a compare of the model id and one atomic step. The first pick under
+    /// a model id and a profile builds their handle and keeps it, where
+    /// handles are kept at all and the model's label is its own. Any other
+    /// pick counts through the calling thread's handles
+    /// ([`Self::count_policy_decision`]).
+    ///
+    /// Every pick of the engine in this process says one outcome and one
+    /// mode, so the kept handle is found by the model id, the document's
+    /// generation and the profile, and counts under the first pick's two.
+    pub fn count_engine_pick(
+        kept: &KeptPicks,
+        model_id: &str,
+        pick: PolicyDecision,
+        profile_name: impl FnOnce() -> Option<Arc<str>>,
+    ) {
+        let mut link = &kept.first;
+        while let Some(handles) = link.get() {
+            if handles.generation == pick.generation
+                && handles.profile == pick.profile
+                && *handles.model == *model_id
+            {
+                handles.decided.increment(1);
+                return;
+            }
+            link = &handles.next;
+        }
+        let name = profile_name();
+        let label = intern_model_label(model_id);
+        if name.is_none() || !handles::keep_handles() || handles::is_sentinel(&label) {
+            return Self::count_policy_decision(model_id, pick, || name);
+        }
+        let decided = policy_decisions(label, name, pick.outcome, pick.mode);
+        decided.increment(1);
+        // A caller another one's handle got ahead of has counted through
+        // its own, which is a handle to the same series, and drops it.
+        let _ = link.set(Box::new(PickHandles {
+            model: model_id.into(),
+            generation: pick.generation,
+            profile: pick.profile,
+            decided,
+            next: std::sync::OnceLock::new(),
+        }));
+    }
+
     /// Record the `seconds` one policy decision took. A caller that times
     /// every decision records each; the engine in the gateway's own process
     /// times one decision in [`POLICY_DECISIONS_PER_TIMED`], so there the
     /// histogram's count is a sample's and the counter's is the decisions'.
+    #[inline]
     pub fn time_policy_decision(mode: &'static str, outcome: &'static str, seconds: f64) {
         handles::with_static(
             &handles::POLICY_DECISION_SECONDS,

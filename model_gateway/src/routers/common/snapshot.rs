@@ -10,7 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_policy_controller::engine::policy_engine::{PolicyEngine, PoolMembers};
+use smg_policy_controller::engine::{PolicyEngine, PoolMembers};
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -20,6 +20,7 @@ use smg_worker::{
 use symphony::grammar::GrammarStart;
 
 use crate::{
+    observability::metrics::KeptPicks,
     policies::hash_ring::HashRing,
     routers::common::pair_index::{PdPairIndex, PdWire},
 };
@@ -184,6 +185,9 @@ pub struct ModelWorkerSnapshot {
     /// What the policy engine reads of each pool's members (see
     /// [`Self::pool_members`]).
     pool_members: [OnceLock<PoolMembers>; RoutingPool::COUNT],
+    /// The metric handles each pool's picks by the policy engine count
+    /// through (see [`Self::pool_picks`]).
+    pool_picks: [KeptPicks; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -197,6 +201,7 @@ impl ModelWorkerSnapshot {
             labels: OnceLock::new(),
             hash_ring: OnceLock::new(),
             pool_members: std::array::from_fn(|_| OnceLock::new()),
+            pool_picks: std::array::from_fn(|_| KeptPicks::default()),
         }
     }
 
@@ -374,6 +379,14 @@ impl ModelWorkerSnapshot {
     ) -> &PoolMembers {
         self.pool_members[pool.index()]
             .get_or_init(|| engine.pool_members(model_id, self.pool(pool)))
+    }
+
+    /// The metric handles the picks of `pool` by the policy engine count
+    /// through: built by the first pick after the membership change, found
+    /// by every pick after it with no lookup. A new snapshot starts with
+    /// none.
+    pub(crate) fn pool_picks(&self, pool: RoutingPool) -> &KeptPicks {
+        &self.pool_picks[pool.index()]
     }
 
     /// The workers of `pool`, projected once per snapshot and borrowed from

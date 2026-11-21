@@ -15,7 +15,7 @@ use crate::{
         view::{Candidate, ModelFingerprint, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::{push_drawn, target_of},
+    stages::builtins::{live_turns, push_drawn, target_of},
     tracking::lease::Lifecycle,
     Draw,
 };
@@ -223,6 +223,48 @@ impl Picker for RoundRobin {
         true
     }
 
+    // Reads no fact of a row: its rotation is its whole rule.
+    fn live_wise(&self) -> bool {
+        true
+    }
+
+    /// The pool's own turn, and no alternate: the row the pool's rotation
+    /// lands on is the pick when every filter keeps it. A turn that lands
+    /// on a refused row takes the pool's next turn, as many turns as the
+    /// pool's size earns (`live_turns`), and the first row kept is the
+    /// pick. Each turn is one step of the pool's rotation and one read of a
+    /// worker, and no step is taken twice: over a turn of the pool each
+    /// kept row is the pick of exactly one request, as in the survivors'
+    /// own rotation, and no request reads the pool whole while a kept row
+    /// stands within those turns. The requests are served in the pool's
+    /// order, where the whole pass serves them in the survivors'. Past a
+    /// run of refused rows that long the whole pass decides: none of the
+    /// turns taken stood on a kept row, so no kept row lost its turn. No
+    /// value of the seed's stream is read.
+    fn draw_live(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        keep: &mut dyn FnMut(&Candidate) -> bool,
+        kept: &mut Vec<u32>,
+        _: &mut Draw,
+    ) -> bool {
+        let rows = candidates.len();
+        if rows == 0 {
+            return false;
+        }
+        let key = Self::pool_key(facts, pool, rows);
+        for _ in 0..live_turns(rows) {
+            let turn = self.advance(key) as usize % rows;
+            if keep(&candidates[turn]) {
+                kept.push(turn as u32);
+                return true;
+            }
+        }
+        false
+    }
+
     /// The pool's own turn: the row the pool's rotation lands on is the pick
     /// when every filter keeps it, and the rows kept behind it follow as
     /// alternates, as far as [`DRAW_BOUND`] refused rows let the walk go. A
@@ -250,7 +292,7 @@ impl Picker for RoundRobin {
         kept.push(pick as u32);
         let mut refused = 0;
         for step in 1..rows {
-            if kept.len() == facts.most_targets() || refused == DRAW_BOUND {
+            if kept.len() == MAX_TARGETS || refused == DRAW_BOUND {
                 break;
             }
             let row = (pick + step) % rows;

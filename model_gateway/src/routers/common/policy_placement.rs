@@ -1,6 +1,6 @@
 //! Placement by the policy engine, over the registry's own data.
 //!
-//! Where the `policy_controller` setting is on and the gateway hosts the
+//! Where the `policy_controller` setting is on and the gateway keeps the
 //! engine itself, the placement asks the policy engine where it would ask a
 //! classic policy ([`super::placement`]). Nothing around the decision
 //! changes: the pool is the registry's routing pool for the model, the
@@ -27,8 +27,7 @@ use std::{
 };
 
 use smg_policy_controller::engine::{
-    policy_engine::{Placement, PolicyEngine, PoolMembers, Request},
-    WorkerId,
+    Placement, PlacementRequest, PolicyEngine, PoolMembers, WorkerId,
 };
 use smg_worker::identity::basic::Worker;
 
@@ -36,22 +35,24 @@ use super::{
     placement::{PlacementInputs, WireConstraint},
     snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
 };
-use crate::observability::metrics::{Metrics, PolicyDecision, POLICY_DECISIONS_PER_TIMED};
+use crate::observability::metrics::{
+    KeptPicks, Metrics, PolicyDecision, POLICY_DECISIONS_PER_TIMED,
+};
 
 /// The `mode` label of a decision made in this process.
 const EMBEDDED: &str = "embedded";
 
-/// What a thread keeps for the requests held to some of a pool's workers:
-/// the rows such a request may not take, and the ids of the workers it
-/// tried.
+/// What limits one request to some of a pool's workers, in the lists a
+/// thread keeps for such requests: the rows the request may not take, and
+/// the ids of the workers it tried.
 #[derive(Default)]
-struct Held {
+struct Limits {
     refused: Vec<u32>,
     tried: Vec<WorkerId>,
 }
 
 thread_local! {
-    static HELD: RefCell<Held> = RefCell::new(Held::default());
+    static LIMITS: RefCell<Limits> = RefCell::new(Limits::default());
     /// The decisions this thread has yet to make before it times one.
     static UNTIMED: Cell<u32> = const { Cell::new(0) };
 }
@@ -83,14 +84,15 @@ pub(crate) fn single(
         return None;
     }
     let members = snapshot.pool_members(pool, model_id, engine);
+    let picks = snapshot.pool_picks(pool);
     if wire.is_none() && inputs.candidate_filter.is_none() && inputs.tried.is_empty() {
-        return decide(engine, &Request::of(model_id), members);
+        return decide(engine, &PlacementRequest::of(model_id), members, picks);
     }
     // Each worker is asked once what holds the request to some of them, as
     // the classic placement asks, and nothing is allocated for the answer.
-    let decide_held = |held: &mut Held| {
-        held.refused.clear();
-        held.tried.clear();
+    let decide_limited = |limits: &mut Limits| {
+        limits.refused.clear();
+        limits.tried.clear();
         for (position, worker) in workers.iter().enumerate() {
             let admitted = WireConstraint::admits(wire, worker.as_ref())
                 && inputs
@@ -98,34 +100,39 @@ pub(crate) fn single(
                     .is_none_or(|accepts| accepts(worker.as_ref()));
             if admitted {
                 if inputs.tried.iter().any(|url| url == worker.base_url()) {
-                    held.tried.extend(members.id_at(position));
+                    limits.tried.extend(members.id_at(position));
                 }
             } else {
-                held.refused
+                limits
+                    .refused
                     .push(u32::try_from(position).unwrap_or(u32::MAX));
             }
         }
-        let request = Request {
-            tried: &held.tried,
-            refused: &held.refused,
-            ..Request::of(model_id)
+        let request = PlacementRequest {
+            tried: &limits.tried,
+            refused: &limits.refused,
+            ..PlacementRequest::of(model_id)
         };
-        decide(engine, &request, members)
+        decide(engine, &request, members, picks)
     };
-    HELD.with(|held| match held.try_borrow_mut() {
-        Ok(mut held) => decide_held(&mut held),
+    LIMITS.with(|limits| match limits.try_borrow_mut() {
+        Ok(mut limits) => decide_limited(&mut limits),
         // A candidate predicate that places a request of its own on this
         // thread: its lists are its own.
-        Err(_) => decide_held(&mut Held::default()),
+        Err(_) => decide_limited(&mut Limits::default()),
     })
 }
 
 /// One decision of `engine` for `request` over `members`, counted under the
-/// request's model and timed where its turn comes.
+/// request's model and timed where its turn comes. A pick counts through
+/// the handles `picks` keeps for the pool, with no lookup: a gateway that
+/// serves many models pays for none. A request placed on nobody is counted
+/// through the calling thread's handles.
 fn decide(
     engine: &PolicyEngine,
-    request: &Request<'_>,
+    request: &PlacementRequest<'_>,
     members: &PoolMembers,
+    picks: &KeptPicks,
 ) -> Option<Arc<dyn Worker>> {
     let started = timed().then(Instant::now);
     let placed = engine.place(request, members);
@@ -135,20 +142,21 @@ fn decide(
         Err(unplaced) if unplaced.queued => (unplaced.profile, "queue"),
         Err(unplaced) => (unplaced.profile, "shed"),
     };
-    Metrics::count_policy_decision(
-        request.model,
-        PolicyDecision {
-            generation: engine.spec().generation(),
-            profile,
-            outcome,
-            mode: EMBEDDED,
-        },
-        || {
-            let profiles = engine.spec().engine().profiles();
-            let profile = profiles.get(usize::from(profile?))?;
-            Some(Arc::from(profile.name.as_str()))
-        },
-    );
+    let decision = PolicyDecision {
+        generation: engine.spec().generation(),
+        profile,
+        outcome,
+        mode: EMBEDDED,
+    };
+    let profile_name = || {
+        let profiles = engine.spec().engine().profiles();
+        let profile = profiles.get(usize::from(profile?))?;
+        Some(Arc::from(profile.name.as_str()))
+    };
+    match &placed {
+        Ok(_) => Metrics::count_engine_pick(picks, request.model, decision, profile_name),
+        Err(_) => Metrics::count_policy_decision(request.model, decision, profile_name),
+    }
     if let Some(seconds) = seconds {
         Metrics::time_policy_decision(EMBEDDED, outcome, seconds);
     }
@@ -178,7 +186,10 @@ mod tests {
 
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_policy_controller::document::{AppliedSpec, PolicySpec};
-    use smg_worker::test_support::{no_health_check, render_with_recorder};
+    use smg_worker::{
+        metrics::handles::force_on_this_thread,
+        test_support::{no_health_check, render_with_recorder},
+    };
 
     use super::*;
     use crate::{
@@ -197,9 +208,13 @@ mod tests {
     }
 
     fn worker(url: &str) -> Arc<dyn Worker> {
+        worker_of(MODEL, url)
+    }
+
+    fn worker_of(model: &str, url: &str) -> Arc<dyn Worker> {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(url)
-                .model(ModelCard::new(MODEL))
+                .model(ModelCard::new(model))
                 .health_config(no_health_check())
                 .build(),
         );
@@ -298,7 +313,7 @@ mod tests {
         let odd = |worker: &dyn Worker| {
             fleet
                 .iter()
-                .position(|held| held.url() == worker.url())
+                .position(|member| member.url() == worker.url())
                 .is_some_and(|at| at % 2 == 1)
         };
         let tried = [fleet[1].base_url().to_owned()];
@@ -422,5 +437,63 @@ mod tests {
             .find(|line| line.starts_with("smg_policy_decision_seconds_count{"))
             .expect("some decisions are timed");
         assert!(timed.ends_with(" 3"), "{timed}");
+    }
+
+    /// Requests for several models in turn find their counters with no
+    /// lookup: each model's pool keeps the handles its picks count through,
+    /// one link for the model id, and every pick is counted under its own
+    /// model. A request placed on nobody keeps nothing with the pool.
+    #[test]
+    fn the_picks_of_each_model_count_through_the_handles_its_pool_keeps() {
+        const MODELS: [&str; 3] = ["kept-a", "kept-b", "kept-c"];
+        let rendered = render_with_recorder(|| {
+            force_on_this_thread(Some(true));
+            let registry = WorkerRegistry::new();
+            for model in MODELS {
+                for at in 0..2 {
+                    let worker = worker_of(model, &format!("http://{model}-{at}:8000"));
+                    assert!(registry.register(worker).is_some());
+                }
+            }
+            let policies = policies("round_robin");
+            let select = |model: &str, inputs| {
+                let pool = RoutingPool::HttpRegular;
+                select_single(&registry, &policies, model, pool, None, inputs)
+            };
+            for _ in 0..7 {
+                for model in MODELS {
+                    assert!(select(model, PlacementInputs::default()).is_some());
+                }
+            }
+            let nobody = |_: &dyn Worker| false;
+            let refused = PlacementInputs {
+                candidate_filter: Some(&nobody),
+                ..PlacementInputs::default()
+            };
+            assert!(select(MODELS[0], refused).is_none());
+            for model in MODELS {
+                let snapshot = registry.get_routing_snapshot(model);
+                assert_eq!(snapshot.pool_picks(RoutingPool::HttpRegular).links(), 1);
+            }
+            force_on_this_thread(None);
+        });
+        for model in MODELS {
+            let labelled = format!("model=\"{model}\"");
+            let of = |name: &str, more: &str| {
+                rendered
+                    .lines()
+                    .find(|line| {
+                        line.starts_with(name) && line.contains(&labelled) && line.contains(more)
+                    })
+                    .expect("the model's series is rendered")
+            };
+            let picked = of("smg_policy_decisions_total{", "outcome=\"pick\"");
+            assert!(picked.ends_with(" 7"), "{picked}");
+        }
+        let shed = rendered
+            .lines()
+            .find(|line| line.contains("outcome=\"shed\"") && line.contains("kept-a"))
+            .expect("the request nobody took is counted");
+        assert!(shed.ends_with(" 1"), "{shed}");
     }
 }

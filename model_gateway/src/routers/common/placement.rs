@@ -363,9 +363,10 @@ pub(crate) fn candidates(
 /// selectable. Records the selection metric under the chosen worker's own
 /// transport label.
 ///
-/// Where the gateway hosts the policy engine it decides here, over the same
-/// pool of the same registry ([`policy_placement::single`]), and the
-/// decision is counted as the engine's.
+/// Where the gateway keeps the policy engine in its own process the engine
+/// decides here, over the same pool of the same registry
+/// ([`policy_placement::single`]), and the decision is counted as the
+/// engine's.
 pub(crate) fn select_single(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,

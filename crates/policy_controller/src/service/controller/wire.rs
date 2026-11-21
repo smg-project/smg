@@ -433,7 +433,7 @@ impl Checked {
                 signal_cells: view.signal_cells,
                 client_key: facts.client_key,
                 // The controller's rows carry their own health and counts.
-                live: None,
+                live_rows: None,
             },
             Constraints {
                 excluded: &lists.excluded,

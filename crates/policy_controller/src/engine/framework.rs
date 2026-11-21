@@ -33,10 +33,14 @@ use crate::{
 
 mod encode;
 mod engines;
+mod live;
 mod vetoed;
 
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
+#[cfg(feature = "test-util")]
+pub use live::turn_live_draw_from;
+pub use live::{LIVE_DRAWS, LIVE_DRAW_FROM};
 use vetoed::AllVetoed;
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -385,6 +389,16 @@ pub trait Scorer: Lifecycle + Debug {
     fn warm_rule(&self) -> Option<WarmRule> {
         None
     }
+
+    /// Whether the scorer answers over rows that carry no live fact
+    /// ([`Engine::decide_live`]): it reads no health bit and no report off
+    /// a row, and a row's count through the request's facts alone
+    /// ([`RequestFacts::in_flight`]). The default is no, and a profile
+    /// that holds such a scorer is decided over rows written for the
+    /// decision. The engine reads it once per profile when it is built.
+    fn live_wise(&self) -> bool {
+        false
+    }
 }
 
 /// What a picker's narrowing left of the survivors: the first `compared` are
@@ -431,63 +445,6 @@ pub const DRAW_BOUND: u32 = 8;
 /// cells `power_of_two/half/16` and `power_of_two/half/32` hold that shape
 /// and where it ends.
 pub const DRAW_FROM: usize = 16;
-
-/// The smallest pool at which a decision draws first where its host lends a
-/// reader of live rows ([`RequestFacts::live`]), set by run. There a row
-/// asked about is a read of the host's worker, a call and the worker's own
-/// words, where a row that carries its facts is a read of the row beside
-/// the last: the whole pass pays that read a row at any size, and the draw
-/// pays it for the rows it draws alone. The run counts one decision's
-/// instructions under each floor, every row ready: the draw reads fewer
-/// than the whole pass from one row on under `round_robin` (3,147 against
-/// 3,355 at one row, 3,172 against 5,227 at eight) and under `random`, and
-/// from two rows on under a picker that draws two (4,212 against 4,318),
-/// which leaves a pool of one row to the whole pass before it draws. So
-/// every pool that holds a row is drawn from.
-pub const LIVE_DRAW_FROM: usize = 1;
-
-/// [`LIVE_DRAW_FROM`] as the run that sets it turns it: a bench asks the
-/// same decision under each floor in one build.
-#[cfg(feature = "test-util")]
-mod turned {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static LIVE_DRAW_FROM: AtomicUsize = AtomicUsize::new(super::LIVE_DRAW_FROM);
-
-    pub(super) fn live_draw_from() -> usize {
-        LIVE_DRAW_FROM.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn turn(rows: usize) {
-        LIVE_DRAW_FROM.store(rows, Ordering::Relaxed);
-    }
-}
-
-/// Turns the floor a decision over a reader of live rows draws first from,
-/// for every engine of the process: the knob of the run that sets
-/// [`LIVE_DRAW_FROM`], and no test's.
-#[cfg(feature = "test-util")]
-pub fn turn_live_draw_from(rows: usize) {
-    turned::turn(rows);
-}
-
-/// The smallest pool at which this decision draws first: [`DRAW_FROM`] over
-/// rows that carry their facts, and [`LIVE_DRAW_FROM`] where the host lends
-/// a reader of live rows.
-#[inline]
-fn draws_from(facts: &RequestFacts<'_>) -> usize {
-    if facts.live.is_none() {
-        return DRAW_FROM;
-    }
-    #[cfg(feature = "test-util")]
-    {
-        turned::live_draw_from()
-    }
-    #[cfg(not(feature = "test-util"))]
-    {
-        LIVE_DRAW_FROM
-    }
-}
 
 /// The pool size from which a profile whose leading stages are ranks is
 /// decided by rank ([`Scorer::spread`]); a smaller pool is asked whole. Rows
@@ -683,6 +640,39 @@ pub trait Picker: Lifecycle + Debug {
     /// through the assignment's stage without asking the picker.
     fn by_assignment(&self) -> bool {
         false
+    }
+
+    /// Whether the picker decides over rows that carry no live fact
+    /// ([`Engine::decide_live`]): it reads no health bit and no report off
+    /// a row, a row's count through the request's facts alone
+    /// ([`RequestFacts::in_flight`]), and it draws its pick by
+    /// [`Picker::draw_live`]. The default is no, and a profile under such a
+    /// picker is decided over rows written for the decision. The engine
+    /// reads it once per profile when it is built.
+    fn live_wise(&self) -> bool {
+        false
+    }
+
+    /// [`Picker::draw_first`] for a decision over live rows
+    /// ([`Engine::decide_live`]). There each row `keep` is asked about is
+    /// one read of a worker, and one target is taken a decision: the picker
+    /// draws its pick and no alternate, and where the row drawn is refused
+    /// it goes on by its own rule, as far as its own bound. A rotation
+    /// takes the pool's next turn, and a random pick draws again
+    /// ([`LIVE_DRAWS`]). A whole pass reads every worker of the pool, so it
+    /// is this draw's last resort. On `true`, `kept` holds the pick. On
+    /// `false` nothing is decided, what `kept` holds is dropped and the
+    /// whole pass runs. The default is the picker's own draw.
+    fn draw_live(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        keep: &mut dyn FnMut(&Candidate) -> bool,
+        kept: &mut Vec<u32>,
+        draw: &mut Draw,
+    ) -> bool {
+        self.draw_first(facts, pool, candidates, keep, kept, draw)
     }
 }
 
@@ -1064,6 +1054,10 @@ struct Buffers {
     /// The veto the rule lifted for the rows it kept ([`vetoed::emptied`]):
     /// the mark of its pick's trace ([`vetoed::steered`]).
     lifted: Lifted,
+    /// The rows a draw over live rows landed on and refused, for the whole
+    /// pass it widens to ([`live`]): a picker's own bound of them at the
+    /// most, so a thread's first such draws size it.
+    refused: Vec<u32>,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
 }
@@ -3023,6 +3017,10 @@ pub struct Engine {
     /// pass keeps the rows of the single plan's pool by it
     /// ([`keep_folded`]).
     row_tests: Vec<Option<RowTests>>,
+    /// Per profile, whether its stages decide over rows that carry no live
+    /// fact ([`live::live_wise`]), said once at the build. A decision over
+    /// live rows reads it ([`Self::decide_live`]), and no other does.
+    live_wise: Vec<bool>,
     /// Per profile, which of its leading stages are ranks ([`Order`]). A
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
@@ -4107,6 +4105,11 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
+        let live_wise: Vec<bool> = profiles
+            .iter()
+            .zip(&row_tests)
+            .map(|(profile, &folded)| live::live_wise(profile, folded))
+            .collect();
         let named_by: Vec<NamedBy> = profiles
             .iter()
             .zip(&row_tests)
@@ -4206,6 +4209,7 @@ impl Engine {
             profile_needs,
             named_by,
             row_tests,
+            live_wise,
             orders,
             seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
@@ -4807,22 +4811,6 @@ impl Engine {
         })
     }
 
-    /// Whether a decision for `model` in `phase` reads no clock: its profile
-    /// asks its host for nothing ([`Engine::reads_for`]), shows no row to a
-    /// plugin, refuses by no report, and its binding holds no sessions rule.
-    /// Such a decision reads its rows' bits and counts, its pool's rotation
-    /// and its seed, and a host may hand it no instant
-    /// ([`RequestFacts::now_micros`] of `0`). A host that keeps its own
-    /// clock asks once a membership, not once a request.
-    #[must_use]
-    pub fn clock_free(&self, model: &str, phase: Phase) -> bool {
-        let Some((entry, _, _)) = self.resolve(model, phase) else {
-            return true;
-        };
-        let (needs, shown, by_reports) = self.reads_for(model, phase);
-        needs == Needs::default() && !shown && !by_reports && entry.binding.sessions.is_none()
-    }
-
     /// The binding a request resolves to, with its profile for the phase: one
     /// walk of the bindings per decision; `None` when no binding matches or
     /// the binding's plan has no side for the phase.
@@ -4924,6 +4912,11 @@ impl Engine {
         debug_assert_cells(facts.signal_cells, candidates);
         debug_assert_named(facts, candidates);
         debug_assert_keyed(facts, candidates);
+        // This entry's passes read a row's bits as the row's own.
+        debug_assert!(
+            facts.live_rows.is_none(),
+            "rows that carry no live fact are decided through decide_live"
+        );
         if !column_fits(facts.affinity, candidates) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
@@ -5033,7 +5026,7 @@ impl Engine {
             // A draw or the ranks, only over a pool of `DRAW_FROM` rows or
             // more: the ranks' floor is the draw's.
             let ahead = marks.ahead();
-            if ahead != 0 && candidates.len() >= draws_from(facts) {
+            if ahead != 0 && candidates.len() >= DRAW_FROM {
                 // A profile that draws for every request is the draw's at one
                 // compare, the one it paid before the ranks: it holds no rank
                 // mark, so its marks read `DRAWS_FIRST` alone ([`Marks::of`]).
@@ -5230,7 +5223,7 @@ impl Engine {
             }
         }
         let ahead = marks.ahead();
-        if ahead != 0 && candidates.len() >= draws_from(facts) {
+        if ahead != 0 && candidates.len() >= DRAW_FROM {
             if ahead == Marks::DRAWS_FIRST || (facts.named.is_some() && ahead & Marks::JOINED != 0)
             {
                 return Some(run_drawn(self, index, facts, pool, set, cx, buf));

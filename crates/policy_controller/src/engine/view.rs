@@ -7,6 +7,8 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{load::signals, tracking::counts};
 
 /// The stable identity of a candidate: a hash of the registration key and the
@@ -868,28 +870,202 @@ pub struct KeyedRow {
     pub in_flight: u16,
 }
 
-/// One row's live facts, as its host reads them at a decision
-/// ([`LiveRows`]).
+/// One row's live facts in one word: its health bits and its requests in
+/// flight, as one read of the row's worker gave them ([`LiveRows`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LiveRow {
-    /// The row's health bits now.
-    pub health: Health,
-    /// The row's requests in flight now.
-    pub in_flight: u32,
+pub struct LiveRow(u32);
+
+impl LiveRow {
+    const HEALTHY: u32 = 1;
+    const BREAKER_OPEN: u32 = 1 << 1;
+    const STALLED: u32 = 1 << 2;
+    const DRAINING: u32 = 1 << 3;
+    const OVERLOADED: u32 = 1 << 4;
+    /// The bits below the count.
+    const HEALTH_BITS: u32 = 5;
+    /// The four bits [`Health::routable_ignoring_overload`] reads.
+    const ROUTING: u32 = Self::HEALTHY | Self::BREAKER_OPEN | Self::STALLED | Self::DRAINING;
+
+    /// The most requests in flight a word holds: a larger count reads as
+    /// this many.
+    pub const MAX_IN_FLIGHT: u32 = (1 << (32 - Self::HEALTH_BITS)) - 1;
+
+    /// The word of a row with these bits and this many requests in flight.
+    #[must_use]
+    pub const fn new(health: Health, in_flight: u32) -> Self {
+        let count = if in_flight > Self::MAX_IN_FLIGHT {
+            Self::MAX_IN_FLIGHT
+        } else {
+            in_flight
+        };
+        Self(
+            health.healthy as u32
+                | (health.breaker_open as u32) << 1
+                | (health.stalled as u32) << 2
+                | (health.draining as u32) << 3
+                | (health.overloaded as u32) << 4
+                | count << Self::HEALTH_BITS,
+        )
+    }
+
+    /// The row's health bits.
+    #[must_use]
+    pub const fn health(self) -> Health {
+        Health {
+            healthy: self.0 & Self::HEALTHY != 0,
+            breaker_open: self.0 & Self::BREAKER_OPEN != 0,
+            stalled: self.0 & Self::STALLED != 0,
+            draining: self.0 & Self::DRAINING != 0,
+            overloaded: self.0 & Self::OVERLOADED != 0,
+        }
+    }
+
+    /// The row's requests in flight.
+    #[must_use]
+    pub const fn in_flight(self) -> u32 {
+        self.0 >> Self::HEALTH_BITS
+    }
+
+    /// [`Health::routable_ignoring_overload`] of the row's bits, in one
+    /// compare of the word.
+    #[must_use]
+    pub const fn routable_ignoring_overload(self) -> bool {
+        self.0 & Self::ROUTING == Self::HEALTHY
+    }
+
+    /// The row's overload bit.
+    #[must_use]
+    pub const fn overloaded(self) -> bool {
+        self.0 & Self::OVERLOADED != 0
+    }
 }
 
-/// A host's reader of the live facts it keeps beside the rows it lends
-/// ([`RequestFacts::live`]): the health bits and the requests in flight of
-/// the row at a position, read where the host keeps them.
+/// One row's place in the live facts a decision keeps ([`LiveRows::whole`]):
+/// the row's word under the mark of the decision that read it. A cell that
+/// holds another decision's mark holds nothing for this one, so no cell is
+/// cleared between decisions.
+#[derive(Debug, Default)]
+pub struct LiveCell(AtomicU64);
+
+impl LiveCell {
+    /// What the decision marked `mark` read of the row: `None` where the
+    /// cell holds another decision's read.
+    #[inline]
+    #[must_use]
+    pub fn kept(&self, mark: u32) -> Option<LiveRow> {
+        let word = self.0.load(Ordering::Relaxed);
+        ((word >> 32) as u32 == mark).then_some(LiveRow(word as u32))
+    }
+
+    /// Keeps `row` as the read of the decision marked `mark`.
+    #[inline]
+    pub fn keep(&self, mark: u32, row: LiveRow) {
+        let word = u64::from(mark) << 32 | u64::from(row.0);
+        self.0.store(word, Ordering::Relaxed);
+    }
+
+    /// The row the cell holds, whichever decision read it. A pass over a
+    /// whole column reads it ([`LiveRows::whole`]): every cell of that
+    /// column holds the deciding decision's read.
+    #[inline]
+    #[must_use]
+    pub fn row(&self) -> LiveRow {
+        LiveRow(self.0.load(Ordering::Relaxed) as u32)
+    }
+
+    /// Empties the cell: it holds no decision's read.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The two tests of a row's health bits one pass over a whole pool asks of
+/// every row ([`LiveRows::pass`]): which of them stand for the decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveTest {
+    /// The row is routable, its overload verdict aside
+    /// ([`Health::routable_ignoring_overload`]).
+    pub routable: bool,
+    /// The row is not over its overload thresholds.
+    pub not_overloaded: bool,
+}
+
+impl LiveTest {
+    /// Whether a row of these health bits passes.
+    #[inline]
+    #[must_use]
+    pub const fn passes(self, health: Health) -> bool {
+        (!self.routable || health.routable_ignoring_overload())
+            && (!self.not_overloaded || !health.overloaded)
+    }
+
+    /// [`Self::passes`] of a row's word.
+    #[inline]
+    #[must_use]
+    pub const fn passes_row(self, row: LiveRow) -> bool {
+        (!self.routable || row.routable_ignoring_overload())
+            && (!self.not_overloaded || !row.overloaded())
+    }
+
+    /// The pass over rows every one of which holds its read
+    /// ([`LiveRows::whole`]): the position of each row that passes is
+    /// pushed to `kept`, in the rows' order.
+    pub fn pass_whole(self, cells: &[LiveCell], kept: &mut Vec<u32>) {
+        for (position, cell) in (0u32..).zip(cells) {
+            if self.passes_row(cell.row()) {
+                kept.push(position);
+            }
+        }
+    }
+}
+
+/// The live facts of a pool's rows for one decision, read where their owner
+/// keeps them ([`RequestFacts::live_rows`]). A gateway that keeps a
+/// worker's health and its requests in flight on the worker object writes
+/// its rows once a membership, with no live fact in them, and lends this
+/// beside them.
 ///
-/// A decision reads one value a row: the reader keeps its first read of a
-/// position for the decision, and every later read returns it. A stage
-/// that reads a row twice, or orders rows by what it read, then reads one
-/// number, as it does of rows that carry their own.
+/// A decision is made from one value a row: a row's read is kept for the
+/// decision ([`Self::read`], [`Self::whole`]), and every later read of it
+/// returns that. So one read of a worker answers every test of its row and
+/// every stage that reads its count, whatever the worker says meanwhile. A
+/// row the decision does not ask about is not read. The one read that is
+/// not kept is of a row a whole pass refuses ([`Self::pass`]): nothing is
+/// decided from it but that the row does not stand.
 pub trait LiveRows: std::fmt::Debug + Sync {
     /// The live facts of the row at `position` in the rows the decision
-    /// is made over.
+    /// is made over. A position past the rows reads as a row that is not
+    /// routable.
     fn read(&self, position: u32) -> LiveRow;
+
+    /// The live facts of every row, in the rows' order, for a pass over the
+    /// whole pool: each row the decision holds no read of is read now, and
+    /// the cells are handed as plain values, a cell a row. The pass pays
+    /// one call for the pool, not one a row.
+    fn whole(&self) -> &[LiveCell];
+
+    /// One pass over the whole pool by `test`: the position of every row
+    /// whose health bits pass is pushed to `kept`, in the rows' order.
+    ///
+    /// `refused` names the rows the decision read before the pass, where
+    /// it refused each and read no other: the rows its draws landed on, in
+    /// rising order. The pass leaves them out and reads every other row
+    /// with no look at what the decision holds of it. `None` where the
+    /// decision holds a read it does not name: a row it holds a read of is
+    /// then tested by that read.
+    ///
+    /// The read of a row that passes is kept, and the read of a row that is
+    /// refused is not, so a pool mostly refused costs one read and one test
+    /// a row and no more. A decision that goes on to ask about a refused
+    /// row (a pool the pass left nobody) reads the pool through
+    /// [`Self::whole`] and decides by those reads.
+    ///
+    /// The default is the pass over [`Self::whole`], which keeps every
+    /// read and tests a named row by the read the decision holds of it.
+    fn pass(&self, test: LiveTest, refused: Option<&[u32]>, kept: &mut Vec<u32>) {
+        let _ = refused;
+        test.pass_whole(self.whole(), kept);
+    }
 }
 
 /// One request as a decision sees it. Borrowed from the host for the
@@ -1036,17 +1212,17 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
-    /// The host's reader of the rows' live facts, where the rows carry
-    /// none ([`LiveRows`]): a host that keeps a worker's health and its
-    /// requests in flight on the worker itself writes its rows once a
-    /// membership and lends the reader here, asked by a row's position. A
-    /// reader of a row's health bits or of its count asks
-    /// [`RequestFacts::health`] and [`RequestFacts::in_flight`], and none
-    /// learns which rows it was given. `None` where the rows carry their
-    /// own: the rows a store publishes, and rows a host writes for the
-    /// decision. A profile that shows its rows to a plugin is handed
-    /// written rows and no reader. In-process only.
-    pub live: Option<&'a dyn LiveRows>,
+    /// The live facts of the rows, where the rows carry none
+    /// ([`LiveRows`]): a gateway that keeps a worker's health and its
+    /// requests in flight on the worker object writes its rows once a
+    /// membership and lends their reader here. Such a decision is made
+    /// through [`Engine::decide_live`](crate::engine::Engine::decide_live), by a
+    /// profile whose stages read a row's count through
+    /// [`RequestFacts::in_flight`] and none of its health bits
+    /// ([`Engine::decides_live`](crate::engine::Engine::decides_live)). `None`
+    /// where the rows carry their own facts: the rows a store publishes,
+    /// and rows written for the decision. In-process only.
+    pub live_rows: Option<&'a dyn LiveRows>,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1123,40 +1299,17 @@ impl<'a> RequestFacts<'a> {
     /// the row's own count otherwise. Every reader of a row's count asks
     /// here, and none learns which rows it was given. A decision reads one
     /// count a row: beside lent rows the first read is kept, and every
-    /// later read returns it.
+    /// later read returns it. Beside rows that carry no live fact the
+    /// count is the one their reader read with the row's health bits
+    /// ([`RequestFacts::live_rows`]), kept for the decision as well.
     #[inline]
     pub fn in_flight(&self, row: &Candidate) -> u32 {
-        if let Some(live) = self.live {
-            return live.read(row.position).in_flight;
-        }
         match self.lent_in_flight {
             Some(lent) => lent.at(row.position),
-            None => row.in_flight,
-        }
-    }
-
-    /// The health bits of `row`: what the host's reader says of the row's
-    /// position where it lent one ([`RequestFacts::live`]), the row's own
-    /// bits otherwise. Every reader of a row's health asks here.
-    #[inline]
-    pub fn health(&self, row: &Candidate) -> Health {
-        match self.live {
-            Some(live) => live.read(row.position).health,
-            None => row.health,
-        }
-    }
-
-    /// The most targets the decision names. A host that lends a reader of
-    /// live rows takes one worker a decision and asks again for a retry,
-    /// with the workers it tried named ([`RequestFacts::tried`]): no
-    /// alternate is read for it. Every other host takes
-    /// [`MAX_TARGETS`](crate::engine::MAX_TARGETS).
-    #[inline]
-    pub fn most_targets(&self) -> usize {
-        if self.live.is_some() {
-            1
-        } else {
-            crate::engine::MAX_TARGETS
+            None => match self.live_rows {
+                None => row.in_flight,
+                Some(live) => live.read(row.position).in_flight(),
+            },
         }
     }
 
@@ -1515,9 +1668,9 @@ mod tests {
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
     /// The signal cells are one word, for every signal, the client's key
-    /// is one word more, and the host's reader of live rows two (a
-    /// reference to a trait object): a field the facts gain moves this
-    /// number and carries the decision bench's cells that copy the facts
+    /// is one word more, and the reader of live rows two (a reference to a
+    /// trait object): a field the facts gain moves this number and carries
+    /// the decision bench's cells that copy the facts
     /// (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {

@@ -178,7 +178,7 @@ fn request_record() -> &'static [&'static str] {
             model_fingerprint,
             signal_cells,
             client_key,
-            live,
+            live_rows,
         }
     )
 }
@@ -661,7 +661,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "named",
                 "model_fingerprint",
                 "signal_cells",
-                "live",
+                "live_rows",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -907,7 +907,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "model_fingerprint",
                 "signal_cells",
                 "client_key",
-                "live",
+                "live_rows",
             ],
             before: &[],
             beside: &[],

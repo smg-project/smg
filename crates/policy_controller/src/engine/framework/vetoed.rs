@@ -345,9 +345,16 @@ pub(super) fn emptied(
     // veto is lifted: that tier is one look at the whole set.
     if steers
         && veto_ran(profile, NotOverloaded.name(), emptied_by)
-        && candidates
-            .iter()
-            .any(|row| !NotOverloaded.keep(facts, row, cx))
+        && match facts.live_rows {
+            None => candidates
+                .iter()
+                .any(|row| !NotOverloaded.keep(facts, row, cx)),
+            // Beside rows that carry no live fact the look reads the
+            // decision's kept reads, and the facts are asked which once.
+            Some(live) => {
+                !cx.overload_lifted && live.whole().iter().any(|cell| cell.row().overloaded())
+            }
+        }
     {
         let whole = RequestFacts {
             tried: &[],
@@ -370,9 +377,17 @@ pub(super) fn emptied(
     // harder veto refuses too gains nobody when it is lifted. Nor does a
     // row a hold of the host stands on, whichever doubt it carries: it
     // stays masked, and both tests pass it by.
-    let own = candidates.iter().any(|row| {
-        doubted_alone(facts.health(row)) && cx.held.binary_search(&row.position).is_err()
-    });
+    let own = match facts.live_rows {
+        None => candidates
+            .iter()
+            .any(|row| doubted_alone(row.health) && cx.held.binary_search(&row.position).is_err()),
+        // Rows that carry no live fact come with no hold beside them
+        // ([`Engine::decide_live`]): the doubt is the read's own bit.
+        Some(live) => live
+            .whole()
+            .iter()
+            .any(|cell| doubted_alone(cell.row().health())),
+    };
     // The two lengths answer for the rows only where every held row is a
     // row of the mask, named once: the store's view keeps that, and a host
     // that fills the constraints by hand owes it.
@@ -380,7 +395,7 @@ pub(super) fn emptied(
         cx.held.iter().all(|held| cx.stalled.contains(held)),
         "a held row is no row of the mask"
     );
-    let masked = cx.stalled.len() > cx.held.len() && mask_doubts(facts, candidates, cx);
+    let masked = cx.stalled.len() > cx.held.len() && mask_doubts(candidates, cx);
     if (own || masked) && veto_ran(profile, Healthy.name(), ended) {
         return doubted(emptied_by, own, profile, facts, cx, buf, set);
     }
@@ -455,18 +470,23 @@ fn doubted(
     };
     let stage = if own {
         let mut rows = std::mem::take(&mut buf.undoubted);
-        undoubted(facts, set.candidates, &mut rows);
+        undoubted(&whole, set.candidates, &mut rows);
         let lifted = Set {
             candidates: &rows,
             ..set.shedding()
         };
-        // The rows written for this pass carry their own bits and counts:
-        // a host's reader of live rows is not asked about them.
-        let written = RequestFacts {
-            live: None,
-            ..whole
+        let stage = match whole.live_rows {
+            None => filter(profile, &whole, &pass, buf, lifted),
+            // The rows written for this pass carry the bits and the counts
+            // the decision read: no reader stands beside them.
+            Some(_) => {
+                let written = RequestFacts {
+                    live_rows: None,
+                    ..whole
+                };
+                filter(profile, &written, &pass, buf, lifted)
+            }
         };
-        let stage = filter(profile, &written, &pass, buf, lifted);
         buf.undoubted = rows;
         stage
     } else {
@@ -491,26 +511,33 @@ fn doubted(
 /// host's mask alone doubts are read as they are, with the mask cut to the
 /// rows a hold stands on. A stage that answers from its own scope answers
 /// as it did: the scope was opened over the decision's rows. One pool of
-/// rows a scratch, sized at the first pass that needs it.
+/// rows a scratch, sized at the first pass that needs it. Beside rows that
+/// carry no live fact ([`RequestFacts::live_rows`]) each row is written
+/// with the bits and the count the decision read of it, the doubt lifted
+/// the same way.
 fn undoubted(facts: &RequestFacts<'_>, candidates: &[Candidate], rows: &mut Vec<Candidate>) {
     rows.clear();
-    rows.extend(candidates.iter().map(|row| {
-        let health = facts.health(row);
-        Candidate {
+    match facts.live_rows {
+        None => rows.extend(candidates.iter().map(|row| Candidate {
             health: Health {
-                stalled: health.stalled && health.breaker_open,
-                ..health
-            },
-            // Beside a host's reader of live rows the row written here
-            // carries the count the reader said, as it carries the bits.
-            in_flight: if facts.live.is_some() {
-                facts.in_flight(row)
-            } else {
-                row.in_flight
+                stalled: row.health.stalled && row.health.breaker_open,
+                ..row.health
             },
             ..*row
-        }
-    }));
+        })),
+        Some(live) => rows.extend(candidates.iter().zip(live.whole()).map(|(row, cell)| {
+            let read = cell.row();
+            let health = read.health();
+            Candidate {
+                health: Health {
+                    stalled: health.stalled && health.breaker_open,
+                    ..health
+                },
+                in_flight: read.in_flight(),
+                ..*row
+            }
+        })),
+    }
 }
 
 /// Whether the liveness veto alone refuses a row of these bits: the row
@@ -530,12 +557,12 @@ const fn doubted_alone(health: Health) -> bool {
 /// stands on whose own bits refuse nothing. Both lists are in order, so a
 /// held row is found by a search. Asked only of a pool the rule was put
 /// to, and only where the mask is longer than the held list.
-fn mask_doubts(facts: &RequestFacts<'_>, candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
+fn mask_doubts(candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
     cx.stalled.iter().any(|&at| {
         cx.held.binary_search(&at).is_err()
             && candidates
                 .get(at as usize)
-                .is_some_and(|row| facts.health(row).routable_ignoring_overload())
+                .is_some_and(|row| row.health.routable_ignoring_overload())
     })
 }
 

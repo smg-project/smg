@@ -12,41 +12,54 @@
 //!   The gateway keeps the value beside the list it was made from, for as
 //!   long as that list stands. Nothing of it is built at a request.
 //! - **Once a request.** [`PolicyEngine::place`] borrows those rows and the
-//!   list. No row is copied or written. A stage that asks for a row's
-//!   health bits or its count is answered by the worker object at the row's
-//!   position ([`LiveRows`]): the worker is read once, by the one call that
-//!   answers all of them, and the decision keeps that read, so no worker is
-//!   read twice and no decision sees two values of one worker. Only the
-//!   workers a decision asks about are read. The decision's scratch is the
-//!   calling thread's own: no lock is taken and nothing is allocated after
-//!   a thread's first decisions.
+//!   list. No row is copied or written. A row the decision asks about is
+//!   answered by the worker object at the row's position ([`LiveRows`]):
+//!   one call on the worker answers its status, its breaker, its vetoes
+//!   and its count together, and the decision keeps that read, so what it
+//!   decides it decides from one value of each worker. Only the workers a
+//!   decision asks about are read: one where the rotation's worker takes
+//!   the request, and the whole pool only where no worker near the turn
+//!   does. A pass over the whole pool is the classic policy's: one read
+//!   and one test a worker. Where it finds nobody, the pool is read once
+//!   more for the rule that decides such a pool, as the classic placement
+//!   reads it. The decision's scratch is the calling thread's own: no lock
+//!   is taken and nothing is allocated after a thread's first decisions.
+//! - **Rows written for a decision.** Two kinds of decision are made over
+//!   rows written for them, one read of each worker left: a request its
+//!   router limits to some of the pool's workers
+//!   ([`PlacementRequest::refused`]), and a profile whose stages read a
+//!   row's facts off the row ([`Engine::decides_live`]). The rows go into
+//!   a list the thread keeps.
 //!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation, a session's pins.
 //!
-//! A decision names one worker. A host that retries asks again and names
-//! the workers it tried ([`Request::tried`]).
+//! A decision names one worker. A router that retries asks again and names
+//! the workers it tried ([`PlacementRequest::tried`]).
 
 use std::{
     cell::RefCell,
     collections::BTreeMap,
     hash::Hasher,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rustc_hash::FxHasher;
-use smg_worker::identity::basic::{ConnectionMode, Worker, WorkerType};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker, WorkerType},
+    runtime::RoutingState,
+};
 
 use super::{
     decision::{Decision, ShedReason},
     framework::{Engine, Scratch},
     view::{
-        fingerprint, Candidate, Constraints, Health, LiveRow, LiveRows, ModelFingerprint, Phase,
-        PoolFacts, RequestFacts, Role, WireModes, WorkerId,
+        fingerprint, Candidate, Constraints, Health, LiveCell, LiveRow, LiveRows, LiveTest,
+        ModelFingerprint, Phase, PoolFacts, RequestFacts, Role, WireModes, WorkerId,
     },
 };
 use crate::document::spec::{AppliedSpec, Listed};
@@ -63,7 +76,8 @@ const fn phase_at(phase: Phase) -> usize {
     }
 }
 
-/// The engine of one policy document, for the gateway that hosts it.
+/// The engine of one policy document, for a gateway that decides in its own
+/// process.
 ///
 /// Built once, at the gateway's start, from the document in force. It holds
 /// the document's stages and their state, and no worker.
@@ -87,7 +101,7 @@ pub struct PolicyEngine {
 /// list's objects.
 ///
 /// The rows hold nothing of the model's id. What the engine reads of the id
-/// (its fingerprint, and what its profiles ask of a host) is kept for the
+/// (its fingerprint, and what its profiles ask of their caller) is kept for the
 /// spelling the pool was first asked under, with that spelling: a registry
 /// answers an alias and its canonical id with one list, a binding matches
 /// the id as spelled, and a request under another spelling is read by its
@@ -105,9 +119,10 @@ pub struct PoolMembers {
     model: ModelFingerprint,
     /// By phase: a decision reads no clock ([`Engine::clock_free`]).
     clock_free: [bool; PHASES.len()],
-    /// By phase: the profile shows its rows to a plugin, which reads a
-    /// row's facts as the row's own fields.
-    shown: [bool; PHASES.len()],
+    /// By phase: the decision is made over these rows in place
+    /// ([`Engine::decides_live`]); any other is made over rows written
+    /// for it.
+    live: [bool; PHASES.len()],
 }
 
 /// What the engine reads of a model's id for one phase.
@@ -115,7 +130,7 @@ pub struct PoolMembers {
 struct Spelled {
     model: ModelFingerprint,
     clock_free: bool,
-    shown: bool,
+    live: bool,
 }
 
 impl Spelled {
@@ -123,7 +138,7 @@ impl Spelled {
         Self {
             model: ModelFingerprint::of(model),
             clock_free: engine.clock_free(model, phase),
-            shown: engine.reads_for(model, phase).1,
+            live: engine.decides_live(model, phase),
         }
     }
 }
@@ -149,7 +164,7 @@ impl PoolMembers {
     }
 
     /// The id of the worker at `position` of the list: what a retry names
-    /// as tried ([`Request::tried`]). `None` past the list.
+    /// as tried ([`PlacementRequest::tried`]). `None` past the list.
     #[must_use]
     pub fn id_at(&self, position: usize) -> Option<WorkerId> {
         self.rows.get(position).map(|row| row.id)
@@ -159,13 +174,13 @@ impl PoolMembers {
     /// the kept spelling, and the id's own reading for any other. The
     /// compare is of the two spellings' bytes: no id is hashed and no
     /// binding walked for the spelling the pool is asked under.
-    fn spelled(&self, engine: &Engine, request: &Request<'_>) -> Spelled {
+    fn spelled(&self, engine: &Engine, request: &PlacementRequest<'_>) -> Spelled {
         if *self.spelling == *request.model {
             let at = phase_at(request.phase);
             Spelled {
                 model: self.model,
                 clock_free: self.clock_free[at],
-                shown: self.shown[at],
+                live: self.live[at],
             }
         } else {
             Spelled::of(engine, request.model, request.phase)
@@ -175,9 +190,9 @@ impl PoolMembers {
 
 /// What a router states of one attempt of a request.
 ///
-/// Built over [`Request::of`]: `Request { tried, ..Request::of(model) }`.
+/// Built over [`PlacementRequest::of`]: `PlacementRequest { tried, ..PlacementRequest::of(model) }`.
 #[derive(Clone, Copy, Debug)]
-pub struct Request<'a> {
+pub struct PlacementRequest<'a> {
     /// The model the request is for, as the router resolved it.
     pub model: &'a str,
     /// A regular attempt is single. A pair is asked at its prefill.
@@ -195,7 +210,7 @@ pub struct Request<'a> {
     pub refused: &'a [u32],
 }
 
-impl<'a> Request<'a> {
+impl<'a> PlacementRequest<'a> {
     /// A single request for `model` that tried no worker yet and may be
     /// sent to every worker of its pool.
     #[must_use]
@@ -225,7 +240,7 @@ impl Placement {
     }
 
     /// The worker's id in the engine's rows: what a retry names as tried
-    /// ([`Request::tried`]).
+    /// ([`PlacementRequest::tried`]).
     #[must_use]
     pub fn id(&self) -> WorkerId {
         self.id
@@ -254,12 +269,12 @@ pub struct Unplaced {
     pub emptied_by: &'static str,
     /// The pacing hint, in seconds; `0` for none.
     pub retry_after_secs: u16,
-    /// The binding lets the host hold the request for a worker to come.
+    /// The binding lets the gateway hold the request for a worker to come.
     pub wait_allowed: bool,
     /// The profile that decided, by its position in the document; `None`
     /// where the request was declined ahead of every profile.
     pub profile: Option<u16>,
-    /// The decision was a ticket for a queue. This host holds none: the
+    /// The decision was a ticket for a queue. This engine holds none: the
     /// request is not placed.
     pub queued: bool,
 }
@@ -303,7 +318,7 @@ impl PolicyEngine {
             spelling: model.into(),
             model: ModelFingerprint::of(model),
             clock_free: readings.map(|spelled| spelled.clock_free),
-            shown: readings.map(|spelled| spelled.shown),
+            live: readings.map(|spelled| spelled.live),
         }
     }
 
@@ -315,122 +330,75 @@ impl PolicyEngine {
     /// The engine's refusal where no worker of the pool takes the request.
     pub fn place(
         &self,
-        request: &Request<'_>,
+        request: &PlacementRequest<'_>,
         members: &PoolMembers,
     ) -> Result<Placement, Unplaced> {
-        THREAD.with(|thread| match thread.try_borrow_mut() {
-            Ok(mut thread) => self.place_on(request, members, &mut thread),
+        WORKSPACE.with(|workspace| match workspace.try_borrow_mut() {
+            Ok(mut workspace) => self.place_on(request, members, &mut workspace),
             // A stage of the decision asked the engine again on this thread:
-            // the inner decision takes a scratch of its own.
-            Err(_) => self.place_on(request, members, &mut Thread::new()),
+            // the inner decision takes a workspace of its own.
+            Err(_) => self.place_on(request, members, &mut Workspace::new()),
         })
     }
 
     fn place_on(
         &self,
-        request: &Request<'_>,
+        request: &PlacementRequest<'_>,
         members: &PoolMembers,
-        thread: &mut Thread,
+        workspace: &mut Workspace,
     ) -> Result<Placement, Unplaced> {
         let engine = self.spec.engine();
         let spelled = members.spelled(engine, request);
-        let seed = thread.seed();
-        // A plugin reads a row's facts as the row's own fields, and a
-        // request some workers may not take is decided over the others
-        // alone: both are handed rows written for the decision.
-        let writes = spelled.shown || !request.refused.is_empty();
-        let stamp = if writes {
-            0
+        let seed = workspace.seed();
+        // The pool's own rows, read in place: a request every worker of the
+        // pool may take, under a profile that reads no live fact off a row.
+        let in_place = spelled.live && request.refused.is_empty();
+        let mark = if in_place {
+            workspace.mark(members.rows.len())
         } else {
-            thread.stamp(members.rows.len())
+            0
         };
-        let Thread {
+        let Workspace {
             scratch,
-            kept,
+            cells,
             written,
             positions,
             ..
-        } = thread;
-        let hosted = Hosted {
-            workers: &members.workers,
-            stamp,
-            kept,
-        };
-        let (candidates, live, reach): (&[Candidate], Option<&dyn LiveRows>, u64) = if writes {
-            write(members, request.refused, written, positions);
-            (written, None, reach_of(request.refused))
-        } else {
-            (&members.rows, Some(&hosted), 0)
-        };
+        } = workspace;
         let pool = PoolFacts {
             pool_size: u32::try_from(members.rows.len()).unwrap_or(u32::MAX),
             membership_epoch: members.epoch,
             generation: engine.generation(),
-            reach,
             ..PoolFacts::default()
         };
-        let facts = RequestFacts {
-            model: request.model,
-            model_fingerprint: spelled.model,
-            phase: request.phase,
-            tried: request.tried,
-            seed,
-            now_micros: if spelled.clock_free {
-                0
-            } else {
-                u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
-            },
-            live,
-            ..RequestFacts::default()
+        let now_micros = if spelled.clock_free {
+            0
+        } else {
+            u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
         };
-        let decision = engine.decide(&facts, &pool, candidates, &Constraints::default(), scratch);
-        let profile = decision.trace().made_under();
-        match decision {
-            Decision::Pick(pick) => pick
-                .targets
-                .as_slice()
-                .first()
-                .and_then(|target| {
-                    // A written row stands at its place among the rows
-                    // written, and names its place in the list beside it.
-                    let position = if writes {
-                        *positions.get(target.position as usize)?
-                    } else {
-                        target.position
-                    };
-                    let worker = members.workers.get(position as usize)?;
-                    Some(Placement {
-                        worker: Arc::clone(worker),
-                        id: target.id,
-                        profile,
-                    })
-                })
-                .ok_or(Unplaced {
-                    reason: ShedReason::PolicyDeclined,
-                    emptied_by: "targets",
-                    retry_after_secs: 0,
-                    wait_allowed: false,
-                    profile,
-                    queued: false,
-                }),
-            Decision::Shed(shed) => Err(Unplaced {
-                reason: shed.reason,
-                emptied_by: shed.emptied_by,
-                retry_after_secs: shed.retry_after_secs,
-                wait_allowed: shed.wait_allowed,
-                profile,
-                queued: false,
-            }),
-            // No built-in issues a ticket, and this host holds no queue.
-            Decision::Queue(_) => Err(Unplaced {
-                reason: ShedReason::FlowLimit,
-                emptied_by: "queue",
-                retry_after_secs: 0,
-                wait_allowed: false,
-                profile,
-                queued: true,
-            }),
+        if in_place {
+            let rows = WorkerRows {
+                workers: &members.workers,
+                cells: cells.get(..members.workers.len()).unwrap_or(&[]),
+                mark,
+                whole: AtomicBool::new(false),
+            };
+            let lent = facts_of(request, spelled.model, seed, now_micros, Some(&rows));
+            if let Some(decision) = engine.decide_live(&lent, &pool, &members.rows, scratch) {
+                return placed(decision, members, None);
+            }
         }
+        let facts = facts_of(request, spelled.model, seed, now_micros, None);
+        // Rows written for this decision, each with one read of its worker:
+        // a request held to some of the pool's workers, or a profile whose
+        // stages read a row's facts off the row.
+        write(members, request.refused, written, positions);
+        let pool = PoolFacts {
+            reach: reach_of(request.refused),
+            ..pool
+        };
+        let decision = engine.decide(&facts, &pool, written, &Constraints::default(), scratch);
+        placed(decision, members, Some(positions))
     }
 
     /// The row of the worker at `position` of its pool: the facts of its
@@ -489,22 +457,111 @@ impl PolicyEngine {
     }
 }
 
+/// The facts of one decision for `request`, built once: with the reader of
+/// the pool's live rows where the decision is made over the pool's own
+/// rows, and with none where rows are written for it.
+#[inline(always)]
+fn facts_of<'a>(
+    request: &PlacementRequest<'a>,
+    model_fingerprint: ModelFingerprint,
+    seed: u64,
+    now_micros: u64,
+    live_rows: Option<&'a dyn LiveRows>,
+) -> RequestFacts<'a> {
+    RequestFacts {
+        model: request.model,
+        model_fingerprint,
+        phase: request.phase,
+        tried: request.tried,
+        seed,
+        now_micros,
+        live_rows,
+        ..RequestFacts::default()
+    }
+}
+
+/// What a router is told of `decision`: the worker object its first target
+/// names, or why no worker was placed. `positions` is each written row's
+/// place in the pool's list, where the decision was made over rows written
+/// for it: a written row stands at its place among the rows written.
+fn placed(
+    decision: Decision,
+    members: &PoolMembers,
+    positions: Option<&[u32]>,
+) -> Result<Placement, Unplaced> {
+    let profile = decision.trace().made_under();
+    match decision {
+        Decision::Pick(pick) => pick
+            .targets
+            .as_slice()
+            .first()
+            .and_then(|target| {
+                let position = match positions {
+                    Some(positions) => *positions.get(target.position as usize)?,
+                    None => target.position,
+                };
+                let worker = members.workers.get(position as usize)?;
+                Some(Placement {
+                    worker: Arc::clone(worker),
+                    id: target.id,
+                    profile,
+                })
+            })
+            .ok_or(Unplaced {
+                reason: ShedReason::PolicyDeclined,
+                emptied_by: "targets",
+                retry_after_secs: 0,
+                wait_allowed: false,
+                profile,
+                queued: false,
+            }),
+        Decision::Shed(shed) => Err(Unplaced {
+            reason: shed.reason,
+            emptied_by: shed.emptied_by,
+            retry_after_secs: shed.retry_after_secs,
+            wait_allowed: shed.wait_allowed,
+            profile,
+            queued: false,
+        }),
+        // No built-in issues a ticket, and this engine holds no queue.
+        Decision::Queue(_) => Err(Unplaced {
+            reason: ShedReason::FlowLimit,
+            emptied_by: "queue",
+            retry_after_secs: 0,
+            wait_allowed: false,
+            profile,
+            queued: true,
+        }),
+    }
+}
+
 /// A worker's live facts, read on the worker object: one read answers its
 /// status, its breaker, its liveness veto, its overload verdict and its
 /// requests in flight.
 fn read(worker: &dyn Worker) -> LiveRow {
-    let state = worker.routing_state();
-    LiveRow {
-        health: Health {
-            healthy: state.healthy,
-            // An open breaker refuses the worker, and no rule lifts it.
-            breaker_open: !state.can_execute,
-            stalled: state.stalled,
-            // A worker being drained is not ready: the status says it.
-            draining: false,
-            overloaded: state.overloaded,
-        },
-        in_flight: u32::try_from(state.load).unwrap_or(u32::MAX),
+    row_of_state(&worker.routing_state())
+}
+
+/// The row one read of a worker makes.
+#[inline]
+fn row_of_state(state: &RoutingState) -> LiveRow {
+    LiveRow::new(
+        health_of(state),
+        u32::try_from(state.load).unwrap_or(u32::MAX),
+    )
+}
+
+/// A worker's health bits as its one read says them.
+#[inline]
+fn health_of(state: &RoutingState) -> Health {
+    Health {
+        healthy: state.healthy,
+        // An open breaker refuses the worker, and no rule lifts it.
+        breaker_open: !state.can_execute,
+        stalled: state.stalled,
+        // A worker being drained is not ready: the status says it.
+        draining: false,
+        overloaded: state.overloaded,
     }
 }
 
@@ -533,8 +590,8 @@ fn write(
         let live = read(worker.as_ref());
         written.push(Candidate {
             position: u32::try_from(written.len()).unwrap_or(u32::MAX),
-            health: live.health,
-            in_flight: live.in_flight,
+            health: live.health(),
+            in_flight: live.in_flight(),
             ..*row
         });
         positions.push(position);
@@ -556,80 +613,108 @@ fn reach_of(refused: &[u32]) -> u64 {
     reach.finish() | 1
 }
 
-/// The reader of one decision's live rows: the pool's worker objects, and
-/// the calling thread's cells, where a position's first read is kept for
+/// The live rows of one decision over a pool: the pool's worker objects,
+/// and the calling thread's cells, where a worker's first read is kept for
 /// the decision.
 #[derive(Debug)]
-struct Hosted<'a> {
+struct WorkerRows<'a> {
     workers: &'a [Arc<dyn Worker>],
-    /// The decision's mark, in a cell's high half: a cell that holds
-    /// another decision's mark holds nothing for this one.
-    stamp: u64,
-    kept: &'a [AtomicU64],
+    /// One cell a worker, in the list's order.
+    cells: &'a [LiveCell],
+    /// The decision's mark: a cell that holds another holds nothing for
+    /// this decision.
+    mark: u32,
+    /// Every cell holds this decision's read: a pass over the whole pool
+    /// read them all.
+    whole: AtomicBool,
 }
 
-/// The bits of a kept cell below the decision's mark: five of the row's
-/// health, the rest its requests in flight.
-const HEALTH_BITS: u32 = 5;
-const COUNT_MAX: u64 = (1 << (32 - HEALTH_BITS)) - 1;
-const LOW_HALF: u64 = u32::MAX as u64;
-
-const fn packed(row: LiveRow) -> u64 {
-    let health = row.health;
-    let bits = health.healthy as u64
-        | (health.breaker_open as u64) << 1
-        | (health.stalled as u64) << 2
-        | (health.draining as u64) << 3
-        | (health.overloaded as u64) << 4;
-    let count = if row.in_flight as u64 > COUNT_MAX {
-        COUNT_MAX
-    } else {
-        row.in_flight as u64
-    };
-    bits | (count << HEALTH_BITS)
-}
-
-const fn unpacked(cell: u64) -> LiveRow {
-    LiveRow {
-        health: Health {
-            healthy: cell & 1 != 0,
-            breaker_open: cell & (1 << 1) != 0,
-            stalled: cell & (1 << 2) != 0,
-            draining: cell & (1 << 3) != 0,
-            overloaded: cell & (1 << 4) != 0,
-        },
-        in_flight: ((cell & LOW_HALF) >> HEALTH_BITS) as u32,
-    }
-}
-
-impl LiveRows for Hosted<'_> {
+impl LiveRows for WorkerRows<'_> {
     #[inline]
     fn read(&self, position: u32) -> LiveRow {
         let at = position as usize;
-        let (Some(worker), Some(cell)) = (self.workers.get(at), self.kept.get(at)) else {
+        let (Some(worker), Some(cell)) = (self.workers.get(at), self.cells.get(at)) else {
             // No row of the pool stands there: nobody asks, and a row that
             // is not there is not routable.
             return LiveRow::default();
         };
-        let held = cell.load(Ordering::Relaxed);
-        if held & !LOW_HALF == self.stamp {
-            return unpacked(held);
+        if let Some(kept) = cell.kept(self.mark) {
+            return kept;
         }
-        let cell_of = packed(read(worker.as_ref()));
-        cell.store(self.stamp | cell_of, Ordering::Relaxed);
-        // What the cell keeps is what the decision reads: a count past the
-        // cell's width reads as the width's most at every read alike.
-        unpacked(cell_of)
+        let row = read(worker.as_ref());
+        cell.keep(self.mark, row);
+        row
+    }
+
+    fn whole(&self) -> &[LiveCell] {
+        if !self.whole.load(Ordering::Relaxed) {
+            for (worker, cell) in self.workers.iter().zip(self.cells) {
+                if cell.kept(self.mark).is_none() {
+                    cell.keep(self.mark, read(worker.as_ref()));
+                }
+            }
+            self.whole.store(true, Ordering::Relaxed);
+        }
+        self.cells
+    }
+
+    /// The pass a classic policy makes over its pool: one read of a worker
+    /// and one test of what it says, the worker's own
+    /// ([`RoutingState::eligible`]). A worker that passes has its read
+    /// kept, so a stage that reads its count reads the same value, and a
+    /// worker that is refused costs nothing more. The rows the decision's
+    /// draws refused are left out, and no cell is looked at for the others:
+    /// the decision read none of them.
+    fn pass(&self, test: LiveTest, refused: Option<&[u32]>, kept: &mut Vec<u32>) {
+        let Some(refused) = refused else {
+            // The decision holds reads nobody named: each row is tested by
+            // its one read, the rows not read yet by a read made now.
+            return test.pass_whole(self.whole(), kept);
+        };
+        match (test.routable, test.not_overloaded) {
+            (true, true) => self.pass_by(RoutingState::eligible, refused, kept),
+            (true, false) => {
+                self.pass_by(RoutingState::eligible_ignoring_overload, refused, kept);
+            }
+            _ => self.pass_by(|state| test.passes(health_of(&state)), refused, kept),
+        }
+    }
+}
+
+impl WorkerRows<'_> {
+    /// [`LiveRows::pass`] by one test of a worker's read, compiled once a
+    /// test: the rows between the refused ones, then the rows past the
+    /// last, each read once.
+    #[inline(always)]
+    fn pass_by(&self, admits: impl Fn(RoutingState) -> bool, refused: &[u32], kept: &mut Vec<u32>) {
+        let rows = self.workers.len().min(self.cells.len());
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        let mut from = 0u32;
+        for until in refused.iter().copied().chain([rows]) {
+            let until = until.min(rows);
+            // A row named twice, or out of its order, opens no span.
+            let span = from as usize..until as usize;
+            let workers = self.workers.get(span.clone()).unwrap_or_default();
+            let cells = self.cells.get(span).unwrap_or_default();
+            for ((worker, cell), position) in workers.iter().zip(cells).zip(from..until) {
+                let state = worker.routing_state();
+                if admits(state) {
+                    cell.keep(self.mark, row_of_state(&state));
+                    kept.push(position);
+                }
+            }
+            from = from.max(until.saturating_add(1));
+        }
     }
 }
 
 /// What a deciding thread keeps between its decisions.
 #[derive(Debug)]
-struct Thread {
+struct Workspace {
     scratch: Scratch,
-    /// One cell a row of the largest pool this thread decided over: the
-    /// live facts a decision read, under its mark.
-    kept: Vec<AtomicU64>,
+    /// One cell a row of the largest pool this thread decided over in
+    /// place: what a decision read of its workers, under its mark.
+    cells: Vec<LiveCell>,
     /// The last decision's mark, from 1.
     mark: u32,
     /// The rows written for a decision that is handed written rows.
@@ -641,7 +726,7 @@ struct Thread {
 }
 
 thread_local! {
-    static THREAD: RefCell<Thread> = RefCell::new(Thread::new());
+    static WORKSPACE: RefCell<Workspace> = RefCell::new(Workspace::new());
 }
 
 /// The threads that decided so far: each starts its seeds from its number.
@@ -649,7 +734,7 @@ static THREADS: AtomicU64 = AtomicU64::new(0);
 
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 
-impl Thread {
+impl Workspace {
     fn new() -> Self {
         let number = THREADS.fetch_add(1, Ordering::Relaxed);
         // The wall clock at the thread's first decision tells two runs of
@@ -659,7 +744,7 @@ impl Thread {
             .map_or(0, |since| since.as_nanos() as u64);
         Self {
             scratch: Scratch::default(),
-            kept: Vec::new(),
+            cells: Vec::new(),
             mark: 0,
             written: Vec::new(),
             positions: Vec::new(),
@@ -676,22 +761,22 @@ impl Thread {
         z ^ (z >> 31)
     }
 
-    /// The next decision's mark over a pool of `rows`, in a cell's high
-    /// half, with a cell for each row. The cells are sized at a thread's
-    /// first decision over a pool that large, and cleared when the marks
-    /// come round.
-    fn stamp(&mut self, rows: usize) -> u64 {
-        if self.kept.len() < rows {
-            self.kept.resize_with(rows, AtomicU64::default);
+    /// The next decision's mark over a pool of `rows`, with a cell for each
+    /// row. The cells are sized at a thread's first decision over a pool
+    /// that large, and emptied when the marks come round: a read kept under
+    /// a mark of the round before would read as this decision's.
+    fn mark(&mut self, rows: usize) -> u32 {
+        if self.cells.len() < rows {
+            self.cells.resize_with(rows, LiveCell::default);
         }
         self.mark = self.mark.wrapping_add(1);
         if self.mark == 0 {
-            for cell in &self.kept {
-                cell.store(0, Ordering::Relaxed);
+            for cell in &self.cells {
+                cell.clear();
             }
             self.mark = 1;
         }
-        u64::from(self.mark) << 32
+        self.mark
     }
 }
 
@@ -700,10 +785,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use openai_protocol::worker::WorkerStatus;
-    use smg_worker::test_support::ready_worker;
+    use smg_worker::{runtime::StallReason, test_support::ready_worker};
 
     use super::*;
-    use crate::document::spec::PolicySpec;
+    use crate::{document::spec::PolicySpec, policies::power_of_two::PowerOfTwoMetric};
 
     const MODEL: &str = "model-a";
 
@@ -723,7 +808,22 @@ mod tests {
             .collect()
     }
 
-    fn place(engine: &PolicyEngine, members: &PoolMembers, request: &Request<'_>) -> usize {
+    /// The reader of the next decision over `list`.
+    fn reader_of<'a>(list: &'a [Arc<dyn Worker>], workspace: &'a mut Workspace) -> WorkerRows<'a> {
+        let mark = workspace.mark(list.len());
+        WorkerRows {
+            workers: list,
+            cells: &workspace.cells[..list.len()],
+            mark,
+            whole: AtomicBool::new(false),
+        }
+    }
+
+    fn place(
+        engine: &PolicyEngine,
+        members: &PoolMembers,
+        request: &PlacementRequest<'_>,
+    ) -> usize {
         let placed = engine.place(request, members).expect("a worker is placed");
         members
             .workers()
@@ -756,7 +856,7 @@ mod tests {
         for workers in [1, 2, 3, 8, 16, 64] {
             let engine = preset("round_robin");
             let members = engine.pool_members(MODEL, &pool(workers));
-            let request = Request::of(MODEL);
+            let request = PlacementRequest::of(MODEL);
             let first = place(&engine, &members, &request);
             for step in 1..2 * workers {
                 let at = place(&engine, &members, &request);
@@ -772,7 +872,7 @@ mod tests {
         let engine = preset("round_robin");
         let list = pool(4);
         let members = engine.pool_members(MODEL, &list);
-        let request = Request::of(MODEL);
+        let request = PlacementRequest::of(MODEL);
         list[1].set_status(WorkerStatus::NotReady);
         list[2].set_overloaded(true);
         for _ in 0..16 {
@@ -797,7 +897,7 @@ mod tests {
             engine.pool_members(MODEL, &first),
             engine.pool_members(MODEL, &second),
         ];
-        let request = Request::of(MODEL);
+        let request = PlacementRequest::of(MODEL);
         let mut named = [[0u32; 4]; 2];
         for _ in 0..8 {
             for (pool, named) in pools.iter().zip(&mut named) {
@@ -821,9 +921,11 @@ mod tests {
         let list = pool(4);
         for first in ["canonical", "alias"] {
             let members = engine.pool_members(first, &list);
-            assert!(engine.place(&Request::of("canonical"), &members).is_ok());
+            assert!(engine
+                .place(&PlacementRequest::of("canonical"), &members)
+                .is_ok());
             let unbound = engine
-                .place(&Request::of("alias"), &members)
+                .place(&PlacementRequest::of("alias"), &members)
                 .expect_err("no binding names the alias");
             assert_eq!(
                 (unbound.reason, unbound.emptied_by, unbound.profile),
@@ -841,7 +943,7 @@ mod tests {
         let members = engine.pool_members("kept", &pool(2));
         let inner = engine.spec().engine();
         for spelling in ["kept", "other"] {
-            let request = Request::of(spelling);
+            let request = PlacementRequest::of(spelling);
             assert_eq!(
                 members.spelled(inner, &request),
                 Spelled::of(inner, spelling, Phase::Single),
@@ -849,89 +951,9 @@ mod tests {
             );
         }
         assert_ne!(
-            members.spelled(inner, &Request::of("kept")).model,
-            members.spelled(inner, &Request::of("other")).model
+            members.spelled(inner, &PlacementRequest::of("kept")).model,
+            members.spelled(inner, &PlacementRequest::of("other")).model
         );
-    }
-
-    /// A decision reads a worker once and keeps the read: a second ask of
-    /// the same row within the decision answers the first read, whatever
-    /// the worker says by then, and the next decision reads the worker
-    /// again.
-    #[test]
-    fn a_decision_keeps_its_first_read_of_a_worker() {
-        let list = pool(3);
-        let mut thread = Thread::new();
-        let stamp = thread.stamp(list.len());
-        let reader = Hosted {
-            workers: &list,
-            stamp,
-            kept: &thread.kept,
-        };
-        let first = reader.read(1);
-        assert!(first.health.healthy && first.in_flight == 0);
-        list[1].increment_load();
-        list[1].set_overloaded(true);
-        assert_eq!(reader.read(1), first);
-        // Another row of the same decision is its own read.
-        list[2].increment_load();
-        assert_eq!(reader.read(2).in_flight, 1);
-        let stamp = thread.stamp(list.len());
-        let next = Hosted {
-            workers: &list,
-            stamp,
-            kept: &thread.kept,
-        };
-        let again = next.read(1);
-        assert!(again.health.overloaded && again.in_flight == 1);
-        // A place past the pool is no worker's.
-        assert_eq!(next.read(9), LiveRow::default());
-    }
-
-    /// A cell keeps every health bit and the count beside the mark, and a
-    /// count past the cell's width reads as the width's most.
-    #[test]
-    fn a_kept_cell_holds_the_bits_and_the_count() {
-        for bits in 0u32..32 {
-            let row = LiveRow {
-                health: Health {
-                    healthy: bits & 1 != 0,
-                    breaker_open: bits & 2 != 0,
-                    stalled: bits & 4 != 0,
-                    draining: bits & 8 != 0,
-                    overloaded: bits & 16 != 0,
-                },
-                in_flight: 7 + bits,
-            };
-            assert_eq!(unpacked(packed(row)), row);
-            assert_eq!(packed(row) & !LOW_HALF, 0);
-        }
-        let most = LiveRow {
-            in_flight: u32::MAX,
-            ..LiveRow::default()
-        };
-        assert_eq!(u64::from(unpacked(packed(most)).in_flight), COUNT_MAX);
-    }
-
-    /// The marks come round after their last value: the cells are cleared,
-    /// so a read kept under a mark of the round before answers no decision.
-    #[test]
-    fn the_marks_come_round_over_cleared_cells() {
-        let list = pool(1);
-        let mut thread = Thread::new();
-        thread.mark = u32::MAX - 1;
-        let last = thread.stamp(1);
-        assert_eq!(last, u64::from(u32::MAX) << 32);
-        let reader = Hosted {
-            workers: &list,
-            stamp: last,
-            kept: &thread.kept,
-        };
-        let _ = reader.read(0);
-        assert_ne!(thread.kept[0].load(Ordering::Relaxed), 0);
-        let first = thread.stamp(1);
-        assert_eq!(first, 1 << 32);
-        assert_eq!(thread.kept[0].load(Ordering::Relaxed), 0);
     }
 
     /// A request that may not be sent to some workers is decided over the
@@ -943,9 +965,9 @@ mod tests {
         let list = pool(20);
         let members = engine.pool_members(MODEL, &list);
         let refused: Vec<u32> = (0..20).filter(|at| at % 4 != 1).collect();
-        let request = Request {
+        let request = PlacementRequest {
             refused: &refused,
-            ..Request::of(MODEL)
+            ..PlacementRequest::of(MODEL)
         };
         let mut named = [0u32; 20];
         for _ in 0..10 {
@@ -957,9 +979,9 @@ mod tests {
         }
         // Every worker refused: nobody is placed.
         let all: Vec<u32> = (0..20).collect();
-        let nobody = Request {
+        let nobody = PlacementRequest {
             refused: &all,
-            ..Request::of(MODEL)
+            ..PlacementRequest::of(MODEL)
         };
         assert!(engine.place(&nobody, &members).is_err());
     }
@@ -975,97 +997,378 @@ mod tests {
             members.id_at(0).expect("a row"),
             members.id_at(2).expect("a row"),
         ];
-        let request = Request {
+        let request = PlacementRequest {
             tried: &tried,
-            ..Request::of(MODEL)
+            ..PlacementRequest::of(MODEL)
         };
         for _ in 0..6 {
             assert_eq!(place(&engine, &members, &request), 1);
         }
     }
 
-    /// The live reader and written rows decide alike: over a fleet with
-    /// vetoed workers, two engines of one document, one asked through the
-    /// reader and one over rows written with the same facts, name the same
-    /// worker first for the same seeds.
+    /// The pool's own rows and rows written with the same facts decide
+    /// alike: two engines of one document, one asked over the reader and
+    /// one over written rows, give the same answer for the same seeds.
+    /// Over a pool all ready each names the same worker. Over a pool every
+    /// worker of which is over its thresholds each is steered to the one
+    /// worker with the fewest requests in flight. Over a pool nobody
+    /// serves each sheds at the health filter.
     #[test]
-    fn the_live_reader_and_written_rows_name_the_same_worker() {
-        for name in ["round_robin", "random", "power_of_two"] {
-            let (live, written) = (preset(name), preset(name));
-            let list = pool(48);
-            for (at, worker) in list.iter().enumerate() {
-                match at % 7 {
-                    2 => worker.set_status(WorkerStatus::NotReady),
-                    5 => {
-                        worker.set_overloaded(true);
-                    }
-                    _ => {}
-                }
-                for _ in 0..at % 5 {
+    fn the_pools_own_rows_and_written_rows_decide_alike() {
+        // What sets a fleet's worker at a place of its list.
+        type Prepare = fn(usize, &Arc<dyn Worker>);
+        let fleets: [(&str, Prepare); 3] = [
+            ("all ready", |_, _| {}),
+            ("all over their thresholds", |at, worker| {
+                worker.set_overloaded(true);
+                // One worker holds no request, and no two the same count.
+                for _ in 0..(at + 41) % 48 {
                     worker.increment_load();
                 }
-            }
-            let members = live.pool_members(MODEL, &list);
-            let other = written.pool_members(MODEL, &list);
-            let rows: Vec<Candidate> = list
-                .iter()
-                .zip(&*other.rows)
-                .map(|(worker, row)| {
-                    let live = read(worker.as_ref());
-                    Candidate {
-                        health: live.health,
-                        in_flight: live.in_flight,
-                        ..*row
+            }),
+            ("nobody ready", |_, worker| {
+                worker.set_status(WorkerStatus::NotReady);
+            }),
+        ];
+        for name in ["round_robin", "random"] {
+            for (fleet, prepare) in fleets {
+                let (live, written) = (preset(name), preset(name));
+                let list = pool(48);
+                for (at, worker) in list.iter().enumerate() {
+                    prepare(at, worker);
+                }
+                let members = live.pool_members(MODEL, &list);
+                let other = written.pool_members(MODEL, &list);
+                let rows: Vec<Candidate> = list
+                    .iter()
+                    .zip(&*other.rows)
+                    .map(|(worker, row)| {
+                        let live = read(worker.as_ref());
+                        Candidate {
+                            health: live.health(),
+                            in_flight: live.in_flight(),
+                            ..*row
+                        }
+                    })
+                    .collect();
+                let mut workspace = Workspace::new();
+                let mut by_rows = Scratch::default();
+                for seed in 1..=200u64 {
+                    let facts = RequestFacts {
+                        model: MODEL,
+                        model_fingerprint: ModelFingerprint::of(MODEL),
+                        seed,
+                        ..RequestFacts::default()
+                    };
+                    let pool_of = |members: &PoolMembers| PoolFacts {
+                        pool_size: 48,
+                        membership_epoch: members.epoch,
+                        generation: 1,
+                        ..PoolFacts::default()
+                    };
+                    let mark = workspace.mark(list.len());
+                    let reader = WorkerRows {
+                        workers: &list,
+                        cells: &workspace.cells[..list.len()],
+                        mark,
+                        whole: AtomicBool::new(false),
+                    };
+                    let lent = RequestFacts {
+                        live_rows: Some(&reader),
+                        ..facts
+                    };
+                    let by_reader = live
+                        .spec()
+                        .engine()
+                        .decide_live(
+                            &lent,
+                            &pool_of(&members),
+                            &members.rows,
+                            &mut workspace.scratch,
+                        )
+                        .expect("the pool's own rows decide it");
+                    let by_rows = written.spec().engine().decide(
+                        &facts,
+                        &pool_of(&other),
+                        &rows,
+                        &Constraints::default(),
+                        &mut by_rows,
+                    );
+                    let said = |decision: &Decision| match decision {
+                        Decision::Pick(pick) => {
+                            let first = pick.targets.as_slice().first().map(|t| t.id);
+                            (first, "", pick.trace.lifted)
+                        }
+                        Decision::Shed(shed) => (None, shed.emptied_by, shed.trace.lifted),
+                        Decision::Queue(queue) => (None, "queue", queue.trace.lifted),
+                    };
+                    assert_eq!(
+                        said(&by_reader),
+                        said(&by_rows),
+                        "{name}, {fleet}, seed {seed}"
+                    );
+                    if fleet == "all over their thresholds" {
+                        let idle = members.id_at(7).expect("a row");
+                        assert_eq!(said(&by_reader).0, Some(idle), "{name}, seed {seed}");
                     }
-                })
-                .collect();
-            let mut thread = Thread::new();
-            let mut scratch = Scratch::default();
-            for seed in 1..=200u64 {
-                let facts = RequestFacts {
-                    model: MODEL,
-                    model_fingerprint: ModelFingerprint::of(MODEL),
-                    seed,
-                    ..RequestFacts::default()
-                };
-                let pool_of = |members: &PoolMembers| PoolFacts {
-                    pool_size: 48,
-                    membership_epoch: members.epoch,
-                    generation: 1,
-                    ..PoolFacts::default()
-                };
-                let stamp = thread.stamp(list.len());
-                let reader = Hosted {
-                    workers: &list,
-                    stamp,
-                    kept: &thread.kept,
-                };
-                let asked = RequestFacts {
-                    live: Some(&reader),
-                    ..facts
-                };
-                let cx = Constraints::default();
-                let by_reader = live.spec().engine().decide(
-                    &asked,
-                    &pool_of(&members),
-                    &members.rows,
-                    &cx,
-                    &mut thread.scratch,
-                );
-                let by_rows = written.spec().engine().decide(
-                    &facts,
-                    &pool_of(&other),
-                    &rows,
-                    &cx,
-                    &mut scratch,
-                );
-                let first = |decision: &Decision| match decision {
-                    Decision::Pick(pick) => pick.targets.as_slice().first().map(|t| t.id),
-                    _ => None,
-                };
-                assert!(first(&by_reader).is_some(), "{name} seed {seed}");
-                assert_eq!(first(&by_reader), first(&by_rows), "{name} seed {seed}");
+                }
             }
+        }
+    }
+
+    /// A decision reads a worker once and keeps the read: a second ask of
+    /// the same row within the decision answers the first read, whatever
+    /// the worker says by then, a pass over the whole pool reads only the
+    /// workers not read yet, and the next decision reads each again.
+    #[test]
+    fn a_decision_keeps_its_first_read_of_a_worker() {
+        let list = pool(3);
+        let mut workspace = Workspace::new();
+        let mark = workspace.mark(list.len());
+        let reader = WorkerRows {
+            workers: &list,
+            cells: &workspace.cells[..list.len()],
+            mark,
+            whole: AtomicBool::new(false),
+        };
+        let first = reader.read(1);
+        assert!(first.health().healthy && first.in_flight() == 0);
+        list[1].increment_load();
+        list[1].set_overloaded(true);
+        assert_eq!(reader.read(1), first);
+        // The whole pool: the row read already stands as it was read, and
+        // the others are read now.
+        list[2].increment_load();
+        let whole: Vec<LiveRow> = reader.whole().iter().map(LiveCell::row).collect();
+        assert_eq!(whole[1], first);
+        assert_eq!(whole[2].in_flight(), 1);
+        list[0].increment_load();
+        assert_eq!(reader.whole()[0].row().in_flight(), 0, "read once");
+        // The next decision reads each worker again.
+        let mark = workspace.mark(list.len());
+        let next = WorkerRows {
+            workers: &list,
+            cells: &workspace.cells[..list.len()],
+            mark,
+            whole: AtomicBool::new(false),
+        };
+        let again = next.read(1);
+        assert!(again.health().overloaded && again.in_flight() == 1);
+        assert_eq!(next.read(0).in_flight(), 1);
+        // A place past the pool is no worker's.
+        assert_eq!(next.read(9), LiveRow::default());
+    }
+
+    /// The pass over a pool's workers leaves the rows whose one read passes
+    /// the decision's test, under each test a decision asks: every veto is
+    /// read on the worker object, as the worker's own test of its routing
+    /// state reads it, and the read of a row that passes is kept. A row the
+    /// decision's draw refused is named to the pass, which leaves it out
+    /// and does not read it again. A decision that names no row it read is
+    /// answered from each row's one read.
+    #[test]
+    fn the_pass_leaves_the_rows_whose_one_read_passes_the_test() {
+        let list = pool(16);
+        for (at, worker) in list.iter().enumerate() {
+            if at & 1 != 0 {
+                worker.set_status(WorkerStatus::NotReady);
+            }
+            if at & 2 != 0 {
+                worker.set_overloaded(true);
+            }
+            if at & 4 != 0 {
+                worker.set_stall(Some(StallReason::Wedged));
+            }
+            if at & 8 != 0 {
+                for _ in 0..16 {
+                    worker.record_outcome(500);
+                }
+            }
+        }
+        let states: Vec<RoutingState> = list.iter().map(|worker| worker.routing_state()).collect();
+        for (at, state) in states.iter().enumerate() {
+            assert_eq!(state.healthy, at & 1 == 0, "worker {at}");
+            assert_eq!(state.overloaded, at & 2 != 0, "worker {at}");
+            assert_eq!(state.stalled, at & 4 != 0, "worker {at}");
+            assert_eq!(state.can_execute, at & 8 == 0, "worker {at}");
+        }
+        let mut workspace = Workspace::new();
+        let mut kept = Vec::new();
+        for (routable, not_overloaded) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let test = LiveTest {
+                routable,
+                not_overloaded,
+            };
+            let expected: Vec<u32> = (0u32..)
+                .zip(&states)
+                .filter(|(_, state)| test.passes(health_of(state)))
+                .map(|(at, _)| at)
+                .collect();
+            let reader = reader_of(&list, &mut workspace);
+            kept.clear();
+            reader.pass(test, Some(&[]), &mut kept);
+            assert_eq!(kept, expected, "{test:?}");
+            for (at, cell) in (0u32..).zip(reader.cells) {
+                let passed = expected.contains(&at);
+                assert_eq!(cell.kept(reader.mark).is_some(), passed, "worker {at}");
+            }
+        }
+        let test = LiveTest {
+            routable: true,
+            not_overloaded: true,
+        };
+        let reader = reader_of(&list, &mut workspace);
+        assert!(!test.passes_row(reader.read(1)));
+        // The worker is ready by the pass, and its refusal stands: the row
+        // is named, and the pass reads no named row.
+        list[1].set_status(WorkerStatus::Ready);
+        kept.clear();
+        reader.pass(test, Some(&[1]), &mut kept);
+        assert_eq!(kept, [0]);
+        // A decision that names no row it read keeps the row's one read.
+        list[1].set_status(WorkerStatus::NotReady);
+        let reader = reader_of(&list, &mut workspace);
+        assert!(!test.passes_row(reader.read(1)));
+        list[1].set_status(WorkerStatus::Ready);
+        kept.clear();
+        reader.pass(test, None, &mut kept);
+        assert_eq!(kept, [0]);
+        // The next decision reads the worker as it stands.
+        let reader = reader_of(&list, &mut workspace);
+        kept.clear();
+        reader.pass(test, Some(&[]), &mut kept);
+        assert_eq!(kept, [0, 1]);
+    }
+
+    /// The marks come round after their last value: the cells are emptied,
+    /// so a read kept under a mark of the round before answers no decision.
+    #[test]
+    fn the_marks_come_round_over_emptied_cells() {
+        let list = pool(1);
+        let mut workspace = Workspace::new();
+        workspace.mark = u32::MAX - 1;
+        let last = workspace.mark(1);
+        assert_eq!(last, u32::MAX);
+        let reader = WorkerRows {
+            workers: &list,
+            cells: &workspace.cells[..1],
+            mark: last,
+            whole: AtomicBool::new(false),
+        };
+        let _ = reader.read(0);
+        assert!(workspace.cells[0].kept(last).is_some());
+        let first = workspace.mark(1);
+        assert_eq!(first, 1);
+        assert!(workspace.cells[0].kept(last).is_none());
+        assert!(workspace.cells[0].kept(first).is_none());
+    }
+
+    /// One worker in eight is not ready, and in another fleet three in
+    /// four. None of them is named, and the ready workers are named in
+    /// turn: each exactly once a turn of the ready ones, as the classic
+    /// rotation among the ready workers names them. With the workers ready
+    /// again each is named once a turn of the pool.
+    #[test]
+    fn a_turn_on_a_worker_not_ready_goes_to_the_next_ready_one() {
+        for ready in [
+            (|at: usize| at % 8 != 5) as fn(usize) -> bool,
+            (|at: usize| at % 4 == 2) as fn(usize) -> bool,
+        ] {
+            let engine = preset("round_robin");
+            let list = pool(64);
+            let members = engine.pool_members(MODEL, &list);
+            let request = PlacementRequest::of(MODEL);
+            for (at, worker) in list.iter().enumerate() {
+                if !ready(at) {
+                    worker.set_status(WorkerStatus::NotReady);
+                }
+            }
+            let serving = (0..64).filter(|&at| ready(at)).count();
+            let mut named = [0u32; 64];
+            for _ in 0..serving * 50 {
+                named[place(&engine, &members, &request)] += 1;
+            }
+            for (at, &times) in named.iter().enumerate() {
+                let expected = if ready(at) { 50 } else { 0 };
+                assert_eq!(times, expected, "worker {at}");
+            }
+            for worker in list.iter() {
+                worker.set_status(WorkerStatus::Ready);
+            }
+            let first = place(&engine, &members, &request);
+            for step in 1..128 {
+                assert_eq!(place(&engine, &members, &request), (first + step) % 64);
+            }
+        }
+    }
+
+    /// A pool none of whose workers passes every filter is decided by the
+    /// engine's staged pass and its rule for such a pool, over the same
+    /// reads: a pool nobody serves places the request on no worker and
+    /// names the filter that left none, a pool over its overload
+    /// thresholds is steered to the worker with the fewest requests in
+    /// flight, and a retry that tried every worker is placed on one of
+    /// them again.
+    #[test]
+    fn a_pool_no_worker_of_which_passes_is_decided_by_the_staged_pass() {
+        let engine = preset("round_robin");
+        let request = PlacementRequest::of(MODEL);
+
+        let list = pool(6);
+        let members = engine.pool_members(MODEL, &list);
+        for worker in list.iter() {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let unplaced = engine
+            .place(&request, &members)
+            .expect_err("nobody serves the model");
+        assert_eq!(unplaced.emptied_by, "healthy");
+        assert!(unplaced.profile.is_some());
+
+        let list = pool(6);
+        let members = engine.pool_members(MODEL, &list);
+        for (at, worker) in list.iter().enumerate() {
+            worker.set_overloaded(true);
+            if at != 4 {
+                worker.increment_load();
+            }
+        }
+        for _ in 0..8 {
+            assert_eq!(place(&engine, &members, &request), 4);
+        }
+
+        let list = pool(3);
+        let members = engine.pool_members(MODEL, &list);
+        let tried: Vec<WorkerId> = (0..3).filter_map(|at| members.id_at(at)).collect();
+        let retry = PlacementRequest {
+            tried: &tried,
+            ..PlacementRequest::of(MODEL)
+        };
+        assert!(place(&engine, &members, &retry) < 3);
+    }
+
+    /// A profile whose stages read a row's facts off the row is decided
+    /// over rows written for the decision: a picker that takes the fewest
+    /// requests in flight places every request on the idle worker of a
+    /// pool whose others hold one.
+    #[test]
+    fn a_profile_that_reads_rows_is_decided_over_written_rows() {
+        let mut document = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of the built-in preset");
+        document.generation = 1;
+        let engine = engine_of(&document);
+        assert!(!engine.spec().engine().decides_live(MODEL, Phase::Single));
+        let list = pool(5);
+        let members = engine.pool_members(MODEL, &list);
+        for (at, worker) in list.iter().enumerate() {
+            if at != 3 {
+                worker.increment_load();
+            }
+        }
+        for _ in 0..8 {
+            assert_eq!(place(&engine, &members, &PlacementRequest::of(MODEL)), 3);
         }
     }
 }

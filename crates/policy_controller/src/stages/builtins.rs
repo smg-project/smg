@@ -25,7 +25,10 @@ use crate::{
             TieBand, DRAW_BOUND,
         },
         terms::{Coefficients, Term},
-        view::{Candidate, Constraints, LoadRow, PoolFacts, ReportCutoff, RequestFacts, WorkerId},
+        view::{
+            Candidate, Constraints, LiveRow, LiveRows, LiveTest, LoadRow, PoolFacts, ReportCutoff,
+            RequestFacts, WorkerId,
+        },
     },
     load::signals::{SignalColumn, SignalSums, SignalTerm},
     policies::cache_aware::WarmRule,
@@ -64,8 +67,8 @@ impl Filter for Healthy {
         true
     }
 
-    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
-        OwnBits::keeps(facts.health(c)) && !cx.masks(c.position)
+    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+        c.health.routable_ignoring_overload() && !cx.masks(c.position)
     }
 
     /// The host's mask is asked about once: a pass under no standing veto
@@ -78,7 +81,7 @@ impl Filter for Healthy {
         kept: &mut Vec<u32>,
     ) {
         if !cx.stalled.is_empty() {
-            return retain_masked(facts, candidates, cx, kept);
+            return retain_masked(candidates, cx, kept);
         }
         OwnBits.retain(facts, candidates, cx, kept);
     }
@@ -101,18 +104,26 @@ impl Filter for OwnBits {
         false
     }
 
-    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
-        Self::keeps(facts.health(c))
+    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+        c.health.routable_ignoring_overload()
     }
-}
 
-impl OwnBits {
-    /// The test of a row's own bits, of bits read already: the filter's
-    /// `keep` and the folded test ([`RowTests::keeps`]) both ask here, so
-    /// the two cannot part.
-    #[inline(always)]
-    const fn keeps(health: crate::engine::Health) -> bool {
-        health.routable_ignoring_overload()
+    /// The pass, compiled once for each kind of rows: the loop the trait
+    /// gives a filter over rows that carry their bits, and a loop over the
+    /// decision's kept reads beside rows that carry none
+    /// ([`RequestFacts::live_rows`]). The request's facts are asked which
+    /// once a pass, so no row tests it.
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        match facts.live_rows {
+            None => kept.retain(|&i| self.keep(facts, &candidates[i as usize], cx)),
+            Some(live) => retain_live(live, kept, LiveRow::routable_ignoring_overload),
+        }
     }
 }
 
@@ -120,13 +131,19 @@ impl OwnBits {
 /// the host's mask. Out of line, so the pass under no veto stays the short
 /// one.
 #[inline(never)]
-fn retain_masked(
-    facts: &RequestFacts<'_>,
-    candidates: &[Candidate],
-    cx: &Constraints<'_>,
-    kept: &mut Vec<u32>,
-) {
-    kept.retain(|&i| OwnBits::keeps(facts.health(&candidates[i as usize])) && !cx.masks(i));
+fn retain_masked(candidates: &[Candidate], cx: &Constraints<'_>, kept: &mut Vec<u32>) {
+    kept.retain(|&i| candidates[i as usize].health.routable_ignoring_overload() && !cx.masks(i));
+}
+
+/// A filter's pass over rows that carry no live fact: the rows of `kept`
+/// whose kept read passes `test` stay. The reads are the decision's own
+/// ([`LiveRows::whole`]): a row the decision read already is not read
+/// again, and the pass reads plain values, with no call a row. Out of
+/// line, so a pass over rows that carry their bits holds none of it.
+#[inline(never)]
+fn retain_live(live: &dyn LiveRows, kept: &mut Vec<u32>, test: impl Fn(LiveRow) -> bool) {
+    let rows = live.whole();
+    kept.retain(|&i| rows.get(i as usize).is_some_and(|cell| test(cell.row())));
 }
 
 /// Not over the overload thresholds, unless the host lifted the veto.
@@ -147,17 +164,24 @@ impl Filter for NotOverloaded {
         true
     }
 
-    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
-        Self::keeps(facts.health(c), cx)
+    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+        cx.overload_lifted || !c.health.overloaded
     }
-}
 
-impl NotOverloaded {
-    /// The filter's test of bits read already, shared with the folded
-    /// test ([`RowTests::keeps`]).
-    #[inline(always)]
-    const fn keeps(health: crate::engine::Health, cx: &Constraints<'_>) -> bool {
-        cx.overload_lifted || !health.overloaded
+    /// The pass, compiled once for each kind of rows, as the health
+    /// filter's is (`OwnBits::retain`).
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        match facts.live_rows {
+            None => kept.retain(|&i| self.keep(facts, &candidates[i as usize], cx)),
+            Some(_) if cx.overload_lifted => {}
+            Some(live) => retain_live(live, kept, |row| !row.overloaded()),
+        }
     }
 }
 
@@ -872,16 +896,63 @@ impl RowTests {
         cx: &Constraints<'_>,
     ) -> bool {
         let holds = |test: u8| self.0 & test != 0;
-        // One read of the row's bits answers both tests of them: beside a
-        // host's reader of live rows a read is a read of its worker.
-        let health = if holds(Self::HEALTHY | Self::NOT_OVERLOADED) {
-            facts.health(c)
-        } else {
-            c.health
-        };
-        (!holds(Self::HEALTHY) || OwnBits::keeps(health))
-            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded::keeps(health, cx))
+        (!holds(Self::HEALTHY) || OwnBits.keep(facts, c, cx))
+            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded.keep(facts, c, cx))
             && (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
+            && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
+            && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))
+    }
+
+    /// [`Self::keeps`] of a row that carries no live fact
+    /// ([`Engine::decide_live`](crate::engine::Engine::decide_live)): the two
+    /// tests of a row's health bits read `live`, the one read of the row's
+    /// worker, and every other test reads the row. It keeps the rows
+    /// [`Self::keeps`] keeps of rows written with the same bits: a case
+    /// walks every set over every word of bits and holds the two together.
+    #[inline(always)]
+    pub(crate) fn keeps_live(
+        self,
+        live: LiveRow,
+        facts: &RequestFacts<'_>,
+        c: &Candidate,
+        cx: &Constraints<'_>,
+    ) -> bool {
+        let holds = |test: u8| self.0 & test != 0;
+        (!holds(Self::HEALTHY) || live.routable_ignoring_overload())
+            && (!holds(Self::NOT_OVERLOADED) || cx.overload_lifted || !live.overloaded())
+            && (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
+            && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
+            && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))
+    }
+
+    /// The two tests of a row's health bits in the set, as one pass over a
+    /// whole pool of live rows asks them of each row where it reads the
+    /// row's worker ([`LiveRows::pass`]). With [`Self::keeps_row`] it is
+    /// [`Self::keeps_live`] in two halves: a case holds the three together.
+    pub(crate) fn live_test(self, cx: &Constraints<'_>) -> LiveTest {
+        LiveTest {
+            routable: self.0 & Self::HEALTHY != 0,
+            not_overloaded: self.0 & Self::NOT_OVERLOADED != 0 && !cx.overload_lifted,
+        }
+    }
+
+    /// Whether the set holds a test that reads the row itself and no live
+    /// fact: the capacity bit, the room bit, the rows tried.
+    pub(crate) fn reads_rows(self) -> bool {
+        self.0 & (Self::HAS_CAPACITY | Self::HAS_ROOM | Self::NOT_TRIED) != 0
+    }
+
+    /// The tests of the set that read the row itself and no live fact:
+    /// what [`Self::keeps_live`] asks beside [`Self::live_test`].
+    #[inline(always)]
+    pub(crate) fn keeps_row(
+        self,
+        facts: &RequestFacts<'_>,
+        c: &Candidate,
+        cx: &Constraints<'_>,
+    ) -> bool {
+        let holds = |test: u8| self.0 & test != 0;
+        (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
             && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
             && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))
     }
@@ -3526,6 +3597,30 @@ pub(crate) fn draw_kept(
     None
 }
 
+/// One uniform draw over the rows of the pool `keep` keeps, for a decision
+/// over live rows ([`Picker::draw_live`]): a row is drawn again while it is
+/// refused, `draws` draws at the most. Each row asked about is one read of
+/// a worker, so the draw reads `draws` workers at the most where the whole
+/// pass reads the pool. `None` once every draw was refused, and over a pool
+/// that holds no row.
+pub(crate) fn draw_kept_live(
+    draw: &mut Draw,
+    candidates: &[Candidate],
+    draws: u32,
+    keep: &mut dyn FnMut(&Candidate) -> bool,
+) -> Option<usize> {
+    if candidates.is_empty() {
+        return None;
+    }
+    for _ in 0..draws {
+        let row = draw.below(candidates.len());
+        if keep(&candidates[row]) {
+            return Some(row);
+        }
+    }
+    None
+}
+
 impl Picker for Best {
     fn name(&self) -> &'static str {
         "best"
@@ -3811,6 +3906,31 @@ impl Picker for CountFirst {
             }
         });
     }
+}
+
+/// How many turns of the pool a decision over live rows takes at the most
+/// past a turn that lands on a refused row, before it reads the pool whole
+/// ([`RoundRobin::draw_live`], [`live_turns`]). The one place that sets
+/// the rule: at `0` a turn on a refused row goes to the whole pass at once,
+/// which turns the survivors' own rotation at one read of every worker of
+/// the pool.
+///
+/// [`RoundRobin::draw_live`]: crate::policies::round_robin::RoundRobin::draw_live
+const TURNS_AHEAD: u32 = DRAW_BOUND;
+
+/// The rows of a pool that earn a decision one turn past a refused row. A
+/// turn that misses costs its own steps whatever the pool holds, and the
+/// whole pass it may save costs a read a row. So a small pool, whose pass
+/// is short, goes to the pass at once, as the survivors' rotation always
+/// did, and a larger pool takes one more turn for each this many rows it
+/// holds, [`TURNS_AHEAD`] at the most.
+const ROWS_A_TURN: usize = 32;
+
+/// The turns of the pool a decision over live rows takes over a pool of
+/// `rows` rows before it reads the pool whole: its own, and one past a
+/// refused row for each [`ROWS_A_TURN`] rows, [`TURNS_AHEAD`] at the most.
+pub(crate) fn live_turns(rows: usize) -> usize {
+    1 + (rows / ROWS_A_TURN).min(TURNS_AHEAD as usize)
 }
 
 /// The five filters of this file a set names, by bit: what the cases of the

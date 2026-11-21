@@ -229,11 +229,11 @@ default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
 wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 # A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
-# host that takes the thread's core, and the knob of the run that sets the
-# pool size a decision over live rows draws first from. The package's own
-# tests and benches turn it on through the dev-dependency on the package
-# itself, and the gateway's benches through its own `test-util`; no build
-# of a product has it.
+# host that takes the thread's core. The package's own tests and benches
+# turn it on through the dev-dependency on the package itself; no build of
+# a product has it. It also holds the knob of the run that sets the pool
+# size a decision over live rows draws first from, which the gateway's
+# benches turn through the gateway's own `test-util`.
 test-util = ["smg-worker?/test-util"]
 
 [dev-dependencies]

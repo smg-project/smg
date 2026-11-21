@@ -29,8 +29,8 @@
 //!   pools (single worker and prefill/decode pairs), the one sequence the
 //!   HTTP and gRPC families used to each carry a copy of
 //! - `policy_placement` — that placement decided by the policy engine,
-//!   where the gateway hosts it: the same pools of the same registry, read
-//!   in place
+//!   where the gateway keeps it in its own process: the same pools of the
+//!   same registry, read in place
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - `test_support` (test builds only) — the fast retry policy the HTTP
@@ -229,9 +229,7 @@ pub(crate) fn attach_sized_body(
 pub mod bench_support {
     use std::sync::Arc;
 
-    use smg_policy_controller::{
-        document::AppliedSpec, engine::policy_engine::PolicyEngine, stages::Catalog,
-    };
+    use smg_policy_controller::{document::AppliedSpec, engine::PolicyEngine, stages::Catalog};
     use smg_worker::{
         identity::basic::{Worker, WorkerLoadGuard},
         load::state::LoadReceiver,
@@ -267,7 +265,7 @@ pub mod bench_support {
     ///
     /// A configuration no policy document says, and a document the engine
     /// refuses, each in its own words.
-    pub fn host_policy_engine(
+    pub fn set_policy_engine_of(
         policies: &PolicyRegistry,
         config: &RouterConfig,
     ) -> Result<(), String> {

@@ -1,9 +1,9 @@
 //! What a benchmark needs of the policy controller in this process: the
-//! store, its membership feed and its host built as the context builds them
-//! under the setting, workers registered through the feed's door as the
-//! registration line writes them, and one request's routing as a regular
-//! router runs it (the ask, the commit, the send's report, the load guard
-//! and the end's report).
+//! store, its membership feed and the engine over both, built as the context
+//! builds them under the setting, workers registered through the feed's door
+//! as the registration line writes them, and one request's routing as a
+//! regular router runs it (the ask, the commit, the send's report, the load
+//! guard and the end's report).
 
 use std::{
     sync::Arc,
@@ -46,7 +46,7 @@ pub enum Route {
 
 /// One model's fleet placed by the policy controller in this process.
 pub struct ControllerPath {
-    host: Arc<PolicyEngine>,
+    engine: Arc<PolicyEngine>,
     feed: Feed,
     registry: Arc<WorkerRegistry>,
     model: String,
@@ -54,7 +54,7 @@ pub struct ControllerPath {
 
 impl ControllerPath {
     /// The store a gateway starts under `config`, which holds the setting,
-    /// with its feed over a new registry and the host over both.
+    /// with its feed over a new registry and the engine over both.
     ///
     /// # Errors
     ///
@@ -67,12 +67,12 @@ impl ControllerPath {
         };
         let registry = Arc::new(WorkerRegistry::new());
         let (feed, _) = feeds(&store, &registry, BackendConnector::shared(), None);
-        let host = Arc::new(PolicyEngine::new(
+        let engine = Arc::new(PolicyEngine::new(
             Arc::clone(&store),
             Arc::clone(&feed.objects),
         ));
         Ok(Self {
-            host,
+            engine,
             feed,
             registry,
             model: model.to_owned(),
@@ -118,18 +118,17 @@ impl ControllerPath {
         StoreLoadSink::publish(&**store, due);
     }
 
-    /// One pass of the host's clock, as its timer makes about once a second.
+    /// One pass of the engine's clock, as its timer makes about once a second.
     pub fn upkeep(&self) {
-        self.host.sweep(Instant::now());
+        self.engine.sweep(Instant::now());
     }
 
     /// One request's routing on `route`: the prompt's hashes, the ask and
     /// the commit, the worker's load guard, the send's report and the end's
     /// report. `false` where the request had no worker.
     pub fn route(&self, route: Route, tokens: Option<&[u32]>) -> bool {
-        let host = &self.host;
         let model = self.model.as_str();
-        let hashes = host.hashes(model, &Prompt::of(tokens, None));
+        let hashes = self.engine.hashes(model, &Prompt::of(tokens, None));
         let id = engine::mark();
         let (wires, pool) = match route {
             Route::Http => (WireModes::NONE, RoutingPool::HttpRegular),
@@ -143,7 +142,9 @@ impl ControllerPath {
             hashes: Some(&hashes),
             ..Ask::of(&id, model)
         };
-        let placing = host.place_where(&ask, |worker| pool.matches(worker), Instant::now());
+        let placing = self
+            .engine
+            .place_where(&ask, |worker| pool.matches(worker), Instant::now());
         // The door in this process decides on the calling thread.
         let Some(Ok(mut placed)) = placing.now_or_never() else {
             return false;
