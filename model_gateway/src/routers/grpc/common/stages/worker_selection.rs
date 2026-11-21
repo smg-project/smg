@@ -2119,6 +2119,7 @@ impl WorkerSelectionStage {
         let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
         let ask = Ask {
             wires: route_wires(wire),
+            prompt: Some(&prompt),
             pool: Some(RoutingPool::GrpcPipelineRegular),
             among: among.as_ref(),
             snapshot: snapshot.as_ref(),
@@ -2245,6 +2246,7 @@ impl WorkerSelectionStage {
             decode_again: true,
             attempt: Some(attempt.number()),
             wires: route_wires(wire),
+            prompt: Some(&prompt),
             ..attempt.ask(model_id, &id, &hashes)
         };
         // A worker passes the rule of its own pool: a pool matches its own

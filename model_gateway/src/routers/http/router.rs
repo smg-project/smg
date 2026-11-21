@@ -879,32 +879,47 @@ impl Router {
         }
         let id = engine::mark();
         let tried = attempt.tried_rows.lock().clone();
-        // The prompt the classic arm routes by: the request's token ids
-        // where it has them, else its text.
-        let hashes = attempt.lease.with_view(|view| {
-            let prompt = Prompt {
-                text: view.text,
-                ..Prompt::of(view.tokens, view.cache_namespace)
-            };
-            policy_engine.hashes(&model, &prompt)
-        });
-        let ask = Ask {
+        let stated = Ask {
             streaming: attempt.is_stream,
             headers: attempt.headers,
             rid: attempt.rid,
             tried: &tried,
-            hashes: Some(&hashes),
             pool: Some(RoutingPool::HttpRegular),
             ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
-        let placed = policy_engine
-            .place_at(
-                &ask,
-                |worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker),
-                Instant::now,
-            )
-            .await;
+        let rule =
+            |worker: &dyn Worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker);
+        // The prompt the classic arm routes by: the request's token ids
+        // where it has them, else its text. The lease lends it for as long
+        // as its view stands, so the engine of this process is asked inside
+        // the view, on this thread, and reads the prompt for its record of
+        // sent prefixes. A followed controller's engine reads the hashes
+        // alone, and its ask waits behind the view.
+        let here = attempt.lease.with_view(|view| {
+            let prompt = Prompt {
+                text: view.text,
+                ..Prompt::of(view.tokens, view.cache_namespace)
+            };
+            let hashes = policy_engine.hashes(&model, &prompt);
+            let ask = Ask {
+                hashes: Some(&hashes),
+                prompt: Some(&prompt),
+                ..stated
+            };
+            let placed = policy_engine.place_here(&ask, rule, Instant::now);
+            placed.ok_or(hashes)
+        });
+        let placed = match here {
+            Ok(placed) => placed,
+            Err(hashes) => {
+                let ask = Ask {
+                    hashes: Some(&hashes),
+                    ..stated
+                };
+                policy_engine.place_at(&ask, rule, Instant::now).await
+            }
+        };
         placed.map_err(|unplaced| {
             self.report_refusal(
                 "Router::route_typed_request",
@@ -2772,11 +2787,16 @@ impl Router {
             return Err(Unstreamed::Refused(Box::new(refusal)));
         }
         let id = engine::mark();
-        let hashes = hinted_tokens
-            .map(|tokens| policy_engine.hashes(&model, &Prompt::of(Some(tokens), None)));
+        // The hint is the prompt this route holds: it is hashed, and lent
+        // to the engine of this process as the buffered path lends its own.
+        let prompt = hinted_tokens.map(|tokens| Prompt::of(Some(tokens), None));
+        let hashes = prompt
+            .as_ref()
+            .map(|prompt| policy_engine.hashes(&model, prompt));
         let ask = Ask {
             headers: Some(headers),
             hashes: hashes.as_ref(),
+            prompt: prompt.as_ref(),
             pool: Some(RoutingPool::HttpRegular),
             ..Ask::of(&id, &model)
         };

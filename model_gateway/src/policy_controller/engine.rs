@@ -58,7 +58,7 @@ use smg_policy_controller::{
         worker_id, worker_rank, AlonePick, Constraints, DecideOutcome, Decided, Decision,
         DecisionEngine, DecisionRefused, EncodeItems, EncodePlaced, HashSeeds, HeldDecision,
         Identity, LiftedVeto, MediaCounts, Pair, Phase, Plain, PolicyEngine as OwnEngine,
-        PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind, ShedReason,
+        PoolMembers, PromptLent, Request, RequestFacts, RequestMaker, ShadowKind, ShedReason,
         StoreBackedEngine, SweepOutcome, Target, Targets, Trace, WireModes, WorkerId, WorkerLists,
         MAX_TARGETS,
     },
@@ -204,6 +204,11 @@ pub(crate) struct Ask<'a> {
     /// The attempt's prompt hashes, where it has them. The stage that holds
     /// the tokens fills this once per attempt, before its first ask.
     pub hashes: Option<&'a Hashes>,
+    /// The attempt's prompt as its route holds it, where it holds one: lent
+    /// to the engine of this process for its record of the prefixes it
+    /// sent, and to nothing else. No fact of the request holds it. A
+    /// followed controller's engine reads nothing here.
+    pub prompt: Option<&'a Prompt<'a>>,
     /// The pool of the route that asks: the registry's list a regular
     /// attempt is placed over, where the policy engine decides in this
     /// process. The route states the pool its classic arm reads. An ask that
@@ -230,8 +235,8 @@ impl<'a> Ask<'a> {
     /// An ask for `model` under the request's `id` that states no other
     /// fact: a single request of no stated prompt size, not streamed, no
     /// input of a routing key, no media, no stated wire, nothing tried, no
-    /// stated attempt, no hashes, no second ask of a decode, no pool, no
-    /// narrowed list and no snapshot.
+    /// stated attempt, no hashes, no prompt lent, no second ask of a decode,
+    /// no pool, no narrowed list and no snapshot.
     pub(crate) const fn of(id: &'a [u8], model: &'a str) -> Self {
         Self {
             id,
@@ -247,6 +252,7 @@ impl<'a> Ask<'a> {
             tried: &[],
             attempt: None,
             hashes: None,
+            prompt: None,
             pool: None,
             among: None,
             snapshot: None,
@@ -394,6 +400,11 @@ impl RequestMaker for Made<'_, '_> {
 
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads
+    }
+
+    // The prompt its route stated on the ask, where it stated one.
+    fn prompt(&self) -> Option<PromptLent<'_>> {
+        self.ask.prompt.map(Prompt::lent)
     }
 }
 
@@ -2095,6 +2106,9 @@ impl KeptAsk {
             tried: &self.tried,
             attempt: self.attempt,
             hashes: self.hashes.as_ref(),
+            // A prompt is its route's to lend, for as long as the route
+            // holds it: a kept ask owns its facts, and lends none.
+            prompt: None,
             // A pair is placed over its family's two lists, and no pool
             // of a regular route.
             pool: None,
