@@ -160,13 +160,16 @@ pub(crate) enum StartError {
     },
     /// The document its operator supplied states a rule of its own, apart
     /// from its bindings, that nothing in this process would run
-    /// ([`rule_not_run`]): the start names the field.
+    /// ([`rule_not_run`]): the start names the field, and says what its
+    /// operator can do.
     #[error(
-        "the policy document states `{field}`, which is not run in this process yet: {because}"
+        "the policy document states `{field}`, which is not run in this process yet: {because}. \
+         {instead}, or run the gateway under a controller's address"
     )]
     FieldNotRun {
         field: &'static str,
         because: &'static str,
+        instead: String,
     },
 }
 
@@ -257,10 +260,13 @@ pub(crate) fn start_with(
 ///
 /// A document the routing settings mean is decided by the engine where it
 /// picks the place's profile by itself, and by the classic policy of the
-/// setting elsewhere. A document its operator supplied has no setting
-/// behind a place, so a place of it the engine does not pick by itself
-/// is refused here ([`StartError::NotAlone`]), and so is a rule of a
-/// binding that nothing in this process would run ([`rule_not_run`]).
+/// setting elsewhere. That holds for the settings' own document handed
+/// back as a supplied one too: it says what they say. Any other document
+/// its operator supplied has no setting behind a place, so a place of it
+/// the engine does not pick by itself is refused here
+/// ([`StartError::NotAlone`]), and so is a rule that nothing in this
+/// process would run ([`rule_not_run`]). So neither of the two meets a
+/// document the gateway wrote, beside the settings that wrote it.
 ///
 /// Every check and refusal is [`engine_for`]'s, which answers for a
 /// document the gateway does not run as well ([`would_start`]). The start
@@ -328,10 +334,14 @@ fn engine_for(
     let written = serde_yaml::to_string(&document)?;
     let spec = checked(config, &stages, &document, &written)?;
     let engine = Arc::new(smg_policy_controller::engine::PolicyEngine::new(spec));
-    let origin = if config.policy_spec.is_some() {
-        DocumentOrigin::Supplied
-    } else {
+    // The document is its operator's own where it says another thing than
+    // the routing settings mean. The number is no part of what it says.
+    let mut settings = config.policy_document()?;
+    settings.generation = document.generation;
+    let origin = if settings == document {
         DocumentOrigin::Settings
+    } else {
+        DocumentOrigin::Supplied
     };
     if origin == DocumentOrigin::Supplied {
         if let Some(place) = engine.not_alone() {
@@ -342,7 +352,7 @@ fn engine_for(
                 phase: place.phase.name(),
             });
         }
-        rule_not_run(config, &document)?;
+        rule_not_run(config, &settings, &document)?;
     }
     Ok(Some(InProcess {
         engine,
@@ -354,7 +364,8 @@ fn engine_for(
 }
 
 /// Refuses a supplied `document` by its first rule that nothing in this
-/// process would run.
+/// process would run. `settings` is the document the routing settings
+/// mean.
 ///
 /// The engine is asked for picks, and the gateway's own placement holds
 /// every other rule of a request. It keeps sessions, reads a request's
@@ -375,7 +386,11 @@ fn engine_for(
 /// explain. So a pair plan's `pairing` other than the settings' mode, a
 /// pair plan's `decode: after-prefill` and an `explain.sample` other than
 /// zero are refused by the field ([`StartError::FieldNotRun`]).
-fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), StartError> {
+fn rule_not_run(
+    config: &RouterConfig,
+    settings: &PolicySpec,
+    document: &PolicySpec,
+) -> Result<(), StartError> {
     use smg_policy_controller::{
         document::{BindingSpec, DecodePick, Pairing, PlanName},
         engine::Phase,
@@ -395,7 +410,6 @@ fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), Star
         );
     // What the routing settings say of a binding's own rules: the one
     // binding of their document.
-    let settings = config.policy_document()?;
     let run = settings.bindings.first().cloned().unwrap_or_default();
     let mut pair_planned = false;
     for (at, binding) in document.bindings.iter().enumerate() {
@@ -435,26 +449,47 @@ fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), Star
         }
     }
     // The document's own rules. A pair plan's rules have a request only
-    // where a binding plans the pair.
-    let stated = |field, because| StartError::FieldNotRun { field, because };
+    // where a binding plans the pair. Each refusal says what the operator
+    // can do: a field left out reads as its default.
+    const REMOVE: &str = "Remove the field";
+    let stated = |field, because, instead: String| StartError::FieldNotRun {
+        field,
+        because,
+        instead,
+    };
     if pair_planned {
-        let by_settings = match config.pd_pairing_mode {
+        let mode = config.pd_pairing_mode;
+        let by_settings = match mode {
             PdPairingMode::Off => Pairing::Off,
             PdPairingMode::Lenient => Pairing::Lenient,
             PdPairingMode::Strict => Pairing::Strict,
         };
         if document.plans.pd_pair.pairing != by_settings {
-            return Err(stated("plans.pd-pair.pairing", BY_SETTINGS));
+            let instead = if by_settings == Pairing::default() {
+                REMOVE.to_owned()
+            } else {
+                format!("State `{}`, the routing settings' mode", mode.as_str())
+            };
+            return Err(stated(
+                "plans.pd-pair.pairing",
+                "the gateway's placement pairs by the routing settings' mode",
+                instead,
+            ));
         }
         if document.plans.pd_pair.decode != DecodePick::WithPrefill {
             return Err(stated(
                 "plans.pd-pair.decode",
                 "a pair's decode is picked with its prefill",
+                REMOVE.to_owned(),
             ));
         }
     }
     if document.explain.sample != 0 {
-        return Err(stated("explain.sample", "no decision is kept for explain"));
+        return Err(stated(
+            "explain.sample",
+            "no decision is kept for explain",
+            REMOVE.to_owned(),
+        ));
     }
     Ok(())
 }

@@ -685,6 +685,10 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
 /// workers serve has none: the placement reads the default policy for it.
 /// With the policy controller picked and no controller's address that is as
 /// with the setting off.
+///
+/// This case changes when the policy engine decides a profile that places
+/// otherwise than a rotation: under a supplied document, a model no local
+/// worker serves is then placed by the profile of its own binding.
 #[tokio::test]
 async fn a_model_only_a_peers_worker_serves_is_placed_by_the_default_policy() {
     for picked in [false, true] {
