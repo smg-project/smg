@@ -65,6 +65,24 @@ fn serialize_request_body_impl<T: Serialize>(
 ) -> Result<Vec<u8>, RequestBodyError> {
     let bytes = serialize_json_sized(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
 
+    // With no alias and no worker edit only the strip can change an object,
+    // and it removes a field written `"name":null`, `"name":true` or
+    // `"name":false`: a body with none of them goes out unparsed.
+    if canonical_model.is_none()
+        && !worker.mutates_request()
+        && bytes.first() == Some(&b'{')
+        && !(strip_defaults
+            && memchr::memchr_iter(b':', &bytes).any(|colon| {
+                matches!(bytes.get(colon + 1), Some(b'n' | b't' | b'f'))
+                    && bytes[..colon].strip_suffix(b"\"").is_some_and(|key| {
+                        let name = &key[memchr::memrchr(b'"', key).map_or(0, |quote| quote + 1)..];
+                        SGLANG_FIELDS.iter().any(|field| field.as_bytes() == name)
+                    })
+            }))
+    {
+        return Ok(bytes);
+    }
+
     // A body the raw editor cannot parse (in practice: non-objects) takes
     // the Value pipeline rather than skipping the hooks.
     let Ok(mut body) = RawBody::parse(&bytes) else {
@@ -480,6 +498,28 @@ mod tests {
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
         assert_eq!(body, serialize_json_sized(&req, None).unwrap());
+    }
+
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    #[test]
+    fn a_body_no_edit_applies_to_allocates_only_its_bytes() {
+        use crate::routers::grpc::testing::bytes_allocated_during;
+
+        let worker = worker();
+        let req = generate_request(json!({}));
+
+        let direct = bytes_allocated_during(|| {
+            serialize_json_sized(&req, None).unwrap();
+        });
+        let routed = bytes_allocated_during(|| {
+            serialize_request_body(&req, None, &worker, None).unwrap();
+        });
+
+        assert_eq!(routed, direct);
     }
 
     #[test]
