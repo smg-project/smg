@@ -2807,7 +2807,7 @@ mod tests {
             format!("]<]minimax[>[<text>{long}]<]minimax[>[</p>   \n {long}]<]minimax[>[</text>"),
             format!("]<]minimax[>[<text>{long}]<]minimax[>[<em>{long}]<]minimax[>[</em>{long}]<]minimax[>[</text>"),
             format!("]<]minimax[>[<file>{long}]<]minimax[>[<last>   \n false]<]minimax[>[</last>]<]minimax[>[<text>{long}]<]minimax[>[</text>"),
-            format!("]<]minimax[>[<text>{long}]<]minimax[>[<last>   \n fals{long}]<]minimax[>[</last>{long}]<]minimax[>[</text>"),
+            format!("]<]minimax[>[<text>{long}]<]minimax[>[<last>   \n fals{long}]<]minimax[>[</last>{long}]<]minimax[>[</text>"), // codespell:ignore fals
         ] {
             let output = save_call(&body);
             let longest_tag = "<invoke name=\"save\">".len();

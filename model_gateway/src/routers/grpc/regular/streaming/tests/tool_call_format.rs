@@ -786,11 +786,11 @@ async fn a_forced_scalar_whole_where_the_output_ends_is_delivered_and_an_unfinis
         assert_eq!(calls[0].function.arguments.as_deref(), Some(whole));
     }
     for (finish, at_limit, values) in [
-        ("stop", false, &["{\"city\": \"Par", "[1, 2", "tru"][..]),
+        ("stop", false, &["{\"city\": \"Par", "[1, 2", "tru"][..]), // codespell:ignore tru
         (
             "length",
             true,
-            &["{\"city\": \"Par", "[1, 2", "tru", "7", "-12"][..],
+            &["{\"city\": \"Par", "[1, 2", "tru", "7", "-12"][..], // codespell:ignore tru
         ),
     ] {
         for unfinished in values {

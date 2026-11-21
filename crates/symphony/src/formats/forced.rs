@@ -164,7 +164,8 @@ mod tests {
                 assert_eq!(losses(&events), [], "{whole}");
             }
         }
-        for unfinished in ["{\"city\": \"Par", "[1, 2", "tru", "\"Par"] {
+        let unfinished = ["{\"city\": \"Par", "[1, 2", "tru", "\"Par"]; // codespell:ignore tru
+        for unfinished in unfinished {
             let stopped = read(unfinished, EngineFinish::Stop);
             assert_eq!(endings(&stopped), [(0, CallEnd::Stop)], "{unfinished}");
             assert_eq!(
