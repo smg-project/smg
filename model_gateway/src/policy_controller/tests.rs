@@ -20,7 +20,7 @@ use openai_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::{operator::SpecRejected, AppliedSpec, PolicySpec, SpecError},
+    document::{operator::SpecRejected, AppliedSpec, PolicyDocumentError, PolicySpec, SpecError},
     engine::{Candidate, RequestFacts, Role, Scorer, TieBand, WireModes, WorkerId},
     stages::{Catalog, CatalogError},
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
@@ -33,7 +33,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    config::{ManualAssignmentMode, PolicyConfig, PolicyDocumentError, RouterConfig, RoutingMode},
+    config::{ManualAssignmentMode, PolicyConfig, RouterConfig, RoutingMode},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
         gateway::Gateway,

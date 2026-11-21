@@ -9,13 +9,13 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg_policy_controller::document::{PolicySpec, SpecError, PRESETS};
+use smg_policy_controller::document::{PolicyDocumentError, PolicySpec, SpecError, PRESETS};
 
 use super::{
     super::{url_port::CommandLine, Cli, CliArgs, Commands},
     PolicySpecPrint,
 };
-use crate::config::{PolicyDocumentError, RouterConfig, RoutingMode};
+use crate::config::{RouterConfig, RoutingMode};
 
 /// The urls of a side that the binary reads ahead of clap, each with its
 /// bootstrap port.

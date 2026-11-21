@@ -47,7 +47,10 @@ use std::sync::Arc;
 
 pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
-    document::operator::{Format, SpecDoor, SpecRejected},
+    document::{
+        operator::{Format, SpecDoor, SpecRejected},
+        PolicyDocumentError,
+    },
     stages::Catalog,
     store::MemoryStore,
 };
@@ -56,7 +59,7 @@ use tracing::info;
 
 use crate::{
     app_context::AppContext,
-    config::{validation::ConfigValidator, ConfigError, PolicyDocumentError, RouterConfig},
+    config::{validation::ConfigValidator, ConfigError, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, RouterTrait},
 };
 

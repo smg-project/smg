@@ -1,12 +1,18 @@
 //! The policy document: its schema and validator, where a request's routing key
-//! comes from, and the calls an operator makes on a document in force.
+//! comes from, the calls an operator makes on a document in force, and the
+//! document a gateway's routing settings mean.
 
 #[cfg(feature = "operator")]
 pub mod operator;
 pub(crate) mod routing_key;
+pub(crate) mod routing_settings;
 pub(crate) mod spec;
 
 pub use routing_key::{strip_lineage, DerivedKey, KeySource, KeySources};
+pub use routing_settings::{
+    LoadMetricSetting, ModeSettings, PolicyDocumentError, PolicySettings,
+    RoutingKeyOverrideSettings, RoutingSettings,
+};
 pub use spec::{
     AcrossRanks, AdmissionSpec, AffinitySource, AppliedSpec, Assignment, BestParams,
     BestWithTemperatureParams, BindingSpec, BoundedLoadParams, Bounds, BucketParams, CanarySpec,
