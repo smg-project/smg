@@ -117,6 +117,17 @@ fn profile_of(decision: &Decision) -> Option<u16> {
     decision.trace().made_under()
 }
 
+/// The labels a decision made in this process is counted under: those of
+/// its trace, and `refused` with no profile where the engine made none.
+fn labels(decision: Option<&Decision>) -> PolicyDecision {
+    PolicyDecision {
+        generation: decision.map_or(0, |decision| decision.trace().generation),
+        profile: decision.and_then(profile_of),
+        outcome: decision.map_or("refused", outcome),
+        mode: "embedded",
+    }
+}
+
 /// The next ask's process-local number, in eight bytes. The gateway assigns
 /// it independently of any request id supplied by a client.
 pub(crate) fn mark() -> [u8; 8] {
@@ -501,10 +512,6 @@ fn hinted(mut response: Response, secs: u32) -> Response {
 /// A pick awaiting commit, with its targets and lease.
 pub(crate) struct Asked {
     targets: Targets,
-    /// The worker of each target of a regular pick, where the ask was made
-    /// over a list of the registry: the worker at the target's place in
-    /// that list. Empty where the targets name a store's rows.
-    listed: [Option<Arc<dyn Worker>>; MAX_TARGETS],
     /// The prefill and decode resolved for each pair target.
     pairs: [[Option<Arc<dyn Worker>>; 2]; MAX_TARGETS],
     handle: DecisionGuard<Arc<Decider>>,
@@ -720,7 +727,7 @@ impl PolicyEngine {
     /// registry. So a row the store shows ahead of its object, as a
     /// replacement inside its own write, takes no request. `None` too where
     /// the engine of this process decided: its targets name a worker by its
-    /// place in the list the ask was made over ([`Asked::listed`]).
+    /// place in the list its ask was made over ([`Self::place_listed`]).
     fn worker(&self, id: WorkerId) -> Option<Arc<dyn Worker>> {
         match &self.workers {
             Workers::Held(objects) => objects.registry().get(&objects.object(id)?),
@@ -743,6 +750,12 @@ impl PolicyEngine {
             Workers::AtKey(registry) => registry,
             Workers::Listed(registry) => registry,
         }
+    }
+
+    /// The name of the profile `decision` was made under, for the counter
+    /// that asks it the first time it sees the profile.
+    fn named(&self, decision: Option<&Decision>) -> Option<Arc<str>> {
+        self.profile_name(decision?.trace())
     }
 
     fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
@@ -861,6 +874,9 @@ impl PolicyEngine {
     /// `first` ask, the one that counts its key's source. A pair's attempt
     /// decides again at each wake of the admission queue, from a list a
     /// wait on room leaves empty: its list does not tell its first ask.
+    ///
+    /// The engine of this process is handed no list here. A regular attempt
+    /// reaches it over the registry's list by [`Self::place_listed`].
     #[expect(
         clippy::unused_async,
         reason = "a controller at an address is asked behind this call, over its session"
@@ -872,48 +888,10 @@ impl PolicyEngine {
         first: bool,
         now: Instant,
     ) -> Result<Asked, Unplaced> {
-        // Where the engine of this process decides, the ask is made over
-        // the list the registry publishes for its route's pool, read once:
-        // the membership a classic arm reads. What the engine keeps of the
-        // list stands in the snapshot's cell beside it, made by the list's
-        // first ask.
-        let snapshot = match (&self.workers, &*self.door, ask.pool) {
-            (Workers::Listed(registry), Decider::Own(engine), Some(pool)) => {
-                Some((registry.get_routing_snapshot(ask.model), engine, pool))
-            }
-            _ => None,
-        };
-        let members = snapshot.as_ref().map(|(snapshot, engine, pool)| {
-            let list = snapshot.pool(*pool);
-            &**snapshot
-                .pool_members_cell(*pool)
-                .get_or_init(|| Box::new(engine.pool_members(list)))
-        });
-        // An ask held to wires the pool's workers do not all serve (a
-        // retry pinned to its retained plan's wire, over a pool of two
-        // wires) is made over a list of its own, the pool's workers on
-        // those wires, as the classic arm makes one. Nothing is kept of it.
-        let dialed = match (members, &snapshot) {
-            (Some(pool), Some((_, engine, _)))
-                if !ask.wires.is_empty() && !ask.wires.contains(pool.wires()) =>
-            {
-                let dialed: Arc<[Arc<dyn Worker>]> = pool
-                    .workers()
-                    .iter()
-                    .filter(|worker| {
-                        WireModes::from(*worker.connection_mode()).intersects(ask.wires)
-                    })
-                    .cloned()
-                    .collect();
-                Some(engine.pool_members(&dialed))
-            }
-            _ => None,
-        };
-        let members = dialed.as_ref().or(members);
         let made = Made {
             ask,
             missed,
-            members,
+            members: None,
             source: Cell::new(None),
         };
         let started = Instant::now();
@@ -927,18 +905,10 @@ impl PolicyEngine {
             Metrics::record_routing_key_source(source);
         }
         let decision = decided.as_ref().ok().map(DecisionGuard::decision);
-        let trace = decision.map(Decision::trace);
-        let generation = trace.map_or(0, |trace| trace.generation);
-        let profile = decision.and_then(profile_of);
         Metrics::record_policy_decision(
             ask.model,
-            PolicyDecision {
-                generation,
-                profile,
-                outcome: decision.map_or("refused", outcome),
-                mode: "embedded",
-            },
-            || trace.and_then(|trace| self.profile_name(trace)),
+            labels(decision),
+            || self.named(decision),
             seconds,
         );
         let handle = decided.map_err(Unplaced::Refused)?;
@@ -946,27 +916,13 @@ impl PolicyEngine {
         match decision {
             Decision::Pick(pick) => {
                 let mut pairs: [_; MAX_TARGETS] = Default::default();
-                let mut listed: [_; MAX_TARGETS] = Default::default();
-                match members {
-                    // A target of the engine of this process names its
-                    // worker by its place in the list the ask was made over.
-                    Some(members) => {
-                        let list = members.workers();
-                        for (target, worker) in pick.targets.iter().zip(&mut listed) {
-                            *worker = list.get(target.position as usize).cloned();
-                        }
-                    }
-                    None => {
-                        for (target, workers) in pick.targets.iter().zip(&mut pairs) {
-                            if let Some(pair) = target.pair {
-                                *workers = [self.worker(target.id), self.worker(pair.decode_id)];
-                            }
-                        }
+                for (target, workers) in pick.targets.iter().zip(&mut pairs) {
+                    if let Some(pair) = target.pair {
+                        *workers = [self.worker(target.id), self.worker(pair.decode_id)];
                     }
                 }
                 Ok(Asked {
                     targets: pick.targets,
-                    listed,
                     pairs,
                     handle,
                 })
@@ -1018,13 +974,12 @@ impl PolicyEngine {
     ) -> Option<Placed> {
         let Asked {
             targets,
-            listed,
             mut handle,
             ..
         } = asked;
-        for (index, (target, listed)) in targets.iter().zip(listed).enumerate() {
-            let sendable = listed
-                .or_else(|| self.worker(target.id))
+        for (index, target) in targets.iter().enumerate() {
+            let sendable = self
+                .worker(target.id)
                 .filter(|worker| routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref()));
             if let Some(worker) = sendable {
                 handle.take(index);
@@ -1257,18 +1212,147 @@ impl PolicyEngine {
 
     /// A regular attempt's worker at `now` on a route with a rule of its
     /// own: as [`PolicyEngine::place`], over [`PolicyEngine::commit_where`].
+    /// Where the engine of this process decides, the ask and the commit are
+    /// one pass over the registry's list ([`Self::place_listed`]).
     pub(crate) async fn place_where(
         &self,
         ask: &Ask<'_>,
         holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
         now: Instant,
     ) -> Result<Placed, Unplaced> {
+        if let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) {
+            return self.place_listed(registry, engine, ask, &holds, now);
+        }
         let mut missed: Vec<WorkerId> = Vec::new();
         for _ in 0..ASKS {
             let asked = self.ask(ask, &missed, now).await?;
             if let Some(placed) = self.commit_where(asked, &holds, &mut missed, now) {
                 return Ok(placed);
             }
+        }
+        Err(Unplaced::NoTargetHolds)
+    }
+
+    /// A regular attempt's worker where `engine`, the engine of this
+    /// process, decides over the lists `registry` publishes: the ask and
+    /// the commit of [`PolicyEngine::place_where`] in one pass on the
+    /// calling thread, three asks at most.
+    ///
+    /// Each ask reads the list the registry publishes for the ask's pool
+    /// once: the membership a classic arm reads. What the engine keeps of
+    /// the list stands in the snapshot's cell beside it, made by the list's
+    /// first ask. An ask that states no pool is decided over no worker.
+    ///
+    /// The decision stays where its guard holds it. Its targets are walked
+    /// there, best first: a target's worker is the one at the target's
+    /// place in the list, and the first the gateway can send to is taken on
+    /// one read of the worker's state. Nothing of the decision is copied
+    /// before a worker is taken. Where no target holds, the lease is given
+    /// up by name and the targets join the next ask's missed.
+    fn place_listed(
+        &self,
+        registry: &WorkerRegistry,
+        engine: &OwnEngine,
+        ask: &Ask<'_>,
+        holds: &impl Fn(&dyn Worker) -> bool,
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
+        let mut missed: Vec<WorkerId> = Vec::new();
+        for _ in 0..ASKS {
+            let snapshot = ask
+                .pool
+                .map(|pool| (registry.get_routing_snapshot(ask.model), pool));
+            let kept = snapshot.as_ref().map(|(snapshot, pool)| {
+                let list = snapshot.pool(*pool);
+                &**snapshot
+                    .pool_members_cell(*pool)
+                    .get_or_init(|| Box::new(engine.pool_members(list)))
+            });
+            // An ask held to wires the pool's workers do not all serve (a
+            // retry pinned to its retained plan's wire, over a pool of two
+            // wires) is made over a list of its own, the pool's workers on
+            // those wires, as the classic arm makes one. Nothing is kept of it.
+            let dialed = kept
+                .filter(|pool| !ask.wires.is_empty() && !ask.wires.contains(pool.wires()))
+                .map(|pool| {
+                    let dialed: Arc<[Arc<dyn Worker>]> = pool
+                        .workers()
+                        .iter()
+                        .filter(|worker| {
+                            WireModes::from(*worker.connection_mode()).intersects(ask.wires)
+                        })
+                        .cloned()
+                        .collect();
+                    engine.pool_members(&dialed)
+                });
+            let members = dialed.as_ref().or(kept);
+            let made = Made {
+                ask,
+                missed: &missed,
+                members,
+                source: Cell::new(None),
+            };
+            let started = Instant::now();
+            let decided = DecisionGuard::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
+            let seconds = started.elapsed().as_secs_f64();
+            // A key's source counts once an attempt, at its first ask, as
+            // an ask of a followed controller counts it.
+            if let Some(source) = made.source.get().filter(|_| missed.is_empty()) {
+                Metrics::record_routing_key_source(source);
+            }
+            let decision = decided.as_ref().ok().map(DecisionGuard::decision);
+            Metrics::record_policy_decision(
+                ask.model,
+                labels(decision),
+                || self.named(decision),
+                seconds,
+            );
+            let mut handle = decided.map_err(Unplaced::Refused)?;
+            let taken = match handle.decision() {
+                Decision::Pick(pick) => {
+                    let list = members.map(PoolMembers::workers);
+                    let taken = pick.targets.iter().enumerate().find_map(|(index, target)| {
+                        let worker = list?.get(target.position as usize)?;
+                        // Ready and let through by its circuit breaker, as
+                        // a commit over a store's rows asks
+                        // (`routable_but_for_veto`), on one read.
+                        let state = worker.routing_state();
+                        (state.healthy && state.can_execute && holds(worker.as_ref()))
+                            .then(|| (index, Arc::clone(worker), target.id, target.dp_rank))
+                    });
+                    if taken.is_none() {
+                        missed.extend(pick.targets.iter().map(|target| target.id));
+                    }
+                    taken
+                }
+                Decision::Shed(shed) => {
+                    let verdict = Unplaced::Shed {
+                        reason: shed.reason,
+                        emptied_by: shed.emptied_by,
+                        retry_after_secs: shed.retry_after_secs,
+                    };
+                    let unpaired = (shed.reason == ShedReason::NoEndpoints)
+                        .then(|| self.unpaired(ask))
+                        .flatten();
+                    self.trace_decision(handle.decision(), None);
+                    return Err(unpaired.unwrap_or(verdict));
+                }
+                Decision::Queue(_) => return Err(Unplaced::Queued),
+            };
+            let Some((index, worker, id, rank)) = taken else {
+                handle.released(ReleaseReason::CommitFailed, now);
+                self.trace_decision(handle.decision(), None);
+                continue;
+            };
+            handle.take(index);
+            self.trace_decision(handle.decision(), Some(&worker));
+            return Ok(Placed {
+                worker,
+                id,
+                rank,
+                pair: None,
+                handle,
+            });
         }
         Err(Unplaced::NoTargetHolds)
     }
