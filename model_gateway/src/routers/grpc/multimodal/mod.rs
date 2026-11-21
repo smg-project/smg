@@ -544,8 +544,8 @@ mod tests {
 
     use super::{
         config_unavailable_response, encoder_budget::ItemOverEncoderBudget,
-        processing_failed_message, processing_failed_response, record_decoder_availability,
-        report_jpeg_decoder, Response,
+        invalid_multimodal_request, processing_failed_message, processing_failed_response,
+        record_decoder_availability, report_jpeg_decoder, Response,
     };
     use crate::{middleware::test_support::json_of, routers::common::retry::NonRetryable};
 
@@ -707,6 +707,22 @@ mod tests {
             .expect("the answer's body");
         let body = serde_json::from_slice(&bytes).expect("a JSON envelope");
         (status, header, body)
+    }
+
+    /// Media that could not be prepared is the request's to fix: a 400 under
+    /// the media request code, with the cause after the route's lead.
+    #[tokio::test]
+    async fn invalid_multimodal_input_maps_to_bad_request() {
+        let (status, code, body) =
+            answer(invalid_multimodal_request("unsupported audio modality")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid_multimodal_request");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            "Invalid multimodal request: unsupported audio modality"
+        );
     }
 
     /// A fetch that ran out of its budget and an origin that answered 5xx are
