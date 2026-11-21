@@ -656,6 +656,22 @@ pub(crate) mod tests {
         }
     }
 
+    /// The read of a file that left its path and came back to it, and that
+    /// stood as `before` when it left. A rename stamps the file's change
+    /// time, and the stamp has the file system's grain. Where it shows, the
+    /// file moved and takes the two looks of [`settle`]. Where it does not,
+    /// the watch finds the file as it last saw it, and the next look reads
+    /// it.
+    fn returned(file: &mut SpecFile, before: &Seen) -> Result<Applied, SpecRejected> {
+        if look(&file.path) != *before {
+            return settle(file);
+        }
+        match file.poll() {
+            Look::Read(outcome) => outcome,
+            other => panic!("the file stood as last seen and the look was {other:?}"),
+        }
+    }
+
     /// Reads through the descriptor seam and counts attempts to take bytes
     /// from a descriptor other than the looked file.
     fn read_counting_unexpected(
@@ -1162,7 +1178,7 @@ pub(crate) mod tests {
         if saved.exists() {
             fs::rename(&saved, &bed.path).expect("the file returns after the missing open");
         }
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(returned(&mut file, &standing), Ok(Applied::Generation(2)));
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
     }
 
@@ -1256,7 +1272,10 @@ pub(crate) mod tests {
         );
 
         assert!(started.is_ok(), "the standing file starts after the retry");
-        assert!(looks >= 4, "the transient read is retried");
+        // The look whose read met the replacement, and the two around the
+        // read of the restored file. Where the stamp of the renames shows,
+        // that read is made once more.
+        assert!(looks >= 3, "the transient read is retried");
         assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
     }
@@ -1297,7 +1316,7 @@ pub(crate) mod tests {
         if saved.exists() {
             fs::rename(&saved, &bed.path).expect("the settled file is restored");
         }
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(returned(&mut file, &settled), Ok(Applied::Generation(2)));
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
     }
 
