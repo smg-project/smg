@@ -1,4 +1,5 @@
-//! The `random` policy: how it is composed, and the picker only it uses.
+//! The `random` policy: how it is composed, and its picker. The engine draws
+//! with the picker too, under a sessions rule whose assignment is random.
 
 use crate::{
     document::spec::ProfileSpec,

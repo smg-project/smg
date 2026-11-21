@@ -11,10 +11,15 @@
 //! through `prefix_hash`. The engine draws with [`random::Random`] under a
 //! sessions rule whose assignment is random.
 //!
-//! Two shared pieces still sit in a policy's file. `bucket` reads the fence of
-//! retired workers in `consistent_hashing` ([`consistent_hashing::FENCE`]).
+//! Three shared pieces still sit in a policy's file. `bucket` reads the fence
+//! of retired workers in `consistent_hashing` ([`consistent_hashing::FENCE`]).
 //! `prefix_hash`, `consistent_hashing` and the policy document read the block
-//! arithmetic of `cache_aware` ([`cache_aware::Gates`], `blocks_within`).
+//! arithmetic of `cache_aware` ([`cache_aware::Gates`], `blocks_within`). The
+//! engine, the store and the shared stages read the warm-up ruling of
+//! `cache_aware` ([`cache_aware::WarmRule`], [`cache_aware::Warming`]): the
+//! [`Scorer`](crate::engine::Scorer) trait returns it, and the engine's
+//! `decide_stated` and `decide_stated_keeping` call `forget_judged` of
+//! `cache_aware`.
 //!
 //! A stage written for no one policy lives in [`stages`](crate::stages).
 

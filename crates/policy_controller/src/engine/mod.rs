@@ -1,6 +1,8 @@
 //! The decision engine: the stages run over one request's candidate workers,
 //! what a decision reads (the view) and what it returns, and the engine that
 //! decides over the policy store.
+//!
+//! The session table that a `sessions` rule reads lives in this folder too.
 
 pub(crate) mod decider;
 pub(crate) mod decision;
