@@ -233,6 +233,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the ids without a word. The
   request's media read (`GenerateRequest::media_fields`, `carries_media`) is one definition here,
   read by the gRPC path's media refusal as well.
+- A Realtime session and a `response.create` keep the fields the public API added: `reasoning`
+  (its `effort`, `minimal` to `xhigh`) and `parallel_tool_calls`; an input transcription's
+  `languages`, `keywords` and `delay`; and an MCP tool's `tunnel_id`, `allowed_callers` and
+  `defer_loading`. Each was dropped on the way to the upstream, so a reasoning model ran at its
+  default effort and the transcription lost its hints. The session answer
+  (`RealtimeSessionCreateResponse`) keeps the `reasoning` it echoes. Breaking:
+  `RealtimeSessionCreateRequest` and `RealtimeResponseCreateParams` gain `reasoning` and
+  `parallel_tool_calls`, `RealtimeSessionCreateResponse` gains `reasoning`, `AudioTranscription`
+  gains `languages`, `keywords` and `delay`, and `RealtimeToolsConfig::McpTool` gains the three
+  keys.
 - A built-in `range` or `length` rule that carries no message of its own answers a sentence in the
   routes' form (`Invalid 'dimensions': integer below minimum value. Expected an integer >= 1, but got 0
   instead.`) instead of the validation library's rendering of the rule's name and parameters

@@ -16,8 +16,8 @@ use crate::{
     common::{invalid, ResponsePrompt},
     realtime_conversation::{ConversationItemRole, RealtimeContentPart, RealtimeConversationItem},
     realtime_session::{
-        MaxOutputTokens, OutputModality, RealtimeAudioFormats, RealtimeToolChoiceConfig,
-        RealtimeToolsConfig, Voice,
+        MaxOutputTokens, OutputModality, RealtimeAudioFormats, RealtimeReasoning,
+        RealtimeToolChoiceConfig, RealtimeToolsConfig, Voice,
     },
 };
 
@@ -58,6 +58,10 @@ pub struct RealtimeResponseCreateParams {
     pub max_output_tokens: Option<MaxOutputTokens>,
     pub metadata: Option<HashMap<String, String>>,
     pub output_modalities: Option<Vec<OutputModality>>,
+    /// Whether the model may call tools in parallel
+    pub parallel_tool_calls: Option<bool>,
+    /// The reasoning effort of a reasoning model
+    pub reasoning: Option<RealtimeReasoning>,
     pub prompt: Option<ResponsePrompt>,
     pub tool_choice: Option<RealtimeToolChoiceConfig>,
     pub tools: Option<Vec<RealtimeToolsConfig>>,

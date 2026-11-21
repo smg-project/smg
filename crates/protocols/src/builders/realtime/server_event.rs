@@ -233,6 +233,8 @@ mod tests {
         let config = SessionConfig::Realtime(Box::new(RealtimeSessionCreateRequest {
             r#type: RealtimeSessionType::Realtime,
             output_modalities: Some(vec![OutputModality::Audio]),
+            parallel_tool_calls: None,
+            reasoning: None,
             model: None,
             instructions: None,
             audio: None,
