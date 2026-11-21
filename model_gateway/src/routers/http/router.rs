@@ -2502,9 +2502,19 @@ impl Router {
             .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
-            policy_needs_text: self
-                .policy_registry
-                .any_policy_needs_request_text(Some(headers)),
+            // Where the policy engine of this process places the request,
+            // the document in force says whether a placement reads the
+            // prompt. A valid tokens hint lifts the read there too.
+            policy_needs_text: match self.policy_engine.as_deref() {
+                Some(policy_engine) if policy_engine.in_process() => {
+                    policy_engine.reads_body(|| {
+                        header_utils::parse_routing_tokens_hint(Some(headers)).is_some()
+                    })
+                }
+                _ => self
+                    .policy_registry
+                    .any_policy_needs_request_text(Some(headers)),
+            },
             // A worker knows a model's canonical id alone, and only a body
             // read here has an alias in it rewritten to that id.
             model_ambiguous: self.worker_registry.model_count() > 1
@@ -2532,13 +2542,20 @@ impl Router {
     /// forward the raw body verbatim (JSON validation and normalization
     /// defer to the worker). `Err` hands the request back untouched —
     /// body unconsumed — for the buffered typed path.
+    ///
+    /// Where the policy engine of this process places requests, it places
+    /// this one from its headers ([`Self::place_streamed`]), and its lease
+    /// is told the dispatch and the end as an attempt of the buffered path
+    /// tells them. A gateway that follows a controller hands every request
+    /// back: its streamed path does not ask the controller.
     pub(crate) async fn route_streaming_request(
         &self,
         req: Request<Body>,
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
-        if self.policy_engine.is_some() {
+        let policy_engine = self.policy_engine.as_deref();
+        if policy_engine.is_some_and(|policy_engine| !policy_engine.in_process()) {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PLACED_BY_CONTROLLER);
             return Err(req);
         }
@@ -2566,25 +2583,47 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
-            model_id,
-            None,
-            hinted_tokens.as_deref(),
-            Some(req.headers()),
-            None,
-            None,
-            None,
-            &[],
-        ) else {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
-            return Err(req);
+        let (worker, mut placed) = match policy_engine {
+            None => {
+                let Some(worker) = self.select_worker_for_model(
+                    model_id,
+                    None,
+                    hinted_tokens.as_deref(),
+                    Some(req.headers()),
+                    None,
+                    None,
+                    None,
+                    &[],
+                ) else {
+                    Metrics::record_request_body_path(
+                        BODY_PATH_BUFFERED,
+                        REASON_NO_AVAILABLE_WORKER,
+                    );
+                    return Err(req);
+                };
+                (worker, None)
+            }
+            Some(policy_engine) => {
+                let placed = self
+                    .place_streamed(policy_engine, req.headers(), hinted_tokens.as_deref())
+                    .await;
+                match placed {
+                    Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
+                    Err(Unstreamed::Refused(refusal)) => return Ok(*refusal),
+                    Err(Unstreamed::Buffered(reason)) => {
+                        Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
+                        return Err(req);
+                    }
+                }
+            }
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
         // wrong-model selection. An alias registered after the decision is
         // not re-checked: the request named a name that did not exist when
-        // its path was decided.
+        // its path was decided. A placement handed back here is given up at
+        // its drop, ahead of any dispatch.
         if worker.mutates_request() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_WORKER_MUTATES_BODY);
             return Err(req);
@@ -2619,14 +2658,15 @@ impl Router {
         let mut headers_with_trace = parts.headers;
         inject_trace_context_http(&mut headers_with_trace);
 
+        let mut source = RelaySource::new(model_id, route, Arc::clone(&worker));
+        if let Some(placed) = placed.as_mut() {
+            placed.dispatched(Instant::now());
+            // Whether the answer is a stream is the worker's to say, behind
+            // the send: the relay of one writes a cut on this mark.
+            source = source.marking(placed.cut_mark());
+        }
         let response = self
-            .send_streamed_request(
-                &headers_with_trace,
-                body,
-                route,
-                RelaySource::new(model_id, route, Arc::clone(&worker)),
-                load_guard,
-            )
+            .send_streamed_request(&headers_with_trace, body, route, source, load_guard)
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -2641,10 +2681,11 @@ impl Router {
             error_code,
             REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
         );
+        // A streamed head's success was recorded before its relay task was
+        // spawned (see `forward_worker_response`).
+        let head_success_recorded = head_success_recorded(&response);
         if !client_body_fault {
-            // A streamed head's success was recorded before its relay task
-            // was spawned (see `forward_worker_response`).
-            if !head_success_recorded(&response) {
+            if !head_success_recorded {
                 worker.record_outcome(status.as_u16());
             }
             if status.is_server_error() {
@@ -2684,8 +2725,73 @@ impl Router {
                 error_reason_from_status(status),
             );
         }
-        Ok(response)
+        // A placement ends with its answer: a stream's at the end of its
+        // body, any other here.
+        Ok(match placed {
+            None => response,
+            Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
+            Some(placed) => {
+                placed.ended_by(&response, Instant::now());
+                response
+            }
+        })
     }
+
+    /// The placement of a request whose body is not read, by the policy
+    /// engine of this process: the ask of an attempt on the buffered path
+    /// ([`Self::place_attempt`]) with what the headers alone state. The
+    /// request names no model here, so it is asked under the one model the
+    /// workers serve. A valid tokens hint is the prompt the buffered path
+    /// would hash. The request is sent once, so no ledger narrows the
+    /// commit: it keeps to this router's own pool.
+    ///
+    /// A request the engine does not place goes back to the buffered path,
+    /// which answers it with the body read, as one the classic selection
+    /// finds no worker for does. A request that names its worker where the
+    /// buffered path refuses the shape ([`Self::explicit_target_refusal`])
+    /// reads that refusal here, with no body read for it: like the version
+    /// check's, it is counted on neither body path.
+    async fn place_streamed(
+        &self,
+        policy_engine: &PolicyEngine,
+        headers: &HeaderMap,
+        hinted_tokens: Option<&[u32]>,
+    ) -> Result<Placed, Unstreamed> {
+        let Some(model) = self.model_of_an_unnamed_request() else {
+            return Err(Unstreamed::Buffered(REASON_MODEL_AMBIGUOUS));
+        };
+        if let Some(refusal) = self.explicit_target_refusal(&model, Some(headers)) {
+            return Err(Unstreamed::Refused(Box::new(refusal)));
+        }
+        let id = engine::mark();
+        let hashes = hinted_tokens
+            .map(|tokens| policy_engine.hashes(&model, &Prompt::of(Some(tokens), None)));
+        let ask = Ask {
+            headers: Some(headers),
+            hashes: hashes.as_ref(),
+            pool: Some(RoutingPool::HttpRegular),
+            ..Ask::of(&id, &model)
+        };
+        let placed = policy_engine
+            .place_where(
+                &ask,
+                |worker| RoutingPool::HttpRegular.matches(worker),
+                Instant::now(),
+            )
+            .await;
+        placed.map_err(|_| Unstreamed::Buffered(REASON_NO_AVAILABLE_WORKER))
+    }
+}
+
+/// Why the policy engine placed no worker for a request whose body is not
+/// read ([`Router::place_streamed`]).
+enum Unstreamed {
+    /// The request is answered here, with this refusal. Behind a pointer:
+    /// the other answer is one word, and a placement's error rides small.
+    Refused(Box<Response>),
+    /// The request goes back to the buffered path, counted under this
+    /// reason.
+    Buffered(&'static str),
 }
 
 /// State of [`StreamBodyLayer`]: the app-level router handle (the manager in
@@ -4558,7 +4664,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_capture_stub(
+    pub(super) async fn spawn_capture_stub(
         content_type: &'static str,
         response_body: &'static str,
     ) -> (String, CapturedUpstreamRequest) {
