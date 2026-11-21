@@ -985,6 +985,48 @@ pub(crate) mod tests {
         assert!(dec.pending().is_empty());
     }
 
+    /// The index answers every byte string of its table with the lowest id
+    /// that holds it and no other string, at every count of ids from none
+    /// on (the powers of two among them): every fifth id is absent, an odd
+    /// id repeats the bytes of the even id below it, and every other pair's
+    /// bytes are not UTF-8. Some probe goes round the end of the slots.
+    #[test]
+    fn the_text_index_answers_every_byte_string_with_its_lowest_id() {
+        let mut wrapped = false;
+        for ids in 0..=64_u32 {
+            let mut builder = ByteLevelTableBuilder::with_capacity(ids as usize);
+            let mut lowest = HashMap::new();
+            for id in 0..ids {
+                if id % 5 == 4 {
+                    builder.push_absent();
+                    continue;
+                }
+                let pair = id / 2;
+                let bytes = if pair % 2 == 0 {
+                    format!("t{pair}").into_bytes()
+                } else {
+                    vec![0xFF, pair as u8]
+                };
+                builder.push(&bytes, false);
+                lowest.entry(bytes).or_insert(id);
+            }
+            let table = builder.finish();
+            let index = TextIndex::build(&table);
+            for (bytes, &id) in &lowest {
+                assert_eq!(index.get(&table, bytes), Some(id), "of {ids} ids");
+                let at = index
+                    .slots
+                    .iter()
+                    .position(|slot| slot & index.id_mask() == id);
+                wrapped |= at.is_some_and(|at| at < index.place(bytes).0);
+            }
+            for miss in [&b""[..], b"t1", &[0xFF]] {
+                assert_eq!(index.get(&table, miss), None, "of {ids} ids");
+            }
+        }
+        assert!(wrapped, "no probe went round the end of its slots");
+    }
+
     #[test]
     fn only_byte_level_decoders_get_a_table() {
         let tokenizer = byte_level_tokenizer();
