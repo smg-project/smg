@@ -210,6 +210,8 @@ fn merge_prefill_logprobs(
 /// HTTP prefill-decode router answers for the same failure; for a single
 /// worker the code clients know. A worker's report that the engine could not
 /// continue the request under its constraint is answered for the constraint.
+/// The gateway's own request timeout, on any stream, is the timeout's one
+/// answer (`to_http_error`), final for the retry layer.
 fn stream_failed(
     side: Option<PdSide>,
     worker_name: &str,
@@ -737,20 +739,27 @@ mod tests {
     }
 
     /// A side's stream the request timeout cut is answered as on every other
-    /// path: under the timeout's code, and never replayed.
+    /// path: under the timeout's code, and never replayed. A worker's own
+    /// deadline is still the side's failure: its code, and a replay.
     #[test]
     fn a_side_stream_the_request_timeout_cut_is_the_timeouts_answer_and_final() {
-        let status = RequestDeadline::after(Duration::from_secs(3)).status();
-        let response = stream_failed(Some(PdSide::Decode), "Decode", &status, None);
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(
-            response
-                .headers()
-                .get(error::HEADER_X_SMG_ERROR_CODE)
-                .and_then(|v| v.to_str().ok()),
-            Some("call_upstream_timeout")
-        );
-        assert!(!is_retryable_response(&response));
+        let code = |response: &Response| {
+            let header = response.headers().get(error::HEADER_X_SMG_ERROR_CODE);
+            header.and_then(|v| v.to_str().ok()).map(str::to_owned)
+        };
+        let cut = RequestDeadline::after(Duration::from_secs(3)).status();
+        let workers_own = tonic::Status::deadline_exceeded("engine deadline");
+        for side in [PdSide::Prefill, PdSide::Decode] {
+            let response = stream_failed(Some(side), side.name(), &cut, None);
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(code(&response).as_deref(), Some("call_upstream_timeout"));
+            assert!(!is_retryable_response(&response));
+
+            let response = stream_failed(Some(side), side.name(), &workers_own, None);
+            let sides_own = side.code(SidePhase::Stream);
+            assert_eq!(code(&response).as_deref(), Some(sides_own));
+            assert!(is_retryable_response(&response));
+        }
     }
 
     /// A side's stream failure read into a non-streamed answer is counted
