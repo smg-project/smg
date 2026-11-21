@@ -66,13 +66,13 @@ fn word(i: usize) -> String {
 }
 
 /// The tests of this binary read one allocator count, so they run one at a
-/// time.
+/// time, setup and all: a tokenizer one test builds while the other counts
+/// reads as bytes the counting test's threads kept.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// Loads, encodes with and drops `CYCLES` tokenizers from `load` in turn on
 /// `THREADS` long-lived threads, and checks what the threads keep.
 fn leaves_nothing_behind(load: impl Fn() -> HuggingFaceTokenizer) {
-    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let (done, reports) = mpsc::channel::<()>();
     let workers: Vec<_> = (0..THREADS)
         .map(|thread| {
@@ -126,6 +126,7 @@ fn leaves_nothing_behind(load: impl Fn() -> HuggingFaceTokenizer) {
 
 #[test]
 fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     leaves_nothing_behind(|| HuggingFaceTokenizer::from_tokenizer(byte_level_bpe()));
 }
 
@@ -133,6 +134,7 @@ fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
 /// same holds for the tokenizer read from its `tokenizer.json`.
 #[test]
 fn a_dropped_tokenizer_read_from_a_file_leaves_nothing_on_the_threads_either() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("tokenizer.json");
     std::fs::write(
