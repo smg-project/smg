@@ -85,15 +85,19 @@ pub(super) struct Preformed {
 pub(super) struct Raws {
     bytes: Vec<u8>,
     /// Per token: its id, where its bytes start and how many they are.
-    spans: Vec<(u32, usize, usize)>,
+    spans: Vec<(u32, u32, u32)>,
+    /// False once a token's place did not fit the spans' 32 bits.
+    whole: bool,
 }
 
 impl Raws {
-    /// For about `tokens` tokens: their spans in one allocation.
-    pub(super) fn for_tokens(tokens: usize) -> Self {
+    /// For about `tokens` tokens of at most `bytes` bytes together: their
+    /// spans in one allocation, their bytes in one where `bytes` is known.
+    pub(super) fn for_tokens(tokens: usize, bytes: usize) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Vec::with_capacity(bytes),
             spans: Vec::with_capacity(tokens),
+            whole: true,
         }
     }
 
@@ -115,7 +119,10 @@ impl Raws {
         }
         let len = self.bytes.len() - start;
         if len > 0 && keep(&self.bytes[start..]) {
-            self.spans.push((id, start, len));
+            match (u32::try_from(start), u32::try_from(len)) {
+                (Ok(start), Ok(len)) => self.spans.push((id, start, len)),
+                _ => self.whole = false,
+            }
         } else {
             self.bytes.truncate(start);
         }
@@ -124,7 +131,7 @@ impl Raws {
     fn iter(&self) -> impl Iterator<Item = (&u32, &[u8])> {
         self.spans
             .iter()
-            .map(|(id, start, len)| (id, &self.bytes[*start..*start + *len]))
+            .map(|(id, start, len)| (id, &self.bytes[*start as usize..][..*len as usize]))
     }
 }
 
@@ -175,6 +182,11 @@ impl Preformed {
     /// are); `min_operand` holds, per id, the least rank of a merge that
     /// takes the id as an operand (`u32::MAX` for none).
     pub(super) fn analyse(table: &MergeTable, mut raws: Raws, min_operand: &[u32]) -> Self {
+        // A token the spans could not place is a fragment the analysis would
+        // miss, and a character could pre-form where it must not: none does.
+        if !raws.whole {
+            return Self::empty();
+        }
         raws.spans.sort_unstable_by_key(|&(id, ..)| id);
         // The fragment tokens: leading continuation bytes -> the rest;
         // a trailing incomplete character -> the bytes before it.

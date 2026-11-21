@@ -58,7 +58,7 @@ use tokenizers::{
 use crate::{
     encode_path::Declined,
     tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
-    word_cache::{entries_of, ReadBpe},
+    word_cache::{entries_of, Listing, ReadBpe},
 };
 
 mod preformed;
@@ -401,7 +401,12 @@ impl MergeTable {
             // by id where the read says the ids are the range, else through
             // a clone of the vocabulary map.
             let entries = entries_of(bpe, read);
-            let mut raws = Raws::for_tokens(entries.size_hint().1.unwrap_or_default());
+            // A token stands for a byte per character, so its text bounds its
+            // bytes: the listing's text, all of them (none without a listing).
+            let listed = read
+                .and_then(|read| read.tokens.as_deref())
+                .map_or(0, Listing::bytes);
+            let mut raws = Raws::for_tokens(entries.size_hint().1.unwrap_or_default(), listed);
             for (id, token) in entries {
                 let token: &str = token.as_ref();
                 let raw = token
@@ -518,7 +523,7 @@ impl MergeTable {
             min_operand[left as usize] = min_operand[left as usize].min(rank);
             min_operand[right as usize] = min_operand[right as usize].min(rank);
         }
-        let mut raws = Raws::for_tokens(ranks.len());
+        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
         for (token, &rank) in ranks {
             raws.push(rank, token.iter().copied().map(Some), |_| true);
         }

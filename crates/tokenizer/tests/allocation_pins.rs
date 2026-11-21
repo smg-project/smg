@@ -674,7 +674,10 @@ fn the_cached_wrappers_owned_render_wraps_in_place_as_the_renderers_does() {
 
 /// A merge more costs a load nine allocator calls: none of them is a block
 /// for the bytes the new token stands for, which the merge table's analysis
-/// reads into one buffer.
+/// reads into one buffer. The opt-in v1 pipeline, when its feature is
+/// compiled in, loads a BPE tokenizer in front of the direct path, so this
+/// pin of the direct path's load is built without that feature.
+#[cfg(not(feature = "tokenizers-v1"))]
 #[test]
 fn a_merge_more_costs_a_load_no_block_for_its_tokens_bytes() {
     let pairs: Vec<(String, String)> = ('a'..='j')
