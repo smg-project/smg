@@ -1,5 +1,5 @@
 //! One request's routing, head to head, over one fleet of workers a model,
-//! every one ready unless the cell says otherwise. Three paths:
+//! every one ready unless the cell says otherwise. Two paths:
 //!
 //! - `classic`: the classic policies over the worker registry.
 //! - `object`: the policy engine asked where the classic placement's pass
@@ -8,12 +8,10 @@
 //!   sink, the load feed) and the request runs the same function, pass and
 //!   all; the one difference is the policy the registry hands the pass,
 //!   which asks the engine.
-//! - `controller`: the policy controller over its own store in this
-//!   process, registered and reported to as that mode does it.
 //!
 //! A cell is one path, one route, one policy, one fleet size and one count
 //! of callers. Each caller routes requests back to back: the placement, the
-//! worker's load guard and what the path says of the send and of the end.
+//! worker's load guard and what its drop tells the model's policy.
 //! The cell prints its decisions a second over every caller and one caller's
 //! time a decision. The callers are threads that stand for the whole cell,
 //! and each makes its first decisions untimed. The gateway's metrics
@@ -21,9 +19,9 @@
 //! stretches. The binary runs on the gateway's stock allocator, as the
 //! serving binary does.
 //!
-//! `--not-ready N` leaves one worker in `N` not ready, on the `classic`
-//! and `object` paths: a request is then placed among the others, and a
-//! turn that lands on a worker that is not ready is part of the cell.
+//! `--not-ready N` leaves one worker in `N` not ready: a request is then
+//! placed among the others, and a turn that lands on a worker that is not
+//! ready is part of the cell.
 //! `--ready N` leaves `N` workers of the fleet ready and every other not
 //! ready: with `1`, nearly every request is placed by a pass over the pool.
 //! `--overloaded true` puts every worker over its overload thresholds, each
@@ -32,9 +30,9 @@
 //! thresholds.
 //!
 //! `--models N` serves `N` models, each with a fleet of its own of the
-//! cell's size, on the `classic` and `object` paths: a caller's requests
-//! name the models in turn, as the requests of a gateway that serves many
-//! models do, so no two requests in a row are for one model.
+//! cell's size: a caller's requests name the models in turn, as the
+//! requests of a gateway that serves many models do, so no two requests in
+//! a row are for one model.
 //!
 //! No Criterion harness: a cell runs a fixed count of decisions, so the same
 //! binary counts instructions under callgrind (two counts, one difference).
@@ -71,9 +69,7 @@ use smg::{
     policies::PolicyRegistry,
     routers::{
         common::{
-            bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, ControllerPath, Route,
-            },
+            bench_support::{attach_loads, policies_asking_the_engine, route_classic, Route},
             snapshot::WorkerRegistry,
         },
         grpc::backend_client::BasicWorkerBuilder,
@@ -276,14 +272,11 @@ fn reports(fleet: &[Arc<dyn Worker>]) -> Vec<(Arc<dyn Worker>, WorkerLoadRespons
 /// and its turn among its caller's requests, which names its model.
 type Routing = Box<dyn Fn(&[u32], u64) -> bool + Send + Sync>;
 
-/// What a path's timer does about once a second in a serving process.
-type Upkeep = Box<dyn Fn()>;
-
-/// The classic path: a registry with the fleet, the policies a registration
-/// leaves (the model's policy and each worker's completion sink), and the
-/// load feed the monitor would publish. On the `object` path, the same, and
+/// A cell's path, built: a registry with the fleet, the policies a
+/// registration leaves (the model's policy and each worker's completion
+/// sink), and the load feed the monitor would publish. On the `object` path
 /// the registry's policies ask the policy engine of the same policy.
-fn classic(cell: &Cell) -> (Routing, Option<TestFeed>) {
+fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
     let registry = Arc::new(WorkerRegistry::new());
     let config = RouterConfig {
         policy_controller: true,
@@ -291,8 +284,9 @@ fn classic(cell: &Cell) -> (Routing, Option<TestFeed>) {
         ..RouterConfig::default()
     };
     let policies = Arc::new(match cell.path.as_str() {
+        "classic" => PolicyRegistry::new(policy_config(&cell.policy)),
         "object" => policies_asking_the_engine(&config).unwrap(),
-        _ => PolicyRegistry::new(policy_config(&cell.policy)),
+        other => panic!("no path {other}"),
     });
     let models = model_ids(cell.models);
     let mut every = Vec::with_capacity(models.len() * cell.workers);
@@ -327,50 +321,11 @@ fn classic(cell: &Cell) -> (Routing, Option<TestFeed>) {
     (routing, feed)
 }
 
-/// The controller's path: the store, the feed and the engine a gateway builds
-/// under the setting, the fleet registered through the feed's door, and the
-/// reports said through the feed's load sink.
-fn controller(cell: &Cell) -> (Routing, Upkeep) {
-    let config = RouterConfig {
-        policy_controller: true,
-        policy: policy_config(&cell.policy),
-        ..RouterConfig::default()
-    };
-    assert_eq!(
-        (cell.not_ready, cell.ready, cell.overloaded, cell.models),
-        (0, 0, false, 1),
-        "--not-ready, --ready, --overloaded and --models are for the classic and object paths"
-    );
-    let path = Arc::new(ControllerPath::start(&config, MODEL).unwrap());
-    let fleet = fleet(cell.route, MODEL, cell.workers);
-    path.register(&fleet).unwrap();
-    assert_eq!(path.registry().len(), cell.workers, "every worker stands");
-    if cell.reports {
-        path.report_loads(&reports(&fleet));
-    }
-    let route = cell.route;
-    let swept = Arc::clone(&path);
-    (
-        Box::new(move |tokens, _| path.route(route, Some(tokens))),
-        Box::new(move || swept.upkeep()),
-    )
-}
-
 fn main() {
     let cell = cell();
     let recorder = start_prometheus(PrometheusConfig::default());
     let tokens: Vec<u32> = (0..1_024).collect();
-    let (routing, upkeep, _feed): (Routing, Upkeep, Option<TestFeed>) = match cell.path.as_str() {
-        "classic" | "object" => {
-            let (routing, feed) = classic(&cell);
-            (routing, Box::new(|| {}), feed)
-        }
-        "controller" => {
-            let (routing, upkeep) = controller(&cell);
-            (routing, upkeep, None)
-        }
-        other => panic!("no path {other}"),
-    };
+    let (routing, _feed) = build(&cell);
     // The path's first sight of the pool, untimed: what a registration and
     // the first request after it build once.
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;
@@ -381,7 +336,6 @@ fn main() {
         );
     }
     recorder.run_upkeep();
-    upkeep();
 
     // The callers stand for the whole cell, as a serving process's threads
     // do: each makes its first decisions untimed (the buffers a path keeps
@@ -427,7 +381,6 @@ fn main() {
             done.wait();
             wall += started.elapsed();
             recorder.run_upkeep();
-            upkeep();
             left -= decisions;
         }
         stretch.store(0, Ordering::Relaxed);

@@ -235,7 +235,6 @@ pub mod bench_support {
         overload,
         placement::{select_pair, select_single, PlacementInputs},
     };
-    pub use crate::policy_controller::bench_support::{ControllerPath, Route};
     use crate::{
         config::RouterConfig,
         observability::cache_trace,
@@ -246,6 +245,15 @@ pub mod bench_support {
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
     };
+
+    /// The route a request is placed on: the pool its router places over.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Route {
+        /// The regular HTTP router.
+        Http,
+        /// The gRPC pipeline's regular selection stage.
+        Grpc,
+    }
 
     /// Hands the classic policies the load feed the monitor would publish.
     pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
