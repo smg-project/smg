@@ -45,10 +45,10 @@ spec:
           annotations:
             summary: "Too many responses are server errors"
             description: "{{ `{{ $value | humanizePercentage }}` }} of the responses of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }}, the probe routes excluded, were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
-        {{- /* The edge family counts a response once, by its head: a stream that fails after its first token (an engine that died mid-generation, a worker whose connection broke, an output the reader could not parse) is a 200 there, with no error code, and the ratio above never sees it. The router families count the request and its failure whatever the point of failure, so a wave of failed streams reads here. The refusals the client earned stay out of the numerator: a malformed request (validation_error), a model nobody serves, or whose every worker is unavailable (no_workers, SmgNoHealthyWorker's case), a tenant over its limit (rate_limit_error) and a grammar of the client's own (constraint_error). */}}
+        {{- /* The edge family counts a response once, by its head: a stream that fails after its first token (an engine that died mid-generation, a worker whose connection broke, an output the reader could not parse) is a 200 there, with no error code, and the ratio above never sees it. The router families count the request and its failure whatever the point of failure, so a wave of failed streams reads here. The refusals the client earned stay out of the numerator: a malformed request (validation_error), a model nobody serves, or whose every worker is unavailable (no_workers, SmgNoHealthyWorker's case), a tenant over its limit (rate_limit_error) and a grammar of the client's own (constraint_error). And one outcome that is the model's: an answer the wire's contract fails because the model wrote a tool call that could not be read (invalid_tool_call_format); the gateway and its workers served that request. */}}
         - alert: SmgHighRouterErrorRatio
           expr: |
-            sum by (namespace, job) (rate(smg_router_request_errors_total{ {{ $job }}, error_type!~"validation_error|no_workers|rate_limit_error|constraint_error" }[5m]))
+            sum by (namespace, job) (rate(smg_router_request_errors_total{ {{ $job }}, error_type!~"validation_error|no_workers|rate_limit_error|constraint_error|invalid_tool_call_format" }[5m]))
               / sum by (namespace, job) (rate(smg_router_requests_total{ {{ $job }} }[5m])) > {{ $a.errorRatio }}
           for: {{ $a.errorRatioFor }}
           labels:

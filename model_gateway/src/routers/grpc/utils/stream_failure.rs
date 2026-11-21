@@ -29,6 +29,10 @@
 //! (`utils::isolation`), is the request's own failure: an `internal_error`
 //! event under `reader_panicked`, charged to no worker, counted under the
 //! table that read the output ([`Panicked::record`]).
+//! A tool call the reader could not read, on a wire whose contract fails the
+//! request on one ([`UnreadableToolCallFailure`]), is the request's outcome as
+//! well: counted under `invalid_tool_call_format`, charged to no worker, and
+//! ended by its own frame, the stream's last, with no `[DONE]` after it.
 
 use std::{fmt, sync::Arc, time::Instant};
 
@@ -53,7 +57,10 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         error::error_type_for_status,
-        grpc::context::{DispatchMetadata, Placement, WorkerSelection},
+        grpc::{
+            context::{DispatchMetadata, Placement, WorkerSelection},
+            wire::UnreadableToolCallFailure,
+        },
     },
 };
 
@@ -234,6 +241,13 @@ pub(crate) enum StreamFailure {
     /// request's boundary (`utils::isolation`): the request's failure, not
     /// the task's.
     Panicked(Panicked),
+    /// The answer ended with a tool call the reader could not read, under a
+    /// request that fails on one (`ChatResponseSpec::fails_on_unreadable_call`):
+    /// the request's outcome, ended as the wire's contract ends it
+    /// ([`UnreadableToolCallFailure`]): after the answer as it was read, the
+    /// usage chunk when asked for, then the contract's event as the last
+    /// frame, no finish chunk and no `[DONE]`.
+    ToolCallFormat(UnreadableToolCallFailure),
 }
 
 impl StreamFailure {
@@ -262,15 +276,19 @@ impl StreamFailure {
     pub(crate) fn class(&self) -> Option<UpstreamClass> {
         match self {
             Self::Upstream { status, .. } => Some(UpstreamClass::of(status)),
-            Self::Internal(_) | Self::Panicked(_) => None,
+            Self::Internal(_) | Self::Panicked(_) | Self::ToolCallFormat(_) => None,
         }
     }
 
     /// The `type` of the SSE error event that ends the response:
     /// `stream_error` for a stream the worker failed, the HTTP error body's
     /// type for any other status the engine answered, `internal_error` for a
-    /// failure of the gateway's own processing.
+    /// failure of the gateway's own processing, the contract's own type for
+    /// a tool call the reader could not read.
     pub(crate) fn error_type(&self) -> &'static str {
+        if matches!(self, Self::ToolCallFormat(_)) {
+            return UnreadableToolCallFailure::CODE;
+        }
         self.class().map_or(INTERNAL_ERROR_TYPE, |class| {
             class.client_type(STREAM_ERROR_TYPE)
         })
@@ -288,8 +306,10 @@ impl StreamFailure {
     /// failure has one of its own: `constraint_failed` for a worker's report
     /// that the engine could not continue the request under its constraint,
     /// `call_upstream_timeout` for a stream the gateway's request timeout
-    /// cut, `reader_panicked` for a reading that panicked; each the code the
-    /// HTTP answer to the same failure carries. `None` otherwise.
+    /// cut, `reader_panicked` for a reading that panicked,
+    /// `invalid_tool_call_format` for a tool call the reader could not read;
+    /// each the code the HTTP answer to the same failure carries. `None`
+    /// otherwise.
     pub(crate) fn code(&self) -> Option<&'static str> {
         match self {
             Self::Upstream { status, .. } if is_constraint_failure(status) => {
@@ -299,8 +319,21 @@ impl StreamFailure {
                 Some(REQUEST_TIMEOUT_CODE)
             }
             Self::Panicked(_) => Some(READER_PANICKED_CODE),
+            Self::ToolCallFormat(_) => Some(UnreadableToolCallFailure::CODE),
             Self::Upstream { .. } | Self::Internal(_) => None,
         }
+    }
+
+    /// Whether the failure is a verdict on an answer the engine completed,
+    /// ended by a last frame of its own: the tool call the reader could not
+    /// read, alone. The verdict is taken after the answer stream was released
+    /// (completed at the engine's end, or let go at a local stop, as on the
+    /// path that ends well), so no `[DONE]` follows its event, the prefill
+    /// side of a disaggregated pair is not aborted for it, and a placed
+    /// dispatch is told it ended whole. Every other failure ends with
+    /// `[DONE]` and leaves the engine's request to abort.
+    pub(crate) fn ends_a_completed_answer(&self) -> bool {
+        matches!(self, Self::ToolCallFormat(_))
     }
 }
 
@@ -347,6 +380,7 @@ impl fmt::Display for StreamFailure {
             } => write!(f, "Prefill stream error: {}", status.message()),
             Self::Internal(message) => f.write_str(message),
             Self::Panicked(panicked) => write!(f, "{panicked}"),
+            Self::ToolCallFormat(failure) => f.write_str(failure.message()),
         }
     }
 }
@@ -462,10 +496,28 @@ impl StreamSource {
     /// the failure was explained by one). A failure of the gateway's own
     /// processing leaves the worker's record alone; a reading that panicked
     /// is recorded as the isolation records it ([`Panicked::record`]): the
-    /// table's outcome and one ERROR line naming the request.
+    /// table's outcome and one ERROR line naming the request. A tool call the
+    /// reader could not read is the request's outcome: one WARN without the
+    /// model's bytes and the router-error family under the contract's label
+    /// and the `bad_response` reason; no worker is charged, and the lease of
+    /// a placed dispatch was told the answer ended whole where the stream
+    /// settled.
     pub(crate) fn account(&self, failure: &StreamFailure) {
         if let StreamFailure::Panicked(panicked) = failure {
             panicked.record(&self.request_id, &self.model);
+            return;
+        }
+        if let StreamFailure::ToolCallFormat(failure) = failure {
+            failure.warn(&self.request_id, &self.model);
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_GRPC,
+                self.backend_type,
+                metrics_labels::CONNECTION_GRPC,
+                &self.model,
+                self.endpoint,
+                metrics_labels::ERROR_INVALID_TOOL_CALL_FORMAT,
+                metrics_labels::REASON_BAD_RESPONSE,
+            );
             return;
         }
         let StreamFailure::Upstream {
@@ -555,7 +607,10 @@ impl StreamSource {
 }
 
 /// End a failed streaming response: the accounting, then the SSE error event
-/// typed for the failure (the caller's `[DONE]` follows). A client that has
+/// typed for the failure (the caller's `[DONE]` follows), or, for a tool call
+/// the reader could not read, the contract's own frame in place of the
+/// gateway's event, after which the caller sends no `[DONE]`
+/// ([`StreamFailure::ends_a_completed_answer`]). A client that has
 /// already gone is told nothing, and a failure of the gateway's own processing
 /// is logged only when there was a client to fail. A decode side the engine
 /// failed without a reason is first read against the pair's bootstrap port
@@ -572,11 +627,18 @@ pub(crate) async fn send_stream_failure(
     if tx.is_closed() {
         return;
     }
-    if let StreamFailure::Internal(message) = failure {
-        error!(
-            request_id = %source.request_id,
-            "Streaming response failed in the gateway: {message}"
-        );
+    match failure {
+        StreamFailure::Internal(message) => {
+            error!(
+                request_id = %source.request_id,
+                "Streaming response failed in the gateway: {message}"
+            );
+        }
+        StreamFailure::ToolCallFormat(failure) => {
+            let _ = tx.send(Ok(failure.sse_frame())).await;
+            return;
+        }
+        StreamFailure::Upstream { .. } | StreamFailure::Panicked(_) => {}
     }
     send_error_sse_with_code(tx, failure, failure.error_type(), failure.code()).await;
 }
@@ -1539,5 +1601,89 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A tool call the reader could not read is the request's outcome: the
+    /// router family counts it under the contract's label and the
+    /// `bad_response` reason, no worker is charged (its breaker stays
+    /// closed, the worker-error family has no sample), the failure names the
+    /// contract's type and code and the contract's sentence, and it alone
+    /// ends a completed answer.
+    #[test]
+    fn a_tool_call_the_reader_could_not_read_is_the_requests_outcome() {
+        use crate::routers::grpc::{
+            regular::symphony::UnreadableCall, wire::minimax::InvalidToolCallFormat,
+        };
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = worker();
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let source =
+            StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        let failure = StreamFailure::ToolCallFormat(InvalidToolCallFormat::new(
+            UnreadableCall::Incomplete,
+            true,
+        ));
+        metrics::with_local_recorder(&recorder, || source.account(&failure));
+        let rendered = handle.render();
+        assert_eq!(router_error_type(&rendered), "invalid_tool_call_format");
+        assert_eq!(router_error_reason(&rendered), "bad_response");
+        assert!(worker_error_type(&rendered).is_none(), "{rendered}");
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        assert_eq!(failure.error_type(), "invalid_tool_call_format");
+        assert_eq!(failure.code(), Some("invalid_tool_call_format"));
+        assert_eq!(
+            failure.to_string(),
+            "Treat this response as failed. The model stopped due to max_tokens before it \
+             completed the tool call. Retry the request."
+        );
+        assert!(failure.class().is_none());
+        assert!(failure.ends_a_completed_answer());
+        assert!(!cut().ends_a_completed_answer());
+        assert!(!StreamFailure::Internal("the gateway's own".to_string()).ends_a_completed_answer());
+    }
+
+    /// The failure's account leaves the lease of a placed dispatch alone: the
+    /// stream told it the answer ended whole where it settled, and the
+    /// failure names no status of the worker's.
+    #[tokio::test]
+    async fn a_tool_call_the_reader_could_not_read_says_no_end_of_its_own() {
+        use crate::routers::grpc::{
+            regular::symphony::UnreadableCall, wire::minimax::InvalidToolCallFormat,
+        };
+
+        let (source, placement, store) = placed_source().await;
+        source.account(&StreamFailure::ToolCallFormat(InvalidToolCallFormat::new(
+            UnreadableCall::Malformed,
+            false,
+        )));
+        assert!(placement.ends().lock().is_empty());
+        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+        source.completed(11, 13);
+        assert_end(&placement.ends(), &store, 200, TransportClass::Ok, 11, 13);
+    }
+
+    /// The stream's last frame for the failure is the contract's own, in
+    /// place of the gateway's error event.
+    #[tokio::test]
+    async fn a_tool_call_the_reader_could_not_read_ends_the_stream_with_the_contracts_frame() {
+        use tokio::sync::mpsc;
+
+        use crate::routers::grpc::{
+            regular::symphony::UnreadableCall, wire::minimax::InvalidToolCallFormat,
+        };
+
+        let source = StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        let contract = InvalidToolCallFormat::new(UnreadableCall::Incomplete, false);
+        let (tx, mut rx) = mpsc::channel(4);
+        send_stream_failure(&tx, &StreamFailure::ToolCallFormat(contract), &source).await;
+        drop(tx);
+        let frame = rx.recv().await.expect("the frame").expect("a write");
+        assert_eq!(frame, contract.sse_frame());
+        assert!(frame.starts_with(b"event: error\ndata: {\"error\":{\"message\":"));
+        assert!(rx.recv().await.is_none(), "one frame");
     }
 }

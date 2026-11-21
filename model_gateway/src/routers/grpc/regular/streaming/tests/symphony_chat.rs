@@ -490,6 +490,7 @@ async fn fold_through(
             None,
         )
         .await
+        .map_err(|failure| failure.to_string())
 }
 
 /// The tokens whose logprobs the choice kept, joined.

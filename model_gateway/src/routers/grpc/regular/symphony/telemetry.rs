@@ -167,7 +167,7 @@ const NO_TABLE: &str = "none";
 /// (`MalformedReason`, in its order, each under the crate's own spelling of it), so a dashboard
 /// tells a stray tag from a call written in the wrong syntax without the sampled line, and
 /// `other` for a reason this build does not know (the crate's enum is non-exhaustive).
-const REASONS: [&str; 31] = [
+const REASONS: [&str; 36] = [
     "unterminated_region",
     "invalid_arguments",
     "unknown_tool",
@@ -198,6 +198,11 @@ const REASONS: [&str; 31] = [
     "marker_out_of_place",
     "open_at_the_stop",
     "open_at_the_marker",
+    "stray_closing_tag",
+    "open_at_the_parents_close",
+    "misnamed_closing_tag",
+    "open_at_the_next_parameter",
+    "unconfirmed_string_end",
     "other",
 ];
 /// The place of `other` in [`REASONS`]: a reason the match below does not know.
@@ -281,6 +286,11 @@ fn reason_index(why: MalformedReason) -> usize {
         MalformedReason::MarkerOutOfPlace => 27,
         MalformedReason::OpenAtTheStop => 28,
         MalformedReason::OpenAtTheMarker => 29,
+        MalformedReason::StrayClosingTag => 30,
+        MalformedReason::OpenAtTheParentsClose => 31,
+        MalformedReason::MisnamedClosingTag => 32,
+        MalformedReason::OpenAtTheNextParameter => 33,
+        MalformedReason::UnconfirmedStringEnd => 34,
         _ => OTHER_REASON,
     }
 }
@@ -1230,7 +1240,7 @@ impl Sampler {
 mod tests {
     use serde_json::Value;
     use smg_external_router::metrics::handles::force_on_this_thread;
-    use symphony::{DropReason, FinishReason, Text};
+    use symphony::{CallEnd, DropReason, FinishReason, Text};
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{
@@ -1353,6 +1363,7 @@ mod tests {
             Event::ToolCallEnd {
                 index: 0,
                 source: Text::uncounted("</tool_call>"),
+                ended: CallEnd::Closed,
             },
             finish(1),
         ] {
@@ -2172,6 +2183,7 @@ mod tests {
             tally.see_forbidden(&Event::ToolCallEnd {
                 index: 0,
                 source: Text::uncounted("</tool_call>"),
+                ended: CallEnd::Closed,
             });
             tally.see_forbidden(&malformed("", MalformedReason::UnknownTool));
             tally.see_forbidden(&call_named(1, "nope", "<tool_call>"));

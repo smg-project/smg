@@ -6,7 +6,7 @@ use serde_json::{json as value, Value};
 
 use crate::{
     adapt,
-    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{CallEnd, DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::Format,
     grammar::{GrammarStart, Options},
     input::{EngineFinish, Input},
@@ -92,6 +92,29 @@ pub(crate) fn malformed_texts<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         .iter()
         .filter_map(|event| match event {
             Event::Malformed { text, .. } => Some(&*text.text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How each call ended, in order: its index and its end's word ([`CallEnd`]).
+pub(crate) fn endings(events: &[Event]) -> Vec<(u32, CallEnd)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCallEnd { index, ended, .. } => Some((*index, *ended)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The reasons among the `Malformed` events that say a call was lost, in order
+/// ([`MalformedReason::loses_a_call`]).
+pub(crate) fn losses(events: &[Event]) -> Vec<MalformedReason> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Malformed { why, .. } if why.loses_a_call() => Some(*why),
             _ => None,
         })
         .collect()
@@ -788,7 +811,7 @@ pub(crate) fn weather_declared() -> Declared {
 /// empty source the adapters do not read, and the engine's finish with no
 /// reasoning tokens.
 pub(crate) mod events {
-    use crate::event::{Event, FinishReason, Text};
+    use crate::event::{CallEnd, Event, FinishReason, Text};
 
     /// A call's start, `call_<index>` as its id.
     pub(crate) fn call(index: u32, name: &str) -> Event<'static> {
@@ -814,6 +837,7 @@ pub(crate) mod events {
         Event::ToolCallEnd {
             index,
             source: Text::default(),
+            ended: CallEnd::Closed,
         }
     }
 

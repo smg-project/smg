@@ -145,6 +145,31 @@ is a later step).
   any finish but `Stop` is cut as before; a driver hands a stop sequence of the request's that
   matched inside the call over as such a finish, so that it never completes the call (the stop
   row in `format`).
+- Each `ToolCallEnd` says which of the three endings closed its call (`CallEnd`, the event's
+  `ended`): `closed` for the model's own end of the call (its closing terminal, what the syntax
+  reads as its end, or the stop where the table's stop row stands for the marker), `stop` for a
+  call the model's stop found open in a state with no stop row, `cut` for one a cut found open.
+  The engine writes it where the region ends (`Engine::close_call`); an assembler ends every call
+  as closed, since only the engine knows how the region ended. One syntax has no delimiter to
+  close its call, the forced arguments, which are the whole output: the output's end is that
+  call's own end where its value is whole there (a number or a literal the bytes end on), which
+  the assembler says when asked (`CallAssembler::ends_with_the_output`), and the end is then
+  `closed`, as it is for the object that closed at its brace: at the model's stop for either,
+  and at a cut for a literal alone, since a cut may have taken a number's next digit (`12` of
+  `123`), so a number the cut found is a call the cut found open, its bytes delivered. The
+  events and their order are what they were, so a driver that does not read the field sees no
+  change. One that fails its request on a call the model did not finish reads it there, beside
+  `MalformedReason::loses_a_call` for a call the syntax could not read whole: the reason is the
+  word on that, on every refusal, since the bytes a syntax refuses leave as
+  `Dropped { MalformedCall }` whether a call lost them or not (a closing tag of the XML syntax
+  that names nothing open is dropped so, and costs no call anything). One reason says more
+  than happened: the keyed and Qwen tagged syntaxes count a bare closing tag between a call's
+  members as a tag out of its place (`TagOutOfPlace`), a reason that loses a call, and close
+  the call whole past it. A block that named no call
+  has no end to carry the word: the output's end that found it open refuses its bytes in that
+  last step, before the `Finish`. An invoke of the XML syntax that the output ended in before
+  any byte of its name holds no byte to refuse, and says the same reason by a `Malformed` event
+  of no bytes alone.
 - A table can say that the template discards the text of a state (`Format::framing`): Hugging
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is
@@ -175,7 +200,14 @@ is a later step).
   after the last is held, a terminal the table ignores inside it in its place, and dropped as
   the template's spacing when a row ends the stay or the stream does. So a client reads prose
   between two calls, or after a call's object, as the model wrote it, byte for byte, whole and
-  streamed alike.
+  streamed alike. One syntax reads tags there: between a block's calls of the XML syntax, whose
+  calls are tags, a closing tag with no text before it since the last call names nothing open,
+  since no call is, and is ignored as the syntax ignores one between a call's members
+  (`Engine::wrapping_tags`; after text of the stay it is the prose's, and stays in it): one
+  `Malformed { StrayClosingTag }` event of no bytes, the tag's bytes `Dropped { MalformedCall }`
+  and never content. The tag is read across deltas, its bytes held from `</` while they can
+  still spell one, up to 128 of them; a longer run, and bytes that spell none after all, are
+  the stay's text, as before.
 - A call given as data (`CallSyntax::Shaped`) opens only when the header after its terminal
   matches: the engine holds the terminal and every byte after it, and takes no row, until the
   header decides. A header that cannot match gives the terminal back: its first character is the

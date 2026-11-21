@@ -270,7 +270,14 @@ fn chat_sse_events<'a, C: Deserialize<'a>>(
         if event == "data: [DONE]" {
             return Some(ChatSseEvent::Done);
         }
-        let data = event.strip_prefix("data: ")?.trim();
+        // A data event, or the one named event a chat stream ends with: the
+        // `event: error` of a tool call the reader could not read
+        // (`wire::UnreadableToolCallFailure`), whose data line is the
+        // turn's error.
+        let data = event
+            .strip_prefix("data: ")
+            .or_else(|| event.strip_prefix("event: error\ndata: "))?
+            .trim();
         if let Ok(chunk) = serde_json::from_str::<C>(data) {
             return Some(ChatSseEvent::Chunk(chunk));
         }
@@ -2452,7 +2459,8 @@ mod tests {
     /// the terminal's error object (`code`, else `type`, else `server_error`;
     /// `message`, else the generic wording), the terminator, and every other
     /// data event left to the caller; lines that are not data events are
-    /// nobody's.
+    /// nobody's, but the chat stream's one named event, the `event: error` of
+    /// a tool call the reader could not read, whose data line is read.
     #[test]
     fn the_chat_sse_reader_sorts_a_frames_events() {
         let frame = concat!(
@@ -2463,6 +2471,9 @@ mod tests {
             "data: {\"unexpected\":true}\n\n",
             "data: {\"error\":{\"type\":\"internal_error\",\"message\":\"engine unavailable\"}}\n\n",
             "data: {\"error\":{\"code\":\"rate_limited\"}}\n\n",
+            "event: error\ndata: {\"error\":{\"message\":\"Treat this response as failed.\",\
+             \"type\":\"invalid_tool_call_format\",\"code\":\"invalid_tool_call_format\",\
+             \"finish_reason\":\"error\"}}\n\n",
             "data: [DONE]\n\n",
             "data: {\"after\":\"done\"}\n\n",
         );
@@ -2484,6 +2495,7 @@ mod tests {
                 "other:data: {\"unexpected\":true}",
                 "error:{\"code\":\"internal_error\",\"message\":\"engine unavailable\"}",
                 "error:{\"code\":\"rate_limited\",\"message\":\"Upstream generation failed\"}",
+                "error:{\"code\":\"invalid_tool_call_format\",\"message\":\"Treat this response as failed.\"}",
                 "done",
                 "other:data: {\"after\":\"done\"}",
             ]

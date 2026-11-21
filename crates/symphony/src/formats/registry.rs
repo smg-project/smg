@@ -856,6 +856,18 @@ mod tests {
         assert!(for_model("MiniMax-M3.1").is_none());
     }
 
+    /// The XML syntax is the MiniMax M3 table's alone. It is the one syntax that names a stray
+    /// closing tag by a reason of its own (`MalformedReason::StrayClosingTag`), inside a call
+    /// and between a block's calls, so no other table counts a tag under that reason.
+    #[test]
+    fn only_the_minimax_m3_table_reads_its_calls_with_the_xml_syntax() {
+        let xml: Vec<Table> = Table::ALL
+            .into_iter()
+            .filter(|table| matches!(table.format().call_syntax(), Some(CallSyntax::Xml)))
+            .collect();
+        assert_eq!(xml, [Table::MinimaxM3]);
+    }
+
     #[test]
     fn every_table_has_a_name_of_its_own_that_spells_it_back() {
         let mut seen: Vec<&str> = Vec::new();

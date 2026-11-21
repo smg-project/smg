@@ -11,7 +11,7 @@ use axum::response::Response;
 use crate::{
     observability::metrics::metrics_labels,
     routers::grpc::{
-        common::stages::RateLimitCell,
+        common::{response_formatting::TokenCounts, stages::RateLimitCell},
         context::{stage_output, wrong_response_spec, DispatchContext, FinalResponse},
         regular::{processor, streaming},
         spec::ResponseSpec,
@@ -100,7 +100,7 @@ impl ChatResponseProcessingStage {
 
         let stop_decoder = stage_output(ctx.response.stop_decoder.as_mut(), FUNCTION)?;
 
-        let (response, counts) = self
+        let answered = self
             .processor
             .process_non_streaming_chat_response(
                 execution_result,
@@ -110,7 +110,31 @@ impl ChatResponseProcessingStage {
                 stop_decoder,
                 request_logprobs,
             )
-            .await?;
+            .await;
+        let (response, counts) = match answered {
+            Ok(answered) => answered,
+            Err(failure) => {
+                // A failure that carries the engine's counters ends a request
+                // whose answer the engine completed (a tool call the reader
+                // could not read), as the stream that fails the same way
+                // ends. The dispatch is told the answer ended whole, with its
+                // counts: the lease takes its first end, so the failed
+                // attempt's release that follows charges the worker no
+                // failure and gives up no pair. And the reservation is
+                // settled with the counts here, so its close after a failed
+                // answer finds it settled and keeps no estimate in their
+                // place.
+                if let Some(counts) = TokenCounts::carried_by(&failure) {
+                    if let Some(placement) = ctx.placement() {
+                        placement.completed(counts.prompt, counts.completion);
+                    }
+                    if let Some(cell) = ctx.rate_limit_cell.as_deref() {
+                        cell.settle(counts.settlement()).await;
+                    }
+                }
+                return Err(failure);
+            }
+        };
 
         // Store the final response, and the engine's counters for the settlement
         ctx.response.final_response = Some(FinalResponse::Chat(response));

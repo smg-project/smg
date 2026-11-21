@@ -216,7 +216,8 @@ malformed_reasons! {
     /// Text where the call's syntax has only tags: between a tag and the next, outside a value.
     TextBetweenTags => "text between a call's tags",
     /// A tag of the syntax where it has no place: a value's close with no value open, a
-    /// parameter tag before the function's.
+    /// parameter tag before the function's. The XML syntax alone names a closing tag that
+    /// names nothing open by a reason of its own, [`Self::StrayClosingTag`].
     TagOutOfPlace => "a tag where the call's syntax has none",
     /// A tag another tag, or the call's end, cut short before it closed.
     TagCutShort => "a tag that another tag or the call's end cut short",
@@ -284,11 +285,195 @@ malformed_reasons! {
     /// JSON. The marker is the model's own end of the call, so the value's bytes are complete, as
     /// at the stop. The event carries no bytes and stands before the closing quote.
     OpenAtTheMarker => "a string value left open at the call's closing marker",
+    /// A closing tag of the XML syntax that names nothing open, where the syntax has the next
+    /// member's tag, the next call or a close: between a call's members, or between a block's
+    /// calls with no text before it since the last call. The tag is ignored: it carries no
+    /// member, the call it stands in or beside is as whole after it as before, and what
+    /// follows is read where it stands. The event carries no bytes and stands before the
+    /// tag's own, which leave as `Dropped { MalformedCall }`, never content. Only the XML
+    /// syntax gives the reason: the other syntaxes of tags count a closing tag between a
+    /// call's members as a tag out of its place ([`Self::TagOutOfPlace`]).
+    StrayClosingTag => "a closing tag that names nothing open",
+    /// An element of the XML syntax that the closing tag of an element around it, or the
+    /// call's own closing marker, found open: the model left the element's own close out, and
+    /// the syntax closes it there with what it holds (its text as its value, nothing as the
+    /// empty value of its declared type, its members as they stand), and the elements between
+    /// it and the one the tag names after it. Nothing is refused and the call stays whole. The
+    /// event carries no bytes and stands before the first fragment that closes an element. A
+    /// streamed string the call's marker found open says [`Self::OpenAtTheMarker`] instead.
+    OpenAtTheParentsClose => "an element left open at the closing tag of the one around it",
+    /// A closing tag behind the template's separator that names nothing open, inside an
+    /// element of the XML syntax that holds text, or nothing yet: the syntax reads it as that
+    /// element's own close under another name, and closes the element with the text before
+    /// it. The event carries no bytes and stands before the fragment that closes the element.
+    /// This is a reading of what the model meant, where [`Self::StrayClosingTag`] ignores a
+    /// tag that changes nothing: had the model meant the tag as the value's text, the value
+    /// ends early here, and what follows it is read as the syntax reads it there (text between
+    /// elements is refused; closing tags are ignored). The reason is its own so that the rate
+    /// of the reading can be counted.
+    MisnamedClosingTag => "a value closed by a closing tag of another name",
+    /// A string value of the XML syntax with no closing tag of its own, ended where the next
+    /// parameter's opening tag stands behind the template's separator: a top-level parameter
+    /// the tool types `string` and nothing else, and a tag that names a parameter the tool
+    /// declares and the call has not given, before a value of that parameter's type where
+    /// the type constrains its text. The string is closed there and the parameter opens. The event carries no bytes and stands before the closing quote, whose source is
+    /// that tag. This is a reading of what the model meant; the rest of the call has to bear
+    /// it out, or the call says [`Self::UnconfirmedStringEnd`].
+    OpenAtTheNextParameter => "a string value left open at the next parameter's opening tag",
+    /// A call in which a string value was ended at the next parameter's opening tag
+    /// ([`Self::OpenAtTheNextParameter`]) and the reading did not hold: the string's own
+    /// closing tag came after all, so the tag that ended it was its text; or the call needed
+    /// another repair after it, named a parameter the tool does not declare or gave one twice,
+    /// or ended without its own closing tag. What the client was sent of the call may be
+    /// wrong, so the call gets no close and is no whole call. The event carries no bytes.
+    UnconfirmedStringEnd => "a string value ended at the next parameter's tag, which the call did not bear out",
+}
+
+impl MalformedReason {
+    /// Whether the reason says that the model wrote a tool call the syntax could not read
+    /// whole: bytes of a member, a name or arguments written for a call that are in no call
+    /// the output delivers (refused as a malformed call's, or returned as text where the
+    /// syntax has a call, a name, a key, a value or arguments), or a call that ends without
+    /// its whole arguments. A call the syntax repaired is not one: where the model slipped on
+    /// a tag and every member it wrote is in the call (a closing tag ignored, misnamed or left
+    /// out, a string closed where its close was missing), the call is all there and is
+    /// delivered, under a reason that says which repair was made. A driver that fails its
+    /// request on a call it could not read asks this of every `Malformed` event, beside the
+    /// word a call's end carries on a call the model did not end ([`CallEnd`]).
+    ///
+    /// The reasons that lose no call, each for its own cause:
+    ///
+    /// - [`UnknownTool`](Self::UnknownTool): the call is read whole and goes out as the model
+    ///   wrote it; only its name is not one the request declares.
+    /// - [`MarkerOutOfPlace`](Self::MarkerOutOfPlace): a marker kept as text in a content
+    ///   state, where no call is read.
+    /// - [`OpenAtTheStop`](Self::OpenAtTheStop), [`OpenAtTheMarker`](Self::OpenAtTheMarker)
+    ///   and [`OpenAtTheParentsClose`](Self::OpenAtTheParentsClose): the syntax closed what the
+    ///   model left open, and every byte the model wrote is in the call. Whether the model
+    ///   ended the call itself is [`CallEnd`]'s to say, on the call's end.
+    /// - [`StrayClosingTag`](Self::StrayClosingTag): a closing tag of the XML syntax that
+    ///   names nothing open is ignored; it carries no member, and the call beside it is whole
+    ///   without it.
+    /// - [`MisnamedClosingTag`](Self::MisnamedClosingTag): the syntax read a closing tag of
+    ///   another name as a value's own close; the call closes whole with the value it read.
+    /// - [`OpenAtTheNextParameter`](Self::OpenAtTheNextParameter): the syntax ended a string
+    ///   with no close of its own at the next parameter's tag; where the rest of the call
+    ///   bears that out, the call closes whole.
+    /// - [`TextAfterTheArguments`](Self::TextAfterTheArguments) and
+    ///   [`TextAfterTheList`](Self::TextAfterTheList): text after a call, or a list of calls,
+    ///   that was read whole; the text is returned and no call is short of it.
+    ///
+    /// Every other reason loses one. [`TextBetweenCalls`](Self::TextBetweenCalls) names text
+    /// where a call should begin and prose beside whole calls alike, and is classed as losing
+    /// one for both: prose inside a call block is no part of a block the syntax reads whole.
+    /// [`TagOutOfPlace`](Self::TagOutOfPlace) is classed as losing one for every tag it names:
+    /// a tag with a member the call does not get behind it, and the bare closing tag between
+    /// a call's members that the keyed and the Qwen tagged syntaxes count under it and close
+    /// the call past. The reason does not tell the two apart, so of those two syntaxes it
+    /// says a call was lost where that call is whole; the XML syntax gives the tag a reason
+    /// of its own ([`StrayClosingTag`](Self::StrayClosingTag)), which loses none.
+    ///
+    /// The bytes a syntax refuses leave as `Dropped { MalformedCall }` behind the `Malformed`
+    /// event of no bytes that gives the reason, so the reason is the word on whether a call was
+    /// lost: the XML syntax's stray closing tag is dropped so too, and loses none.
+    ///
+    /// The match names every reason, so a reason added to the crate is classed here before the
+    /// crate builds.
+    pub fn loses_a_call(self) -> bool {
+        match self {
+            // The call is read whole, or no call is read where the reason stands.
+            Self::UnknownTool
+            | Self::MarkerOutOfPlace
+            | Self::OpenAtTheStop
+            | Self::OpenAtTheMarker
+            | Self::OpenAtTheParentsClose
+            | Self::StrayClosingTag
+            | Self::MisnamedClosingTag
+            | Self::OpenAtTheNextParameter
+            | Self::TextAfterTheArguments
+            | Self::TextAfterTheList => false,
+            // The stream ended inside a call or a block that named none; arguments that are no
+            // JSON; bytes inside a call the syntax refused; a block that made no call of the
+            // bytes it held.
+            Self::UnterminatedRegion
+            | Self::InvalidArguments
+            | Self::TextBetweenTags
+            | Self::TagOutOfPlace
+            | Self::TagCutShort
+            | Self::TagTail
+            | Self::EmptyName
+            | Self::CallWithoutName
+            | Self::CallWithoutFunctionTag
+            | Self::SecondFunctionTag
+            | Self::ClosedBeforeTheName
+            | Self::TextWhereTheNameShouldBe
+            | Self::TextBetweenCalls
+            | Self::TextWhereAnArgumentShouldBegin
+            | Self::TextInPlaceOfTheList
+            | Self::NameWithoutArguments
+            | Self::NameWithoutACall
+            | Self::KeyWrittenTwice
+            | Self::KeyWithoutAValue
+            | Self::KeyCutShort
+            | Self::ValueCutShort
+            | Self::EmptyKey
+            | Self::BlockWithoutACompleteCall
+            | Self::NoForcedFunction
+            | Self::UnconfirmedStringEnd => true,
+        }
+    }
 }
 
 impl std::fmt::Display for MalformedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.sentence())
+    }
+}
+
+/// How a tool call ended: what closed it. Every [`Event::ToolCallEnd`] says it, so a driver knows
+/// of each call whether the model ended it. A call ends once, and its fragments say what its
+/// arguments are either way; this says who ended it.
+///
+/// The engine writes it, from how the call's region ended. Only a call the end of the output
+/// found open ends as [`Stop`](Self::Stop) or [`Cut`](Self::Cut), so at most the output's last
+/// call does; every call before it ended [`Closed`](Self::Closed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallEnd {
+    /// The model ended the call: its closing marker arrived, or what the syntax reads as the
+    /// call's end (the next call's opener, the block's close, the brace that closes a call's
+    /// object), or the stream's stop where the table's stop row stands for the closing marker
+    /// the stop decoder hides. Or the output ended where a call with no delimiter of its own
+    /// was whole: the forced arguments, which are the whole output, when their value is a
+    /// literal the bytes end on, or a number the model's own stop found.
+    #[default]
+    Closed,
+    /// The model's own end of output found the call open, in a state the table has no stop row
+    /// for: the stream stopped (`EngineFinish::Stop`) before anything the syntax reads as the
+    /// call's end. A syntax that writes the arguments' JSON closes what was open there, and says
+    /// so by a `Malformed { OpenAtTheStop }` event; the model still did not end the call.
+    Stop,
+    /// The stream was cut inside the call: by the token limit, an abort, or a finish the crate
+    /// does not read. Nothing is closed for the client, and a `Malformed` event before the end
+    /// says that the arguments are no whole value. One cut call has whole arguments and no
+    /// such event: the forced arguments that are a number where the cut came, which read whole
+    /// and may be the start of a longer number (`12` of `123`).
+    Cut,
+}
+
+impl CallEnd {
+    /// Whether the model ended the call ([`CallEnd::Closed`]).
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
+
+    /// [`Self::is_closed`] as serde asks whether to write the member.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's `skip_serializing_if` passes the field by reference"
+    )]
+    fn is_unwritten(&self) -> bool {
+        self.is_closed()
     }
 }
 
@@ -358,6 +543,11 @@ pub enum Event<'d> {
         /// The output bytes this event accounts for: the closing marker, and any buffered bytes
         /// no earlier event of this call accounted for.
         source: Text<'d>,
+        /// How the call ended: closed by the model, left open at the model's own stop, or cut.
+        /// Not written when serialized for a call the model closed, and read as that when
+        /// absent, so an event recorded before the field reads and writes as it did.
+        #[serde(default, skip_serializing_if = "CallEnd::is_unwritten")]
+        ended: CallEnd,
     },
     /// Text the format consumed without showing it.
     Dropped {
@@ -413,9 +603,14 @@ impl Event<'_> {
                 json: Cow::Owned(json.into_owned()),
                 source: source.into_owned(),
             },
-            Event::ToolCallEnd { index, source } => Event::ToolCallEnd {
+            Event::ToolCallEnd {
+                index,
+                source,
+                ended,
+            } => Event::ToolCallEnd {
                 index,
                 source: source.into_owned(),
+                ended,
             },
             Event::Dropped { text, why } => Event::Dropped {
                 text: text.into_owned(),
@@ -752,6 +947,94 @@ mod tests {
         assert_eq!(seen.len(), MalformedReason::ALL.len());
     }
 
+    /// The reasons that lose no call are the ten the method's doc names; every other reason
+    /// of the crate loses one. Pinned by name, so a reason moved from one side to the other is
+    /// a change made here on purpose.
+    #[test]
+    fn the_reasons_that_lose_no_call_are_the_ten_named() {
+        let harmless: Vec<MalformedReason> = MalformedReason::ALL
+            .iter()
+            .copied()
+            .filter(|why| !why.loses_a_call())
+            .collect();
+        assert_eq!(
+            harmless,
+            [
+                MalformedReason::UnknownTool,
+                MalformedReason::TextAfterTheArguments,
+                MalformedReason::TextAfterTheList,
+                MalformedReason::MarkerOutOfPlace,
+                MalformedReason::OpenAtTheStop,
+                MalformedReason::OpenAtTheMarker,
+                MalformedReason::StrayClosingTag,
+                MalformedReason::OpenAtTheParentsClose,
+                MalformedReason::MisnamedClosingTag,
+                MalformedReason::OpenAtTheNextParameter,
+            ]
+        );
+        assert_eq!(
+            MalformedReason::ALL.len() - harmless.len(),
+            25,
+            "every other reason loses a call"
+        );
+    }
+
+    /// A call's end serializes as it did before it said how the call ended, for a call the
+    /// model closed: the member is not written, and an end recorded without it reads as closed.
+    /// A call the stop or a cut ended writes the word and reads it back.
+    #[test]
+    fn a_closed_end_serializes_as_before_and_the_other_two_say_their_word() {
+        let end = |ended| Event::ToolCallEnd {
+            index: 0,
+            source: Text::uncounted("</c>"),
+            ended,
+        };
+        let closed = serde_json::to_value(end(CallEnd::Closed)).expect("an event serializes");
+        assert_eq!(
+            closed,
+            serde_json::json!({
+                "kind": "tool_call_end", "index": 0, "source": {"text": "</c>", "tokens": null}
+            })
+        );
+        let read: Event = serde_json::from_value(closed).expect("the event reads back");
+        assert_eq!(read, end(CallEnd::Closed));
+        assert!(CallEnd::default().is_closed());
+        for (ended, word) in [(CallEnd::Stop, "stop"), (CallEnd::Cut, "cut")] {
+            assert!(!ended.is_closed());
+            let written = serde_json::to_value(end(ended)).expect("an event serializes");
+            assert_eq!(written["ended"], word);
+            let read: Event = serde_json::from_value(written).expect("the event reads back");
+            assert_eq!(read, end(ended));
+        }
+    }
+
+    /// An end keeps its word when the event is freed of its delta, and a call the request drops
+    /// loses it with the rest of the call.
+    #[test]
+    fn an_end_keeps_how_the_call_ended_when_it_is_owned() {
+        let end = Event::ToolCallEnd {
+            index: 0,
+            source: Text::uncounted("x"),
+            ended: CallEnd::Cut,
+        };
+        assert!(matches!(
+            end.clone().into_owned(),
+            Event::ToolCallEnd {
+                ended: CallEnd::Cut,
+                ..
+            }
+        ));
+        let mut events = [end];
+        forbidden_calls(&mut events);
+        assert!(matches!(
+            &events[0],
+            Event::Dropped {
+                why: DropReason::ForbiddenCall,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn reasoning_text_tokens_sum_the_reasoning_texts_alone() {
         let events = vec![
@@ -782,6 +1065,7 @@ mod tests {
             Event::ToolCallEnd {
                 index,
                 source: Text::uncounted(">"),
+                ended: CallEnd::Closed,
             },
         ]
     }
@@ -819,6 +1103,7 @@ mod tests {
         let end = Event::ToolCallEnd {
             index: 1,
             source: Text::uncounted(">"),
+            ended: CallEnd::Closed,
         };
         let mut events = vec![tail("a"), end, tail("b")];
         first_call_only(&mut events);

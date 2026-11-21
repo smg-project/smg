@@ -18,7 +18,7 @@
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
-    event::{Event, Events, MalformedReason, Text},
+    event::{CallEnd, Event, Events, MalformedReason, Text},
     json::{
         fragments::{Arrived, Fragments},
         outline::{Scanner, Span},
@@ -205,6 +205,7 @@ impl Assembler {
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::uncounted(self.text[tail_start..at].to_owned()),
+                ended: CallEnd::Closed,
             });
             self.done = true;
             return taken;
@@ -231,6 +232,7 @@ impl Assembler {
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::uncounted(self.text[tail_start..close].to_owned()),
+                ended: CallEnd::Closed,
             });
             self.done = true;
         }
@@ -312,6 +314,7 @@ impl Assembler {
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::default(),
+                ended: CallEnd::Closed,
             });
             return;
         }
@@ -581,6 +584,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted("}"),
+                    ended: CallEnd::Closed,
                 },
             ]
         );
@@ -640,6 +644,7 @@ mod tests {
             Some(&Event::ToolCallEnd {
                 index: 1,
                 source: Text::uncounted(r#", "name": "get_weather"}"#),
+                ended: CallEnd::Closed,
             })
         );
         assert_eq!(sources(&events), text);
@@ -666,6 +671,7 @@ mod tests {
             Event::ToolCallEnd {
                 index: 0,
                 source: Text::default(),
+                ended: CallEnd::Closed,
             },
         ];
         let text = r#"{"name": "f"}"#;
@@ -690,6 +696,7 @@ mod tests {
                 Some(&Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted(end),
+                    ended: CallEnd::Closed,
                 }),
                 "{text}"
             );
@@ -781,6 +788,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::default(),
+                    ended: CallEnd::Closed,
                 },
             ],
             "the value was cut: the call says so before its end"
@@ -797,6 +805,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::default(),
+                    ended: CallEnd::Closed,
                 },
             ]
         );
@@ -1023,6 +1032,7 @@ mod tests {
                     Some(&Event::ToolCallEnd {
                         index: 0,
                         source: Text::uncounted("}"),
+                        ended: CallEnd::Closed,
                     }),
                     "{text:?} {how}"
                 );
@@ -1057,6 +1067,7 @@ mod tests {
                     Event::ToolCallEnd {
                         index: 0,
                         source: Text::uncounted("}"),
+                        ended: CallEnd::Closed,
                     },
                 ],
                 "{text:?}: {events:#?}"
@@ -1077,6 +1088,7 @@ mod tests {
             Some(&Event::ToolCallEnd {
                 index: 0,
                 source: Text::uncounted("}"),
+                ended: CallEnd::Closed,
             }),
             "the surplus after the brace is the format's, not the end's"
         );
@@ -1124,6 +1136,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted("}"),
+                    ended: CallEnd::Closed,
                 },
             ]
         );
@@ -1230,6 +1243,7 @@ mod tests {
         let end = |source: &str| Event::ToolCallEnd {
             index: 0,
             source: Text::uncounted(source.to_owned()),
+            ended: CallEnd::Closed,
         };
         let head = r#"{"name": "f", "arguments": "#;
         let value = Event::ToolCallArguments {

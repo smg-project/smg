@@ -4,6 +4,7 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
+use axum::response::Response;
 use openai_protocol::{common::Usage, generate::GenerateResponse};
 
 use crate::{
@@ -162,6 +163,23 @@ impl TokenCounts {
             details.rejected_prediction_tokens = None;
         }
         usage
+    }
+
+    /// Carry the counters on `response`, the failure a request ends with
+    /// after the engine completed its answer (a tool call the reader could
+    /// not read, on a wire whose contract fails the request on one). The
+    /// engine generated the answer, so its counters are what the request
+    /// used: the response stage settles the request's reservation with them
+    /// ([`Self::carried_by`]), as a stream that fails the same way settles
+    /// them at its end, in place of the estimate a failed answer keeps.
+    pub(crate) fn carry_on(self, response: &mut Response) {
+        response.extensions_mut().insert(self);
+    }
+
+    /// The counters `response` carries ([`Self::carry_on`]): `None` for
+    /// every other response.
+    pub(crate) fn carried_by(response: &Response) -> Option<Self> {
+        response.extensions().get::<Self>().copied()
     }
 
     /// The settlement of the request's reservation: the engine's counts as
@@ -340,6 +358,35 @@ mod tests {
     use smg_grpc_client::{tokenspeed_proto as tokenspeed, vllm_proto as vllm};
 
     use super::*;
+
+    /// A failed answer carries the engine's counters to the stage that
+    /// settles them, whole; a response nobody marked carries none.
+    #[test]
+    fn a_failed_answer_carries_the_engines_counters() {
+        use axum::{http::StatusCode, response::IntoResponse};
+
+        let counts = TokenCounts {
+            prompt: 11,
+            completion: 7,
+            cached: 3,
+            reasoning: 2,
+            spec_accepted: 1,
+            spec_drafted: Some(4),
+        };
+        let mut response = StatusCode::BAD_REQUEST.into_response();
+        assert_eq!(TokenCounts::carried_by(&response), None);
+        counts.carry_on(&mut response);
+        assert_eq!(TokenCounts::carried_by(&response), Some(counts));
+        assert_eq!(
+            TokenCounts::carried_by(&response).map(TokenCounts::settlement),
+            Some(UsageSettlement {
+                actual_input_tokens: 11,
+                completion_tokens: 7,
+                cached_input_tokens: 3,
+                reasoning_tokens: 2,
+            })
+        );
+    }
 
     /// The usage the counters of `responses` make.
     fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {

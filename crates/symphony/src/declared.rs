@@ -90,6 +90,20 @@ impl Declared {
         Some((root, root.get("properties")?.get(parameter)?))
     }
 
+    /// Where `parameter` stands among the properties `function` declares, in the order the
+    /// schema keeps them, and whether its type is `string` and nothing else; nothing when the
+    /// function declares no such property. The place is a small number a reader can keep a
+    /// bit for: which parameters a call has given, without keeping their names.
+    pub(crate) fn place(&self, function: &str, parameter: &str) -> Option<(usize, bool)> {
+        let properties = self.schema(function)?.get("properties")?.as_object()?;
+        let (place, (_, schema)) = properties
+            .iter()
+            .enumerate()
+            .find(|(_, (name, _))| *name == parameter)?;
+        let plain_string = schema.get("type").and_then(Value::as_str) == Some("string");
+        Some((place, plain_string))
+    }
+
     /// The kind `function` declares at `path` below its parameters, for a value inside another:
     /// below an object a segment selects that property's schema, below an array any segment
     /// selects the items' schema (MiniMax writes a list's elements as `<item>` elements, and a

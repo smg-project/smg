@@ -23,7 +23,7 @@
 //! [`Declared::forced`]: crate::Declared::forced
 
 use crate::{
-    event::{Event, Events, MalformedReason, Text},
+    event::{CallEnd, Event, Events, MalformedReason, Text},
     json::{
         arguments::{Arguments, AsWritten},
         prefix::json_space,
@@ -112,6 +112,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::default(),
+            ended: CallEnd::Closed,
         });
     }
 }
@@ -142,6 +143,18 @@ impl crate::engine::CallAssembler for Assembler {
     /// template's wrapping, which the engine drops.
     fn markers_are_text(&self) -> bool {
         self.started && !self.ended
+    }
+
+    /// The call has no delimiter of its own, so the output's end is its end where the value
+    /// is whole there: a number or a literal the bytes end on. A literal is whole at a cut
+    /// too, since no byte continues it; a number is whole only at the model's own stop, since
+    /// the cut may have taken its next digit. A value the end finds unfinished is a call left
+    /// open.
+    fn ends_with_the_output(&self, cut: bool) -> bool {
+        self.started
+            && !self.ended
+            && self.arguments.whole_at_the_end()
+            && !(cut && self.arguments.is_a_number())
     }
 
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {

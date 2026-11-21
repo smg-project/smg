@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(names, ["spotify_play", "spotify_play"]);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::ToolCallEnd { index: 1, source } if source.text == "</function>"
+            Event::ToolCallEnd { index: 1, source, .. } if source.text == "</function>"
         )));
         assert!(malformed(&events).is_empty());
     }

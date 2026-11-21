@@ -23,6 +23,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
 use crate::{
+    middleware::ReportedRefusal,
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     routers::{
         common::retry::mark_non_retryable,
@@ -41,9 +42,44 @@ use crate::{
                 self,
                 isolation::{isolated, isolated_sync, Panicked, READER_PANICKED_CODE},
             },
+            wire::UnreadableToolCallFailure,
         },
     },
 };
+
+/// Why a choice could not be read into its message.
+#[derive(Debug)]
+pub(crate) enum ChoiceFailure {
+    /// The gateway's own processing failed: the request's 500.
+    Read(String),
+    /// The answer ended with a tool call the reader could not read, under a
+    /// request that fails on one
+    /// (`ChatResponseSpec::fails_on_unreadable_call`): the request's 400
+    /// ([`UnreadableToolCallFailure`]).
+    ToolCallFormat(UnreadableToolCallFailure),
+}
+
+impl std::fmt::Display for ChoiceFailure {
+    /// The failure's text: why the reading failed, or the contract's sentence.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(why) => f.write_str(why),
+            Self::ToolCallFormat(failure) => f.write_str(failure.message()),
+        }
+    }
+}
+
+impl From<String> for ChoiceFailure {
+    fn from(why: String) -> Self {
+        Self::Read(why)
+    }
+}
+
+impl From<SymphonyError> for ChoiceFailure {
+    fn from(error: SymphonyError) -> Self {
+        Self::Read(error.to_string())
+    }
+}
 
 /// Unified response processor for both routers
 #[derive(Clone)]
@@ -99,7 +135,7 @@ impl ResponseProcessor {
         // between availability check and parsing.
         reasoning_parser_name: Option<&str>,
         tool_parser_name: Option<&str>,
-    ) -> Result<(ChatChoice, u32), String> {
+    ) -> Result<(ChatChoice, u32), ChoiceFailure> {
         stop_decoder.reset();
         if let Some(assignment) = &original_request.symphony {
             return Self::read_with_symphony(
@@ -124,7 +160,7 @@ impl ResponseProcessor {
             request_id,
             index as u32,
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| ChoiceFailure::Read(e.to_string()))?
         .with_eager_token_ends(
             original_request.separate_reasoning && reasoning_parser_available,
             tokenizer,
@@ -223,6 +259,12 @@ impl ResponseProcessor {
     /// is finished, the engine's finish, and the message the events fold into.
     /// The matched stop is set as on the older path, and the logprobs are the
     /// engine's, one entry per generated token, as the older path's are.
+    ///
+    /// Under a request that fails on a tool call the reader could not read
+    /// (`ChatResponseSpec::fails_on_unreadable_call`), such a call is the
+    /// choice's failure in place of a message ([`UnreadableToolCallFailure`]);
+    /// the token limit is blamed only where the finish says it cut the
+    /// output.
     #[expect(clippy::too_many_arguments)]
     fn read_with_symphony(
         request_id: &str,
@@ -233,7 +275,7 @@ impl ResponseProcessor {
         model: &str,
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
-    ) -> Result<(ChatChoice, u32), String> {
+    ) -> Result<(ChatChoice, u32), ChoiceFailure> {
         let tools = original_request.tools.clone().unwrap_or_default();
         // The output as one delta, then the decoder's last text: two deltas the events borrow,
         // both outliving the buffer.
@@ -241,7 +283,8 @@ impl ResponseProcessor {
         let mut flushed = Delta::default();
         let mut events = Events::new();
         let mut reader = Reader::new(assignment, tools, &mut events)?
-            .first_call_only(original_request.first_tool_call_only);
+            .first_call_only(original_request.first_tool_call_only)
+            .noting_unreadable_calls(original_request.fails_on_unreadable_call());
         let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         // Complete token decoding, including bytes and a partial stop match, as
         // on the older path; the text it releases is the last token's.
@@ -261,6 +304,14 @@ impl ResponseProcessor {
             choice: index as u32,
         };
         reader.end(engine_finish(reason), who, &mut events)?;
+        let failure = reader.unreadable_call().and_then(|unreadable| {
+            original_request
+                .wire
+                .unreadable_tool_call_failure(unreadable, reason == "length")
+        });
+        if let Some(failure) = failure {
+            return Err(ChoiceFailure::ToolCallFormat(failure));
+        }
         let reasoning_tokens =
             finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);
         let mut choice = adapt::chat::message(index as u32, &events);
@@ -471,7 +522,26 @@ impl ResponseProcessor {
                     choices.push(choice);
                     parsed_reasoning_tokens += reasoning_tokens;
                 }
-                Ok(Err(e)) => {
+                // The model's own doing, answered as the wire's contract
+                // answers it: one such choice fails the whole request. The
+                // engine completed the answer, so the failure carries the
+                // engine's counters for the request's settlement, as the
+                // stream settles them on the same failure. Its one line is
+                // written here, and the answer says so, so the layers above
+                // write no second one at ERROR for an outcome that is the
+                // model's.
+                Ok(Err(ChoiceFailure::ToolCallFormat(failure))) => {
+                    failure.warn(&dispatch.request_id, model);
+                    let mut response = failure.response();
+                    response.extensions_mut().insert(ReportedRefusal);
+                    response_formatting::TokenCounts::of_collected(
+                        &all_responses,
+                        chat_request.expected_choices,
+                    )
+                    .carry_on(&mut response);
+                    return Err(response);
+                }
+                Ok(Err(ChoiceFailure::Read(e))) => {
                     return Err(error::internal_error(
                         "process_choice_failed",
                         format!("Failed to process choice {index}: {e}"),
@@ -1704,7 +1774,7 @@ fn object_inputs(content: &mut [messages::ContentBlock], function: &'static str)
 #[cfg(test)]
 mod tool_use_input_tests {
     use serde_json::json;
-    use symphony::{adapt, Event, Events, FinishReason, Text};
+    use symphony::{adapt, CallEnd, Event, Events, FinishReason, Text};
 
     use super::{messages, object_inputs, tool_use_input};
 
@@ -1764,6 +1834,7 @@ mod tool_use_input_tests {
             events.push(Event::ToolCallEnd {
                 index: 0,
                 source: Text::new("", 0),
+                ended: CallEnd::Closed,
             });
             events.push(Event::Finish {
                 reason: FinishReason::ToolCalls,

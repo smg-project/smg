@@ -21,7 +21,8 @@ use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
     event::{
-        release_between, runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text,
+        release_between, runs_at, CallEnd, DropReason, Event, Events, FinishReason,
+        MalformedReason, Text,
     },
     format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
@@ -134,7 +135,15 @@ struct Pending {
 struct Stay {
     begun: bool,
     held: Vec<Held>,
+    /// A closing tag being read between a block's calls, for a syntax whose calls are tags
+    /// ([`Engine::wrapping_tags`]): the bytes after its `<`, held while they can still spell
+    /// one, wherever the deltas cut them.
+    tag: Option<String>,
 }
+
+/// The bytes of a closing tag a wrapping stay holds while it reads one between a block's calls
+/// ([`Engine::wrapping_tags`]): a longer run that has not closed is the stay's text.
+const HELD_TAG: usize = 128;
 
 /// Bytes a stay holds, in the output's order: a trimmed stay's run after its last text that is not
 /// whitespace, a content stay's lead before its first, or a wrapping stay's run after its last.
@@ -218,6 +227,8 @@ pub(crate) fn is_strip_space(c: char) -> bool {
 /// What the engine asks of a call syntax's assembler, whichever the syntax: the region's bytes as
 /// they arrive, the table's ignored terminal inside the region, and the two endings. Each syntax
 /// implements it over its own assembler, so the policy of what ends a call lives with the syntax.
+/// An assembler ends every call as [`CallEnd::Closed`]: how the region ended is the engine's to
+/// know, and the engine writes the word on the ends an ending pushes ([`Engine::close_call`]).
 /// An engine moves between threads with its request, so the assembler does too.
 pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// Takes the next bytes of the region and pushes the events they complete; the number of bytes
@@ -290,6 +301,18 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// the answer says whether the terminal's bytes were taken as the call's end (`ToolCallEnd`'s
     /// source); otherwise the engine drops them as the region's.
     fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool;
+
+    /// Whether the end of the output is the call's own end: for a syntax whose call has no
+    /// delimiter to close it (the forced arguments, which are the whole output), a value that
+    /// is whole where the bytes end, as a number or a literal the bytes end on is. Asked before
+    /// the stop or the cut ends the call, for the word its end carries ([`CallEnd`]): such a
+    /// call was not left open, and its end says `Closed`. `cut` says the output's end is a cut
+    /// and not the model's own stop: a value that more bytes could have continued (a number)
+    /// is whole at the stop alone. Every other syntax closes a call with bytes of its own, and
+    /// one the output's end reaches before them is open.
+    fn ends_with_the_output(&self, _cut: bool) -> bool {
+        false
+    }
 
     /// The stream was cut inside the region: nothing is closed for the client, so arguments cut
     /// short never look complete.
@@ -951,7 +974,148 @@ impl Engine {
                     self.wrapping(rest, MalformedReason::TextAfterTheArguments, out);
                 }
             }
+            Emits::Wrapper if self.reads_tags_between_calls() => self.wrapping_tags(text, out),
             Emits::Wrapper => self.wrapping(text, MalformedReason::TextBetweenCalls, out),
+        }
+    }
+
+    /// Whether the syntax's calls are tags, so that a closing tag between a block's calls is
+    /// read as one ([`Self::wrapping_tags`]): the XML syntax's.
+    fn reads_tags_between_calls(&self) -> bool {
+        matches!(self.format.call_syntax(), Some(CallSyntax::Xml))
+    }
+
+    /// Text between a block's calls of a syntax whose calls are tags. A closing tag there, with
+    /// no text before it since the last call, names nothing open, since no call is, and is
+    /// ignored ([`Self::stray_close`]); everything else is text where the template only wraps
+    /// ([`Self::wrapping`]), as under any syntax, a closing tag after text of the stay
+    /// included: the model is writing prose there, and a tag in it is the prose's. A tag is
+    /// read across pieces: from its `</` the bytes are held while they can still spell one, up
+    /// to [`HELD_TAG`] of them, so where the deltas cut it changes nothing, and bytes that
+    /// spell none after all, or run past the bound, are the stay's text, in the run they stand
+    /// in.
+    fn wrapping_tags<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
+        let why = MalformedReason::TextBetweenCalls;
+        // Where the text of this piece not yet handed on starts, and where the tag being read
+        // began in it: a tag begun in an earlier piece has every byte so far held.
+        let mut plain = 0;
+        let mut began: Option<usize> = None;
+        for (at, c) in text.char_indices() {
+            let spells = match self.stay.tag.as_mut() {
+                None => {
+                    if c == '<' {
+                        self.stay.tag = Some(String::new());
+                        began = Some(at);
+                    }
+                    continue;
+                }
+                Some(tag) => {
+                    let spells = if tag.is_empty() {
+                        c == '/'
+                    } else {
+                        tagged::xml::is_tag_byte(c)
+                    };
+                    if spells {
+                        tag.push(c);
+                    }
+                    spells
+                }
+            };
+            if spells {
+                // A run past the bound is no tag's name: its bytes are the stay's text from
+                // here. Begun in this piece they stay in the run they stand in; held from an
+                // earlier one they go on as text.
+                if self
+                    .stay
+                    .tag
+                    .as_ref()
+                    .is_some_and(|tag| tag.len() > HELD_TAG)
+                {
+                    let tag = self.stay.tag.take().unwrap_or_default();
+                    if began.take().is_none() {
+                        self.wrapping(Cow::Owned(format!("<{tag}")), why, out);
+                        plain = at + c.len_utf8();
+                    }
+                }
+                continue;
+            }
+            let tag = self.stay.tag.take().unwrap_or_default();
+            let here = began.take();
+            let name = tag.strip_prefix('/').unwrap_or_default();
+            if c == '>' && !name.is_empty() && !name.contains('/') {
+                // A whole closing tag. After text of the stay it is the prose's, where the
+                // model wrote it: begun in this piece it stays in the run it stands in, begun
+                // in an earlier one the bytes held go on as text.
+                let before = here.unwrap_or(plain);
+                let in_prose =
+                    self.stay.begun || text[plain..before].contains(|c: char| !c.is_whitespace());
+                if in_prose {
+                    if here.is_none() {
+                        self.wrapping(Cow::Owned(format!("<{tag}>")), why, out);
+                        plain = at + c.len_utf8();
+                    }
+                    continue;
+                }
+                // With no text before it since the last call it names nothing open: the
+                // whitespace before it goes on, the tag is ignored.
+                if plain < before {
+                    self.wrapping(part(&text, plain..before), why, out);
+                }
+                self.stray_close(format!("<{tag}>"), out);
+                plain = at + c.len_utf8();
+                continue;
+            }
+            // No closing tag after all. Begun in this piece, its bytes stay in the run they
+            // stand in; begun in an earlier one, the bytes held are the stay's text.
+            if here.is_none() {
+                self.wrapping(Cow::Owned(format!("<{tag}")), why, out);
+                plain = at;
+            }
+            if c == '<' {
+                self.stay.tag = Some(String::new());
+                began = Some(at);
+            }
+        }
+        // What the piece ends on: text, or a tag still being read, whose bytes are held.
+        let end = match (&self.stay.tag, began) {
+            (Some(_), Some(began)) => began,
+            (Some(_), None) => plain,
+            (None, _) => text.len(),
+        };
+        if plain < end {
+            self.wrapping(part(&text, plain..end), why, out);
+        }
+    }
+
+    /// A closing tag between a block's calls of the XML syntax, with no text before it since
+    /// the last call: it names nothing open, since no call is, and is ignored as that syntax
+    /// ignores one between a call's members. It is counted by a
+    /// `Malformed { StrayClosingTag }` event of no bytes, the reason the XML syntax alone
+    /// gives, and its own bytes leave as a malformed call's, never content. The run the stay
+    /// held before it is the template's spacing around a tag, dropped as at any tag.
+    fn stray_close(&mut self, tag: String, out: &mut Events) {
+        self.end_stay(out);
+        out.push(Event::Malformed {
+            text: self.tokens.text(""),
+            why: MalformedReason::StrayClosingTag,
+        });
+        out.push(Event::Dropped {
+            text: self.tokens.text(tag),
+            why: DropReason::MalformedCall,
+        });
+    }
+
+    /// The bytes of a tag a wrapping stay was still reading when the stay ends or a marker the
+    /// table ignores arrives: they spelled no closing tag, and are the stay's text. Only a
+    /// wrapping stay of the XML syntax ever holds one, so its callers ask first, and every
+    /// other stay and table pays one test of a field for it.
+    fn release_held_tag(&mut self, out: &mut Events) {
+        if let Some(tag) = self.stay.tag.take() {
+            self.wrapping(
+                Cow::Owned(format!("<{tag}")),
+                MalformedReason::TextBetweenCalls,
+                out,
+            );
         }
     }
 
@@ -1028,6 +1192,9 @@ impl Engine {
     /// The run the stay held is the state's text: the whitespace is shown, and an ignored
     /// terminal among it is dropped in its place.
     fn release_stay(&mut self, out: &mut Events) {
+        if self.stay.tag.is_some() {
+            self.release_held_tag(out);
+        }
         if self.stay.held.is_empty() {
             return;
         }
@@ -1046,6 +1213,9 @@ impl Engine {
     /// after its last text as much as a lead no text followed, and the run a wrapping stay held
     /// after its last text, the template's spacing before the terminal that ended the stay.
     fn end_stay(&mut self, out: &mut Events) {
+        if self.stay.tag.is_some() {
+            self.release_held_tag(out);
+        }
         // A content or reasoning stay's run is whitespace the format treats as structural; a
         // wrapping stay's is the template's wrapping, as it is before the stay's first text.
         let spacing = match self.emits() {
@@ -1148,6 +1318,10 @@ impl Engine {
             return;
         }
         if self.format.ignored(index) {
+            // A tag a wrapping stay was reading ends at the marker: its bytes came before.
+            if self.stay.tag.is_some() {
+                self.release_held_tag(out);
+            }
             let text = self.format.terminal_text(index).to_string();
             if self.call_holds_markers() {
                 self.text(Cow::Owned(text), out);
@@ -1334,6 +1508,8 @@ impl Engine {
         }
         let mut finished: Events<'static> = std::mem::take(&mut self.scratch);
         let mut as_marker = closed == Closed::Marker;
+        // Asked before the ending takes the call: whether the output's end is the call's own.
+        let own_end = closed != Closed::Marker && call.ends_with_the_output(closed == Closed::Cut);
         let taken = match closed {
             Closed::Marker => call.close(terminal, &mut finished),
             Closed::Stop => {
@@ -1352,13 +1528,27 @@ impl Engine {
         if taken {
             self.region.fed += terminal.len();
         }
+        // How a call this ending closes ended ([`CallEnd`]): the model's own doing where its
+        // marker closed the region, the stop stands for the marker, or the output's end is the
+        // end of a call whose syntax has no delimiter and whose value is whole there; else the
+        // stop or the cut that found it open. A call that ended inside the region ended before
+        // this, closed.
+        let ended = match closed {
+            Closed::Marker => CallEnd::Closed,
+            Closed::Stop | Closed::Cut if own_end => CallEnd::Closed,
+            Closed::Stop if as_marker => CallEnd::Closed,
+            Closed::Stop => CallEnd::Stop,
+            Closed::Cut => CallEnd::Cut,
+        };
         let closed_by_marker = |mut event: Event<'static>| {
-            if as_marker {
-                if let Event::Malformed { why, .. } = &mut event {
-                    if *why == MalformedReason::UnterminatedRegion {
-                        *why = MalformedReason::BlockWithoutACompleteCall;
-                    }
+            match &mut event {
+                Event::Malformed { why, .. }
+                    if as_marker && *why == MalformedReason::UnterminatedRegion =>
+                {
+                    *why = MalformedReason::BlockWithoutACompleteCall;
                 }
+                Event::ToolCallEnd { ended: how, .. } => *how = ended,
+                _ => {}
             }
             event
         };
@@ -1671,7 +1861,7 @@ mod tests {
         formats::{glm, inkling, llama4, mistral, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
-        testing::{arguments_of, bytes, malformed, weather_declared},
+        testing::{arguments_of, bytes, endings, losses, malformed, weather_declared},
     };
 
     /// GLM's last call, its closing marker not written: the stop token that would end it is
@@ -2057,6 +2247,47 @@ mod tests {
         }
     }
 
+    /// Every call's end says who ended it. The model's own closing marker closes it, and so
+    /// does the stop where the table's stop row stands for the marker the stop decoder hides;
+    /// without the row the stop found the call open, whatever the syntax closed for the model;
+    /// the token limit and an abort cut it. Only the call the output's end found open ends as
+    /// stopped or cut: the call before it closed at its own marker.
+    #[test]
+    fn a_calls_end_says_who_ended_it() {
+        let whole = format!("{LAST_CALL}</tool_call>");
+        for finish in [EngineFinish::Stop, EngineFinish::Length] {
+            let events = run(glm(), &whole, finish);
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        }
+        let with_row = run(glm().closes_at_stop("call"), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(endings(&with_row), [(0, CallEnd::Closed)]);
+        assert_eq!(losses(&with_row), []);
+        let stopped = run(glm(), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(endings(&stopped), [(0, CallEnd::Stop)]);
+        // The syntax closed the object for the model and said so: a repair, no call lost.
+        assert_eq!(
+            malformed(&stopped),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        assert_eq!(losses(&stopped), []);
+        for finish in [
+            EngineFinish::Length,
+            EngineFinish::Abort,
+            EngineFinish::Other("content_filter".to_string()),
+        ] {
+            for format in [glm(), glm().closes_at_stop("call")] {
+                let events = run(format, LAST_CALL, finish.clone());
+                assert_eq!(endings(&events), [(0, CallEnd::Cut)], "{finish:?}");
+                assert_eq!(losses(&events), [MalformedReason::UnterminatedRegion]);
+            }
+        }
+        let two = format!("{whole}{LAST_CALL}");
+        let events = run(glm(), &two, EngineFinish::Length);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Cut)]);
+        let events = run(glm(), &two, EngineFinish::Stop);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Stop)]);
+    }
+
     #[test]
     fn a_closing_marker_the_model_wrote_ends_the_call_with_or_without_the_row() {
         let output = format!("{LAST_CALL}</tool_call><tool_call>get_weather</tool_call>");
@@ -2095,6 +2326,7 @@ mod tests {
                         Event::ToolCallEnd { index, .. } => Event::ToolCallEnd {
                             index: *index,
                             source: Text::uncounted(""),
+                            ended: CallEnd::Closed,
                         },
                         event => event.clone(),
                     })

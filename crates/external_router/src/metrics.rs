@@ -155,6 +155,11 @@ pub mod metrics_labels {
     /// constraint (a grammar it could not keep to): the request's outcome,
     /// not the worker's failure; the client reads a 422 `constraint_failed`.
     pub const ERROR_CONSTRAINT: &str = "constraint_error";
+    /// The model wrote a tool call the gateway could not read, on a wire whose
+    /// contract fails the request on one (MiniMax's): the request's outcome,
+    /// not the worker's failure; the client reads a 400
+    /// `invalid_tool_call_format`, whose code is this label.
+    pub const ERROR_INVALID_TOOL_CALL_FORMAT: &str = "invalid_tool_call_format";
 
     // Router error reasons: the cause behind an `error_type`, as far as the
     // router that counted the error could tell it. The set is fixed; a

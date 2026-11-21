@@ -153,5 +153,5 @@ pub(crate) use self::{
         reasoning_open, reasoning_open_for, set_aside_by_the_registry, table_label_read,
         PromptReplay, Reading,
     },
-    reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
+    reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader, UnreadableCall},
 };

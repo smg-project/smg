@@ -435,7 +435,9 @@ What the syntax says, and what the assembler does with it:
   same rule (their sections): no assembler of this module closes a call its syntax refused bytes
   in, with one reading of their own: a bare closing tag between members carries no member the
   client could lose, so there it is refused and counted but costs the call nothing, where this
-  assembler reads it as any tag out of its place.
+  assembler reads it as any tag out of its place. The keyed and Qwen tagged assemblers count it
+  as a tag out of its place all the same (`TagOutOfPlace`); the XML assembler alone counts it
+  under a reason of its own (`StrayClosingTag`, which says no call lost its bytes).
 - **Every byte of the call lands in exactly one event.**
 
 ## The XML assembler (`tagged::xml`)
@@ -476,24 +478,79 @@ What the syntax says, and what the assembler does with it:
   most) and never closes, the closing tag of the element directly around it following, is
   written `[]` or `{}` too: a closing tag is no value of a list or an object, so only the
   element's own close is missing. Whitespace it held is dropped there, though under the
-  element's own closing tag it is the element's text. One `Malformed { TagCutShort }` event
-  of no bytes stands before its fragment, nothing is refused, and the call stays whole.
-  The tag stays the
-  element's text under a declared string or integer, under an element with no declaration,
-  under a declared container that holds text already or whose empty value would nest past the
-  bound, and when it names an element further out; the call's own end closes no element so.
+  element's own closing tag it is the element's text. One `Malformed { OpenAtTheParentsClose }`
+  event of no bytes stands before its fragment, nothing is refused, and the call stays whole;
+  where its empty value would nest past the bound, the tag stays the element's text.
+- **A closing tag behind the separator is structure, whatever it names.** The template writes
+  its separator before every tag it writes and never inside a value, so inside an element that
+  holds text, or nothing yet, a closing tag is the element's text unless the separator stands
+  right before it. Behind the separator it is read by what it names. The element itself: its
+  close, as without the separator. An open element further out: the model left out the closes
+  of what it opened inside, and the tag closes them all, innermost first, then the element it
+  names (`Assembler::close_through`): an element that holds text is written with it, typed as
+  its own close would type it, an element with nothing in it is the empty value of its type,
+  a container closes with the members it has, and what follows the tag is read in the
+  container the model went back to. One `Malformed { OpenAtTheParentsClose }` event of no
+  bytes stands before the first fragment, and nothing is refused. Nothing open: what follows
+  the tag says how it reads, so the tag is held, with at most 64 bytes of whitespace behind
+  it, for the next other byte (`Assembler::settle_stray_close`). A tag behind it (the
+  separator comes, or the call's end): it stands for the element's own close, misnamed, and
+  closes it the same way behind one `Malformed { MisnamedClosingTag }` event of no bytes
+  (`Assembler::close_left_open`). Text behind it: it stood in the middle of the value, so it
+  is ignored (`StrayClosingTag`) and the value goes on, the whitespace part of it. Both are
+  readings of what the model meant, each counted under its own reason. Three closing tags
+  behind a separator stay the element's text: one that pairs with an opening tag the value
+  took as its text behind a separator (tags the model is writing inside a declared string; a
+  tag with attributes counts, and the value's own closing tag pairs with a tag of its own
+  name first); any one that names nothing open once the value took such a tag, from where
+  only the value's own closing tag behind a separator closes it; and any closing tag but its
+  own once a value held for its close has the start of a tag in its text, where what the
+  model meant is no longer known. Between elements, where the syntax
+  has only tags, the separator decides nothing: a closing tag that names an open element
+  further out closes through to it, and one that names nothing open is ignored (below).
   Nothing is taken from a value: the template writes it directly between the tags, with no
   escaping.
+- **A string whose close is missing ends at the next parameter's tag.** Inside a parameter of
+  the call itself that the tool types `string` and nothing else, an opening tag behind the
+  separator that names a parameter the tool declares and the call has not given is that
+  parameter: a string has no child element, so the string ends there, behind one
+  `Malformed { OpenAtTheNextParameter }` event of no bytes, and what streamed is the string
+  whole (`Assembler::ends_a_string`). Nothing of the string is held and nothing is taken
+  back. Where the named parameter's type constrains its text (an integer, a number, a
+  boolean, a null, an enumerated value), the tag ends the string only where a value of that
+  type stands behind it. A number begins with a digit, behind a sign or not, and is known
+  there. A boolean or a null is one of the words the template writes for it, and an
+  enumerated value one of the schema's values: whole, ended by whitespace, a tag or the
+  separator, so a longer word that only begins like one (`Truex`) is none. The tag is held
+  for that, with at most 64 bytes of whitespace and at most 64 bytes of the value behind it
+  (two for a number, the word and one byte for a boolean or a null, an enumerated value's
+  length and one byte), and anything else behind it leaves the tag the string's text
+  (`Assembler::weigh_candidate`); a parameter typed `string`, or with no such type, cannot be
+  told apart that way and ends the string at its tag. The call keeps one bit per declared
+  property for the parameters it has given (`Declared::place`), for the first 64. A property
+  past them is never taken for the next parameter, and a string past them is never ended at
+  a tag: its own closing tag after all could not be seen to undo the reading. Every other
+  opening tag behind a separator
+  stays the string's text: one that names no parameter of the tool, one that names a
+  parameter the call gave already, and one with attributes or any tail after its name, which
+  is no whole tag. Since nothing sent can be taken
+  back, the rest of the call has to bear the reading out: the string's own closing tag after
+  all, another repair in the call, a parameter the tool does not declare or one given twice,
+  or an end other than the call's own closing tag makes the call no whole call, said once by
+  `Malformed { UnconfirmedStringEnd }`, a reason that loses a call. The model's stop inside
+  such a call says that alone: no `OpenAtTheStop` announces a close the call does not get.
 - **A top-level null is never written.** The template leaves an argument whose value is `None`
   out (`for k, v in arguments.items() if v is not none`), so no output carries one; the
   parity test counts that as a corpus class.
 - **A tag is `<`, a name and `>`**, the name any run of characters without whitespace or angle
   brackets, with a leading `/` for a closing tag. A `<` followed by anything else is
   text, so a comparison in a value stays text; a `<` that does spell a tag is one, inside a
-  value too, as every marker parser reads it. Inside a leaf, a tag other than the leaf's own
-  closing tag is the leaf's text; a closing tag that matches nothing open is refused, as is text
-  where the syntax has tags (`tagged::refuse`: a `Malformed` event of no bytes counts it, the bytes
-  leave as `Dropped { MalformedCall }`, never content).
+  value too, as every marker parser reads it. Inside a leaf, an opening tag is the leaf's
+  text, and a closing tag other than the leaf's own is too, unless the separator stands before
+  it (above). Between elements a closing tag that names nothing open is ignored, counted by a
+  `Malformed { StrayClosingTag }` event of no bytes, and text where the syntax has tags is
+  refused (`tagged::refuse`: a `Malformed` event of no bytes counts each, the bytes leave as
+  `Dropped { MalformedCall }`, never content).
 - **The name ends at its quote**, and the invoke tag at `>`; text between the two is refused,
   as for DSML. An invoke with no name starts no call, and it is refused whole, the terminal that
   ended it included.
@@ -503,20 +560,26 @@ What the syntax says, and what the assembler does with it:
 - **Two endings.** `Assembler::close` is the invoke's closing tag (`INVOKE_CLOSE`, the one
   terminal a started call's end carries), or the next invoke's opening or the block's close,
   which end the call with no bytes of their own: every open container and the arguments object
-  are closed when the syntax read the call whole; a leaf never written and an element without a
-  child are refused, as is a tag the end cut short between elements, and a call inside which
+  are closed when the syntax read the call whole, and so is an element the end finds open
+  holding text, or nothing yet: the marker is the model's own end of the call, so the element
+  is written with what it holds, as the closing tag of an element around it writes it, behind
+  one `Malformed { OpenAtTheParentsClose }` event of no bytes. A tag the end cut short is
+  refused, between elements on its own and inside an element with the element, and so is a
+  value held for its close with the start of a tag in its text; a call inside which
   the syntax refused bytes, there or earlier (a tail after the name's quote, text where it has
   tags, a tag out of its place or cut short, the nesting past the bound; not a closing tag that
-  names nothing open, which is refused and counted but carries no member the client could
-  lose, so it costs the call nothing, where one that names an open element further out, an
-  inner close left out, is out of its place, since what follows it would land in the wrong
-  container), gets no close, its open containers included (the attributed assembler's rule):
+  names nothing open, which is ignored and counted but carries no member the client could
+  lose, so it costs the call nothing), gets no close, its open containers included (the
+  attributed assembler's rule):
   the
   fragments stand, a strict JSON prefix and no whole value, the whitespace carried leaves as
   wrapping, and the stop announces no close for it; a streamed string innermost is closed first,
   the start of a tag held as its text, under one `Malformed { OpenAtTheMarker }` event of no
   bytes before its quote (`tagged::left_open`), since the model ended the call and the
-  value's bytes are complete, then the containers above it. An invoke that
+  value's bytes are complete, then the containers above it. The stream's stop inside the
+  invoke (`Assembler::stop`) ends the call the same way but for the element held open: output
+  that ends inside a value says nothing of the value's end, so a leaf never written and an
+  element without a child are refused there, and the call gets no close. An invoke that
   named no call takes whichever terminal ended it, so that it is
   refused the same way however it ended. `Assembler::finish` is a stream that was
   cut: nothing is closed, and a call that started still ends, with no bytes of its own, as

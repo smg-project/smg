@@ -2588,7 +2588,7 @@ fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Ev
                     }
                 }
             }
-            Event::ToolCallEnd { index, source } => {
+            Event::ToolCallEnd { index, source, .. } => {
                 assert!(
                     started.contains(index),
                     "{}: before the call's start",
@@ -2628,15 +2628,22 @@ fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Ev
             Event::Malformed { text, why } => {
                 // The word of a call, or a string in it, that the stream's stop closed, or of a
                 // string the call's closing marker closed: the fragment right after it may close
-                // the string with no bytes behind it, and the call's arguments at its end are
-                // whole JSON, which the end checks as for a call no word was said about.
+                // the string with no bytes behind it.
                 let stops_word = matches!(
                     why,
                     MalformedReason::OpenAtTheStop | MalformedReason::OpenAtTheMarker
                 ) && text.text.is_empty();
                 after_the_stops_word = stops_word;
                 for index in &started {
-                    if !ended.contains(index) && !malformed_inside.contains(index) && !stops_word {
+                    // A word that loses no call (a string or an element the syntax closed where
+                    // the model left its close out, a closing tag it ignored or read as a
+                    // value's own) leaves the call whole: its arguments at its end are whole
+                    // JSON, which the end checks as for a call no word was said about. Only a
+                    // reason that loses a call excuses arguments that are none.
+                    if !ended.contains(index)
+                        && !malformed_inside.contains(index)
+                        && why.loses_a_call()
+                    {
                         malformed_inside.push(*index);
                     }
                     if !ended.contains(index)

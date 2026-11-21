@@ -97,6 +97,12 @@ pub(crate) fn error_type_for_response(response: &Response) -> &'static str {
     if code == CONSTRAINT_FAILED_CODE {
         return metrics_labels::ERROR_CONSTRAINT;
     }
+    // A tool call the reader could not read, on a wire whose contract fails
+    // the request on one (`wire::UnreadableToolCallFailure`): the
+    // request's outcome, whose code is the label itself.
+    if code == metrics_labels::ERROR_INVALID_TOOL_CALL_FORMAT {
+        return metrics_labels::ERROR_INVALID_TOOL_CALL_FORMAT;
+    }
     // The request's media failed (see `TonicStatusExt::media_fault`,
     // `multimodal::processing_failed_response`): the request's error whichever
     // status tells the client what to do about it.
@@ -232,6 +238,37 @@ mod tests {
         assert_eq!(error_type_for_response(&response), "constraint_error");
         let other = error::create_error(StatusCode::UNPROCESSABLE_ENTITY, "other", "other");
         assert_eq!(error_type_for_response(&other), "internal_error");
+    }
+
+    /// A tool call the reader could not read, answered as the wire's contract
+    /// answers it, counts under the contract's own label and the
+    /// `bad_response` reason; a 400 of another making keeps the status's
+    /// class.
+    #[test]
+    fn an_unreadable_tool_call_counts_under_the_contracts_label() {
+        use crate::routers::{
+            error,
+            grpc::{regular::symphony::UnreadableCall, wire::minimax::InvalidToolCallFormat},
+        };
+
+        for (unreadable, at_limit) in [
+            (UnreadableCall::Incomplete, true),
+            (UnreadableCall::Incomplete, false),
+            (UnreadableCall::Malformed, false),
+        ] {
+            let response = InvalidToolCallFormat::new(unreadable, at_limit).response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                error_type_for_response(&response),
+                metrics_labels::ERROR_INVALID_TOOL_CALL_FORMAT
+            );
+            assert_eq!(
+                error_reason_for_response(&response),
+                metrics_labels::REASON_BAD_RESPONSE
+            );
+        }
+        let other = error::bad_request("other", "other");
+        assert_eq!(error_type_for_response(&other), "validation_error");
     }
 
     /// A failure of the request's media counts as the request's error on both

@@ -3,8 +3,10 @@
 //!
 //! The provider profile (`openai_protocol::profile`) is the request-side
 //! contract: what a vendor's requests may say and how they are normalized.
-//! This module is the response side: the shape of a chat stream and the
-//! re-slicing of a relayed stream. A [`Wire`] is selected from the profile
+//! This module is the response side: the shape of a chat stream, the
+//! re-slicing of a relayed stream, and the one answer a vendor's contract
+//! fails instead of delivering (MiniMax's, for a tool call the reader could
+//! not read). A [`Wire`] is selected from the profile
 //! alone ([`Wire::of`]): in `ChatResponseSpec::for_request` for the stream,
 //! and at the HTTP relay for its re-chunking. It is a fieldless `Copy` enum,
 //! so carrying it costs nothing, and every vendor rule is one `match` whose
@@ -14,15 +16,21 @@
 //!
 //! One file per vendor holds that vendor's rules: [`deepseek`] and
 //! [`minimax`]. The OpenAI wire has no file: it is the unconditional code at
-//! each hook. Outside the object: the request side (the profile), the error
-//! bodies and the SSE error events inside a 200 stream.
+//! each hook. Outside the object: the request side (the profile), and the
+//! gateway's own error bodies and SSE error events inside a 200 stream.
 
 use openai_protocol::{common::StreamOptions, profile::ProviderProfile};
 
-use crate::routers::common::sse_rechunk::RechunkPolicy;
+use crate::routers::{common::sse_rechunk::RechunkPolicy, grpc::regular::symphony::UnreadableCall};
 
 pub(crate) mod deepseek;
 pub(crate) mod minimax;
+
+/// How a wire's contract ends a request whose answer holds a tool call the
+/// reader could not read ([`Wire::unreadable_tool_call_failure`]): the
+/// failure's status, body and stream frame. One wire has such a contract and
+/// defines the type; the code every wire shares names it by this.
+pub(crate) type UnreadableToolCallFailure = minimax::InvalidToolCallFormat;
 
 /// The vendor whose shapes a request's successful answer takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +78,49 @@ impl Wire {
     pub(crate) fn rechunk_policy(self) -> Option<RechunkPolicy> {
         match self {
             Self::Minimax => Some(minimax::RECHUNK),
+            Self::OpenAi | Self::DeepSeek => None,
+        }
+    }
+
+    /// Whether the vendor's contract fails a request whose answer, read by
+    /// `table`, holds a tool call the reader could not read, in place of
+    /// ending it as an answer: a whole answer is the contract's refusal, and
+    /// a stream, which has sent the call as far as the model wrote it, ends
+    /// with the contract's event and no finish. MiniMax's, for the answers
+    /// its M3 table reads ([`minimax::InvalidToolCallFormat`]). The spec asks once per choice's
+    /// reader, for a request that expects tool calls
+    /// (`ChatResponseSpec::fails_on_unreadable_call`).
+    pub(crate) fn fails_on_unreadable_tool_call(self, table: &str) -> bool {
+        match self {
+            Self::Minimax => minimax::fails_on_unreadable_tool_call(table),
+            Self::OpenAi | Self::DeepSeek => false,
+        }
+    }
+
+    /// Whether the wire's contract has that rule for any table: what the
+    /// spec asks before it looks at a request for the tool calls it expects,
+    /// so a request on a wire with no rule pays nothing for it.
+    pub(crate) fn has_unreadable_tool_call_rule(self) -> bool {
+        match self {
+            Self::Minimax => true,
+            Self::OpenAi | Self::DeepSeek => false,
+        }
+    }
+
+    /// The failure the wire's contract ends such a request with
+    /// ([`UnreadableToolCallFailure`]), for the reader's verdict on an output
+    /// the engine ended at the token limit or elsewhere. `None` on a wire
+    /// whose contract has no such rule.
+    pub(crate) fn unreadable_tool_call_failure(
+        self,
+        unreadable: UnreadableCall,
+        ended_at_limit: bool,
+    ) -> Option<UnreadableToolCallFailure> {
+        match self {
+            Self::Minimax => Some(minimax::InvalidToolCallFormat::new(
+                unreadable,
+                ended_at_limit,
+            )),
             Self::OpenAi | Self::DeepSeek => None,
         }
     }
@@ -241,5 +292,25 @@ mod tests {
             );
         }
         assert_eq!(Wire::Minimax.rechunk_policy(), Some(minimax::RECHUNK));
+    }
+
+    /// Only MiniMax's wire fails a request on a tool call the reader could
+    /// not read, and only for an answer its M3 table reads; every other wire
+    /// delivers the answer as its table read it, the M3 table's included.
+    #[test]
+    fn only_minimaxs_wire_fails_a_request_on_an_unreadable_tool_call() {
+        use symphony::formats::Table;
+
+        for wire in [Wire::OpenAi, Wire::DeepSeek, Wire::Minimax] {
+            assert_eq!(
+                wire.fails_on_unreadable_tool_call(Table::MinimaxM3.name()),
+                wire == Wire::Minimax,
+                "{wire:?}"
+            );
+            assert!(
+                !wire.fails_on_unreadable_tool_call(Table::MinimaxM2.name()),
+                "{wire:?}"
+            );
+        }
     }
 }
