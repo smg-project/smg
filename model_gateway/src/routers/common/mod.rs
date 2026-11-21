@@ -380,7 +380,9 @@ pub mod bench_support {
     pub struct EngineObject(EngineObjectOf);
 
     impl EngineObject {
-        /// The object a gateway's start builds for `config` over `registry`.
+        /// The object a gateway's start builds for `config` over `registry`,
+        /// handed `loads`, the load feed the monitor would publish, as the
+        /// start hands it the monitor's.
         ///
         /// # Errors
         ///
@@ -388,7 +390,11 @@ pub mod bench_support {
         /// refuses, and a policy the engine does not decide whole yet: the
         /// routers would keep their classic placement pass, and a cell
         /// named for the object would time that one.
-        pub fn of(config: &RouterConfig, registry: &Arc<WorkerRegistry>) -> Result<Self, String> {
+        pub fn of(
+            config: &RouterConfig,
+            registry: &Arc<WorkerRegistry>,
+            loads: Option<LoadReceiver>,
+        ) -> Result<Self, String> {
             let picked = RouterConfig {
                 policy_controller: true,
                 ..config.clone()
@@ -402,10 +408,23 @@ pub mod bench_support {
                     config.policy.name()
                 ));
             }
-            Ok(Self(EngineObjectOf::own(
-                started.engine,
-                Arc::clone(registry),
-            )))
+            let object = EngineObjectOf::own(started.engine, Arc::clone(registry));
+            if let Some(loads) = loads {
+                object.read_loads(loads);
+            }
+            Ok(Self(object))
+        }
+
+        /// How many times the reports of `model`'s workers on `route` were
+        /// converted for the engine's records: once for each load snapshot
+        /// a decision converted the list under. Zero for a pool no request
+        /// was routed over, and under a document that reads no report.
+        pub fn conversions(registry: &WorkerRegistry, model: &str, route: Route) -> u64 {
+            registry
+                .get_routing_snapshot(model)
+                .pool_members_cell(route.pool())
+                .get()
+                .map_or(0, |members| members.conversions())
         }
     }
 

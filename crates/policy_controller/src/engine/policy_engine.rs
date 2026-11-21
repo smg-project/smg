@@ -200,6 +200,15 @@ impl PoolMembers {
             .get_or_init(|| PoolRecords::new(&self.workers, spec, clock))
     }
 
+    /// How many times the list's reports were converted so far
+    /// ([`PoolRecords::conversions`]): zero for a list no decision made
+    /// records of. It makes none: what a bench counts against the snapshots
+    /// published, over a list its engine decides.
+    #[must_use]
+    pub fn conversions(&self) -> u64 {
+        self.records.get().map_or(0, PoolRecords::conversions)
+    }
+
     /// Every wire a worker of the list is dialed on, as the workers'
     /// registrations state it: read once a list, at the first call. A
     /// request that dials each of them may be sent to any worker of the

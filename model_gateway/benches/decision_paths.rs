@@ -61,8 +61,8 @@
 //! publishes pushed reports at most once in 20 milliseconds. `0`, the
 //! default, publishes once before the first request. The result line counts
 //! the snapshots published while the callers ran (`publications`), and on
-//! the `records` path the times the engine converted a pool's reports
-//! (`conversions`: at most one a snapshot a pool).
+//! the `records` and `engine` paths the times the engine converted a pool's
+//! reports (`conversions`: at most one a snapshot a pool).
 //!
 //! The result line's `alloc_bytes_per_decision` is what the callers'
 //! threads allocated in their timed decisions, by the allocator's own count
@@ -525,7 +525,7 @@ fn build(cell: &Cell) -> Built {
             Decider::Policies(policies)
         }
         None if cell.path == "engine" => {
-            Decider::Engine(EngineObject::of(&config, &registry).unwrap())
+            Decider::Engine(EngineObject::of(&config, &registry, receiver).unwrap())
         }
         None => Decider::Records(EngineOverRecords::of(&config, receiver).unwrap()),
     });
@@ -538,7 +538,11 @@ fn build(cell: &Cell) -> Built {
                 .iter()
                 .map(|model| engine.conversions(&registry, model, route))
                 .sum(),
-            Decider::Policies(_) | Decider::Engine(_) => 0,
+            Decider::Engine(_) => models
+                .iter()
+                .map(|model| EngineObject::conversions(&registry, model, route))
+                .sum(),
+            Decider::Policies(_) => 0,
         })
     };
     let (route, pair) = (cell.route, cell.pair);
