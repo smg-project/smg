@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::response::Response;
-use openai_protocol::responses::{ResponseUsage, ResponsesRequest, ResponsesUsage};
+use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
 use serde_json::json;
 use smg_mcp::McpServerBinding;
 use tracing::{debug, warn};
@@ -28,22 +28,46 @@ use crate::{
             sse::{sse_channel, SseSender},
         },
         grpc::{
-            common::responses::{
-                await_stream_startup, ensure_mcp_connection, load_history,
-                persist_response_if_needed, stream_startup_channel,
-                streaming::{ResponseStreamEventEmitter, StreamStartupSender},
-                tool_call_limit,
-                utils::{
-                    add_model_call_usage, iteration_exceeds_safety_limit, tool_call_allowance,
-                    tool_call_overflow, McpToolCallLimit,
+            common::{
+                response_formatting::TokenCounts,
+                responses::{
+                    await_stream_startup, ensure_mcp_connection, load_history,
+                    persist_response_if_needed, stream_startup_channel,
+                    streaming::{ResponseStreamEventEmitter, StreamStartupSender},
+                    tool_call_limit,
+                    utils::{
+                        add_model_call_usage, iteration_exceeds_safety_limit, tool_call_allowance,
+                        tool_call_overflow, McpToolCallLimit,
+                    },
+                    BackgroundStream, ReplayInto, ResponsesContext,
                 },
-                BackgroundStream, ReplayInto, ResponsesContext,
+                stages::RateLimitCell,
             },
+            context::LoadGuards,
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
     },
     tenant::storage_tenant,
 };
+
+/// Settle the iteration. The counts come with the terminal frame; a stream
+/// that ended before it brought none, and the reservation keeps its debit
+/// as the chat streams' does. A placed iteration that ended whole says its
+/// end with the same counts.
+async fn settle_iteration(
+    reservation: &RateLimitCell,
+    guards: Option<&LoadGuards>,
+    counts: Option<TokenCounts>,
+) {
+    if let Some(counts) = counts {
+        reservation.settle(counts.settlement()).await;
+        if let Some(placement) = guards.and_then(LoadGuards::placement) {
+            placement.completed(counts.prompt, counts.completion);
+        }
+    } else {
+        reservation.close_unsettled().await;
+    }
+}
 
 /// Serve Harmony Responses API with streaming (SSE)
 ///
@@ -278,7 +302,7 @@ async fn execute_mcp_tool_loop_streaming(
         // Execute pipeline and get stream + load guards, under the
         // iteration's tenant rate-limit reservation
         let startup_pending = startup.is_some();
-        let (execution_result, _load_guards, reservation, router_stops) = match ctx
+        let (execution_result, load_guards, reservation, router_stops) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
@@ -327,13 +351,7 @@ async fn execute_mcp_tool_loop_streaming(
         .await
         {
             Ok((result, counts)) => {
-                // The counts come with the terminal frame; a stream that
-                // ended before it brought none, and the reservation keeps
-                // its debit as the chat streams' does.
-                match counts {
-                    Some(counts) => reservation.settle(counts.settlement()).await,
-                    None => reservation.close_unsettled().await,
-                }
+                settle_iteration(&reservation, load_guards.as_ref(), counts).await;
                 result
             }
             Err(err_msg) => {
@@ -422,8 +440,8 @@ async fn execute_mcp_tool_loop_streaming(
                             "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
                         ),
                     });
-                    let mut final_response = emitter.finalize_failed(None, error.clone());
-                    final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
+                    let final_response =
+                        emitter.finalize_failed(usage_total.clone(), error.clone());
                     // A foreground record that could not be written is already
                     // logged and counted by persist; the terminal keeps the
                     // run's own error, as the regular stream does, and the
@@ -504,8 +522,7 @@ async fn execute_mcp_tool_loop_streaming(
                     // `previous_response_id`, and a background response is
                     // polled from this record. Then response.completed with the
                     // usage the non-streamed response carries.
-                    let mut final_response = emitter.finalize(None);
-                    final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
+                    let final_response = emitter.finalize(usage_total.clone());
                     // As the completed exit: a foreground response the client
                     // expects stored ends with response.failed when its
                     // record could not be written.
@@ -556,8 +573,7 @@ async fn execute_mcp_tool_loop_streaming(
                 add_model_call_usage(&mut usage_total, Some(&usage));
 
                 // Finalize response from emitter's accumulated data
-                let mut final_response = emitter.finalize(None);
-                final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
+                let final_response = emitter.finalize(usage_total.clone());
 
                 // Persist response to storage if store=true; a foreground
                 // response the client expects stored ends with
@@ -608,7 +624,7 @@ async fn execute_without_mcp_streaming(
     // with its context instead of copying it.
     let current_request = Arc::new(current_request);
     let startup_pending = startup.is_some();
-    let (execution_result, _load_guards, reservation, router_stops) = match ctx
+    let (execution_result, load_guards, reservation, router_stops) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(
             &current_request,
@@ -650,13 +666,7 @@ async fn execute_without_mcp_streaming(
     .await
     {
         Ok((result, counts)) => {
-            // The counts come with the terminal frame; a stream that ended
-            // before it brought none, and the reservation keeps its debit
-            // as the chat streams' does.
-            match counts {
-                Some(counts) => reservation.settle(counts.settlement()).await,
-                None => reservation.close_unsettled().await,
-            }
+            settle_iteration(&reservation, load_guards.as_ref(), counts).await;
             result
         }
         Err(err_msg) => {
@@ -667,7 +677,6 @@ async fn execute_without_mcp_streaming(
             return;
         }
     };
-    // _load_guards dropped here after iteration completes
 
     // Extract usage from iteration result
     let usage = match iteration_result {
@@ -675,7 +684,9 @@ async fn execute_without_mcp_streaming(
         ResponsesIterationResult::Completed { usage, .. } => usage,
     };
 
-    // Finalize response from emitter's accumulated data
+    // The response-level usage of this model call is shared by the stored
+    // object and its terminal event.
+    let usage = ResponseUsage::from(&usage);
     let final_response = emitter.finalize(Some(usage.clone()));
 
     // Persist response to storage if store=true; a foreground response the
@@ -697,6 +708,6 @@ async fn execute_without_mcp_streaming(
     // The terminal with the usage the non-streamed response (and the stored
     // final response) carries
     emitter
-        .finish_stream(Some(&ResponseUsage::from(&usage)), not_stored.as_ref(), tx)
+        .finish_stream(Some(&usage), not_stored.as_ref(), tx)
         .await;
 }

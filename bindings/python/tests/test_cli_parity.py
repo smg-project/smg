@@ -1,13 +1,12 @@
 """The launcher's options are the Rust CLI's flags, pinned against the CLI's source.
 
-``RouterArgs.add_cli_args`` mirrors ``struct CliArgs`` in ``model_gateway/src/main.rs``
-and the modules of its ``cli/`` directory: one option per flag, the same spelling and
-the same second spellings (plus ``--prefill`` and ``--encode``, which the CLI reads
-ahead of clap). These tests read the clap struct and the pre-clap flags from the
+``RouterArgs.add_cli_args`` mirrors the Rust arguments in ``model_gateway/src/cli/``:
+one option per flag, with the same spelling and aliases. These tests read the
+clap structs and the pre-clap flags (``--prefill`` and ``--encode``) from the
 source tree, so a flag added on one side without the other fails here instead of at
-a launch line; on an installed wheel without the source they skip. The exception
-lists below carry the reason for every divergence left, and an entry that no longer
-holds fails too, so the lists cannot rot.
+a launch line. Comparisons using the ``rust`` fixture skip when the gateway source
+tree is absent. The exception lists below give the reason for each difference, and
+each listed difference still has to occur.
 """
 
 from __future__ import annotations
@@ -18,22 +17,42 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from smg.router_args import RouterArgs
+from smg.router_args import DOCUMENT_REPLACES, RouterArgs
 
-MAIN_RS = Path(__file__).resolve().parents[3] / "model_gateway" / "src" / "main.rs"
-# The binary's command line leaves main.rs block by block for the modules of this
-# directory; the reader sees them all as one text.
-CLI_DIR = MAIN_RS.with_name("cli")
+ROOT = Path(__file__).resolve().parents[3]
+GATEWAY_SRC = ROOT / "model_gateway" / "src"
+CLI_DIR = GATEWAY_SRC / "cli"
+CLI_MODULE = CLI_DIR / "mod.rs"
+NATIVE_MODULE = ROOT / "bindings" / "python" / "src" / "lib.rs"
 
 
 def cli_source() -> str:
-    """``main.rs`` followed by every module of its ``cli/`` directory."""
-    return "\n".join([MAIN_RS.read_text(), *(p.read_text() for p in sorted(CLI_DIR.glob("*.rs")))])
+    """The command-line module and the source files beside it."""
+    return "\n".join(p.read_text() for p in sorted(CLI_DIR.glob("*.rs")))
+
+
+def test_the_executable_takes_the_stock_allocator_in_one_line():
+    if not GATEWAY_SRC.is_dir():
+        pytest.skip("the Rust CLI's source is not in this checkout")
+    executable = (GATEWAY_SRC / "main.rs").read_text()
+    library = (GATEWAY_SRC / "lib.rs").read_text()
+    cli = cli_source()
+    registration = "register_jemalloc_as_global_allocator();"
+
+    assert "smg::stock_allocator!();" in executable
+    assert "smg::main_from_args()" in executable
+    # No call registers the allocator: the library finds out which one serves.
+    assert registration not in executable
+    assert "pub fn main_from_args()" in library
+    assert registration not in re.sub(r"(?m)^\s*//.*$", "", library)
+    assert registration not in cli
+    assert "#[global_allocator]" not in cli
 
 
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
+    "--print-policy-spec": "the binary prints its policy document and exits; the launcher does not",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
@@ -65,14 +84,12 @@ class RustCli:
 
 
 # Where a named CLI default is declared when the CLI sources do not declare it
-# themselves: the config types and server modules main.rs imports its constants
-# from, and the worker crate's settings, whose constants the config types
-# re-export. The ``rust`` fixture hands their texts to the reader; a synthetic
-# source hands its own.
+# themselves: the config types and server modules, and the worker settings whose
+# constants the config types re-export.
 CONST_SOURCES = (
-    MAIN_RS.parent / "config" / "types.rs",
-    MAIN_RS.parent / "server.rs",
-    MAIN_RS.parents[2] / "crates" / "worker" / "src" / "settings.rs",
+    GATEWAY_SRC / "config" / "types.rs",
+    GATEWAY_SRC / "server.rs",
+    ROOT / "crates" / "worker" / "src" / "settings.rs",
 )
 
 
@@ -344,12 +361,12 @@ def launcher_options(use_router_prefix: bool = False) -> dict[str, argparse.Acti
 
 @pytest.fixture(scope="module")
 def rust() -> RustCli:
-    if not MAIN_RS.exists():
+    if not GATEWAY_SRC.is_dir():
         pytest.skip("the Rust CLI's source is not in this checkout")
     text = cli_source()
     cli = parse_rust_cli(text, constant_sources=tuple(p.read_text() for p in CONST_SOURCES))
     assert cli.attributes == arg_attributes(text), (
-        f"{MAIN_RS} and {CLI_DIR}: {arg_attributes(text)} #[arg] attributes, {cli.attributes} reached from"
+        f"{CLI_DIR}: {arg_attributes(text)} #[arg] attributes, {cli.attributes} reached from"
         " struct CliArgs; a group it flattens is declared in a shape parse_rust_cli does not"
         " follow (or the rest belong to a struct outside the launch CLI: teach the reader)"
     )
@@ -475,7 +492,7 @@ def constructor_defaults() -> dict[str, tuple[str, object]]:
     """The parameters of the Rust ``Router`` constructor with their defaults as the
     Rust text and the literal it reads as (None when it is not a literal), read
     from the ``#[pyo3(signature)]`` block of ``lib.rs``."""
-    text = (MAIN_RS.parents[2] / "bindings" / "python" / "src" / "lib.rs").read_text()
+    text = (ROOT / "bindings" / "python" / "src" / "lib.rs").read_text()
     start = text.index("#[pyo3(signature = (", text.index("impl Router {"))
     block = text[start : text.index("))]", start)]
     defaults: dict[str, tuple[str, object]] = {}
@@ -545,7 +562,7 @@ def test_every_option_has_its_router_prefixed_spelling():
 def test_the_launcher_backend_choices_are_the_cli_backends(launcher):
     """``--backend`` takes the same names on both sides, in the CLI's order, so a
     provider route the binary runs can be chosen from Python and the chart."""
-    enum = MAIN_RS.read_text().split("pub enum Backend {", 1)[1].split("}", 1)[0]
+    enum = CLI_MODULE.read_text().split("enum Backend {", 1)[1].split("}", 1)[0]
     assert launcher["--backend"].choices == re.findall(r'#\[value\(name = "([a-z]+)"\)\]', enum)
 
 
@@ -557,6 +574,62 @@ def test_the_launcher_encode_policy_choices_are_the_cli_choices(launcher):
     cli_choices = re.findall(r'"([a-z_]+)"', attribute.group(1).split("value_parser", 1)[1])
     assert cli_choices == ["random", "round_robin", "consistent_hashing"]
     assert list(launcher["--encode-policy"].choices) == cli_choices
+
+
+def test_the_launcher_policy_controller_choices_are_the_cli_choices(launcher):
+    attribute = re.search(
+        r"value_parser\s*=\s*\[([^\]]+)\][^\]]*\)\]\s*policy_controller: String,",
+        cli_source(),
+    )
+    assert attribute, "the CLI's --policy-controller choices are missing"
+    assert list(launcher["--policy-controller"].choices) == re.findall(
+        r'"([a-z]+)"', attribute.group(1)
+    )
+
+
+def test_the_launchers_leave_policy_unset_and_describe_the_same_default(rust, launcher):
+    option = launcher["--policy"]
+    assert rust.flags["--policy"] is option.default is None
+    assert constructor_defaults()["policy"] == ("None", None)
+
+    declaration = re.search(
+        r"(?P<help>(?:^[ \t]*/// [^\n]+\n)+)"
+        r"\s*#\[arg\((?P<attribute>[^\n]+)\)\]\n\s*policy: Option<String>,",
+        CLI_MODULE.read_text(),
+        re.MULTILINE,
+    )
+    assert declaration, "the CLI's --policy declaration moved"
+    choices = re.search(r"value_parser\s*=\s*\[([^\]]+)\]", declaration["attribute"])
+    assert choices, "the CLI's --policy choices are missing"
+    assert sorted(option.choices) == sorted(re.findall(r'"([a-z_]+)"', choices[1]))
+    cli_help = " ".join(line.split("/// ", 1)[1] for line in declaration["help"].splitlines())
+    default_help = (
+        "Defaults to cache_aware."
+        " A policy document replaces the routing flags, and --policy is refused beside one."
+    )
+    assert cli_help.endswith(default_help)
+    assert option.help.endswith(default_help)
+
+
+def test_the_launchers_list_the_same_options_a_document_replaces():
+    block = re.search(
+        r"const DOCUMENT_REPLACES: \[&str; (\d+)\] = \[(.*?)\];", CLI_MODULE.read_text(), re.S
+    )
+    assert block, "the CLI's list of the flags a document replaces moved"
+    cli = re.findall(r'"([a-z_0-9]+)"', block[2])
+    assert len(cli) == int(block[1])
+    # The launcher spells the interval with its unit and folds the disable
+    # flag into worker_overload_protection.
+    cli.remove("disable_worker_overload_protection")
+    cli[cli.index("eviction_interval")] = "eviction_interval_secs"
+    assert list(DOCUMENT_REPLACES) == cli
+
+
+def test_the_native_start_lists_the_same_options_a_document_replaces():
+    # The native start refuses by its own copy of the list: a third home.
+    block = re.search(r"let moved: Vec<&str> = moved!\[(.*?)\]", NATIVE_MODULE.read_text(), re.S)
+    assert block, "the native start's list of the settings a document replaces moved"
+    assert re.findall(r"[a-z_0-9]+", block[1]) == list(DOCUMENT_REPLACES)
 
 
 @pytest.mark.parametrize("use_router_prefix", [False, True])
@@ -576,9 +649,8 @@ def test_the_eviction_interval_default_is_one_value_on_every_surface(rust, launc
     """The CLI, the launcher, the Python Router and the chart evict the cache tree
     on one cadence. The launcher's 60 s predated the CLI's 120 s and was never
     followed; the three other surfaces agreed on 120."""
-    repo = MAIN_RS.parents[2]
-    lib_rs = repo / "bindings" / "python" / "src" / "lib.rs"
-    chart_values = repo / "deploy" / "helm" / "smg" / "values.yaml"
+    lib_rs = ROOT / "bindings" / "python" / "src" / "lib.rs"
+    chart_values = ROOT / "deploy" / "helm" / "smg" / "values.yaml"
     signature = re.search(r"\beviction_interval_secs = (\d+)", lib_rs.read_text())
     chart = re.search(r"^\s*evictionIntervalSecs:\s*(\d+)\s*$", chart_values.read_text(), re.M)
     assert signature and chart, "the Python Router's signature or the chart's value moved"

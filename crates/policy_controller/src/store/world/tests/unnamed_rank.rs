@@ -10,8 +10,8 @@ use super::{
     view, MODEL,
 };
 use crate::{
+    engine::view::{Role, WorkerId},
     store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
-    view::{Role, WorkerId},
 };
 
 const ENGINE: &str = "grpc://e:9000";
@@ -295,6 +295,33 @@ fn a_row_passed_over_for_a_record_ends_no_word_that_no_report_came() {
     names_one_alone(&store, zero, one, t0);
     store.publish(t2);
     assert_eq!(overloaded(&store, t2), [zero]);
+}
+
+#[test]
+fn an_answer_passed_over_whole_for_its_stamp_names_its_ranks_again() {
+    let (store, t0, zero, one) = two_ranks();
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(overloaded(&store, t0), [zero], "rank zero takes the mark");
+    // A later answer names both ranks under a stamp older than each sample
+    // on file. Both rows are passed over and the samples stand, and the
+    // answer still names the rank its engine had left out.
+    let t1 = t0 + Duration::from_secs(1);
+    let passed = store.report_sampled(
+        &[(zero, 0, Some(load(7, 0))), (one, 1, Some(load(8, 0)))],
+        t1,
+        t0 - Duration::from_secs(1),
+        LoadSource::Poll,
+    );
+    assert_eq!(passed, [0, 1]);
+    assert_eq!(store.unnamed_ranks(), 0, "the answer names it again");
+    assert_eq!(overloaded(&store, t1), []);
+    let rows = view(&store, &ask(t1)).0;
+    let row = rows.iter().find(|row| row.id == zero).expect("its row");
+    assert_eq!(
+        row.load.map(|load| load.running),
+        Some(1),
+        "the sample stands"
+    );
 }
 
 #[test]

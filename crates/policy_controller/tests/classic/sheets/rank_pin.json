@@ -1,0 +1,295 @@
+{
+  "recorded_from": "a4935a5acd15151641b1988e234016a95fd172da",
+  "policy": "rank-pin",
+  "rows": [
+    {
+      "name": "a-request-no-rank-can-be-pinned-for-leaves-the-workers-that-registered-one",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "rank_registered": false
+        },
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 2,
+          "rank_registered": true
+        },
+        {
+          "state": "free",
+          "dp_rank": 1,
+          "dp_size": 2,
+          "rank_registered": true
+        },
+        {
+          "state": "free",
+          "rank_registered": false
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-group-of-one-still-registered-a-rank",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 1,
+          "rank_registered": true
+        },
+        {
+          "state": "free",
+          "rank_registered": false
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-pool-with-no-rank-takes-the-request-whole",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "rank_registered": false
+        },
+        {
+          "state": "free",
+          "rank_registered": false
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "every-worker-registered-a-rank",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 2,
+          "rank_registered": true
+        },
+        {
+          "state": "free",
+          "dp_rank": 1,
+          "dp_size": 2,
+          "rank_registered": true
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 400,
+            "code": "dp_aware_not_supported",
+            "retry_after": false,
+            "message": "/v1/audio/transcriptions does not yet support DP-aware workers"
+          }
+        }
+      ]
+    },
+    {
+      "name": "one-worker-and-it-registered-a-rank",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 1,
+          "rank_registered": true
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 400,
+            "code": "dp_aware_not_supported",
+            "retry_after": false,
+            "message": "/v1/audio/transcriptions does not yet support DP-aware workers"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-transcription-of-a-model-no-worker-serves",
+      "shed": false,
+      "workers": [],
+      "answers": [
+        {
+          "refused": {
+            "status": 404,
+            "code": "model_not_found",
+            "retry_after": false,
+            "message": "No worker available for model 'm'"
+          }
+        }
+      ]
+    },
+    {
+      "name": "the-worker-with-no-rank-is-down",
+      "shed": false,
+      "workers": [
+        {
+          "state": "down",
+          "rank_registered": false
+        },
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 2,
+          "rank_registered": true
+        },
+        {
+          "state": "free",
+          "dp_rank": 1,
+          "dp_size": 2,
+          "rank_registered": true
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-worker-with-no-rank-over-its-thresholds-yields-to-one-under-them",
+      "shed": false,
+      "workers": [
+        {
+          "state": "over",
+          "rank_registered": false
+        },
+        {
+          "state": "free",
+          "rank_registered": false
+        },
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 1,
+          "rank_registered": true
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-workers-with-no-rank-are-over-their-thresholds",
+      "shed": false,
+      "workers": [
+        {
+          "state": "over",
+          "rank_registered": false
+        },
+        {
+          "state": "over",
+          "rank_registered": false
+        },
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 1,
+          "rank_registered": true
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "the-workers-with-no-rank-are-over-and-shedding-is-on",
+      "shed": true,
+      "workers": [
+        {
+          "state": "over",
+          "rank_registered": false
+        },
+        {
+          "state": "over",
+          "rank_registered": false
+        },
+        {
+          "state": "free",
+          "dp_rank": 0,
+          "dp_size": 1,
+          "rank_registered": true
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-worker-with-a-rank-that-is-down-still-counts-as-one",
+      "shed": false,
+      "workers": [
+        {
+          "state": "down",
+          "dp_rank": 0,
+          "dp_size": 2,
+          "rank_registered": true
+        },
+        {
+          "state": "free",
+          "dp_rank": 1,
+          "dp_size": 2,
+          "rank_registered": true
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 400,
+            "code": "dp_aware_not_supported",
+            "retry_after": false,
+            "message": "/v1/audio/transcriptions does not yet support DP-aware workers"
+          }
+        }
+      ]
+    }
+  ]
+}

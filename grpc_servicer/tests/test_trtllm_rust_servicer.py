@@ -262,7 +262,7 @@ def test_serve_rust_wires_the_server_the_shim_and_the_supervisor(monkeypatch, tm
 
     monkeypatch.setattr(rust, "launch_shim", fake_launch)
 
-    async def fake_supervise(server, engine, *, drain_secs):
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
         assert isinstance(server, FakeServer) and engine == "engine"
         return 7
 

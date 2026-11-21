@@ -17,13 +17,15 @@
 use std::{
     fs::{self, File},
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant},
 };
+
+use tokio::net::TcpSocket;
 
 /// The loopback address every listener of a launched gateway binds.
 pub const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -40,8 +42,11 @@ pub enum Until {
     Bound,
     /// The gateway answers `GET /health` with 200 on the first watched port:
     /// the proof that the gateway itself serves there, where a bare connect
-    /// would also pass for another process that took the port in the gap
-    /// after [`free_ports`] released it.
+    /// would also pass for another process on the port ([`free_ports`]
+    /// keeps a picked port from one on Linux alone). The kill at the first
+    /// answer takes the lines the gateway's writer thread has not written
+    /// yet: a case that reads a line of the log keeps its gateway
+    /// ([`Gateway`]) and waits for the line ([`log_with_line`]).
     Served,
 }
 
@@ -61,22 +66,68 @@ pub struct Launch {
 }
 
 /// The launches of one test binary run one at a time: a port a test picked
-/// with [`free_ports`] and released for its gateway to bind must not be taken
-/// meanwhile by another test's gateway, or by a listener it holds, which a
-/// poll of that port would read as the first gateway's bind. [`launch`] holds
-/// the guard; a test that picks its own ports and runs [`launch_with`] holds
-/// it itself, from the first to the last.
-pub fn serial() -> MutexGuard<'static, ()> {
+/// with [`free_ports`] for its gateway to bind must not be taken meanwhile by
+/// another test's gateway, or by a listener it holds, which a poll of that
+/// port would read as the first gateway's bind. [`launch`] holds the guard; a
+/// test that picks its own ports and runs [`launch_with`] holds it itself,
+/// from the first to the last. The ports picked under the guard are let go
+/// with it.
+pub fn serial() -> Serial {
     static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    Serial(SERIAL.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
-/// `N` distinct free ports: bound at once so the kernel hands out different
-/// ones, then released for the gateway to bind moments later.
+/// The guard of [`serial`].
+#[must_use = "launches run one at a time, and picked ports are kept, only while the guard lives"]
+pub struct Serial(MutexGuard<'static, ()>);
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        PICKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
+/// The sockets behind the ports [`free_ports`] keeps, until the guard of
+/// [`serial`] they were picked under is let go.
+static PICKED: Mutex<Vec<TcpSocket>> = Mutex::new(Vec::new());
+
+/// `N` distinct free ports for the gateway the caller launches: each picked
+/// by a socket that binds port 0 with `SO_REUSEADDR` and never listens, the
+/// sockets bound at once so the kernel hands out different ports.
+///
+/// On Linux the sockets are kept until the caller lets go of [`serial`]. The
+/// kernel then hands a kept port to no other socket that asks for a free one
+/// and to no connection as its source port, a connect to it is refused, and
+/// the gateway, whose listeners set `SO_REUSEADDR` too, binds it and listens
+/// on it as on a free port. Released instead, a port was now and then handed
+/// to another process on a busy host before the gateway bound it, and the
+/// gateway was refused on a port its test did not hold. The crate's
+/// `RefusedAddress` holds a port the same way for a worker that never
+/// answers; held without `SO_REUSEADDR`, as its port is, a port could not be
+/// bound by the gateway.
+///
+/// Elsewhere a second socket cannot bind a port the first still holds, so
+/// the sockets are let go here and the gateway binds the ports moments later.
 pub fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: [TcpListener; N] =
-        std::array::from_fn(|_| TcpListener::bind((IP, 0)).expect("a free port"));
-    listeners.map(|listener| listener.local_addr().expect("the bound address").port())
+    let sockets: [TcpSocket; N] = std::array::from_fn(|_| {
+        let socket = TcpSocket::new_v4().expect("a TCP socket");
+        socket.set_reuseaddr(true).expect("SO_REUSEADDR");
+        socket.bind(SocketAddr::from((IP, 0))).expect("a free port");
+        socket
+    });
+    let ports = sockets
+        .each_ref()
+        .map(|socket| socket.local_addr().expect("the bound address").port());
+    if cfg!(target_os = "linux") {
+        PICKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(sockets);
+    }
+    ports
 }
 
 /// The common flags: the HTTP listener on `port`, the metrics listener on

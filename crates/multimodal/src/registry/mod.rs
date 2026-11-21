@@ -73,7 +73,7 @@ impl ModelRegistry {
                 // Muse Spark matches its own model_type / architecture / id only.
                 LazySpec::new(|| Box::new(MuseSparkSpec)),
                 // Nemotron-H Omni matches its own model_type only.
-                LazySpec::new(|| Box::new(NemotronOmniSpec)),
+                LazySpec::new(|| Box::new(NemotronOmniSpec::Packed)),
                 LazySpec::new(|| Box::new(NemotronTranscribeSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
@@ -88,6 +88,29 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(Step3VLVisionSpec)),
             ],
         }
+    }
+
+    /// A registry for an engine that reads only `format`: the specs of
+    /// [`new`](Self::new) that emit it. For `Reference` it also holds the
+    /// Nemotron VL / Omni specs, which `new` leaves out because it serves
+    /// that family through the Packed Nemotron-H Omni spec.
+    pub fn for_format(format: EncoderInputFormat) -> Self {
+        let mut registry = Self::new();
+        registry
+            .specs
+            .retain(|spec| spec.get().encoder_input_format() == format);
+        if format == EncoderInputFormat::Reference {
+            // One spec per image layout. Both match the family's
+            // architectures only, so they can lead.
+            registry.specs.splice(
+                0..0,
+                [
+                    LazySpec::new(|| Box::new(NemotronOmniSpec::ReferenceTiled)),
+                    LazySpec::new(|| Box::new(NemotronOmniSpec::Reference)),
+                ],
+            );
+        }
+        registry
     }
 
     pub fn lookup<'a>(&'a self, metadata: &ModelMetadata) -> Option<&'a dyn ModelProcessorSpec> {

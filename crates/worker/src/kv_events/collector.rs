@@ -5,7 +5,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, OnceLock, Weak,
     },
 };
@@ -57,7 +57,9 @@ pub trait KvEventHost: Send + Sync + 'static {
         model: &str,
     ) -> Option<KvEventFeed<Self::Sink>>;
 
-    /// The model's last events subscription is gone.
+    /// The model's last events subscription is gone: no slot of the model
+    /// is left, active or held by a removal still under way. Told once each
+    /// time the model's slots go to none.
     ///
     /// Called under the slot lock like [`enroll`](Self::enroll), by whoever
     /// frees the subscription's slot: it must not wait, and it must not
@@ -86,6 +88,10 @@ pub struct KvEventCollector<H: KvEventHost> {
     /// sink, a peer in the host. Unset in a collector built alone (the
     /// tests), which holds every object.
     worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
+    /// Set by [`Self::stop`] and never cleared: a stopped collector starts
+    /// no subscription. Written and read under the slot lock, so an add
+    /// finds it on the turn that would have started its task.
+    stopped: AtomicBool,
 }
 
 /// The registry as the collector holds it: it asks one thing of it, the
@@ -117,7 +123,7 @@ enum Slot {
 /// What a removal leaves in a URL's slot until the old task has ended.
 ///
 /// The task lifts it itself at the end of its exit path
-/// ([`KvEventCollector::complete_removal`]), and `done` closes when the task
+/// ([`KvEventCollector::lift_turn`]), and `done` closes when the task
 /// is gone for any reason (an abort, a panic past its guard). Nothing about
 /// it depends on the `on_worker_removed` future living on: the registry's
 /// removal step runs it under a timeout, and a cleanup waiting on the
@@ -184,6 +190,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
             worker_handles: Arc::new(Mutex::new(HashMap::new())),
             load_sink: OnceLock::new(),
             worker_registry: OnceLock::new(),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -248,7 +255,8 @@ impl<H: KvEventHost> KvEventCollector<H> {
     /// object has under the URL is left to it. The registry's removal
     /// changes the registry before it reaches this lock: a read here sees
     /// the removal, or the removal finds the slot this add inserts. A
-    /// collector without a registry holds every object.
+    /// collector without a registry holds every object. A stopped
+    /// collector starts nothing: the add reads that on the same turns.
     pub async fn on_worker_added(&self, worker: &Arc<dyn Worker>, kind: SubscriptionKind) {
         let url = worker.url().to_string();
         // An empty model id is keyed as `UNKNOWN_MODEL_ID`.
@@ -265,6 +273,13 @@ impl<H: KvEventHost> KvEventCollector<H> {
 
         let mut handles = loop {
             let mut handles = self.worker_handles.lock().await;
+            // Under the slot lock, on every turn: a stopped collector starts
+            // nothing, so no task begins behind the stop that would have
+            // ended it.
+            if self.stopped.load(Ordering::Relaxed) {
+                debug!(worker_url = %Endpoint::redacted_str(&url), "no KV event stream from a stopped collector");
+                return;
+            }
             // Under the slot lock, on every turn: an object the registry no
             // longer holds gets no stream, and a stream another object has
             // under the URL is not stopped for it.
@@ -350,7 +365,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
         )]
         let handle = tokio::spawn(async move {
             // The task writes for the worker after the loop has returned it
-            // (the panic counter, the gauge `complete_removal` lowers). It
+            // (the panic counter, the gauge `lift_turn` lowers). It
             // keeps a handle on the worker through those writes: the series
             // store forgets a removed address once no handle on its workers
             // is left, and a write for the address by name alone after that
@@ -402,7 +417,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
                 );
                 Metrics::record_kv_event_subscription_failure(writer.url(), "panic");
             }
-            Self::complete_removal(&slots, &host, &writer, id).await;
+            Self::lift_turn(&slots, &host, &writer, id).await;
             // The task's last write is made: the worker may go.
             drop(writer);
             // Closes `done` last: an add waiting on it finds the slot free.
@@ -424,20 +439,20 @@ impl<H: KvEventHost> KvEventCollector<H> {
         );
     }
 
-    /// The task's last turn of the slot lock, at the end of its exit path.
-    /// Behind a removal, once the sink has heard that the worker left, it
-    /// lifts the URL's reservation if it is this task's (a later
-    /// subscription under the URL has its own) and tells the host when the
-    /// model's last events subscription went with it. The task does this
-    /// itself, since a caller may drop `on_worker_removed` before the task
-    /// has ended. A task that ended on its own finds its slot still
-    /// `Active` and marks it ended: the removal that comes frees the slot
-    /// on its first turn, whether or not the task's channel has closed by
-    /// then. A slot `stop` took is gone, and a later subscription's is left
-    /// as it is. `worker` is the removed worker itself, which the task
+    /// The task's own lift turn: its last turn of the slot lock, at the end
+    /// of its exit path. Behind a removal, once the sink has heard that the
+    /// worker left, it lifts the URL's reservation if it is this task's (a
+    /// later subscription under the URL has its own) and tells the host
+    /// when the model's last events subscription went with it. The task
+    /// does this itself, since a caller may drop `on_worker_removed` before
+    /// the task has ended. A task that ended on its own finds its slot
+    /// still `Active` and marks it ended: the removal that comes frees the
+    /// slot on its first turn, whether or not the task's channel has closed
+    /// by then. A slot `stop` took is gone, and a later subscription's is
+    /// left as it is. `worker` is the removed worker itself, which the task
     /// holds through the write made here (see the task in
     /// [`Self::on_worker_added`]).
-    async fn complete_removal(
+    async fn lift_turn(
         slots: &Mutex<HashMap<String, Slot>>,
         host: &H,
         worker: &Arc<dyn Worker>,
@@ -494,9 +509,14 @@ impl<H: KvEventHost> KvEventCollector<H> {
         if kind != SubscriptionKind::Events {
             return;
         }
+        // A reservation counts until it is lifted: its task may still feed
+        // the sink, and its own lift tells the host if it is the last.
         let last_of_model = !handles.values().any(|slot| {
-            matches!(slot, Slot::Active(other)
-                if other.kind == SubscriptionKind::Events && other.model_id == model_id)
+            let (other_kind, other_model) = match slot {
+                Slot::Active(other) => (other.kind, &other.model_id),
+                Slot::Removing(other) => (other.kind, &other.model_id),
+            };
+            other_kind == SubscriptionKind::Events && other_model == model_id
         });
         if last_of_model {
             host.model_left(model_id);
@@ -614,12 +634,12 @@ impl<H: KvEventHost> KvEventCollector<H> {
         info!(worker_url = %Endpoint::redacted_str(worker_url), "Stopping KV event subscription");
         // Signal graceful shutdown: the task tells the sink the worker left.
         let _ = sub.shutdown_tx.send(());
-        // The task lifts the reservation on its own (`complete_removal`);
-        // this wait is for the caller, who has the worker out of the sink on
+        // The task lifts the reservation on its own (`lift_turn`); this
+        // wait is for the caller, who has the worker out of the sink on
         // return. A caller that drops the future here leaves the lift to
-        // the task and loses the join error below.
-        // Panics are caught inside the task; a JoinError here (abort or a
-        // panic that escaped the guard) must still be surfaced, not discarded.
+        // the task and loses the join error below. Panics are caught inside
+        // the task; a JoinError here (abort or a panic that escaped the
+        // guard) must still be surfaced, not discarded.
         let id = sub.id;
         if let Err(e) = sub.handle.await {
             error!(
@@ -630,7 +650,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
         }
         // A task that ends on the shutdown signal lifts its reservation in
-        // its own cleanup (`complete_removal`). One that did not reach
+        // its own cleanup (`lift_turn`). One that did not reach
         // that step (an abort, a panic past its guard) left the
         // reservation in place: lifted here, under the slot lock and only
         // while the reservation is still this subscription's. A caller
@@ -642,22 +662,32 @@ impl<H: KvEventHost> KvEventCollector<H> {
         Self::lift_reservation(&mut handles, &self.host, worker_url, id);
     }
 
-    /// Stop all subscriptions. What the host holds is its caller's to clear.
+    /// Stop every subscription, for good. The active tasks are told to stop
+    /// and awaited, and the task of a removal under way is awaited too: on
+    /// return no task of the collector runs, and an add that comes later,
+    /// or that was waiting for a turn of the slot lock, starts none. What
+    /// the host keeps for a model is the host's to clear: a stop tells it
+    /// of no model.
     pub async fn stop(&self) {
-        let subscriptions: Vec<(String, WorkerSubscription)> = {
+        let (subscriptions, leaving) = {
             let mut handles = self.worker_handles.lock().await;
+            // Under the lock, ahead of the slots taken below: an add on a
+            // later turn finds the mark.
+            self.stopped.store(true, Ordering::Relaxed);
             let mut active = Vec::new();
+            let mut leaving = Vec::new();
             for (url, slot) in std::mem::take(&mut *handles) {
                 match slot {
                     Slot::Active(sub) => active.push((url, sub)),
-                    // The task behind a removal in flight lifts its own
-                    // reservation.
-                    reserved @ Slot::Removing(_) => {
-                        handles.insert(url, reserved);
+                    // The task behind a removal under way lifts its own
+                    // reservation: the stop waits for its end below.
+                    Slot::Removing(reserved) => {
+                        leaving.push(reserved.done.clone());
+                        handles.insert(url, Slot::Removing(reserved));
                     }
                 }
             }
-            active
+            (active, leaving)
         };
 
         if !subscriptions.is_empty() {
@@ -677,6 +707,11 @@ impl<H: KvEventHost> KvEventCollector<H> {
                     Metrics::record_kv_event_subscription_failure(&url, "join_error");
                 }
             }
+        }
+        // Nothing is ever sent on a reservation's channel: each wait returns
+        // when its task has ended.
+        for mut done in leaving {
+            let _ = done.changed().await;
         }
     }
 
@@ -916,7 +951,7 @@ mod tests {
     }
 
     /// The subscription task writes for its worker after the loop has
-    /// returned it (the gauge `complete_removal` lowers), and it keeps a
+    /// returned it (the gauge `lift_turn` lowers), and it keeps a
     /// handle on the worker through that write: the series store forgets a
     /// removed address once no handle on its workers is left, so a late write
     /// by name alone would recreate the address's series for good.
@@ -1064,9 +1099,9 @@ mod tests {
 
     /// A replacement that streams nothing (its host wants neither its events
     /// nor its loads) ends the stream the object it replaced had under the
-    /// URL: the records on that stream would keep
-    /// reaching an object the registry no longer holds, and nothing else on
-    /// the replace path stops it.
+    /// URL: the records on that stream would keep reaching an object the
+    /// registry no longer holds, and nothing else on the replace path stops
+    /// it.
     #[traced_test]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replacement_that_streams_nothing_ends_the_stream_of_the_object_it_replaced() {
@@ -1778,8 +1813,115 @@ mod tests {
         assert_eq!(host.calls(), ["model_left m"]);
     }
 
+    /// A task that never reaches its own lift turn (an abort, a panic past
+    /// its guard) leaves its reservation to the remover: the removal lifts
+    /// it after its wait, frees the slot and tells the host.
+    #[tokio::test]
+    async fn a_removal_behind_a_task_short_of_its_lift_lifts_after_its_wait() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:20");
+        let url = worker.url();
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        wait_until("the task opens its place", || host.calls().len() == 2).await;
+
+        // The removal's first turn finds the task alive and leaves its
+        // reservation; then the task is gone short of its lift turn.
+        let sub = {
+            let mut handles = collector.worker_handles.lock().await;
+            KvEventCollector::<RecordingHost>::begin_removal(&mut handles, &host, url)
+        }
+        .expect("the removal takes the subscription out");
+        assert_eq!(collector.slot_ids(url).await, (None, Some(sub.id)));
+        sub.handle.abort();
+        collector.finish_removal(url, sub).await;
+
+        assert_eq!(collector.slot_ids(url).await, (None, None));
+        assert_eq!(
+            host.calls().last().map(String::as_str),
+            Some("model_left unknown"),
+            "the remover's lift tells the host"
+        );
+    }
+
+    /// The host hears that a model left once, when the model's last slot is
+    /// freed: a reservation counts until it is lifted, since its task may
+    /// still feed the sink. Two reservations of one model are laid here as
+    /// two removals' first turns leave them.
+    #[tokio::test]
+    async fn a_model_leaves_with_its_last_reservation() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let urls = ["grpc://127.0.0.1:21", "grpc://127.0.0.1:22"];
+        // The senders are held to the case's end: both tasks still run.
+        let (_first_tx, first_done) = watch::channel(());
+        let (_second_tx, second_done) = watch::channel(());
+        let mut handles = collector.worker_handles.lock().await;
+        let mut ids = Vec::new();
+        for (url, done) in urls.into_iter().zip([first_done, second_done]) {
+            let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+            ids.push(id);
+            handles.insert(
+                url.to_string(),
+                Slot::Removing(Reservation {
+                    id,
+                    done,
+                    model_id: "m".to_string(),
+                    kind: SubscriptionKind::Events,
+                }),
+            );
+        }
+
+        KvEventCollector::<RecordingHost>::lift_reservation(&mut handles, &host, urls[0], ids[0]);
+        assert!(
+            host.calls().is_empty(),
+            "the model keeps a subscription that is still leaving"
+        );
+        KvEventCollector::<RecordingHost>::lift_reservation(&mut handles, &host, urls[1], ids[1]);
+        assert_eq!(host.calls(), ["model_left m"]);
+    }
+
+    /// A task's lift turn marks its own slot alone: one that makes it after
+    /// a later subscription stands under its address leaves that slot as it
+    /// is. Marked by the old task, the later subscription's removal would
+    /// free the slot at once while its task still runs.
+    #[tokio::test]
+    async fn a_lift_turn_behind_a_later_subscription_marks_nothing() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:23");
+        let url = worker.url();
+        // The id of an older subscription of the address, whose slot is gone.
+        let old = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        let (later, _) = collector.slot_ids(url).await;
+        assert!(later.is_some(), "the later subscription is active");
+
+        KvEventCollector::<RecordingHost>::lift_turn(
+            &collector.worker_handles,
+            &host,
+            &worker,
+            old,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                collector.worker_handles.lock().await.get(url),
+                Some(Slot::Active(sub)) if !sub.ended
+            ),
+            "the old task leaves the later subscription unmarked"
+        );
+        assert_eq!(collector.slot_ids(url).await, (later, None));
+        collector.on_worker_removed(url).await;
+    }
+
     /// A stop ends the tasks and tells the host of no model: what the host
-    /// keeps is its caller's to clear.
+    /// keeps for a model is the host's to clear.
     #[tokio::test]
     async fn a_stop_tells_the_host_of_no_model() {
         let host = Arc::new(RecordingHost::default());
@@ -1799,6 +1941,88 @@ mod tests {
             ],
             "a stop asks the host nothing"
         );
+    }
+
+    /// A stop is for good: an add that comes after it starts no task, takes
+    /// no slot and asks the host nothing.
+    #[tokio::test]
+    async fn an_add_after_a_stop_starts_nothing() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        collector.stop().await;
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:17");
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        assert_eq!(collector.slot_ids(worker.url()).await, (None, None));
+        assert!(
+            host.calls().is_empty(),
+            "a stopped collector asks the host nothing"
+        );
+    }
+
+    /// The add reads the stop on each of its turns: one that waited for an
+    /// old task to end while the stop came starts nothing on its next turn,
+    /// where it would have started a task the stop never ends.
+    #[tokio::test]
+    async fn an_add_that_waited_through_a_stop_starts_nothing() {
+        let collector = new_collector();
+        let url = "grpc://127.0.0.1:18";
+        let first = unconnected_grpc_worker_at(url);
+        collector
+            .on_worker_added(&first, SubscriptionKind::Loads)
+            .await;
+        let (old, _) = collector.slot_ids(url).await;
+        assert!(old.is_some(), "the first object's stream is active");
+
+        // Another object under the address: its add takes the old stream
+        // out and waits for the old task to end.
+        let second = unconnected_grpc_worker_at(url);
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut restart =
+            std::pin::pin!(collector.on_worker_added(&second, SubscriptionKind::Loads));
+        assert!(
+            std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
+            "the restart's first turn ends in its wait for the old task"
+        );
+        assert_eq!(collector.slot_ids(url).await, (None, old));
+
+        collector.stop().await;
+        restart.await;
+        assert_eq!(
+            collector.slot_ids(url).await,
+            (None, None),
+            "the add starts nothing behind the stop"
+        );
+    }
+
+    /// A stop returns once no task of the collector runs: it waits for the
+    /// task of a removal under way too, which lifts its own reservation. The
+    /// reservation is laid here as a removal's first turn leaves it, and the
+    /// case holds the channel's end that such a task holds.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_task_of_a_removal_under_way() {
+        let collector = new_collector();
+        let (done_tx, done) = watch::channel(());
+        collector.worker_handles.lock().await.insert(
+            "grpc://127.0.0.1:19".to_string(),
+            Slot::Removing(Reservation {
+                id: NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
+                done,
+                model_id: "m".to_string(),
+                kind: SubscriptionKind::Loads,
+            }),
+        );
+
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut stop = std::pin::pin!(collector.stop());
+        assert!(
+            std::future::Future::poll(stop.as_mut(), &mut cx).is_pending(),
+            "the stop waits for the task of the removal under way"
+        );
+        // The task ends: its channel closes.
+        drop(done_tx);
+        stop.await;
     }
 
     /// A dropped collector aborts its tasks, and an aborted task tells the

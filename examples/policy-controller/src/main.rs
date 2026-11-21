@@ -8,7 +8,8 @@
 use std::process::ExitCode;
 
 use smg_policy_controller::{
-    controller, Candidate, Catalog, CatalogError, Lifecycle, Needs, RequestFacts, Scorer, TieBand,
+    service::controller, Candidate, Catalog, CatalogError, Lifecycle, Needs, RequestFacts, Scorer,
+    TieBand,
 };
 
 /// The process's allocator, the one the stock controller's binary registers,
@@ -72,6 +73,15 @@ impl Scorer for Pack {
         }
     }
 
+    /// This scorer only places, and by the engines' own reports: it turns
+    /// no request away. Saying so leaves a price: a stage that says
+    /// nothing is taken as one that may refuse a request by what the
+    /// gateways report of leases, and each decision under it applies those
+    /// reports first.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn score(
         &self,
         _: &RequestFacts<'_>,
@@ -121,8 +131,8 @@ mod tests {
     };
 
     use smg_policy_controller::{
-        controller::{Config, Controller, Election, Error, Listener, Scope, SpecRejected},
-        spec::OVERLOAD_WAITING_REQUESTS,
+        document::spec::OVERLOAD_WAITING_REQUESTS,
+        service::controller::{Config, Controller, Election, Error, Listener, Scope, SpecRejected},
         store::{
             Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers,
             WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
@@ -291,6 +301,7 @@ mod tests {
                 now: self.window + Duration::from_secs(1),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             }
         }
 
@@ -469,6 +480,7 @@ mod tests {
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             election: Election::default(),
+            discovery: None,
         }
     }
 

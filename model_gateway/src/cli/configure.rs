@@ -1,37 +1,14 @@
 //! Phase 1b to phase 3 of the start-up, on the parsed arguments: the secrets'
 //! sources resolved into the flag fields, the start-up announced, and the
 //! server configuration assembled from the flags (`CliArgs::configure`).
-//! The argument structs stay with `CliArgs` at the crate root, where clap
-//! builds them; this module reads them.
+//! The parent module declares the argument structs that clap builds.
 
 use std::collections::HashMap;
 
 use rand::{distr::Alphanumeric, RngExt};
-use smg::{
-    config::{
-        bind_socket_addr,
-        secrets::{parse_control_plane_api_key, parse_tenant_api_key},
-        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
-        ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
-        MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
-        TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
-    },
-    mesh::discovery::MeshDiscoveryConfig,
-    observability::metrics::PrometheusConfig,
-    policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
-    secrets::SecretFiles,
-    server::{
-        posture::{SecretSource, SecretSources},
-        ServerConfig,
-    },
-    service_discovery::RuntimeDiscoveryConfig,
-    version,
-};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_service_discovery::RuntimeDiscoveryConfig;
 use smg_worker::identity::{
     basic::{ConnectionMode, RuntimeType},
     endpoint::Endpoint,
@@ -43,8 +20,32 @@ use super::{
         REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
     },
     value::parse_role_mapping,
+    Backend, CliArgs, DiscoveryProvider,
 };
-use crate::{Backend, CliArgs, DiscoveryProvider};
+use crate::{
+    config::{
+        bind_socket_addr,
+        secrets::{parse_control_plane_api_key, parse_tenant_api_key},
+        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
+        ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
+        MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
+        RouterConfigBuilder, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+    },
+    mesh::discovery::MeshDiscoveryConfig,
+    observability::metrics::PrometheusConfig,
+    policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
+    policy_controller,
+    secrets::SecretFiles,
+    server::{
+        posture::{SecretSource, SecretSources},
+        ServerConfig,
+    },
+    version,
+};
 
 enum OracleConnectSource {
     Dsn { descriptor: String },
@@ -401,6 +402,17 @@ impl CliArgs {
             server_key_path: key.into(),
             ..MTLSConfig::default()
         }))
+    }
+
+    /// Select the main routing policy. A policy document replaces the
+    /// routing flags, so the line names no policy beside one: the
+    /// configuration's default stands in, and the document decides.
+    fn routing_policy(&self) -> PolicyConfig {
+        match self.routing.policy.as_deref() {
+            Some(policy) => self.parse_policy(policy),
+            None if self.routing.policy_spec.is_some() => RouterConfig::default().policy,
+            None => self.parse_policy("cache_aware"),
+        }
     }
 
     /// Build a routing policy with the same per-policy defaults as the CLI flags.
@@ -1104,22 +1116,83 @@ impl CliArgs {
         Ok(model_aliases)
     }
 
+    /// The routing part of the configuration: what a policy document reads,
+    /// the multi-router mode with it, and what the validator's routing rules
+    /// read beside it (the workers' discovery and the data-parallel
+    /// setting). A start's assembly builds on it and `--print-policy-spec`
+    /// converts it alone, so the two read one routing part. No file is read
+    /// here.
+    fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
+        Ok(RouterConfig::builder()
+            .mode(mode)
+            .policy(self.routing_policy())
+            .cache_boundaries(self.routing.cache_boundaries.clone())
+            .maybe_discovery(self.discovery_config()?)
+            .igw(self.routing.enable_igw)
+            .dp_aware(self.routing.dp_aware)
+            .worker_warmup(
+                self.routing.worker_warmup_secs,
+                self.routing.worker_warmup_share,
+                self.routing.worker_warmup_blocks,
+                self.routing.worker_warmup_thin_ratio,
+                self.routing.worker_warmup_divert_every,
+            )
+            .worker_overload_protection(
+                self.routing.worker_overload_protection
+                    && !self.routing.disable_worker_overload_protection,
+            )
+            .worker_overload_waiting_requests(Some(self.routing.worker_overload_waiting_requests))
+            .worker_overload_token_usage(Some(self.routing.worker_overload_token_usage))
+            .worker_overload_shed(self.routing.worker_overload_shed)
+            .tenant_header_name(&self.serving.tenant_header_name)
+            .pd_pairing_mode(
+                PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
+            )
+            .grouped_dp_sticky(self.routing.grouped_dp_sticky)
+            .routing_key_override(RoutingKeyOverrideConfig {
+                enabled: self.routing.routing_key_override,
+                eviction_interval_secs: self.routing.eviction_interval,
+                max_idle_secs: self.routing.max_idle_secs,
+                assignment_mode: Self::parse_assignment_mode(
+                    self.routing.assignment_mode.as_deref(),
+                    ManualAssignmentMode::Delegate,
+                ),
+                headers: self.routing.routing_key_headers.clone(),
+            })
+            .dp_minimum_tokens_scheduler(self.routing.dp_minimum_tokens_scheduler))
+    }
+
     /// The router configuration of the flags. A refusal is raised in this
-    /// order: the flag shapes, the discovery flags, the schema file, the
-    /// tenant keys, the history store, the model aliases, and last the
-    /// shared validator over the built configuration, which the builder
-    /// runs.
+    /// order: flag shapes, controller and worker sources, discovery flags,
+    /// the schema file, tenant keys, the history store, model aliases, and
+    /// the shared validator over the built configuration.
     pub(crate) fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         self.validate_flag_formats()?;
+        if self.routing.policy_controller_address.is_some() {
+            if !self.routing.worker_urls.is_empty()
+                || !encode_urls.is_empty()
+                || !prefill_urls.is_empty()
+                || !self.workers.decode.is_empty()
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode".to_owned(),
+                });
+            }
+            if self.selected_discovery_provider().is_some() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--policy-controller-address supplies the workers and conflicts with --service-discovery and --discovery-provider".to_owned(),
+                });
+            }
+        }
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
-        let policy = self.parse_policy(&self.routing.policy);
-        let discovery = self.discovery_config()?;
+        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
+        let routing = self.routing_part(mode)?;
         let metrics = Some(MetricsConfig {
             port: self.serving.prometheus_port,
             host: self.metrics_host(),
@@ -1128,7 +1201,6 @@ impl CliArgs {
             enable_trace: self.integrations.enable_trace,
             otlp_traces_endpoint: self.integrations.otlp_traces_endpoint.clone(),
         });
-        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
         let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
         let history_backend = match self.model.history_backend.as_str() {
             "none" => HistoryBackend::None,
@@ -1152,10 +1224,7 @@ impl CliArgs {
         };
         let model_aliases = Self::model_aliases(&self.discovery.model_alias)?;
 
-        let builder = RouterConfig::builder()
-            .mode(mode)
-            .policy(policy)
-            .cache_boundaries(self.routing.cache_boundaries.clone())
+        let builder = routing
             .connection_mode(connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.routing.zmq_engine_count)
@@ -1188,22 +1257,8 @@ impl CliArgs {
             .worker_stall_secs(self.workers.worker_stall_secs)
             .worker_wedge_secs(self.workers.worker_wedge_secs)
             .worker_stale_secs(self.workers.worker_stale_secs)
-            .worker_warmup(
-                self.routing.worker_warmup_secs,
-                self.routing.worker_warmup_share,
-                self.routing.worker_warmup_blocks,
-                self.routing.worker_warmup_thin_ratio,
-                self.routing.worker_warmup_divert_every,
-            )
             .pd_admission_wait_secs(self.workers.pd_admission_wait_secs)
             .disable_load_monitoring(self.workers.disable_load_monitoring)
-            .worker_overload_protection(
-                self.routing.worker_overload_protection
-                    && !self.routing.disable_worker_overload_protection,
-            )
-            .worker_overload_waiting_requests(Some(self.routing.worker_overload_waiting_requests))
-            .worker_overload_token_usage(Some(self.routing.worker_overload_token_usage))
-            .worker_overload_shed(self.routing.worker_overload_shed)
             .engine_metrics(self.workers.engine_metrics)
             .multimodal_tensor_transport(self.workers.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.workers.multimodal_shm_min_bytes)
@@ -1284,7 +1339,6 @@ impl CliArgs {
             .access_log_fields(self.serving.access_log_fields.clone())
             .maybe_api_key(self.integrations.api_key.as_ref())
             .tenant_api_keys(tenant_api_keys)
-            .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.serving.log_dir.as_ref())
@@ -1298,7 +1352,6 @@ impl CliArgs {
                     .then(|| Self::parse_selector(&self.serving.storage_context_headers)),
             )
             .trust_tenant_header(self.serving.trust_tenant_header)
-            .tenant_header_name(&self.serving.tenant_header_name)
             .maybe_rate_limit_tokens_per_second(self.serving.rate_limit_tokens_per_second)
             .max_background_responses(self.serving.max_background_responses)
             .maybe_model_path(self.model.model_path.as_ref())
@@ -1311,33 +1364,18 @@ impl CliArgs {
             .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
-            .dp_aware(self.routing.dp_aware)
-            .pd_pairing_mode(
-                PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
-            )
-            .grouped_dp_sticky(self.routing.grouped_dp_sticky)
-            .routing_key_override(RoutingKeyOverrideConfig {
-                enabled: self.routing.routing_key_override,
-                eviction_interval_secs: self.routing.eviction_interval,
-                max_idle_secs: self.routing.max_idle_secs,
-                assignment_mode: Self::parse_assignment_mode(
-                    self.routing.assignment_mode.as_deref(),
-                    ManualAssignmentMode::Delegate,
-                ),
-                headers: self.routing.routing_key_headers.clone(),
-            })
+            .policy_controller(self.routing.policy_controller == "on")
+            .maybe_policy_spec_path(self.routing.policy_spec.as_ref())
             .retries(!self.serving.disable_retries)
             .upstream_http2(self.routing.upstream_http2)
             .circuit_breaker(!self.serving.disable_circuit_breaker)
             .enable_wasm(self.model.enable_wasm)
             .maybe_storage_hook_wasm_path(self.model.storage_hook_wasm_path.as_deref())
-            .igw(self.routing.enable_igw)
             .rl(smg_rl::RlConfig {
                 enabled: self.workers.enable_rl,
                 control_timeout_secs: self.workers.rl_control_timeout_secs,
                 fanout_concurrency: self.workers.rl_fanout_concurrency,
             })
-            .dp_minimum_tokens_scheduler(self.routing.dp_minimum_tokens_scheduler)
             .maybe_client_cert_and_key(
                 self.integrations.client_cert_path.as_ref(),
                 self.integrations.client_key_path.as_ref(),
@@ -1348,7 +1386,15 @@ impl CliArgs {
                 self.integrations.tls_key_path.as_ref(),
             );
 
-        builder.build()
+        let config = RouterConfig {
+            policy_controller_address: self.routing.policy_controller_address.clone(),
+            policy_controller_tls_ca_cert: self.routing.policy_controller_tls_ca_cert.clone(),
+            policy_controller_tls_cert: self.routing.policy_controller_tls_cert.clone(),
+            policy_controller_tls_key: self.routing.policy_controller_tls_key.clone(),
+            ..builder.build_with_validation(false)?
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Combine validated router settings with listener, discovery, and authentication flags.
@@ -1454,9 +1500,18 @@ impl CliArgs {
         if self.routing.enable_igw {
             return;
         }
-        println!("Policy: {}", self.routing.policy);
+        println!("{}", self.policy_line());
         for line in self.node_lines(prefill_urls, encode_urls) {
             println!("{line}");
+        }
+    }
+
+    /// The banner's policy line: the document where one decides, else the
+    /// policy the line means.
+    fn policy_line(&self) -> String {
+        match &self.routing.policy_spec {
+            Some(path) => format!("Policy: document {path}"),
+            None => format!("Policy: {}", self.routing_policy().name()),
         }
     }
 
@@ -1497,11 +1552,10 @@ impl CliArgs {
         lines
     }
 
-    /// Phase 3, configure: the router configuration, validated once by the
-    /// builder's `build()`, wrapped in the server configuration. Every
-    /// refusal is a [`ConfigError`] naming the flag; nothing has been bound
-    /// or spawned when one is raised. (`startup` validates once more, for a
-    /// library caller that never went through the builder.)
+    /// Phase 3, configure: assemble the validated router configuration and
+    /// wrap it in the server configuration. A refusal names the flag before
+    /// any listener binds or task starts. Startup also validates configurations
+    /// built by library callers.
     pub(crate) fn configure(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1510,4 +1564,88 @@ impl CliArgs {
         let router_config = self.to_router_config(prefill_urls, encode_urls)?;
         self.to_server_config(router_config)
     }
+
+    /// The routing part of a command line alone, as a configuration, checked
+    /// by the validator's rules for that part
+    /// ([`RouterConfigBuilder::build_routing`]). It reads the command line
+    /// and no file: no secret, no key and no store address. A start checks
+    /// the rest of the line, and it alone resolves a Consul address and the
+    /// Consul environment.
+    fn routing_config(
+        &self,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<RouterConfig> {
+        self.validate_flag_formats()?;
+        self.routing_part(self.routing_mode(prefill_urls, encode_urls))?
+            .build_routing()
+    }
+
+    /// The answer of `--print-policy-spec`: the policy document this command
+    /// line means, as YAML, checked by the function a start hands its own
+    /// document to ([`policy_controller::hosted`]): the operators' door over
+    /// the stock stages. The routing part of the line is read alone
+    /// ([`Self::routing_config`]). Nothing is bound or spawned.
+    pub(crate) fn policy_spec_print(
+        &self,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
+    ) -> PolicySpecPrint {
+        let config = match self.routing_config(prefill_urls, encode_urls) {
+            Ok(config) => config,
+            Err(refusal) => return PolicySpecPrint::Refused(refusal.to_string()),
+        };
+        let document = match config.policy_document() {
+            Ok(document) => document,
+            Err(refusal) => return PolicySpecPrint::Refused(refusal.to_string()),
+        };
+        let yaml = match serde_yaml::to_string(&document) {
+            Ok(yaml) => yaml,
+            Err(refusal) => return PolicySpecPrint::Refused(refusal.to_string()),
+        };
+        // A document this gateway's check refuses is still the one the flags
+        // mean: it prints, with the check's word for what it refuses.
+        match policy_controller::hosted(&config, None, &yaml) {
+            Ok(_) => PolicySpecPrint::Document(yaml),
+            Err(refusal) => PolicySpecPrint::DocumentRefused {
+                document: yaml,
+                refusal: refusal.to_string(),
+            },
+        }
+    }
 }
+
+/// What `--print-policy-spec` answers with.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PolicySpecPrint {
+    /// The document as YAML. This gateway's check of a document it hosts
+    /// takes it.
+    Document(String),
+    /// The document as YAML, and what that check refuses of it, in one
+    /// sentence. The answer is a failure.
+    DocumentRefused { document: String, refusal: String },
+    /// No document, and why in one sentence: the configuration's own
+    /// refusal, or the setting no document says.
+    Refused(String),
+}
+
+impl PolicySpecPrint {
+    /// The document as YAML, where the command line has one.
+    pub(crate) fn document(&self) -> Option<&str> {
+        match self {
+            Self::Document(document) | Self::DocumentRefused { document, .. } => Some(document),
+            Self::Refused(_) => None,
+        }
+    }
+
+    /// Why the answer is a failure, in one sentence.
+    pub(crate) fn refusal(&self) -> Option<&str> {
+        match self {
+            Self::Document(_) => None,
+            Self::DocumentRefused { refusal, .. } | Self::Refused(refusal) => Some(refusal),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

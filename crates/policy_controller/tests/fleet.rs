@@ -1,17 +1,20 @@
 //! The end-to-end case, the harness first: a controller on ephemeral ports,
 //! a fleet of mock engines and the generated client, in one process. The
 //! fleet registers, an engine of one rank through the control scope's call;
-//! the controller's own load driver polls it; a probe turn of the case asks
-//! each engine its health and writes what it heard; and the pool is read
-//! back as a decision's view reads it: every rank a row, healthy by its
-//! probe, its load from a poll, an engine that holds requests reading them.
+//! the controller's own load driver polls it; each engine is asked its
+//! health and what it answered is written, by the controller's own prober
+//! where its build has one and by a probe turn of the case elsewhere; and
+//! the pool is read back as a decision's view reads it: every rank a row,
+//! healthy by its probe, its load from a poll, an engine that holds
+//! requests reading them.
 //! That engine's KV events follow: a subscriber of the case hands each batch
 //! of its stream to the sink, and its row's index holds every block the
 //! events left the engine holding, where the cache-aware preset then asks a
-//! prompt that states them. Then one engine is killed: the first dial
+//! prompt that states them. Then one engine is killed: the first probe
 //! that hears it dead writes it, and the pool reads its rows unhealthy and
 //! every other row healthy. Next, an engine stops answering with its sockets
-//! open: a probe turn waits out its dial bound, writes it and goes on. Last,
+//! open: its probe waits out its bound and writes it, and a dial turn of
+//! the case waits out its own and goes on to every other engine. Last,
 //! the gateway sends requests of its own and reports each on its session:
 //! the store holds the completion of the engine that answered, none of class
 //! ok for the dead and the hung one, and nothing of it for another gateway;
@@ -61,11 +64,21 @@
 //! served plugin's beside the stock stages, on a spec file that names the
 //! three, answers each cache namespace of a request on a row of its own,
 //! and under either plugin passes over the row that holds a lease.
+//! A host that embeds the engine holds its own decisions: over a store
+//! with no controller beside it a door decides on the caller's thread and
+//! a handle carries each lease from its issue to its end. A request is
+//! served by the engine its pick names, and each way a request ends with
+//! no answer leaves no lease on file and no engine booked.
 //!
 //! The overload veto is read under an operator's patch on the control
 //! listener: the engine that holds requests, patched past its threshold,
 //! is no pick of a rotation until the gateway lifts the veto, and a session
 //! key keeps its ring worker over it.
+//!
+//! A gateway's link answers concurrent asks. Their leases leave the store
+//! on the caller's reports, or on the link's own release if an answer
+//! arrives after the caller's budget. A watch on the link takes the
+//! snapshot and the tail beside an ask, and can follow after the link ends.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -110,33 +123,45 @@ mod wasm_guest;
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
-    sync::mpsc,
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
 use engines::cpu_seconds;
 use fleet::{
     within, DialEnd, Harness, Replica, Shape, DIAL_TIMEOUT, GATEWAY, POLL_INTERVAL, PROBE_INTERVAL,
-    ROOM,
+    PRODUCT_PROBES, ROOM,
 };
 use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
 use prost::Message as _;
 use smg_policy_controller::{
-    client::{self, blocking, Answer, Client},
-    controller::{State, PROTOCOL_VERSION},
-    proto::{
-        completed::Class, decision::Outcome, identity::Form, principal, released, Completed,
-        DecideRequest, Decision, Identity, OverloadThresholds, Released, RequestFacts, ShedReason,
-        Side,
+    document::{
+        spec,
+        spec::{BindingSpec, Match},
     },
-    spec::{BindingSpec, Match},
-    store::{LaneCounts, WorkerStatus},
-    view::{Role, SignalSource, WireModes},
+    engine::view::{Role, SignalSource, WireModes, WorkerId},
+    service::{
+        client::{self, blocking, Answer, Client, Link, Unanswered},
+        controller::{State, PROTOCOL_VERSION},
+        proto,
+        proto::{
+            busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
+            released, worker_event, Completed, DecideRequest, Decision, Dispatched, Hello,
+            Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
+            WatchWorkersRequest,
+        },
+        watcher::{Ended, Following, Watcher},
+    },
+    store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
     PolicySpec, PowerOfTwoMetric, SpecError,
 };
-use tokio::sync::oneshot;
-use tonic::Code;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{oneshot, Barrier, Notify},
+    task::JoinSet,
+};
+use tonic::{transport::Endpoint, Code};
 
 const MODEL: &str = "fleet-model";
 
@@ -230,6 +255,8 @@ fn ask(id: &[u8]) -> DecideRequest {
             ..RequestFacts::default()
         }),
         constraints: None,
+        again: false,
+        ..Default::default()
     }
 }
 
@@ -391,7 +418,7 @@ fn for_model(mut ask: DecideRequest, model: &str) -> DecideRequest {
 fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
     if let Some(facts) = &mut ask.facts {
         SIZED.clone_into(&mut facts.model);
-        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+        facts.phase = proto::Phase::Prefill.into();
         facts.prompt_tokens = tokens;
     }
     ask
@@ -402,12 +429,12 @@ fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
 fn by_size() -> Result<PolicySpec, SpecError> {
     let mut document = PolicySpec::preset("bucket")?;
     for profile in document.profiles.values_mut() {
-        let sizes = smg_policy_controller::spec::BucketParams {
+        let sizes = spec::BucketParams {
             abs_threshold: Some(u32::MAX),
             adjust_interval_s: Some(3_600),
             ..Default::default()
         };
-        profile.score = vec![smg_policy_controller::spec::ScoreStage::Bucket(sizes).into()];
+        profile.score = vec![spec::ScoreStage::Bucket(sizes).into()];
     }
     Ok(document)
 }
@@ -456,7 +483,7 @@ async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Ve
         .facts
         .as_ref()
         .is_some_and(|facts| facts.session_key.is_some());
-    let answer = harness.client().decide(ask).await;
+    let answer = answered(harness, ask).await;
     let Ok(Answer::Decision(Decision {
         leases,
         outcome: Some(Outcome::Pick(pick)),
@@ -478,6 +505,37 @@ async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Ve
     Ok((row_of(harness, target.id, target.dp_rank)?, leases))
 }
 
+/// The pause before an ask is asked again.
+const AGAIN: Duration = Duration::from_millis(25);
+
+/// Whether `error` is a session its controller ended because it stopped
+/// leading, or leads under a later term: a gateway opens its session again.
+fn ended(error: &client::Error) -> bool {
+    matches!(error, client::Error::Status(status) if status.code() == Code::Aborted)
+}
+
+/// One ask's answer. A controller that elects over a lease file is asked
+/// again while it answers that it does not lead. A leader whose renewal
+/// lands past its renew deadline leads nobody until one lands in time, and
+/// the lease's store on a busy host can hold a renewal that long. A gateway
+/// asks again, and so does the case, inside the room. A controller that
+/// leads itself is asked once: a case counts what its client sent.
+async fn answered(harness: &mut Harness, ask: DecideRequest) -> Result<Answer, client::Error> {
+    let began = Instant::now();
+    loop {
+        match harness.client().decide(ask.clone()).await {
+            Ok(Answer::Busy(busy))
+                if harness.elects()
+                    && busy.reason() == busy::Reason::NotLeader
+                    && began.elapsed() < ROOM =>
+            {
+                tokio::time::sleep(AGAIN).await;
+            }
+            answer => return answer,
+        }
+    }
+}
+
 /// Gives `leases` up on the session, as a gateway whose client left, and
 /// waits until the store's file holds `left` leases of the gateway.
 async fn given_up(harness: &mut Harness, leases: &[u64], left: usize) -> Result<(), String> {
@@ -487,7 +545,18 @@ async fn given_up(harness: &mut Harness, leases: &[u64], left: usize) -> Result<
             reason: released::Reason::ClientGone.into(),
             ..Released::default()
         };
-        let reported = harness.client().released(released).await;
+        let reported = match harness.client().released(released).await {
+            // A leader that took its renew deadline whole ended its
+            // sessions, and a gateway hears it at its next report: it opens
+            // its session again and says the report there. Boxed: the
+            // dial's future is large, and every pick of a case would carry
+            // it.
+            Err(error) if harness.elects() && ended(&error) => {
+                Box::pin(harness.redial()).await?;
+                harness.client().released(released).await
+            }
+            reported => reported,
+        };
         reported.map_err(|status| format!("a lease is not given up: {status:?}"))?;
     }
     // Every pick of the case passes here, and a report is one frame the
@@ -626,8 +695,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .sum();
         let pool = harness.view(MODEL, Role::Single).expect("the view");
         assert_eq!(pool.len(), ranks, "every rank is a row: {pool:?}");
+        // A controller that probes by itself asks an engine as its row
+        // arrives: nothing is asked yet only where the stand-in probes.
         assert!(
-            pool.iter().all(|row| !row.healthy && row.load.is_none()),
+            PRODUCT_PROBES || pool.iter().all(|row| !row.healthy && row.load.is_none()),
             "nothing is known of an engine nobody asked: {pool:?}"
         );
 
@@ -858,12 +929,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             kv_usage_permille: Some(1),
             ..OverloadThresholds::default()
         };
-        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, Some(busy))
+        overloaded(&mut harness, ranks, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         let mut vetoed = HashSet::new();
@@ -894,14 +964,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the gateway's lift of the veto keeps the overloaded row: {lifted:?}"
         );
         assert!(
-            reads_overloaded(&mut harness, whole, Some(busy)),
+            reads_overloaded(&mut harness, ranks, Some(busy)),
             "the engine read overloaded through both rotations"
         );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, None)
+        overloaded(&mut harness, ranks, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 
@@ -1147,7 +1217,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // returns to that failover.
         let away = |run: &str, n: u64| {
             let mut ask = keyed(nth(run, n), sticky);
-            ask.constraints = Some(smg_policy_controller::proto::Constraints {
+            ask.constraints = Some(proto::Constraints {
                 excluded: vec![sent.id],
                 ..Default::default()
             });
@@ -1282,8 +1352,15 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the busy engine's blocks reach its row's index",
             PROBE_INTERVAL + ROOM,
             || {
+                // The listener's stream and the store's own are two: they
+                // are read at rest, the cursor at the last sequence the
+                // listener heard and the index holding what it holds.
                 harness.heard(busy).first().is_some_and(|row| {
-                    row.indexed > 0 && row.cursor.is_some_and(|cursor| cursor.applied >= 1)
+                    row.indexed > 0
+                        && row.indexed == row.held
+                        && row
+                            .cursor
+                            .is_some_and(|cursor| cursor.applied >= 1 && cursor.applied == row.last)
                 })
             },
         )
@@ -1305,7 +1382,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the cursor stands at what the stream delivered: {fed:?}"
         );
         assert!(
-            fed.applied >= 1 && fed.indexed == fed.held,
+            fed.indexed >= 1 && fed.indexed == fed.held,
             "the index holds each block the engine's events left it holding: {fed:?}"
         );
         assert_eq!(
@@ -1346,7 +1423,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         for engine in engines.iter().filter(|engine| **engine != busy) {
             for idle in harness.heard(*engine) {
                 assert!(
-                    idle.applied == 0 && idle.indexed == 0 && idle.held == 0,
+                    idle.last == 0 && idle.indexed == 0 && idle.held == 0,
                     "an engine that stored no block published none: engine {engine} {idle:?}"
                 );
             }
@@ -1376,12 +1453,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             }
         }
         let (key, row) = held.expect("of 256 routing keys one is the busy engine's");
-        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, Some(busy))
+        overloaded(&mut harness, ranks, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         for n in 0..8 {
@@ -1394,14 +1470,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             );
         }
         assert!(
-            reads_overloaded(&mut harness, whole, Some(busy)),
+            reads_overloaded(&mut harness, ranks, Some(busy)),
             "the engine read overloaded through the key's asks"
         );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, None)
+        overloaded(&mut harness, ranks, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 
@@ -1806,7 +1882,33 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         })
         .await
         .expect("a live engine reads healthy");
+        let killed = harness.mark();
         let death = harness.kill(dead).await.expect("the kill");
+        // The death's verdicts are the statuses the store moved from the
+        // kill on, one a rank, whoever probes. The liveness rule moves a
+        // not-ready row on to failed three failures later: that step
+        // follows the death, it is not its verdict.
+        let verdicts = |harness: &Harness| {
+            let mut moved = harness.moved(killed).expect("the store's tail");
+            moved.retain(|moved| moved.engine == dead && moved.to != WorkerStatus::Failed);
+            moved
+        };
+        within(
+            "the death is written, one verdict a rank",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || verdicts(&harness).len() >= 2,
+        )
+        .await
+        .expect("the death is written");
+        let written = death.at.elapsed();
+        assert_eq!(
+            verdicts(&harness)
+                .iter()
+                .map(|moved| (moved.from, moved.to))
+                .collect::<Vec<_>>(),
+            [(WorkerStatus::Ready, WorkerStatus::NotReady); 2],
+            "one verdict a rank from the kill on"
+        );
         within(
             "a dead engine's rows read unhealthy and every other row healthy",
             PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
@@ -1825,48 +1927,39 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ranks,
             "a dead engine's rows stay rows: {pool:?}"
         );
-        // The death's verdicts are the ones written from the kill on, one a
-        // rank, by the first dial that heard the engine dead: a turn in
-        // flight at the kill, or the first one begun after the death. The
-        // liveness rule moves a not-ready row on to failed three failures
-        // later: that step follows the death, it is not its verdict.
-        let moved: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.engine == dead
-                    && verdict.at >= death.at
-                    && verdict.to != WorkerStatus::Failed
-            })
-            .collect();
-        assert_eq!(
-            moved.len(),
-            2,
-            "one verdict a rank from the kill on: {moved:?}"
-        );
-        let first = harness
-            .first_unhealthy(dead, death.asked)
-            .expect("a dial heard the engine dead");
-        assert!(
-            first <= death.turn + 1,
-            "the first turn after the death dialed it: turn {first} after {death:?}"
-        );
-        for verdict in &moved {
-            assert_eq!(
-                (verdict.from, verdict.to),
-                (WorkerStatus::Ready, WorkerStatus::NotReady),
-                "{verdict:?}"
+        // Where the stand-in probes, its turns tell which dial wrote: the
+        // first that heard the engine dead, a turn in flight at the kill
+        // or the first one begun after the death.
+        if !PRODUCT_PROBES {
+            let first = harness
+                .first_unhealthy(dead, death.asked)
+                .expect("a dial heard the engine dead");
+            assert!(
+                first <= death.turn + 1,
+                "the first turn after the death dialed it: turn {first} after {death:?}"
             );
-            assert_eq!(
-                verdict.turn, first,
-                "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
-            );
+            let wrote: Vec<_> = harness
+                .verdicts()
+                .into_iter()
+                .filter(|verdict| {
+                    verdict.engine == dead
+                        && verdict.at >= death.at
+                        && verdict.to != WorkerStatus::Failed
+                })
+                .collect();
+            assert_eq!(wrote.len(), 2, "one verdict a rank: {wrote:?}");
+            for verdict in &wrote {
+                assert_eq!(
+                    (verdict.from, verdict.to),
+                    (WorkerStatus::Ready, WorkerStatus::NotReady),
+                    "{verdict:?}"
+                );
+                assert_eq!(
+                    verdict.turn, first,
+                    "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
+                );
+            }
         }
-        let written = moved
-            .iter()
-            .map(|verdict| verdict.at.duration_since(death.at))
-            .max()
-            .unwrap_or_default();
         // No decision names the dead engine: from the probe that heard it
         // dead its rows are no candidates.
         harness
@@ -1900,6 +1993,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // costs a probe turn its dial bound and no more: that turn writes
         // the engine's row not ready, and no live row moves.
         let hung = engines[2];
+        let hanged = harness.mark();
         let hang = Instant::now();
         harness.hang(hung).expect("the hang");
         within(
@@ -1915,24 +2009,29 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .await
         .expect("the hang is seen");
         let hung_seen = hang.elapsed();
-        let moved: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.engine == hung && verdict.at >= hang && verdict.to != WorkerStatus::Failed
-            })
-            .collect();
+        let moved = harness.moved(hanged).expect("the store's tail");
         assert_eq!(
             moved
                 .iter()
-                .map(|verdict| (verdict.from, verdict.to))
+                .filter(|moved| moved.engine == hung && moved.to != WorkerStatus::Failed)
+                .map(|moved| (moved.from, moved.to))
                 .collect::<Vec<_>>(),
             [(WorkerStatus::Ready, WorkerStatus::NotReady)],
             "one verdict for the hung engine's one rank: {moved:?}"
         );
-        // That turn went on to every engine after the hung one, and from
-        // the hang on no live row moved.
-        let turn = moved[0].turn;
+        // The dialer's turn that waited out the bound went on to every
+        // engine after the hung one, and from the hang on no live row
+        // moved.
+        within(
+            "a dial waits out the hung engine",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || harness.first_unhealthy(hung, 0).is_some(),
+        )
+        .await
+        .expect("a dial of the hung engine ends");
+        let turn = harness
+            .first_unhealthy(hung, 0)
+            .expect("the turn that waited out the bound");
         within("the turn that waited out the bound ends", ROOM, || {
             harness.dialed(turn).len() == FLEET.len()
         })
@@ -1954,13 +2053,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ],
             "the turn that waited out the bound went on to every engine"
         );
-        let others: Vec<_> = harness
-            .verdicts()
-            .into_iter()
-            .filter(|verdict| {
-                verdict.at >= hang && verdict.engine != hung && verdict.engine != dead
-            })
-            .collect();
+        let mut others = harness.moved(hanged).expect("the store's tail");
+        others.retain(|moved| moved.engine != hung && moved.engine != dead);
         assert!(
             others.is_empty(),
             "no live row moves at the hang: {others:?}"
@@ -2158,7 +2252,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         writeln!(out, "FLEET_READY_MS {}", ready.as_millis()).expect("stdout");
         writeln!(out, "FLEET_LOADS_FOLLOW_MS {}", followed.as_millis()).expect("stdout");
         writeln!(out, "FLEET_KV_FOLLOW_MS {}", stored.as_millis()).expect("stdout");
-        writeln!(out, "FLEET_KV_BATCHES {}", fed.applied).expect("stdout");
+        writeln!(out, "FLEET_KV_BATCHES {}", fed.last).expect("stdout");
         writeln!(out, "FLEET_KV_BLOCKS {}", fed.indexed).expect("stdout");
         writeln!(out, "FLEET_DEATH_WRITTEN_MS {}", written.as_millis()).expect("stdout");
         writeln!(out, "FLEET_DEATH_SEEN_MS {}", seen.as_millis()).expect("stdout");
@@ -2227,7 +2321,7 @@ const PAIR_PLAN: &str = r#"{
 fn at_prefill(n: u64) -> DecideRequest {
     let mut ask = for_model(nth("pair", n), PAIRED);
     if let Some(facts) = &mut ask.facts {
-        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+        facts.phase = proto::Phase::Prefill.into();
     }
     ask
 }
@@ -2359,6 +2453,8 @@ async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engin
 
 /// The blocking form of the reference client asks the same started
 /// controller from a thread that runs no runtime, and holds the same floor.
+/// Its watch tells the controller's refusal of a request and, of one the
+/// controller takes, the snapshot first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own() {
     let case = async {
@@ -2375,11 +2471,24 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
                         .as_ref()
                         .map(|told| told.subject.clone());
                     let decided = client.decide(ask(b"blocking"))?;
-                    Ok((leader, client.term_floor(), subject, decided))
+                    // A resume under a term with no place is refused by its field.
+                    let unplaced = WatchWorkersRequest {
+                        resume_term: 1,
+                        ..WatchWorkersRequest::default()
+                    };
+                    let refused = match client.watch_workers(unplaced) {
+                        Err(client::Error::Status(status)) => {
+                            Some((status.code(), status.message().to_owned()))
+                        }
+                        _ => None,
+                    };
+                    let mut watch = client.watch_workers(WatchWorkersRequest::default())?;
+                    let told = client.next_of(&mut watch)?;
+                    Ok((leader, client.term_floor(), subject, decided, refused, told))
                 });
             let _ = answered.send(asked.map_err(|error| error.to_string()));
         });
-        let (leader, floor, subject, decided) = tokio::time::timeout(ROOM, answer)
+        let (leader, floor, subject, decided, refused, told) = tokio::time::timeout(ROOM, answer)
             .await
             .expect("the blocking client answers inside its bound")
             .expect("the client's thread sends its answer")
@@ -2399,9 +2508,373 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
                 if shed.reason() == ShedReason::PolicyDeclined && shed.emptied_by == "binding"),
             "{decided:?}"
         );
+        // The watch: an open the controller refuses tells its status, and
+        // the first event of one it takes is the snapshot of no worker.
+        assert!(
+            matches!(&refused, Some((Code::InvalidArgument, said)) if said.contains("resume_term")),
+            "{refused:?}"
+        );
+        let told = told.expect("the watch tells a snapshot first");
+        assert!(
+            matches!(&told.event, Some(worker_event::Event::Snapshot(page))
+                if page.last && page.workers.is_empty()),
+            "{told:?}"
+        );
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// Ready workers under a controller that leads itself.
+async fn linked_fleet(gateway: &str, workers: usize) -> Result<(Harness, Link), String> {
+    let mut harness = Harness::start().await?;
+    harness.apply("round_robin")?;
+    harness.register(&FLEET[..workers]).await?;
+    harness.feed();
+    within("the workers are ready", ROOM, || {
+        harness
+            .view(MODEL, Role::Single)
+            .is_ok_and(|pool| pool.len() == workers && pool.iter().all(|row| row.healthy))
+    })
+    .await?;
+    let endpoint = Endpoint::from_shared(format!("http://{}", harness.gateway()))
+        .map_err(|error| error.to_string())?;
+    let link = Box::pin(Link::connect(endpoint, gateway))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((harness, link))
+}
+
+async fn linked_pick(link: &Link, request: DecideRequest) -> Result<Lease, String> {
+    let answer = link.ask(request, ROOM).await;
+    let Ok(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(_)),
+        ..
+    }) = answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let [lease] = leases.as_slice() else {
+        return Err(format!("a pick with the wrong leases: {leases:?}"));
+    };
+    Ok(*lease)
+}
+
+async fn leases_before_expiry(
+    harness: &Harness,
+    link: &Link,
+    gateway: &str,
+    left: usize,
+    before: Instant,
+) -> Result<(), String> {
+    let span = Duration::from_millis(u64::from(link.welcome().dispatch_ttl_ms));
+    within(
+        "the store reaches the reported lease count before expiry",
+        span.saturating_sub(before.elapsed()),
+        || before.elapsed() < span && harness.leases(gateway) == left,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
+    const GATEWAY: &str = "fleet-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let mut asks = JoinSet::new();
+        let count = usize::try_from(ASKS).expect("the number of asks fits");
+        let ready = Arc::new(Barrier::new(count + 1));
+        let before = Instant::now();
+        for n in 0..ASKS {
+            let link = link.clone();
+            let ready = Arc::clone(&ready);
+            asks.spawn(async move {
+                let session = session_of(&n.to_string(), MODEL);
+                ready.wait().await;
+                let lease = linked_pick(&link, keyed(nth("link", n), session))
+                    .await
+                    .expect("the controller answers with a pick");
+                assert_eq!(lease.session_key, session, "each ask gets its own decision");
+                (lease.id, lease.side)
+            });
+        }
+        ready.wait().await;
+        let mut leases = HashMap::new();
+        while let Some(answer) = asks.join_next().await {
+            let (id, side) = answer.expect("the caller gets its answer");
+            assert!(
+                leases.insert(id, side).is_none(),
+                "a distinct lease for every ask"
+            );
+        }
+        assert_eq!(harness.leases(GATEWAY), count);
+        for (lease_id, side) in leases {
+            link.report(gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(lease_id)),
+                reason: released::Reason::ClientGone.into(),
+                side,
+            }));
+        }
+        leases_before_expiry(&harness, &link, GATEWAY, 0, before)
+            .await
+            .expect("the reports end the leases");
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A request can outlast the session its decision came over. The gateway
+/// dials its link again, and what the request reports then reaches the
+/// controller on the link's next session: a dispatched lease, which no
+/// deadline ends, ends at that report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
+    const GATEWAY: &str = "fleet-redial";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let endpoint =
+            Endpoint::from_shared(format!("http://{}", harness.gateway())).expect("a URI");
+        // A request in flight holds a clone of the link.
+        let held = link.clone();
+        let sent = |lease: Lease| {
+            gateway_frame::Frame::Dispatched(Dispatched {
+                lease_id: lease.id,
+                target_index: 0,
+                side: lease.side,
+                since_decision_micros: 0,
+            })
+        };
+        let ended = |lease: Lease| {
+            gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(lease.id)),
+                reason: released::Reason::ClientGone.into(),
+                side: lease.side,
+            })
+        };
+
+        // The controller ends the session under a dispatched request: a
+        // second hello on one stream is refused.
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        held.report(sent(first));
+        within("the store reads the first lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, first.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        tokio::time::timeout(ROOM, link.closed())
+            .await
+            .expect("the session ends");
+        assert!(!held.stands());
+
+        // The request ends with no session standing. Its report waits, and
+        // the link's next session says it.
+        held.report(ended(first));
+        assert_eq!(harness.leases(GATEWAY), 1, "no session said the end");
+        Box::pin(link.redial(endpoint.clone(), GATEWAY))
+            .await
+            .expect("the link's next session");
+        within("the report that waited ends the lease", ROOM, || {
+            harness.leases(GATEWAY) == 0
+        })
+        .await
+        .expect("the next session said the report");
+
+        // A redial over a session that stands: the next session takes its
+        // place, and the gateway's lease with it.
+        let second = linked_pick(&held, ask(b"second"))
+            .await
+            .expect("a pick on the next session");
+        held.report(sent(second));
+        within("the store reads the second lease dispatched", ROOM, || {
+            harness.dispatched(GATEWAY, second.id)
+        })
+        .await
+        .expect("the session said the dispatch");
+        Box::pin(link.redial(endpoint, GATEWAY))
+            .await
+            .expect("the link's third session");
+        assert_eq!(
+            harness.leases(GATEWAY),
+            1,
+            "the lease stands through the redial"
+        );
+        held.report(ended(second));
+        within(
+            "the report on the third session ends the lease",
+            ROOM,
+            || harness.leases(GATEWAY) == 0,
+        )
+        .await
+        .expect("the third session said the report");
+        assert!(held.stands());
+        assert_eq!(held.reports_dropped(), 0);
+        drop((link, held));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
+    const GATEWAY: &str = "fleet-late-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let before = Instant::now();
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        assert!(matches!(
+            link.ask(ask(b"late"), Duration::ZERO).await,
+            Err(Unanswered::Late)
+        ));
+        let last = linked_pick(&link, ask(b"last")).await.expect("a last pick");
+        // The three asks run on the same decider. The gap proves that the
+        // middle ask booked a lease even if its release has arrived already.
+        assert_eq!(last.id, first.id + 2);
+        leases_before_expiry(&harness, &link, GATEWAY, 2, before)
+            .await
+            .expect("only the first and last leases remain");
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A frame the call refuses ends the stream it is sent on, and a link's
+/// stream is every caller's. The link refuses such a frame at its own door:
+/// nothing is sent, the link stands, and the next ask is answered on the
+/// stream that stood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
+    const GATEWAY: &str = "fleet-ranged-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        let mut wrong = ask(b"wrong");
+        wrong.facts.as_mut().expect("the ask states facts").phase = 99;
+        let refused = link.ask(wrong, ROOM).await;
+        assert!(
+            matches!(&refused, Err(Unanswered::Unsent(error))
+                if error.to_string().contains("facts.phase")),
+            "{refused:?}"
+        );
+        assert!(link.stands(), "the link stands");
+        let last = linked_pick(&link, ask(b"last"))
+            .await
+            .expect("a pick after the refusal");
+        // Both picks ran on the same decider: no lease was booked between
+        // them, so the refused frame reached no decider.
+        assert_eq!(last.id, first.id + 1);
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
+    use smg_policy_controller::{
+        engine::door::{Door, Request},
+        tracking::handle::Handle,
+        Outcome, RequestFacts, Side, TransportClass,
+    };
+
+    const GATEWAY: &str = "fleet-handle";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 2))
+            .await
+            .expect("a ready fleet");
+        for id in ["held-0", "held-1", "held-2"] {
+            let asked = Request {
+                id: id.as_bytes(),
+                facts: RequestFacts {
+                    model: MODEL,
+                    budget_micros: 5_000_000,
+                    ..RequestFacts::default()
+                },
+                constraints: Default::default(),
+            };
+            let started = Instant::now();
+            let held = Box::pin(Handle::<&Door>::asked(&link, &asked, started, ROOM)).await;
+            let mut handle = held.expect("the controller's decision");
+            let taken = handle.take(0).expect("a picked worker");
+            let alternate = handle.decision().pick().expect("a pick").targets.as_slice()[1];
+            let (picked, _) = harness
+                .named(taken.id.0)
+                .expect("the picked worker is in the fleet");
+            let (served, _) = harness
+                .named(alternate.id.0)
+                .expect("the alternate is in the fleet");
+            assert_ne!(served, picked);
+            assert_eq!(harness.leases(GATEWAY), 1, "the controller filed the lease");
+            let sent = Instant::now();
+            handle.dispatched(sent);
+            let (class, frames) = harness
+                .serve_request(served, id.to_owned())
+                .await
+                .expect("the worker answers");
+            assert_eq!(class, Class::Ok);
+            assert!(frames > 0);
+            let ended = Instant::now();
+            handle.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: alternate.id,
+                    status: 0,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 8,
+                    tokens_out: frames,
+                    duration_micros: u32::try_from(ended.duration_since(sent).as_micros())
+                        .unwrap_or(u32::MAX),
+                },
+                ended,
+            );
+            leases_before_expiry(&harness, &link, GATEWAY, 0, started)
+                .await
+                .expect("the completion ends the lease");
+            within(
+                "the completion is written on the served worker",
+                ROOM,
+                || harness.completed_ok(GATEWAY, served, started),
+            )
+            .await
+            .expect("the controller records the named worker's completion");
+            assert!(!harness.completed_ok(GATEWAY, picked, started));
+        }
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }
@@ -2463,6 +2936,282 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
         .expect("the case ends inside its outer bound");
 }
 
+/// What a watcher's store holds of its controller's workers, by id: each
+/// row's facts, status and revision.
+fn watched(watcher: &Watcher) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
+    let (_, mut rows) = WorkersStore::snapshot(&**watcher.store());
+    rows.sort_by_key(|row| row.id.0);
+    rows.into_iter()
+        .map(|row| (row.id, row.facts, row.status, row.revision))
+        .collect()
+}
+
+/// The status a watcher holds for a row, if it holds the row.
+fn status_of(watcher: &Watcher, id: WorkerId) -> Option<WorkerStatus> {
+    WorkersStore::get(&**watcher.store(), id).map(|row| row.status)
+}
+
+/// Follows the stream until `stands` holds of its watcher, each event
+/// inside the room of a wait.
+async fn follows(
+    following: &mut Following<'_>,
+    mut stands: impl FnMut(&Watcher) -> bool,
+) -> Result<(), String> {
+    while !stands(following.watcher()) {
+        let taken = tokio::time::timeout(ROOM, following.next())
+            .await
+            .map_err(|_| "the watch told nothing inside its room".to_owned())?
+            .map_err(|ended| format!("the stream is followed no further: {ended:?}"))?;
+        if !taken {
+            return Err("the watch ended with no status".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// A gateway that watches holds the controller's rows. A snapshot tells the
+/// fleet as it registered. The tail tells each status the prober writes, an
+/// engine that registers behind the snapshot and a dead engine's status. A
+/// stream opened after the last place taken is told the tail alone. At one
+/// place, the watcher holds what one that started from a later snapshot
+/// holds. The later snapshot keeps a lease already on file in its store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
+    use smg_policy_controller::{
+        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, Picked},
+        tracking::lease::{Lease, LeaseId},
+    };
+
+    let case = async {
+        let mut harness = Harness::start().await.expect("the harness starts");
+        let engines = harness
+            .register(&FLEET[..3])
+            .await
+            .expect("the fleet registers");
+        let ids: Vec<WorkerId> = engines
+            .iter()
+            .map(|engine| harness.worker(*engine).expect("the engine's row"))
+            .collect();
+        let dead = |watcher: &Watcher, id: WorkerId| {
+            status_of(watcher, id).is_some_and(|status| status != WorkerStatus::Ready)
+        };
+
+        // The snapshot tells the fleet as it registered. Where the stand-in
+        // probes, no prober has started yet and every row is pending. A
+        // controller that probes by itself may have readied a row already.
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let opened = watcher.open(harness.client()).await;
+        let mut stream = opened.expect("the watch opens");
+        let told = follows(&mut stream, |held| held.at().is_some()).await;
+        told.expect("a snapshot is told");
+        for id in &ids {
+            let status = status_of(stream.watcher(), *id);
+            assert!(
+                status == Some(WorkerStatus::Pending)
+                    || (PRODUCT_PROBES && status == Some(WorkerStatus::Ready)),
+                "a row of the snapshot reads {status:?}"
+            );
+        }
+
+        // The prober starts: the tail tells each engine it heard.
+        harness.feed();
+        let ready = |watcher: &Watcher| {
+            ids.iter()
+                .all(|id| status_of(watcher, *id) == Some(WorkerStatus::Ready))
+        };
+        let told = follows(&mut stream, ready).await;
+        told.expect("the fleet is told ready");
+
+        // An engine that registers behind the snapshot.
+        let late = harness.register(&FLEET[3..4]).await;
+        let late = late.expect("one more engine registers")[0];
+        let late = harness.worker(late).expect("the late engine's row");
+        let ready = |watcher: &Watcher| status_of(watcher, late) == Some(WorkerStatus::Ready);
+        let told = follows(&mut stream, ready).await;
+        told.expect("the late engine is told ready");
+
+        // A dead engine: the prober's word reaches the watcher.
+        harness.kill(engines[0]).await.expect("an engine dies");
+        let told = follows(&mut stream, |held| dead(held, ids[0])).await;
+        told.expect("the death is told");
+
+        // A stream opened after the last place taken: the tail alone.
+        drop(stream);
+        let opened = watcher.open(harness.client()).await;
+        let mut stream = opened.expect("the watch opens again");
+        harness
+            .kill(engines[1])
+            .await
+            .expect("a second engine dies");
+        let told = follows(&mut stream, |held| dead(held, ids[1])).await;
+        told.expect("the second death is told");
+        assert_eq!(
+            stream.watcher().snapshots(),
+            1,
+            "no snapshot behind a place"
+        );
+
+        // A watcher that starts now takes a snapshot. Both are then told
+        // one more death, and at its place the first holds what the second
+        // holds.
+        let store = Arc::new(MemoryStore::new());
+        let leases: &dyn LeasesStore = &*store;
+        let gateway = GatewayId(1);
+        let now = Instant::now();
+        leases
+            .issue(LeaseRecord {
+                lease: Lease {
+                    id: LeaseId(1),
+                    ..Lease::default()
+                },
+                gateway,
+                request: 1,
+                target: late,
+                picked: Picked::default(),
+                decode: None,
+                term: 0,
+                issued_at: now,
+                dispatch_deadline: now + ROOM,
+                state: LeaseState::ISSUED,
+            })
+            .expect("filed");
+        assert_eq!(leases.live(gateway), 1);
+        let mut fresh = Watcher::new(Arc::clone(&store));
+        let opened = fresh.open(harness.client()).await;
+        let mut snapshot = opened.expect("a second watch opens");
+        let told = follows(&mut snapshot, |held| held.at().is_some()).await;
+        told.expect("a snapshot is told");
+        assert_eq!(leases.live(gateway), 1);
+        harness.kill(engines[2]).await.expect("a third engine dies");
+        let told = follows(&mut stream, |held| dead(held, ids[2])).await;
+        told.expect("the third death is told on the tail");
+        let told = follows(&mut snapshot, |held| dead(held, ids[2])).await;
+        told.expect("the third death is told behind the snapshot");
+        let (first, second) = (stream.watcher(), snapshot.watcher());
+        assert_eq!(first.at(), second.at(), "both stand at the death's place");
+        assert_eq!(watched(first), watched(second));
+        assert_eq!(watched(first).len(), 4, "four engines of one rank");
+        assert_eq!((first.snapshots(), second.snapshots()), (1, 1));
+
+        drop((stream, snapshot));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
+    const GATEWAY: &str = "fleet-link-watch";
+    let case = async {
+        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
+            .await
+            .expect("a ready fleet");
+        let first = harness.worker(0).expect("the first worker's row");
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut stream = watcher
+            .open_on(&link)
+            .await
+            .expect("the link opens a watch");
+        follows(&mut stream, |held| held.at().is_some())
+            .await
+            .expect("the watch takes a snapshot");
+        assert_eq!(watched(stream.watcher()).len(), 1);
+        assert_eq!(
+            status_of(stream.watcher(), first),
+            Some(WorkerStatus::Ready)
+        );
+
+        let tail = follows(&mut stream, |held| watched(held).len() == 2);
+        let ask_and_register = async {
+            linked_pick(&link, ask(b"watching"))
+                .await
+                .expect("the link answers while the watch waits");
+            harness
+                .register(&FLEET[1..2])
+                .await
+                .expect("a worker joins the fleet");
+        };
+        let (told, ()) = tokio::join!(biased; tail, ask_and_register);
+        told.expect("the watch takes the new row on its tail");
+        drop(stream);
+
+        let mut stream = watcher
+            .open_on(&link)
+            .await
+            .expect("the link resumes the watch");
+        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        tokio::time::timeout(ROOM, link.closed())
+            .await
+            .expect("the second hello ends the link");
+        drop(link);
+
+        harness.kill(0).await.expect("the first worker dies");
+        follows(&mut stream, |held| {
+            status_of(held, first).is_some_and(|status| status != WorkerStatus::Ready)
+        })
+        .await
+        .expect("the watch takes the status after the link ends");
+        assert_eq!(stream.watcher().snapshots(), 1);
+        drop(stream);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A watch whose controller goes silent, with its connection still open,
+/// ends: the client keeps its channel alive, and a peer that answers no
+/// ping ends the streams on it. A relay stands between the two. At a word
+/// it stops relaying and closes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watch_ends_when_its_controller_goes_silent() {
+    let case = async {
+        let harness = Harness::start().await.expect("the harness starts");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let relay = listener.local_addr().expect("the relay's address");
+        let controller = harness.gateway();
+        let silent = Arc::new(Notify::new());
+        let word = Arc::clone(&silent);
+        let mut relayed = JoinSet::new();
+        relayed.spawn(async move {
+            let (mut near, _) = listener.accept().await.expect("the client dials");
+            let far = TcpStream::connect(controller).await;
+            let mut far = far.expect("the controller listens");
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut near, &mut far) => {}
+                () = word.notified() => std::future::pending::<()>().await,
+            }
+        });
+
+        let address = format!("http://{relay}");
+        let connected = Client::connect(&address, "silent-gateway").await;
+        let mut client = connected.expect("the client connects through the relay");
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let opened = watcher.open(&mut client).await;
+        let mut stream = opened.expect("the watch opens");
+        let first = tokio::time::timeout(ROOM, stream.next()).await;
+        assert!(matches!(first, Ok(Ok(true))), "the snapshot: {first:?}");
+
+        silent.notify_one();
+        // A ping goes out one keepalive after the last frame read, and the
+        // channel ends one answer's wait after a ping with no answer.
+        let bound = client::KEEPALIVE + client::ANSWER_WAIT + Duration::from_secs(5);
+        let ended = tokio::time::timeout(bound, stream.next())
+            .await
+            .expect("a silent controller ends the stream inside its bound");
+        assert!(matches!(ended, Err(Ended::Client(_))), "{ended:?}");
+
+        relayed.abort_all();
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
 /// A controller of a host's own build over the fleet: its catalog holds a
 /// scorer in code, a WebAssembly guest's and a served plugin's beside the
 /// stock stages, and the document of its spec file names the three.
@@ -2471,9 +3220,11 @@ mod hosted {
     use std::{collections::HashSet, sync::Arc};
 
     use smg_policy_controller::{
-        grpc::{self, GrpcPluginSpec, GrpcScorer, Transport},
-        plugins::OpenDecisions,
-        wasm::{self, PluginSpec, WasmScorer},
+        plugins::{
+            grpc::{self, GrpcPluginSpec, GrpcScorer, Transport},
+            shared::OpenDecisions,
+            wasm::{self, PluginSpec, WasmScorer},
+        },
         Candidate, Catalog, Lifecycle, Scorer, TieBand,
     };
 
@@ -2908,4 +3659,210 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
     tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
+}
+
+/// A host that embeds the engine over the fleet: no controller stands
+/// beside the store, a door decides on the caller's thread and a handle
+/// holds each decision from its answer to the end of its request.
+mod embedded {
+    use std::{sync::Arc, time::Instant};
+
+    use smg_policy_controller::{
+        engine::{
+            door::{Door, Request},
+            view::fingerprint,
+        },
+        store::{GatewayId, HealthSink, LeaseState, LeasesStore},
+        tracking::handle::Handle,
+        Constraints, Outcome, PolicySpec, ReleaseReason, RequestFacts, Side, TransportClass,
+        WorkerId,
+    };
+
+    use super::{
+        fleet::{within, Embedded, GATEWAY, ROOM},
+        CASE, FLEET, MODEL,
+    };
+
+    /// One request for the fleet's model, as a host in process states it.
+    fn asked(id: &[u8]) -> Request<'_> {
+        Request {
+            id,
+            facts: RequestFacts {
+                model: MODEL,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        }
+    }
+
+    /// What a host says of a request it sent at `sent`: the class its
+    /// transport read on the worker that served, and the frames it read.
+    fn read(served: WorkerId, class: TransportClass, frames: u32, sent: Instant) -> Outcome {
+        Outcome {
+            side: Side::Single,
+            served,
+            // The gRPC code the request ended with.
+            status: if class == TransportClass::Ok { 0 } else { 14 },
+            class,
+            ttft_micros: 0,
+            tokens_in: 8,
+            tokens_out: frames,
+            duration_micros: u32::try_from(sent.elapsed().as_micros()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Three engines, a rotation over them, and a door with handles in the
+    /// place of a controller and its client. Three requests are held at
+    /// once: each lease books the engine its pick names, each request is
+    /// sent on that engine's own wire and read to its end, and each
+    /// completion frees its engine and is written for the health
+    /// precedence. Then each way a request ends with no answer: a commit
+    /// that refuses every target, a client that leaves before the
+    /// dispatch, a request its host lets go with no word, a client that
+    /// leaves behind a dispatch on the pick's second target, and an engine
+    /// that died under a held decision. Behind each no lease stands on
+    /// file and no engine is booked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_in_process_holds_each_decision_to_its_requests_end() {
+        let case = async {
+            let rotation = PolicySpec::preset("round_robin").expect("a preset of this build");
+            let mut fleet = Embedded::start(4, rotation).expect("the store takes the preset");
+            let engines = fleet
+                .register(&FLEET[..3])
+                .await
+                .expect("the engines register");
+            fleet.feed();
+            let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
+            let idle = vec![(true, 0); engines.len()];
+            within("a decision reads every engine healthy", ROOM, || {
+                fleet.read(MODEL, gateway) == idle
+            })
+            .await
+            .expect("a probe turn reads the fleet ready");
+            let store = Arc::clone(fleet.store());
+            let door = Door::new(Arc::clone(&store));
+            let live = || LeasesStore::live(store.as_ref(), gateway);
+            let booked = |fleet: &Embedded| -> Vec<u32> {
+                let rows = fleet.read(MODEL, gateway);
+                rows.into_iter().map(|(_, count)| count).collect()
+            };
+
+            // Three requests held at once. A rotation names each engine
+            // once, and each lease books the engine its pick names.
+            let started = Instant::now();
+            let ids: [&[u8]; 3] = [b"held-0", b"held-1", b"held-2"];
+            let mut held = Vec::new();
+            for id in ids {
+                let decided = Handle::decide(&door, gateway, &asked(id), Instant::now());
+                let mut handle = decided.expect("a decision");
+                let target = handle.take(0).expect("a pick over the fleet");
+                let engine = fleet.engine_of(target.id);
+                let engine = engine.expect("a pick names a row of the fleet");
+                handle.dispatched(Instant::now());
+                held.push((handle, target.id, engine));
+            }
+            assert_eq!(booked(&fleet), [1, 1, 1], "each engine holds one request");
+            assert_eq!(live(), 3);
+            // Each is sent on its engine's own wire and read to its end:
+            // the completion says what the transport read.
+            for (mut handle, served, engine) in held {
+                let sent = Instant::now();
+                let answered = fleet.send(engine, "held").await;
+                let (class, frames) = answered.expect("an engine of the fleet");
+                assert_eq!(class, TransportClass::Ok, "engine {engine}");
+                assert!(frames > 0, "engine {engine} answered no frame");
+                handle.completed(&read(served, class, frames, sent), Instant::now());
+                assert!(
+                    store.completed_ok_since(gateway, served, started),
+                    "the completion of engine {engine} is written"
+                );
+            }
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+
+            // A commit that refuses every target releases the lease.
+            let decided = Handle::decide(&door, gateway, &asked(b"refused"), Instant::now());
+            let mut handle = decided.expect("a decision");
+            assert_eq!(live(), 1, "the issue files the lease");
+            handle.released(ReleaseReason::CommitFailed, Instant::now());
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            drop(handle);
+
+            // A client that leaves before the dispatch: a host that knows
+            // says so.
+            let decided = Handle::decide(&door, gateway, &asked(b"left"), Instant::now());
+            let mut handle = decided.expect("a decision");
+            assert_eq!(live(), 1);
+            handle.released(ReleaseReason::ClientGone, Instant::now());
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            drop(handle);
+
+            // A request its host lets go with no word: the lease is given
+            // up where the handle is dropped.
+            let decided = Handle::decide(&door, gateway, &asked(b"dropped"), Instant::now());
+            assert_eq!((decided.is_ok(), live()), (true, 1));
+            drop(decided);
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+
+            // A request sent to the pick's second target books that
+            // engine from its dispatch. Its client leaves behind the
+            // dispatch: the lease ends as cancelled, no completion of
+            // class ok.
+            let then = Instant::now();
+            let decided = Handle::decide(&door, gateway, &asked(b"second"), then);
+            let mut handle = decided.expect("a decision");
+            let first = handle.take(0).expect("a pick over the fleet");
+            let second = handle.take(1).expect("a rotation offers a second target");
+            let passed = fleet.engine_of(first.id).expect("a row of the fleet");
+            let taken = fleet.engine_of(second.id).expect("a row of the fleet");
+            assert_ne!(passed, taken);
+            let on = |engine: usize| -> Vec<u32> {
+                let engines = 0..engines.len();
+                engines.map(|at| u32::from(at == engine)).collect()
+            };
+            assert_eq!(
+                booked(&fleet),
+                on(passed),
+                "the issue books the first target"
+            );
+            handle.dispatched(Instant::now());
+            assert_eq!(
+                booked(&fleet),
+                on(taken),
+                "the dispatch books the one taken"
+            );
+            let lease = handle.lease().expect("a pick's lease").lease.id;
+            let on_file = LeasesStore::get(store.as_ref(), gateway, lease);
+            let on_file = on_file.expect("the lease is on file");
+            assert!(
+                matches!(on_file.state, LeaseState::Dispatched { .. })
+                    && on_file.target == second.id,
+                "{on_file:?}"
+            );
+            drop(handle);
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            assert!(!store.completed_ok_since(gateway, second.id, then));
+
+            // An engine dies under a held decision: the send fails, and
+            // the completion its host says with no dispatch ends the
+            // lease on the dead engine.
+            let decided = Handle::decide(&door, gateway, &asked(b"dead"), Instant::now());
+            let mut handle = decided.expect("a decision");
+            let target = handle.take(0).expect("a pick over the fleet");
+            let engine = fleet.engine_of(target.id).expect("a row of the fleet");
+            fleet.kill(engine).await.expect("the engine dies");
+            let sent = Instant::now();
+            let answered = fleet.send(engine, "dead").await;
+            let (class, frames) = answered.expect("an engine of the fleet");
+            assert_eq!((class, frames), (TransportClass::ConnectFailed, 0));
+            handle.completed(&read(target.id, class, frames, sent), Instant::now());
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            assert!(!store.completed_ok_since(gateway, target.id, sent));
+
+            assert_eq!((door.faults(), store.lifecycle_faults()), (0, 0));
+            fleet.stop().await.expect("a clean stop");
+        };
+        tokio::time::timeout(CASE, Box::pin(case))
+            .await
+            .expect("the case ends inside its outer bound");
+    }
 }

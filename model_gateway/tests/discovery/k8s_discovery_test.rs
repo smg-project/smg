@@ -32,10 +32,10 @@ use smg::{
     app_context::AppContext,
     mesh::discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
     routers::grpc::backend_client::BasicWorkerBuilder,
-    service_discovery::{
-        start_service_discovery_with_client, DiscoveryHost, ServiceDiscoveryConfig,
-        DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
-    },
+};
+use smg_service_discovery::{
+    start_service_discovery_with_client, DiscoveryHost, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
+    DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
 };
 use smg_worker::test_support::RefusedAddress;
 use tokio::sync::broadcast;

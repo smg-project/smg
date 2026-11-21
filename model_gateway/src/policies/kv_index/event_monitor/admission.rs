@@ -1,25 +1,23 @@
 //! One stream's state: the admission cursor per data-parallel rank, gap
 //! recovery, relay snapshots, and the metrics around an applied batch.
 
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, time::Duration};
 
-use smg_grpc_client::common_proto::{kv_cache_event, KvEventBatch, KvSnapshotChunk};
-use smg_worker::{identity::endpoint::Endpoint, metrics::writers::Metrics};
+use smg_grpc_client::common_proto::{KvEventBatch, KvSnapshotChunk};
+use smg_worker::{
+    identity::endpoint::Endpoint,
+    kv_events::apply::{apply_cleared, apply_counted, WorkerIndexState},
+    metrics::writers::Metrics,
+};
 use tracing::{debug, info, warn};
 
-use super::{
-    apply::{WorkerIndexCounters, WorkerIndexState},
-    KvEventMonitor,
-};
+use super::KvEventMonitor;
 use crate::policies::kv_index::{
     event_monitor::{
         port::{BatchFacts, ResyncReason},
         recovery::{Admission, RankState},
     },
-    index_backend::KvIndex,
+    index_backend::{KvIndex, WorkerBlocks},
 };
 
 /// A worker's subscription state: one admission cursor per data-parallel
@@ -29,7 +27,7 @@ use crate::policies::kv_index::{
 #[derive(Default)]
 pub(super) struct WorkerStreamState {
     pub(super) ranks: HashMap<i32, RankState>,
-    pub(super) index: WorkerIndexState,
+    pub(super) index: WorkerIndexState<WorkerBlocks>,
     /// A relay snapshot whose chunks are still arriving on the stream.
     pub(super) snapshot: Option<SnapshotProgress>,
     /// The data-parallel rank this worker stands for under `--dp-aware`,
@@ -108,19 +106,18 @@ impl WorkerStreamState {
         }
     }
 
-    /// The stream ended with a snapshot still arriving: what was applied is
-    /// a partial live set, so the next subscription asks from zero (and gets
-    /// a whole snapshot) instead of resuming after the last chunk's stamp.
-    /// Returns whether a snapshot was abandoned.
+    /// A stream's snapshot was abandoned: start every cursor over so the next
+    /// subscription asks from zero, whether or not this sink still considers
+    /// the snapshot open. Returns whether a snapshot was open.
     pub(super) fn abandon_snapshot(&mut self) -> bool {
-        let Some(progress) = self.snapshot.take() else {
-            return false;
-        };
         for cursor in self.ranks.values_mut() {
             cursor.reset();
         }
-        debug_assert!(progress.applied < progress.count);
-        true
+        let progress = self.snapshot.take();
+        if let Some(progress) = progress {
+            debug_assert!(progress.applied < progress.count);
+        }
+        progress.is_some()
     }
 }
 
@@ -335,7 +332,7 @@ impl KvEventMonitor {
                      the engine (rank degraded)"
                 );
             }
-            Self::apply_cleared(worker_id, indexer, &mut state.index);
+            apply_cleared(worker_id, indexer, &mut state.index);
             for cursor in state.ranks.values_mut() {
                 cursor.reset();
             }
@@ -384,11 +381,10 @@ impl KvEventMonitor {
         }
     }
 
-    /// Apply a batch this worker indexes and account for it: the blocks it
-    /// stored (under `stored_op`) and removed, the stores the index did not
-    /// take as is, the batch's age, the batch itself under `disposition`,
-    /// and the worker's index-blocks gauge. Returns how long the apply took;
-    /// the live stream publishes it as its pace, a snapshot chunk does not.
+    /// Apply a batch this worker indexes and account for it by the worker
+    /// crate's one routine ([`apply_counted`]), then set the worker's
+    /// index-blocks gauge. Returns how long the apply took; the live stream
+    /// publishes it as its pace, a snapshot chunk does not.
     fn apply_indexed_batch(
         batch: &KvEventBatch,
         worker_url: &str,
@@ -398,29 +394,15 @@ impl KvEventMonitor {
         stored_op: &'static str,
         disposition: &'static str,
     ) -> Duration {
-        let started = Instant::now();
-        let counters_before = state.index.counters;
-        let (mut stored_blocks, mut removed_blocks) = (0usize, 0usize);
-        for event in &batch.events {
-            match &event.data {
-                Some(kv_cache_event::Data::Stored(stored)) => stored_blocks += stored.blocks.len(),
-                Some(kv_cache_event::Data::Removed(removed)) => {
-                    removed_blocks += removed.block_hashes.len();
-                }
-                _ => {}
-            }
-        }
-        Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
-        let took = started.elapsed();
-        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
-        if stored_blocks > 0 {
-            Metrics::record_kv_event_blocks(worker_url, stored_op, stored_blocks);
-        }
-        if removed_blocks > 0 {
-            Metrics::record_kv_event_blocks(worker_url, "removed", removed_blocks);
-        }
-        Self::record_lag(worker_url, batch.timestamp);
-        Metrics::record_kv_event_batch(worker_url, disposition);
+        let took = apply_counted(
+            batch,
+            worker_url,
+            worker_id,
+            indexer,
+            &mut state.index,
+            stored_op,
+            disposition,
+        );
         Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
         took
     }
@@ -437,7 +419,7 @@ impl KvEventMonitor {
         state: &mut WorkerStreamState,
         rank: i32,
     ) -> u64 {
-        Self::apply_cleared(worker_id, indexer, &mut state.index);
+        apply_cleared(worker_id, indexer, &mut state.index);
         let mut dropped = 0;
         for (other, cursor) in &mut state.ranks {
             if *other != rank {
@@ -446,28 +428,6 @@ impl KvEventMonitor {
             }
         }
         dropped
-    }
-
-    /// Publish the stores a batch placed without their parent, the sub-block
-    /// stores it left out of the index and the stores the index declined at an
-    /// arena cap, if any.
-    fn record_not_indexed(
-        worker_url: &str,
-        after: &WorkerIndexCounters,
-        before: &WorkerIndexCounters,
-    ) {
-        let (stores, blocks) = after.parentless_since(before);
-        if stores > 0 {
-            Metrics::record_kv_event_parentless(worker_url, stores, blocks);
-        }
-        let (stores, blocks) = after.sub_block_since(before);
-        if stores > 0 {
-            Metrics::record_kv_event_sub_block(worker_url, stores, blocks);
-        }
-        let (stores, blocks) = after.cap_refused_since(before);
-        if stores > 0 {
-            Metrics::record_kv_event_cap_refused(worker_url, stores, blocks);
-        }
     }
 
     /// The server declared its history gone: drop the worker's index state
@@ -481,7 +441,7 @@ impl KvEventMonitor {
         worker_url: &str,
         reason: ResyncReason,
     ) {
-        Self::apply_cleared(worker_id, indexer, &mut state.index);
+        apply_cleared(worker_id, indexer, &mut state.index);
         let pending: u64 = state.ranks.values().map(RankState::pending_gap).sum();
         for cursor in state.ranks.values_mut() {
             cursor.reset();
@@ -491,21 +451,6 @@ impl KvEventMonitor {
         Metrics::record_kv_event_resync(worker_url, reason.as_str());
         Metrics::set_kv_event_degraded_ranks(worker_url, 0);
         Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
-    }
-
-    /// Age of a batch when applied, from the publisher's wall-clock stamp.
-    fn record_lag(worker_url: &str, published_at: f64) {
-        if published_at <= 0.0 {
-            return;
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        let lag = now - published_at;
-        if lag.is_finite() && lag >= 0.0 {
-            Metrics::record_kv_event_lag(worker_url, lag);
-        }
     }
 }
 
@@ -517,11 +462,12 @@ mod tests {
         salt::namespace_seed, ContentHash, ReferenceIndexer, SequenceHash, StoredBlock,
     };
     use smg_grpc_client::common_proto::{
-        KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent, KvCacheTier,
+        kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
+        KvCacheTier,
     };
-    use smg_worker::kv_events::batch_facts;
+    use smg_worker::kv_events::{apply::convert_kv_block, batch_facts};
 
-    use super::{super::apply::convert_kv_block, *};
+    use super::*;
     use crate::{
         policies::kv_index::event_monitor::recovery::{
             Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,

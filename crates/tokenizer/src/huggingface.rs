@@ -22,8 +22,8 @@ use tokenizers::{
         PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
-    tokenizer::{OffsetReferential, OffsetType, SplitDelimiterBehavior, Tokenizer as HfTokenizer},
-    AddedToken, AddedVocabulary, Model,
+    tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
+    AddedToken, AddedVocabulary, Decoder as _, Model,
 };
 use tracing::{debug, info, warn};
 
@@ -31,7 +31,9 @@ use tracing::{debug, info, warn};
 use crate::v1::V1Encoder;
 use crate::{
     byte_fallback::{byte_token, PieceTable},
-    byte_level::{cut_start, decoder_kind, ByteLevelIncremental, ByteLevelTable, UnknownId},
+    byte_level::{
+        cut_start, decoder_kind, push_token_bytes, ByteLevelIncremental, ByteLevelTable, UnknownId,
+    },
     chat_template::{
         load_chat_template_from_file, wrap_string_content_in_place, ChatTemplateContentFormat,
         ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, ThinkingKeyName,
@@ -187,6 +189,39 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
         DecoderWrapper::ByteFallback(_) => true,
         DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_fallback),
         _ => false,
+    }
+}
+
+fn has_byte_level(decoder: &DecoderWrapper) -> bool {
+    match decoder {
+        DecoderWrapper::ByteLevel(_) => true,
+        DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_level),
+        _ => false,
+    }
+}
+
+/// Decode a chain at end of input, dropping bytes after its last complete
+/// character before the byte-level decoder turns them into U+FFFD.
+fn finish_byte_level_chain(
+    decoder: &DecoderWrapper,
+    mut tokens: Vec<String>,
+) -> tokenizers::Result<Vec<String>> {
+    match decoder {
+        DecoderWrapper::Sequence(sequence) => {
+            for decoder in sequence.get_decoders() {
+                tokens = finish_byte_level_chain(decoder, tokens)?;
+            }
+            Ok(tokens)
+        }
+        DecoderWrapper::ByteLevel(_) => {
+            let mut bytes = Vec::new();
+            for token in tokens {
+                push_token_bytes(&token, &mut bytes);
+            }
+            let end = cut_start(&bytes);
+            Ok(vec![String::from_utf8_lossy(&bytes[..end]).into_owned()])
+        }
+        _ => decoder.decode_chain(tokens),
     }
 }
 
@@ -510,9 +545,8 @@ impl EncoderCore {
     /// into its spelling, which the matcher of [`Self::added`], a reader of
     /// the raw text, passes. A prompt rendered by segments is encoded by
     /// segments under such a pipeline: there the text is its characters.
-    /// A built value of several controls stays unbound under it, so that
-    /// the text between them is read as the flat encode reads it (see
-    /// `ChatTemplateState::mark_built_controls`).
+    /// A template that builds its control spellings stays as it is under
+    /// it (see `ChatTemplateState::mark_built_controls`).
     fn matches_after_normalization(&self) -> bool {
         *self.matches_after_normalization.get_or_init(|| {
             let normalizes = match self.tokenizer.get_normalizer() {
@@ -528,21 +562,6 @@ impl EncoderCore {
                     .values()
                     .any(|token| token.normalized)
         })
-    }
-
-    /// The added tokens the flat encode cuts out of `text`, in order, as the
-    /// reference pipeline finds them: the entries matched as spelled, then,
-    /// in what is left, the ones matched after normalization. Only the load
-    /// of a template asks, where [`Self::matches_after_normalization`].
-    fn cut_out(&self, text: &str) -> Vec<Range<usize>> {
-        self.tokenizer
-            .get_added_vocabulary()
-            .extract_and_normalize(self.tokenizer.get_normalizer(), text)
-            .get_splits(OffsetReferential::Original, OffsetType::Byte)
-            .into_iter()
-            .filter(|(_, _, tokens)| tokens.is_some())
-            .map(|(_, (start, end), _)| start..end)
-            .collect()
     }
 
     /// Whether the flat encode of `text` cuts out exactly the added tokens at
@@ -1134,7 +1153,6 @@ impl HuggingFaceTokenizer {
                     || core.added_entries(),
                     || core.added(),
                     &|| !core.matches_after_normalization(),
-                    &|text: &str| core.cut_out(text),
                     &special_tokens,
                 )
                 .map(|written| {
@@ -1178,6 +1196,34 @@ impl HuggingFaceTokenizer {
             return Ok(table.render(ids, skip_special_tokens));
         }
         self.decode(ids, skip_special_tokens)
+    }
+
+    /// The window's end through a decoder chain that contains ByteLevel: the
+    /// same chain as `decode`, except that its incomplete final bytes are
+    /// removed before their lossy conversion. Other decoder kinds use the
+    /// regular window decode.
+    fn finish_window_decode(
+        &self,
+        ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> Result<String> {
+        let Some(decoder) = self
+            .core
+            .tokenizer
+            .get_decoder()
+            .filter(|decoder| has_byte_level(decoder))
+        else {
+            return self.window_decode(ids, skip_special_tokens);
+        };
+        let added = self.core.tokenizer.get_added_vocabulary();
+        let tokens: Vec<String> = ids
+            .iter()
+            .filter_map(|&id| self.core.tokenizer.id_to_token(id))
+            .filter(|token| !skip_special_tokens || !added.is_special_token(token))
+            .collect();
+        finish_byte_level_chain(decoder, tokens)
+            .map(|tokens| tokens.concat())
+            .map_err(|error| Error::msg(format!("Decoding failed: {error}")))
     }
 
     /// The token-text table (see `token_text`); `None` for a decoder it does
@@ -1863,6 +1909,25 @@ fn is_legacy_space_replace(step: &NormalizerWrapper) -> bool {
             .is_some_and(|pattern| pattern == serde_json::json!({"String": " "}))
 }
 
+impl HuggingFaceTokenizer {
+    /// The Unigram arm of `encode`. Never inlined: with the Unigram encoder
+    /// inlined there, `encode` came out longer, and a WordPiece encode,
+    /// which returns above this arm, took three to five instructions more
+    /// per token at identical work. As a call, the arms above pay nothing
+    /// for it and a Unigram encode pays the call.
+    #[inline(never)]
+    fn encode_unigram(
+        &self,
+        unigram: &UnigramEncoder,
+        input: &str,
+        add_special_tokens: bool,
+    ) -> Option<Encoding> {
+        unigram
+            .encode(&self.core.tokenizer, input, add_special_tokens)
+            .map(Encoding::Plain)
+    }
+}
+
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
         #[cfg(feature = "tokenizers-v1")]
@@ -1905,8 +1970,8 @@ impl Encoder for HuggingFaceTokenizer {
         // tokenizer is the one it was made from. It returns nothing when a
         // kind is another, and the encode then runs in `tokenizers`.
         if let Some(unigram) = &self.core.unigram {
-            if let Some(ids) = unigram.encode(&self.core.tokenizer, input, add_special_tokens) {
-                return Ok(Encoding::Plain(ids));
+            if let Some(encoding) = self.encode_unigram(unigram, input, add_special_tokens) {
+                return Ok(encoding);
             }
         }
         self.core
@@ -2492,15 +2557,15 @@ impl Decoder for HuggingFaceTokenizer {
         if self.has_byte_fallback {
             // The byte tokens of a character the end cut short come off the
             // window: the end releases the text before them and nothing for
-            // the character, where the window's decode would render the
-            // whole byte run around them as replacement characters,
-            // rewriting text already sent (the one end that differs from
-            // `decode`, see `IncrementalDecoder::finish_into`).
+            // the character, as every stream end drops an incomplete
+            // trailing character (see `IncrementalDecoder::finish_into`);
+            // the window's decode would render the whole byte run around
+            // them as replacement characters, rewriting text already sent.
             let held = (*prefix_index).min(ids.len());
             let cut = self.cut_tail(&ids[held..], skip_special_tokens);
             ids.truncate(ids.len() - cut);
         }
-        let decoded = self.window_decode(ids, skip_special_tokens)?;
+        let decoded = self.finish_window_decode(ids, skip_special_tokens)?;
         let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
@@ -2893,7 +2958,6 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 || core.added_entries(),
                 || core.added(),
                 &|| !core.matches_after_normalization(),
-                &|text: &str| core.cut_out(text),
                 &self.special_tokens,
             );
             self.kept = written.as_deref().and_then(|written| core.kept(written));
@@ -2960,7 +3024,11 @@ fn detect_renderer_from_config(dir: &Path, has_chat_template: bool) -> Renderer 
     // Checked before the V4 arm below: V4.1 ships its own architecture name,
     // but some checkpoints identify themselves only via `model_type`.
     let model_type = value.get("model_type").and_then(|v| v.as_str());
-    if arch_strs.contains(&"Inkling2ForConditionalGeneration") || model_type == Some("inkling2") {
+    // Looped checkpoints (`inkling2_loop`) render the same chats.
+    if arch_strs.contains(&"Inkling2ForConditionalGeneration")
+        || arch_strs.contains(&"Inkling2LoopForConditionalGeneration")
+        || matches!(model_type, Some("inkling2" | "inkling2_loop"))
+    {
         debug!(?path, "selected Inkling2 typed renderer");
         return Renderer::Inkling2;
     }

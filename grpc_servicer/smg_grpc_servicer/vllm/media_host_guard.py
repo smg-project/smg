@@ -28,7 +28,10 @@ an HTTP connection whose session:
   unchecked. A hop sent directly is resolved and pinned as above.
 
 A refusal is a :class:`MediaHostRefused` (a ``ValueError``): the request's
-media, terminal, answered as ``media_fetch_failed``.
+media, terminal. A refusal of the URL the request named is answered as
+``invalid_multimodal_request``; one of a redirect target, a
+:class:`MediaRedirectRefused`, as ``media_fetch_failed``, as the router
+answers a redirect its policy refuses.
 """
 
 from __future__ import annotations
@@ -49,6 +52,33 @@ IpAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 class MediaHostRefused(ValueError):
     """A media URL's host the policy refuses: the caller's, never retried."""
+
+
+class MediaRedirectRefused(MediaHostRefused):
+    """A redirect target the policy refuses: the URL the request named was
+    admitted and its origin sent the fetch somewhere the worker does not go,
+    a fetch that failed (as the router answers a redirect its policy
+    refuses), not a reference refused as the request sent it."""
+
+
+# Set on whatever the guarded connection's download raised (a hop refused, an
+# origin's error status, a broken transfer, a size cap), so a caller can tell
+# a failed fetch from a failure to read the bytes a fetch delivered, whatever
+# vLLM wraps the download's error in.
+_RAISED_BY_FETCH_ATTR = "smg_raised_by_media_fetch"
+
+
+def mark_raised_by_fetch(exc: BaseException) -> BaseException:
+    """`exc`, marked as raised by a media download."""
+    setattr(exc, _RAISED_BY_FETCH_ATTR, True)
+    return exc
+
+
+def raised_by_fetch(exc: BaseException) -> bool:
+    """Whether `exc` itself was raised by a media download (see
+    :func:`mark_raised_by_fetch`); the exceptions it was raised from are the
+    caller's to walk."""
+    return getattr(exc, _RAISED_BY_FETCH_ATTR, False) is True
 
 
 def _ipv4_class(address: ipaddress.IPv4Address) -> str | None:
@@ -282,6 +312,15 @@ _HOP_PROXY_HOST: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+# Whether the hop being sent is a redirect target rather than the URL the
+# request named: cleared when a request starts and set when it follows a
+# redirect (aiohttp's trace signals, sent in the request's own context around
+# each hop), so the middleware and the resolver of that hop read it.
+_HOP_IS_REDIRECT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "media_hop_is_redirect", default=False
+)
+
+
 def _same_host(a: str, b: str) -> bool:
     return a.rstrip(".").lower() == b.rstrip(".").lower()
 
@@ -325,19 +364,37 @@ def guarded_session(policy: MediaHostPolicy):
         # (from Location or URI, joined as it joins them) and `req.proxy` the
         # proxy it chose for that URL, NO_PROXY applied.
         proxy = req.proxy
-        await policy.check_hop(req.url, resolve=proxy is not None)
-        token = _HOP_PROXY_HOST.set(proxy.raw_host if proxy is not None else None)
         try:
-            return await handler(req)
-        finally:
-            _HOP_PROXY_HOST.reset(token)
+            await policy.check_hop(req.url, resolve=proxy is not None)
+            token = _HOP_PROXY_HOST.set(proxy.raw_host if proxy is not None else None)
+            try:
+                return await handler(req)
+            finally:
+                _HOP_PROXY_HOST.reset(token)
+        except MediaHostRefused as e:
+            # Refused here or by the resolver as this hop connects.
+            if not _HOP_IS_REDIRECT.get() or isinstance(e, MediaRedirectRefused):
+                raise
+            raise MediaRedirectRefused(f"redirect refused: {e}") from e
+
+    async def request_started(session, ctx, params) -> None:
+        _HOP_IS_REDIRECT.set(False)
+
+    async def redirected(session, ctx, params) -> None:
+        _HOP_IS_REDIRECT.set(True)
+
+    hops = aiohttp.TraceConfig()
+    hops.on_request_start.append(request_started)
+    hops.on_request_redirect.append(redirected)
 
     connector = None
     if not policy.allow_private_hosts:
         # No DNS cache: every connect resolves (and is checked) in the
         # request's own context, never from an answer another hop resolved.
         connector = aiohttp.TCPConnector(resolver=_resolver_class()(), use_dns_cache=False)
-    return aiohttp.ClientSession(trust_env=True, connector=connector, middlewares=(guard_hop,))
+    return aiohttp.ClientSession(
+        trust_env=True, connector=connector, middlewares=(guard_hop,), trace_configs=[hops]
+    )
 
 
 def guarded_connection(policy: MediaHostPolicy):
@@ -354,6 +411,25 @@ def guarded_connection(policy: MediaHostPolicy):
 
         def get_sync_client(self):
             raise RuntimeError("worker media fetches are async only")
+
+        async def async_get_bytes(self, *args: Any, **kwargs: Any) -> bytes:
+            # The one network step of vLLM's loader: what fails here is the
+            # fetch, never the decode of the bytes it delivered. Except a URL
+            # the request named that aiohttp will not send at all (no host, a
+            # scheme it does not fetch): refused as the request sent it, so
+            # left unmarked; the same refusal of a redirect target is the
+            # fetch's. aiohttp may refuse the named URL before the request's
+            # start resets the hop, so the download resets it here first.
+            from aiohttp import InvalidURL, NonHttpUrlClientError
+
+            _HOP_IS_REDIRECT.set(False)
+            try:
+                return await super().async_get_bytes(*args, **kwargs)
+            except Exception as e:
+                unsendable = isinstance(e, (InvalidURL, NonHttpUrlClientError))
+                if not unsendable or _HOP_IS_REDIRECT.get():
+                    mark_raised_by_fetch(e)
+                raise
 
     return GuardedHTTPConnection()
 

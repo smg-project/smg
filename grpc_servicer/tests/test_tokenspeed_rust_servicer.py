@@ -1555,7 +1555,8 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     _run_serve_rust(monkeypatch, tmp_path)
     recorded = _run_serve_rust.recorded
     assert recorded["server"].ready == [] and recorded["server"].serving == []
-    assert recorded["supervise_kwargs"] == {}
+    assert "warmup" not in recorded["supervise_kwargs"]
+    assert recorded["supervise_kwargs"]["linger_secs"] == rust_lifecycle.DRAIN_LINGER_SECS
 
 
 def test_serve_rust_refuses_a_warm_up_knob_it_cannot_read_before_the_server_binds(

@@ -67,7 +67,9 @@ as of `tokenizer/src/*`.
   kinds of checkpoint: one that ships its own vocabulary file beside the conversion, and one
   whose template builds its control spellings (it writes no control
   token whole by itself, in one piece or in pieces side by side: it binds each to a name, out of
-  a constant of its own or spelled whole in that one statement, and writes the names). On
+  a constant of its own or spelled whole in that one statement, and writes the names; a control
+  may also be kept in an attribute of a namespace that the top level makes once, and written by
+  that attribute). On
   `apply_chat_template_with_encoding` the template's tokens are tokens and a spelling typed into
   a message, a tool, a document or a template argument stays text, also when it is typed in two
   parts the template joins, and so does a text that only the pipeline's normalizer makes an
@@ -77,13 +79,11 @@ as of `tokenizer/src/*`.
   template itself, and
   only when its syntax shows that every value it builds is only written (alone, in a join, or
   asked whether it is empty), each of those values is empty, one control spelling, or a string
-  that begins with a control spelling and ends with one (that last kind only where the pipeline
-  matches every added token as it is spelled), each fits in one plain string literal (it holds
-  no newline or other control character, no backslash and not both kinds of quote), and the
-  marks cover every control it writes on a few probe conversations (under a pipeline that matches
-  an added token after normalization the flat `encode` is asked what it cuts out of the text a
-  template writes: one that writes a text the normalizer turns into an added token is left as it
-  is); any other checkpoint renders
+  that begins with a control spelling and ends with one, each fits in one plain string literal
+  (it holds no newline or other control character, no backslash and not both kinds of quote),
+  the pipeline matches every added token as it is spelled (under one that matches an added
+  token after normalization the template is left as it is), and the marks cover every control
+  it writes on a few probe conversations; any other checkpoint renders
   and encodes as before. The flat `encode` of a rendered text reads a spelling as its token.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
   the template matches the current official one. Any other template keeps MiniJinja.
@@ -292,6 +292,11 @@ Corpus: 33 texts per size class of about 256, 2,000, 32,000, 128,000, 500,000 an
 DeepSeek V4.1 vocabulary; a 1M text is two 500k texts joined), assembled from public text: XL-Sum news articles in Arabic, Chinese, English, Hindi, Japanese,
 Korean, Russian and Thai, and open-source code and configuration (Rust, Python, Go, shell, C, Jinja templates, TOML and YAML,
 protobuf, JSON) with generated tool-call payloads; 17 to 39 % of the bytes of a size class are outside ASCII.
+A warm cell encodes one text, the first of its size class, again and again: a warm figure is the speed of that one
+text with hot caches, not the speed of mixed traffic. Those six texts are 1,548 bytes (256), 8,873 (2k), 151,173 (32k),
+599,401 (128k), 2,289,914 (500k) and 4,613,798 (1M), with 90.1, 41.2, 50.1, 42.3, 39.4 and 40.9 % of their bytes
+outside ASCII, where their classes hold 17.1, 31.1, 37.6, 38.3, 38.7 and 38.7 %. Such a text can read slower warm
+than its class reads cold, as some cells from the 32k class up do in `benches/compare/encode-rounds.csv`.
 
 Families: the tokenizer files of sixteen public checkpoints. Ten byte-level BPE vocabularies (DeepSeek V4.1 Flash,
 DeepSeek V3.2, Llama 3.2, Llama 4 Scout, gpt-oss, Qwen3.6, GLM-5.3 Flash, MiniMax M3, MiMo V2.6, and Ministral 3 through

@@ -244,6 +244,7 @@ fn doors(c: &mut Criterion) {
                 now: Instant::now(),
                 pinned: None,
                 affinity: false,
+                signal_cells: false,
             };
             let mut pair = PairBuffers::default();
             assert!(

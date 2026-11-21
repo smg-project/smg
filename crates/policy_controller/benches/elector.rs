@@ -26,7 +26,7 @@ use std::{hint::black_box, sync::mpsc, thread, time::Instant};
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    elector::{
+    service::elector::{
         ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord, MemoryLease, Tick, Written,
     },
     Constraints, PoolFacts, RequestFacts, Scratch,
@@ -185,7 +185,7 @@ mod kubernetes {
     use k8s_openapi::api::coordination::v1::Lease;
     use kube::{client::Body, core::Status, Client};
     use parking_lot::Mutex;
-    use smg_policy_controller::elector::KubernetesLease;
+    use smg_policy_controller::service::elector::KubernetesLease;
 
     /// One `Lease` object and its resource version: a GET answers it, a
     /// POST creates it, a PUT replaces it under the version it names.

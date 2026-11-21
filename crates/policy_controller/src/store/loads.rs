@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use crate::{
+    engine::view::{LoadRow, SignalSource, WorkerId},
     store::GatewayId,
-    view::{LoadRow, SignalSource, WorkerId},
 };
 
 /// Where a load row came from, as the ingress knows it. The view's
@@ -49,12 +49,10 @@ pub enum PollMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadSample {
     pub row: LoadRow,
-    /// When the store received it, on the host's clock: what the poll
-    /// decision reads.
+    /// A pushed row's receipt or a poll's start, on the host's clock.
     pub received_at: Instant,
-    /// When the engine's state behind it was sampled: the receipt less the
-    /// row's age. A load scorer releases the dispatches it made at or
-    /// before it.
+    /// When the state behind the report was sampled, on the host's clock.
+    /// A load scorer releases the dispatches it made at or before it.
     pub sampled_at: Instant,
     pub source: LoadSource,
 }
@@ -135,6 +133,21 @@ pub trait LoadSink: Send + Sync {
         source: LoadSource,
     ) -> Vec<usize>;
 
+    /// A poll answer with a known sample instant, on the host's clock.
+    /// The rows carry the age at receipt. The sample instant may lie
+    /// before or during the poll, whose start still arbitrates with
+    /// pushed records. A sink that only keeps the rows can use `report`.
+    fn report_sampled(
+        &self,
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
+        polled_at: Instant,
+        sampled_at: Instant,
+        source: LoadSource,
+    ) -> Vec<usize> {
+        let _ = sampled_at;
+        self.report(answer, polled_at, source)
+    }
+
     /// The poll decision for the worker at `now` under the poll `interval`.
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode;
 
@@ -161,6 +174,12 @@ pub trait LoadSink: Send + Sync {
 
     /// The worker left, or its reports stopped: nothing on file for it.
     fn evict(&self, id: WorkerId);
+
+    /// Evict every member whose row is not `Ready`, as [`Self::evict`] does
+    /// one. A host's collector asks behind events it lost: a member that
+    /// left `Ready` among them was never forgotten. A sink that keeps no
+    /// membership has no status to read and does nothing.
+    fn evict_unready(&self);
 
     /// When the writes this sink took and has not yet shown its readers are
     /// due to be shown; `None` when nothing waits. A sink that shows each

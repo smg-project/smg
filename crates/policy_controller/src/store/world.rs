@@ -108,20 +108,28 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     affinity::WarmRule,
-    counts::{Counts, KeptCounts, LentCounts, Slot},
-    framework::{OverloadThresholds, PairPools, PairTable},
-    spec::{AppliedSpec, Listed, Pairing},
+    document::spec::{AppliedSpec, IndexKind, Listed, Pairing},
+    engine::{
+        demands::DemandFacts,
+        framework::{Engine, OverloadThresholds, PairPools, PairTable},
+        view::{
+            fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, NamedHolder,
+            OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
+        },
+    },
+    load::signals::{SignalCell, SignalCells},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
-        index::{KvTables, Named, PoolIndex, Reading},
+        health::LeaderBits,
+        index::{KvTables, Named, PoolIndex, Predict, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
-    view::{
-        fingerprint, AffinityFacts, Candidate, Engines, Health, OverloadRegime, Phase, PoolFacts,
-        Role, WireModes, WorkerId,
+    tracking::{
+        counts::{Counts, KeptCounts, LentCounts, Slot},
+        lease::{Lifecycle, Signal},
     },
     EncodePool, EncoderFacts,
 };
@@ -162,6 +170,20 @@ pub struct Ask {
     /// ([`Needs::affinity`](crate::Needs::affinity)): the build fills it
     /// then, and leaves it empty otherwise.
     pub affinity: bool,
+    /// Whether the profile's stages declared the signal cells
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)): the build
+    /// hands them then, and none otherwise.
+    pub signal_cells: bool,
+}
+
+impl Ask {
+    /// Whether the ask takes a column at all. The two flags are read as
+    /// one word: a view or a build makes one test for a profile that asks
+    /// for neither column, as most do.
+    #[inline]
+    fn any_column(&self) -> bool {
+        (u16::from(self.affinity) | (u16::from(self.signal_cells) << 8)) != 0
+    }
 }
 
 /// What a decision brings to the naming of its rows ([`World::name`]).
@@ -172,6 +194,8 @@ pub struct Naming<'a> {
     /// The request's block hashes, in order from its first block
     /// ([`RequestFacts::block_hashes`](crate::RequestFacts::block_hashes)).
     pub block_hashes: &'a [u64],
+    /// The request's cache namespace ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)).
+    pub namespace_seed: u64,
     /// The decision's seed: where a list is cut, the rows kept are drawn
     /// from it, on streams of the naming's own.
     pub seed: u64,
@@ -207,6 +231,133 @@ pub struct ViewBuffers {
     /// ([`World::view`]): a row's first read is kept here, so a decision
     /// reads one count a row.
     pub kept: KeptCounts,
+    /// The signal cells of the rows a build wrote here, in the rows' order,
+    /// under an ask that takes them ([`Ask::signal_cells`]); a view names
+    /// the cells a decision reads ([`PoolView::signal_cells`]).
+    pub signal_cells: SignalCells,
+}
+
+impl ViewBuffers {
+    /// The signal cells of the rows a build wrote here ([`World::build`]):
+    /// `None` where its ask took none and under a generation that declares
+    /// no signal. A view ([`World::view`]) names its own cells
+    /// ([`PoolView::signal_cells`]): one that lends its rows writes none
+    /// here, and these stay those of the build before.
+    pub fn cells(&self) -> Option<&SignalCells> {
+        (self.signal_cells.signals() != 0).then_some(&self.signal_cells)
+    }
+}
+
+/// Narrows a built view by the gateway's wires and subset hint. Returns
+/// how many rows the wires took. A hint of zero clears the view first.
+/// A stated wire set keeps rows that share a wire. Omitted wires keep
+/// every row. Kept rows keep their order and take their new positions.
+pub(crate) fn narrow(view: &mut ViewBuffers, wires: Option<WireModes>, subset: Option<u32>) -> u64 {
+    narrow_view::<()>(view, wires, subset, None)
+}
+
+#[inline]
+fn narrow_view<T>(
+    view: &mut ViewBuffers,
+    wires: Option<WireModes>,
+    subset: Option<u32>,
+    column: Option<&mut Vec<T>>,
+) -> u64 {
+    if subset == Some(0) {
+        view.candidates.clear();
+        view.affinity.clear();
+        view.signal_cells.refill(0);
+        if let Some(column) = column {
+            column.clear();
+        }
+        return 0;
+    }
+    let Some(wires) = wires else {
+        return 0;
+    };
+    let rows = view.candidates.len();
+    let dialed = |row: &Candidate| row.wire_modes.intersects(wires);
+    // Each column follows the rows before the rows move.
+    retain_column(&view.candidates, &mut view.affinity, dialed);
+    retain_cells(&view.candidates, &mut view.signal_cells, dialed);
+    if let Some(column) = column {
+        retain_column(&view.candidates, column, dialed);
+    }
+    view.candidates.retain(dialed);
+    let took = rows - view.candidates.len();
+    if took > 0 {
+        for (row, position) in view.candidates.iter_mut().zip(0..) {
+            row.position = position;
+        }
+    }
+    took as u64
+}
+
+fn retain_column<T>(rows: &[Candidate], column: &mut Vec<T>, dialed: impl Fn(&Candidate) -> bool) {
+    let mut beside = rows.iter();
+    column.retain(|_| beside.next().is_some_and(&dialed));
+}
+
+/// The signal cells follow the rows as a column does: a kept row's cells
+/// move to its new position, so a read by that position answers the row's
+/// own value. One test where the build wrote no cell.
+fn retain_cells(rows: &[Candidate], cells: &mut SignalCells, dialed: impl Fn(&Candidate) -> bool) {
+    let Some(mut kept) = KeptCells::of(cells, rows.len()) else {
+        return;
+    };
+    for (at, row) in rows.iter().enumerate() {
+        if dialed(row) {
+            kept.keep(at);
+        }
+    }
+    kept.end();
+}
+
+/// The signal cells of a view's rows through a narrowing in place, for
+/// every routine that narrows a built view: each kept row's cells move
+/// behind the cells kept so far, so a read by the row's new position
+/// answers the row's own value.
+pub(crate) struct KeptCells<'a> {
+    column: &'a mut Vec<SignalCell>,
+    signals: usize,
+    kept: usize,
+}
+
+impl<'a> KeptCells<'a> {
+    /// The cells a build wrote for `rows` rows; `None` where it wrote no
+    /// cell. Cells that do not fit the rows are dropped: cells of other
+    /// rows answer no row, so every read is no value.
+    pub(crate) fn of(cells: &'a mut SignalCells, rows: usize) -> Option<Self> {
+        let signals = cells.signals();
+        if signals == 0 {
+            return None;
+        }
+        let fits = cells.fits(rows);
+        let column = cells.cells_mut();
+        if !fits {
+            column.clear();
+            return None;
+        }
+        Some(Self {
+            column,
+            signals,
+            kept: 0,
+        })
+    }
+
+    /// Keeps the cells of the row at `at`, at the next kept row's place.
+    /// Rows are kept in ascending order.
+    pub(crate) fn keep(&mut self, at: usize) {
+        let signals = self.signals;
+        self.column
+            .copy_within(at * signals..(at + 1) * signals, self.kept * signals);
+        self.kept += 1;
+    }
+
+    /// Ends the narrowing: the cells past the kept rows leave.
+    pub(crate) fn end(self) {
+        self.column.truncate(self.kept * self.signals);
+    }
 }
 
 /// The buffers a host keeps across pair decisions: both sides' views and
@@ -238,21 +389,59 @@ impl PairBuffers {
             decodes: &self.decode.candidates,
             prefill_affinity: &self.prefill.affinity,
             decode_affinity: &self.decode.affinity,
+            prefill_signal_cells: self.prefill.cells(),
+            decode_signal_cells: self.decode.cells(),
             table: PairTable::new(&self.ends, &self.listed),
         }
     }
 
-    /// Both sides' views, the prefill's first: what a request's own
-    /// gateway states of itself is taken from each ahead of the engine's
-    /// pair entry.
-    pub(crate) fn sides_mut(&mut self) -> [&mut ViewBuffers; 2] {
-        [&mut self.prefill, &mut self.decode]
+    /// Narrows both sides and reports what the wires took and whether a
+    /// side went empty.
+    pub(crate) fn narrow(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+    ) -> (u64, bool) {
+        self.narrow_with_classes(wires, subset, built, None)
+    }
+
+    #[inline]
+    fn narrow_with_classes(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+        classes: Option<&mut Vec<u32>>,
+    ) -> (u64, bool) {
+        let prefill = narrow_view(&mut self.prefill, wires, subset, classes);
+        let decode = narrow(&mut self.decode, wires, subset);
+        (prefill + decode, self.emptied(built))
+    }
+
+    fn emptied(&self, built: &(Built, Built)) -> bool {
+        (built.0.pool_size > 0 && self.prefill.candidates.is_empty())
+            || (built.1.pool_size > 0 && self.decode.candidates.is_empty())
+    }
+
+    /// Reports the pair's narrowing when the wire cut may have included
+    /// another view. A subset of zero counts no rows as taken by wires.
+    pub(crate) fn narrowing(&self, built: &(Built, Built), cut_by_wires: bool) -> (u64, bool) {
+        let took = if cut_by_wires {
+            u64::from(built.0.pool_size) + u64::from(built.1.pool_size)
+                - self.prefill.candidates.len() as u64
+                - self.decode.candidates.len() as u64
+        } else {
+            0
+        };
+        (took, self.emptied(built))
     }
 
     fn clear(&mut self) {
         for side in [&mut self.prefill, &mut self.decode] {
             side.candidates.clear();
             side.affinity.clear();
+            side.signal_cells.refill(0);
         }
         self.ends.clear();
         self.listed.clear();
@@ -288,8 +477,34 @@ impl EncodePairBuffers {
             facts: &self.facts,
             prefill_classes: &self.prefill_classes,
             affinity: &self.encode.affinity,
+            signal_cells: self.encode.cells(),
         };
         (self.pair.pools(), encode)
+    }
+
+    /// The pair's buffers, for the lease counts on each side's rows.
+    pub(crate) fn pair_mut(&mut self) -> &mut PairBuffers {
+        &mut self.pair
+    }
+
+    /// Narrows the three views by the gateway's wires and subset hint.
+    /// The prefill classes and encoder facts follow their rows. Returns
+    /// how many rows the wires took and whether a populated view went empty.
+    pub(crate) fn narrow(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+    ) -> (u64, bool) {
+        let (took, emptied) =
+            self.pair
+                .narrow_with_classes(wires, subset, built, Some(&mut self.prefill_classes));
+        let had_encoders = !self.encode.candidates.is_empty();
+        let encoded = narrow_view(&mut self.encode, wires, subset, Some(&mut self.facts));
+        (
+            took + encoded,
+            emptied || (had_encoders && self.encode.candidates.is_empty()),
+        )
     }
 }
 
@@ -353,7 +568,9 @@ pub struct PoolView<'a> {
     /// The rows a veto of the asking gateway masks at the decision's
     /// instant, by position, in order: what
     /// [`Constraints::stalled`](crate::Constraints::stalled) takes. Empty
-    /// where the rows carry their stalled bits.
+    /// where the rows carry their stalled bits. The rows of it a hold of
+    /// that gateway stands on are asked apart ([`World::held`]): a view
+    /// under no veto has none, and carries nothing for them.
     pub stalled: &'a [u32],
     /// One more than the position of the pinned worker's row: what
     /// [`RequestFacts::pinned_at`](crate::RequestFacts::pinned_at) takes.
@@ -371,6 +588,12 @@ pub struct PoolView<'a> {
     /// rows and the candidates stand at the pool's own positions: a pool
     /// that holds a host-local row hands none.
     pub engines: Engines<'a>,
+    /// The rows' signal cells: what
+    /// [`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)
+    /// takes. The publication's own block where the pool was lent, the
+    /// decision's written copy otherwise. `None` for an ask that takes
+    /// none and under a generation that declares no signal.
+    pub signal_cells: Option<&'a SignalCells>,
     /// What the view read beside the rows.
     pub built: Built,
 }
@@ -415,6 +638,10 @@ struct PoolShape {
     encoders: Option<Arc<[EncoderFacts]>>,
     /// The pool's engines, where one of them holds several rows.
     engines: PoolEngines,
+    /// What each row states for a request's hard demands, in the rows'
+    /// order: the column a door reads for a request that states one
+    /// ([`World::demand_facts`]).
+    demanded: Box<[DemandFacts]>,
 }
 
 /// One pool's engines: each engine's rows by position, the ranks of a
@@ -461,7 +688,7 @@ const fn role_slot(role: Role) -> usize {
 }
 
 /// The phase a role's pool decides: what a binding is matched on.
-const fn phase_of(role: Role) -> Phase {
+pub(crate) const fn phase_of(role: Role) -> Phase {
     match role {
         Role::Single => Phase::Single,
         Role::Prefill => Phase::Prefill,
@@ -481,6 +708,10 @@ struct Derived {
     /// status (a status change is a health signal and moves no position).
     by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
     pools: Box<[PoolShape]>,
+    /// The members in no pool, by id, each with its slot in the counts:
+    /// a member that offers no model. With the pools' rows they are every
+    /// member the build read ([`World::unpooled_of`]).
+    unpooled: Box<[(WorkerId, Slot)]>,
     /// The store's counts of the leases on file, which the pools' slots
     /// name: the one table of the store's life, lent with its shapes.
     counts: Arc<Counts>,
@@ -566,14 +797,42 @@ impl Ends<'_> {
 }
 
 /// One standing veto as its gateway's run in a pool carries it: the row it
-/// masks, by index and by id, and its end. The index finds the row in a
+/// masks, by index and by id, and its ends. The index finds the row in a
 /// pool every gateway copies whole, the id in a pool that holds host-local
 /// rows, whichever gateway asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PoolVeto {
     row: u32,
     id: WorkerId,
+    ends: VetoEnds,
+}
+
+/// A veto's two ends as the writer keeps them, with no kind. The veto masks
+/// its row until `until`. Its hold stands until `hold`, never past the
+/// veto's own end: while it does, a decision of the gateway reads the row
+/// as behind an open breaker, a veto no rule lifts, and from then to the
+/// veto's end as doubted
+/// ([`HealthSink::gateway_veto_noted`](crate::store::HealthSink::gateway_veto_noted)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VetoEnds {
     until: Instant,
+    hold: Option<Instant>,
+}
+
+impl VetoEnds {
+    /// The ends as a door hands them: a hold past the veto's end is cut to
+    /// it.
+    fn new(until: Instant, hold: Option<Instant>) -> Self {
+        Self {
+            until,
+            hold: hold.map(|hold| hold.min(until)),
+        }
+    }
+
+    /// Whether the hold stands at `now`: the veto then stands too.
+    fn held_at(self, now: Instant) -> bool {
+        self.hold.is_some_and(|hold| hold > now)
+    }
 }
 
 /// One gateway's standing vetoes in one pool, sorted by row: never empty.
@@ -581,6 +840,20 @@ struct PoolVeto {
 struct GatewayRun {
     gateway: GatewayId,
     vetoes: Arc<[PoolVeto]>,
+    /// Whether a veto of the run has a hold's end, passed or not: a view
+    /// that lends its rows reads the holds of such a run alone.
+    holds: bool,
+}
+
+impl GatewayRun {
+    fn new(gateway: GatewayId, vetoes: Arc<[PoolVeto]>) -> Self {
+        let holds = vetoes.iter().any(|veto| veto.ends.hold.is_some());
+        Self {
+            gateway,
+            vetoes,
+            holds,
+        }
+    }
 }
 
 /// One pool's standing vetoes: a run for each gateway that holds one in
@@ -661,14 +934,14 @@ fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
 }
 
 /// A pool's runs with `gateway`'s veto on the row `row` of worker `id` set
-/// until `until`, or cleared: that gateway's run built again, each other
-/// run shared.
+/// to `ends`, or cleared: that gateway's run built again, each other run
+/// shared.
 fn with_veto(
     runs: &PoolVetoes,
     gateway: GatewayId,
     row: u32,
     id: WorkerId,
-    until: Option<Instant>,
+    ends: Option<VetoEnds>,
 ) -> PoolVetoes {
     let found = runs.binary_search_by_key(&gateway, |run| run.gateway);
     let own: &[PoolVeto] = match found {
@@ -677,12 +950,12 @@ fn with_veto(
     };
     // Each arm is one pass of a known length: one allocation, the run's
     // own, and no entry of another gateway is read.
-    let own: Arc<[PoolVeto]> = match (own.binary_search_by_key(&row, |veto| veto.row), until) {
-        (Ok(at), Some(until)) => own
+    let own: Arc<[PoolVeto]> = match (own.binary_search_by_key(&row, |veto| veto.row), ends) {
+        (Ok(at), Some(ends)) => own
             .iter()
             .enumerate()
             .map(|(n, standing)| PoolVeto {
-                until: if n == at { until } else { standing.until },
+                ends: if n == at { ends } else { standing.ends },
                 ..*standing
             })
             .collect(),
@@ -691,12 +964,12 @@ fn with_veto(
             let after = after.get(1..).unwrap_or_default();
             before.iter().chain(after).copied().collect()
         }
-        (Err(at), Some(until)) => {
+        (Err(at), Some(ends)) => {
             let (before, after) = own.split_at(at);
             before
                 .iter()
                 .copied()
-                .chain(std::iter::once(PoolVeto { row, id, until }))
+                .chain(std::iter::once(PoolVeto { row, id, ends }))
                 .chain(after.iter().copied())
                 .collect()
         }
@@ -709,10 +982,7 @@ fn with_veto(
     };
     let (before, after) = runs.split_at(at);
     let after = after.get(held..).unwrap_or_default();
-    let own = (!own.is_empty()).then_some(GatewayRun {
-        gateway,
-        vetoes: own,
-    });
+    let own = (!own.is_empty()).then(|| GatewayRun::new(gateway, own));
     before
         .iter()
         .cloned()
@@ -722,7 +992,7 @@ fn with_veto(
 }
 
 /// The gateways' vetoes as the writer keeps them: per gateway its vetoed
-/// workers by id, each until an instant. Replaced whole at each of the
+/// workers by id, each with its ends. Replaced whole at each of the
 /// four writes that change them, all rare: a veto's write, a gateway's
 /// leaving that takes its whole list, a membership write that takes a
 /// departed worker's vetoes with its row, and a window's publication that
@@ -730,25 +1000,25 @@ fn with_veto(
 /// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
-    by_gateway: FxHashMap<GatewayId, Arc<[(WorkerId, Instant)]>>,
+    by_gateway: FxHashMap<GatewayId, Arc<[(WorkerId, VetoEnds)]>>,
 }
 
 impl Vetoes {
-    /// The vetoes with `gateway`'s veto on `id` set until `until`, or
-    /// cleared; `None` when that changes nothing.
-    fn with(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) -> Option<Self> {
-        let mut list: Vec<(WorkerId, Instant)> = self
+    /// The vetoes with `gateway`'s veto on `id` set to `ends`, or cleared;
+    /// `None` when that changes nothing.
+    fn with(&self, gateway: GatewayId, id: WorkerId, ends: Option<VetoEnds>) -> Option<Self> {
+        let mut list: Vec<(WorkerId, VetoEnds)> = self
             .by_gateway
             .get(&gateway)
             .map(|list| list.to_vec())
             .unwrap_or_default();
-        match (list.binary_search_by_key(&id, |&(worker, _)| worker), until) {
-            (Ok(at), Some(until)) if list[at].1 == until => return None,
-            (Ok(at), Some(until)) => list[at].1 = until,
+        match (list.binary_search_by_key(&id, |&(worker, _)| worker), ends) {
+            (Ok(at), Some(ends)) if list[at].1 == ends => return None,
+            (Ok(at), Some(ends)) => list[at].1 = ends,
             (Ok(at), None) => {
                 list.remove(at);
             }
-            (Err(at), Some(until)) => list.insert(at, (id, until)),
+            (Err(at), Some(ends)) => list.insert(at, (id, ends)),
             (Err(_), None) => return None,
         }
         let mut by_gateway = self.by_gateway.clone();
@@ -763,13 +1033,13 @@ impl Vetoes {
     /// The vetoes still standing at `at`, when some veto ended at or before
     /// it: what the clock has ended leaves by the store's own clock.
     fn standing_at(&self, at: Instant) -> Option<Self> {
-        let stands = |&(_, until): &(WorkerId, Instant)| until > at;
+        let stands = |&(_, ends): &(WorkerId, VetoEnds)| ends.until > at;
         if self.by_gateway.values().all(|list| list.iter().all(stands)) {
             return None;
         }
         let mut by_gateway = FxHashMap::default();
         for (gateway, list) in &self.by_gateway {
-            let kept: Vec<(WorkerId, Instant)> = list.iter().copied().filter(stands).collect();
+            let kept: Vec<(WorkerId, VetoEnds)> = list.iter().copied().filter(stands).collect();
             if !kept.is_empty() {
                 by_gateway.insert(*gateway, kept.into());
             }
@@ -784,16 +1054,16 @@ impl Vetoes {
         /// The entries of `list` on a worker in `members`. Both rise by
         /// worker id: one walk over each joins them.
         fn kept<'a>(
-            list: &'a [(WorkerId, Instant)],
+            list: &'a [(WorkerId, VetoEnds)],
             members: &'a [WorkerId],
-        ) -> impl Iterator<Item = (WorkerId, Instant)> + 'a {
+        ) -> impl Iterator<Item = (WorkerId, VetoEnds)> + 'a {
             let mut at = 0;
             list.iter().copied().filter(move |&(id, _)| {
                 at = seek(members, at, id, |&member| member);
                 members.get(at) == Some(&id)
             })
         }
-        let whole = |list: &Arc<[(WorkerId, Instant)]>| kept(list, members).count() == list.len();
+        let whole = |list: &Arc<[(WorkerId, VetoEnds)]>| kept(list, members).count() == list.len();
         if self.by_gateway.values().all(whole) {
             return None;
         }
@@ -803,7 +1073,7 @@ impl Vetoes {
                 by_gateway.insert(*gateway, Arc::clone(list));
                 continue;
             }
-            let kept: Vec<(WorkerId, Instant)> = kept(list, members).collect();
+            let kept: Vec<(WorkerId, VetoEnds)> = kept(list, members).collect();
             if !kept.is_empty() {
                 by_gateway.insert(*gateway, kept.into());
             }
@@ -857,11 +1127,23 @@ pub struct World {
     /// a publication shows, so a decision reads one number. One list for
     /// every world until a count moves.
     unreported: Arc<[u32]>,
+    /// The epoch of the overload verdicts these rows carry
+    /// ([`Self::overload_epoch`]).
+    overload_epoch: u64,
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
     spec: Arc<AppliedSpec>,
+    /// The served decider reads this with the world, before following
+    /// the pointer to the generation.
+    #[cfg(feature = "controller")]
+    samples_decisions: bool,
     /// Each pool's standing in its model's index, at the pool's index.
     indexes: Arc<[Option<Arc<PoolIndex>>]>,
+    /// Each pool's signal cells as this publication left them, at the
+    /// pool's index: one cell a row a signal the generation declares, in
+    /// the rows' order. No list under a generation that declares none. One
+    /// list for every world until a pool's cells move.
+    cells: Arc<[Arc<SignalCells>]>,
 }
 
 impl std::fmt::Debug for World {
@@ -899,9 +1181,84 @@ impl World {
         &self.spec
     }
 
+    #[cfg(feature = "controller")]
+    pub(crate) fn samples_decisions(&self) -> bool {
+        self.samples_decisions
+    }
+
+    /// Tells this world's engine each rank's report, where a stage of it
+    /// keeps a number of them ([`Lifecycle::keeps_loads`]): what the store
+    /// does before it shows a world, so a decision over the world finds
+    /// the numbers of its own rows. An engine with no such stage says so
+    /// by one word made at its build, and the tell is not entered: by
+    /// count the call alone read 29 instructions a publication.
+    pub(crate) fn tell_kept_loads(&self) {
+        let engine = self.spec.engine();
+        if engine.keeps_loads() {
+            self.tell_loads(engine);
+        }
+    }
+
+    /// Tells each stage of `engine` that keeps a number of the reports
+    /// each rank's report as this world shows it to a decision, with the
+    /// rank's slot and the report's sample instant ([`Signal::Load`]). A
+    /// stage that keeps none is sent nothing. A member of several pools is
+    /// told once a pool, the same word.
+    pub fn tell_loads(&self, engine: &Engine) {
+        engine.tell_loads(|tell| {
+            for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
+                for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
+                    if let Some(load) = row.load {
+                        tell(&Signal::Load {
+                            worker: row.id,
+                            dp_rank: row.dp_rank,
+                            row: load,
+                            slot,
+                            sampled_at_micros: row.load_sampled_at_micros,
+                        });
+                    }
+                }
+            }
+        });
+    }
+
     /// `at` in the rows' clock: microseconds since the store's origin.
     pub fn micros(&self, at: Instant) -> u64 {
         micros(self.origin, at)
+    }
+
+    /// The epoch of this world's overload verdicts: the one thing to
+    /// compare between two worlds' verdicts. It moves with a judgment that
+    /// moved a row's bit, whatever started it, and with every membership
+    /// build, whose rows are judged from no bit. Two worlds of one epoch
+    /// carry the same verdict on every row, so a host that mirrors the
+    /// verdicts ([`Self::overloaded`]) reads them again only where the
+    /// epoch moved.
+    pub fn overload_epoch(&self) -> u64 {
+        self.overload_epoch
+    }
+
+    /// Every row this world publishes under an overload verdict, pool by
+    /// pool. A worker has a row in each pool it serves, and each row is
+    /// judged under its own pool's thresholds. A host that mirrors the
+    /// verdict onto its own worker object reads the worker overloaded
+    /// where any of its rows is handed, and clear where none is.
+    pub fn overloaded(&self) -> impl Iterator<Item = &Candidate> + '_ {
+        self.rows
+            .iter()
+            .flat_map(|pool| pool.iter())
+            .filter(|row| row.health.overloaded)
+    }
+
+    /// The row of worker `id` in the first pool that lists it, by one
+    /// binary search a pool; `None` for a worker no pool lists. A member
+    /// holds one rank in every pool that lists it, and each of its rows
+    /// carries that rank's load record: the first pool found answers for
+    /// its figures. Its overload verdict is each pool's own
+    /// ([`Self::overloaded`]).
+    pub fn first_row_of(&self, id: WorkerId) -> Option<&Candidate> {
+        let (pool, row) = self.pooled_row(id)?;
+        self.rows.get(pool)?.get(row)
     }
 
     /// How many members serve `model` in `role`, every status and every
@@ -961,14 +1318,41 @@ impl World {
     }
 
     /// The slot of worker `id`'s count wherever this world lists it: a
-    /// member's rows name one. `None` for a worker in no pool. It searches
-    /// every pool, for a lease written outside a decision.
+    /// member's rows name one. `None` for a worker in no pool: a member
+    /// there is read apart ([`World::unpooled_of`]). It searches every
+    /// pool, for a lease written outside a decision.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<Slot> {
-        let mut pools = self.rows.iter().zip(self.derived.pools.iter());
-        pools.find_map(|(rows, shape)| {
+        let (pool, row) = self.pooled_row(id)?;
+        self.derived.pools.get(pool)?.booked.get(row).copied()
+    }
+
+    /// Whether this world lists `id` at `rank`: asked of a dispatch
+    /// report's row, which may have left or changed its rank since its
+    /// decision. A member holds one rank in every pool that lists it, so
+    /// the first pool found answers.
+    pub(crate) fn lists_rank(&self, id: WorkerId, rank: u16) -> bool {
+        self.pooled_row(id)
+            .is_some_and(|(pool, row)| self.rows[pool][row].dp_rank == rank)
+    }
+
+    /// The first pool that lists `id`, with the member's row there: one
+    /// binary search a pool, as a pool's rows stand in id order.
+    fn pooled_row(&self, id: WorkerId) -> Option<(usize, usize)> {
+        self.rows.iter().enumerate().find_map(|(pool, rows)| {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
-            shape.booked.get(row).copied()
+            Some((pool, row))
         })
+    }
+
+    /// The slot of worker `id`'s count where the worker is a member in no
+    /// pool of this world: one that offers no model. `None` for a member
+    /// a pool lists, and for a worker that was no member when this
+    /// world's membership was built. A lease's door reads it behind the
+    /// pools and the table, off the path of a listed target.
+    pub(crate) fn unpooled_of(&self, id: WorkerId) -> Option<Slot> {
+        let unpooled = &self.derived.unpooled;
+        let at = unpooled.binary_search_by_key(&id, |&(of, _)| of).ok()?;
+        unpooled.get(at).map(|&(_, slot)| slot)
     }
 
     /// Writes over `rows`, the candidates `built` left for `ask` before
@@ -1026,10 +1410,12 @@ impl World {
     /// Each row is as this publication left it, its engine's overload
     /// verdict with the rest ([`LoadSink::report`](crate::store::LoadSink::report)),
     /// with what is the decision's own written over it: its position in the slice, its
-    /// report's age at `ask.now`, the stalled bit where a veto of the
-    /// asking gateway is in this publication and stands at that instant,
-    /// whichever kind of veto it is, and the session bit on the pinned
-    /// worker. A veto past its end masks nothing and costs the build one
+    /// report's age at `ask.now`, the bit of a veto of the asking gateway
+    /// that is in this publication and stands at that instant, and the
+    /// session bit on the pinned worker. A veto writes the stalled bit,
+    /// and the breaker bit beside it while its hold stands: the store
+    /// keeps no kind, and the hold says which veto no rule lifts. A veto
+    /// past its end masks nothing and costs the build one
     /// compare until a window's publication drops it; a store that
     /// publishes no window keeps it. A window's publication drops every
     /// veto ended by its own instant, so a decision dated before that
@@ -1037,7 +1423,9 @@ impl World {
     /// decision reads one publication, and its date restores nothing the
     /// publication dropped. The health sink's own answer keeps its compare.
     /// Under `ask.affinity` the column holds one entry per candidate with
-    /// the worker's age since admission.
+    /// the worker's age since admission. Under `ask.signal_cells` the
+    /// buffers hold the rows' signal cells, each row's at its position
+    /// here ([`ViewBuffers::cells`]).
     ///
     /// A row's in-flight count is not written here: every decision moves
     /// the count of the leases on file, so no publication carries it, and
@@ -1045,9 +1433,10 @@ impl World {
     /// ([`World::count_in_flight`]).
     ///
     /// What no fact of the store feeds yet reads as the row's default: the
-    /// two session counts, the two admission bits, the breaker
-    /// bit, the four positions into declared lists, the encode bit, and the
-    /// column's four index facts. The
+    /// two session counts, the two admission bits, the four positions into
+    /// declared lists, the encode bit, and the column's four index facts.
+    /// The breaker bit reads a hold of the asking gateway and nothing else
+    /// yet. The
     /// healthy bit is the status alone: the health sink's precedence rule
     /// (a gateway's completed dispatches against the prober) is not
     /// applied here yet.
@@ -1062,6 +1451,7 @@ impl World {
             out.candidates.clear();
             out.affinity.clear();
             out.stalled.clear();
+            out.signal_cells.refill(0);
             return None;
         };
         self.build_at(index, ask, out)
@@ -1076,6 +1466,9 @@ impl World {
         out.candidates.clear();
         out.affinity.clear();
         out.stalled.clear();
+        // What reads these buffers past the build knows no ask: cells an
+        // earlier build wrote are not this one's.
+        out.signal_cells.refill(0);
         let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
         Some(self.written(index, rows, shape, ask, out))
     }
@@ -1105,14 +1498,19 @@ impl World {
         if let Some(row) = ask.pinned.and_then(|id| row_of_id(&mut out.candidates, id)) {
             row.session_hit = true;
         }
-        if ask.affinity {
-            let admitted = &shape.admitted_micros;
-            for (from, to) in Segments::of(&shape.locals, ask.gateway, admitted.len()) {
-                out.affinity
-                    .extend(admitted[from..to].iter().map(|&admitted| AffinityFacts {
-                        admitted_age_ms: age_ms(now_micros, admitted),
-                        ..AffinityFacts::default()
-                    }));
+        if ask.any_column() {
+            if ask.affinity {
+                let admitted = &shape.admitted_micros;
+                for (from, to) in Segments::of(&shape.locals, ask.gateway, admitted.len()) {
+                    out.affinity
+                        .extend(admitted[from..to].iter().map(|&admitted| AffinityFacts {
+                            admitted_age_ms: age_ms(now_micros, admitted),
+                            ..AffinityFacts::default()
+                        }));
+                }
+            }
+            if ask.signal_cells {
+                self.write_cells(index, shape, ask, rows.len(), &mut out.signal_cells);
             }
         }
         // The asking gateway's run among the gateways that hold a veto in
@@ -1143,6 +1541,31 @@ impl World {
         }
     }
 
+    /// The signal cells of the pool at `index`, written into `out` for the
+    /// rows the asking gateway reaches, in the order [`World::build`]
+    /// writes those rows: a row's cells stand at its new position. No cell
+    /// under a generation that declares no signal.
+    fn write_cells(
+        &self,
+        index: usize,
+        shape: &PoolShape,
+        ask: &Ask,
+        rows: usize,
+        out: &mut SignalCells,
+    ) {
+        let Some(block) = self.cells.get(index) else {
+            out.refill(0);
+            return;
+        };
+        let signals = block.signals();
+        let (held, cells) = (block.cells(), out.refill(signals));
+        for (from, to) in Segments::of(&shape.locals, ask.gateway, rows) {
+            if let Some(held) = held.get(from * signals..to * signals) {
+                cells.extend_from_slice(held);
+            }
+        }
+    }
+
     /// One decision's view of the pool serving `model` in `role`; `None`,
     /// with the buffers cleared, when no member serves it.
     ///
@@ -1152,11 +1575,15 @@ impl World {
     /// position was published with it. The vetoes of the asking gateway
     /// that stand at `ask.now` are handed as positions, in order, read from
     /// its own run alone and by the build's rule: a veto past its end masks
-    /// nothing. The pinned worker's row is handed as one more than its
+    /// nothing. The rows of them a hold stands on are handed once more,
+    /// apart: where the build writes a row both bits, the view names the
+    /// row twice. The pinned worker's row is handed as one more than its
     /// position. Under `ask.affinity` the column is filled as the build
-    /// fills it. A row's report age stays what the report carried when it
-    /// was recorded: the age at the decision is the decision's instant less
-    /// the row's sample instant, and no stage of this crate reads it.
+    /// fills it. Under `ask.signal_cells` the publication's own block of
+    /// cells is lent beside its rows, and nothing is copied.
+    /// A row's report age stays what the report carried when it
+    /// was recorded. The report age limit uses the decision's instant less
+    /// the row's sample instant on either form of the row.
     ///
     /// The rows are copied and written ([`World::build`]) where they cannot
     /// be lent: in a pool that holds host-local rows, where the asking
@@ -1194,6 +1621,7 @@ impl World {
                 affinity: &out.affinity,
                 in_flight: None,
                 engines: shape.engines(index as u32),
+                signal_cells: if ask.signal_cells { out.cells() } else { None },
                 built,
             });
         }
@@ -1204,7 +1632,7 @@ impl World {
             .get(index)
             .and_then(|runs| run_of(runs, ask.gateway));
         if let Some(run) = own {
-            let standing = run.vetoes.iter().filter(|veto| veto.until > ask.now);
+            let standing = run.vetoes.iter().filter(|veto| veto.ends.until > ask.now);
             out.stalled.extend(standing.map(|veto| veto.row));
         }
         // The search of the build's own pin, over the same rows.
@@ -1212,12 +1640,18 @@ impl World {
             .pinned
             .and_then(|id| rows.binary_search_by_key(&id, |row| row.id).ok())
             .map_or(0, |at| at as u32 + 1);
-        if ask.affinity {
-            let admitted = shape.admitted_micros.iter();
-            out.affinity.extend(admitted.map(|&admitted| AffinityFacts {
-                admitted_age_ms: age_ms(now_micros, admitted),
-                ..AffinityFacts::default()
-            }));
+        let mut signal_cells = None;
+        if ask.any_column() {
+            if ask.affinity {
+                let admitted = shape.admitted_micros.iter();
+                out.affinity.extend(admitted.map(|&admitted| AffinityFacts {
+                    admitted_age_ms: age_ms(now_micros, admitted),
+                    ..AffinityFacts::default()
+                }));
+            }
+            if ask.signal_cells {
+                signal_cells = self.cells.get(index).map(|block| &**block);
+            }
         }
         // A view a veto masks is the asking gateway's own list, as a copy
         // a veto masks is.
@@ -1233,6 +1667,7 @@ impl World {
             affinity: &out.affinity,
             in_flight: Some(self.derived.counts.lend(&shape.booked, &mut out.kept)),
             engines: shape.engines(index as u32),
+            signal_cells,
             built: Built {
                 pool: index as u32,
                 pool_size: rows.len() as u32,
@@ -1243,6 +1678,43 @@ impl World {
                 unreported: self.unreported_at(index),
             },
         })
+    }
+
+    /// The rows of a lent view's mask ([`PoolView::stalled`]) a hold of the
+    /// asking gateway stands on at the decision's instant, by position, in
+    /// order, into `rows`: what
+    /// [`Constraints::held`](crate::Constraints::held) takes beside the
+    /// mask. Asked of the publication the view was read from, with the
+    /// view's own `ask`. A hold stands no longer than its veto, so a held
+    /// row is a row of the mask.
+    ///
+    /// A view under no veto has no held row and is answered here at one
+    /// test: its pool's vetoes are not read again. Rows written for a
+    /// decision carry the breaker bit beside the stalled one where a hold
+    /// stands, and their view's mask is empty.
+    #[inline]
+    pub fn held<'a>(&self, view: &PoolView<'_>, ask: &Ask, rows: &'a mut Vec<u32>) -> &'a [u32] {
+        if view.stalled.is_empty() {
+            return &[];
+        }
+        self.held_rows(view.built.pool, ask, rows)
+    }
+
+    /// The walk behind [`Self::held`], out of line: the asking gateway's
+    /// run in pool `pool`, and the row of each of its vetoes whose hold
+    /// stands at the ask's instant. A run with no hold is one test.
+    #[inline(never)]
+    fn held_rows<'a>(&self, pool: u32, ask: &Ask, rows: &'a mut Vec<u32>) -> &'a [u32] {
+        rows.clear();
+        let own = self
+            .vetoes
+            .get(pool as usize)
+            .and_then(|runs| run_of(runs, ask.gateway));
+        if let Some(run) = own.filter(|run| run.holds) {
+            let held = run.vetoes.iter().filter(|veto| veto.ends.held_at(ask.now));
+            rows.extend(held.map(|veto| veto.row));
+        }
+        rows
     }
 
     /// Build both sides of one pair decision into `out`: the model's
@@ -1297,6 +1769,7 @@ impl World {
     ) -> Option<(Built, Built)> {
         out.encode.candidates.clear();
         out.encode.affinity.clear();
+        out.encode.signal_cells.refill(0);
         out.facts.clear();
         out.prefill_classes.clear();
         let pair = self.build_pair(model, ask, &mut out.pair);
@@ -1331,6 +1804,23 @@ impl World {
         Some(built)
     }
 
+    /// What each row of a build states for a request's hard demands
+    /// ([`DemandFacts`]), into `out`, cleared first: one entry a row of the
+    /// list `built` was written as for `ask`'s gateway, in the rows' order,
+    /// as [`World::build`] copied them. Asked of the publication the build
+    /// read, by a door whose request states a demand: a request that states
+    /// none reads no column. Empty where the build's pool is no pool of
+    /// this publication.
+    pub fn demand_facts(&self, built: &Built, ask: &Ask, out: &mut Vec<DemandFacts>) {
+        out.clear();
+        let Some(shape) = self.derived.pools.get(built.pool as usize) else {
+            return;
+        };
+        for (from, to) in Segments::of(&shape.locals, ask.gateway, shape.demanded.len()) {
+            out.extend_from_slice(&shape.demanded[from..to]);
+        }
+    }
+
     /// Name the rows the affinity stages read in the column's place
     /// ([`NamedAffinity`](crate::NamedAffinity)) for `view`, the rows a
     /// decision of `model` in `role` is made over: the pool's as
@@ -1340,7 +1830,12 @@ impl World {
     /// index under the profile's cap (its sample, or no cap where it takes
     /// none), and the pool's warming rows as this publication read them,
     /// less those whose naming ended by the decision's instant. Under a cap
-    /// the holders' lookup lists nothing of the pool's length, and the
+    /// the holders' lookup lists nothing of the pool's length. Where the
+    /// pool holds a record of sent prefixes, its rows with no heard lane are
+    /// named beside the index's holders under the same cap: after them, in
+    /// the room they leave, or ahead of them where no prefix stage of the
+    /// profile reads cache events. That lookup finds the deepest block a
+    /// worker of the view was sent. The
     /// warming rows are read where the publication holds them: they are
     /// copied only for a view that is not the pool whole, and past the
     /// first row's end. No row is named, and no index is read, where the
@@ -1355,6 +1850,39 @@ impl World {
         role: Role,
         naming: &Naming<'_>,
         view: &[Candidate],
+        named: &mut Named,
+    ) {
+        self.name_in::<false>(model, role, naming, view, HashKind::Token, named);
+    }
+
+    /// [`World::name`] for rows its caller cut by more than its gateway's
+    /// wires since their build: the rows a request's hard demands took
+    /// are out of `view`, and nothing else says which. The holders'
+    /// lookup is kept within the view's own rows, so the cap is filled
+    /// from the rows that stay, and a warming row is named where the view
+    /// holds it.
+    pub fn name_cut(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+    ) {
+        self.name_in::<true>(model, role, naming, view, HashKind::Token, named);
+    }
+
+    /// The one naming behind [`World::name`] and [`World::name_cut`], built
+    /// once for each. Those two name a token request. The door names a
+    /// request by the kind it was hashed by: a text request is named by
+    /// the record of sent prefixes alone.
+    pub(crate) fn name_in<const CUT: bool>(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        hash_kind: HashKind,
         named: &mut Named,
     ) {
         named.clear();
@@ -1373,7 +1901,108 @@ impl World {
         ) else {
             return;
         };
-        held.name(naming, rows, &shape.locals, view, named);
+        let pool: (u32, &[Candidate]) = (index as u32, rows);
+        if CUT {
+            held.name_cut(naming, pool, &shape.locals, view, hash_kind, named);
+        } else {
+            held.name(naming, pool, &shape.locals, view, hash_kind, named);
+        }
+    }
+
+    /// Records the prefixes of a naming on the lease's first target. A
+    /// naming that sent none ends at this test, in its caller's line: a
+    /// decision whose profile keeps no record pays no call for it.
+    #[inline(always)]
+    pub(crate) fn sent(&self, named: &Named, target: WorkerId) {
+        if let Some(pool) = named.sent_pool() {
+            self.sent_to(pool, named, target);
+        }
+    }
+
+    /// [`Self::sent`] for a naming that sent prefixes to the pool at
+    /// `pool`. Out of line: both of a single's orders write the record.
+    #[inline(never)]
+    fn sent_to(&self, pool: usize, named: &Named, target: WorkerId) {
+        let (Some(rows), Some(Some(held))) = (self.rows.get(pool), self.indexes.get(pool)) else {
+            return;
+        };
+        held.sent(rows, named, target);
+    }
+
+    /// Holds the holders just named for `view` ([`World::name`] or
+    /// [`World::name_cut`], by the same `naming`, into `named`) to the
+    /// test the decision's pass asks of a row
+    /// ([`Engine::keeps_for`](crate::engine::framework::Engine::keeps_for)), where
+    /// they fill the naming's cap. A naming shorter than its cap holds
+    /// every holder the index has, and one under no cap names them all: no
+    /// lookup made again reads another, so neither is asked anything and
+    /// `keeps`, which makes the test, is not called.
+    ///
+    /// The holders of a full cap are asked by their rows in the view, up
+    /// to the first the pass keeps. Where one passes the naming stands as
+    /// it was made: no holder outside it is deeper, and the pass drops the
+    /// refused ones itself. Where the pass refuses every holder named, the
+    /// cap is full of rows the request cannot take. Their ids leave the
+    /// rows the lookup is kept within and the lookup is made again, so the
+    /// next deepest holders are read: at most four rounds more, until one
+    /// reads a holder that passes. Where none does the first naming
+    /// stands, and the pass rules on its rows itself. The warming rows are
+    /// not asked. `keeps` answers none where the pass alone can say.
+    #[inline]
+    pub(crate) fn name_kept<K: Fn(&Candidate) -> bool>(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+        keeps: impl FnOnce() -> Option<K>,
+    ) {
+        if naming.cap != 0 && named.holders.len() >= naming.cap as usize {
+            self.name_tested(model, role, naming, view, named, keeps);
+        }
+    }
+
+    /// [`World::name_kept`] for a naming that fills its cap. Out of line:
+    /// a decision that names no row, or fewer than its cap, runs past the
+    /// call and holds nothing of the test in its frame.
+    #[inline(never)]
+    fn name_tested<K: Fn(&Candidate) -> bool>(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+        keeps: impl FnOnce() -> Option<K>,
+    ) {
+        let Some(keeps) = keeps() else {
+            return;
+        };
+        let passes = |holder: &NamedHolder| view.get(holder.row as usize).is_some_and(&keeps);
+        if !named.holders.iter().any(passes) {
+            self.name_again(model, role, naming, view, named, &keeps);
+        }
+    }
+
+    /// [`World::name_kept`] past a cap full of refused holders, out of line.
+    #[cold]
+    #[inline(never)]
+    fn name_again(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+        keeps: &dyn Fn(&Candidate) -> bool,
+    ) {
+        let Some(index) = self.index(model, role) else {
+            return;
+        };
+        if let (Some(rows), Some(Some(held))) = (self.rows.get(index), self.indexes.get(index)) {
+            held.name_again(naming, rows, view, keeps, named);
+        }
     }
 
     /// The pool's standing in its model's index, for the cases: a
@@ -1381,6 +2010,11 @@ impl World {
     #[cfg(test)]
     pub(super) fn standing(&self, model: &str, role: Role) -> Option<Arc<PoolIndex>> {
         self.indexes.get(self.index(model, role)?)?.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_slices(&self, model: &str, role: Role) -> Option<usize> {
+        self.standing(model, role)?.sent_slices()
     }
 
     /// Every pool's standing, for the cases: a membership write that moved
@@ -1412,8 +2046,9 @@ impl World {
     }
 }
 
-/// Write the stalled bit on each row of `rows` a veto of `run` masks at
-/// `now`, and say whether one did.
+/// Write a veto's bits on each row of `rows` a veto of `run` masks at
+/// `now`, and say whether one did: the stalled bit, and the breaker bit
+/// beside it while the veto's hold stands.
 ///
 /// A pool every gateway dials whole is copied whole (`whole`): a veto's row
 /// is its position. Another gateway's host-local rows are left out, so
@@ -1425,7 +2060,7 @@ impl World {
 fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> bool {
     let mut masked = false;
     for veto in run.vetoes.iter() {
-        if veto.until <= now {
+        if veto.ends.until <= now {
             continue;
         }
         let row = if whole {
@@ -1434,7 +2069,16 @@ fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> 
             row_of_id(rows, veto.id)
         };
         if let Some(row) = row {
+            // Every standing veto masks its row, as the mask beside lent
+            // rows names it: a stage that reads the stalled bit refuses
+            // the row whichever way its host handed it. A hold says more,
+            // by the breaker bit: it refuses execution as an open breaker
+            // does, and no rule lifts it. A veto with no hold, or past its
+            // hold's end, is a doubt alone.
             row.health.stalled = true;
+            if veto.ends.held_at(now) {
+                row.health.breaker_open = true;
+            }
             masked = true;
         }
     }
@@ -1504,12 +2148,13 @@ struct Held {
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, its load record when one is on file, and its engine
-/// family, zone and labels as `listed` reads them under the standing
-/// generation's lists. Its pair class is the membership's to derive
-/// ([`pair_up`]).
+/// its status bits, the bits the leader's own worker object sets, its load
+/// record when one is on file, and its engine family, zone and labels as
+/// `listed` reads them under the standing generation's lists. Its pair
+/// class is the membership's to derive ([`pair_up`]).
 fn row_of(
     member: &WorkerRow,
+    leader: LeaderBits,
     sample: Option<&LoadSample>,
     origin: Instant,
     listed: Listed,
@@ -1520,12 +2165,19 @@ fn row_of(
         role: facts.role,
         dp_rank: facts.dp_rank,
         dp_size: facts.dp_size,
-        health: health_of(member.status),
+        health: Health {
+            stalled: leader.stalled,
+            ..health_of(member.status)
+        },
         wire_modes: facts.wire_modes,
         load: sample.map(|sample| sample.row),
         load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
         host_local: facts.reachable_from != Reachability::Any,
         vision: facts.vision,
+        // No admission window is the store's to know: both bits read open,
+        // and the host that asks gates capacity at its own commit.
+        has_capacity: true,
+        has_room: true,
         // The low 32 bits of the registration key's fingerprint.
         key: fingerprint(facts.key.as_bytes()) as u32,
         engine_kind: listed.engine_kind,
@@ -1771,6 +2423,15 @@ pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
         && old.encode == new.encode
 }
 
+/// Whether the prefixes sent to a worker under `old` still say what it
+/// holds under `new`, where both are one worker's facts under one
+/// registration: the same offer at the same rank. A rank is a cache of
+/// its own. Every write that keeps a worker under its id asks here, and
+/// the worker leaves the records of sent prefixes where it says no.
+pub(super) fn same_cache(old: &WorkerFacts, new: &WorkerFacts) -> bool {
+    old.dp_rank == new.dp_rank && same_offer(old, new)
+}
+
 /// The models `old` stands in a pool of and `new` does not, where both are
 /// one worker's facts under one registration: every model of the old list
 /// where the role moved, and the old list less the new where it did not.
@@ -1942,6 +2603,12 @@ struct Working {
     /// The thresholds the standing generation's binding hands this pool;
     /// `None` when no binding matches it or its block is switched off.
     binding: Option<OverloadThresholds>,
+    /// The rows' signal cells, row after row: one cell a signal the
+    /// standing generation declares, and none under a generation that
+    /// declares none.
+    cells: Vec<SignalCell>,
+    /// A cell was written since the last publication.
+    cells_dirty: bool,
 }
 
 /// One engine as the overload verdict reads it: the ranks of one
@@ -2012,6 +2679,54 @@ fn ranked_at(
         .map(|&(_, group, heard)| (group, heard))
 }
 
+/// What the load table holds of one rank, as a membership build and an
+/// applied generation read it: its load sample, and its signal cells under
+/// the standing generation's columns. A closure reads the samples of a
+/// table that keeps no cell.
+pub(super) trait OnFile {
+    /// The rank's load sample.
+    fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample>;
+
+    /// The rank's signal cells, one a signal the standing generation
+    /// declares; `None` where no value was written for the rank.
+    fn cells(&self, id: WorkerId, rank: u16) -> Option<&[SignalCell]> {
+        let _ = (id, rank);
+        None
+    }
+}
+
+impl<F: Fn(WorkerId, u16) -> Option<LoadSample>> OnFile for F {
+    fn sample(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
+        self(id, rank)
+    }
+}
+
+/// The signal cells of `rows`, row after row, as the table holds them:
+/// `signals` cells a row, and cells of no value for a rank with none on
+/// file.
+fn cells_beside(rows: &[Candidate], signals: usize, on_file: &impl OnFile) -> Vec<SignalCell> {
+    let mut cells = Vec::with_capacity(rows.len() * signals);
+    for row in rows {
+        let held = on_file.cells(row.id, row.dp_rank);
+        match held.filter(|held| held.len() == signals) {
+            Some(held) => cells.extend_from_slice(held),
+            None => cells.resize(cells.len() + signals, SignalCell::NONE),
+        }
+    }
+    cells
+}
+
+/// Writes `cells` over `over` when the writer holds the last reference to
+/// it, by the rule a pool's rows are written over ([`written_over`]).
+/// Whether it did.
+fn cells_over(over: &mut Arc<SignalCells>, cells: &[SignalCell], signals: usize) -> bool {
+    let Some(over) = Arc::get_mut(over) else {
+        return false;
+    };
+    over.refill(signals).extend_from_slice(cells);
+    true
+}
+
 /// The build the membership writes since the last one left owed.
 #[derive(Clone, Copy)]
 struct Owed {
@@ -2059,7 +2774,20 @@ pub(super) struct Writer {
     /// that publication alone: a pool of their length with no spare to
     /// write over takes them, and the publication frees the rest.
     unlisted: Vec<Arc<[Candidate]>>,
-    /// How many times a publication allocated a pool's rows.
+    /// Each pool's signal cells as the last publication left them
+    /// ([`World::cells`]): one list for every world until a pool's cells
+    /// move, and no list under a generation that declares no signal.
+    cells: Arc<[Arc<SignalCells>]>,
+    /// Each pool's spare cells: the block it published before its last,
+    /// kept for its next publication to write over, as its rows' spare is.
+    /// A block some world still lists is let go and stays that world's: a
+    /// world is freed by a write ([`Self::replaced`]), so no decision
+    /// frees a block.
+    cell_spares: Vec<Option<Arc<SignalCells>>>,
+    /// A write moved a pool's cells since the last publication: the one
+    /// word a publication tests for them.
+    cells_moved: bool,
+    /// How many times a publication allocated a pool's rows or its cells.
     allocations: u64,
     /// How many times the pools were built from the membership.
     builds: u64,
@@ -2096,6 +2824,10 @@ pub(super) struct Writer {
     /// it ([`KvTables::moves`]): while it stands, no pool's place in an
     /// index moved.
     lanes: u64,
+    /// How many membership writes walked the pools
+    /// ([`Self::index_pools`]), for the cases.
+    #[cfg(test)]
+    walks: u64,
     /// The store's index tables, where a membership write reads each
     /// pool's standing ([`Self::over`]). A writer made alone holds tables
     /// of its own with no lane.
@@ -2147,6 +2879,11 @@ pub(super) struct Writer {
     unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
+    /// The epoch of the working rows' overload verdicts. It moves with a
+    /// judgment that moved a row's bit ([`Self::judge`]) and with every
+    /// membership build, whose rows start with no bit. A world carries the
+    /// epoch of its publication ([`World::overload_epoch`]).
+    overload_epoch: u64,
     /// The standing members outside the standing generation's lists.
     outside: OutsideLists,
     /// Each member's fields under the standing generation's lists, in id
@@ -2183,6 +2920,9 @@ impl Writer {
             working: Vec::new(),
             held: Vec::new(),
             unlisted: Vec::new(),
+            cells: Arc::default(),
+            cell_spares: Vec::new(),
+            cells_moved: false,
             allocations: 0,
             builds: 0,
             worlds: Vec::new(),
@@ -2195,6 +2935,8 @@ impl Writer {
             indexes: Arc::default(),
             reading: Reading::default(),
             lanes: 0,
+            #[cfg(test)]
+            walks: 0,
             kv: Arc::default(),
             retired: None,
             engines: Vec::new(),
@@ -2207,6 +2949,7 @@ impl Writer {
             silenced: 0,
             unnamed: Vec::new(),
             flips: 0,
+            overload_epoch: 0,
             outside: OutsideLists::default(),
             listed: Vec::new(),
             listed_spare: Vec::new(),
@@ -2239,9 +2982,13 @@ impl Writer {
             derived: Arc::clone(&self.derived),
             rows: self.published.clone().into_boxed_slice(),
             unreported: Arc::clone(&self.unreported),
+            overload_epoch: self.overload_epoch,
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
+            #[cfg(feature = "controller")]
+            samples_decisions: self.spec.engine().explain_sample() != 0,
             indexes: Arc::clone(&self.indexes),
+            cells: Arc::clone(&self.cells),
         })
     }
 
@@ -2292,8 +3039,8 @@ impl Writer {
         &mut self,
         spec: Arc<AppliedSpec>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, Slot)>,
-        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+        members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
+        on_file: impl OnFile,
     ) -> Result<(Arc<World>, Option<Arc<AppliedSpec>>), StaleGeneration> {
         let standing = self.spec.generation();
         if spec.generation() <= standing {
@@ -2310,7 +3057,7 @@ impl Writer {
                 // No member's fields are carried into other lists.
                 self.listed.clear();
             }
-            self.rebuild(epoch, members, sample_of, Classes::Derive)
+            self.rebuild(epoch, members, on_file, Classes::Derive)
         } else {
             if relisted {
                 self.list(members);
@@ -2318,11 +3065,12 @@ impl Writer {
             self.bind();
             // A generation of the standing mode comes with no membership
             // write: the receipts are read from the samples as the rows
-            // stand.
-            self.hear_again(sample_of);
+            // stand, and the cells under the generation's own columns.
+            self.hear_again(&on_file);
+            self.read_cells(&on_file);
             self.judge_every();
             // A generation may rule a pool's warming rows by other numbers,
-            // or rule none.
+            // or rule none, and it may turn a pool's record of sent prefixes.
             self.rule_indexes();
             self.publish()
         };
@@ -2335,7 +3083,7 @@ impl Writer {
     /// the members written since the last and carries every other's
     /// ([`Writer::rebuild`]). A pool with a row that moved is published
     /// whole.
-    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, Slot)>) {
+    fn list<'a>(&mut self, members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>) {
         let Self {
             places,
             working,
@@ -2348,7 +3096,7 @@ impl Writer {
         let listing = !lists.is_empty();
         *outside = OutsideLists::default();
         held.clear();
-        for (member, _) in members {
+        for (member, ..) in members {
             let facts = &member.facts;
             let listed = lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
             outside.engines += u32::from(listed.engine_outside);
@@ -2382,7 +3130,7 @@ impl Writer {
     /// binding the pool is decided under, which is the first to match its
     /// model and its role's phase, or the model's pair binding for a
     /// decode pool
-    /// ([`Engine::pool_binding`](crate::framework::Engine::pool_binding)).
+    /// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)).
     /// Whether any pool has a pair.
     fn bind(&mut self) -> bool {
         let Self {
@@ -2494,6 +3242,7 @@ impl Writer {
             heard,
             sample_bound,
             unnamed,
+            overload_epoch,
             ..
         } = self;
         let Some(engine) = engines.get(engine as usize).filter(|engine| engine.judged) else {
@@ -2590,6 +3339,7 @@ impl Writer {
                 moved = true;
             }
         }
+        *overload_epoch += u64::from(moved);
         moved
     }
 
@@ -2705,7 +3455,7 @@ impl Writer {
     /// applied generation judges by, since a record's write keeps the
     /// receipts only while an engine has a threshold. A membership write
     /// reads them in its own walk.
-    fn hear_again(&mut self, sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>) {
+    fn hear_again(&mut self, on_file: &impl OnFile) {
         for (heard, at) in self.heard.iter_mut().zip(&self.engine_rows) {
             if !at.rank {
                 continue;
@@ -2714,9 +3464,104 @@ impl Writer {
                 .working
                 .get(at.pool as usize)
                 .and_then(|pool| pool.rows.get(at.row as usize))
-                .and_then(|row| sample_of(row.id, row.dp_rank));
+                .and_then(|row| on_file.sample(row.id, row.dp_rank));
             *heard = sample.map_or(0, |sample| micros(self.origin, sample.received_at));
         }
+    }
+
+    /// Every pool's signal cells read from the table under the standing
+    /// generation's columns, and published whole with the next world: for
+    /// a membership build, whose rows are new, and for an applied
+    /// generation, whose columns may be other ones. One test where neither
+    /// the standing generation nor the one before declares a signal.
+    fn read_cells(&mut self, on_file: &impl OnFile) {
+        let signals = self.spec.signal_columns().len();
+        if signals == 0 && self.cells.is_empty() {
+            return;
+        }
+        self.cells_moved = false;
+        self.cell_spares.clear();
+        self.cell_spares.resize(self.working.len(), None);
+        for pool in &mut self.working {
+            pool.cells_dirty = false;
+            pool.cells = if signals == 0 {
+                Vec::new()
+            } else {
+                cells_beside(&pool.rows, signals, on_file)
+            };
+        }
+        self.cells = if signals == 0 {
+            Arc::default()
+        } else {
+            let block = |pool: &Working| Arc::new(SignalCells::new(pool.cells.clone(), signals));
+            self.working.iter().map(block).collect()
+        };
+    }
+
+    /// Write one value into the cells of member `id`'s rows at `rank`,
+    /// under `column`. Whether a row took it: none does for a member with
+    /// no place yet and for one whose rows stand at another rank, and the
+    /// build that gives the rank its row reads the value from the table.
+    pub(super) fn fold_signal(
+        &mut self,
+        id: WorkerId,
+        rank: u16,
+        column: usize,
+        cell: SignalCell,
+    ) -> bool {
+        let signals = self.spec.signal_columns().len();
+        let Self {
+            places, working, ..
+        } = self;
+        let mut folded = false;
+        for place in places_of(places, id) {
+            let Some(pool) = working.get_mut(place.pool as usize) else {
+                continue;
+            };
+            let row = place.row as usize;
+            if pool.rows.get(row).is_none_or(|row| row.dp_rank != rank) {
+                continue;
+            }
+            if let Some(held) = pool.cells.get_mut(row * signals + column) {
+                *held = cell;
+                pool.cells_dirty = true;
+                folded = true;
+            }
+        }
+        self.cells_moved |= folded;
+        folded
+    }
+
+    /// Member `id`'s rows hold no value any more: its cells left the table
+    /// with its load samples. Whether a row held one.
+    pub(super) fn forget_signals(&mut self, id: WorkerId) -> bool {
+        let signals = self.spec.signal_columns().len();
+        let Self {
+            places, working, ..
+        } = self;
+        let mut forgot = false;
+        for place in places_of(places, id) {
+            let Some(pool) = working.get_mut(place.pool as usize) else {
+                continue;
+            };
+            let from = place.row as usize * signals;
+            let Some(held) = pool.cells.get_mut(from..from + signals) else {
+                continue;
+            };
+            if held.iter().any(|cell| !cell.is_none()) {
+                held.fill(SignalCell::NONE);
+                pool.cells_dirty = true;
+                forgot = true;
+            }
+        }
+        self.cells_moved |= forgot;
+        forgot
+    }
+
+    /// The standing generation: the one every world is published under
+    /// until the next is applied.
+    pub(super) fn spec(&self) -> &AppliedSpec {
+        &self.spec
     }
 
     /// Every ready rank is heard once a `period` from here on: a judgment
@@ -2864,6 +3709,12 @@ impl Writer {
         self.outside
     }
 
+    /// Forget the fields read under the generation's lists. A snapshot
+    /// can give the same id and revision different facts.
+    pub(super) fn clear_listed(&mut self) {
+        self.listed.clear();
+    }
+
     /// Derive the pools of the membership `members` at the store's `epoch`,
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the
@@ -2878,13 +3729,16 @@ impl Writer {
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, Slot)>,
-        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+        members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
+        on_file: impl OnFile,
         classes: Classes,
     ) -> Arc<World> {
         // A build takes in every membership write: none stays owed.
         self.owed = None;
         self.builds += 1;
+        // A build's rows start with no bit: a verdict the last world showed
+        // can go with no judgment to move it.
+        self.overload_epoch += 1;
         let origin = self.origin;
         // The last write's classes: carried, or what the written worker's
         // derive starts from.
@@ -2921,17 +3775,21 @@ impl Writer {
         // Each model's members a side, by their place in `entries`: a
         // member's entry is written once, whatever it offers.
         let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
+        // The members that offer no model, by their place in `members`: in
+        // no pool, and named by the world all the same. None in most
+        // fleets.
+        let mut bare: Vec<u32> = Vec::new();
         // The members' ids are read by the vetoes alone: a membership build
         // with no veto standing does not collect them.
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
         // The members in id order, by this write's one sort, each id beside
-        // its row and the slot its write gave it: an id is one member, so
-        // every pool's entries, the ranks and the ids are pushed in order
-        // and nothing below sorts them. The sort moves an id, a reference
-        // and a slot, never a whole entry.
-        let mut members: Vec<(WorkerId, &'a WorkerRow, Slot)> = members
-            .map(|(member, slot)| (member.id, member, slot))
+        // its row, the slot its write gave it and the leader's bits: an id
+        // is one member, so every pool's entries, the ranks and the ids are
+        // pushed in order and nothing below sorts them. The sort moves an
+        // id, a reference, a slot and those bits, never a whole entry.
+        let mut members: Vec<(WorkerId, &'a WorkerRow, Slot, LeaderBits)> = members
+            .map(|(member, slot, leader)| (member.id, member, slot, leader))
             .collect();
         members.sort_unstable_by_key(|&(id, ..)| id);
         // Every member's entry, in that order. A pool's list of whole
@@ -2951,12 +3809,12 @@ impl Writer {
         incoming.clear();
         let mut from = 0;
         let mut outside = OutsideLists::default();
-        for &(_, member, slot) in &members {
+        for &(_, member, slot, leader) in &members {
             if standing {
                 ids.push(member.id);
             }
             let facts = &member.facts;
-            let sample = sample_of(member.id, facts.dp_rank);
+            let sample = on_file.sample(member.id, facts.dp_rank);
             // The ranks of a data-parallel engine share its key. A
             // single-rank worker's engine is its own key, which no other
             // row has: it is an engine alone, and no key is looked up.
@@ -3011,7 +3869,7 @@ impl Writer {
                 Listed::default()
             };
             let entry = Entry {
-                row: row_of(member, sample.as_ref(), origin, listed),
+                row: row_of(member, leader, sample.as_ref(), origin, listed),
                 facts,
                 admitted_micros: micros(origin, member.admitted_at),
                 local: match facts.reachable_from {
@@ -3025,6 +3883,11 @@ impl Writer {
             };
             let at = entries.len() as u32;
             entries.push(entry);
+            if facts.models.is_empty() {
+                // In no pool, and done: the loop below starts on a model.
+                bare.push(at);
+                continue;
+            }
             let side = role_slot(facts.role);
             for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
@@ -3143,6 +4006,10 @@ impl Writer {
                         None
                     },
                     engines: engines_of(&entries, &ranked, &mut placed),
+                    demanded: entries
+                        .iter()
+                        .map(|entry| entry.facts.demand_facts)
+                        .collect(),
                 });
                 self.spares.push(None);
                 self.working.push(Working {
@@ -3158,6 +4025,9 @@ impl Writer {
                         Vec::new()
                     },
                     binding: None,
+                    // Read at this write's end, once every pool stands.
+                    cells: Vec::new(),
+                    cells_dirty: false,
                 });
                 indexes[side] = Some(index);
             }
@@ -3335,11 +4205,21 @@ impl Writer {
         self.engines = engines;
         self.silenced = silenced;
         self.epoch = epoch;
+        // In id order, as the walk above pushed them.
+        // A place names its member's id and slot: the list stands by id, as
+        // the walk read the members.
+        let unpooled: Box<[(WorkerId, Slot)]> = bare
+            .iter()
+            .filter_map(|&at| members.get(at as usize))
+            .map(|&(id, _, slot, _)| (id, slot))
+            .collect();
+        debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
         let before = mem::replace(
             &mut self.derived,
             Arc::new(Derived {
                 by_model,
                 pools: pools.into_boxed_slice(),
+                unpooled,
                 counts: Arc::clone(&self.counts),
             }),
         );
@@ -3371,6 +4251,8 @@ impl Writer {
             pool.dirty = false;
             self.published.push(Arc::from(pool.rows.as_slice()));
         }
+        // Every pool's rows are new, and so are their cells.
+        self.read_cells(&on_file);
         self.index_pools(&before, classes);
         // Every pool's rows are new: each count is taken again, by the one
         // pass over a pool's rows that a membership write pays for it.
@@ -3405,7 +4287,7 @@ impl Writer {
             // The list and the places both rise by worker id: one walk
             // over each joins them.
             let mut at = 0;
-            for &(id, until) in list.iter() {
+            for &(id, ends) in list.iter() {
                 at = seek(&self.places, at, id, |place| place.id);
                 while let Some(place) = self.places.get(at).filter(|place| place.id == id) {
                     at += 1;
@@ -3415,7 +4297,7 @@ impl Writer {
                     let veto = PoolVeto {
                         row: place.row,
                         id,
-                        until,
+                        ends,
                     };
                     match pool.last_mut() {
                         Some((owner, run)) if *owner == gateway => run.push(veto),
@@ -3431,10 +4313,7 @@ impl Writer {
             .into_iter()
             .map(|runs| {
                 runs.into_iter()
-                    .map(|(gateway, vetoes)| GatewayRun {
-                        gateway,
-                        vetoes: vetoes.into(),
-                    })
+                    .map(|(gateway, vetoes)| GatewayRun::new(gateway, vetoes.into()))
                     .collect()
             })
             .collect();
@@ -3444,7 +4323,7 @@ impl Writer {
     /// a row in, the writing gateway's run takes the veto, moves its end
     /// or loses it. No other gateway's run and no other pool's is built
     /// again: a publication shares them with the one before.
-    fn write_veto(&mut self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
+    fn write_veto(&mut self, gateway: GatewayId, id: WorkerId, ends: Option<VetoEnds>) {
         if self.vetoes.by_gateway.is_empty() {
             // The last veto left: no list at all, as before the first.
             self.pool_vetoes = Arc::default();
@@ -3459,7 +4338,7 @@ impl Writer {
             .map(|pool| {
                 let runs = self.pool_vetoes.get(pool).unwrap_or(&none);
                 match places.next_if(|place| place.pool as usize == pool) {
-                    Some(place) => with_veto(runs, gateway, place.row, id, until),
+                    Some(place) => with_veto(runs, gateway, place.row, id, ends),
                     None => Arc::clone(runs),
                 }
             })
@@ -3524,10 +4403,37 @@ impl Writer {
     /// statuses a row reads alike: nothing a decision reads moved.
     #[must_use]
     pub(super) fn fold_status(&mut self, id: WorkerId, status: WorkerStatus) -> Option<Arc<World>> {
+        let health = health_of(status);
+        self.fold_health(id, |row| {
+            let moved = (row.healthy, row.draining) != (health.healthy, health.draining);
+            row.healthy = health.healthy;
+            row.draining = health.draining;
+            moved
+        })
+    }
+
+    /// Fold what the leader's own worker object knows of a member into its
+    /// rows and publish at once, as a status change is: a decision does
+    /// not wait a window for a worker the leader doubts. `None` for a
+    /// worker with no row, and for the bits its rows carry already.
+    #[must_use]
+    pub(super) fn fold_leader(&mut self, id: WorkerId, bits: LeaderBits) -> Option<Arc<World>> {
+        self.fold_health(id, |row| {
+            mem::replace(&mut row.stalled, bits.stalled) != bits.stalled
+        })
+    }
+
+    /// Write `fold` over the health bits of each of the member's rows, and
+    /// publish at once where it says a bit of one moved: a pool with a row
+    /// that moved is published whole. `None` where none did.
+    fn fold_health(
+        &mut self,
+        id: WorkerId,
+        fold: impl Fn(&mut Health) -> bool,
+    ) -> Option<Arc<World>> {
         let Self {
             places, working, ..
         } = self;
-        let health = health_of(status);
         let mut folded = false;
         for place in places_of(places, id) {
             let Some(pool) = working.get_mut(place.pool as usize) else {
@@ -3536,29 +4442,29 @@ impl Writer {
             let Some(row) = pool.rows.get_mut(place.row as usize) else {
                 continue;
             };
-            if (row.health.healthy, row.health.draining) == (health.healthy, health.draining) {
-                continue;
+            if fold(&mut row.health) {
+                pool.dirty = true;
+                folded = true;
             }
-            row.health.healthy = health.healthy;
-            row.health.draining = health.draining;
-            pool.dirty = true;
-            folded = true;
         }
         folded.then(|| self.publish())
     }
 
-    /// Set `gateway`'s veto on `id` until `until`, or clear it, and publish
-    /// at once; `None` when the write changes no veto.
+    /// Set `gateway`'s veto on `id` until `until` and its hold until `hold`,
+    /// never past the veto's own end, or clear both, and publish at once;
+    /// `None` when the write changes neither end.
     #[must_use]
     pub(super) fn veto(
         &mut self,
         gateway: GatewayId,
         id: WorkerId,
         until: Option<Instant>,
+        hold: Option<Instant>,
     ) -> Option<Arc<World>> {
-        let vetoes = self.vetoes.with(gateway, id, until)?;
+        let ends = until.map(|until| VetoEnds::new(until, hold));
+        let vetoes = self.vetoes.with(gateway, id, ends)?;
         self.vetoes = Arc::new(vetoes);
-        self.write_veto(gateway, id, until);
+        self.write_veto(gateway, id, ends);
         Some(self.publish())
     }
 
@@ -3648,8 +4554,8 @@ impl Writer {
         &mut self,
         at: Option<Instant>,
         epoch: u64,
-        members: impl Iterator<Item = (&'a WorkerRow, Slot)>,
-        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+        members: impl Iterator<Item = (&'a WorkerRow, Slot, LeaderBits)>,
+        on_file: impl OnFile,
     ) -> Option<Arc<World>> {
         let owed = self.owed.take()?;
         if let Some(at) = at {
@@ -3660,7 +4566,7 @@ impl Writer {
                 self.vetoes = Arc::new(vetoes);
             }
         }
-        Some(self.rebuild(epoch, members, sample_of, owed.classes))
+        Some(self.rebuild(epoch, members, on_file, owed.classes))
     }
 
     /// The end of the window `last` opened; `None` for a window so long
@@ -3741,11 +4647,48 @@ impl Writer {
             // One allocation: the counts go straight into their shared list.
             self.unreported = self.working.iter().map(|pool| pool.unreported).collect();
         }
+        if mem::take(&mut self.cells_moved) {
+            self.publish_cells();
+        }
         // Rows no world lists and no pool took are freed here, by a write.
         self.unlisted.clear();
         self.waiting = false;
         self.publications += 1;
         self.world()
+    }
+
+    /// Each pool whose cells a write moved since the last publication takes
+    /// a new block, whole, as its rows do: the pool's working cells written
+    /// over its spare where no world lists the spare any more, and over a
+    /// new block, which is counted, where one does. The worlds take one
+    /// new list of the blocks, in one allocation.
+    fn publish_cells(&mut self) {
+        let signals = self.spec.signal_columns().len();
+        let Self {
+            working,
+            cells,
+            cell_spares,
+            allocations,
+            ..
+        } = self;
+        debug_assert_eq!(cells.len(), working.len());
+        let pools = working.iter_mut().zip(cell_spares.iter_mut());
+        let blocks = pools.zip(cells.iter()).map(|((pool, spare), standing)| {
+            if !pool.cells_dirty {
+                return Arc::clone(standing);
+            }
+            pool.cells_dirty = false;
+            let over = spare
+                .take()
+                .and_then(|mut over| cells_over(&mut over, &pool.cells, signals).then_some(over));
+            let next = over.unwrap_or_else(|| {
+                *allocations += 1;
+                Arc::new(SignalCells::new(pool.cells.clone(), signals))
+            });
+            *spare = Some(Arc::clone(standing));
+            next
+        });
+        *cells = blocks.collect();
     }
 
     /// How many worlds the writer published: the first world, made with
@@ -3792,6 +4735,13 @@ impl Writer {
         self.derivations.get(model).map(Derivation::wholes)
     }
 
+    /// How many membership writes walked the pools to stand each in its
+    /// model's index ([`Self::index_pools`]).
+    #[cfg(test)]
+    pub(super) fn walks(&self) -> u64 {
+        self.walks
+    }
+
     /// Each pool's standing in its model's index as this membership write
     /// leaves it. A pool the write did not move keeps its standing: its
     /// tables, and its warming rows as a write or a window last read them.
@@ -3805,11 +4755,13 @@ impl Writer {
     /// admission after it. A pool is found at its place, or among
     /// `before`, the pools as they stood, where the write moved its place.
     /// A write that moved no member and no offer ([`Classes::Carry`]) moved
-    /// no row, no admission and no wire a row states: where no lane moved
-    /// either, every pool stands as it did and none is walked. Under
-    /// [`Classes::Derive`] the pools may stand under a generation of another
-    /// pairing mode, one the standings were not ruled by: every kept pool's
-    /// warming rows are ruled and read again.
+    /// no row, no admission and no wire a row states: where no lane, no
+    /// block size of record and no row's word to record moved either
+    /// ([`KvTables::moves`]), every pool stands as it did and none is
+    /// walked. A pool is also made anew when its sent-prefix settings
+    /// change. Under [`Classes::Derive`] the pools may stand under a
+    /// generation of another pairing mode, one the standings were not ruled
+    /// by: every kept pool's warming rows are ruled and read again.
     fn index_pools(&mut self, before: &Derived, classes: Classes) {
         let Self {
             derived,
@@ -3824,12 +4776,18 @@ impl Writer {
             ..
         } = self;
         let window = last_window.map_or(0, |at| micros(*origin, at));
-        // No lane was made or retired since the last write stood its
-        // pools: no pool's place in an index moved, and none is looked up.
+        // No lane was made or retired, no block size of record moved and
+        // no row's word to record was cleared since the last write stood
+        // its pools: no pool's place in an index moved, no record's bound
+        // and no row's word, and none is looked up.
         let moves = kv.moves();
         let still = mem::replace(lanes, moves) == moves;
         if still && classes == Classes::Carry {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.walks += 1;
         }
         let ruled = classes != Classes::Derive;
         // The list is copied at the first pool whose standing is new:
@@ -3848,6 +4806,7 @@ impl Writer {
                     continue;
                 };
                 let (rows, admitted) = (&*rows.rows, &*shape.admitted_micros);
+                let predict = predict_of(spec, kv, model, rows);
                 let here = held.get(at).and_then(Option::as_ref);
                 let here = here.filter(|standing| standing.is_of(model, rows));
                 let was = here.map(|standing| (at, standing)).or_else(|| {
@@ -3856,7 +4815,9 @@ impl Writer {
                     Some((old, held.get(old)?.as_ref()?))
                 });
                 let kept = was.filter(|(_, standing)| {
-                    standing.holds(rows, admitted) && (still || kv.stands(model, rows, standing))
+                    standing.predict() == predict
+                        && standing.holds(rows, admitted)
+                        && (still || kv.stands(model, rows, standing))
                 });
                 let now = || admitted.iter().copied().fold(window, u64::max);
                 let read = match kept {
@@ -3874,7 +4835,7 @@ impl Writer {
                     }
                     None => {
                         let rule = ruling_of(spec, model, rows);
-                        Arc::new(kv.pool(model, rows, admitted, rule, now(), reading))
+                        Arc::new(kv.pool(model, rows, admitted, rule, predict, now(), reading))
                     }
                 };
                 let next = next.get_or_insert_with(|| held.to_vec());
@@ -3890,7 +4851,8 @@ impl Writer {
 
     /// Rule every pool's warming rows again under the standing generation,
     /// at the last window's instant: it may rule a pool by other numbers,
-    /// or rule none.
+    /// or rule none. A pool whose settings for the record of sent prefixes
+    /// moved is made anew.
     fn rule_indexes(&mut self) {
         let Self {
             derived,
@@ -3898,6 +4860,7 @@ impl Writer {
             spec,
             reading,
             indexes,
+            kv,
             origin,
             last_window,
             ..
@@ -3907,11 +4870,27 @@ impl Writer {
         for (model, sides) in &derived.by_model {
             for &pool in sides.iter().flatten() {
                 let at = pool as usize;
-                let (Some(Some(held)), Some(rows)) = (indexes.get(at), working.get(at)) else {
+                let (Some(Some(held)), Some(rows), Some(shape)) =
+                    (indexes.get(at), working.get(at), derived.pools.get(at))
+                else {
                     continue;
                 };
                 let rule = ruling_of(spec, model, &rows.rows);
-                if let Some(read) = held.again(rule, now, reading) {
+                let predict = predict_of(spec, kv, model, &rows.rows);
+                let read = if held.predict() == predict {
+                    held.again(rule, now, reading)
+                } else {
+                    Some(kv.pool(
+                        model,
+                        &rows.rows,
+                        &shape.admitted_micros,
+                        rule,
+                        predict,
+                        now,
+                        reading,
+                    ))
+                };
+                if let Some(read) = read {
                     put_read(&mut next, indexes, at, read);
                 }
             }
@@ -3985,13 +4964,40 @@ fn put_read(
 /// `spec`, by the pool's model and its role's phase: as a request of that
 /// phase asked alone resolves its profile, not by the pair binding a decode
 /// pool's thresholds take
-/// ([`Engine::pool_binding`](crate::framework::Engine::pool_binding)). The
+/// ([`Engine::pool_binding`](crate::engine::framework::Engine::pool_binding)). The
 /// hand names rows for such a request alone; a pair's sides read their
 /// columns. `None` where the profile's warm-up stages rule by different
 /// numbers: it is named no rows.
 fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmRule> {
     let role = rows.first()?.role;
-    spec.engine().warm_rule_for(model, phase_of(role))
+    spec.engine().pool_rule_for(model, phase_of(role))
+}
+
+/// The tree's placement bound for a pool that keeps a record of sent
+/// prefixes: its profile reads them, or its binding's shadow does where
+/// that profile is named no row
+/// ([`Engine::pool_record_for`](crate::engine::framework::Engine::pool_record_for)).
+fn predict_of(
+    spec: &AppliedSpec,
+    kv: &KvTables,
+    model: &str,
+    rows: &[Candidate],
+) -> Option<Predict> {
+    let phase = phase_of(rows.first()?.role);
+    let ahead = spec.engine().pool_record_for(model, phase)?;
+    let index = spec.index_for(model);
+    if index.kind != IndexKind::Tree {
+        return None;
+    }
+    let size = kv
+        .block_size(model)
+        .unwrap_or_else(|| spec.block_size())
+        .max(1);
+    let bound = (index.max_size / u64::from(size)).max(1);
+    Some(Predict {
+        bound: usize::try_from(bound).unwrap_or(usize::MAX),
+        ahead,
+    })
 }
 
 /// How many of `rows` hold no report: the pass a membership write takes over

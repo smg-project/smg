@@ -7,13 +7,14 @@ use std::time::Instant;
 
 use super::{facts, generation_pairing, pair_facts, pair_rows, MODEL};
 use crate::{
-    spec::Pairing,
+    document::spec::Pairing,
+    engine::view::{Role, WireModes, WorkerId},
     store::{
         world::{Classes, Writer, PUBLISH_WINDOW},
-        Kinds, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        Kinds, LeaderBits, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus, WorkersStore,
     },
-    view::{Role, WireModes, WorkerId},
+    tracking::counts::Slot,
 };
 
 /// A store fed the standing rows of `store`, each as a first registration.
@@ -186,6 +187,18 @@ fn a_worker_that_leaves_one_of_its_models_moves_that_models_classes_alone() {
     assert_ne!(after.pairs("other"), before.pairs("other"));
 }
 
+/// Each member with its slot, as a store's build hands them: no leader
+/// said a word of either.
+fn filed(
+    members: &[WorkerRow],
+    slots: [Slot; 2],
+) -> impl Iterator<Item = (&WorkerRow, Slot, LeaderBits)> {
+    members
+        .iter()
+        .zip(slots)
+        .map(|(member, slot)| (member, slot, LeaderBits::default()))
+}
+
 #[test]
 fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
     let origin = Instant::now();
@@ -207,10 +220,10 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
     let slots = [counts.claim(), counts.claim()];
     // A model of one side keeps none, and its first pair makes one.
     let mut members = vec![row(1, Role::Prefill, "m0")];
-    writer.rebuild(1, members.iter().zip(slots), |_, _| None, moved(1));
+    writer.rebuild(1, filed(&members, slots), |_, _| None, moved(1));
     assert_eq!(writer.derivations.len(), 0);
     members.push(row(2, Role::Decode, "m0"));
-    writer.rebuild(2, members.iter().zip(slots), |_, _| None, moved(2));
+    writer.rebuild(2, filed(&members, slots), |_, _| None, moved(2));
     assert_eq!(writer.derivations.len(), 1);
     // The pair moves through a hundred models, the decode first: the
     // model it left keeps no derivation, and the one both stand in has
@@ -218,10 +231,10 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
     for n in 1..100_u64 {
         let model = format!("m{n}");
         members[1] = row(2, Role::Decode, &model);
-        writer.rebuild(2 * n + 1, members.iter().zip(slots), |_, _| None, moved(2));
+        writer.rebuild(2 * n + 1, filed(&members, slots), |_, _| None, moved(2));
         assert_eq!(writer.derivations.len(), 0, "{model}");
         members[0] = row(1, Role::Prefill, &model);
-        writer.rebuild(2 * n + 2, members.iter().zip(slots), |_, _| None, moved(1));
+        writer.rebuild(2 * n + 2, filed(&members, slots), |_, _| None, moved(1));
         let kept: Vec<&str> = writer.derivations.keys().map(|model| &**model).collect();
         assert_eq!(kept, [model.as_str()]);
     }

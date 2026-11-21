@@ -90,6 +90,7 @@ fn encode_pair(c: &mut Criterion) {
                 facts: &of_encoders,
                 prefill_classes: &prefill_classes,
                 affinity: &[],
+                ..EncodePool::default()
             };
             let pool = PoolFacts {
                 pool_size: prefills.len() as u32,
@@ -210,6 +211,7 @@ fn left_out(c: &mut Criterion) {
                 facts: &of_encoders,
                 prefill_classes: &prefill_classes,
                 affinity: &[],
+                ..EncodePool::default()
             };
             let pool = PoolFacts {
                 pool_size: prefills.len() as u32,

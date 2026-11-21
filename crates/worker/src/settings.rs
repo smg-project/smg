@@ -3,7 +3,13 @@
 //! reads. The gateway's configuration module re-exports each at the path it
 //! had there.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "runtime")]
+use crate::health::circuit_breaker::CircuitBreakerConfig;
+use crate::{health::overload::OverloadThresholds, worker::HealthCheckConfig};
 
 /// Which Failed workers the health checker removes. Mesh-imported workers
 /// are never removed under any scope: their owner manages them.
@@ -77,7 +83,7 @@ impl PdPairingMode {
 pub const DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS: u64 = 3600;
 
 /// Retry configuration for request handling
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetryConfig {
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
@@ -102,4 +108,50 @@ impl Default for RetryConfig {
 
 fn default_retry_jitter_factor() -> f32 {
     0.2
+}
+
+/// What a host fixes for every worker registration it runs, read once from
+/// its own configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistrationSettings {
+    /// Whether worker-directed clients are tuned for HTTP/2 upstreams. An HTTP
+    /// worker that declares no version is then asked for HTTP/2 with prior
+    /// knowledge beside HTTP/1.1.
+    pub upstream_http2: bool,
+    /// Timeout of one health probe, in seconds, for a worker whose own health
+    /// settings name none.
+    pub health_check_timeout_secs: u64,
+    /// How long a starting worker is polled before its registration fails, in
+    /// seconds.
+    pub startup_timeout_secs: u64,
+    /// How long a worker is left alone before its first probe, in seconds.
+    pub startup_delay_secs: u64,
+    /// The pause between two probes of a starting worker, in seconds.
+    pub startup_check_interval_secs: u64,
+    /// Whether a registration reads how many data-parallel (DP) ranks a
+    /// worker runs. A host that addresses each rank on its own turns it on.
+    pub dp_aware: bool,
+    /// Model identity for a ZMQ worker whose spec and labels name no model.
+    pub model_path: Option<String>,
+    /// Aliases to add to the card of the canonical model they name.
+    pub model_aliases: HashMap<String, String>,
+    /// Retry settings for a worker before its own overrides.
+    pub retry: RetryConfig,
+    /// Whether a worker retries requests unless its spec sets otherwise.
+    pub retries_enabled: bool,
+    /// Circuit breaker settings for a worker before its own overrides.
+    #[cfg(feature = "runtime")]
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// Whether a worker uses its circuit breaker unless its spec sets otherwise.
+    pub circuit_breaker_enabled: bool,
+    /// Overload thresholds for signals the worker leaves unset.
+    pub overload_defaults: OverloadThresholds,
+    /// Health probe settings for a worker before its own overrides.
+    pub health: HealthCheckConfig,
+    /// Path a worker's HTTP health probe requests.
+    pub health_endpoint: String,
+    /// How long a stage of a worker's ZMQ startup handshake may stay silent.
+    pub zmq_startup_timeout_secs: u64,
+    /// Request timeout used for the ZMQ link when the worker has none of its own.
+    pub request_timeout_secs: u64,
 }

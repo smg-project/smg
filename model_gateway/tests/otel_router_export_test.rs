@@ -8,7 +8,6 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{body::Body, extract::Request, http::StatusCode};
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
-use portpicker::pick_unused_port;
 use serde_json::json;
 use smg::{
     config::{RouterConfig, TraceConfig},
@@ -35,9 +34,8 @@ mod collector;
 #[tokio::test]
 async fn a_router_request_under_tracing_reaches_the_collector_as_two_spans() {
     // 1. Start the OTLP collector
-    let port = pick_unused_port().expect("Failed to pick unused port");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let collector = start_collector(port, shutdown_rx)
+    let (collector, port) = start_collector(shutdown_rx)
         .await
         .expect("Failed to start collector");
     let collector_endpoint = format!("0.0.0.0:{port}");

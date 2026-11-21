@@ -38,7 +38,7 @@ providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
 # Client-injection seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
 # It turns on the worker crate's test support, which the gateway's re-exports.
-test-util = ["smg-worker/test-util"]
+test-util = ["smg-worker/test-util", "smg-service-discovery/test-util"]
 
 vendored-openssl = ["openssl/vendored"]
 
@@ -46,14 +46,16 @@ vendored-openssl = ["openssl/vendored"]
 name = "smg"
 crate-type = ["rlib"]
 
+# Both binaries use the library's command line. Its unit tests run with the
+# library, so neither builds a test harness.
 [[bin]]
 name = "smg"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "amg"
 path = "src/main.rs"
-# The same source as `smg`: its unit tests run in the `smg` binary's test harness, so this one builds none.
 test = false
 
 [dependencies]
@@ -66,7 +68,6 @@ dashmap.workspace = true
 futures.workspace = true
 http.workspace = true
 lru.workspace = true
-notify.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -90,6 +91,7 @@ uuid = { workspace = true, features = ["serde", "fast-rng"] }
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
 smg-worker = { workspace = true, features = ["axum", "metrics", "runtime", "workflow"] }
+smg-service-discovery = { workspace = true, features = ["consul", "file", "fs-watch", "kubernetes", "slurm"] }
 reasoning-parser.workspace = true
 tool-parser.workspace = true
 smg-symphony.workspace = true
@@ -106,6 +108,12 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
+# The policy document, its presets, and the controller's store, door and
+# handle in this process: every target builds them. The worker-host feature
+# supplies the membership door and the holder of worker objects, and the
+# operator feature the operators' door over the document. The crate's
+# client is two targets': see the end of this file.
+smg-policy-controller = { workspace = true, features = ["operator", "worker-host"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -195,7 +203,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 rustls-pemfile = "2.2"
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 validator = "0.20.0"
-tracing-test = "0.2"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 tokio = { workspace = true, features = ["test-util"] }
 kv-index.workspace = true
 # The bellwether render-parity test reads the fixture manifests (TOML).
@@ -324,3 +332,10 @@ workspace = true
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }
+
+# The controller crate's client, for a gateway that follows a controller
+# (`src/policy_controller/follower.rs`). The client builds on the controller's
+# own runtime, which builds on Linux and macOS. Those two take it, and a
+# controller's address is refused at startup elsewhere.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+smg-policy-controller = { workspace = true, features = ["client"] }

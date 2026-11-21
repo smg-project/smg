@@ -8,7 +8,6 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::Usage,
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
@@ -152,6 +151,7 @@ struct ArgumentsDelta<'a> {
 }
 
 const REASONING_TEXT_DELTA: &str = "response.reasoning_text.delta";
+const RETAIN_OUTPUT_ITEM: bool = true;
 
 /// The `response.output_item.added` and `response.output_item.done` events:
 /// the item an output index opens or closes with, borrowed into the frame
@@ -1062,16 +1062,18 @@ impl ResponseStreamEventEmitter {
     }
 
     /// The `response.output_item.done` event of the item `output_index`
-    /// closes with, sent as [`OutputItemFrame`]. The emitter keeps the item
-    /// for the terminal event and the stored object, and the frame borrows
-    /// the kept item: a close costs the item once, not the event map's copy
-    /// and a kept clone besides - for every item but a namespaced function
-    /// call, whose restored copy is the one kept. An index the emitter does
-    /// not track gets its event all the same and keeps nothing, as before.
+    /// closes with, sent as [`OutputItemFrame`]. When `retain`, the emitter
+    /// retains the item for the terminal event and stored object, and the
+    /// frame borrows it: a close costs the item once, not the event map's copy
+    /// and a retained clone besides, except for a namespaced function call,
+    /// whose restored copy is retained. A partial item rejected by the
+    /// completed parse closes with `retain` false. An untracked index always
+    /// retains nothing.
     pub async fn send_output_item_done(
         &mut self,
         output_index: usize,
         item: serde_json::Value,
+        retain: bool,
         tx: &SseSender,
     ) -> Result<(), String> {
         let item = match self.normalize_function_item(&item) {
@@ -1079,13 +1081,17 @@ impl ResponseStreamEventEmitter {
             std::borrow::Cow::Borrowed(_) => item,
         };
         let sequence_number = self.next_sequence();
-        let kept: &serde_json::Value = match self
-            .output_items
-            .iter_mut()
-            .find(|tracked| tracked.output_index == output_index)
-        {
-            Some(tracked) => tracked.item_data.insert(item),
-            None => &item,
+        let kept: &serde_json::Value = if retain {
+            match self
+                .output_items
+                .iter_mut()
+                .find(|tracked| tracked.output_index == output_index)
+            {
+                Some(tracked) => tracked.item_data.insert(item),
+                None => &item,
+            }
+        } else {
+            &item
         };
         let event = OutputItemFrame {
             kind: OutputItemEvent::DONE,
@@ -1212,7 +1218,7 @@ impl ResponseStreamEventEmitter {
     /// This constructs the final ResponsesResponse from all accumulated output items
     /// for persistence. Should be called after streaming is complete.
     /// Reads non-destructively so `emit_completed()` can still drain state afterwards.
-    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
+    pub fn finalize(&self, usage: Option<ResponseUsage>) -> ResponsesResponse {
         // Build output array from tracked items, read in place (emit_completed drains later)
         let output: Vec<ResponseOutputItem> = self
             .output_items
@@ -1238,8 +1244,8 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // The usage the terminal event carries, through the one conversion.
-        let responses_usage = usage.map(|u| ResponsesUsage::Modern(ResponseUsage::from(&u)));
+        // The response-level usage the terminal event carries.
+        let responses_usage = usage.map(ResponsesUsage::Modern);
 
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason, a cut call without one.
@@ -1268,7 +1274,7 @@ impl ResponseStreamEventEmitter {
     /// the terminal, which drains the items: the stored object keeps them.
     pub fn finalize_failed(
         &self,
-        usage: Option<Usage>,
+        usage: Option<ResponseUsage>,
         error: serde_json::Value,
     ) -> ResponsesResponse {
         let mut response = self.finalize(usage);
@@ -1308,7 +1314,8 @@ impl ResponseStreamEventEmitter {
         self.send_output_item_added(output_index, &item, tx).await?;
 
         // Immediately emit output_item.done (no streaming for reasoning)
-        self.send_output_item_done(output_index, item, tx).await?;
+        self.send_output_item_done(output_index, item, RETAIN_OUTPUT_ITEM, tx)
+            .await?;
 
         // Mark as completed
         self.complete_output_item(output_index);
@@ -1388,7 +1395,7 @@ impl ResponseStreamEventEmitter {
             }
         }
         let item_sent = self
-            .send_output_item_done(reasoning.output_index, item, tx)
+            .send_output_item_done(reasoning.output_index, item, RETAIN_OUTPUT_ITEM, tx)
             .await;
         self.complete_output_item(reasoning.output_index);
         sent.and(item_sent)
@@ -1476,7 +1483,9 @@ impl ResponseStreamEventEmitter {
                 "content": [{"type": "output_text", "text": std::mem::take(&mut self.accumulated_text)}],
                 "status": self.message_status(),
             });
-            let item_sent = self.send_output_item_done(output_index, item, tx).await;
+            let item_sent = self
+                .send_output_item_done(output_index, item, RETAIN_OUTPUT_ITEM, tx)
+                .await;
             sent = sent.and(item_sent);
         }
         self.complete_output_item(output_index);
@@ -1543,7 +1552,7 @@ impl ResponseStreamEventEmitter {
                 })
             };
             let item_sent = self
-                .send_output_item_done(item.output_index, full, tx)
+                .send_output_item_done(item.output_index, full, RETAIN_OUTPUT_ITEM, tx)
                 .await;
             sent = sent.and(item_sent);
             self.complete_output_item(item.output_index);
@@ -2062,7 +2071,7 @@ impl ResponseStreamEventEmitter {
         }
 
         // Emit output_item.done (the emitter keeps the item)
-        self.send_output_item_done(output_index, item_done, tx)
+        self.send_output_item_done(output_index, item_done, RETAIN_OUTPUT_ITEM, tx)
             .await?;
 
         self.complete_output_item(output_index);
@@ -2257,6 +2266,8 @@ mod tests {
             "truncation, cancellation, steering and valid calls are not malformed-call warnings"
         );
     }
+
+    use openai_protocol::common::Usage;
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::{
@@ -2623,7 +2634,7 @@ mod tests {
             "status": "completed"
         });
         emitter
-            .send_output_item_done(index, item.clone(), &tx)
+            .send_output_item_done(index, item.clone(), RETAIN_OUTPUT_ITEM, &tx)
             .await
             .unwrap();
         emitter.complete_output_item(index);
@@ -2691,7 +2702,7 @@ mod tests {
             .await
             .unwrap();
         emitter
-            .send_output_item_done(index, item.clone(), &tx)
+            .send_output_item_done(index, item.clone(), RETAIN_OUTPUT_ITEM, &tx)
             .await
             .unwrap();
         emitter.complete_output_item(index);
@@ -2770,7 +2781,7 @@ mod tests {
             .await
             .unwrap();
         emitter
-            .send_output_item_done(index, item, &tx)
+            .send_output_item_done(index, item, RETAIN_OUTPUT_ITEM, &tx)
             .await
             .unwrap();
         emitter.complete_output_item(index);
@@ -2779,7 +2790,10 @@ mod tests {
             "message": "Reached the max_tool_calls limit (1) before executing the remaining tool calls.",
         });
 
-        let response = emitter.finalize_failed(Some(Usage::from_counts(3, 2)), error.clone());
+        let response = emitter.finalize_failed(
+            Some(ResponseUsage::from(&Usage::from_counts(3, 2))),
+            error.clone(),
+        );
 
         assert_eq!(response.status, ResponseStatus::Failed);
         assert_eq!(response.error, Some(error.clone()));
@@ -2843,7 +2857,7 @@ mod tests {
         let emitter =
             ResponseStreamEventEmitter::new("resp_test".to_string(), "test-model".to_string(), 1);
 
-        let usage = responses_api_test_usage();
+        let usage = ResponseUsage::from(&responses_api_test_usage());
         let wire = serde_json::to_value(emitter.finalize(Some(usage)))
             .expect("finalized response should serialize");
         assert_responses_api_usage(&wire);
@@ -2919,7 +2933,7 @@ mod namespace_tests {
             .await
             .unwrap();
         emitter
-            .send_output_item_done(index, item, &tx)
+            .send_output_item_done(index, item, RETAIN_OUTPUT_ITEM, &tx)
             .await
             .unwrap();
         for _ in 0..2 {

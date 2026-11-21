@@ -15,10 +15,9 @@
 //! What a probe's outcome or a connect signal does to a worker's status
 //! crosses the port of [`super::port`]: this loop is the port's collector.
 //! It says the fact to a [`HealthSink`], and what the fact did to the status
-//! is the sink's answer.
-//! The schedule still reads the status on the worker object (the places are
-//! on the trait). The registry's impl of the port, further down, is the
-//! state machine.
+//! is the sink's answer. The schedule still reads the status on the worker
+//! object (the places are on the trait). The registry's impl of the port,
+//! further down, is the state machine.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -51,7 +50,7 @@ use crate::{
         endpoint::{grpc_base_url, Endpoint},
         error::WorkerResult,
     },
-    jobs::WorkerJobs,
+    jobs::{WorkerJobAsker, WorkerJobs},
     labels::DISCOVERY_PROVIDER_LABEL,
     load::{
         metrics_aggregator::{self, MetricPack},
@@ -60,7 +59,7 @@ use crate::{
     metrics::writers::Metrics,
     metrics_labels,
     registry::{
-        event::{WorkerConnected, WorkerEvent},
+        event::{WorkerConnected, WorkerEvent, WorkerSignal},
         Generation, WorkerId, WorkerOrigin, WorkerRegistry,
     },
     runtime::WorkerRuntime,
@@ -228,6 +227,26 @@ impl WorkerManager {
         health_checks_enabled: bool,
         zmq_transport_enabled: bool,
     ) -> Option<Self> {
+        let sink: Arc<dyn HealthSink> = registry.clone();
+        Self::maybe_start_with_sink(
+            registry,
+            sink,
+            config,
+            job_queue,
+            health_checks_enabled,
+            zmq_transport_enabled,
+        )
+    }
+
+    /// [`Self::maybe_start`] over the sink a host hands.
+    pub fn maybe_start_with_sink<G: Generation>(
+        registry: Arc<WorkerRegistry<G>>,
+        sink: Arc<dyn HealthSink>,
+        config: WorkerManagerConfig,
+        job_queue: Option<Arc<dyn WorkerJobs>>,
+        health_checks_enabled: bool,
+        zmq_transport_enabled: bool,
+    ) -> Option<Self> {
         if !health_checks_enabled
             && !zmq_transport_enabled
             && !registry.has_workers_awaiting_connect_signal()
@@ -239,7 +258,7 @@ impl WorkerManager {
             return None;
         }
         let default_check_interval_secs = config.default_check_interval_secs;
-        let manager = Self::start(registry, config, job_queue);
+        let manager = Self::start_with_sink(registry, sink, config, job_queue);
         debug!("Started WorkerManager loop with {default_check_interval_secs}s default interval");
         Some(manager)
     }
@@ -269,8 +288,8 @@ impl WorkerManager {
     /// (the places are on [`HealthSink`]): a sink that keeps the status
     /// elsewhere writes it on the worker object before it answers, by the
     /// registry's guarded transition. [`Self::start`] hands the registry as
-    /// the sink too, since it runs
-    /// this crate's status state machine over those objects.
+    /// the sink too, since it runs this crate's status state machine over
+    /// those objects.
     pub fn start_with_sink<G: Generation>(
         registry: Arc<WorkerRegistry<G>>,
         sink: Arc<dyn HealthSink>,
@@ -301,9 +320,10 @@ impl WorkerManager {
         reconcile_from_registry(&registry, &mut next_check, &config);
 
         // Drain the connect-readiness signal (workers wake us the instant
-        // their backend handshake lands). Taken once — a second manager on
-        // the same registry would simply run poll-only.
-        let connect_rx = registry.take_connect_signal_receiver();
+        // their backend handshake lands). One loop holds the receiver: a
+        // second manager on the same registry runs poll-only until the
+        // first ends and hands it back.
+        let signals = HeldSignals::take(&registry);
 
         #[expect(
             clippy::disallowed_methods,
@@ -314,7 +334,7 @@ impl WorkerManager {
                 registry,
                 sink,
                 events_rx,
-                connect_rx,
+                signals,
                 next_check,
                 config,
                 job_queue,
@@ -489,7 +509,7 @@ async fn run_health_loop<G: Generation>(
     registry: Arc<WorkerRegistry<G>>,
     sink: Arc<dyn HealthSink>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
-    mut connect_rx: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
+    mut signals: HeldSignals<G>,
     mut next_check: HashMap<WorkerId, tokio::time::Instant>,
     config: WorkerManagerConfig,
     job_queue: Option<Arc<dyn WorkerJobs>>,
@@ -504,6 +524,11 @@ async fn run_health_loop<G: Generation>(
     };
     let mut probes: ProbeFutures = FuturesUnordered::new();
     let mut in_flight: HashSet<WorkerId> = HashSet::new();
+
+    // The sink is told every worker's liveness once at the start. A host
+    // that starts a loop for each term of its lead writes what its objects
+    // know at the term's start this way, with no call of its own.
+    tell_liveness_of_all(&registry, sink.as_ref());
 
     loop {
         let now = tokio::time::Instant::now();
@@ -619,9 +644,12 @@ async fn run_health_loop<G: Generation>(
                 }
             }
             () = tokio::time::sleep_until(sleep_until) => {}
-            signal = recv_connect_signal(&mut connect_rx) => {
+            signal = signals.recv() => {
                 match signal {
-                    Some(connected) => {
+                    Some(WorkerSignal::LivenessMoved { url }) => {
+                        apply_liveness_signal(&registry, sink.as_ref(), &url);
+                    }
+                    Some(WorkerSignal::Connected(connected)) => {
                         apply_connect_signal_and_refresh(
                             &registry,
                             sink.as_ref(),
@@ -632,13 +660,15 @@ async fn run_health_loop<G: Generation>(
                         )
                         .await;
                     }
-                    // Every sender lives on the registry (Arc), so recv() only
-                    // returns None if the registry itself is gone. Drop the
-                    // branch so the loop stops polling a dead channel.
-                    None => connect_rx = None,
+                    // The registry holds a sender and this loop holds the
+                    // registry, so no loop meets a closed channel. One that
+                    // did would drop the receiver, not hand it back, and
+                    // the branch would lie dormant.
+                    None => signals.receiver = None,
                 }
             }
             event = events_rx.recv() => {
+                tell_liveness_at_event(&event, &registry, sink.as_ref());
                 if apply_registry_event(event, &registry, &mut next_check, &config).is_break() {
                     return;
                 }
@@ -893,15 +923,115 @@ async fn apply_probe_completion<G: Generation>(
     answer
 }
 
-/// Await the next connect-readiness signal, or park forever when there is no
-/// receiver (health checks disabled, or a second manager already took it). The
-/// `pending()` arm keeps this `select!` branch dormant instead of busy-looping.
-async fn recv_connect_signal(
-    rx: &mut Option<mpsc::UnboundedReceiver<WorkerConnected>>,
-) -> Option<WorkerConnected> {
-    match rx {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
+/// The registry's connect-signal receiver in one loop's hands. It goes back
+/// to the registry when the loop's task ends, by its return or by the abort
+/// at the manager's drop, with the signals no loop has read. So a host that
+/// runs one loop after another over a registry (one for each term of its
+/// lead) is signalled in each of them, not in the first alone.
+struct HeldSignals<G: Generation> {
+    registry: Arc<WorkerRegistry<G>>,
+    receiver: Option<mpsc::UnboundedReceiver<WorkerSignal>>,
+}
+
+impl<G: Generation> HeldSignals<G> {
+    /// The receiver where no other loop holds it. Else none yet:
+    /// [`Self::recv`] takes it when it comes back.
+    fn take(registry: &Arc<WorkerRegistry<G>>) -> Self {
+        Self {
+            registry: Arc::clone(registry),
+            receiver: registry.take_connect_signal_receiver(),
+        }
+    }
+
+    /// The next signal. A loop that holds no receiver waits here for the
+    /// loop that does to end, then takes it: the `select!` branch lies
+    /// dormant meanwhile and never spins. Cancel safe: a signal leaves the
+    /// channel only in the `recv` that returns it.
+    async fn recv(&mut self) -> Option<WorkerSignal> {
+        loop {
+            match &mut self.receiver {
+                Some(receiver) => return receiver.recv().await,
+                None => {
+                    self.registry.connect_signal_receiver_returned().await;
+                    self.receiver = self.registry.take_connect_signal_receiver();
+                }
+            }
+        }
+    }
+}
+
+impl<G: Generation> Drop for HeldSignals<G> {
+    fn drop(&mut self) {
+        if let Some(receiver) = self.receiver.take() {
+            self.registry.return_connect_signal_receiver(receiver);
+        }
+    }
+}
+
+/// Say to `sink` that the liveness veto of `worker` may have moved
+/// ([`HealthSink::liveness_moved`]). The mark of a waiting signal is taken
+/// first and the sink reads the veto after: a move behind that read signals
+/// again, so the sink's last read is never older than the last move.
+fn tell_liveness(sink: &dyn HealthSink, worker_id: &WorkerId, worker: &dyn Worker) {
+    if let Some(runtime) = worker.runtime_state() {
+        runtime.liveness_signal_taken();
+    }
+    sink.liveness_moved(worker_id, worker.revision());
+}
+
+/// A liveness signal ([`WorkerSignal::LivenessMoved`]): the sink is told of
+/// the worker that stands at the URL now, at its revision. A replacement
+/// shares the running state of the worker it replaced, the veto with the
+/// rest, so a signal raised through the earlier object is the
+/// replacement's too. The signal of a worker that left is nobody's.
+fn apply_liveness_signal<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
+    sink: &dyn HealthSink,
+    url: &str,
+) {
+    let Some(worker_id) = registry.get_id_by_url(url) else {
+        return;
+    };
+    let Some(worker) = registry.get(&worker_id) else {
+        return;
+    };
+    tell_liveness(sink, &worker_id, worker.as_ref());
+}
+
+/// The liveness of every worker the registry holds: at the loop's start,
+/// and at its rebuild behind a lagged subscription, which may have lost a
+/// replacement's event.
+fn tell_liveness_of_all<G: Generation>(registry: &Arc<WorkerRegistry<G>>, sink: &dyn HealthSink) {
+    for descriptor in registry.reconcile_snapshot() {
+        if let Some(worker) = registry.get(&descriptor.worker_id) {
+            tell_liveness(sink, &descriptor.worker_id, worker.as_ref());
+        }
+    }
+}
+
+/// The liveness tells a registry event carries. A worker laid in another's
+/// place took its running state, the veto with it: the sink is told at the
+/// replacement's revision, where a tell of the earlier object may have met
+/// a sink already past it. A registered worker starts with no veto and is
+/// told of at its first move. A lagged subscription tells every worker.
+fn tell_liveness_at_event<G: Generation>(
+    event: &Result<WorkerEvent, broadcast::error::RecvError>,
+    registry: &Arc<WorkerRegistry<G>>,
+    sink: &dyn HealthSink,
+) {
+    match event {
+        Ok(WorkerEvent::Replaced {
+            worker_id,
+            new: worker,
+            ..
+        }) => tell_liveness(sink, worker_id, worker.as_ref()),
+        Err(broadcast::error::RecvError::Lagged(_)) => tell_liveness_of_all(registry, sink),
+        Ok(
+            WorkerEvent::Registered { .. }
+            | WorkerEvent::Removed { .. }
+            | WorkerEvent::StatusChanged { .. },
+        )
+        | Err(broadcast::error::RecvError::Closed) => {}
     }
 }
 
@@ -1170,7 +1300,10 @@ fn labels_follow_the_engine<G: Generation>(
 /// submission is logged; the next transition retries.
 async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &dyn WorkerJobs) {
     let url = worker.url().to_string();
-    match job_queue.refresh_worker_labels(url.clone()).await {
+    match job_queue
+        .refresh_worker_labels(url.clone(), WorkerJobAsker::Health)
+        .await
+    {
         Ok(true) => debug!(
             worker_url = %Endpoint::redacted_str(&url),
             "Submitted a label refresh for a worker that came into service"
@@ -1395,7 +1528,12 @@ async fn submit_removal_job<G: Generation>(
         "Removing failed worker from registry"
     );
     if let Err(e) = job_queue
-        .remove_worker(url.clone(), worker_id, expected_revision)
+        .remove_worker(
+            url.clone(),
+            worker_id,
+            expected_revision,
+            WorkerJobAsker::Health,
+        )
         .await
     {
         error!(
@@ -1645,7 +1783,7 @@ impl WorkerManager {
     }
 
     /// Build the fleet-wide load body from the monitor's published
-    /// snapshot: the same numbers the routing policies are acting on.
+    /// snapshot, with each rank's report under its worker's address.
     ///
     /// No request reaches a worker. That is what makes the route safe to
     /// stack — a gateway registered as a worker under another gateway

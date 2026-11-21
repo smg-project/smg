@@ -11,11 +11,15 @@ use openai_protocol::model_card::ModelCard;
 use smg::{
     routers::grpc::backend_client::BasicWorkerBuilder,
     workflow::{
-        data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
+        data::{WorkerRegistrationMode, WorkerWorkflowData},
         steps::local::EnsureHarmonyEncodingStep,
     },
 };
-use smg_worker::identity::basic::{ConnectionMode, Worker, WorkerType};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker, WorkerType},
+    jobs::WorkerJobAsker,
+    workflow::WorkerKind,
+};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
 
 fn force_offline_vocab() {
@@ -40,6 +44,7 @@ fn context(
     WorkflowContext::new(
         WorkflowInstanceId::new(),
         WorkerWorkflowData {
+            asker: WorkerJobAsker::Api,
             config: openai_protocol::worker::WorkerSpec::new("grpc://127.0.0.1:1"),
             registration_mode: WorkerRegistrationMode::Upsert,
             worker_kind: Some(kind),
@@ -49,11 +54,11 @@ fn context(
             detected_runtime_type: None,
             discovered_labels: Default::default(),
             dp_info: None,
-            symphony_table: None,
+            host_notes: Default::default(),
             model_cards: Vec::new(),
             workers: None,
             final_labels: Default::default(),
-            app_context: None,
+            host: None,
             actual_workers: Some(workers),
         },
     )

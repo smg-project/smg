@@ -16,7 +16,9 @@ use tiktoken_rs::{
 };
 
 use crate::{
-    byte_level::{ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId},
+    byte_level::{
+        cut_start, ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId,
+    },
     chat_template::{
         load_chat_template_from_file, python_isspace, ChatTemplateContentFormat,
         ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, PreparedTools, ThinkingKeyName,
@@ -38,8 +40,8 @@ use crate::{
     native::{Added, AddedTokens, NativeEncoder},
     tekken,
     traits::{
-        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
-        PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
+        past_emitted, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding,
+        IncrementalDecoder, PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
         Tokenizer as TokenizerTrait,
     },
 };
@@ -98,27 +100,39 @@ fn parse_tiktoken_config(value: &serde_json::Value) -> TiktokenConfig {
     }
 }
 
+/// The entries of `added_tokens_decoder` that name a token: the id, the
+/// spelling and the `"special"` flag of each. An entry whose id does not
+/// parse, or whose `content` is missing or empty, names no text: it is left
+/// out of the load whole, as the Hugging Face library leaves one out of its
+/// added vocabulary. It gives no spelling and no skipped id, and no encoder
+/// or matcher is built over it.
+fn added_token_entries(
+    config: &serde_json::Value,
+) -> impl Iterator<Item = (TokenIdType, &str, bool)> {
+    config
+        .get("added_tokens_decoder")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(id_str, token_info)| {
+            let id = id_str.parse::<TokenIdType>().ok()?;
+            let content = token_info.get("content").and_then(|v| v.as_str())?;
+            let special = token_info
+                .get("special")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (!content.is_empty()).then_some((id, content, special))
+        })
+}
+
 /// Ids of `added_tokens_decoder` entries flagged `"special": true`: the set
 /// `skip_special_tokens` strips, as HuggingFace defines it. Added tokens
 /// without the flag (Kimi-K3's `<|open|>` / `<|close|>` / `<|sep|>`) are
 /// control tokens for encoding but stay in decoded text.
 fn parse_skip_token_ids(config: &serde_json::Value) -> HashSet<TokenIdType> {
-    let mut ids = HashSet::new();
-    if let Some(added) = config
-        .get("added_tokens_decoder")
-        .and_then(|v| v.as_object())
-    {
-        for (id_str, token_info) in added {
-            let special = token_info
-                .get("special")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if let (true, Ok(id)) = (special, id_str.parse::<TokenIdType>()) {
-                ids.insert(id);
-            }
-        }
-    }
-    ids
+    added_token_entries(config)
+        .filter_map(|(id, _, special)| special.then_some(id))
+        .collect()
 }
 
 /// Load `tokenizer_config.json` from `dir`, returning both the parsed
@@ -141,21 +155,9 @@ fn load_tiktoken_config_from_dir(
 ///
 /// Format: `{ "163584": { "content": "[BOS]", "special": true }, ... }`
 fn parse_added_tokens_decoder(config: &serde_json::Value) -> HashMap<String, TokenIdType> {
-    let mut tokens = HashMap::new();
-    if let Some(added) = config
-        .get("added_tokens_decoder")
-        .and_then(|v| v.as_object())
-    {
-        for (id_str, token_info) in added {
-            if let (Ok(id), Some(content)) = (
-                id_str.parse::<TokenIdType>(),
-                token_info.get("content").and_then(|v| v.as_str()),
-            ) {
-                tokens.insert(content.to_string(), id);
-            }
-        }
-    }
-    tokens
+    added_token_entries(config)
+        .map(|(id, content, _)| (content.to_string(), id))
+        .collect()
 }
 
 /// Extract named special tokens (bos, eos, unk, etc.) from config JSON.
@@ -292,6 +294,8 @@ struct FileVocabulary {
     /// The split pattern the ranks were trained under.
     pattern: Cow<'static, str>,
     /// Special token spellings to id: recognized in text, decoded by spelling.
+    /// Never an empty spelling: each reader of a vocabulary leaves one out
+    /// (`added_token_entries`) or refuses the file (`tekken::read`).
     specials: HashMap<String, TokenIdType>,
     /// The ids `skip_special_tokens` strips.
     skip_token_ids: HashSet<TokenIdType>,
@@ -517,17 +521,11 @@ impl TiktokenTokenizer {
     /// template from an explicit path, else the configuration's, else a file
     /// beside the vocabulary; the EOS ids; the renderer).
     fn from_vocabulary(
-        mut vocabulary: FileVocabulary,
+        vocabulary: FileVocabulary,
         dir: &Path,
         chat_template_path: Option<&str>,
         config_chat_template: ConfigChatTemplates,
     ) -> Result<Self> {
-        // An added token with an empty spelling names no text: it is left
-        // out of the set, as the Hugging Face library leaves one out of its
-        // added vocabulary, and no encoder or matcher is built over it.
-        vocabulary
-            .specials
-            .retain(|spelling, _| !spelling.is_empty());
         let FileVocabulary {
             ranks,
             pattern,
@@ -721,8 +719,6 @@ impl TiktokenTokenizer {
             },
             // This file's reader takes every added token as it is spelled.
             &|| true,
-            // So it is not asked what it cuts out of a text.
-            &|_: &str| Vec::new(),
             &self.special_tokens,
         );
         if let Some(written) = written {
@@ -1430,6 +1426,32 @@ impl Decoder for TiktokenTokenizer {
         }
     }
 
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        let step = if ids.len() <= *prefix_index {
+            DecodeStep::default()
+        } else {
+            let decoded = self.decode(ids, skip_special_tokens)?;
+            if decoded.ends_with(char::REPLACEMENT_CHARACTER) {
+                let kept = self.kept_ids(ids, skip_special_tokens);
+                let bytes = self.bytes_of(&kept);
+                let end = cut_start(&bytes);
+                past_emitted(&String::from_utf8_lossy(&bytes[..end]), prefix)
+            } else {
+                past_emitted(&decoded, prefix)
+            }
+        };
+        ids.clear();
+        prefix.clear();
+        *prefix_index = 0;
+        Ok(step)
+    }
+
     /// Every id stands for fixed bytes, so one stream needs only a
     /// pending-bytes buffer: no window re-decoded per token, and a character
     /// that merely spans tokens is held back, not a decode failure. An id the
@@ -1784,8 +1806,7 @@ mod tests {
     const PARTIAL_BYTE_TIKTOKEN_MODEL: &str = "YQ== 0\nYg== 1\nww== 2\nqQ== 3\n77+9 4\nIMM= 5\n";
 
     /// The stop decoder's reading of `ids`: as a stream (the deltas joined,
-    /// the finish last) and as one buffer (every token, then the finish,
-    /// appended into it: the non-streaming path).
+    /// the finish last) and as one buffer (every token, then the finish).
     fn stop_decoded(
         tokenizer: &Arc<dyn Tokenizer>,
         ids: &[TokenIdType],
@@ -2386,47 +2407,45 @@ mod tests {
     }
 
     /// The streams of `PARTIAL_BYTE_TIKTOKEN_MODEL` (with `[EOS]` as id 6) that
-    /// end while the decoder holds bytes: (ids, skip special tokens, the text
-    /// the full decode and the stream both read). A lone continuation byte, a
-    /// literal replacement character, a byte before a skipped special token
-    /// and a lead byte the end cut (C3 alone, after `a`, before a skipped
-    /// special token, or behind the space of its own rank) are released as
-    /// the full decode renders them.
-    const STREAM_END_CASES: [(&[TokenIdType], bool, &str); 9] = [
-        (&[2], false, "\u{FFFD}"),
-        (&[0, 2], false, "a\u{FFFD}"),
-        (&[2, 6], true, "\u{FFFD}"),
-        (&[5], false, " \u{FFFD}"),
-        (&[0, 1, 3], false, "ab\u{FFFD}"),
-        (&[4], false, "\u{FFFD}"),
-        (&[2, 3], false, "é"),
-        (&[3, 6], true, "\u{FFFD}"),
-        (&[3, 6], false, "\u{FFFD}[EOS]"),
+    /// end while the decoder holds bytes: (ids, skip special tokens, the full
+    /// decode, the stream). A cut character is absent only from the stream;
+    /// invalid bytes and a literal replacement character remain visible.
+    const STREAM_END_CASES: [(&[TokenIdType], bool, &str, &str); 9] = [
+        (&[2], false, "\u{FFFD}", ""),
+        (&[0, 2], false, "a\u{FFFD}", "a"),
+        (&[2, 6], true, "\u{FFFD}", ""),
+        (&[5], false, " \u{FFFD}", " "),
+        (&[0, 1, 3], false, "ab\u{FFFD}", "ab\u{FFFD}"),
+        (&[4], false, "\u{FFFD}", "\u{FFFD}"),
+        (&[2, 3], false, "é", "é"),
+        (&[3, 6], true, "\u{FFFD}", "\u{FFFD}"),
+        (&[3, 6], false, "\u{FFFD}[EOS]", "\u{FFFD}[EOS]"),
     ];
 
-    /// `STREAM_END_CASES` on `tokenizer`, through `Sequence`, through the
-    /// stop decoder as a stream and as one buffer (the non-streaming path).
+    /// `STREAM_END_CASES` on `tokenizer`, through `Sequence`, and through the
+    /// stop decoder as a stream and as one buffer.
     fn assert_stream_end_cases(tokenizer: &Arc<dyn Tokenizer>) {
-        for (ids, skip, text) in STREAM_END_CASES {
-            assert_eq!(tokenizer.decode(ids, skip).unwrap(), text, "ids={ids:?}");
+        for (ids, skip, full, streamed) in STREAM_END_CASES {
+            assert_eq!(tokenizer.decode(ids, skip).unwrap(), full, "ids={ids:?}");
             let (pieces, finish) = stream_then_finish(tokenizer, ids, skip);
             assert_eq!(
                 pieces.concat() + &finish,
-                text,
+                streamed,
                 "ids={ids:?} skip={skip}: pieces {pieces:?}, finish {finish:?}"
             );
             let (stop_streamed, whole) = stop_decoded(tokenizer, ids, skip);
-            assert_eq!(stop_streamed, text, "stop decoder: ids={ids:?} skip={skip}");
-            assert_eq!(whole, text, "whole: ids={ids:?} skip={skip}");
+            assert_eq!(
+                stop_streamed, streamed,
+                "stop decoder: ids={ids:?} skip={skip}"
+            );
+            assert_eq!(whole, streamed, "whole: ids={ids:?} skip={skip}");
         }
     }
 
-    /// A stream that ends while the per-stream decoder holds bytes: its finish
-    /// releases the held bytes as the full decode renders them, a character
-    /// the end cut as its replacement character, and the pieces before it
-    /// hold as they did.
+    /// A stream that ends while the per-stream decoder holds bytes drops a
+    /// cut character while keeping complete or invalid text before it.
     #[test]
-    fn stream_end_renders_held_bytes_as_decode_does() {
+    fn stream_end_drops_an_incomplete_character() {
         let dir = write_tiktoken_dir(
             PARTIAL_BYTE_TIKTOKEN_MODEL,
             r#"{"added_tokens_decoder": {"6": {"content": "[EOS]", "special": true}}}"#,
@@ -2444,17 +2463,16 @@ mod tests {
         assert_eq!(finish, "\u{FFFD}");
         let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 2], false);
         assert_eq!(pieces, ["a", ""]);
-        assert_eq!(finish, "\u{FFFD}");
+        assert_eq!(finish, "");
         let (pieces, finish) = stream_then_finish(&tokenizer, &[5], false);
         assert_eq!(pieces, [""]);
-        assert_eq!(finish, " \u{FFFD}");
+        assert_eq!(finish, " ");
     }
 
     /// The same end through the generic decoder (no per-id table because an
-    /// added token sits far beyond the ranks): the window's held bytes are
-    /// released as the full decode renders them, a cut character included.
+    /// added token sits far beyond the ranks).
     #[test]
-    fn stream_end_renders_held_bytes_as_decode_does_on_the_generic_path() {
+    fn generic_stream_end_drops_an_incomplete_character() {
         let dir = write_tiktoken_dir(
             PARTIAL_BYTE_TIKTOKEN_MODEL,
             r#"{"added_tokens_decoder": {"6": {"content": "[EOS]", "special": true}, "100000000": {"content": "[FAR]", "special": true}}}"#,
@@ -2469,7 +2487,7 @@ mod tests {
         assert_eq!(finish, "\u{FFFD}");
         let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 2], false);
         assert_eq!(pieces, ["a", ""]);
-        assert_eq!(finish, "\u{FFFD}");
+        assert_eq!(finish, "");
     }
 
     #[test]
@@ -3099,6 +3117,25 @@ mod tests {
         assert_eq!(typed_turn_ids(&tokenizer), (TYPED_AS_TEXT.to_vec(), false));
     }
 
+    /// A control the template keeps in an attribute of a namespace is marked
+    /// on a tiktoken file's checkpoint as on any other (see
+    /// `ChatTemplateState::mark_built_controls`): the attribute's control is
+    /// the control token, and a typed spelling stays text.
+    #[test]
+    fn a_tiktoken_file_s_control_kept_in_a_namespace_is_marked() {
+        let template = builds_its_controls()
+            .replace(
+                "{% for",
+                "{% set ns = namespace(shut='') %}{% set ns.shut = close %}{% for",
+            )
+            .replace("{{ close }}", "{{ ns.shut }}");
+        assert!(template.contains("{{ ns.shut }}"));
+        let dir = suffixed_controls_dir(&template, None);
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.controls.is_some());
+        assert_eq!(typed_turn_ids(&tokenizer), (TYPED_AS_TEXT.to_vec(), false));
+    }
+
     /// A value the template builds out of several controls, with text
     /// between them, takes the marks around each on a tiktoken file's
     /// checkpoint as on any other (see
@@ -3151,12 +3188,12 @@ mod tests {
     }
 
     /// An added token whose spelling is empty is left out of the set a
-    /// tiktoken file's checkpoint gives (see
-    /// `TiktokenTokenizer::from_vocabulary`): the file loads, and it reads
-    /// as the same file without that entry under a template that builds its
-    /// control spellings, one that builds a value of several and one that
-    /// spells them whole. The cases run on a thread of their own, so that a
-    /// load or an encode that does not come back fails the test.
+    /// tiktoken file's checkpoint gives (see `added_token_entries`): the
+    /// file loads, and it reads as the same file without that entry under a
+    /// template that builds its control spellings, one that builds a value
+    /// of several and one that spells them whole. The cases run on a thread
+    /// of their own, so that a load or an encode that does not come back
+    /// fails the test.
     #[test]
     fn a_tiktoken_file_s_added_token_with_an_empty_spelling_is_left_out() {
         let several = builds_its_controls()
@@ -3193,12 +3230,117 @@ mod tests {
         }
     }
 
+    /// An entry of `added_tokens_decoder` that names no token, by an empty
+    /// spelling or by none, is left out of the load whole (see
+    /// `added_token_entries`), also where it is flagged special: at the rank
+    /// of a byte a decode that skips special tokens keeps that byte, far
+    /// beyond the ranks the per-id byte table is still built, and the file
+    /// reads as the same file without the entry.
+    #[test]
+    fn a_tiktoken_file_s_entry_that_names_no_token_skips_no_id() {
+        let read = |entry: Option<(&str, serde_json::Value)>| {
+            let mut config = serde_json::json!({
+                "added_tokens_decoder": {"300": {"content": "</s:x>", "special": true}},
+                "eos_token": "</s:x>",
+            });
+            if let Some((id, entry)) = entry {
+                config["added_tokens_decoder"][id] = entry;
+            }
+            let dir = write_tiktoken_dir(&full_byte_tiktoken_model(), &config.to_string(), None);
+            let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            (
+                tokenizer.decode(&[72, 65, 66, 300], true).unwrap(),
+                tokenizer.decode(&[72, 65, 66, 300], false).unwrap(),
+                tokenizer.encode("HAB", false).unwrap().token_ids().to_vec(),
+                tokenizer.token_to_id(""),
+                tokenizer.vocab_size,
+                tokenizer.byte_level.is_some(),
+            )
+        };
+        let without = read(None);
+        assert_eq!(
+            without,
+            (
+                "HAB".to_string(),
+                "HAB</s:x>".to_string(),
+                vec![72, 65, 66],
+                None,
+                301,
+                true
+            )
+        );
+        for (id, entry) in [
+            ("65", serde_json::json!({"content": "", "special": true})),
+            ("65", serde_json::json!({"special": true})),
+            (
+                "100000000",
+                serde_json::json!({"content": "", "special": true}),
+            ),
+        ] {
+            assert_eq!(read(Some((id, entry.clone()))), without, "{id}: {entry}");
+        }
+    }
+
+    /// The id of such an entry stays skipped where a second entry names a
+    /// special token at it: each entry is read on its own.
+    #[test]
+    fn an_id_a_named_special_entry_shares_with_one_that_names_no_token_stays_skipped() {
+        let config = serde_json::json!({"added_tokens_decoder": {
+            "0300": {"content": "", "special": true},
+            "300": {"content": "</s:x>", "special": true},
+            "301": {"special": true},
+            "65": {"content": "", "special": true},
+        }});
+        assert_eq!(parse_skip_token_ids(&config), HashSet::from([300]));
+        assert_eq!(
+            parse_added_tokens_decoder(&config),
+            HashMap::from([("</s:x>".to_string(), 300)])
+        );
+    }
+
+    /// A reserved slot of a Kimi checkpoint that such an entry sits on is
+    /// filled as a free slot is: the checkpoint reads as the same files
+    /// without the entry.
+    #[test]
+    fn a_kimi_checkpoint_s_entry_that_names_no_token_holds_no_reserved_slot() {
+        let read = |added: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            // 'a' 0, 'b' 1, 'ab' 2: the reserved slots begin at 3.
+            std::fs::write(
+                dir.path().join("tiktoken.model"),
+                "YQ== 0\nYg== 1\nYWI= 2\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                format!(
+                    r#"{{"tokenizer_class": "TikTokenTokenizer",
+                    "auto_map": {{"AutoTokenizer": ["tokenization_kimi.TikTokenTokenizer", null]}},
+                    "added_tokens_decoder": {added}}}"#
+                ),
+            )
+            .unwrap();
+            let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            (
+                tokenizer.token_to_id("<|reserved_token_5|>"),
+                tokenizer.decode(&[0, 5], true).unwrap(),
+                tokenizer.vocab_size,
+            )
+        };
+        let without = read("{}");
+        assert_eq!(without, (Some(5), "a<|reserved_token_5|>".to_string(), 259));
+        assert_eq!(read(r#"{"5": {"content": "", "special": true}}"#), without);
+    }
+
     /// A template that builds its control spellings and also writes an
     /// added token in pieces that stand side by side (a literal and the text
-    /// after it, two literals, a join of two, a text a comment parts) writes
-    /// that token whole (see `written_text`): it stays unmarked, as one that
-    /// spells the token in one piece does, and every request is encoded from
-    /// its text, also under an argument no probe conversation sets.
+    /// after it, two literals, a join of two, a text a comment parts), or
+    /// in pieces a render brings together (a piece between them left out, a
+    /// whole piece between them, a macro's text written where it is called),
+    /// writes that token whole (see `written_text` and `spelled_across`): it
+    /// stays unmarked, as one that spells the token in one piece does, and
+    /// every request is encoded from its text, also under an argument no
+    /// probe conversation sets.
     #[test]
     fn a_tiktoken_file_s_template_that_writes_an_added_token_in_pieces_stays_unmarked() {
         for piece in [
@@ -3208,6 +3350,9 @@ mod tests {
             "<{# no text #}b>",
             "<{# no text #}\nb>",
             "<b>",
+            "<{% if extra %}x{% endif %}b>",
+            "<{% if extra %}x{% endif %}{{ 'b' }}{% if extra %}y{% endif %}>",
+            "{% macro tail() %}b>{% endmacro %}<{{ tail() }}",
         ] {
             let template = format!(
                 "{}{{% if tag %}}{piece}{{% endif %}}",

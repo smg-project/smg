@@ -22,6 +22,7 @@ The render checks need the ``helm`` binary and are skipped without it.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -39,8 +40,8 @@ CHART = REPO / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
 SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
-# The gateway's Consul provider, which reads Consul's own variables.
-CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
+# The discovery crate's Consul provider, which reads Consul's own variables.
+CONSUL_PROVIDER = REPO / "crates" / "service_discovery" / "src" / "consul.rs"
 # The chart needs Kubernetes >= 1.26 and `helm template` checks it against
 # its default version, which older helm releases put below that.
 KUBE_VERSION = "1.30.0"
@@ -86,8 +87,11 @@ needs_chart = pytest.mark.skipif(not HELPERS.exists(), reason="chart not present
 needs_helm = pytest.mark.skipif(
     shutil.which("helm") is None or not HELPERS.exists(), reason="helm or the chart not present"
 )
-needs_gateway_source = pytest.mark.skipif(
-    not CONSUL_PROVIDER.exists(), reason="the gateway source is not in this checkout"
+# A checkout with no Rust sources has no workspace manifest, and the test that
+# reads them stands down. With the sources there, a provider file that moved
+# fails that test: a skip would hide the move.
+needs_rust_sources = pytest.mark.skipif(
+    not (REPO / "Cargo.toml").exists(), reason="the Rust sources are not in this checkout"
 )
 
 
@@ -674,7 +678,7 @@ def test_consul_secrets_are_wired_only_for_the_consul_provider(provider):
 
 
 @needs_chart
-@needs_gateway_source
+@needs_rust_sources
 def test_chart_consul_variables_are_the_ones_the_gateway_reads():
     text = HELPERS.read_text() + ROUTER_TEMPLATE.read_text()
     assert set(re.findall(r"\bCONSUL_[A-Z_]+\b", text)) == CONSUL_VARIABLES
@@ -863,21 +867,25 @@ def test_every_example_renders_arguments_the_launcher_parses(example, tmp_path):
     launcher_args(with_readable_files(router_container(documents)["args"], tmp_path))
 
 
+def launcher_policies() -> list[str]:
+    """The launcher's ``--policy`` choices, read from its own parser."""
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    choices = parser._option_string_actions["--policy"].choices
+    assert choices is not None, "the launcher's --policy option holds no choices"
+    return list(choices)
+
+
 @needs_chart
 def test_the_schema_admits_the_policies_the_launcher_takes():
-    """``router.policy`` is rendered as the launcher's ``--policy``, so the
-    schema's enum is that option's choices: no fewer (a policy the gateway
-    runs could not be deployed through the value) and no more (helm would
-    render a pod whose launcher exits at argparse)."""
+    """The schema accepts an empty value and every launcher policy."""
     schema = json.loads(SCHEMA.read_text())
     policy = schema["properties"]["router"]["properties"]["policy"]
-    assert policy["enum"] == router_args.COMMON_POLICY_CHOICES, (
-        "values.schema.json's router.policy enum differs from the launcher's --policy choices"
-    )
+    assert policy["enum"] == ["", *launcher_policies()]
 
 
 @needs_helm
-@pytest.mark.parametrize("policy", router_args.COMMON_POLICY_CHOICES)
+@pytest.mark.parametrize("policy", launcher_policies())
 def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
     _, documents = render(f"router.policy={policy}")
     args = router_container(documents)["args"]
@@ -886,10 +894,269 @@ def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
 
 
 @needs_helm
-def test_a_prefill_only_policy_is_refused_by_the_schema():
-    """``bucket`` is a ``--prefill-policy`` choice, not a ``--policy`` one; the
-    schema refuses it where the launcher would, at render time."""
-    assert "router.policy must be one of the following" in render_error("router.policy=bucket")
+def test_a_policy_the_launcher_does_not_take_is_refused_by_the_schema():
+    """The schema refuses a name at render time, where the launcher would."""
+    assert "router.policy must be one of the following" in render_error("router.policy=fastest")
+
+
+POLICY_CONTROLLER_ON = "router.policyController=on"
+INLINE_ROUTER_POLICY = (
+    "router.policySpec.apiVersion=smg.policy/v1",
+    "router.policySpec.profiles.default.filter[0]=healthy",
+    "router.policySpec.profiles.default.score[0]=least-load",
+    "router.policySpec.profiles.default.pick=best",
+)
+NAMED_ROUTER_POLICY = "router.policySpecConfigMap=yes"
+
+
+@needs_helm
+def test_no_document_and_no_policy_value_renders_the_line_as_before():
+    """Keep the default arguments in order so an upgrade does not roll the pods."""
+    _, documents = render()
+    expected = """
+        --host 0.0.0.0
+        --port 30000
+        --policy cache_aware
+        --cache-threshold 0.3
+        --balance-abs-threshold 64
+        --balance-rel-threshold 1.5
+        --eviction-interval-secs 120
+        --max-tree-size 67108864
+        --block-size 16
+        --max-payload-size 536870912
+        --request-timeout-secs 1800
+        --mm-turbojpeg require
+        --shutdown-grace-period-secs 180
+        --max-concurrent-requests -1
+        --queue-size 100
+        --queue-timeout-secs 60
+        --retry-max-retries 5
+        --retry-initial-backoff-ms 50
+        --retry-max-backoff-ms 30000
+        --retry-backoff-multiplier 1.5
+        --retry-jitter-factor 0.2
+        --cb-failure-threshold 10
+        --cb-success-threshold 3
+        --cb-timeout-duration-secs 60
+        --cb-window-duration-secs 120
+        --health-failure-threshold 3
+        --health-success-threshold 2
+        --health-check-timeout-secs 5
+        --health-check-interval-secs 60
+        --health-check-endpoint /health
+        --prometheus-port 29000
+        --log-level info
+    """.split()
+    assert router_container(documents)["args"] == expected
+
+
+CACHE_TUNING_DEFAULTS = (
+    "router.cacheThreshold=0.3",
+    "router.balanceAbsThreshold=64",
+    "router.balanceRelThreshold=1.5",
+    "router.evictionIntervalSecs=120",
+    "router.maxTreeSize=67108864",
+    "router.blockSize=16",
+)
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "settings",
+    [
+        INLINE_ROUTER_POLICY,
+        (NAMED_ROUTER_POLICY,),
+        (NAMED_ROUTER_POLICY, "router.disaggregation.mode=pd"),
+        (NAMED_ROUTER_POLICY, *CACHE_TUNING_DEFAULTS),
+    ],
+    ids=["inline", "named", "pd", "defaults written out"],
+)
+def test_a_document_renders_no_flag_a_document_replaces(settings):
+    _, documents = render(POLICY_CONTROLLER_ON, *settings)
+    args = router_container(documents)["args"]
+    # The command line refuses each of these beside a document, at its
+    # default too. The Python launcher refuses one that is not at its default.
+    replaced = {"--" + name.replace("_", "-") for name in router_args.DOCUMENT_REPLACES}
+    assert {"--policy", "--prefill-policy", "--cache-threshold", "--block-size"} <= replaced
+    assert replaced.isdisjoint(args)
+    assert launcher_args(args).options_a_document_replaces() == []
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("value", "settings"),
+    [
+        ("router.policy", ("router.policy=random",)),
+        (
+            "router.disaggregation.prefillPolicy",
+            ("router.disaggregation.mode=pd", "router.disaggregation.prefillPolicy=random"),
+        ),
+        (
+            "router.disaggregation.decodePolicy",
+            ("router.disaggregation.mode=pd", "router.disaggregation.decodePolicy=random"),
+        ),
+        (
+            "router.disaggregation.encodePolicy",
+            ("router.disaggregation.mode=epd", "router.disaggregation.encodePolicy=random"),
+        ),
+        ("router.cacheThreshold", ("router.cacheThreshold=0.5",)),
+        ("router.balanceAbsThreshold", ("router.balanceAbsThreshold=32",)),
+        ("router.balanceRelThreshold", ("router.balanceRelThreshold=2",)),
+        ("router.evictionIntervalSecs", ("router.evictionIntervalSecs=60",)),
+        ("router.maxTreeSize", ("router.maxTreeSize=1024",)),
+        ("router.blockSize", ("router.blockSize=8",)),
+    ],
+)
+def test_a_value_a_document_replaces_fails_the_render_by_name(value, settings):
+    error = render_error(POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY, *settings)
+    assert f"{value} is set beside a policy document" in error
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("settings", "policy"),
+    [
+        ((), "cache_aware"),
+        ((POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY), "the policy document"),
+    ],
+    ids=["default", "document"],
+)
+def test_the_notes_name_the_rendered_policy(settings, policy, tmp_path):
+    # Helm template omits NOTES.txt from its output. Render the same text into a ConfigMap.
+    chart = tmp_path / "smg"
+    shutil.copytree(CHART, chart)
+    shutil.copy(chart / "templates" / "NOTES.txt", chart / "notes.txt")
+    (chart / "templates" / "notes-rendered.yaml").write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes\n"
+        'data:\n  notes: {{ tpl (.Files.Get "notes.txt") . | toJson }}\n'
+    )
+    completed = helm_template(settings, chart=chart)
+    assert completed.returncode == 0, completed.stderr
+    (notes,) = [
+        document["data"]["notes"]
+        for document in yaml.safe_load_all(completed.stdout)
+        if document and document["kind"] == "ConfigMap" and document["metadata"]["name"] == "notes"
+    ]
+    assert f"  Policy:   {policy}" in notes.splitlines()
+
+
+@needs_helm
+def test_default_values_render_no_policy_controller_flag():
+    defaults = yaml.safe_load((CHART / "values.yaml").read_text())["router"]
+    assert defaults["policyController"] == "off"
+    assert defaults["policySpec"] == {}
+    assert defaults["policySpecConfigMap"] == ""
+    _, documents = render()
+    assert render("router.policyController=false")[1] == documents
+    pod = router_pod(documents)
+    container = router_container(documents)
+    assert not {"--policy-controller", "--policy-spec"} & set(container["args"])
+    assert not any(
+        d["kind"] == "ConfigMap" and d["metadata"]["name"] == "smg-policy-spec" for d in documents
+    )
+    assert all(volume["name"] != "policy-spec" for volume in pod["spec"]["volumes"])
+    assert all(mount["name"] != "policy-spec" for mount in container["volumeMounts"])
+    assert "checksum/policy-spec" not in (pod["metadata"]["annotations"] or {})
+
+
+@needs_helm
+@pytest.mark.parametrize("switch", ["on", "true"])
+def test_the_switch_renders_its_flag(switch):
+    # A values file that writes a bare on gives a boolean: both forms mean on.
+    _, documents = render(f"router.policyController={switch}")
+    args = router_container(documents)["args"]
+    assert has_run(args, ["--policy-controller", "on"])
+    assert "--policy-spec" not in args
+    assert not any(
+        d["kind"] in ("Deployment", "Service") and d["metadata"]["name"] == "smg-policy-controller"
+        for d in documents
+    )
+    assert "router.policyController" in render_error("router.policyController=unknown")
+
+
+@needs_helm
+def test_an_inline_document_renders_its_configmap_mount_flag_and_checksum():
+    settings = (
+        POLICY_CONTROLLER_ON,
+        "router.podAnnotations.checksum/policy-spec=stale",
+        "router.podAnnotations.owner=routing",
+        *INLINE_ROUTER_POLICY,
+    )
+    _, documents = render(*settings)
+    (config_map,) = [
+        d
+        for d in documents
+        if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "smg-policy-spec"
+    ]
+    (router,) = [
+        d for d in documents if d["kind"] == "Deployment" and d["metadata"]["name"] == "smg-router"
+    ]
+    assert config_map["apiVersion"] == "v1"
+    assert config_map["metadata"]["labels"] == router["metadata"]["labels"]
+    spec = config_map["data"]["spec.yaml"]
+    assert spec.endswith("\n")
+    assert yaml.safe_load(spec) == {
+        "apiVersion": "smg.policy/v1",
+        "profiles": {"default": {"filter": ["healthy"], "score": ["least-load"], "pick": "best"}},
+    }
+    pod = router_pod(documents)
+    container = router_container(documents)
+    assert has_run(container["args"], ["--policy-controller", "on"])
+    assert has_run(container["args"], ["--policy-spec", "/etc/smg/policy/spec.yaml"])
+    assert named(container["volumeMounts"], "policy-spec") == {
+        "name": "policy-spec",
+        "mountPath": "/etc/smg/policy",
+        "readOnly": True,
+    }
+    assert named(pod["spec"]["volumes"], "policy-spec")["configMap"] == {"name": "smg-policy-spec"}
+    annotations = pod["metadata"]["annotations"]
+    assert annotations["owner"] == "routing"
+    checksum = annotations["checksum/policy-spec"]
+    assert checksum == hashlib.sha256(spec.encode()).hexdigest()
+    _, changed = render(*settings, "router.policySpec.generation=2")
+    assert router_pod(changed)["metadata"]["annotations"]["checksum/policy-spec"] != checksum
+    assert "router.policySpec" in render_error(POLICY_CONTROLLER_ON, "router.policySpec=not-a-map")
+
+
+@needs_helm
+def test_a_named_configmap_renders_the_mount_and_no_checksum():
+    _, documents = render(POLICY_CONTROLLER_ON, NAMED_ROUTER_POLICY)
+    assert not any(d["kind"] == "ConfigMap" and "spec.yaml" in d.get("data", {}) for d in documents)
+    pod = router_pod(documents)
+    container = router_container(documents)
+    assert has_run(container["args"], ["--policy-controller", "on"])
+    assert has_run(container["args"], ["--policy-spec", "/etc/smg/policy/spec.yaml"])
+    assert named(container["volumeMounts"], "policy-spec") == {
+        "name": "policy-spec",
+        "mountPath": "/etc/smg/policy",
+        "readOnly": True,
+    }
+    assert named(pod["spec"]["volumes"], "policy-spec")["configMap"] == {"name": "yes"}
+    assert "checksum/policy-spec" not in (pod["metadata"]["annotations"] or {})
+    assert "router.policySpecConfigMap" in render_error(
+        POLICY_CONTROLLER_ON, "router.policySpecConfigMap=1"
+    )
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("settings", "value"),
+    [
+        (INLINE_ROUTER_POLICY, "router.policySpec"),
+        ((NAMED_ROUTER_POLICY,), "router.policySpecConfigMap"),
+    ],
+    ids=["inline", "named"],
+)
+def test_a_document_with_the_switch_off_fails_the_render(settings, value):
+    error = render_error(*settings)
+    assert f"{value} " in error
+    assert "router.policyController" in error
+
+
+@needs_helm
+def test_both_forms_of_the_document_fail_the_render():
+    error = render_error(POLICY_CONTROLLER_ON, *INLINE_ROUTER_POLICY, NAMED_ROUTER_POLICY)
+    assert "router.policySpec and router.policySpecConfigMap" in error
 
 
 # Tags of digits alone, two workers whose tags are filled in as written, and
@@ -959,6 +1226,65 @@ def test_a_tag_of_digits_quoted_names_the_image(tmp_path):
         f"docker.io/lightseekorg/smg:{version}",
         f"ghcr.io/smg-project/smg:{version}",
     }
+
+
+def worker_pods(documents: list[dict]) -> dict[str, dict]:
+    """Every worker Deployment's pod spec, by worker name."""
+    return {
+        document["metadata"]["labels"]["smg.lightseek.org/worker"]: document["spec"]["template"][
+            "spec"
+        ]
+        for document in documents
+        if document["kind"] == "Deployment"
+        and document["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    }
+
+
+@needs_helm
+def test_a_worker_pod_gets_a_termination_grace_that_covers_the_servicer_drain(tmp_path):
+    """A worker's Rust servicer drains in-flight streams for up to 30 s on
+    SIGTERM, then stops its server and terminates the engine: 70 s, past
+    Kubernetes' default grace of 30 s. A worker pod gets 90 s unless the entry
+    names its own, 0 included."""
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"')
+        + "    terminationGracePeriodSeconds: 0\n"
+        + "  - name: three\n    engine: sglang\n    model: m\n"
+        + "    terminationGracePeriodSeconds: 300\n"
+    )
+    _, documents = render(files=(values,))
+    graces = {
+        name: pod.get("terminationGracePeriodSeconds")
+        for name, pod in worker_pods(documents).items()
+    }
+    assert graces == {"one": 90, "two": 0, "three": 300}
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ['"90s"', '"90"', "90.5", "-1"])
+def test_a_termination_grace_that_is_not_whole_seconds_is_refused_by_the_schema(tmp_path, written):
+    """The template reads the grace through ``int``, which turns ``"90s"`` into
+    0: a pod with no grace at all, its streams cut on SIGTERM. The schema
+    refuses a string, a fraction and a negative value under the entry's name
+    (helm 3.18 moved to a JSON pointer for it); ``null`` is the default."""
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + f"    terminationGracePeriodSeconds: {written}\n"
+    )
+    error = render_error(files=(values,))
+    assert any(
+        name in error
+        for name in (
+            "workers.1.terminationGracePeriodSeconds",
+            "/workers/1/terminationGracePeriodSeconds",
+        )
+    ), error
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + "    terminationGracePeriodSeconds: null\n"
+    )
+    _, documents = render(files=(values,))
+    assert worker_pods(documents)["two"]["terminationGracePeriodSeconds"] == 90
 
 
 @needs_helm
@@ -1577,7 +1903,7 @@ HELD_SINCE_1_14 = frozenset(
     """
     global global.image global.image.registry global.image.repository
     global.image.pullPolicy
-    router router.replicas router.progressDeadlineSeconds router.policy router.mesh
+    router router.replicas router.progressDeadlineSeconds router.mesh
     router.serviceDiscovery router.discovery router.cacheThreshold
     router.balanceAbsThreshold router.balanceRelThreshold router.evictionIntervalSecs
     router.maxTreeSize router.blockSize router.maxPayloadSize router.requestTimeoutSecs

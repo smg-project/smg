@@ -29,6 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .extern_path(".smg.grpc.common", "::smg_grpc_client::common_proto")
+        // A snapshot's part is one case of a batch, and the generation it
+        // states one field of a part: boxed, a batch of events carries one
+        // pointer for it and not the generation's own size.
+        .boxed(".smg.policy.v1.ReplicationSnapshot.generation")
         // proto3 `optional` needs the flag below protoc 3.15, the oldest the
         // repository's build scripts run under.
         .protoc_arg("--experimental_allow_proto3_optional")

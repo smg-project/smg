@@ -2,8 +2,8 @@
 //! overloaded. The `runtime` feature adds its liveness, its circuit breaker,
 //! its resilience settings, the fleet's lifecycle (the probe schedule, the
 //! status state machine, the admin fan-outs), the port between that
-//! schedule, its collector, and the sink of what a probe's outcome means
-//! for a worker's status, and the probe of the bootstrap port a
+//! schedule (the port's collector) and the sink of what a probe's outcome
+//! means for a worker's status, and the probe of the bootstrap port a
 //! disaggregated worker advertises.
 
 #[cfg(feature = "runtime")]

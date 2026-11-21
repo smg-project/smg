@@ -814,6 +814,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "deepseek-v4-flash-0731",
+        model: "deepseek-ai/DeepSeek-V4-Flash-0731",
+        also: &[],
+        released: "2026-07-31",
+        smg: (Some("deepseek_v4"), Some("deepseek_v4")),
+        table: Some(Table::DeepSeekV4),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "deepseek-v4.1-flash",
         model: "deepseek-ai/DeepSeek-V4.1-Flash",
         also: &[
@@ -2493,6 +2503,7 @@ const GROUPS: &[Group] = &[
         slug: "qwen2.5-0.5b-instruct",
         model: "Qwen/Qwen2.5-0.5B-Instruct",
         also: &[
+            "EssentialAI/eai-distill-0.5b",
             "Qwen2.5-1.5B-Instruct",
             "Qwen2.5-3B-Instruct",
             "Qwen2.5-7B-Instruct",
@@ -2853,7 +2864,10 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "qwen3.8-flash-next",
         model: "Qwen/Qwen3.8-Flash-Next",
-        also: &["nvidia/Qwen3.8-Flash-Next-FP4-Local"],
+        also: &[
+            "autotrust/Qwen3.8-Flash-Next-E384-FP4-Local",
+            "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+        ],
         released: "2026-08-24",
         smg: (Some("qwen_xml"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),

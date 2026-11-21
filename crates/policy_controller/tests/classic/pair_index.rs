@@ -7,7 +7,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::Pairing,
+    document::spec::Pairing,
     store::pairing::{key, wire_mismatch, Member, PairClasses, PairingDescriptor, LAYOUT_FACTS},
     WireModes, WorkerId,
 };

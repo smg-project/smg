@@ -11,7 +11,7 @@ use openai_protocol::{
     common::{ContentPart, InputAudio},
     transcription::{AudioFile, TranscriptionRequest},
 };
-use tracing::error;
+use tracing::warn;
 
 use super::{audio_format, parse_response_format, resolve_family, supported_families};
 use crate::routers::{
@@ -20,6 +20,7 @@ use crate::routers::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
         regular::stages::chat::prepare_chat_like,
+        utils,
     },
 };
 
@@ -134,11 +135,11 @@ fn build_chat_request(
     let prefill = family
         .assistant_prefill(body.language.as_deref())
         .map_err(|unsupported| {
-            error!(function = "TranscriptionPreparation", language = %unsupported.0, "unsupported transcription language");
-            error::bad_request(
+            warn!(function = "TranscriptionPreparation", language = %unsupported.0, "unsupported transcription language");
+            utils::reported(error::bad_request(
                 "unsupported_transcription_language",
                 format!("{} does not support language '{}'", family.name(), unsupported.0),
-            )
+            ))
         })?;
     let continue_final_message = prefill.is_some();
     if let Some(prefill) = prefill {
@@ -175,8 +176,13 @@ mod tests {
     use llm_multimodal::registry::{
         qwen3_asr::transcription::MAX_PROMPT_BYTES, transcription::FAMILIES,
     };
+    use tracing::Level;
 
     use super::*;
+    use crate::{
+        middleware::ReportedRefusal,
+        observability::logging::test_support::{test_subscriber, LinesAtWarnOrAbove},
+    };
 
     fn transcription_request() -> TranscriptionRequest {
         TranscriptionRequest {
@@ -269,6 +275,27 @@ mod tests {
         assert_eq!(
             error::extract_error_code_from_response(&response),
             "unsupported_transcription_language"
+        );
+    }
+
+    /// A language the family does not transcribe is the client's to fix: the stage writes one
+    /// WARN and marks the answer, and no ERROR.
+    #[test]
+    fn an_unsupported_language_is_one_warn_and_marked() {
+        let mut body = transcription_request();
+        body.language = Some("klingon".to_string());
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let response = build_chat_request(&body, &wav_file(), family()).unwrap_err();
+
+        assert!(response.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(
+            lines.lines(),
+            [(
+                Level::WARN,
+                "unsupported transcription language".to_string()
+            )]
         );
     }
 }

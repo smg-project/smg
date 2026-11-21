@@ -20,13 +20,13 @@ use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_policy_controller::{
-    ingest::rows,
-    spec::{BindingSpec, OverloadSpec},
+    document::spec::{BindingSpec, OverloadSpec},
+    engine::view::permille,
+    load::load_report,
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
-    view::permille,
     AppliedSpec, LoadRow, PolicySpec, Role, SignalSource, WorkerId,
 };
 
@@ -203,7 +203,7 @@ fn load_row(figures: Figures, at: Instant, source: SignalSource) -> LoadRow {
         }],
         ..WorkerLoadResponse::default()
     };
-    rows::load_row(&wire, Role::Single, at, at, source)
+    load_report::load_row(&wire, Role::Single, at, at, source)
 }
 
 /// The store with the row's worker in it: a member row a rank, the ranks
@@ -329,6 +329,7 @@ impl Bed {
             now,
             pinned: None,
             affinity: false,
+            signal_cells: false,
         };
         self.store
             .build_view(MODEL, Role::Single, &ask, &mut out)

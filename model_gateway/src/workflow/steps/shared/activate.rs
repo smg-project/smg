@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
-use smg_worker::identity::basic::{ConnectionMode, Worker};
+use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    registry::WorkerId,
+};
 use tracing::info;
 use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
@@ -46,19 +50,37 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         // added), and so does every other subscriber. A worker the registry
         // no longer holds is flipped directly, as before.
         let registry = &app_context.worker_registry;
+        // Under the policy controller a row's worker is promoted as far as
+        // its row. The store promotes a row at its probes, or at the door
+        // where its checks are off, and the health adapter sets the object
+        // behind a probe. Flipped here over a pending row, the object would
+        // read Ready until the next probe set it back. `None` is a worker
+        // with no row.
+        let row_ready = |id: &WorkerId| {
+            let feed = app_context.door_feed()?;
+            let standing = feed.objects.standing(id)?;
+            let row = feed.store().get(standing.row);
+            Some(row.is_some_and(|row| row.status == RowStatus::Ready))
+        };
         let mut activated = 0;
         for worker in workers {
             if let Some(status) = activation_status(worker) {
                 // Only the worker this workflow registered: an upsert of the
                 // same URL that raced it (discovery beside an API call) must
                 // not have its own worker flipped from here.
-                match registry
-                    .get_id_by_url(worker.url())
-                    .filter(|id| registry.get(id).is_some_and(|w| Arc::ptr_eq(&w, worker)))
-                {
+                let id = registry.get_id_by_url(worker.url());
+                let ours = id
+                    .as_ref()
+                    .filter(|id| registry.get(id).is_some_and(|w| Arc::ptr_eq(&w, worker)));
+                match ours {
+                    Some(worker_id) if row_ready(worker_id) == Some(false) => continue,
                     Some(worker_id) => {
-                        registry.transition_status(&worker_id, status);
+                        registry.transition_status(worker_id, status);
                     }
+                    // A row's object that replaced this worker shares its
+                    // runtime, status included: a flip here would promote
+                    // that object past its row, and tell nobody.
+                    None if id.as_ref().is_some_and(|id| row_ready(id).is_some()) => continue,
                     None => worker.set_status(status),
                 }
                 activated += 1;
@@ -72,7 +94,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         }
 
         info!(
-            "Activated {activated} of {} worker(s) (others left as-is: already ready or awaiting connect signal)",
+            "Activated {activated} of {} worker(s) (others left as-is: already ready, awaiting connect signal, or following a policy controller row)",
             workers.len()
         );
 
@@ -87,7 +109,8 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerSpec;
-    use smg_worker::registry::event::WorkerEvent;
+    use smg_policy_controller::{store::Maker, worker_host::Expect};
+    use smg_worker::{jobs::WorkerJobAsker, registry::event::WorkerEvent};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
@@ -137,6 +160,96 @@ mod tests {
         );
     }
 
+    /// Under the policy controller a row's worker is promoted as far as its
+    /// row. The step leaves it Pending beside its pending row, where the
+    /// classic line flips the same worker Ready. Once the row reads Ready,
+    /// the step promotes the worker through the registry.
+    #[tokio::test]
+    async fn a_rows_worker_is_promoted_as_far_as_its_row_under_the_policy_controller() {
+        let config = RouterConfig {
+            policy_controller: true,
+            ..RouterConfig::default()
+        };
+        let hosted = AppContext::from_config(config, 30, None, None).await;
+        let hosted = Arc::new(hosted.expect("the context"));
+        let feed = hosted.door_feed().expect("the feed");
+        let url = "http://worker:8080";
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        feed.door
+            .found_built(&Maker::Control, Expect::Anything, &worker, None)
+            .expect("the worker's row");
+        let held = hosted.worker_registry.get_by_url(url);
+        assert!(held.is_some_and(|held| Arc::ptr_eq(&held, &worker)));
+
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new(url),
+            WorkerRegistrationMode::Upsert,
+            Arc::clone(&hosted),
+            WorkerJobAsker::Api,
+        );
+        data.actual_workers = Some(vec![Arc::clone(&worker)]);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        ActivateWorkersStep
+            .execute(&mut context)
+            .await
+            .expect("activation");
+
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+        let row = feed.store().by_key(url).expect("the row");
+        assert_eq!(row.status, RowStatus::Pending);
+
+        let moved = feed
+            .store()
+            .set_status(row.id, RowStatus::Ready, row.revision);
+        assert!(moved.is_some());
+        ActivateWorkersStep
+            .execute(&mut context)
+            .await
+            .expect("activation");
+        assert_eq!(worker.status(), WorkerStatus::Ready);
+    }
+
+    /// A worker a later registration replaced shares its runtime with the
+    /// row's object that took its place. The step leaves it alone: a flip
+    /// would promote that object past its pending row.
+    #[tokio::test]
+    async fn a_replaced_worker_does_not_promote_the_rows_object_that_took_its_place() {
+        let config = RouterConfig {
+            policy_controller: true,
+            ..RouterConfig::default()
+        };
+        let hosted = AppContext::from_config(config, 30, None, None).await;
+        let hosted = Arc::new(hosted.expect("the context"));
+        let feed = hosted.door_feed().expect("the feed");
+        let url = "http://worker:8080";
+        let built = || -> Arc<dyn Worker> { Arc::new(BasicWorkerBuilder::new(url).build()) };
+        let (first, second) = (built(), built());
+        for worker in [&first, &second] {
+            feed.door
+                .found_built(&Maker::Control, Expect::Anything, worker, None)
+                .expect("the worker's row");
+        }
+        let held = hosted.worker_registry.get_by_url(url);
+        assert!(held.is_some_and(|held| Arc::ptr_eq(&held, &second)));
+
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new(url),
+            WorkerRegistrationMode::Upsert,
+            Arc::clone(&hosted),
+            WorkerJobAsker::Api,
+        );
+        data.actual_workers = Some(vec![Arc::clone(&first)]);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        ActivateWorkersStep
+            .execute(&mut context)
+            .await
+            .expect("activation");
+
+        assert_eq!(second.status(), WorkerStatus::Pending);
+        let row = feed.store().by_key(url).expect("the row");
+        assert_eq!(row.status, RowStatus::Pending);
+    }
+
     fn test_app_context() -> Arc<AppContext> {
         app_context_for_tests(
             RouterConfig::default(),
@@ -171,6 +284,7 @@ mod tests {
             WorkerSpec::new(url),
             WorkerRegistrationMode::Upsert,
             Arc::clone(&app_context),
+            WorkerJobAsker::Api,
         );
         data.actual_workers = Some(vec![Arc::clone(&worker)]);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);

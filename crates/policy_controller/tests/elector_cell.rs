@@ -26,7 +26,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use smg_policy_controller::elector::{ElectionSettings, Elector, FileLease, LeaseBackend, Tick};
+use smg_policy_controller::service::elector::{
+    ElectionSettings, Elector, FileLease, LeaseBackend, Tick,
+};
 
 const ROLE: &str = "SMG_ELECTOR_CELL_ROLE";
 const LEASE: &str = "SMG_ELECTOR_CELL_LEASE";

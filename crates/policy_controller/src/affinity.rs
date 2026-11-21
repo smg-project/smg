@@ -20,19 +20,27 @@
 //! today. A share-weighted sum cannot hold a deeper holder ahead of a lighter
 //! one, which is the rule the preset keeps.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    counts::with_counts,
-    framework::{Front, Scorer, Spread, TieBand},
-    lease::{Lifecycle, Membership},
-    spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
-    view::{
-        mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, NamedAffinity, Phase,
-        RequestFacts, Walk, WorkerId,
+    document::spec::{
+        AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams,
+    },
+    engine::{
+        decision::{Overlap, OverlapSource},
+        framework::{Front, Scorer, Spread, TieBand},
+        view::{
+            mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow, NamedAffinity,
+            Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
+        },
+    },
+    stages::builtins::ReadsLoad,
+    tracking::{
+        counts::with_counts,
+        lease::{Lifecycle, Membership},
     },
     Draw,
 };
@@ -55,13 +63,34 @@ const DIVERT_SHALLOW_SHARE: f32 = 0.5;
 /// sooner than this after its last one.
 const DIVERT_WINDOW_MICROS: u64 = 2_000_000;
 
-/// Characters a text-window block prices at per token, for the held prefix's
-/// price under `hash_kind: text`.
-const CHARS_PER_TOKEN: u32 = 4;
-
 /// Tokens per block when the document names none: the block size of record
 /// of the common engines.
 const DEFAULT_BLOCK_SIZE: u32 = 16;
+
+/// The matched share under which a request is balanced instead of pinned,
+/// when the document names no threshold. The warm-up slice counts a hit as
+/// a miss at or under the same share when it names none.
+pub const DEFAULT_THRESHOLD: f32 = 0.3;
+
+/// How long after admission a worker counts as warming, in seconds, when
+/// the document names no time.
+pub const DEFAULT_WARMUP_SECS: u64 = 60;
+
+/// The share of misses offered to warming workers when the document names
+/// none.
+pub const DEFAULT_WARMUP_SHARE: f32 = 0.25;
+
+/// The index growth after which a worker is warm, in blocks, when the
+/// document names none.
+pub const DEFAULT_WARMUP_BLOCKS: u64 = 1024;
+
+/// The share of the fleet's median index under which a worker is thin, when
+/// the document names none.
+pub const DEFAULT_WARMUP_THIN_RATIO: f32 = 0.5;
+
+/// One hit in this many is diverted to a thin worker when the document
+/// names no count.
+pub const DEFAULT_WARMUP_DIVERT_EVERY: u64 = 8;
 
 /// The gates the affinity stages of one profile share: the spill gate of
 /// `prefix-affinity`, the fleet KV gate of `kv-pressure`, and the block size
@@ -104,12 +133,12 @@ impl Default for Gates {
 
 /// How many whole blocks of `block_size` lie within the first `tokens`
 /// tokens of a request hashed in `kind`: the tokens over the block size,
-/// under the text kind their characters over the character block size. A
+/// under the text kind their bytes over the window's size in bytes. A
 /// block size is one at least.
 pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
     let units = match kind {
         HashKind::Token => tokens,
-        HashKind::Text => tokens.saturating_mul(CHARS_PER_TOKEN),
+        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
     };
     units / block_size
 }
@@ -145,13 +174,18 @@ impl Gates {
     /// kept candidate over the ceiling, or materially hotter than the
     /// coldest. Read from the active share of the rows that report; a pool
     /// without a report is never under pressure.
-    fn kv_imbalanced(&self, candidates: &[Candidate], kept: &[u32]) -> bool {
+    fn kv_imbalanced(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) -> bool {
         if !self.kv_configured() {
             return false;
         }
         let mut bounds: Option<(f32, f32)> = None;
         for &i in kept {
-            let Some(load) = candidates[i as usize].load else {
+            let Some(load) = load(&candidates[i as usize]) else {
                 continue;
             };
             let usage = load.active_kv();
@@ -212,7 +246,7 @@ impl Gates {
     }
 
     /// The request's size in blocks: its token count over the block size
-    /// (the text kind's characters over the character block size, as
+    /// (the text kind's bytes over the window's size in bytes, as
     /// `tokens_of` reads them back), never under one and never under the
     /// block hashes the host sent. The host caps that list, so a long
     /// request's hashes alone would understate it and overstate every
@@ -229,7 +263,7 @@ impl Gates {
         let units = blocks as f32 * self.block_size_of(facts) as f32;
         match facts.hash_kind {
             HashKind::Token => units,
-            HashKind::Text => units / CHARS_PER_TOKEN as f32,
+            HashKind::Text => units / TEXT_BYTES_PER_TOKEN as f32,
         }
     }
 }
@@ -351,6 +385,54 @@ fn neutral(out: &mut [f32]) -> TieBand {
     TieBand(0.0)
 }
 
+/// What a pass of a prefix stage judged its rows by, kept for the word the
+/// stage says of a pick behind its decision ([`Scorer::said`]). A scorer's
+/// call is handed no scratch of its decision's, and the pick is made
+/// behind it, so the two numbers wait in a slot of the thread. That rests
+/// on a decision that runs on one thread from its priced pass to its word,
+/// which holds while the engine's decision never waits.
+///
+/// The engine clears the slot ahead of a decision whose overlap it states
+/// ([`forget_judged`]). A pass writes it only where it prices the held
+/// prefix. The first stage of a decision to write it keeps it: the engine
+/// asks a profile's first prefix stage, and a later stage's pass is no
+/// word of that one. A later pass of the same stage writes over its own
+/// word, and one that orders nothing under the fleet's KV gate takes it
+/// back, so the word left is of the stage's last pass.
+#[derive(Clone, Copy)]
+struct Judged {
+    /// The stage that judged ([`PrefixAffinity::id`]): a profile may hold
+    /// two, and one's pass is no word of the other's.
+    by: u32,
+    /// The deepest match of the rows judged, in blocks.
+    best: u32,
+    /// The mean in flight the spill gate read.
+    mean: f32,
+}
+
+impl Judged {
+    /// No pass judged: no stage's number, and a match no row holds.
+    const NONE: Self = Self {
+        by: 0,
+        best: 0,
+        mean: 0.0,
+    };
+}
+
+thread_local! {
+    static JUDGED: std::cell::Cell<Judged> = const { std::cell::Cell::new(Judged::NONE) };
+}
+
+/// Forgets what a pass on this thread judged by: a decision no pass
+/// judged for then says that no margin held.
+pub(crate) fn forget_judged() {
+    JUDGED.set(Judged::NONE);
+}
+
+/// The number the next prefix stage takes ([`PrefixAffinity::id`]): none
+/// takes `0`, which reads as no stage.
+static NEXT_STAGE: AtomicU32 = AtomicU32::new(1);
+
 // ---------------------------------------------------------------- prefix affinity
 
 /// The holders of the request's prefix first. A candidate's match is its
@@ -365,15 +447,47 @@ pub struct PrefixAffinity {
     threshold: f32,
     source: AffinitySource,
     gates: Gates,
+    /// The stage's own number, by which a pass's word is told from another
+    /// stage's ([`Judged`]).
+    id: u32,
 }
 
 impl PrefixAffinity {
     /// The stage from its parameters and its profile's gates.
     pub fn new(params: &PrefixAffinityParams, gates: Gates) -> Self {
         Self {
-            threshold: params.threshold.unwrap_or(0.3),
+            threshold: params.threshold.unwrap_or(DEFAULT_THRESHOLD),
             source: params.source.unwrap_or_default(),
             gates,
+            id: NEXT_STAGE.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Whether a held prefix is priced for this request: the document
+    /// prices the margin, and a decode worker prefills nothing again.
+    fn priced(&self, facts: &RequestFacts<'_>) -> bool {
+        self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode
+    }
+
+    /// Leaves what this pass judges by for the word of the pick
+    /// ([`Judged`]). The first stage of a decision to judge keeps the slot,
+    /// and a later pass of its own writes over it.
+    fn judge(&self, best: u32, mean: f32) {
+        let stands = JUDGED.get().by;
+        if stands == 0 || stands == self.id {
+            JUDGED.set(Judged {
+                by: self.id,
+                best,
+                mean,
+            });
+        }
+    }
+
+    /// This pass orders nothing: what an earlier pass of this stage left
+    /// is no word of the pick.
+    fn unjudge(&self) {
+        if JUDGED.get().by == self.id {
+            JUDGED.set(Judged::NONE);
         }
     }
 
@@ -431,8 +545,8 @@ impl PrefixAffinity {
         let avg = spill_mean(feed.drawn_mean(), facts, candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
-        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
-        let held = if priced {
+        let held = if self.priced(facts) {
+            self.judge(best, avg);
             self.gates.tokens_of(best, facts)
         } else {
             0.0
@@ -491,8 +605,8 @@ impl PrefixAffinity {
             }
         }
         let avg = spill_mean(named.mean_in_flight, facts, candidates, kept);
-        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
-        let held = if priced {
+        let held = if self.priced(facts) {
+            self.judge(best, avg);
             self.gates.tokens_of(best, facts)
         } else {
             0.0
@@ -544,6 +658,11 @@ impl Scorer for PrefixAffinity {
         "prefix-affinity"
     }
 
+    // Scores by the affinity column. Its spill gate reads the mean count and places elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// Row by row, unless the fleet's KV gate is configured: that gate
     /// reads every row.
     fn row_wise(&self) -> bool {
@@ -555,22 +674,120 @@ impl Scorer for PrefixAffinity {
         Spread::Levels(0.5)
     }
 
-    /// [`Self::score`] with the word of its scores, said by the pass that
-    /// writes them: it counts the rows it writes the ceiling, and no pass
-    /// reads the scores again. Under the fleet's KV gate every row stands
-    /// alike. The rows a host named say nothing.
+    fn states_overlap(&self) -> bool {
+        true
+    }
+
+    /// The row's match by the stage's source, of the request's blocks, and
+    /// whether the held prefix's price kept the row in front: it is a
+    /// deepest holder of the pass that decided, and at the mean that pass
+    /// judged by it stands over the swing's margin and under the priced
+    /// one. The row's count is the decision's own: a lent table answers a
+    /// second read with the first. Under the fleet's KV gate the stage
+    /// ordered nothing: the row's match is said all the same, and no
+    /// margin.
+    ///
+    /// A request of more than 65,535 blocks halves both counts until its
+    /// own fits, so the share they say stays true.
+    fn said(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], row: u32) -> Overlap {
+        let request_blocks = self.gates.request_blocks(facts);
+        // A row past a column holds nothing, as a row no host named.
+        let held = match facts.feed() {
+            Feed::Column(column) => column.get(row as usize).copied().unwrap_or_default(),
+            Feed::Named(named) => named.entry(row),
+        };
+        let blocks = self.matched(held, request_blocks);
+        let source = if blocks == 0 {
+            OverlapSource::None
+        } else if self.source != AffinitySource::Predictor && held.overlap_blocks == blocks {
+            OverlapSource::Index
+        } else {
+            OverlapSource::Predictor
+        };
+        // The pass's word is taken whichever row is asked about: it is
+        // the word of one decision.
+        let judged = JUDGED.replace(Judged::NONE);
+        let margin_held = blocks > 0
+            && judged.by == self.id
+            && judged.best == blocks
+            && candidates.get(row as usize).is_some_and(|candidate| {
+                let load = facts.in_flight(candidate) as f32;
+                let price = self.gates.tokens_of(blocks, facts);
+                self.gates.over(load, judged.mean, 0.0)
+                    && !self.gates.over(load, judged.mean, price)
+            });
+        // Both counts by one shift: the share they say holds for a
+        // request past sixteen bits.
+        let shift = (u32::BITS - request_blocks.leading_zeros()).saturating_sub(u16::BITS);
+        Overlap {
+            blocks: u16::try_from(blocks >> shift).unwrap_or(u16::MAX),
+            of: u16::try_from(request_blocks >> shift).unwrap_or(u16::MAX),
+            source,
+            margin_held,
+        }
+    }
+
     fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
+    }
+
+    fn needs(&self) -> Needs {
+        let placements = self.source != AffinitySource::Index;
+        Needs {
+            // Every source reads the column: the index's overlap and the
+            // predictor's placement are fields of a candidate's entry. What
+            // feeds the entry differs by source and is declared beside it.
+            affinity: true,
+            token_hashes: true,
+            events: self.source != AffinitySource::Predictor,
+            // The record of sent prefixes holds text windows beside token
+            // blocks, and the events' index holds token blocks alone: a
+            // host hashes its text for a source that reads the record.
+            sent_prefixes: placements,
+            text_hashes: placements,
+            loads: self.gates.kv_configured(),
+            ..Needs::default()
+        }
+    }
+}
+
+impl ReadsLoad for PrefixAffinity {
+    /// The pass counts the rows it writes the ceiling. Under the fleet's
+    /// KV gate every row stands alike. The rows a host named say nothing.
+    fn score_front_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         _: &[u32],
         asked: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> (TieBand, Front) {
         if facts.named_alone().is_some() {
-            return (self.score(facts, candidates, asked, out), Front::Unsaid);
+            return (
+                self.score_with(facts, candidates, asked, out, load),
+                Front::Unsaid,
+            );
         }
-        if self.gates.kv_imbalanced(candidates, asked) {
+        if self.gates.kv_imbalanced(candidates, asked, load) {
+            self.unjudge();
             return (neutral(out), Front::Alike);
         }
         let column = facts.affinity;
@@ -588,14 +805,19 @@ impl Scorer for PrefixAffinity {
         (band, said)
     }
 
-    fn score(
+    // The front's named path calls this whole scorer. Keep it out of
+    // the pass over a column.
+    #[inline(never)]
+    fn score_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
-        if self.gates.kv_imbalanced(candidates, kept) {
+        if self.gates.kv_imbalanced(candidates, kept, load) {
+            self.unjudge();
             return neutral(out);
         }
         // What the rows hold is taken once a pass: a read by index tests
@@ -610,22 +832,6 @@ impl Scorer for PrefixAffinity {
             |i: u32| column[i as usize]
         })
         .0
-    }
-
-    fn needs(&self) -> Needs {
-        let placements = self.source != AffinitySource::Index;
-        Needs {
-            // Every source reads the column: the index's overlap and the
-            // predictor's placement are fields of a candidate's entry. What
-            // feeds the entry differs by source and is declared beside it.
-            affinity: true,
-            token_hashes: true,
-            events: self.source != AffinitySource::Predictor,
-            text: placements,
-            text_hashes: placements,
-            loads: self.gates.kv_configured(),
-            ..Needs::default()
-        }
     }
 }
 
@@ -642,6 +848,11 @@ impl Lifecycle for KvPressure {}
 impl Scorer for KvPressure {
     fn name(&self) -> &'static str {
         "kv-pressure"
+    }
+
+    // Scores by the pressure its feed reports.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The stage orders nothing: the gate it configures is read by the
@@ -831,12 +1042,16 @@ impl WarmupSlice {
     /// The stage from its parameters and its profile's gates.
     pub fn new(params: &WarmupSliceParams, gates: Gates) -> Self {
         Self {
-            secs_micros: params.secs.unwrap_or(60).saturating_mul(1_000_000),
-            share: params.share.unwrap_or(0.25),
-            blocks: u32::try_from(params.blocks.unwrap_or(1024)).unwrap_or(u32::MAX),
-            thin_ratio: params.thin_ratio.unwrap_or(0.5),
-            divert_every: params.divert_every.unwrap_or(8),
-            miss_share: params.miss_share.unwrap_or(0.3),
+            secs_micros: params
+                .secs
+                .unwrap_or(DEFAULT_WARMUP_SECS)
+                .saturating_mul(1_000_000),
+            share: params.share.unwrap_or(DEFAULT_WARMUP_SHARE),
+            blocks: u32::try_from(params.blocks.unwrap_or(DEFAULT_WARMUP_BLOCKS))
+                .unwrap_or(u32::MAX),
+            thin_ratio: params.thin_ratio.unwrap_or(DEFAULT_WARMUP_THIN_RATIO),
+            divert_every: params.divert_every.unwrap_or(DEFAULT_WARMUP_DIVERT_EVERY),
+            miss_share: params.miss_share.unwrap_or(DEFAULT_THRESHOLD),
             gates,
             misses: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -962,28 +1177,30 @@ impl WarmupSlice {
         TieBand(0.0)
     }
 
-    /// How a pass tells a warming row over a host's column, which the
-    /// passes over the pool walk: `None` when nobody warms. A settled fleet
-    /// (no index size fed, nobody young) costs one pass over it.
+    /// How a pass tells a warming row over a host's column: `None` when
+    /// nobody warms. It takes one pass over the column. The fleet's median
+    /// is read only where its smallest index is thin against its largest.
     #[inline(always)]
     fn ruled(&self, column: &[AffinityFacts]) -> Option<Warm<'static>> {
-        let mut any_indexed = false;
+        let mut smallest = u32::MAX;
+        let mut largest = 0;
         let mut young = 0usize;
         for &held in column {
-            any_indexed |= held.indexed_blocks > 0;
+            smallest = smallest.min(held.indexed_blocks);
+            largest = largest.max(held.indexed_blocks);
             young += usize::from(self.is_young(held));
         }
-        if !any_indexed && young == 0 {
+        if largest == 0 && young == 0 {
             return None;
         }
-        let level = if any_indexed {
-            self.fleet_level(column)
+        // Even the largest index is too low a level to make anyone thin
+        // if the smallest index passes at that level.
+        let (level, thin_any) = if self.is_thin(smallest, largest) {
+            let level = self.fleet_level(column);
+            (level, self.is_thin(smallest, level))
         } else {
-            0
+            (0, false)
         };
-        let thin_any = column
-            .iter()
-            .any(|held| self.is_thin(held.indexed_blocks, level));
         if !thin_any && (young == 0 || young == column.len()) {
             return None;
         }
@@ -1062,10 +1279,10 @@ impl WarmupSlice {
         if shallow {
             self.shallow_seen.store(true, Ordering::Relaxed);
         }
-        let hits = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
+        let hits = self.hits.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let shallow_seen = self.shallow_seen.load(Ordering::Relaxed);
         let due = (hits >= self.divert_every && (shallow || !shallow_seen))
-            || hits >= 2 * self.divert_every;
+            || hits >= self.divert_every.saturating_mul(2);
         if !due {
             return None;
         }
@@ -1129,6 +1346,11 @@ impl Scorer for WarmupSlice {
         "warmup-slice"
     }
 
+    // Scores by the warm-up state. Its divert reads a holder's count and places elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// Row by row, unless the fleet's KV gate is configured: that gate
     /// reads every row. What the stage reads of the pool (its level, who
     /// warms) comes from the host's feed, never from the rows handed.
@@ -1141,20 +1363,57 @@ impl Scorer for WarmupSlice {
         Spread::Levels(1.0)
     }
 
-    /// [`Self::score`], and the word of its scores read off two of them.
-    /// The pass writes every row the ceiling, or one row the ceiling and
-    /// every other nothing: the first two rows tell the answers apart, and
-    /// no pass reads the scores again. A lone row stands at the ceiling
-    /// either way, which reads alike. The rows a host named say nothing.
     fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            // The admitted age, the index's growth and size and the overlap
+            // are all read from a candidate's entry of the column.
+            affinity: true,
+            events: true,
+            loads: true,
+            ..Needs::default()
+        }
+    }
+
+    fn warm_rule(&self) -> Option<WarmRule> {
+        Some(self.rule())
+    }
+}
+
+impl ReadsLoad for WarmupSlice {
+    /// A slice either scores every row alike or gives one row the ceiling.
+    /// The first two scores tell those answers apart. A lone row stands at
+    /// the ceiling either way. The rows a host named say nothing.
+    fn score_front_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         _: &[u32],
         asked: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> (TieBand, Front) {
-        let band = self.score(facts, candidates, asked, out);
+        let band = self.score_with(facts, candidates, asked, out, load);
         if facts.named_alone().is_some() {
             return (band, Front::Unsaid);
         }
@@ -1165,14 +1424,15 @@ impl Scorer for WarmupSlice {
         (band, if alike { Front::Alike } else { Front::At(1) })
     }
 
-    fn score(
+    fn score_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
-        if self.share <= 0.0 || self.gates.kv_imbalanced(candidates, kept) {
+        if self.share <= 0.0 || self.gates.kv_imbalanced(candidates, kept, load) {
             return neutral(out);
         }
         // The rows a host named answer out of line, so a pass over a column
@@ -1196,30 +1456,15 @@ impl Scorer for WarmupSlice {
         };
         self.turn::<false>(facts, candidates, kept, out, Feed::Column(column), warm)
     }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            // The admitted age, the index's growth and size and the overlap
-            // are all read from a candidate's entry of the column.
-            affinity: true,
-            events: true,
-            loads: true,
-            ..Needs::default()
-        }
-    }
-
-    fn warm_rule(&self) -> Option<WarmRule> {
-        Some(self.rule())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        counts::tests::Lent,
-        spec::SpillParams,
-        view::{Health, LoadRow, NamedHolder},
+        document::spec::SpillParams,
+        engine::view::{Health, LoadRow, NamedHolder},
+        tracking::counts::tests::Lent,
     };
 
     /// A row and its entry of the affinity column, as a case writes a pool.
@@ -1634,6 +1879,14 @@ mod tests {
     }
 
     #[test]
+    fn the_median_sets_the_thin_boundary_when_one_index_is_large() {
+        let slice = warmup(1.0, 0);
+        let pool = [sized(0, 0, 0, 32), sized(1, 0, 0, 64), sized(2, 0, 0, 1024)];
+        assert_eq!(scores(&slice, &facts(16), &pool), vec![1.0; 3]);
+        assert_eq!(slice.misses.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn one_hit_in_divert_every_goes_to_a_thin_worker_within_its_window() {
         let slice = warmup(0.25, 4);
         // A deep hit on worker 0 (12 of 16 blocks); worker 2 is thin and idle.
@@ -1672,6 +1925,15 @@ mod tests {
         // The worker's window leaves with it.
         fresh.on_membership(&Membership::Removed(WorkerId(3)));
         assert!(fresh.divert_until.lock().is_empty());
+    }
+
+    #[test]
+    fn a_maximal_diversion_period_does_not_overflow() {
+        let slice = warmup(0.25, (1_u64 << 63) + 1);
+        let shallow = [sized(0, 2, 7, 64), sized(1, 1, 0, 64), sized(2, 0, 0, 0)];
+        for _ in 0..2 {
+            assert_eq!(scores(&slice, &facts(16), &shallow), vec![1.0, 1.0, 1.0]);
+        }
     }
 
     #[test]
@@ -1939,6 +2201,12 @@ mod tests {
                 needs.events,
                 source != AffinitySource::Predictor,
                 "{source:?}: events feed the index, they do not name the column"
+            );
+            let placements = source != AffinitySource::Index;
+            assert_eq!(
+                (needs.sent_prefixes, needs.text_hashes, needs.text),
+                (placements, placements, false),
+                "{source:?}: text windows are read by the record, and none asks for the text"
             );
         }
         assert!(warmup(1.0, 0).needs().affinity);
@@ -2354,7 +2622,7 @@ mod tests {
     /// and the two read the same scores.
     #[test]
     fn behind_a_draw_the_stages_search_the_rows_named_and_keep_no_cursor() {
-        use crate::view::LOOKS_BEHIND;
+        use crate::engine::view::LOOKS_BEHIND;
         let pool: Vec<Held> = (0..6).map(|row| candidate(row, 2, 0)).collect();
         let pool = rows(&pool);
         // A draw's order. The holders are shallow, so the slice takes the
@@ -2383,6 +2651,364 @@ mod tests {
             assert!(by_walk.1 > 0, "{}: a walk looks behind", stage.name());
             assert_eq!(by_search.1, 0, "{}: a search keeps no cursor", stage.name());
         }
+    }
+
+    /// The stage's word of a row: its match by the stage's source, of the
+    /// request's blocks, and where the match was read.
+    #[test]
+    fn the_stage_says_what_a_row_holds_by_its_source() {
+        use AffinitySource::{Index, Merged, Predictor};
+        let said = |source, overlap_blocks, predicted_blocks| {
+            let params = PrefixAffinityParams {
+                source: Some(source),
+                ..PrefixAffinityParams::default()
+            };
+            let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
+            let column = [AffinityFacts {
+                overlap_blocks,
+                predicted_blocks,
+                ..AffinityFacts::default()
+            }];
+            let facts = RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            };
+            let said = stage.said(&facts, &rows(&[candidate(0, 0, 0)]), 0);
+            assert!(!said.margin_held);
+            (said.blocks, said.of, said.source)
+        };
+        // The index's blocks, at any depth.
+        assert_eq!(said(Index, 3, 12), (3, 16, OverlapSource::Index));
+        // The predictor's, past the stage's threshold alone.
+        assert_eq!(said(Predictor, 9, 12), (12, 16, OverlapSource::Predictor));
+        assert_eq!(said(Predictor, 9, 4), (0, 16, OverlapSource::None));
+        // Merged: the larger of the two, the index on a tie.
+        assert_eq!(said(Merged, 3, 12), (12, 16, OverlapSource::Predictor));
+        assert_eq!(said(Merged, 13, 12), (13, 16, OverlapSource::Index));
+        assert_eq!(said(Merged, 12, 12), (12, 16, OverlapSource::Index));
+        assert_eq!(said(Merged, 0, 0), (0, 16, OverlapSource::None));
+    }
+
+    /// A row no host named and a row past a column hold nothing. A request
+    /// past sixteen bits of blocks halves both counts until its own fits,
+    /// and their share stands.
+    #[test]
+    fn a_row_nobody_named_holds_nothing_and_a_long_request_keeps_its_share() {
+        let stage = affinity(None);
+        let pool = rows(&[candidate(0, 0, 0), candidate(1, 0, 0)]);
+        let holders = [holder(1, 5)];
+        let named = RequestFacts {
+            named: Some(named(&holders, &[], false)),
+            ..facts(16)
+        };
+        let nothing = Overlap {
+            of: 16,
+            ..Overlap::default()
+        };
+        assert_eq!(stage.said(&named, &pool, 1).blocks, 5);
+        assert_eq!(stage.said(&named, &pool, 0), nothing);
+        let column = [AffinityFacts {
+            overlap_blocks: 70_000,
+            ..AffinityFacts::default()
+        }];
+        let long = RequestFacts {
+            affinity: &column,
+            prompt_tokens: 16 * 80_000,
+            ..facts(16)
+        };
+        let said = stage.said(&long, &pool, 0);
+        assert_eq!((said.blocks, said.of), (35_000, 40_000));
+        assert_eq!(stage.said(&long, &pool, 9).blocks, 0);
+        let longer = RequestFacts {
+            affinity: &column,
+            prompt_tokens: 16 * 300_000,
+            ..facts(16)
+        };
+        let said = stage.said(&longer, &pool, 0);
+        assert_eq!((said.blocks, said.of), (8_750, 37_500));
+    }
+
+    /// One holder over the swing's margin and under the priced one: the
+    /// stage says the margin held. It says so once, of its own pass, of a
+    /// deepest holder, and not behind [`forget_judged`].
+    #[test]
+    fn the_word_of_a_pass_is_one_decisions_and_one_stages() {
+        let gate = || {
+            affinity(Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens: Some(8),
+                ..SpillParams::default()
+            }))
+        };
+        let (stage, other) = (gate(), gate());
+        let pool = [
+            candidate(0, 10, 8),
+            candidate(1, 0, 0),
+            candidate(2, 0, 0),
+            candidate(3, 0, 0),
+        ];
+        let (rows, column) = (rows(&pool), column(&pool));
+        let facts = RequestFacts {
+            affinity: &column,
+            ..facts(16)
+        };
+        let pass = |stage: &PrefixAffinity| {
+            let mut out = vec![0.0; 4];
+            stage.score(&facts, &rows, &kept(4), &mut out);
+            out
+        };
+        assert_eq!(pass(&stage), vec![1.0, 0.5, 0.5, 0.5]);
+        let held = Overlap {
+            blocks: 8,
+            of: 16,
+            source: OverlapSource::Index,
+            margin_held: true,
+        };
+        assert_eq!(stage.said(&facts, &rows, 0), held);
+        // Asked again, the word is spent.
+        assert!(!stage.said(&facts, &rows, 0).margin_held);
+        // A row that is no deepest holder was kept by no price.
+        pass(&stage);
+        assert!(!stage.said(&facts, &rows, 1).margin_held);
+        // The first stage of a decision to judge keeps the slot: a later
+        // stage's pass does not take its word.
+        pass(&stage);
+        pass(&other);
+        assert!(stage.said(&facts, &rows, 0).margin_held);
+        // One stage's pass is no word of another's.
+        pass(&other);
+        assert!(!stage.said(&facts, &rows, 0).margin_held);
+        // A decision whose overlap the engine states begins with no word.
+        pass(&stage);
+        forget_judged();
+        assert!(!stage.said(&facts, &rows, 0).margin_held);
+    }
+
+    /// A later pass of the same stage writes over its own word: the word
+    /// left is of the stage's last pass. Over level loads the swing's
+    /// margin spills nobody, so no price kept the holder.
+    #[test]
+    fn a_later_pass_of_a_stage_writes_over_its_own_word() {
+        let stage = affinity(Some(SpillParams {
+            rel: Some(1.1),
+            prefix_margin_tokens: Some(8),
+            ..SpillParams::default()
+        }));
+        let pool = |others| {
+            [
+                candidate(0, 10, 8),
+                candidate(1, others, 0),
+                candidate(2, others, 0),
+                candidate(3, others, 0),
+            ]
+        };
+        let (busy, level) = (pool(0), pool(10));
+        let pass = |pool: &[Held]| scores(&stage, &facts(16), pool);
+        let held = |pool: &[Held]| {
+            let column = column(pool);
+            let facts = RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            };
+            stage.said(&facts, &rows(pool), 0).margin_held
+        };
+        forget_judged();
+        assert_eq!(pass(&busy), vec![1.0, 0.5, 0.5, 0.5]);
+        assert!(held(&busy));
+        assert_eq!(pass(&busy), vec![1.0, 0.5, 0.5, 0.5]);
+        assert_eq!(pass(&level), vec![1.0, 0.5, 0.5, 0.5]);
+        assert!(!held(&level));
+    }
+
+    /// A pass that orders nothing under the fleet's KV gate takes back the
+    /// word an earlier pass of its stage left: the price did not keep the
+    /// pick behind it.
+    #[test]
+    fn a_pass_under_the_kv_gate_takes_the_stages_word_back() {
+        let kv = KvPressureParams {
+            ceiling: Some(0.9),
+            ..KvPressureParams::default()
+        };
+        let params = PrefixAffinityParams {
+            spill: Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens: Some(8),
+                ..SpillParams::default()
+            }),
+            ..PrefixAffinityParams::default()
+        };
+        let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), Some(&kv), Some(16)));
+        let pool = |usage| {
+            [
+                reporting(0, 10, 8, usage),
+                reporting(1, 0, 0, 500),
+                reporting(2, 0, 0, 500),
+                reporting(3, 0, 0, 500),
+            ]
+        };
+        let (calm, hot) = (pool(500), pool(950));
+        let pass = |pool: &[Held]| scores(&stage, &facts(16), pool);
+        let held = || {
+            let column = column(&calm);
+            let facts = RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            };
+            stage.said(&facts, &rows(&calm), 0).margin_held
+        };
+        forget_judged();
+        assert_eq!(pass(&calm), vec![1.0, 0.5, 0.5, 0.5]);
+        assert!(held());
+        assert_eq!(pass(&calm), vec![1.0, 0.5, 0.5, 0.5]);
+        assert_eq!(pass(&hot), vec![1.0; 4]);
+        assert!(!held());
+    }
+
+    /// The front pass takes the word back as the whole pass does: under the
+    /// fleet's KV gate it says every row alike, and the price an earlier
+    /// pass judged by is not said.
+    #[test]
+    fn a_front_pass_under_the_kv_gate_takes_the_stages_word_back() {
+        let kv = KvPressureParams {
+            ceiling: Some(0.9),
+            ..KvPressureParams::default()
+        };
+        let params = PrefixAffinityParams {
+            spill: Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens: Some(8),
+                ..SpillParams::default()
+            }),
+            ..PrefixAffinityParams::default()
+        };
+        let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), Some(&kv), Some(16)));
+        let pool = |usage| {
+            [
+                reporting(0, 10, 8, usage),
+                reporting(1, 0, 0, 500),
+                reporting(2, 0, 0, 500),
+                reporting(3, 0, 0, 500),
+            ]
+        };
+        let (calm, hot) = (pool(500), pool(950));
+        // The front pass over a pool, lent its rows' counts as the whole
+        // pass's helper lends them: the scores and what the pass said.
+        let front = |pool: &[Held]| {
+            let column = column(pool);
+            let mut lent_rows = rows(pool);
+            let lent = Lent::take(&mut lent_rows);
+            let facts = lent.beside(&RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            });
+            let kept = kept(lent_rows.len() as u32);
+            let mut out = vec![0.0; lent_rows.len()];
+            let (_, said) = stage.score_front(&facts, &lent_rows, &kept, &kept, &mut out);
+            (out, matches!(said, Front::Alike))
+        };
+        let held = || {
+            let column = column(&calm);
+            let facts = RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            };
+            stage.said(&facts, &rows(&calm), 0).margin_held
+        };
+        forget_judged();
+        assert!(!front(&calm).1);
+        assert!(held());
+        assert!(!front(&calm).1);
+        assert_eq!(front(&hot), (vec![1.0; 4], true));
+        assert!(!held());
+    }
+
+    /// The margin's bit is the difference of two scores: the stage that
+    /// prices the held prefix puts the row in front, and the same gate
+    /// with no price puts it behind. Over pools, holders, loads and
+    /// orders drawn at random, on a column, on named rows and behind a
+    /// draw with the engine's mean, a decode phase among them. The word
+    /// is one decision's: asked a second time it says no margin.
+    #[test]
+    fn the_margin_held_is_the_price_alone_keeping_a_row_in_front() {
+        let gate = |prefix_margin_tokens| {
+            affinity(Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens,
+                ..SpillParams::default()
+            }))
+        };
+        let (priced, plain) = (gate(Some(8)), gate(None));
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % below
+        };
+        let mut held = [0u32; 3];
+        for round in 0..3_000u32 {
+            let n = 1 + next(24) as u32;
+            let pool: Vec<Candidate> = (0..n)
+                .map(|row| candidate(row, next(40) as u32, 0).0)
+                .collect();
+            // Every fourth round names nobody.
+            let mut holders = Vec::new();
+            let mut column = vec![AffinityFacts::default(); n as usize];
+            for row in 0..n {
+                if round % 4 != 0 && next(3) == 0 {
+                    let blocks = 1 + next(16) as u32;
+                    holders.push(holder(row, blocks));
+                    column[row as usize].overlap_blocks = blocks;
+                }
+            }
+            // A draw's order: some of the rows, each once.
+            let mut order: Vec<u32> = (0..n).filter(|&row| row == 0 || next(4) != 0).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, next(i as u64 + 1) as usize);
+            }
+            let whole = named(&holders, &[], false);
+            let drawn = NamedAffinity {
+                mean_in_flight: Some(mean_in_flight(&RequestFacts::default(), &pool, &order)),
+                ..whole
+            };
+            // Named rows, named rows behind a draw, a column.
+            let feed = round as usize % 3;
+            let facts = RequestFacts {
+                affinity: if feed == 2 { &column } else { &[] },
+                named: [Some(whole), Some(drawn), None][feed],
+                phase: if round % 5 == 0 {
+                    Phase::Decode
+                } else {
+                    Phase::Single
+                },
+                ..facts(16)
+            };
+            let scored = |stage: &PrefixAffinity| {
+                let mut out = vec![0.0; order.len()];
+                stage.score(&facts, &pool, &order, &mut out);
+                out
+            };
+            let unpriced = scored(&plain);
+            for (at, &row) in order.iter().enumerate() {
+                // The pass that decided is the last that ran.
+                let by_price = scored(&priced);
+                let kept = by_price[at] >= 1.0 && unpriced[at] <= 0.0;
+                assert_eq!(
+                    priced.said(&facts, &pool, row).margin_held,
+                    kept,
+                    "round {round}, row {row}: {holders:?}, order {order:?}"
+                );
+                assert!(
+                    !priced.said(&facts, &pool, row).margin_held,
+                    "round {round}, row {row}: asked twice"
+                );
+                held[feed] += u32::from(kept);
+            }
+        }
+        assert!(
+            held.iter().all(|&rows| rows > 30),
+            "rows the price alone kept, a feed: {held:?}"
+        );
     }
 
     /// The prefix stage's body behind a draw scores as the whole pass's
@@ -2462,7 +3088,7 @@ mod tests {
     /// order does, and the two divert to the same row.
     #[test]
     fn behind_a_draw_a_diverted_hit_searches_the_rows_named_and_keeps_no_cursor() {
-        use crate::view::LOOKS_BEHIND;
+        use crate::engine::view::LOOKS_BEHIND;
         // Rows 1 and 4 hold the request deep. Of the thin rows 3 and 0 are
         // busier than the holders, so the entry of each is read, and row 2
         // takes the hit.

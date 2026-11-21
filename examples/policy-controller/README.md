@@ -46,8 +46,11 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
 1. Write the stage. Implement `Scorer`, `Filter` or `Picker` for a type of
    yours. A scorer writes one score for each row it is handed, from 0 to 1
    with higher better, and allocates nothing. A stage declares what it reads
-   in `needs`: `Pack` declares the load reports. A stage that keeps no state
-   takes every default of `Lifecycle`.
+   in `needs`: `Pack` declares the load reports. A stage that only places
+   says so in `refuses_by_reports`, as `Pack` does. A stage that says nothing
+   is taken as one that may refuse a request by its gateways' reports of
+   leases, and each decision under it applies those reports first. A stage
+   that keeps no state takes every default of `Lifecycle`.
 2. Register it. Start from `Catalog::builtin()` and add the stage under a new
    name with `scorer`, `filter` or `picker`. The name must be free among the
    built-ins and across the three kinds, and it must be the name the stage
@@ -80,12 +83,13 @@ with no error: a stage over one ties or keeps every worker.
 
 | A stage reads | Where it comes from | In this controller today |
 |---|---|---|
-| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status, and a stall where a veto of the asking gateway stands. The breaker is not fed yet and reads as clear. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
+| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status. A veto of the asking gateway is in the row only where the rows were written for the request: the stalled bit, and the breaker bit beside it where the veto holds, as the gateway's own open breaker does. Beside rows the store lends, both bits read clear and the veto stands in the constraints: the row's position in `Constraints::stalled`, and in `Constraints::held` where the veto holds. So a stage asks `Constraints::masks` beside the stalled bit, as `healthy` does. The controller keeps no breaker of its own. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
 | `Candidate::load` (`LoadRow`) | The engine's own load report: requests running and queued, KV-cache usage, the drain rate, the report's age. A stage that reads it declares `Needs::loads`. | Fed. |
 | `Candidate::in_flight` | The requests the deciding host holds on the worker right now. | The leases on file that book the worker, read through `RequestFacts::in_flight`: beside the rows the store lends, in the row where the rows are written for the request. The field itself reads 0 beside lent rows, so a stage asks the request's facts. A decision reads one count a row. |
-| `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. | `session_hit` is set on the worker the ask names as pinned. `session_in_flight` is not fed yet and reads 0. |
+| `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. | `session_hit` is set on the worker the ask names as pinned. A key's requests in flight are the leases on file whose decisions read the key's count, read through `RequestFacts::session_in_flight`: the store lends them beside the rows for a keyed request under a rule with an in-flight cap. The field itself reads 0, so a stage asks the request's facts. For any other request none is lent and the read is 0. |
 | `RequestFacts::affinity_at(index)` (`AffinityFacts`) | The cache index: the prefix blocks of the request the worker at `index` holds. An empty column reads as nothing held. Filled for a profile with a stage that declares `Needs::affinity`. | One entry for each worker. Its index facts are not fed yet and read 0. |
 | `Candidate::role`, `wire_modes`, `zone`, `engine_kind`, `labels` | The worker's registration. | `role` and `wire_modes` are fed. `zone`, `engine_kind` and `labels` are fed against the lists the policy document declares (`view.zones`, `view.engines`, `view.labels`): a position from 1, and one bit for each label selector the worker meets. Each reads 0 where the document declares no list, and a worker whose zone or engine family its list does not name reads 0 there. |
+| `SentCredit::read` (`Sent`) | What the deciding host sent the worker that no load report of it shows yet: the requests and their prompt tokens. A scorer's factory asks for its profile's count with `StageBuild::sent`. | Fed by the dispatch reports of every gateway that decides through this controller. A send stops counting at a report sampled at or after it, at the profile's `sent_ttl_ms` or at the worker's removal. When a send arrives with 8,192 already held on a row, the tally retires the row's oldest batch, at any age. |
 | `RequestFacts` | The request: the model, the tenant, the session key, the prompt's size and block hashes, the allow-listed headers. | The caller's, not the store's. |
 | `PoolFacts`, at `DecisionScope::open` | The pool the model resolves to: its size, the policy's generation, the overload regime. A stage that holds a decision scope reads it when the scope opens. | The size and the generation. The overload regime is not fed yet and reads as none. |
 
@@ -103,11 +107,11 @@ profiles:
     pick: best
 ```
 
-A scorer in code takes a weight from the document and nothing else:
-`- pack: { weight: 2 }`. A bare name weighs one. Settings of your own are
-your binary's: read them in `main`, from the environment or a file, and move
-them into the factory. The command line is the crate's, and it refuses a flag
-it does not know.
+`Pack` takes a weight from the document and nothing else:
+`- pack: { weight: 2 }`. A bare name weighs one. A scorer with settings of
+its own registers with `scorer_with` and reads them from the document as
+typed parameters: the crate's README shows one. The command line is the
+crate's, and it refuses a flag it does not know.
 
 The stock `not-overloaded` filter is where `pack` stops filling a worker. It
 drops a worker whose engine the store judges overloaded: the queue or the
@@ -119,9 +123,9 @@ whose workers each name a queue threshold, and a controller handed this
 document, where the default stands.
 
 The stock build's catalog refuses this document by the scorer's name. The
-published schema (`crates/policy_controller/policyspec.schema.json`) lists
-the stock build's stages, so the document fails that schema too and
-validates over this build's catalog.
+published schema (`crates/policy_controller/policyspec.schema.json`) cannot
+know a host's catalog and takes a scorer by any name, so the document passes
+it. Only validation over a catalog tells the stock build from this one.
 
 ## Build and run
 
@@ -170,6 +174,7 @@ smg-policy-controller = { git = "https://github.com/smg-project/smg", features =
 ```
 
 - `controller`: the listeners, the command line and `controller::run`.
+- `worker-host`: the cache-event feed. With it a controller reads cache events from each gRPC worker whose row asks for them and names a model. The stock image is built with it. Without it a cache-aware document places by warm-up and load.
 - `kubernetes`: the Lease election the Helm chart's replicas use.
 - `client`: the reference client of the protocol. The example's tests ask
   the started controller its decisions through it.
@@ -218,11 +223,14 @@ repository of your own needs its tag.
 
 ## What it leaves out
 
-- Parameters. A stage in code takes none from the document beyond a scorer's
-  weight.
+- Parameters. `Pack` takes none from the document beyond its weight. A scorer
+  registered with `scorer_with`, a filter registered with `filter_with` and a
+  picker registered with `picker_with` read typed parameters.
 - A filter and a picker. They register as the scorer does.
 - State. `Lifecycle` reports what became of each decision to a scorer that
-  learns from it. `Pack` reads the view alone.
+  learns from it. A scorer that keeps a number of each worker's load report
+  answers true to `keeps_loads`, and is then told every report before a
+  decision reads it. `Pack` reads the view alone.
 - A fallback. A plugin that fails falls back to a built-in stage. A stage in
   code is the controller's own code and has none.
 - A name of its own. `--version` and `/version` answer the crate's name and
