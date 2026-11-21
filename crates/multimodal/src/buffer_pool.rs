@@ -16,7 +16,7 @@
 //! ([`EncoderInput::into_bytes_as`](crate::encoder_inputs::EncoderInput::into_bytes_as)).
 //!
 //! Geometry: a length between [`SMALLEST`] and [`LARGEST`] is served from the
-//! class of its next power of two (nine classes, 256 KiB to 64 MiB), so one
+//! class of its next power of two (ten classes, 256 KiB to 128 MiB), so one
 //! class serves every length up to its size and the pages past the length
 //! are never touched; a length outside the range is allocated as before. The
 //! pool holds at most [`BOUND`] bytes of capacity in all, process-wide; a
@@ -46,7 +46,9 @@ use image::DynamicImage;
 /// tile in bfloat16 (677,376 bytes), sits in the 1 MiB class above this floor.
 pub const SMALLEST: usize = 256 << 10;
 /// The longest buffer the pool serves; a longer one is allocated as before.
-pub const LARGEST: usize = 64 << 20;
+/// Ten 1024x768 images as 130 such tiles write one bfloat16 wire of 88 MB,
+/// which sits in this top class; the bound holds two buffers of it.
+pub const LARGEST: usize = 128 << 20;
 /// The capacity the pool holds in all, the idle buffers of every class
 /// together.
 pub const BOUND: usize = 256 << 20;
@@ -287,6 +289,22 @@ mod tests {
         pool.recycle(first);
         let again = pool.take(wire);
         assert_eq!(again.as_ptr(), address);
+    }
+
+    #[test]
+    fn a_buffer_between_64_and_128_mib_is_kept_and_handed_out_again() {
+        // The first length past the former 64 MiB top class, where it was
+        // allocated zero-filled on every request.
+        let len = (64 << 20) + 1;
+        let pool = BufferPool::new();
+        let first = pool.take(len);
+        let address = first.as_ptr();
+        assert_eq!(first.capacity(), 128 << 20);
+        pool.recycle(first);
+        assert_eq!(pool.held(), 128 << 20);
+        let again = pool.take(len);
+        assert_eq!(again.as_ptr(), address);
+        assert_eq!(pool.held(), 0);
     }
 
     #[test]
