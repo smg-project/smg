@@ -110,8 +110,10 @@ pub struct StopRules {
     /// Index boundary: patterns [0..visible_boundary_idx) are hidden,
     /// patterns [visible_boundary_idx..) are visible
     visible_boundary_idx: usize,
-    /// Aho-Corasick automaton for O(N) stop sequence matching
-    aho_corasick: Option<AhoCorasick>,
+    /// What the string stops are matched by, behind one shared pointer: held
+    /// inline, the first bytes' bitmap took the gateway's per-request
+    /// context, which holds a decoder, one allocator class up.
+    matcher: Option<Arc<Matcher>>,
     /// True when there are no string stop sequences (only token-level stops).
     /// In this mode the jail buffer is bypassed entirely for lower overhead.
     token_only: bool,
@@ -120,6 +122,13 @@ pub struct StopRules {
     hidden_stop_ids: StopIds,
     /// The config's visible stop token ids, sorted.
     visible_stop_ids: StopIds,
+}
+
+/// The matcher of the string stop sequences.
+#[derive(Debug)]
+struct Matcher {
+    /// Aho-Corasick automaton for O(N) stop sequence matching
+    automaton: AhoCorasick,
     /// The bytes a stop sequence begins with, one bit a byte value: text with
     /// none of them neither holds a stop sequence nor begins one.
     starts: [u64; 4],
@@ -157,12 +166,13 @@ impl StopRules {
             starts[usize::from(first >> 6)] |= 1 << (first & 63);
         }
 
+        let matcher = aho_corasick.map(|automaton| Arc::new(Matcher { automaton, starts }));
+
         Self {
-            starts,
-            token_only: aho_corasick.is_none(),
+            token_only: matcher.is_none(),
             patterns: (!patterns.is_empty()).then(|| patterns.into()),
             visible_boundary_idx,
-            aho_corasick,
+            matcher,
             hidden_stop_ids: StopIds::new(&stop_tokens),
             visible_stop_ids: StopIds::new(&visible_stop_tokens),
         }
@@ -434,8 +444,11 @@ impl StopSequenceDecoder {
         if !held {
             let text = &out.as_bytes()[before..];
             let patterns = self.rules.patterns.as_deref().unwrap_or_default();
-            let starts =
-                |byte: &u8| (self.rules.starts[usize::from(byte >> 6)] >> (byte & 63)) & 1 == 1;
+            let bitmap = match &self.rules.matcher {
+                Some(matcher) => &matcher.starts,
+                None => &[0; 4],
+            };
+            let starts = |byte: &u8| (bitmap[usize::from(byte >> 6)] >> (byte & 63)) & 1 == 1;
             let may_stop = text.iter().position(starts).is_some_and(|first| {
                 (first..text.len()).any(|at| {
                     starts(&text[at])
@@ -478,8 +491,8 @@ impl StopSequenceDecoder {
         // Check for stop sequences using Aho-Corasick. The jail only ever retains a
         // proper prefix of some pattern, so the buffer is bounded by
         // `longest_pattern + one token of text` and scanning it whole is cheap.
-        if let Some(ac) = &self.rules.aho_corasick {
-            if let Some(mat) = ac.find(Input::new(&self.jail_buffer)) {
+        if let Some(matcher) = &self.rules.matcher {
+            if let Some(mat) = matcher.automaton.find(Input::new(&self.jail_buffer)) {
                 self.stopped = true;
                 self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
                 let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
