@@ -4,7 +4,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
-use openai_protocol::UNKNOWN_MODEL_ID;
+use openai_protocol::{worker::GrammarStart, UNKNOWN_MODEL_ID};
 use smg_worker::{
     identity::{
         basic::ConnectionMode,
@@ -13,7 +13,6 @@ use smg_worker::{
     },
     workflow::{resolve_model_id, WorkerKind},
 };
-use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowResult};
 

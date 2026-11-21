@@ -1276,8 +1276,8 @@ mod tests {
     /// carries no override, and its grammar start reads as advertised.
     #[test]
     fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
+        use openai_protocol::worker::GrammarStart;
         use smg_grpc_client::engine_labels::ServerInfo;
-        use tool_parser::GrammarStart;
 
         let tool_factory = tool_parser::ParserFactory::default();
         let reasoning_factory = reasoning_parser::ParserFactory::default();
