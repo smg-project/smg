@@ -302,15 +302,6 @@ impl WorkflowHost for AppContext {
     }
 }
 
-/// The feed a gateway's worker workflows write at: `feed` where the gateway
-/// decides in its own process, and none where it `follows` a controller.
-/// There the store mirrors that controller's rows, and a write of the
-/// gateway's own would set the mirror apart from the controller: its
-/// workflows stay the classic ones.
-fn workflows_feed(feed: Option<&Feed>, follows: bool) -> Option<&Feed> {
-    feed.filter(|_| !follows)
-}
-
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
@@ -323,13 +314,6 @@ impl AppContext {
     /// health checks and the discovery.
     pub(crate) fn follows_controller(&self) -> bool {
         self.policy_follower.is_some()
-    }
-
-    /// The feed this gateway's worker workflows write at: its own where it
-    /// decides in its own process, and none where a controller supplies its
-    /// workers ([`workflows_feed`]).
-    pub(crate) fn door_feed(&self) -> Option<&Feed> {
-        workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
     }
 
     /// Create AppContext from config with all components initialized
@@ -692,20 +676,12 @@ impl AppContextBuilder {
             policy_registry.keep_rings_warm(&worker_registry, &runtime);
         }
 
-        // Create WorkerService from the already-built components. Where
-        // the workflows write at the door a local worker is a row of the
-        // store.
-        let worker_service = WorkerService::new(
+        // Create WorkerService from the already-built components
+        let worker_service = Arc::new(WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
-        );
-        let rows = workflows_feed(self.policy_feed.as_ref(), self.policy_follower.is_some());
-        let worker_service = Arc::new(if rows.is_some() {
-            worker_service.with_local_workers_as_rows()
-        } else {
-            worker_service
-        });
+        ));
 
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
             router_config.worker_http_client_settings(),

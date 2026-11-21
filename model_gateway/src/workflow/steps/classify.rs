@@ -70,7 +70,7 @@ async fn probe_models_owned_by(
 /// The kind a spec states with no probe: an explicit runtime says it, and a
 /// spec that names no runtime at a known provider's URL is external. `None`
 /// for a spec the probes classify: it ends local whatever they answer.
-pub(crate) fn stated_kind(config: &WorkerSpec) -> Option<WorkerKind> {
+fn stated_kind(config: &WorkerSpec) -> Option<WorkerKind> {
     if config.runtime_type.is_specified() {
         return Some(if config.runtime_type == RuntimeType::External {
             WorkerKind::External

@@ -7,7 +7,6 @@ pub(crate) mod util;
 
 use std::{sync::Arc, time::Duration};
 
-pub(crate) use classify::stated_kind;
 pub use classify::ClassifyWorkerTypeStep;
 pub use external::{
     group_models_into_cards, infer_model_type_from_id, CreateExternalWorkersStep,

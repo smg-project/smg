@@ -1466,22 +1466,3 @@ async fn a_built_contexts_timer_ends_a_lease_whose_dispatch_was_never_named() ->
     drop(placed);
     Ok(())
 }
-
-/// Under a controller's address the store mirrors that controller's rows.
-/// The context holds the feed for the follower, and its worker workflows
-/// get none: a write of the gateway's own would set the mirror apart. A
-/// local worker's registration writes no row there.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[tokio::test]
-async fn a_followed_gateway_hands_its_worker_workflows_no_feed() -> Case {
-    let hosted = AppContext::from_config(picked(quiet()), 30, None, None).await?;
-    assert!(hosted.door_feed().is_some());
-
-    let mut config = picked(quiet());
-    config.policy_controller_address = Some("127.0.0.1:1".to_owned());
-    let followed = AppContext::from_config(config, 30, None, None).await?;
-    assert!(followed.follows_controller());
-    assert!(followed.policy_feed.is_some());
-    assert!(followed.door_feed().is_none());
-    Ok(())
-}

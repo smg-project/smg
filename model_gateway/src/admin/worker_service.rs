@@ -12,8 +12,8 @@ use axum::{
     Json,
 };
 use openai_protocol::worker::{
-    HealthCheckUpdate, RuntimeType, WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec,
-    WorkerStatus, WorkerUpdateRequest,
+    HealthCheckUpdate, WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
+    WorkerUpdateRequest,
 };
 use serde_json::json;
 use smg_auth::AuditResource;
@@ -27,16 +27,14 @@ use smg_worker::{
     jobs::WorkerJobAsker,
     labels::has_control_character,
     registry::WorkerId,
-    workflow::{find_workers_by_url, WorkerKind},
+    workflow::find_workers_by_url,
 };
 use tracing::warn;
 
 use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    workflow::{
-        job_queue::cancel_registration, steps::stated_kind, Job, JobQueue, WorkerRegistrationMode,
-    },
+    workflow::{job_queue::cancel_registration, Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -291,10 +289,7 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
 /// worker and overwrites the edit. What no provider publishes (priority,
 /// cost, API key, health checks) is still a PATCH's to change, and a DELETE
 /// stays allowed; the provider adds the worker back while it still
-/// publishes it. Where a local worker is a row, the worker API writes no
-/// provider's row: a PATCH of any field and a DELETE are refused as well
-/// ([`WorkerServiceError::DiscoveryUpdates`],
-/// [`WorkerServiceError::DiscoveryRemoves`]).
+/// publishes it.
 fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
     match discovery_provider(worker) {
         Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
@@ -309,19 +304,6 @@ fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError>
 /// reconciler writes; `None` for a worker registered locally.
 fn discovery_provider(worker: &dyn Worker) -> Option<&String> {
     worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL)
-}
-
-/// Whether `worker` is a row where a local worker is one: every worker but
-/// a provider's, which stays outside the store.
-fn stands_as_row(worker: &dyn Worker) -> bool {
-    worker.metadata().spec.runtime_type != RuntimeType::External
-}
-
-/// The provider of the first discovered worker among `workers`.
-fn provider_among(workers: &[Arc<dyn Worker>]) -> Option<String> {
-    workers
-        .iter()
-        .find_map(|worker| discovery_provider(worker.as_ref()).cloned())
 }
 
 /// Error types for worker service operations
@@ -353,14 +335,6 @@ pub enum WorkerServiceError {
     /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
     /// discovered worker)
     DiscoveryOwned { url: String, provider: String },
-    /// A PUT or a PATCH of a discovered worker, on a gateway whose local
-    /// workers are rows of the policy controller's store: the worker API
-    /// changes no provider's row
-    DiscoveryUpdates { url: String, provider: String },
-    /// A DELETE of a discovered worker, on a gateway whose local workers are
-    /// rows of the policy controller's store: the worker API removes no
-    /// provider's row
-    DiscoveryRemoves { url: String, provider: String },
     /// The spec targets a provider whose router this build does not carry
     ProviderNotCompiled {
         url: String,
@@ -384,9 +358,7 @@ impl WorkerServiceError {
             // code the window answered before; the message says what holds.
             Self::RemovalInProgress { .. } => "WORKER_ALREADY_EXISTS",
             Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
-            Self::DiscoveryOwned { .. }
-            | Self::DiscoveryUpdates { .. }
-            | Self::DiscoveryRemoves { .. } => "WORKER_DISCOVERY_OWNED",
+            Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
@@ -402,8 +374,6 @@ impl WorkerServiceError {
             Self::RemovalInProgress { .. } => StatusCode::CONFLICT,
             Self::CreateInProgress { .. } => StatusCode::CONFLICT,
             Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
-            Self::DiscoveryUpdates { .. } => StatusCode::CONFLICT,
-            Self::DiscoveryRemoves { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -467,18 +437,6 @@ impl std::fmt::Display for WorkerServiceError {
                 "Worker '{url}' is owned by the '{provider}' discovery provider. \
                 Its spec and labels come from its discovery source: change them there, \
                 not with a PUT or a PATCH of labels."
-            ),
-            Self::DiscoveryUpdates { url, provider } => write!(
-                f,
-                "Worker '{url}' is owned by the '{provider}' discovery provider, and under \
-                the policy controller the worker API changes no provider's worker. Change \
-                it at its discovery source, not with a PUT or a PATCH."
-            ),
-            Self::DiscoveryRemoves { url, provider } => write!(
-                f,
-                "Worker '{url}' is owned by the '{provider}' discovery provider, and under \
-                the policy controller the worker API removes no provider's worker. Take \
-                it out of its discovery source."
             ),
             Self::ProviderNotCompiled {
                 url,
@@ -649,8 +607,6 @@ pub struct WorkerService {
     worker_registry: Arc<WorkerRegistry>,
     job_queue: Arc<std::sync::OnceLock<Arc<JobQueue>>>,
     router_config: RouterConfig,
-    /// Whether a local worker is a row of the policy controller's store.
-    local_workers_are_rows: bool,
 }
 
 impl WorkerService {
@@ -664,34 +620,7 @@ impl WorkerService {
             worker_registry,
             job_queue,
             router_config,
-            local_workers_are_rows: false,
         }
-    }
-
-    /// The service of a gateway whose local workers are rows of the policy
-    /// controller's store: it refuses a change of a discovered worker,
-    /// since it writes no provider's row.
-    #[must_use]
-    pub(crate) fn with_local_workers_as_rows(mut self) -> Self {
-        self.local_workers_are_rows = true;
-        self
-    }
-
-    /// Whether `worker` is a row of the policy controller's store here.
-    fn is_row(&self, worker: &dyn Worker) -> bool {
-        self.local_workers_are_rows && stands_as_row(worker)
-    }
-
-    /// The workers `url` selects that are rows here. An address selects
-    /// every rank registered under it, each a row under its own URL.
-    fn rows_at(&self, url: &str) -> Vec<Arc<dyn Worker>> {
-        if !self.local_workers_are_rows {
-            return Vec::new();
-        }
-        find_workers_by_url(&self.worker_registry, url)
-            .into_iter()
-            .filter(|worker| stands_as_row(worker.as_ref()))
-            .collect()
     }
 
     /// Parse and validate a worker ID string
@@ -832,34 +761,11 @@ impl WorkerService {
                 })?;
         // Before the body is read: a discovered worker's own spec, sent back,
         // carries the reserved labels, and the useful answer is where to make
-        // the change, not which labels to strip. Where a local worker is a
-        // row, the worker API changes no provider's row.
-        let url = existing.url().to_string();
-        let is_row = self.is_row(existing.as_ref());
-        if let (true, Some(provider)) = (is_row, discovery_provider(existing.as_ref())) {
-            return Err(WorkerServiceError::DiscoveryUpdates {
-                url,
-                provider: provider.clone(),
-            });
-        }
+        // the change, not which labels to strip.
         refuse_discovery_owned(existing.as_ref())?;
+        let url = existing.url().to_string();
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
-        // A PUT keeps a worker on its side of the store. A row's worker
-        // restated as a provider's would be accepted and then fail at the
-        // row that holds its URL, and a provider's worker restated as
-        // self-hosted would find no row to replace. The side is asked ahead
-        // of the fields, so the first answer names what stands in the way.
-        let stays_row = stated_kind(&config) != Some(WorkerKind::External);
-        if self.local_workers_are_rows && is_row != stays_row {
-            return Err(WorkerServiceError::BadRequest {
-                message: format!(
-                    "Worker '{url}' would change between a self-hosted worker and a \
-                    provider's. Under the policy controller a PUT keeps it as it is. \
-                    Use DELETE + POST instead."
-                ),
-            });
-        }
 
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration
@@ -1005,13 +911,6 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
-        // Where a local worker is a row, its maker alone removes it at the
-        // store's door, and the API removes as the control maker. A
-        // discovered worker is its provider's row: the removal would be
-        // accepted and then leave it. Refuse here rather than after the 202.
-        if let Some(provider) = provider_among(&self.rows_at(&url)) {
-            return Err(WorkerServiceError::DiscoveryRemoves { url, provider });
-        }
         let job_queue = self.get_job_queue()?;
 
         // An id with no worker behind it is a POST's registration still in
@@ -1092,12 +991,6 @@ impl WorkerService {
                 worker_id: worker_id_raw.to_string(),
             })?;
         let worker = self.worker_registry.get_by_url(&url);
-        // Where a local worker is a row, a discovered worker is its
-        // provider's row whatever the PATCH names.
-        let rows = self.rows_at(&url);
-        if let Some(provider) = provider_among(&rows) {
-            return Err(WorkerServiceError::DiscoveryUpdates { url, provider });
-        }
         // Only a PATCH of labels edits what a provider publishes. Decided
         // before the body is validated, as for a PUT, so reserved labels sent
         // to a discovered worker are told where to make the change.
@@ -1295,260 +1188,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    /// A gateway whose local workers are rows writes a POST's add and a
-    /// PUT's replacement at the store's door. The holder keeps the object
-    /// the registration builds, so a worker that states an API key, a
-    /// priority or a cost passes as on the classic line. A PUT that would
-    /// move a worker between the rows and the providers is a bad request.
-    /// Nothing is reserved.
-    #[tokio::test]
-    async fn where_a_local_worker_is_a_row_the_api_takes_a_key_a_priority_and_a_cost() {
-        let spec = |url: &str, runtime: &str, stated: serde_json::Value| -> WorkerSpec {
-            let mut spec = json!({"url": url, "runtime": runtime});
-            for (field, value) in stated.as_object().into_iter().flatten() {
-                spec[field] = value.clone();
-            }
-            serde_json::from_value(spec).expect("worker spec")
-        };
-        let registry = Arc::new(WorkerRegistry::new());
-        let replaced = "http://replace:8000";
-        register_worker(&registry, replaced, Some("served"));
-        let id = registry.get_id_by_url(replaced).unwrap();
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        // Each passes the row's checks and ends at the queue this service
-        // lacks, as a plain POST and a plain PUT do.
-        let created = "http://create:8000";
-        for stated in [
-            json!({}),
-            json!({"api_key": "secret-key"}),
-            json!({"priority": 7}),
-            json!({"cost": 2.5}),
-        ] {
-            for passed in [
-                service
-                    .create_worker(spec(created, "sglang", stated.clone()))
-                    .await
-                    .map(drop),
-                service
-                    .replace_worker(id.as_str(), spec(replaced, "sglang", stated.clone()))
-                    .await
-                    .map(drop),
-            ] {
-                assert!(
-                    matches!(passed, Err(WorkerServiceError::QueueNotInitialized)),
-                    "{stated}"
-                );
-            }
-        }
-        assert!(registry.get_id_by_url_or_reservation(created).is_none());
-
-        // A PUT keeps a worker on its side of the store.
-        let restated = service
-            .replace_worker(id.as_str(), spec(replaced, "external", json!({})))
-            .await;
-        let (answered, body, _) = answer(restated.map(drop).unwrap_err()).await;
-        assert_eq!(answered, StatusCode::BAD_REQUEST);
-        let sentence = body["error"].as_str().unwrap();
-        assert!(sentence.contains("Use DELETE + POST instead"), "{sentence}");
-
-        // The side is asked first. A provider's worker restated with no
-        // runtime is told of its side, not to drop a field it may keep.
-        let private = "http://litellm:4000";
-        let hosted = BasicWorkerBuilder::new(private)
-            .runtime_type(RuntimeType::External)
-            .model(ModelCard::new("hosted"))
-            .build();
-        registry.register(Arc::new(hosted)).unwrap();
-        let hosted_id = registry.get_id_by_url(private).unwrap();
-        let unstated: WorkerSpec =
-            serde_json::from_value(json!({"url": private, "priority": 7})).expect("worker spec");
-        let restated = service.replace_worker(hosted_id.as_str(), unstated).await;
-        let (answered, body, _) = answer(restated.map(drop).unwrap_err()).await;
-        assert_eq!(answered, StatusCode::BAD_REQUEST);
-        let sentence = body["error"].as_str().unwrap();
-        assert!(sentence.contains("Use DELETE + POST instead"), "{sentence}");
-    }
-
-    /// Where a local worker is a row, its maker alone removes it at the
-    /// store's door, and the API is not a discovered worker's maker. Its
-    /// DELETE is refused by name before the 202 and queues nothing. A
-    /// worker the gateway registered itself, a discovered provider's worker
-    /// and a service with no rows take the DELETE.
-    #[tokio::test]
-    async fn a_delete_of_a_discovered_rows_worker_is_refused_by_name() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let ours = "http://ours:8000";
-        register_worker(&registry, ours, Some("served"));
-        let discovered = "http://discovered:8000";
-        let provider = "https://provider.example/v1";
-        for (url, runtime) in [
-            (discovered, RuntimeType::default()),
-            (provider, RuntimeType::External),
-        ] {
-            let found = BasicWorkerBuilder::new(url)
-                .runtime_type(runtime)
-                .model(ModelCard::new("served"))
-                .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
-                .build();
-            registry.register(Arc::new(found)).unwrap();
-        }
-        let id = |url: &str| registry.get_id_by_url(url).unwrap();
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        let refused = service.delete_worker(id(discovered).as_str()).await;
-        let (answered, body, _) = answer(refused.map(drop).unwrap_err()).await;
-        assert_eq!(answered, StatusCode::CONFLICT);
-        assert_eq!(body["code"], "WORKER_DISCOVERY_OWNED");
-        let sentence = body["error"].as_str().unwrap();
-        assert!(
-            sentence.contains("'kubernetes' discovery provider")
-                && sentence.contains("the worker API removes no provider's worker"),
-            "{sentence}"
-        );
-
-        // Each of these passes the check and ends at the queue this service
-        // lacks.
-        for passed in [
-            service.delete_worker(id(ours).as_str()).await,
-            service.delete_worker(id(provider).as_str()).await,
-            make_service(Arc::clone(&registry))
-                .delete_worker(id(discovered).as_str())
-                .await,
-        ] {
-            assert!(matches!(
-                passed,
-                Err(WorkerServiceError::QueueNotInitialized)
-            ));
-        }
-    }
-
-    /// A PATCH of a row's worker passes whatever it states: its labels and
-    /// its health checks move the row at the store's door, and an API key,
-    /// a priority or a cost moves the object the holder keeps. A
-    /// provider's worker takes each PATCH, and so does a worker of a
-    /// service with no rows.
-    #[tokio::test]
-    async fn a_patch_of_a_rows_worker_takes_a_key_a_priority_and_a_cost() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let row = "http://row:8000";
-        register_worker(&registry, row, Some("served"));
-        let provider = "https://provider.example/v1";
-        let hosted = BasicWorkerBuilder::new(provider)
-            .runtime_type(RuntimeType::External)
-            .model(ModelCard::new("hosted"))
-            .build();
-        registry.register(Arc::new(hosted)).unwrap();
-        let id = |url: &str| registry.get_id_by_url(url).unwrap();
-        let update = |body: &serde_json::Value| -> WorkerUpdateRequest {
-            serde_json::from_value(body.clone()).expect("an update")
-        };
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        // Each PATCH passes the checks on each side and ends at the queue
-        // this service lacks.
-        let patches = [
-            json!({"labels": {"tier": "a"}}),
-            json!({"health": {"timeout_secs": 7}}),
-            json!({"api_key": "secret-key"}),
-            json!({"priority": 7}),
-            json!({"cost": 2.5}),
-            json!({"api_key": "secret-key", "priority": 7, "labels": {"tier": "a"}}),
-        ];
-        let classic = make_service(Arc::clone(&registry));
-        let mut passed = Vec::new();
-        for patch in &patches {
-            passed.push(service.update_worker(id(row).as_str(), update(patch)).await);
-            passed.push(
-                service
-                    .update_worker(id(provider).as_str(), update(patch))
-                    .await,
-            );
-            passed.push(classic.update_worker(id(row).as_str(), update(patch)).await);
-        }
-        for passed in passed {
-            assert!(matches!(
-                passed,
-                Err(WorkerServiceError::QueueNotInitialized)
-            ));
-        }
-    }
-
-    /// Where a local worker is a row, its maker alone changes it at the
-    /// store's door, and the API is not a discovered worker's maker. Its
-    /// PUT, and its PATCH of any field, are refused by the classic code
-    /// before the 202, in a sentence that names both calls. A discovered
-    /// provider's worker, and a discovered worker of a service with no
-    /// rows, take a PATCH of what no provider publishes.
-    #[tokio::test]
-    async fn a_put_or_a_patch_of_a_discovered_rows_worker_is_refused_by_name() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let discovered = "http://discovered:8000";
-        let provider = "https://provider.example/v1";
-        for (url, runtime) in [
-            (discovered, RuntimeType::default()),
-            (provider, RuntimeType::External),
-        ] {
-            let found = BasicWorkerBuilder::new(url)
-                .runtime_type(runtime)
-                .model(ModelCard::new("served"))
-                .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
-                .build();
-            registry.register(Arc::new(found)).unwrap();
-        }
-        let id = |url: &str| registry.get_id_by_url(url).unwrap();
-        let update = |body: serde_json::Value| -> WorkerUpdateRequest {
-            serde_json::from_value(body).expect("an update")
-        };
-        let health = || update(json!({"health": {"timeout_secs": 7}}));
-        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
-
-        let ours = id(discovered);
-        for refused in [
-            service
-                .replace_worker(ours.as_str(), worker_spec(discovered))
-                .await
-                .map(drop),
-            service
-                .update_worker(ours.as_str(), health())
-                .await
-                .map(drop),
-            service
-                .update_worker(ours.as_str(), update(json!({"priority": 7})))
-                .await
-                .map(drop),
-            service
-                .update_worker(ours.as_str(), update(json!({"labels": {"tier": "a"}})))
-                .await
-                .map(drop),
-        ] {
-            let (answered, body, _) = answer(refused.unwrap_err()).await;
-            assert_eq!(answered, StatusCode::CONFLICT);
-            assert_eq!(body["code"], "WORKER_DISCOVERY_OWNED");
-            let sentence = body["error"].as_str().unwrap();
-            assert!(
-                sentence.contains("'kubernetes' discovery provider")
-                    && sentence.contains("the worker API changes no provider's worker")
-                    && sentence.contains("not with a PUT or a PATCH."),
-                "{sentence}"
-            );
-        }
-
-        // Each of these passes the check and ends at the queue this service
-        // lacks.
-        for passed in [
-            service.update_worker(id(provider).as_str(), health()).await,
-            make_service(Arc::clone(&registry))
-                .update_worker(ours.as_str(), health())
-                .await,
-        ] {
-            assert!(matches!(
-                passed,
-                Err(WorkerServiceError::QueueNotInitialized)
-            ));
-        }
     }
 
     #[tokio::test]
