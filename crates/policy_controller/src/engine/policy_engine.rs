@@ -28,6 +28,7 @@
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation.
 
+pub mod overlap;
 pub(super) mod pair;
 
 use std::{
@@ -47,8 +48,6 @@ use super::{
     view::Phase,
 };
 use crate::{document::spec::AppliedSpec, names::intern};
-
-pub mod overlap;
 
 /// The engine of one policy document, for a gateway that decides in its own
 /// process.
