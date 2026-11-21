@@ -954,21 +954,33 @@ impl TiktokenTokenizer {
 /// Format: each line is `<base64-encoded-token-bytes> <rank>`
 fn load_tiktoken_bpe(path: &str) -> Result<FxHashMap<Vec<u8>, Rank>> {
     let content = std::fs::read_to_string(path)?;
-    let mut encoder =
-        FxHashMap::with_capacity_and_hasher(content.lines().count(), Default::default());
+    // As many as `lines()` counts: one a line feed, and a last line without one.
+    let lines = content.bytes().filter(|&byte| byte == b'\n').count()
+        + usize::from(!content.is_empty() && !content.ends_with('\n'));
+    let mut encoder = FxHashMap::with_capacity_and_hasher(lines, Default::default());
     for line in content.lines() {
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let token_b64 = parts
-            .next()
-            .ok_or_else(|| Error::msg("missing token in tiktoken file"))?;
-        let rank_str = parts
-            .next()
-            .ok_or_else(|| Error::msg("missing rank in tiktoken file"))?;
-        let token_bytes = STANDARD.decode(token_b64)?;
-        let rank: Rank = rank_str.parse()?;
+        // The format's line has ONE space between its two fields; a line
+        // that does not read so takes the general split, errors included.
+        let direct = line
+            .split_once(' ')
+            .filter(|(token, _)| !token.is_empty())
+            .and_then(|(token, rank)| Some((STANDARD.decode(token).ok()?, rank.parse().ok()?)));
+        let (token_bytes, rank): (Vec<u8>, Rank) = match direct {
+            Some(entry) => entry,
+            None => {
+                let mut parts = line.split_whitespace();
+                let token_b64 = parts
+                    .next()
+                    .ok_or_else(|| Error::msg("missing token in tiktoken file"))?;
+                let rank_str = parts
+                    .next()
+                    .ok_or_else(|| Error::msg("missing rank in tiktoken file"))?;
+                (STANDARD.decode(token_b64)?, rank_str.parse()?)
+            }
+        };
         encoder.insert(token_bytes, rank);
     }
     Ok(encoder)
