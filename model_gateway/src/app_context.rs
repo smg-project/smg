@@ -15,7 +15,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::{stages::StageRegistry, store::MemoryStore};
+use smg_policy_controller::{engine::CacheIndexes, stages::StageRegistry, store::MemoryStore};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -1254,6 +1254,12 @@ impl AppContextBuilder {
         // label.
         if let Some(ref registry) = self.policy_registry {
             registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
+        }
+        // The engine of this process reads the same indexes, where a
+        // profile's stages read who holds a prompt.
+        if let Some(started) = &self.in_process {
+            let indexes = Arc::clone(&monitor) as Arc<dyn CacheIndexes>;
+            started.engine.affinity().set_indexes(indexes);
         }
 
         self.kv_event_monitor = Some(monitor);

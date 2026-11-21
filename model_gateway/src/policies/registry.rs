@@ -1443,6 +1443,11 @@ impl PolicyRegistry {
     /// on worker removal alongside the cache-aware cleanup above.
     pub fn remove_worker_from_policies(&self, worker_url: &str) {
         self.each_policy(|policy| policy.remove_worker(worker_url));
+        // The engine's record of the prefixes it sent names the worker to
+        // no later request.
+        if let Some(asked) = &self.policy_engine {
+            asked.engine.forget(worker_url);
+        }
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free

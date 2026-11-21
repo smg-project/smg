@@ -32,7 +32,7 @@ use std::{sync::atomic::Ordering, time::Instant};
 
 use smg_worker::runtime::RoutingState;
 
-use super::{keys, PolicyEngine, PoolMembers};
+use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Target, Trace},
@@ -172,7 +172,19 @@ pub(super) fn decide<'r>(
     if let Some(keyed) = keys::decide(engine, members.ring(), records, workers, &live, facts, &cx) {
         return keyed;
     }
-    records::decide(engine, records, workers, &live, facts, &cx)
+    // A profile whose stages read who holds the prompt is named its rows
+    // from the gateway's own data, at the decision's instant the keyed
+    // entry wrote, and its pick is recorded behind it; any other passes
+    // straight to the whole pass.
+    overlap::decide(
+        &own.affinity,
+        members.affinity(),
+        spec,
+        workers,
+        records.ids(),
+        facts,
+        |facts| records::decide(engine, records, workers, &live, facts, &cx),
+    )
 }
 
 /// The answer for a request whose host handed no list: a pool of no worker,
@@ -303,6 +315,7 @@ mod tests {
             decision::{LiftedVeto, Targets},
             decision_engine::{Decided, DecisionEngine, RequestMaker, WorkerLists},
             framework::{Picker, Place, PoolWord, TieBand},
+            prompt_hashes::HashSeeds,
             records::worker_id,
             store_backed_engine::DecisionRefused,
             view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
@@ -628,6 +641,48 @@ mod tests {
                 .err(),
             Some(DecisionRefused::PairSide)
         );
+    }
+
+    /// The default policy's single request is named the worker its prompt
+    /// was sent to. The whole pass reads the engine's record of sent
+    /// prefixes, which the pick before it wrote: a prompt goes back to its
+    /// worker whatever the request's seed, other prompts are not held to
+    /// that worker, and a worker told gone holds no prompt.
+    #[test]
+    fn the_default_policy_sends_a_prompt_back_to_the_worker_it_was_sent_to() {
+        let engine = preset("cache_aware");
+        let list = pool(8);
+        let members = engine.pool_members(&list);
+        let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+        let sent = |tokens: &[u32], seed: u64| {
+            let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = seed;
+            hashes.write_to(&mut asked.facts);
+            let asks = Asks::of(asked, Some(&members));
+            let decided = decided(&engine, &asks);
+            let pick = decided.decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        let asked = prompt(0);
+        let first = sent(&asked, 0);
+        for seed in 1..32 {
+            assert_eq!(sent(&asked, seed), first, "seed {seed}");
+        }
+        // Sixteen other prompts are placed by their seeds, over idle workers.
+        let others: Vec<u32> = (1..=16)
+            .map(|at| sent(&prompt(at * 100_000), u64::from(at)))
+            .collect();
+        assert!(others.iter().any(|&position| position != others[0]));
+        // With every worker told gone before a request, its seed places it.
+        let moved = (0..32).any(|seed| {
+            for worker in list.iter() {
+                engine.forget(worker.url());
+            }
+            sent(&asked, seed) != first
+        });
+        assert!(moved, "a forgotten worker holds no prompt");
+        assert_eq!(engine.affinity().left_out(), 0);
     }
 
     /// What a stage heard of a lease: the word, the worker the lease told

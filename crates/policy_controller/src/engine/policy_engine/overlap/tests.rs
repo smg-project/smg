@@ -202,7 +202,7 @@ impl Bed {
             &self.spec,
             &self.workers,
             &self.ids,
-            facts,
+            &mut { *facts },
             |facts| {
                 named = facts.named.map(|rows| Named {
                     holders: rows
@@ -357,6 +357,41 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
     assert_eq!(bed.holders(&longer, NOW), [(1, 0, 4)]);
     bed.affinity.sweep();
     assert_eq!(bed.holders(&asked, NOW), [(1, 0, 4)]);
+    // A turn that goes on from a recorded prompt writes the blocks it adds
+    // for the worker that holds the rest.
+    bed.decide(&request(&longer, 7, NOW), Some(1));
+    assert_eq!(bed.holders(&longer, NOW), [(1, 0, 6)]);
+    assert_eq!(bed.affinity.left_out(), 0);
+}
+
+/// A pick that meets a held record waits for nobody: it writes nothing, the
+/// record counts what it left out, and the next request of the prefix
+/// writes it.
+#[test]
+fn a_pick_that_meets_a_held_record_leaves_its_prefix_out() {
+    let (affinity, _, _) = hosted(false);
+    let bed = Bed::new(affinity, preset("cache_aware"), 4);
+    let asked = prompt(1_000, 4);
+    assert!(bed.holders(&asked, NOW).is_empty());
+    let record = {
+        let records = bed.affinity.records.lock();
+        Arc::clone(records.get(MODEL).expect("the model's record"))
+    };
+    {
+        let _reader = record.predictor.read();
+        bed.decide(&request(&asked, 7, NOW), Some(2));
+    }
+    assert_eq!(bed.affinity.left_out(), 1);
+    assert!(bed.holders(&asked, NOW).is_empty());
+    bed.decide(&request(&asked, 7, NOW), Some(2));
+    assert_eq!(bed.holders(&asked, NOW), [(2, 0, 4)]);
+    // The whole prompt again, its last use a second old: the write that
+    // would move it meets a held record and leaves nothing out.
+    {
+        let _reader = record.predictor.read();
+        bed.decide(&request(&asked, 7, NOW + 2 * SECOND), Some(2));
+    }
+    assert_eq!(bed.affinity.left_out(), 1);
 }
 
 /// A prompt of more blocks than one turn of the record's lock writes is
@@ -506,14 +541,14 @@ fn the_engine_decides_by_the_rows_named() {
         };
         let mut scratch = Scratch::new();
         let mut place = |seed| {
-            let request = request(&asked, seed, NOW);
+            let mut request = request(&asked, seed, NOW);
             let decision = decide(
                 &bed.affinity,
                 &bed.pool,
                 &bed.spec,
                 &bed.workers,
                 &bed.ids,
-                &request,
+                &mut request,
                 |request| {
                     let engine = bed.spec.engine();
                     engine.decide(
@@ -676,7 +711,7 @@ fn a_profile_named_no_row_is_handed_the_column() {
         &bed.spec,
         &bed.workers,
         &bed.ids,
-        &request(&asked, 7, NOW),
+        &mut request(&asked, 7, NOW),
         |facts| {
             assert!(facts.named.is_none());
             seen = Some(held(facts.affinity));

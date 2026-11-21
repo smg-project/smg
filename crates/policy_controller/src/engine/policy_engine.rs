@@ -35,7 +35,9 @@
 //! in [`pair`], with its decode asked again behind its prefill.
 //!
 //! The engine keeps no worker list, no health and no count of requests in
-//! flight. What it keeps is its stages' own: a rotation.
+//! flight. What it keeps is its stages' own: a rotation, and for the stages
+//! that read who holds a prompt, the record of the prefixes it sent
+//! ([`overlap`]).
 
 mod keys;
 pub mod overlap;
@@ -56,6 +58,7 @@ use std::{
 use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
+use self::overlap::{Affinity, PoolAffinity};
 use super::{
     decision::ShadowKind,
     decision_engine::{Decided, DecisionEngine, HeldDecision, RequestMaker, WorkerLists},
@@ -65,7 +68,7 @@ use super::{
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
     store_backed_engine::{DecideOutcome, DecisionRefused, Request, SweepOutcome},
-    view::{Phase, WireModes},
+    view::{fingerprint, Phase, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
@@ -102,6 +105,10 @@ pub struct PolicyEngine {
     /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
     /// and its plain requests are answered a place ([`Decided::Alone`]).
     hears: EventSet,
+    /// What the affinity stages read across decisions: the host's indexes
+    /// of cache events, once it handed them, and the engine's record of the
+    /// prefixes it sent, one a model ([`Self::affinity`]).
+    affinity: Affinity,
 }
 
 /// One pool of one model as the engine keeps it: the gateway's shared list
@@ -136,6 +143,10 @@ pub struct PoolMembers {
     /// by the picker ([`PolicyEngine::pick_among`]): `rotation` counts
     /// none, and nothing is kept in `alone`.
     part: bool,
+    /// What a decision whose stages read affinity keeps of the list
+    /// ([`Self::affinity`]): read at the list's first such decision, and by
+    /// no other.
+    affinity: PoolAffinity,
 }
 
 /// A word every pick over a pool writes, on cache lines of its own: what
@@ -167,6 +178,8 @@ impl PoolMembers {
             // A part's ring is the one decision's that reads it.
             ring: OnceLock::new(),
             part: true,
+            // So is what its affinity stages keep of it.
+            affinity: PoolAffinity::default(),
         }
     }
 
@@ -214,6 +227,17 @@ impl PoolMembers {
         &self.ring
     }
 
+    /// What a decision whose stages read affinity keeps of the list: each
+    /// worker's number in its model's index of cache events and the list's
+    /// warming rows, as a ruling read again at most once a second
+    /// ([`PoolAffinity`]). A caller that asks a whole decision of its own
+    /// over the list's records hands it to [`overlap::decide`], as a single
+    /// request's decision here does.
+    #[must_use]
+    pub fn affinity(&self) -> &PoolAffinity {
+        &self.affinity
+    }
+
     /// The profile the engine picks alone for a single request of `model`
     /// over this list ([`Place::Alone`]), under a binding that states no
     /// sessions rule: `None` where the place's decision asks more than one
@@ -257,7 +281,27 @@ impl PolicyEngine {
             faults: AtomicU64::new(0),
             unheard: AtomicU64::new(0),
             leases: OwnWord(AtomicU64::new(0)),
+            affinity: Affinity::default(),
         }
+    }
+
+    /// What the engine keeps for its affinity stages: the gateway hands its
+    /// indexes of cache events here, once, at its start
+    /// ([`Affinity::set_indexes`]), and reads the record's own count
+    /// ([`Affinity::left_out`]).
+    #[must_use]
+    pub fn affinity(&self) -> &Affinity {
+        &self.affinity
+    }
+
+    /// The worker at `address` left its pool or was replaced: the records
+    /// of sent prefixes forget it, so no later request is named a worker
+    /// that is gone. The gateway says it where it tells its classic
+    /// policies. A worker no record holds costs one lookup a model.
+    pub fn forget(&self, address: &str) {
+        // The id every decision knew the worker by ([`records::worker_id`]).
+        self.affinity
+            .forget(WorkerId(fingerprint(address.as_bytes())));
     }
 
     /// The clock of the engine's decisions. A caller that makes a list's
@@ -301,6 +345,7 @@ impl PolicyEngine {
             alone: OnceLock::new(),
             ring: OnceLock::new(),
             part: false,
+            affinity: PoolAffinity::default(),
         }
     }
 
@@ -546,10 +591,12 @@ impl DecisionEngine for PolicyEngine {
     // No lease is filed, so no pass ends one: a lease ends at its guard's
     // word or drop. The session keys past their end leave the engine's
     // table here, off the path of a request: from this pass's first run no
-    // read of a key sweeps the table.
+    // read of a key sweeps the table. The records of sent prefixes take a
+    // bounded step of the work they left waiting.
     fn sweep(&self, now: Instant) -> SweepOutcome {
         let sessions = self.spec.engine().sessions();
         sessions.sweep_due(self.clock.micros(now));
+        self.affinity.sweep();
         SweepOutcome::default()
     }
 
@@ -557,15 +604,18 @@ impl DecisionEngine for PolicyEngine {
         read(&self.spec)
     }
 
-    // The document's block size: no worker's reported size is read here.
+    // By the block size the model's cache events taught the host's index,
+    // so the index finds the blocks, and by the document's where the index
+    // knows none.
     fn prompt_hashes(
         &self,
-        _: &str,
+        model: &str,
         tokens: Option<&[u32]>,
         text: Option<&str>,
         seeds: HashSeeds,
     ) -> PromptHashes {
-        PromptHashes::under_document(&self.spec, None, tokens, text, seeds)
+        let size = self.affinity.block_size(model);
+        PromptHashes::under_document(&self.spec, size, tokens, text, seeds)
     }
 
     // The host's own pair index says why a fleet pairs nothing: the engine
@@ -670,7 +720,10 @@ mod tests {
     use smg_worker::{runtime::StallReason, test_support::ready_worker};
 
     use super::*;
-    use crate::{document::spec::PolicySpec, engine::framework::InTheWay};
+    use crate::{
+        document::spec::{Needs, PolicySpec},
+        engine::framework::InTheWay,
+    };
 
     const MODEL: &str = "model-a";
 
@@ -869,6 +922,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every request of a document is decided whole where each of its
+    /// places is picked alone or is an affinity profile the host feeds:
+    /// round robin asks nothing of a host, and the default policy asks for
+    /// everything its stages declare. A host that feeds less, a pair's plan
+    /// and a profile that reads no affinity are not decided so.
+    #[test]
+    fn a_document_is_decided_whole_where_each_place_is_picked_alone_or_fed() {
+        let whole = |engine: &PolicyEngine, fed: Needs| engine.spec().engine().single_and_fed(fed);
+        let nothing = Needs::default();
+        assert!(whole(&preset("round_robin"), nothing));
+        let default = preset("cache_aware");
+        let declared = default.spec().engine().needs_for(MODEL, Phase::Single);
+        assert!(declared.affinity && declared.loads && declared.sent_prefixes);
+        assert!(whole(&default, declared));
+        assert!(!whole(&default, nothing));
+        let unfed = Needs {
+            loads: false,
+            ..declared
+        };
+        assert!(!whole(&default, unfed), "its load stages read reports");
+        // A scorer that reads no affinity is not this rule's to let through.
+        assert!(!whole(&preset("least_load"), declared));
+        let mut pair =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
+        pair.generation = 1;
+        assert!(!whole(&engine_of(&pair), declared));
     }
 
     /// A pick tests a worker's health whole, as the pass does. A profile
