@@ -21,7 +21,7 @@ use smg_worker::{
 
 use super::{mark, Ask, End, Made, PolicyEngine, Prompt, Unplaced, Workers};
 use crate::routers::{
-    common::snapshot::{RoutingPool, WorkerRegistry},
+    common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
     grpc::backend_client::BasicWorkerBuilder,
 };
 
@@ -337,6 +337,39 @@ async fn an_ask_that_states_its_workers_is_decided_over_them_alone() {
         placed_on[at.expect("a worker of the list")] += 1;
     }
     assert_eq!(placed_on, [16, 16]);
+}
+
+/// An attempt's first ask is decided over the snapshot its route read, where
+/// the ask states one: a worker the registry lists since takes no request of
+/// it. An ask that states none reads the registry, and that worker takes its
+/// turn.
+#[tokio::test]
+async fn a_first_ask_is_decided_over_the_snapshot_its_route_read() {
+    let (policy_engine, _workers) = own("round_robin", 2);
+    let registry = policy_engine.registry();
+    let read = registry.get_routing_snapshot(MODEL);
+    let late: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://worker-late:8000")
+            .model(ModelCard::new(MODEL))
+            .health_config(no_health_check())
+            .build(),
+    );
+    late.set_status(WorkerStatus::Ready);
+    assert!(registry.register(Arc::clone(&late)).is_some());
+    for (snapshot, turns) in [(Some(&read), 0), (None, 2)] {
+        let mut on_late = 0;
+        for _ in 0..6 {
+            let id = mark();
+            let ask = Ask {
+                pool: Some(RoutingPool::HttpRegular),
+                snapshot,
+                ..Ask::of(&id, MODEL)
+            };
+            let placed = policy_engine.place(&ask, Instant::now()).await;
+            on_late += u32::from(Arc::ptr_eq(placed.expect("a worker").worker(), &late));
+        }
+        assert_eq!(on_late, turns, "a snapshot stated: {}", snapshot.is_some());
+    }
 }
 
 /// An ask held to one wire, over a pool whose workers are dialed on two, is
