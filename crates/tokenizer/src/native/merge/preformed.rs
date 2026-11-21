@@ -79,6 +79,55 @@ pub(super) struct Preformed {
     some: [u64; 16],
 }
 
+/// A vocabulary's tokens as the raw bytes they stand for, with their ids:
+/// one buffer for all of them, where a block per token was a few hundred
+/// thousand blocks alive at the peak of a load.
+pub(super) struct Raws {
+    bytes: Vec<u8>,
+    /// Per token: its id, where its bytes start and how many they are.
+    spans: Vec<(u32, usize, usize)>,
+}
+
+impl Raws {
+    /// For about `tokens` tokens: their spans in one allocation.
+    pub(super) fn for_tokens(tokens: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            spans: Vec::with_capacity(tokens),
+        }
+    }
+
+    /// Adds the token `id` with the bytes `raw` yields: nothing for a token
+    /// without bytes, with a byte missing, or whose bytes `keep` refuses.
+    pub(super) fn push(
+        &mut self,
+        id: u32,
+        raw: impl IntoIterator<Item = Option<u8>>,
+        keep: impl FnOnce(&[u8]) -> bool,
+    ) {
+        let start = self.bytes.len();
+        for byte in raw {
+            let Some(byte) = byte else {
+                self.bytes.truncate(start);
+                return;
+            };
+            self.bytes.push(byte);
+        }
+        let len = self.bytes.len() - start;
+        if len > 0 && keep(&self.bytes[start..]) {
+            self.spans.push((id, start, len));
+        } else {
+            self.bytes.truncate(start);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u32, &[u8])> {
+        self.spans
+            .iter()
+            .map(|(id, start, len)| (id, &self.bytes[*start..*start + *len]))
+    }
+}
+
 impl Preformed {
     /// No pre-formable character.
     pub(super) fn empty() -> Self {
@@ -125,18 +174,13 @@ impl Preformed {
     /// model's alphabet spellings mapped back, a rank file's bytes as they
     /// are); `min_operand` holds, per id, the least rank of a merge that
     /// takes the id as an operand (`u32::MAX` for none).
-    pub(super) fn analyse(
-        table: &MergeTable,
-        mut raws: Vec<(u32, Vec<u8>)>,
-        min_operand: &[u32],
-    ) -> Self {
-        raws.retain(|(_, raw)| !raw.is_empty());
-        raws.sort_unstable_by_key(|(id, _)| *id);
+    pub(super) fn analyse(table: &MergeTable, mut raws: Raws, min_operand: &[u32]) -> Self {
+        raws.spans.sort_unstable_by_key(|&(id, ..)| id);
         // The fragment tokens: leading continuation bytes -> the rest;
         // a trailing incomplete character -> the bytes before it.
         let mut heads: FxHashMap<&[u8], Vec<Box<[u8]>>> = FxHashMap::default();
         let mut tails: FxHashMap<&[u8], Vec<Box<[u8]>>> = FxHashMap::default();
-        for (_, raw) in &raws {
+        for (_, raw) in raws.iter() {
             let lead = raw
                 .iter()
                 .take_while(|&&b| is_continuation(b))
@@ -158,7 +202,7 @@ impl Preformed {
         let mut rules = vec![Rule::default()];
         let mut rule_index: FxHashMap<Rule, u32> = FxHashMap::default();
         let mut any = false;
-        for (id, raw) in &raws {
+        for (id, raw) in raws.iter() {
             if !(2..=4).contains(&raw.len()) || *id > ID_MASK {
                 continue;
             }
@@ -263,7 +307,7 @@ impl Preformed {
         // Adjacent whole characters inside any token (a fragment token's
         // whole characters count too).
         let mut pairs: Vec<u64> = Vec::new();
-        for (_, raw) in &raws {
+        for (_, raw) in raws.iter() {
             let mut prev: Option<(u32, usize)> = None;
             let mut i = 0;
             while i < raw.len() {

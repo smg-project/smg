@@ -64,7 +64,7 @@ use crate::{
 mod preformed;
 mod serialized;
 
-use preformed::{char_len, code_point, is_continuation, Preformed, NO_CHAR};
+use preformed::{char_len, code_point, is_continuation, Preformed, Raws, NO_CHAR};
 
 /// Entries of one bucket of the pair table: sixteen bytes each, so a bucket
 /// is one 64-byte cache line, read whole.
@@ -397,19 +397,18 @@ impl MergeTable {
             for (byte, &c) in alphabet.iter().enumerate() {
                 byte_of[c as usize] = Some(byte as u8);
             }
-            let raw_of = |token: &str| -> Option<Vec<u8>> {
-                token
-                    .chars()
-                    .map(|c| byte_of.get(c as usize).copied().flatten())
-                    .collect()
-            };
             // The entries borrowed from the read's listing when it has one,
             // by id where the read says the ids are the range, else through
             // a clone of the vocabulary map.
-            let raws = entries_of(bpe, read)
-                .filter_map(|(id, token)| raw_of(token.as_ref()).map(|raw| (id, raw)))
-                .filter(|(_, raw)| !table.lacks_a_token_for(raw))
-                .collect();
+            let entries = entries_of(bpe, read);
+            let mut raws = Raws::for_tokens(entries.size_hint().1.unwrap_or_default());
+            for (id, token) in entries {
+                let token: &str = token.as_ref();
+                let raw = token
+                    .chars()
+                    .map(|c| byte_of.get(c as usize).copied().flatten());
+                raws.push(id, raw, |raw| !table.lacks_a_token_for(raw));
+            }
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }
         Ok(table)
@@ -519,10 +518,10 @@ impl MergeTable {
             min_operand[left as usize] = min_operand[left as usize].min(rank);
             min_operand[right as usize] = min_operand[right as usize].min(rank);
         }
-        let raws = ranks
-            .iter()
-            .map(|(token, &rank)| (rank, token.clone()))
-            .collect();
+        let mut raws = Raws::for_tokens(ranks.len());
+        for (token, &rank) in ranks {
+            raws.push(rank, token.iter().copied().map(Some), |_| true);
+        }
         table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         Ok(table)
     }

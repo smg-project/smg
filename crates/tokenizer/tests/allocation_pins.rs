@@ -671,3 +671,27 @@ fn the_cached_wrappers_owned_render_wraps_in_place_as_the_renderers_does() {
         "allocation calls of the borrowed and the owned render through the cached wrapper"
     );
 }
+
+/// A merge more costs a load nine allocator calls: none of them is a block
+/// for the bytes the new token stands for, which the merge table's analysis
+/// reads into one buffer.
+#[test]
+fn a_merge_more_costs_a_load_no_block_for_its_tokens_bytes() {
+    let pairs: Vec<(String, String)> = ('a'..='j')
+        .flat_map(|x| ('a'..='t').map(move |y| (x.to_string(), y.to_string())))
+        .collect();
+    let more: Vec<(&str, &str)> = common::FEW_MERGES
+        .iter()
+        .copied()
+        .chain(pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())))
+        .collect();
+    let load = |merges: &[(&str, &str)]| {
+        let tokenizer = common::byte_level_bpe(merges, &[]);
+        allocations_during(|| HuggingFaceTokenizer::from_tokenizer(tokenizer)).1
+    };
+    assert_eq!(
+        (load(&more) - load(&common::FEW_MERGES)) / pairs.len(),
+        9,
+        "allocator calls a merge adds to a load"
+    );
+}
