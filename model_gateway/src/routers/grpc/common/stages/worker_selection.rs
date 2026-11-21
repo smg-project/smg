@@ -856,7 +856,7 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     candidate_filter: Some(&pinned),
-                    tried: &[],
+                    tried: &ctx.tried,
                 };
                 let ((pair, placed), guard) = self
                     .select_pd_attempt(
@@ -4612,6 +4612,167 @@ mod tests {
             selected(&ctx).url(),
             owner.url(),
             "with every engine tried the pool is used whole again"
+        );
+    }
+
+    /// A PD retry re-selects away from the prefill engine its failed attempt
+    /// used: the cache-aware policy recorded the prompt on it during that
+    /// attempt and would re-select it, so only the tried set moves the
+    /// retry; with every prefill tried the pool is used whole again.
+    #[tokio::test]
+    async fn reselect_pd_skips_the_prefill_engines_the_failed_attempts_used() {
+        let model_id = "tried-pd-prefill-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let mut prefills = Vec::new();
+        for (url, worker_type) in [
+            ("grpc://127.0.0.1:9330", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9331", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9332", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9333", WorkerType::Decode),
+        ] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(model_id))
+                    .worker_type(worker_type)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Vllm)
+                    .health_config(no_health_check())
+                    .build(),
+            );
+            worker_registry.register(Arc::clone(&worker)).unwrap();
+            if worker_type == WorkerType::Prefill {
+                prefills.push(worker);
+            }
+        }
+        // The file's cache-aware defaults: the relative gate alone (the
+        // `CacheAwareConfig::default` margin is 0) would spill the second
+        // pick off the owner, which still holds its first attempt's slot.
+        let cache_policy = Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            ..Default::default()
+        }));
+        cache_policy.init_workers(&prefills);
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry.set_prefill_policy(cache_policy);
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
+        // A prompt long enough for the token tree to record (a handful of
+        // tokens never reaches it).
+        let prompt: Vec<u32> = (1..=16).collect();
+        let plan = retained_plan(&prompt);
+        let selected_prefill = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Disaggregated { prefill, .. } => Arc::clone(prefill),
+            WorkerSelection::Single { .. } => panic!("expected PD selection"),
+        };
+
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let owner = selected_prefill(&ctx);
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        assert_eq!(
+            selected_prefill(&ctx).url(),
+            owner.url(),
+            "the prompt recorded on the first attempt's prefill re-selects it"
+        );
+
+        ctx.tried.push(owner.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let second = selected_prefill(&ctx);
+        assert_ne!(
+            second.url(),
+            owner.url(),
+            "the retry leaves the tried prefill engine"
+        );
+
+        ctx.tried.push(second.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let third = selected_prefill(&ctx);
+        assert!(
+            third.url() != owner.url() && third.url() != second.url(),
+            "the second retry leaves both tried prefill engines"
+        );
+
+        // With every prefill tried the pool is used whole again: the retry
+        // is placed, and no worker is refused for having been tried.
+        ctx.tried.push(third.base_url().to_string());
+        stage
+            .reselect(&mut ctx, &plan)
+            .await
+            .expect("a pool whose every prefill was tried takes the retry");
+    }
+
+    /// The decode side honors the tried set the same way: a routing key pins
+    /// the decode pick to one engine, and the retry leaves it while another
+    /// decode is left; with every decode tried the pool is used whole again.
+    #[tokio::test]
+    async fn reselect_pd_skips_the_decode_engines_the_failed_attempts_used() {
+        let model_id = "tried-pd-decode-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type) in [
+            ("grpc://127.0.0.1:9340", WorkerType::Prefill),
+            ("grpc://127.0.0.1:9341", WorkerType::Decode),
+            ("grpc://127.0.0.1:9342", WorkerType::Decode),
+        ] {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
+        ctx.headers = Some(headers);
+        let plan = retained_plan(&[1, 2, 3]);
+        let selected_decode = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Disaggregated { decode, .. } => Arc::clone(decode),
+            WorkerSelection::Single { .. } => panic!("expected PD selection"),
+        };
+
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let owner = selected_decode(&ctx);
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        assert_eq!(
+            selected_decode(&ctx).url(),
+            owner.url(),
+            "without a failed attempt the key re-selects its decode owner"
+        );
+
+        ctx.tried.push(owner.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        let second = selected_decode(&ctx);
+        assert_ne!(
+            second.url(),
+            owner.url(),
+            "the retry leaves the tried decode engine"
+        );
+
+        ctx.tried.push(second.base_url().to_string());
+        stage.reselect(&mut ctx, &plan).await.unwrap();
+        assert_eq!(
+            selected_decode(&ctx).url(),
+            owner.url(),
+            "with every decode tried the pool is used whole again"
         );
     }
 
