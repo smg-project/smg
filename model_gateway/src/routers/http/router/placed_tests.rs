@@ -1054,6 +1054,10 @@ fn own_router(preset: &str, urls: &[&str]) -> Case<Router> {
     document.generation = 1;
     let engine = Arc::new(OwnEngine::new(AppliedSpec::validate(&document)?));
     let policy_engine = PolicyEngine::own(engine, Arc::clone(&registry));
+    // The app's task fills a list's hash ring off the path of a request,
+    // and no request does: this bed has no such task, and fills the ring of
+    // its one list here.
+    assert!(policy_engine.fill_rings(MODEL));
     Ok(router(registry, Some(policy_engine)))
 }
 

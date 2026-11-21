@@ -810,6 +810,56 @@ impl PolicyEngine {
         prompt.hashed(|tokens, text, seeds| self.door.prompt_hashes(model, tokens, text, seeds))
     }
 
+    /// Fills the hash ring of each list a regular request of `model` is
+    /// placed over ([`RING_POOLS`]), where the engine of this process
+    /// places it by a ring ([`OwnEngine::fill_ring`]), and says whether the
+    /// engine of this process places the gateway's requests. `false` under
+    /// a followed controller, whose engine reads its own rows: nothing is
+    /// filled.
+    ///
+    /// For the task that hears the registry's membership events, off the
+    /// path of a request: a fill hashes every worker's positions and sorts
+    /// them, and no request builds a ring or waits for one. The lists are
+    /// the ones the registry publishes for `model` now, each with what the
+    /// engine keeps of it in the snapshot's cell, as a request finds it.
+    /// A list that holds no worker takes no ring. Under a document that
+    /// places the model by no ring nothing is made of its lists here.
+    pub(crate) fn fill_rings(&self, model: &str) -> bool {
+        let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) else {
+            return false;
+        };
+        if engine.reads_ring(model) {
+            let snapshot = registry.get_routing_snapshot(model);
+            for pool in RING_POOLS {
+                if !snapshot.pool(pool).is_empty() {
+                    engine.fill_ring(model, members_of(engine, &snapshot, pool));
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the engine's ring stands for each list a regular request of
+    /// `model` is placed over, where the document places it by a ring: the
+    /// requests of `model` walk the ring of the membership that stands. For
+    /// a caller that changed the membership and waits for the placements to
+    /// follow, as a test bed does.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn rings_stand(&self, model: &str) -> bool {
+        let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) else {
+            return true;
+        };
+        if !engine.reads_ring(model) {
+            return true;
+        }
+        let snapshot = registry.get_routing_snapshot(model);
+        RING_POOLS.into_iter().all(|pool| {
+            let members = snapshot.pool_members_cell(pool).get();
+            snapshot.pool(pool).is_empty()
+                || members.is_some_and(|members| members.ring().get().is_some())
+        })
+    }
+
     /// The policy engine of a bed that registers its workers by hand in
     /// `registry`.
     #[cfg(test)]
@@ -1414,12 +1464,9 @@ impl PolicyEngine {
                     .pool
                     .map(|pool| (registry.get_routing_snapshot(ask.model), pool)),
             };
-            let kept = snapshot.as_ref().map(|(snapshot, pool)| {
-                let list = snapshot.pool(*pool);
-                &**snapshot
-                    .pool_members_cell(*pool)
-                    .get_or_init(|| Box::new(engine.pool_members(list)))
-            });
+            let kept = snapshot
+                .as_ref()
+                .map(|(snapshot, pool)| members_of(engine, snapshot, *pool));
             // A list its route or its route's rule narrowed is a part of
             // its pool, and the engine's for this ask alone: its turns are
             // its set's own.
@@ -1602,6 +1649,25 @@ fn held_by(
         return Err(Unplaced::NoTargetHolds);
     }
     Ok(held)
+}
+
+/// The pools the engine of this process places a regular request over: the
+/// lists whose hash ring the gateway fills ([`PolicyEngine::fill_rings`]).
+const RING_POOLS: [RoutingPool; 2] = [RoutingPool::HttpRegular, RoutingPool::GrpcPipelineRegular];
+
+/// What `engine` keeps of `pool`'s list in `snapshot`, the registry's value
+/// of one membership: made at the first call for the pool and kept in the
+/// snapshot's cell beside the list, for as long as the list stands. The one
+/// read of the cell, for a request and for the fill of the list's ring.
+fn members_of<'s>(
+    engine: &OwnEngine,
+    snapshot: &'s ModelWorkerSnapshot,
+    pool: RoutingPool,
+) -> &'s PoolMembers {
+    let list = snapshot.pool(pool);
+    snapshot
+        .pool_members_cell(pool)
+        .get_or_init(|| Box::new(engine.pool_members(list)))
 }
 
 /// A request's end, as its router read it.

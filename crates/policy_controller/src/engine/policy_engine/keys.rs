@@ -6,8 +6,15 @@
 //! ring's walk is the key's owner and the members behind it. Here those rows
 //! are the records of a gateway's own list, each written when the decision
 //! asks about its worker ([`PoolRecords::read`]), and the ring is the
-//! list's own: built at the first decision that reads a ring over the list,
-//! kept with the list and never changed.
+//! list's own, kept with the list and never changed.
+//!
+//! No decision builds a list's ring, and none waits for one. The gateway
+//! builds it off the path of a request, where it hears of the list
+//! ([`PolicyEngine::fill_ring`]). A request that reads a ring before the
+//! list's stands is placed as one that carries no key
+//! ([`RequestFacts::ring_awaited`]).
+//!
+//! [`PolicyEngine::fill_ring`]: super::PolicyEngine::fill_ring
 
 use std::sync::{Arc, OnceLock};
 
@@ -49,16 +56,24 @@ impl<'r> PoolRows<'r> for ListRows<'r, '_> {
         self.records.generation()
     }
 
+    // One read of the cell: a list's ring is built off the path of a
+    // request, and stands or does not at this decision.
     fn ring(&self) -> Option<&'r PoolRing> {
-        Some(self.ring.get_or_init(|| ring_of(self.records)))
+        self.ring.get()
+    }
+
+    fn keeps_a_ring(&self) -> bool {
+        true
     }
 }
 
 /// The ring of the list `records` were made from: each worker by its id and
-/// its stable key, at its place in the list. Built once a list, by the
-/// first decision that reads it: a decision that asks meanwhile waits for
-/// that one build.
-fn ring_of(records: &PoolRecords) -> PoolRing {
+/// its stable key, at its place in the list. Built once a list, off the
+/// path of a request ([`PolicyEngine::fill_ring`]): it hashes every
+/// worker's positions and sorts them.
+///
+/// [`PolicyEngine::fill_ring`]: super::PolicyEngine::fill_ring
+pub(super) fn ring_of(records: &PoolRecords) -> PoolRing {
     PoolRing::new(records.fixed().iter().map(|row| (row.id, row.key)))
 }
 
@@ -68,7 +83,7 @@ fn ring_of(records: &PoolRecords) -> PoolRing {
 /// members behind it. `None` where the key decides nothing by those rows:
 /// the caller then asks the whole decision ([`records::decide`]) with the
 /// same `facts`, which carry the list's ring from here where the binding
-/// reads one.
+/// reads one, or the word that the ring is not built yet.
 ///
 /// The decision's instant is written into `facts` here
 /// ([`RequestFacts::now_micros`]), the one `live` was made at.

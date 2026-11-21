@@ -4,6 +4,7 @@
 
 use std::{cell::Cell, collections::HashMap, sync::Arc, time::Instant};
 
+use axum::http::{HeaderMap, HeaderValue};
 use openai_protocol::{
     model_card::ModelCard,
     worker::{WorkerLoadResponse, WorkerStatus},
@@ -22,7 +23,7 @@ use smg_worker::{
     test_support::no_health_check,
 };
 
-use super::{mark, Ask, End, Made, PolicyEngine, Prompt, Unplaced};
+use super::{mark, Ask, End, Made, PolicyEngine, Prompt, Unplaced, Workers};
 use crate::routers::{
     common::snapshot::{RoutingPool, WorkerRegistry},
     grpc::backend_client::BasicWorkerBuilder,
@@ -46,21 +47,25 @@ fn own_dialed(name: &str, modes: &[ConnectionMode]) -> (PolicyEngine, Vec<Arc<dy
     let listed = modes
         .iter()
         .enumerate()
-        .map(|(at, &mode)| {
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::new(format!("http://worker-{at}:8000"))
-                    .model(ModelCard::new(MODEL))
-                    .connection_mode(mode)
-                    .health_config(no_health_check())
-                    .build(),
-            );
-            worker.set_status(WorkerStatus::Ready);
-            assert!(registry.register(Arc::clone(&worker)).is_some());
-            worker
-        })
+        .map(|(at, &mode)| joined(&registry, at, mode))
         .collect();
     let engine = Arc::new(OwnEngine::new(spec));
     (PolicyEngine::own(engine, registry), listed)
+}
+
+/// A ready worker of [`MODEL`] dialed on `mode`, the `at`-th, registered in
+/// `registry`.
+fn joined(registry: &WorkerRegistry, at: usize, mode: ConnectionMode) -> Arc<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(format!("http://worker-{at}:8000"))
+            .model(ModelCard::new(MODEL))
+            .connection_mode(mode)
+            .health_config(no_health_check())
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    assert!(registry.register(Arc::clone(&worker)).is_some());
+    worker
 }
 
 /// A regular attempt under round robin is placed by the engine of this
@@ -509,4 +514,83 @@ async fn a_bucket_attempt_states_the_size_of_the_prompt_its_route_read() {
     let counted = u32::try_from(text.len()).expect("a short text") / TEXT_BYTES_PER_TOKEN;
     assert!(counted > 256);
     assert_eq!(placed.lease_tokens(), Some(counted));
+}
+
+/// The registry `policy_engine` decides over.
+fn registry_of(policy_engine: &PolicyEngine) -> &WorkerRegistry {
+    match &policy_engine.workers {
+        Workers::Listed(registry) => registry,
+        _ => panic!("the object of an engine of this process"),
+    }
+}
+
+/// The places in `workers` of the workers that `asks` requests of one
+/// routing key are placed on, each place once. Every request is placed.
+async fn places_of_one_key(
+    policy_engine: &PolicyEngine,
+    workers: &[Arc<dyn Worker>],
+    asks: usize,
+) -> Vec<usize> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-smg-routing-key",
+        HeaderValue::from_static("conversation"),
+    );
+    let mut places = Vec::new();
+    for _ in 0..asks {
+        let id = mark();
+        let ask = Ask {
+            headers: Some(&headers),
+            pool: Some(RoutingPool::HttpRegular),
+            ..Ask::of(&id, MODEL)
+        };
+        let now = Instant::now();
+        let placed = policy_engine.place(&ask, now).await;
+        let mut placed = placed.expect("placed, not refused");
+        let at = workers
+            .iter()
+            .position(|worker| Arc::ptr_eq(worker, placed.worker()))
+            .expect("a worker the registry lists");
+        placed.dispatched(now);
+        if !places.contains(&at) {
+            places.push(at);
+        }
+    }
+    places
+}
+
+/// No request builds a list's hash ring and none waits for one: here
+/// nothing fills a ring but the case's own call, so a request that waited
+/// would never return. A keyed request ahead of its list's ring is placed,
+/// not refused, as one that carries no key: one key is handed more workers
+/// than one. Once the ring stands the key keeps one worker. A worker that
+/// joins makes another list, whose ring is owed again: the key's requests
+/// are placed meanwhile, and behind the fill the key keeps the worker it
+/// had, or the one that joined.
+#[tokio::test]
+async fn a_keyed_request_ahead_of_its_lists_ring_is_placed_and_keeps_one_worker_behind_it() {
+    let (policy_engine, mut workers) = own("consistent_hashing", 8);
+    assert!(!policy_engine.rings_stand(MODEL));
+    let ahead = places_of_one_key(&policy_engine, &workers, 24).await;
+    assert!(ahead.len() > 1, "one key, one worker: a ring placed it");
+    assert!(
+        !policy_engine.rings_stand(MODEL),
+        "a request built the ring"
+    );
+
+    assert!(policy_engine.fill_rings(MODEL));
+    assert!(policy_engine.rings_stand(MODEL));
+    let kept = places_of_one_key(&policy_engine, &workers, 24).await;
+    assert_eq!(kept.len(), 1, "the key moved: {kept:?}");
+
+    workers.push(joined(registry_of(&policy_engine), 8, ConnectionMode::Http));
+    assert!(!policy_engine.rings_stand(MODEL), "another list");
+    let ahead = places_of_one_key(&policy_engine, &workers, 24).await;
+    assert!(ahead.len() > 1, "one key, one worker: a ring placed it");
+    assert!(policy_engine.fill_rings(MODEL));
+    let behind = places_of_one_key(&policy_engine, &workers, 24).await;
+    assert!(
+        behind == kept || behind == [8],
+        "the key had {kept:?} and has {behind:?}"
+    );
 }
