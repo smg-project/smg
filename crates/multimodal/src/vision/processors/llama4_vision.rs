@@ -128,6 +128,21 @@ impl Llama4VisionProcessor {
         }
     }
 
+    /// Refuse a tile size of zero, which the canvas divides by, and a tile
+    /// count of zero, which leaves no canvas to pick.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        let zero = if self.tile_size == 0 {
+            "size.height"
+        } else if self.max_patches == 0 {
+            "max_image_tiles"
+        } else {
+            return Ok(());
+        };
+        Err(TransformError::ShapeError(format!(
+            "Llama 4 {zero} must be positive"
+        )))
+    }
+
     /// Get the tile size.
     pub fn tile_size(&self) -> u32 {
         self.tile_size

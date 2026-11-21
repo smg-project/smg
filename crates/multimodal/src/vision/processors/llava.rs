@@ -241,6 +241,16 @@ impl LlavaProcessor {
         self
     }
 
+    /// Refuse a patch size of zero: the token count divides by it.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        if self.patch_size == 0 {
+            return Err(TransformError::ShapeError(
+                "LLaVA patch_size must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Process a single image through the LLaVA 1.5 pipeline.
     ///
     /// The processing flow depends on `self.aspect_ratio`:
@@ -438,6 +448,27 @@ impl LlavaNextProcessor {
     pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
         self.base.transforms = LlavaTransforms::new(config);
         self
+    }
+
+    /// Refuse a size of zero the token count, the anyres grid or the sample
+    /// crops divide by.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        self.base.validate()?;
+        let transforms = &self.base.transforms;
+        let target = transforms
+            .target_size
+            .map_or(self.base.image_size, |(h, _w)| h);
+        let crop = transforms.crop_size.unwrap_or((target, target));
+        let zero = if self.base.image_size == 0 {
+            "image_size"
+        } else if crop.0 == 0 || crop.1 == 0 {
+            "crop_size (or size, when it is absent)"
+        } else {
+            return Ok(());
+        };
+        Err(TransformError::ShapeError(format!(
+            "LLaVA-NeXT {zero} must be positive"
+        )))
     }
 
     /// Create a new LLaVA-NeXT processor with default settings.

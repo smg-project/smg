@@ -632,4 +632,76 @@ mod tests {
             })
         ));
     }
+
+    /// A size of zero that a processor divides by is refused when the
+    /// processor is built: served, it panics on every request with an image.
+    #[test]
+    fn a_size_of_zero_a_processor_divides_by_is_refused_at_construction() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let registry = ModelRegistry::new();
+        let served: Vec<String> = [
+            // The model type, its vision config, the preprocessor config.
+            ("qwen2_vl", "{}", r#"{"patch_size":0}"#, "patch_size"),
+            ("qwen3_vl", "{}", r#"{"merge_size":0}"#, "merge_size"),
+            (
+                "qwen3_omni_moe",
+                "{}",
+                r#"{"temporal_patch_size":0}"#,
+                "temporal_patch_size",
+            ),
+            ("minimax_m3_vl", "{}", r#"{"merge_size":0}"#, "merge_size"),
+            ("llava", r#"{"patch_size":0}"#, "{}", "patch_size"),
+            (
+                "llava",
+                r#"{"model_type":"pixtral"}"#,
+                r#"{"patch_size":0}"#,
+                "patch_size",
+            ),
+            ("llava_next", r#"{"patch_size":0}"#, "{}", "patch_size"),
+            ("llava_next", r#"{"image_size":0}"#, "{}", "image_size"),
+            (
+                "llava_next",
+                "{}",
+                r#"{"crop_size":{"height":0,"width":336}}"#,
+                "crop_size",
+            ),
+            (
+                "llava_next",
+                "{}",
+                r#"{"size":{"shortest_edge":0}}"#,
+                "or size",
+            ),
+            (
+                "llama4",
+                "{}",
+                r#"{"max_image_tiles":0}"#,
+                "max_image_tiles",
+            ),
+            (
+                "llama4",
+                "{}",
+                r#"{"size":{"height":0,"width":336}}"#,
+                "size.height",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(model_type, vision_config, config, size)| {
+            let vision_config: serde_json::Value = serde_json::from_str(vision_config).unwrap();
+            let model_config = json!({"model_type": model_type, "vision_config": vision_config});
+            let spec = registry
+                .lookup(&metadata(&tokenizer, &model_config))
+                .expect("a vision spec");
+            let config = PreProcessorConfig::from_json(config).unwrap();
+            match spec.vision_processor(&model_config, &config, Modality::Image) {
+                Err(ModelRegistryError::InvalidPreprocessorConfig { reason, .. })
+                    if reason.contains(size) =>
+                {
+                    None
+                }
+                other => Some(format!("{} {size}: {:?}", spec.name(), other.err())),
+            }
+        })
+        .collect();
+        assert_eq!(served, Vec::<String>::new());
+    }
 }

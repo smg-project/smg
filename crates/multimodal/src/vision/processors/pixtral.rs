@@ -113,6 +113,16 @@ impl PixtralProcessor {
         }
     }
 
+    /// Refuse a patch size of zero: the output size divides by it.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        if self.patch_size == 0 {
+            return Err(TransformError::ShapeError(
+                "Pixtral patch_size must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Calculates the target output size for an image.
     ///
     /// The image is resized to fit within `longest_edge` while preserving aspect ratio.
