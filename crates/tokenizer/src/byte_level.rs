@@ -271,16 +271,13 @@ impl ByteLevelTable {
     /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
     /// only after concatenation so characters may span token boundaries.
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
-        let mut bytes = Vec::with_capacity(self.decode_capacity(ids, skip_special_tokens));
-        for &id in ids {
-            if let Some((token_bytes, special)) = self.token_bytes(id) {
-                if !skip_special_tokens || !special {
-                    bytes.extend_from_slice(token_bytes);
-                }
-            }
-        }
-        text_of(bytes).0
+        self.concat(ids, skip_special_tokens, false)
+            .unwrap_or_default()
+            .0
     }
+
+    /// Bytes the decode copies at once for a short token.
+    const WINDOW: usize = 16;
 
     /// The ids of one streamed chunk: few enough that the exact sizing pass
     /// of [`Self::decode_capacity`] reads the entries the concatenation reads
@@ -328,21 +325,61 @@ impl ByteLevelTable {
     /// `None` at the first id without an entry, before anything is rendered,
     /// so the caller decodes the whole sequence its own way (the tiktoken
     /// backend's crate decode, with its unknown-id error and its lossy
-    /// fallback); otherwise the same bytes, concatenated and converted once,
-    /// with whether the conversion was lossy, for the caller's log.
+    /// fallback); otherwise the same text, with whether a conversion was
+    /// lossy, for the caller's log.
     pub(crate) fn decode_known(
         &self,
         ids: &[TokenIdType],
         skip_special_tokens: bool,
     ) -> Option<(String, bool)> {
-        let mut bytes = Vec::with_capacity(self.decode_capacity(ids, skip_special_tokens));
+        self.concat(ids, skip_special_tokens, true)
+    }
+
+    /// The text of `ids` and whether a conversion was lossy; `None` at an id
+    /// the vocabulary lacks when `known` is set (dropped otherwise). A token
+    /// that is whole on its own is appended as text, so nothing validates it
+    /// again. The others wait in a run that is converted when a whole token
+    /// or the end closes it: a whole token neither ends nor continues a
+    /// character, so the runs convert as the whole sequence would.
+    #[inline(always)]
+    fn concat(&self, ids: &[TokenIdType], skip: bool, known: bool) -> Option<(String, bool)> {
+        let mut text = String::with_capacity(self.decode_capacity(ids, skip));
+        let mut run = Vec::new();
+        let mut lossy = false;
         for &id in ids {
-            let (token_bytes, special) = self.token_bytes(id)?;
-            if !skip_special_tokens || !special {
-                bytes.extend_from_slice(token_bytes);
+            let Some((kind, span)) = self.locate(id) else {
+                if known {
+                    return None;
+                }
+                continue;
+            };
+            if skip && kind.special() {
+                continue;
+            }
+            if !kind.text() {
+                run.extend_from_slice(&self.bytes[span]);
+                continue;
+            }
+            if !run.is_empty() {
+                lossy |= close_run(&mut run, &mut text);
+            }
+            // A short token goes as one fixed window with the length cut
+            // back, where the buffer has the room: a copy call for a few
+            // bytes costs more than the bytes.
+            let room = text.capacity() - text.len() >= Self::WINDOW;
+            match self.text.get(span.start..span.start + Self::WINDOW) {
+                Some(window) if room && span.len() <= Self::WINDOW => {
+                    let end = text.len() + span.len();
+                    text.push_str(window);
+                    text.truncate(end);
+                }
+                _ => text.push_str(&self.text[span]),
             }
         }
-        Some(text_of(bytes))
+        if !run.is_empty() {
+            lossy |= close_run(&mut run, &mut text);
+        }
+        Some((text, lossy))
     }
 
     /// Where `id` lives: its kind and its span in the store the kind names;
@@ -390,14 +427,22 @@ impl ByteLevelTable {
     }
 }
 
-/// The text of concatenated token bytes: one UTF-8 conversion, lossy only
-/// when the sequence is not valid UTF-8 (a character cut by the sequence's
-/// end, or bytes that never formed one); the flag says it was lossy.
-fn text_of(bytes: Vec<u8>) -> (String, bool) {
-    match String::from_utf8(bytes) {
-        Ok(text) => (text, false),
-        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
-    }
+/// Appends the text of a run of token bytes and empties the run: one UTF-8
+/// conversion, lossy only when the run is not valid UTF-8 (a character cut by
+/// the run's end, or bytes that never formed one); true when it was lossy.
+fn close_run(run: &mut Vec<u8>, text: &mut String) -> bool {
+    let lossy = match std::str::from_utf8(run) {
+        Ok(whole) => {
+            text.push_str(whole);
+            false
+        }
+        Err(_) => {
+            text.push_str(&String::from_utf8_lossy(run));
+            true
+        }
+    };
+    run.clear();
+    lossy
 }
 
 /// The bytes a token string stands for: its chars mapped through the
