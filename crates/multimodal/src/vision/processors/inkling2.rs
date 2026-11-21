@@ -239,7 +239,11 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
                                 table[2][usize::from(blue)],
                             ]);
                         }
-                        let with_alpha = rgba.get(on_image.clone()).unwrap_or_default();
+                        let with_alpha = if rgb.is_none() {
+                            &rgba[on_image.clone()]
+                        } else {
+                            &[]
+                        };
                         for (x, &[red, green, blue, alpha]) in columns.clone().zip(with_alpha) {
                             // An opaque pixel composites to itself.
                             let [red, green, blue] = if alpha == u8::MAX {
