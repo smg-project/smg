@@ -15,7 +15,7 @@ use crate::{
     audio::DecodedAudio,
     buffer_pool,
     error::MediaConnectorError,
-    media::{apply_transparency, decode_image_bytes},
+    media::{apply_transparency, decode_frame_bytes},
     minimax_resize::resize_image,
     vision::{execution, transforms::resize_bicubic_pil},
 };
@@ -228,6 +228,9 @@ pub struct ImageFrame {
     /// Decode directly to the M3 source-policy dimensions in `size`.
     minimax_resize: bool,
     minimax_sglang_resize: bool,
+    /// The orientation tag the header read found, for the decode to apply
+    /// without a second parse of the header.
+    pub(crate) header_orientation: Option<image::metadata::Orientation>,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -511,6 +514,7 @@ impl ImageFrame {
             from_pixels: true,
             minimax_resize: false,
             minimax_sglang_resize: false,
+            header_orientation: None,
         }
     }
 
@@ -536,7 +540,17 @@ impl ImageFrame {
             from_pixels: false,
             minimax_resize: false,
             minimax_sglang_resize: false,
+            header_orientation: None,
         }
+    }
+
+    /// Hand the decode the orientation tag the header read found.
+    pub(crate) fn with_header_orientation(
+        mut self,
+        orientation: Option<image::metadata::Orientation>,
+    ) -> Self {
+        self.header_orientation = orientation;
+        self
     }
 
     /// Mark an encoded frame for one direct resize to its planned dimensions.
@@ -555,10 +569,11 @@ impl ImageFrame {
     /// not vouch for fails here, as the caller's input.
     pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
         self.decoded.get_or_try_init(|| {
-            let image = decode_image_bytes(
+            let image = decode_frame_bytes(
                 &self.raw_bytes,
                 self.max_long_side_pixel,
                 self.transparency(),
+                self.header_orientation,
             )?;
             Ok(if self.minimax_sglang_resize {
                 let resized = resize_bicubic_pil(&image, self.size.width, self.size.height);
@@ -1073,10 +1088,11 @@ mod tests {
                         for _ in 0..2 {
                             waiting_rx.recv().expect("pool waiter ready");
                         }
-                        decode_image_bytes(
+                        decode_frame_bytes(
                             &frame.raw_bytes,
                             frame.max_long_side_pixel,
                             frame.transparency(),
+                            frame.header_orientation,
                         )
                     })
                     .expect("decode and cap")

@@ -55,7 +55,7 @@ fn a_decoded_size_over_the_allocation_limit_is_refused_before_the_allocation() {
     }
     // The header is still readable on its own: the size probe does not
     // allocate the pixels.
-    let size = encoded_image_size(&bomb, None).expect("header read");
+    let (size, _) = encoded_image_size(&bomb, None).expect("header read");
     assert_eq!((size.width, size.height), (30_000, 30_000));
 }
 
