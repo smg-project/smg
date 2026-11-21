@@ -386,8 +386,8 @@ type ProbeFutures = FuturesUnordered<Pin<Box<dyn Future<Output = ProbeCompletion
 
 /// What the schedule does with a worker. Decided in one place,
 /// [`ProbeSlot::of`], for every writer of the schedule (the bootstrap and
-/// lag-recovery reconcile, the registration and replacement events, the
-/// connect signal, the due probes) and for the readers that ask whether a
+/// lag-recovery reconcile, the registration, replacement and status events,
+/// the connect signal, the due probes) and for the readers that ask whether a
 /// Failed worker is being removed (the connect signal, the loop after a
 /// probe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,8 +459,9 @@ impl ProbeSlot {
 
 /// Writes `worker_id`'s slot. A probed worker is due at once (`immediate`: a
 /// registration or replacement is probed without waiting an interval, so is
-/// a demoted worker a contact brings forward, and so is a worker the
-/// bootstrap finds without a verdict) or after its interval; any other slot
+/// a demoted worker a contact brings forward, a worker the bootstrap finds
+/// without a verdict, and one a status change puts back in a probed state
+/// with no deadline held) or after its interval; any other slot
 /// leaves the schedule. (A demoted worker's passing probe short of
 /// its success threshold brings the next read to a probe timeout away, or
 /// leaves an earlier deadline standing; that write is the health loop's own.)
@@ -682,9 +683,10 @@ async fn run_health_loop<G: Generation>(
 }
 
 /// Keeps the schedule in step with the registry: a registered or replaced
-/// worker is probed at once, a removed one leaves the schedule, and a lagged
-/// subscription rebuilds it from a fresh snapshot. `Break` when the registry
-/// is gone and the loop has nothing left to serve.
+/// worker is probed at once, so is one whose status moves into a probed state
+/// while the schedule holds no deadline for it, a removed one leaves the
+/// schedule, and a lagged subscription rebuilds it from a fresh snapshot.
+/// `Break` when the registry is gone and the loop has nothing left to serve.
 fn apply_registry_event<G: Generation>(
     event: Result<WorkerEvent, broadcast::error::RecvError>,
     registry: &Arc<WorkerRegistry<G>>,
@@ -716,9 +718,32 @@ fn apply_registry_event<G: Generation>(
         Ok(WorkerEvent::Removed { worker_id, .. }) => {
             next_check.remove(&worker_id);
         }
-        Ok(WorkerEvent::StatusChanged { .. }) => {
-            // Self-published; nothing to do.
+        // The loop's own transitions and a contact's promotion find their
+        // deadline in place. Another writer's finds none when the worker last
+        // read a state without a slot: the activation of a replacement that
+        // inherited `Draining` puts back in service a worker the schedule no
+        // longer holds.
+        Ok(WorkerEvent::StatusChanged { worker_id, .. })
+            if !next_check.contains_key(&worker_id) =>
+        {
+            if let Some(worker) = registry.get(&worker_id) {
+                let slot = ProbeSlot::of_worker(
+                    registry,
+                    &worker_id,
+                    worker.as_ref(),
+                    worker.status(),
+                    config,
+                );
+                schedule_at(
+                    next_check,
+                    worker_id,
+                    slot,
+                    tokio::time::Instant::now(),
+                    true,
+                );
+            }
         }
+        Ok(WorkerEvent::StatusChanged { .. }) => {}
         Err(broadcast::error::RecvError::Lagged(n)) => {
             warn!("WorkerManager lagged {n} events; rebuilding schedule from registry");
             next_check.clear();

@@ -1113,6 +1113,11 @@ impl BasicWorker {
         self.runtime.load_full()
     }
 
+    #[cfg(feature = "workflow")]
+    pub(crate) fn drained_at(&self) -> u64 {
+        self.runtime.load().drained_at()
+    }
+
     /// Start the one-shot background ZMQ handshake driver for `cell` unless one
     /// is already in flight.
     ///
