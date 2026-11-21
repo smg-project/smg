@@ -1790,6 +1790,44 @@ mod tests {
         assert_eq!(content_of(&delivered), content_of(&unnoted));
     }
 
+    /// An answer of whitespace alone is released as content at its end: it is the whole
+    /// answer. Whitespace before a call block is the template's spacing, and stays so when
+    /// the output ends in the block: where an invoke began and the output ended before any
+    /// byte of its name, the table says a call was lost with no byte to refuse, the answer is
+    /// no empty one, and nothing is released; one byte further the invoke's bytes are, as
+    /// before.
+    #[test]
+    fn whitespace_before_an_invoke_the_output_ended_in_stays_the_templates() {
+        use symphony::formats::minimax_m3;
+        let alone = read_pieces(minimax_m3(), "", &["\n\n"], EngineFinish::Length);
+        assert_eq!(content_of(&alone), "\n\n");
+        let block = read_pieces(
+            minimax_m3(),
+            "",
+            &["\n\n", "<tool_call>\n"],
+            EngineFinish::Length,
+        );
+        assert_eq!(content_of(&block), "\n\n");
+        let begun = read_pieces(
+            minimax_m3(),
+            "",
+            &["\n\n", "<tool_call>\n<invoke name=\""],
+            EngineFinish::Length,
+        );
+        assert_eq!(content_of(&begun), "", "{begun:?}");
+        assert!(begun.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::UnterminatedRegion } if text.text.is_empty()
+        )));
+        let named = read_pieces(
+            minimax_m3(),
+            "",
+            &["\n\n", "<tool_call>\n<invoke name=\"l"],
+            EngineFinish::Length,
+        );
+        assert_eq!(content_of(&named), "<invoke name=\"l", "{named:?}");
+    }
+
     /// A reader without the rule has no verdict, whatever the output: the events it delivers
     /// are the table's, a cut call among them.
     #[test]
