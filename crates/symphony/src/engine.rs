@@ -981,9 +981,11 @@ impl Engine {
         matches!(self.format.call_syntax(), Some(CallSyntax::Xml))
     }
 
-    /// Text between a block's calls of a syntax whose calls are tags. A closing tag there names
-    /// nothing open, since no call is, and is ignored ([`Self::stray_close`]); everything else
-    /// is text where the template only wraps ([`Self::wrapping`]), as under any syntax. A tag is
+    /// Text between a block's calls of a syntax whose calls are tags. A closing tag there, with
+    /// no text before it since the last call, names nothing open, since no call is, and is
+    /// ignored ([`Self::stray_close`]); everything else is text where the template only wraps
+    /// ([`Self::wrapping`]), as under any syntax, a closing tag after text of the stay
+    /// included: the model is writing prose there, and a tag in it is the prose's. A tag is
     /// read across pieces: from its `</` the bytes are held while they can still spell one, so
     /// where the deltas cut it changes nothing, and bytes that spell none after all are the
     /// stay's text, in the run they stand in.
@@ -1021,8 +1023,21 @@ impl Engine {
             let here = began.take();
             let name = tag.strip_prefix('/').unwrap_or_default();
             if c == '>' && !name.is_empty() && !name.contains('/') {
-                // A whole closing tag: the text before it goes on, the tag is ignored.
+                // A whole closing tag. After text of the stay it is the prose's, where the
+                // model wrote it: begun in this piece it stays in the run it stands in, begun
+                // in an earlier one the bytes held go on as text.
                 let before = here.unwrap_or(plain);
+                let in_prose =
+                    self.stay.begun || text[plain..before].contains(|c: char| !c.is_whitespace());
+                if in_prose {
+                    if here.is_none() {
+                        self.wrapping(Cow::Owned(format!("<{tag}>")), why, out);
+                        plain = at + c.len_utf8();
+                    }
+                    continue;
+                }
+                // With no text before it since the last call it names nothing open: the
+                // whitespace before it goes on, the tag is ignored.
                 if plain < before {
                     self.wrapping(part(&text, plain..before), why, out);
                 }
@@ -1052,8 +1067,9 @@ impl Engine {
         }
     }
 
-    /// A closing tag between a block's calls: it names nothing open, since no call is, and is
-    /// ignored as a syntax ignores one between a call's members. It is counted by a
+    /// A closing tag between a block's calls, with no text before it since the last call: it
+    /// names nothing open, since no call is, and is ignored as a syntax ignores one between a
+    /// call's members. It is counted by a
     /// `Malformed { StrayClosingTag }` event of no bytes, and its own bytes leave as a malformed
     /// call's, never content. The run the stay held before it is the template's spacing around
     /// a tag, dropped as at any tag.

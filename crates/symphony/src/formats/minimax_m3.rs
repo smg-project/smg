@@ -2315,6 +2315,67 @@ mod tests {
         );
     }
 
+    /// A closing tag in prose between a block's invokes is the prose's: once the model has
+    /// written text there, a closing tag after it stands where the model wrote it, in the
+    /// content the client reads, whole and at every cut. Only a closing tag with no text before
+    /// it since the last invoke is ignored. The prose is still text where a call should be.
+    #[test]
+    fn a_closing_tag_in_prose_between_a_blocks_invokes_stays_in_the_prose() {
+        let call = "<invoke name=\"get_weather\"><city>Seattle</city></invoke>";
+        let next = "<invoke name=\"get_weather\"><city>NYC</city></invoke>";
+        for (output, prose, calls) in [
+            (
+                format!("<tool_call>\n{call}\nNow <code>g</code> next\n{next}\n</tool_call>"),
+                "Now <code>g</code> next",
+                2,
+            ),
+            (
+                "<tool_call>\nI would call </tool> here\n</tool_call>".to_string(),
+                "I would call </tool> here",
+                0,
+            ),
+            (
+                format!("<tool_call>\n{call}\nsee</invoke>\n</tool_call>"),
+                "see</invoke>",
+                1,
+            ),
+            (
+                format!("<tool_call>\n{call}\nsee ]<]minimax[>[</city> there\n</tool_call>"),
+                "see </city> there",
+                1,
+            ),
+        ] {
+            let read = |pieces: &[&str]| run_with(weather_and_typed(), "", pieces);
+            let whole = read(&[&output]);
+            assert_eq!(bytes(&whole), output);
+            assert_eq!(names(&whole).len(), calls, "{output}");
+            assert_eq!(shown(&whole).as_deref(), Some(prose), "{output}");
+            assert_eq!(streamed(&whole), prose, "{output}");
+            assert!(reported(&whole).is_empty(), "{output}: {whole:#?}");
+            assert_eq!(refused(&whole), "", "{output}");
+            let lost = losses(&whole);
+            assert!(
+                !lost.is_empty()
+                    && lost
+                        .iter()
+                        .all(|why| *why == MalformedReason::TextBetweenCalls),
+                "{output}: {lost:?}"
+            );
+            for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+                let events = read(&[&output[..cut], &output[cut..]]);
+                assert_eq!(bytes(&events), output, "cut at {cut}");
+                assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+                assert_eq!(streamed(&events), prose, "cut at {cut}");
+            }
+            let pieces: Vec<&str> = output
+                .char_indices()
+                .map(|(at, c)| &output[at..at + c.len_utf8()])
+                .collect();
+            let events = read(&pieces);
+            assert_eq!(shown(&events).as_deref(), Some(prose), "{output}");
+        }
+    }
+
     /// The end of the output closes nothing for the model. An invoke the output ends inside is
     /// a call the model did not end, whatever it had closed inside it: its end says so (`stop`
     /// at the model's stop, `cut` at a cut), where the same bytes before the invoke's closing

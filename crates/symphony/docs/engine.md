@@ -198,8 +198,9 @@ is a later step).
   the template's spacing when a row ends the stay or the stream does. So a client reads prose
   between two calls, or after a call's object, as the model wrote it, byte for byte, whole and
   streamed alike. One syntax reads tags there: between a block's calls of the XML syntax, whose
-  calls are tags, a closing tag names nothing open, since no call is, and is ignored as the
-  syntax ignores one between a call's members (`Engine::wrapping_tags`): one
+  calls are tags, a closing tag with no text before it since the last call names nothing open,
+  since no call is, and is ignored as the syntax ignores one between a call's members
+  (`Engine::wrapping_tags`; after text of the stay it is the prose's, and stays in it): one
   `Malformed { StrayClosingTag }` event of no bytes, the tag's bytes `Dropped { MalformedCall }`
   and never content. The tag is read across deltas, its bytes held from `</` while they can
   still spell one; bytes that spell none after all are the stay's text, as before.
