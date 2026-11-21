@@ -4,7 +4,7 @@
 //! A host asks its door for a decision ([`DecisionGuard::decide`]) or, with the
 //! `client` feature, awaits one over a link (`DecisionGuard::asked`). It keeps
 //! the handle while it commits a target, sends the request and reads its end.
-//! Each report goes through the door ([`StoreBackedEngine::report`]) or onto
+//! Each report goes through the door ([`DecisionEngine::say`]) or onto
 //! the link's session. The thread that says it is never held for a decision.
 //! Whoever applies a report tells the engine that issued the lease.
 //!
@@ -73,15 +73,13 @@ use crate::service::client::{wire, DecisionUnavailable, Error, Link};
 use crate::{
     engine::{
         decision::{Decision, Target},
+        decision_engine::{DecisionEngine, RequestMaker},
         framework::{EncodeItems, EncodePlaced},
-        store_backed_engine::{
-            self, DecideOutcome, DecisionRefused, Leased, Request, RequestFromSnapshot,
-            StoreBackedEngine,
-        },
+        store_backed_engine::{DecideOutcome, DecisionRefused, Leased, Request},
         view::WorkerId,
     },
     store::{DecodeRefused, Dispatch, GatewayId, Said},
-    tracking::lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 /// Where a handle's decision came from, and where its reports go.
@@ -151,7 +149,7 @@ fn micros(span: Duration) -> u32 {
 /// its caller's frame, a shared pointer where it travels with the request.
 /// A handle that asks over a link has the same type and keeps the link
 /// for its reports and for its drop.
-pub struct DecisionGuard<D: Deref<Target = StoreBackedEngine>> {
+pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     arm: Arm<D>,
     decided: DecideOutcome,
     /// The index to name at dispatch: the first until the host takes
@@ -165,9 +163,9 @@ pub struct DecisionGuard<D: Deref<Target = StoreBackedEngine>> {
     decode: Owed,
 }
 
-impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
+impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// One decision of `door` for `gateway`'s `request` at `now`, on the
-    /// calling thread ([`StoreBackedEngine::decide`]), held.
+    /// calling thread ([`DecisionEngine::decide`]), held.
     ///
     /// # Errors
     ///
@@ -189,7 +187,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     }
 
     /// [`DecisionGuard::decide`] for a request its host makes from the world
-    /// the door decides under ([`StoreBackedEngine::decide_under`]).
+    /// the door decides under ([`DecisionEngine::decide_under`]).
     ///
     /// # Errors
     ///
@@ -197,10 +195,10 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     pub fn decide_under(
         door: D,
         gateway: GatewayId,
-        maker: &impl RequestFromSnapshot,
+        maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<Self, DecisionRefused> {
-        let (decided, later) = door.decide_under_stated(gateway, maker, now)?;
+        let (decided, later) = door.decide_under(gateway, maker, now)?;
         Ok(Self::hold(
             Arm::Engine { door, gateway },
             decided,
@@ -210,7 +208,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     }
 
     /// Holds the decision made with the request's encode items
-    /// ([`StoreBackedEngine::decide_encode_pair`]). For a pair, the handle
+    /// ([`DecisionEngine::decide_encode_pair`]). For a pair, the handle
     /// reports the prefill and decode.
     ///
     /// # Errors
@@ -304,22 +302,24 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
         request: &Request<'_>,
         now: Instant,
     ) -> Result<&Decision, DecisionRefused> {
-        self.decode_decided(|door, gateway, lease| door.decide_decode(gateway, request, lease, now))
+        self.decode_decided(|door, gateway, lease, prefill| {
+            door.decide_decode(gateway, request, lease, prefill, now)
+        })
     }
 
     /// [`Self::decide_decode`] for a request its host makes from the world
-    /// the call decides under ([`StoreBackedEngine::decide_decode_under`]).
+    /// the call decides under ([`DecisionEngine::decide_decode_under`]).
     ///
     /// # Errors
     ///
     /// As [`Self::decide_decode`].
     pub fn decide_decode_under(
         &mut self,
-        maker: &impl RequestFromSnapshot,
+        maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<&Decision, DecisionRefused> {
-        self.decode_decided(|door, gateway, lease| {
-            door.decide_decode_under(gateway, maker, lease, now)
+        self.decode_decided(|door, gateway, lease, prefill| {
+            door.decide_decode_under(gateway, maker, lease, prefill, now)
         })
     }
 
@@ -328,16 +328,19 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     fn decode_decided(
         &mut self,
         call: impl FnOnce(
-            &StoreBackedEngine,
+            &D::Target,
             GatewayId,
-            LeaseId,
+            &Lease,
+            &Target,
         ) -> Result<DecideOutcome, DecisionRefused>,
     ) -> Result<&Decision, DecisionRefused> {
+        // What the handle holds of the pair goes with the call: the lease
+        // as issued, and the prefill its host took.
         let lease = self
             .lease()
             .ok_or(DecisionRefused::Decode(DecodeRefused::NoLease))?
-            .lease
-            .id;
+            .lease;
+        let prefill = self.target;
         // The handle's own word comes first, where it knows the answer. A
         // single's lease has no decode side. A pair whose two sides are
         // owed nothing has left the store, and the answer is the store's.
@@ -356,7 +359,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
             _ => {}
         }
         let answer = match &self.arm {
-            Arm::Engine { door, gateway } => call(door, *gateway, lease)?,
+            Arm::Engine { door, gateway } => call(door, *gateway, &lease, &prefill)?,
             // A controller over a link issued both sides at the first ask.
             #[cfg(feature = "client")]
             Arm::Link(_) => return Err(DecisionRefused::Decode(DecodeRefused::NotChosen)),
@@ -452,16 +455,14 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     )]
     fn say(&self, lease: LeaseId, side: Side, said: Said, now: Instant) {
         match &self.arm {
-            Arm::Engine { door, gateway } => match said {
-                Said::Completed(outcome) => {
-                    store_backed_engine::completed(door.store(), *gateway, &outcome, now, |said| {
-                        door.report(*gateway, lease, said);
-                    });
+            // The engine is handed what the handle holds of the lease: the
+            // lease as issued, and the target its host took.
+            Arm::Engine { door, gateway } => {
+                if let Some(leased) = &self.decided.lease {
+                    debug_assert_eq!(leased.lease.id, lease, "a handle says of its own lease");
+                    door.say(*gateway, &leased.lease, &self.target, said, now);
                 }
-                Said::Dispatched(..) | Said::Released(..) => {
-                    door.report(*gateway, lease, said);
-                }
-            },
+            }
             #[cfg(feature = "client")]
             Arm::Link(link) => {
                 // With no session standing the report waits in the link's line.
@@ -628,7 +629,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
 }
 
 #[cfg(feature = "client")]
-impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
+impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// One decision of the controller behind `link` for `request`, asked at
     /// `now` and held. The one call of a handle that waits.
     ///
@@ -689,7 +690,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     }
 }
 
-impl<D: Deref<Target = StoreBackedEngine>> Drop for DecisionGuard<D> {
+impl<D: Deref<Target: DecisionEngine>> Drop for DecisionGuard<D> {
     /// A handle dropped with a report owed speaks for a lease nobody
     /// spoke for, in the word of its phase that names no cause: a release
     /// as abandoned before any dispatch, a completion of class cancelled
@@ -704,7 +705,7 @@ impl<D: Deref<Target = StoreBackedEngine>> Drop for DecisionGuard<D> {
     }
 }
 
-impl<D: Deref<Target = StoreBackedEngine>> fmt::Debug for DecisionGuard<D> {
+impl<D: Deref<Target: DecisionEngine>> fmt::Debug for DecisionGuard<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DecisionGuard")
             .field("decided", &self.decided)
@@ -730,8 +731,10 @@ mod tests {
 
     use super::DecisionGuard;
     use crate::{
+        document::spec::AppliedSpec,
         engine::{
             decision::{Decision, Target, Targets},
+            decision_engine::RequestMaker,
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
             store_backed_engine::{
                 tests::{
@@ -739,7 +742,7 @@ mod tests {
                     pair_fleet, pair_request, picking, push_fleet, request, Ends, GATEWAY,
                     PATIENCE,
                 },
-                DecisionRefused, Request, RequestFromSnapshot, StoreBackedEngine,
+                DecisionRefused, Request, StoreBackedEngine,
             },
             view::{Candidate, Identity, RequestFacts, WorkerId},
         },
@@ -747,7 +750,7 @@ mod tests {
         stages::lifecycle::Lifecycle,
         store::{
             DecodeRefused, Dispatch, HealthSink, LeaseState, LeasesStore, MemoryStore, Said,
-            StoreSnapshot, WorkersStore,
+            WorkersStore,
         },
         tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     };
@@ -1564,12 +1567,12 @@ mod tests {
     /// A host that makes a pair's request with a later decode.
     struct Later;
 
-    impl RequestFromSnapshot for Later {
+    impl RequestMaker for Later {
         fn model(&self) -> &str {
             later_request(b"pair").facts.model
         }
 
-        fn make<'w>(&'w self, _: &'w StoreSnapshot) -> Request<'w> {
+        fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
             later_request(b"pair")
         }
     }

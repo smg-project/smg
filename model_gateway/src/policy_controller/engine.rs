@@ -44,10 +44,10 @@ use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
     engine::{
         Constraints, Decision, DecisionRefused, Identity, LiftedVeto, MediaCounts, Pair, Phase,
-        Request, RequestFacts, RequestFromSnapshot, ShadowKind, ShedReason, StoreBackedEngine,
+        Request, RequestFacts, RequestMaker, ShadowKind, ShedReason, StoreBackedEngine,
         SweepOutcome, Targets, Trace, WireModes, WorkerId, MAX_TARGETS,
     },
-    store::{GatewayId, MemoryStore, StoreSnapshot},
+    store::{GatewayId, MemoryStore},
     tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
     worker_host::Objects,
 };
@@ -282,13 +282,13 @@ struct Made<'r, 'a> {
     source: Cell<Option<&'static str>>,
 }
 
-impl RequestFromSnapshot for Made<'_, '_> {
+impl RequestMaker for Made<'_, '_> {
     fn model(&self) -> &str {
         self.ask.model
     }
 
-    fn make<'w>(&'w self, world: &'w StoreSnapshot) -> Request<'w> {
-        let (derived, client_key) = self.ask.keys(world.spec());
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        let (derived, client_key) = self.ask.keys(spec);
         self.source.set(derived.map(|derived| match derived.source {
             KeySource::Header(_) => "header",
             KeySource::Rid => "rid",
@@ -297,7 +297,7 @@ impl RequestFromSnapshot for Made<'_, '_> {
         let mut request = self.ask.request(key, client_key, self.missed);
         // The document's word, like the keys: read from the generation
         // that decides.
-        request.constraints.decode_later = self.ask.decode_later(world.spec());
+        request.constraints.decode_later = self.ask.decode_later(spec);
         request
     }
 }

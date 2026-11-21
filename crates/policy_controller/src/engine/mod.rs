@@ -14,6 +14,7 @@
 //! warming rows by it.
 
 pub(crate) mod decision;
+pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
 pub(crate) mod framework;
@@ -30,6 +31,9 @@ pub use decision::{
     Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, Queue, ShadowKind, Shed, ShedReason,
     Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
+#[cfg(feature = "in-process")]
+pub use decision_engine::HostWorkers;
+pub use decision_engine::{DecisionEngine, RequestMaker};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{
@@ -47,7 +51,7 @@ pub use sticky_sessions::{
 };
 pub use store_backed_engine::{
     DecideOutcome, DecisionExplanation, DecisionNames, DecisionRecord, DecisionRefused, Leased,
-    Request, RequestFromSnapshot, StoreBackedEngine, SweepOutcome, SHADOW_ROWS,
+    Request, StoreBackedEngine, SweepOutcome, SHADOW_ROWS,
 };
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
