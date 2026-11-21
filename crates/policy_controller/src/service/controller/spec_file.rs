@@ -1311,6 +1311,10 @@ pub(crate) mod tests {
         );
 
         assert!(started.is_ok(), "the standing file starts after the retry");
+        // The look whose read met the replacement, and the two around the
+        // read of the restored file. Where the stamp of the renames shows,
+        // that read is made once more.
+        assert!(looks >= 3, "the transient read is retried");
         assert!(read_attempts >= 2, "the transient read is retried");
         assert_eq!(unexpected_reads.load(Ordering::Relaxed), 0);
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
