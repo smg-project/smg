@@ -13,6 +13,7 @@
 
 use crate::shape::{Layout, Message};
 
+pub mod command;
 pub mod deepseek_v3;
 pub mod deepseek_v3_1;
 pub mod deepseek_v3_2;
@@ -52,6 +53,7 @@ pub mod registry;
 pub mod seed_oss;
 pub mod xlam;
 
+pub use command::command;
 pub use deepseek_v3::deepseek_v3;
 pub use deepseek_v3_1::deepseek_v3_1;
 pub use deepseek_v3_2::deepseek_v3_2;

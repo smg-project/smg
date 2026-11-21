@@ -60,6 +60,9 @@ impl From<&common::NamedValue> for NamedValue {
 impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
     /// Read input capacity directly, including absence after the samples expire.
     fn from(record: &common::EngineLoad) -> Self {
+        // Read first: no fixed field below is then held across this
+        // read's calls, and each is written to its place once.
+        let values = read_values(&record.values);
         let signed = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
         let disagg = record.disaggregation.as_ref();
         Self {
@@ -113,7 +116,7 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
                     .saturating_add(d.decode_retracted_queue_reqs)
             }),
             disagg_mode: disagg.map(|d| d.mode.clone()),
-            values: read_values(&record.values),
+            values,
             ..Default::default()
         }
     }

@@ -862,6 +862,9 @@ impl PDRouter {
         // The rows of the pairs the request's failed attempts were sent to,
         // for the policy engine. The classic path leaves it empty.
         let tried_rows = parking_lot::Mutex::new(Vec::new());
+        // Their engines, for the classic selection: a retry steps off them
+        // (`PlacementInputs::tried`). The policy engine leaves it empty.
+        let tried = parking_lot::Mutex::new(Vec::new());
 
         let response = if let Some(denied) = denial {
             denied
@@ -869,7 +872,15 @@ impl PDRouter {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
-                .execute_dual_dispatch_attempt(0, headers, &lease, context, &ledger, &tried_rows)
+                .execute_dual_dispatch_attempt(
+                    0,
+                    headers,
+                    &lease,
+                    context,
+                    &ledger,
+                    &tried,
+                    &tried_rows,
+                )
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
@@ -881,7 +892,7 @@ impl PDRouter {
         } else {
             // The lease keeps the request alive for replay until the retry
             // window closes (first non-retryable response).
-            let (lease, ledger, tried_rows) = (&lease, &ledger, &tried_rows);
+            let (lease, ledger, tried, tried_rows) = (&lease, &ledger, &tried, &tried_rows);
             RetryExecutor::execute_response_with_retry(
                 retry_config,
                 {
@@ -889,7 +900,7 @@ impl PDRouter {
                         let context = context.clone();
                         async move {
                             self.execute_dual_dispatch_attempt(
-                                attempt, headers, lease, context, ledger, tried_rows,
+                                attempt, headers, lease, context, ledger, tried, tried_rows,
                             )
                             .await
                         }
@@ -963,6 +974,10 @@ impl PDRouter {
     /// A retry selects around the workers the request's `ledger` closed the
     /// retry window on, and the attempt's answer is settled on that ledger
     /// ([`Self::settle_attempt`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt: its number and request, and what the attempts before it closed and tried"
+    )]
     async fn execute_dual_dispatch_attempt<T: Serialize>(
         &self,
         attempt: u32,
@@ -970,6 +985,7 @@ impl PDRouter {
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
         ledger: &AttemptLedger,
+        tried: &parking_lot::Mutex<Vec<String>>,
         tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
     ) -> Response {
         // Admission may queue the request, so the classic selection's inputs
@@ -1002,6 +1018,8 @@ impl PDRouter {
         let model_id = context.model_id;
         let (prefill, decode, guards, mut placed, asked) = match &self.policy_engine {
             None => {
+                // Copied out: the selection may wait for admission.
+                let tried = tried.lock().clone();
                 let selected = self
                     .select_pd_pair_with_admission(
                         model_id,
@@ -1012,7 +1030,7 @@ impl PDRouter {
                             rid_key: rid_key.as_deref(),
                             cache_namespace,
                             candidate_filter,
-                            tried: &[],
+                            tried: &tried,
                         },
                         sticky_key,
                     )
@@ -1246,6 +1264,7 @@ impl PDRouter {
                     )
                     .await;
                 let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+                self.join_tried(tried, [&prefill, &decode], &response);
                 return Self::end_placed(placed, tried_rows, response);
             }
 
@@ -1286,6 +1305,7 @@ impl PDRouter {
                 .and_then(|placed| placed.decode())
                 .map_or(decode, Arc::clone);
             let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+            self.join_tried(tried, [&prefill, &decode], &response);
             return Self::end_placed(placed, tried_rows, response);
         }
 
@@ -1413,6 +1433,7 @@ impl PDRouter {
             own_failure(&response),
         );
         let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+        self.join_tried(tried, [&prefill, &decode], &response);
         Self::end_placed(placed, tried_rows, response)
     }
 
@@ -1524,6 +1545,34 @@ impl PDRouter {
     /// where the policy controller placed the attempt.
     fn cut_mark_of(placed: Option<&mut Sent>, is_stream: bool) -> Option<Arc<AtomicU16>> {
         placed.filter(|_| is_stream).map(Sent::cut_mark)
+    }
+
+    /// The engines of a pair whose answer a retry may replace join the
+    /// engines the request tried, which the classic selection reads, by the
+    /// rule [`Self::end_placed`] holds for the policy engine's rows: the
+    /// engine of the side the request's ledger closed, else both.
+    fn join_tried(
+        &self,
+        tried: &parking_lot::Mutex<Vec<String>>,
+        [prefill, decode]: [&Arc<dyn Worker>; 2],
+        response: &Response,
+    ) {
+        if self.policy_engine.is_some() || !is_retryable_response(response) {
+            return;
+        }
+        let named = failed_side_type(response);
+        let mut tried = tried.lock();
+        let mut join = |worker: &Arc<dyn Worker>| {
+            if !tried.iter().any(|engine| engine == worker.base_url()) {
+                tried.push(worker.base_url().to_string());
+            }
+        };
+        if named != Some(WorkerType::Decode) {
+            join(prefill);
+        }
+        if named != Some(WorkerType::Prefill) {
+            join(decode);
+        }
     }
 
     /// The end of an attempt the policy controller placed. The rows of a
@@ -9257,6 +9306,42 @@ mod tests {
         for shape in [Shape::Sequential, Shape::Parallel] {
             let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
             let (refusing_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let (free_url, served) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+            let router = quick_retry_router();
+            register_fleet(
+                &router,
+                shape,
+                &prefill_url,
+                &[refusing_url.as_str(), free_url.as_str()],
+            );
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(Favours(refusing_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (
+                    response.status(),
+                    refused.lock().unwrap().len(),
+                    served.lock().unwrap().len()
+                ),
+                (StatusCode::OK, 1, 1),
+                "{shape:?}: the answer, the attempts on the refusing decode worker, the \
+                 requests the free one served"
+            );
+        }
+    }
+
+    /// A decode worker's 503 is replayed, and the retry leaves the worker
+    /// that gave it while another decode worker is available, even under a
+    /// policy that picks that worker whenever it is a candidate: one attempt
+    /// on it, then the free worker's answer. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_a_decode_worker_that_answered_503() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
+            let (refusing_url, refused) = refusing_stub(StatusCode::SERVICE_UNAVAILABLE).await;
             let (free_url, served) = spawn_recording_stub(r#"{"choices":[]}"#).await;
             let router = quick_retry_router();
             register_fleet(
