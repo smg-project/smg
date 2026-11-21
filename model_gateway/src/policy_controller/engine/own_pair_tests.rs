@@ -11,7 +11,7 @@ use std::{
 use axum::http::StatusCode;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use smg_policy_controller::{
-    document::{AppliedSpec, DecodePick, PolicySpec},
+    document::{AppliedSpec, DecodePick, Pairing, PolicySpec},
     engine::{Phase, PolicyEngine as OwnEngine, ShedReason, WireModes},
 };
 use smg_worker::{
@@ -374,4 +374,26 @@ async fn a_fleet_that_pairs_nothing_reads_the_pair_indexs_refusal() {
         matches!(&unplaced, Some(Unplaced::NoCompatiblePair { mismatches, .. }) if *mismatches == transport),
         "{unplaced:?}"
     );
+}
+
+/// A pair is made by the pairing rule of the document that decides it. The
+/// fleet whose two sides state different transports pairs nothing under
+/// the lenient rule, and is placed under a document that pairs on nothing.
+#[tokio::test]
+async fn a_pair_is_made_by_the_documents_own_pairing() {
+    let registry = Arc::new(WorkerRegistry::new());
+    side(&registry, WorkerType::Prefill, 1, Some("NixlConnector"));
+    side(&registry, WorkerType::Decode, 1, Some("MooncakeConnector"));
+    let id = mark();
+    let lenient = object_of(&registry, pair_document());
+    let unpaired = lenient.place_pair(&pair_ask(&id), None, None).await;
+    assert!(matches!(
+        unpaired.err(),
+        Some(Unplaced::NoCompatiblePair { .. })
+    ));
+    let mut document = pair_document();
+    document.plans.pd_pair.pairing = Pairing::Off;
+    let on_nothing = object_of(&registry, document);
+    let placed = on_nothing.place_pair(&pair_ask(&id), None, None).await;
+    assert!(placed.is_ok(), "{:?}", placed.err());
 }

@@ -20,7 +20,9 @@ use openai_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::{operator::SpecRejected, AppliedSpec, PolicySpec, RoutingSettingsError, SpecError},
+    document::{
+        operator::SpecRejected, AppliedSpec, Pairing, PolicySpec, RoutingSettingsError, SpecError,
+    },
     engine::{Candidate, RequestFacts, Role, Scorer, TieBand, WireModes, WorkerId},
     stages::{Lifecycle, StageRegistry, StageRegistryError},
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
@@ -32,7 +34,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    config::{ManualAssignmentMode, PolicyConfig, RouterConfig, RoutingMode},
+    config::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RouterConfig, RoutingMode},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
         gateway::Gateway,
@@ -1351,6 +1353,32 @@ async fn a_pair_family_serves_in_process_and_refuses_by_name_under_an_address() 
         stop_follower(&context).await?;
     }
 
+    Ok(())
+}
+
+/// Where the engine of this process places a gateway's pairs, it pairs by
+/// its document's own rule, and the gateway's pair functions read that rule
+/// beside it: the registry says the pairing of a supplied document, not the
+/// routing settings' mode.
+#[tokio::test]
+async fn the_registry_says_the_pairing_of_the_document_the_engine_decides() -> Case {
+    let mut config = picked(quiet());
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    assert_eq!(config.pd_pairing_mode, PdPairingMode::Lenient);
+    let mut document = config.policy_document()?;
+    document.plans.pd_pair.pairing = Pairing::Off;
+    config.policy_spec = Some(document);
+    let (context, _gateway) = build(config).await?;
+    assert!(context.policy_engine.is_some());
+    assert_eq!(
+        context.policy_registry.pd_pairing_mode(),
+        PdPairingMode::Off
+    );
     Ok(())
 }
 

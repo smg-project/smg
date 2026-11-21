@@ -365,13 +365,22 @@ fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
         )
     );
 
+    // Where the routers ask the engine for every request of the document,
+    // the engine pairs by the document's own rule: a pairing other than the
+    // routing settings' mode starts.
     let mut document = pair()?;
+    document.plans.pd_pair.pairing = Pairing::Strict;
+    assert!(start_in_process(&supplied(document), None)?.is_some());
+
+    // Where a registry policy still places the pair, the placement pairs by
+    // the routing settings' mode.
+    let mut document = encode_sides()?;
     document.plans.pd_pair.pairing = Pairing::Strict;
     assert_eq!(
         refusal(&supplied(document.clone()))?,
         stated("plans.pd-pair.pairing", by_mode, "Remove the field")
     );
-    // The mode the routing settings state is the one the placement runs:
+    // The mode the routing settings state is the one that placement runs:
     // a document that states it starts, and one that leaves it out is told
     // the mode to state.
     let strict = |document: PolicySpec| RouterConfig {
@@ -380,7 +389,7 @@ fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
     };
     assert!(start_in_process(&strict(document), None)?.is_some());
     assert_eq!(
-        refusal(&strict(pair()?))?,
+        refusal(&strict(encode_sides()?))?,
         stated(
             "plans.pd-pair.pairing",
             by_mode,

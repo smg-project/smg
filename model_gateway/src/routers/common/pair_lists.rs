@@ -30,6 +30,16 @@ use crate::policy_controller::engine::members_of;
 pub(crate) type PairNarrowing<'a> =
     &'a (dyn Fn(&ModelWorkerSnapshot, &PdPairIndex) -> Option<PairSides> + Sync);
 
+/// The mode the snapshot's pair index is built under for a document's
+/// `pairing`: the two name one rule.
+pub(crate) const fn mode_of(pairing: Pairing) -> PdPairingMode {
+    match pairing {
+        Pairing::Off => PdPairingMode::Off,
+        Pairing::Lenient => PdPairingMode::Lenient,
+        Pairing::Strict => PdPairingMode::Strict,
+    }
+}
+
 /// What one decision of a pair holds of the registry: the snapshot of the
 /// model's workers as it stood at the read, and the snapshot's pair index
 /// for the route's wire under the document's pairing mode.
@@ -61,11 +71,7 @@ impl PdPairRead {
         } else {
             PdWire::Grpc
         };
-        let mode = match engine.spec().pairing() {
-            Pairing::Off => PdPairingMode::Off,
-            Pairing::Lenient => PdPairingMode::Lenient,
-            Pairing::Strict => PdPairingMode::Strict,
-        };
+        let mode = mode_of(engine.spec().pairing());
         let snapshot = registry.get_routing_snapshot(model);
         let index = snapshot.pd_pairs(wire, mode);
         let (prefill, decode) = wire.pools();

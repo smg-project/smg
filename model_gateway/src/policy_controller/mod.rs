@@ -539,7 +539,10 @@ fn hash_index(document: &PolicySpec) -> Result<(), StartError> {
 /// phase, and declines one whose binding plans no side for that phase. So
 /// a pair binding that names some models, a second pair binding, a pair
 /// binding that covers the single phase and a binding of some models that
-/// covers a side's phase are run as written, and start.
+/// covers a side's phase are run as written, and start. The engine pairs
+/// by the document's own `pairing` too, and the gateway's pair functions
+/// read that mode beside it, so a pairing other than the settings' mode
+/// starts.
 fn rule_not_run(
     config: &RouterConfig,
     settings: &PolicySpec,
@@ -637,7 +640,7 @@ fn rule_not_run(
             PdPairingMode::Lenient => Pairing::Lenient,
             PdPairingMode::Strict => Pairing::Strict,
         };
-        if document.plans.pd_pair.pairing != by_settings {
+        if !whole && document.plans.pd_pair.pairing != by_settings {
             let instead = if by_settings == Pairing::default() {
                 REMOVE.to_owned()
             } else {

@@ -51,7 +51,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::FormatRegistry,
-            overload, pd_admission,
+            overload, pair_lists, pd_admission,
             prefill_admission::PrefillAdmission,
             realtime::RealtimeRegistry,
             snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry},
@@ -1084,9 +1084,20 @@ impl AppContextBuilder {
             .policy_engine
             .clone()
             .filter(|_| self.in_process.is_some());
+        // The pairing mode the gateway's own pair functions read. The
+        // engine of this process pairs by its document's own rule, so
+        // where it places the gateway's requests the registry says that
+        // rule: a narrowing and a refusal read the pairs the engine
+        // decides over.
+        let pairing = match &self.in_process {
+            Some(started) if placing.is_some() => {
+                pair_lists::mode_of(started.engine.spec().pairing())
+            }
+            _ => config.pd_pairing_mode,
+        };
         self.policy_registry = Some(Arc::new(
             registry
-                .with_pd_pairing_mode(config.pd_pairing_mode)
+                .with_pd_pairing_mode(pairing)
                 .with_rings_of(placing),
         ));
         self
