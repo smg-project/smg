@@ -129,9 +129,9 @@ pub(crate) use door::{
     drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
 };
 pub use door::{Expect, Membership, Over, Refused, Remover, StoreDoor, Wrote};
-pub use found::facts;
 #[cfg(feature = "controller")]
 pub(crate) use found::stated;
+pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
 pub use kv_feed::KvFeed;

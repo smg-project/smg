@@ -1634,6 +1634,74 @@ fn the_same_document_is_refused_only_by_a_host_that_denies_its_header() {
     );
 }
 
+/// A dry run against a standing generation that is handed in answers as
+/// the door's own does where no spec store is bound. The documents: the
+/// standing one again with and without its line, a changed one under no
+/// line, under the standing line, under a lower one and under a higher
+/// one, one the validator refuses, one that reads a header its host
+/// denies, one that is no document and one over the bound. Each is asked
+/// with no guard, with the standing digest and with another one.
+#[test]
+fn a_dry_run_against_a_handed_generation_answers_as_a_door_with_no_spec_store() {
+    let store = Arc::new(MemoryStore::new());
+    let stages = stock();
+    let door = SpecDoor::new(
+        Arc::clone(&store),
+        Arc::clone(&stages),
+        vec!["x-private".to_owned()],
+    );
+    assert_eq!(
+        yaml(&door, with_line(LEAST_LOAD, 5)),
+        Ok(Applied::Generation(5))
+    );
+    let world = store.world();
+    let standing = world.spec();
+    let digest = standing.digest().expect("a document stands").to_string();
+    let another = format!("sha256:{}", "0".repeat(64));
+    let handed = |expected: &str, document: &[u8]| {
+        let denied = ["x-private"];
+        dry_run_against(standing, &stages, &denied, expected, document, Format::Yaml)
+    };
+    let over = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits") + 1;
+    let documents = [
+        LEAST_LOAD.as_bytes().to_vec(),
+        with_line(LEAST_LOAD, 5),
+        RANDOM.as_bytes().to_vec(),
+        with_line(RANDOM, 5),
+        with_line(RANDOM, 3),
+        with_line(RANDOM, 9),
+        LEAST_LOAD.replace("[healthy]", "[nowhere]").into_bytes(),
+        format!("{RANDOM}view:\n  headers: [x-private]\n").into_bytes(),
+        b"profiles: [".to_vec(),
+        vec![b'#'; over],
+    ];
+    for document in &documents {
+        for expected in ["", digest.as_str(), another.as_str()] {
+            let by_door = door.dry_run(expected, document, Format::Yaml);
+            assert_eq!(
+                format!("{:?}", handed(expected, document)),
+                format!("{by_door:?}"),
+                "guard {expected:?}"
+            );
+        }
+    }
+
+    // The answers are a dry run's own, not one refusal told ten times.
+    let again = handed(&digest, LEAST_LOAD.as_bytes()).expect("the standing digest");
+    assert_eq!(again.would_run.map(|(number, _)| number), Ok(5));
+    let next = handed("", RANDOM.as_bytes()).expect("no guard");
+    assert_eq!(next.would_run.map(|(number, _)| number), Ok(6));
+    assert!(
+        next.needs.is_some(),
+        "a document that would run tells its needs"
+    );
+    let claimed = handed("", &with_line(RANDOM, 9)).expect("no guard");
+    assert_eq!(claimed.would_run.map(|(number, _)| number), Ok(9));
+    let guarded = handed(&another, RANDOM.as_bytes());
+    assert!(matches!(guarded, Err(Unanswered::Guarded(5, Some(_)))));
+    assert_eq!(door.counts(), applied(1, 0), "a dry run counts nothing");
+}
+
 /// A JSON document of `bytes` at the most whose last binding writes its
 /// profile as a list: the typed read refuses it there, at its end.
 fn refused_json_of(bytes: usize) -> Vec<u8> {
