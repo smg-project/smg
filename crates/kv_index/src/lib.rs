@@ -20,8 +20,10 @@ mod common;
 pub mod groups;
 mod lane_map;
 pub mod lane_pool;
+pub mod namespace;
 mod path_hash;
 mod prefetch;
+mod prefix_source;
 pub mod reference;
 pub mod salt;
 pub mod sharded;
@@ -40,7 +42,9 @@ pub use lane_map::ChainBlockMap;
 pub use lane_pool::{
     Claimed, Control, LaneHooks, LanePool, LanePoolConfig, PoolMetrics, QueueFull,
 };
+pub use namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use path_hash::{hash_node_path, hash_token_path, GLOBAL_EVICTION_HASH};
+pub use prefix_source::PrefixSource;
 pub use reference::{request_prefix_hashes, ReferenceIndexer};
 pub use sharded::{ShardedChainIndex, SHARD_SHIFT};
 // Re-export under names matching old tree.rs API for easier migration

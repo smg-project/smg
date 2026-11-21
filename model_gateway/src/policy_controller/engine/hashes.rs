@@ -93,7 +93,7 @@ mod tests {
     };
 
     use crate::{
-        policies::CacheNamespace,
+        policies::namespace_of,
         policy_controller::engine::{
             testing::{cache_bed, record_bed, store_blocks, MODEL},
             tests::first,
@@ -128,7 +128,7 @@ mod tests {
     fn a_namespace_hashes_under_its_own_seed() {
         let (_, store, holder) = cache_bed();
         store.set_block_size(MODEL, BLOCK_SIZE);
-        let namespace = CacheNamespace::derive(&CachePartition {
+        let namespace = namespace_of(&CachePartition {
             cache_salt: Some("partition"),
             ..CachePartition::default()
         })
@@ -272,7 +272,7 @@ mod tests {
         );
         // A partition is in the text's seed whole. An extra key alone moves
         // every window, where it leaves the seed of the engines' events.
-        let keyed = CacheNamespace::derive(&CachePartition {
+        let keyed = namespace_of(&CachePartition {
             extra_key: Some("k"),
             ..CachePartition::default()
         })
@@ -299,7 +299,7 @@ mod tests {
         store.set_block_size(MODEL, BLOCK_SIZE);
         let tokens: Vec<u32> = (1..=BLOCK_SIZE * 2).collect();
         let under = |extra_key| {
-            let namespace = CacheNamespace::derive(&CachePartition {
+            let namespace = namespace_of(&CachePartition {
                 extra_key: Some(extra_key),
                 ..CachePartition::default()
             })
@@ -372,7 +372,7 @@ mod tests {
         let tokens: Vec<u32> = (1..=40).collect();
         let plain = plain_prompt(&tokens).hashes(&store, MODEL);
         assert_eq!(written(&plain).block_hashes, RECORDED_TOKENS);
-        let namespace = CacheNamespace::derive(&CachePartition {
+        let namespace = namespace_of(&CachePartition {
             cache_salt: Some("partition"),
             ..CachePartition::default()
         })

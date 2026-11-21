@@ -31,8 +31,8 @@ use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
-        PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        hash_ring::HashRing, namespace_of, policy_reads_hash_ring, CacheNamespace,
+        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     policy_controller::{
         self,
@@ -451,7 +451,7 @@ impl<'a> SelectionInputs<'a> {
         // match the engine's KV-event namespace. Internal IDs stay isolated
         // too, but cannot match name-keyed events without a name mapping.
         let lora_adapter = input.request_type.lora_adapter();
-        let cache_namespace = CacheNamespace::derive(&CachePartition {
+        let cache_namespace = namespace_of(&CachePartition {
             cache_salt: None,
             extra_key: None,
             lora_path: lora_adapter,
@@ -5025,7 +5025,7 @@ mod tests {
         );
         let wire = grpc_wire(RuntimeType::Vllm);
         let namespace = |salt: &str| {
-            CacheNamespace::derive(&CachePartition {
+            namespace_of(&CachePartition {
                 cache_salt: Some(salt),
                 extra_key: None,
                 lora_path: None,

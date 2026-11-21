@@ -19,7 +19,7 @@
 //!
 //! The event-driven index is keyed differently: the engines fold the LoRA
 //! name and the cache salt into their block hashes, and the KV event monitor
-//! recomputes stored blocks under the same XXH3 seed (`kv_index::salt`). A
+//! recomputes stored blocks under the same XXH3 seed ([`crate::salt`]). A
 //! namespace therefore also carries that seed, so a salted or LoRA request
 //! is hashed under it and matches only its own blocks; a plain request keeps
 //! the plain hash. The extra key is not part of the engines' seed.
@@ -39,9 +39,11 @@
 //! Size it for tenants × working set; a per-request salt makes every request
 //! a unique path.
 
-use kv_index::salt::namespace_seed;
-use openai_protocol::common::CachePartition;
+use std::borrow::Cow;
+
 use xxhash_rust::xxh3::Xxh3;
+
+use crate::salt::namespace_seed;
 
 /// Domain separator: a change to the encoding changes every namespace.
 const DOMAIN: &[u8] = b"smg/cache-namespace/v1";
@@ -75,22 +77,25 @@ pub struct CacheNamespace {
 }
 
 impl CacheNamespace {
-    /// Derive the namespace from a request's partition fields; `None` when
+    /// Derive the namespace from a request's partition fields (its cache
+    /// salt, its extra classification key and its LoRA adapter); `None` when
     /// no field is set (an empty string counts as unset, as it does on the
     /// engine). Each field is encoded with a presence byte and its length,
     /// so an absent field and adjacent fields with shifted boundaries hash
     /// differently.
-    pub fn derive(partition: &CachePartition<'_>) -> Option<Self> {
-        if partition.is_empty() {
+    pub fn derive(
+        cache_salt: Option<&str>,
+        extra_key: Option<&str>,
+        lora_path: Option<&str>,
+    ) -> Option<Self> {
+        let fields = [cache_salt, extra_key, lora_path];
+        // No field set, no partition: the one statement of the rule.
+        if fields.iter().all(|field| field.is_none_or(str::is_empty)) {
             return None;
         }
         let mut hasher = Xxh3::new();
         hasher.update(DOMAIN);
-        for field in [
-            partition.cache_salt,
-            partition.extra_key,
-            partition.lora_path,
-        ] {
+        for field in fields {
             match field.filter(|value| !value.is_empty()) {
                 Some(value) => {
                     hasher.update(&[1u8]);
@@ -102,13 +107,14 @@ impl CacheNamespace {
         }
         Some(Self {
             marker: hasher.digest(),
-            event_seed: namespace_seed(partition.lora_path, partition.cache_salt),
+            event_seed: namespace_seed(lora_path, cache_salt),
         })
     }
 
     /// The XXH3 seed the engines' blocks for this partition are hashed under
-    /// (see `kv_index::salt::namespace_seed`); the plain seed when neither a
-    /// LoRA name nor a cache salt is set.
+    /// (see [`namespace_seed`]); the plain seed when neither a LoRA name nor
+    /// a cache salt is set.
+    #[inline]
     pub fn event_seed(self) -> u64 {
         self.event_seed
     }
@@ -118,6 +124,7 @@ impl CacheNamespace {
     /// share a named prefix only where their partitions are one, as they
     /// share an engine's cache. A text request's windows are hashed under
     /// it too: no engine hashes text, so that seed need match none.
+    #[inline]
     pub fn partition_seed(self) -> u64 {
         self.marker
     }
@@ -140,12 +147,18 @@ impl CacheNamespace {
     /// pages: the marker fills whole pages, so the prompt's own page grid is
     /// exactly what it is without a namespace and the match count for a given
     /// prompt is unchanged.
+    #[inline]
     pub fn token_marker_len(page_size: usize) -> usize {
         let page_size = page_size.max(1);
         TOKEN_MARKER_LEN.div_ceil(page_size) * page_size
     }
 
     /// `tokens` with the marker at its head, padded to whole `page_size` pages.
+    ///
+    /// Left out of line on purpose. It allocates, and inlined into
+    /// [`Self::keyed_tokens`] it grows that function past what its callers
+    /// take in: every request, partitioned or not, then pays a call for its
+    /// key (35 instructions a decision, counted).
     pub fn prefixed_tokens(self, tokens: &[u32], page_size: usize) -> Vec<u32> {
         let marker_len = Self::token_marker_len(page_size);
         let mut keyed = Vec::with_capacity(marker_len + tokens.len());
@@ -155,7 +168,8 @@ impl CacheNamespace {
         keyed
     }
 
-    /// `text` with the marker at its head.
+    /// `text` with the marker at its head. Left out of line, as
+    /// [`Self::prefixed_tokens`] is.
     pub fn prefixed_text(self, text: &str) -> String {
         let mut keyed = String::with_capacity(TEXT_MARKER_LEN + text.len());
         keyed.push_str(&self.text_marker());
@@ -166,6 +180,7 @@ impl CacheNamespace {
     /// The routing key of an unpartitioned request: leading ids that carry
     /// the marker bit are dropped so the key can never enter a namespace's
     /// subtree. A no-op for vocabulary ids.
+    #[inline]
     pub fn unpartitioned_tokens(tokens: &[u32]) -> &[u32] {
         let start = tokens
             .iter()
@@ -177,44 +192,68 @@ impl CacheNamespace {
     /// The routing key of an unpartitioned request: leading marker delimiters
     /// are dropped so the key can never enter a namespace's subtree. A no-op
     /// for prompt text.
+    #[inline]
     pub fn unpartitioned_text(text: &str) -> &str {
         text.trim_start_matches(TEXT_MARKER_DELIM)
+    }
+
+    /// The token tree's key for `tokens` in `namespace`, for a tree of
+    /// `page_size`-token pages, and the length of the marker at its head. A
+    /// partitioned request keys under its namespace marker: another
+    /// namespace diverges at position 0 and can never match, and the marker
+    /// never counts toward the match ratio, so a match count read from the
+    /// tree has the marker length subtracted. The marker fills whole pages,
+    /// so the prompt's page grid is the unpartitioned one. An unpartitioned
+    /// request keys under its tokens stripped of marker material, marker
+    /// length 0.
+    #[inline]
+    pub fn keyed_tokens(
+        namespace: Option<Self>,
+        tokens: &[u32],
+        page_size: usize,
+    ) -> (Cow<'_, [u32]>, usize) {
+        match namespace {
+            Some(namespace) => (
+                Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
+                Self::token_marker_len(page_size),
+            ),
+            None => (Cow::Borrowed(Self::unpartitioned_tokens(tokens)), 0),
+        }
+    }
+
+    /// The string tree's key for `text` in `namespace` and the length of
+    /// the marker at its head: the rule of [`Self::keyed_tokens`], in chars.
+    #[inline]
+    pub fn keyed_text(namespace: Option<Self>, text: &str) -> (Cow<'_, str>, usize) {
+        match namespace {
+            Some(namespace) => (Cow::Owned(namespace.prefixed_text(text)), TEXT_MARKER_LEN),
+            None => (Cow::Borrowed(Self::unpartitioned_text(text)), 0),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn partition<'a>(
-        cache_salt: Option<&'a str>,
-        extra_key: Option<&'a str>,
-        lora_path: Option<&'a str>,
-    ) -> CachePartition<'a> {
-        CachePartition {
-            cache_salt,
-            extra_key,
-            lora_path,
-        }
-    }
+    use crate::{StringTree, TokenTree};
 
     #[test]
     fn unpartitioned_requests_have_no_namespace() {
-        assert_eq!(CacheNamespace::derive(&CachePartition::default()), None);
+        assert_eq!(CacheNamespace::derive(None, None, None), None);
     }
 
     #[test]
     fn derivation_is_stable_and_field_sensitive() {
-        let a = CacheNamespace::derive(&partition(Some("tenant-a"), None, None)).unwrap();
+        let a = CacheNamespace::derive(Some("tenant-a"), None, None).unwrap();
         assert_eq!(
             a,
-            CacheNamespace::derive(&partition(Some("tenant-a"), None, None)).unwrap()
+            CacheNamespace::derive(Some("tenant-a"), None, None).unwrap()
         );
-        let b = CacheNamespace::derive(&partition(Some("tenant-b"), None, None)).unwrap();
+        let b = CacheNamespace::derive(Some("tenant-b"), None, None).unwrap();
         assert_ne!(a, b);
         // The same bytes in a different field are a different partition.
-        let extra = CacheNamespace::derive(&partition(None, Some("tenant-a"), None)).unwrap();
-        let lora = CacheNamespace::derive(&partition(None, None, Some("tenant-a"))).unwrap();
+        let extra = CacheNamespace::derive(None, Some("tenant-a"), None).unwrap();
+        let lora = CacheNamespace::derive(None, None, Some("tenant-a")).unwrap();
         assert_ne!(a, extra);
         assert_ne!(a, lora);
         assert_ne!(extra, lora);
@@ -223,13 +262,13 @@ mod tests {
     #[test]
     fn partition_seed_follows_every_field() {
         let seed = |salt, extra, lora| {
-            CacheNamespace::derive(&partition(salt, extra, lora))
+            CacheNamespace::derive(salt, extra, lora)
                 .expect("a partition")
                 .partition_seed()
         };
         // The extra key moves it, where the event seed stays the plain one.
         let extra_only = seed(None, Some("k"), None);
-        assert_ne!(extra_only, kv_index::XXH3_SEED);
+        assert_ne!(extra_only, crate::XXH3_SEED);
         assert_ne!(extra_only, seed(None, Some("other"), None));
         // One value in another field is another partition.
         assert_ne!(
@@ -242,26 +281,23 @@ mod tests {
     #[test]
     fn empty_fields_count_as_absent() {
         // Engines treat an empty salt or adapter as unset; so does routing.
+        assert_eq!(CacheNamespace::derive(Some(""), None, None), None);
         assert_eq!(
-            CacheNamespace::derive(&partition(Some(""), None, None)),
-            None
-        );
-        assert_eq!(
-            CacheNamespace::derive(&partition(Some(""), Some("k"), None)),
-            CacheNamespace::derive(&partition(None, Some("k"), None))
+            CacheNamespace::derive(Some(""), Some("k"), None),
+            CacheNamespace::derive(None, Some("k"), None)
         );
     }
 
     #[test]
     fn shifted_field_boundaries_differ() {
-        let ab_c = CacheNamespace::derive(&partition(Some("ab"), Some("c"), None)).unwrap();
-        let a_bc = CacheNamespace::derive(&partition(Some("a"), Some("bc"), None)).unwrap();
+        let ab_c = CacheNamespace::derive(Some("ab"), Some("c"), None).unwrap();
+        let a_bc = CacheNamespace::derive(Some("a"), Some("bc"), None).unwrap();
         assert_ne!(ab_c, a_bc);
     }
 
     #[test]
     fn unpartitioned_keys_never_start_with_marker_material() {
-        let ns = CacheNamespace::derive(&partition(Some("salt"), None, None)).unwrap();
+        let ns = CacheNamespace::derive(Some("salt"), None, None).unwrap();
         // Vocabulary ids and prompt text pass through untouched.
         assert_eq!(CacheNamespace::unpartitioned_tokens(&[7, 8, 9]), &[7, 8, 9]);
         assert_eq!(CacheNamespace::unpartitioned_text("hello"), "hello");
@@ -278,7 +314,7 @@ mod tests {
 
     #[test]
     fn token_marker_never_collides_with_vocabulary_ids() {
-        let ns = CacheNamespace::derive(&partition(Some("salt"), None, None)).unwrap();
+        let ns = CacheNamespace::derive(Some("salt"), None, None).unwrap();
         for id in ns.token_marker() {
             assert!(id & MARKER_TOKEN_BIT != 0);
         }
@@ -290,7 +326,7 @@ mod tests {
 
     #[test]
     fn token_marker_fills_whole_pages() {
-        let ns = CacheNamespace::derive(&partition(Some("salt"), None, None)).unwrap();
+        let ns = CacheNamespace::derive(Some("salt"), None, None).unwrap();
         assert_eq!(CacheNamespace::token_marker_len(16), 16);
         assert_eq!(CacheNamespace::token_marker_len(1), 2);
         assert_eq!(CacheNamespace::token_marker_len(0), 2);
@@ -305,7 +341,7 @@ mod tests {
 
     #[test]
     fn text_marker_is_fixed_width_and_prefixes_the_prompt() {
-        let ns = CacheNamespace::derive(&partition(None, Some("k"), Some("adapter"))).unwrap();
+        let ns = CacheNamespace::derive(None, Some("k"), Some("adapter")).unwrap();
         let marker = ns.text_marker();
         assert_eq!(marker.chars().count(), TEXT_MARKER_LEN);
         assert!(marker.starts_with(TEXT_MARKER_DELIM));
@@ -318,19 +354,69 @@ mod tests {
 
     #[test]
     fn event_seed_follows_the_lora_name_and_cache_salt_only() {
-        let salted =
-            CacheNamespace::derive(&partition(Some("tenant-a"), None, Some("adapter"))).unwrap();
+        let salted = CacheNamespace::derive(Some("tenant-a"), None, Some("adapter")).unwrap();
         assert_eq!(
             salted.event_seed(),
             namespace_seed(Some("adapter"), Some("tenant-a"))
         );
-        let extra_only = CacheNamespace::derive(&partition(None, Some("k"), None)).unwrap();
-        assert_eq!(extra_only.event_seed(), kv_index::XXH3_SEED);
+        let extra_only = CacheNamespace::derive(None, Some("k"), None).unwrap();
+        assert_eq!(extra_only.event_seed(), crate::XXH3_SEED);
         assert_ne!(
             salted.event_seed(),
-            CacheNamespace::derive(&partition(Some("tenant-b"), None, Some("adapter")))
+            CacheNamespace::derive(Some("tenant-b"), None, Some("adapter"))
                 .unwrap()
                 .event_seed()
         );
+    }
+
+    /// The trees' keying rule is written once: a namespaced and an
+    /// unpartitioned request of one prompt get the keys the trees expect,
+    /// and the marker length that comes with a namespaced key is exactly
+    /// what a match count read from the tree subtracts.
+    #[test]
+    fn a_request_is_keyed_once_for_both_trees_and_the_marker_length_is_what_a_match_subtracts() {
+        let block_size = 16;
+        let tenant_a = CacheNamespace::derive(Some("tenant-a"), None, None).unwrap();
+        // Two whole pages, so the tree matches the key in full.
+        let prompt: Vec<u32> = (100..132).collect();
+        let text = "shared system prompt";
+
+        let (keyed, marker_len) = CacheNamespace::keyed_tokens(Some(tenant_a), &prompt, block_size);
+        assert_eq!(marker_len, CacheNamespace::token_marker_len(block_size));
+        assert_eq!(
+            &keyed[..],
+            &tenant_a.prefixed_tokens(&prompt, block_size)[..]
+        );
+        assert_eq!(&keyed[marker_len..], &prompt[..]);
+        let (plain_key, plain_len) = CacheNamespace::keyed_tokens(None, &prompt, block_size);
+        assert_eq!((&plain_key[..], plain_len), (&prompt[..], 0));
+
+        // What the token tree reads back for the namespaced key is the
+        // prompt plus the marker: the match count minus the marker length
+        // is the prompt's own match, and the plain key sees none of it.
+        let tree = TokenTree::with_config(block_size, Default::default());
+        tree.insert_tokens(&keyed, "http://w1:8000");
+        let hit = tree.match_and_insert(&keyed, "http://w1:8000");
+        assert_eq!(hit.matched_token_count - marker_len, prompt.len());
+        assert_eq!(hit.input_token_count - marker_len, prompt.len());
+        let miss = tree.match_and_insert(&plain_key, "http://w2:8000");
+        assert_eq!(miss.matched_token_count, 0);
+
+        let (keyed_text, text_marker_len) = CacheNamespace::keyed_text(Some(tenant_a), text);
+        assert_eq!(text_marker_len, TEXT_MARKER_LEN);
+        assert_eq!(&*keyed_text, tenant_a.prefixed_text(text));
+        assert_eq!(&keyed_text[text_marker_len..], text);
+        let (plain_text, plain_text_len) = CacheNamespace::keyed_text(None, text);
+        assert_eq!((&*plain_text, plain_text_len), (text, 0));
+
+        let string_tree = StringTree::new();
+        string_tree.insert_text(&keyed_text, "http://w1:8000");
+        let hit = string_tree.match_and_insert(&keyed_text, "http://w1:8000");
+        assert_eq!(
+            hit.matched_char_count - text_marker_len,
+            text.chars().count()
+        );
+        let miss = string_tree.match_and_insert(&plain_text, "http://w2:8000");
+        assert_eq!(miss.matched_char_count, 0);
     }
 }

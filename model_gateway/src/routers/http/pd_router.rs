@@ -60,7 +60,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::with_trace_context_http,
     },
-    policies::{CacheNamespace, PolicyRegistry, WorkerRole},
+    policies::{namespace_of, PolicyRegistry, WorkerRole},
     policy_controller::engine::{self, Ask, Hashes, PolicyEngine, Prompt, Sent, Unplaced},
     rate_limit::RateLimitManager,
     routers::{
@@ -771,7 +771,7 @@ impl PDRouter {
                 .policy_registry
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
-            cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+            cache_namespace: namespace_of(&body.cache_partition()),
         };
         // The policy engine's ask reads the body's own id after the dispatch
         // took the body. The classic path copies nothing.

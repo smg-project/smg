@@ -11,7 +11,8 @@ use std::sync::Arc;
 use openai_protocol::{common::CachePartition, worker::HealthCheckConfig};
 use smg::{
     policies::{
-        CacheAwareConfig, CacheAwarePolicy, CacheNamespace, LoadBalancingPolicy, SelectWorkerInfo,
+        namespace_of, CacheAwareConfig, CacheAwarePolicy, CacheNamespace, LoadBalancingPolicy,
+        SelectWorkerInfo,
     },
     routers::grpc::backend_client::BasicWorkerBuilder,
 };
@@ -43,7 +44,7 @@ fn policy() -> CacheAwarePolicy {
 }
 
 fn salted(salt: &str) -> Option<CacheNamespace> {
-    CacheNamespace::derive(&CachePartition {
+    namespace_of(&CachePartition {
         cache_salt: Some(salt),
         extra_key: None,
         lora_path: None,

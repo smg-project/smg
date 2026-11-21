@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use openai_protocol::UNKNOWN_MODEL_ID;
+use openai_protocol::{common::CachePartition, UNKNOWN_MODEL_ID};
 use rand::RngExt as _;
 use smg_policy_controller::engine::PoolMembers;
 use smg_worker::{identity::basic::Worker, load::state::LoadReceiver, runtime::RoutingState};
@@ -18,7 +18,6 @@ use crate::{config::CacheIndexKind, policies::hash_ring::HashRing};
 
 mod bucket;
 mod cache_aware;
-mod cache_namespace;
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
 mod classic_all_vetoed_rows;
@@ -61,9 +60,10 @@ mod worker_load_tests;
 
 // Re-export PrefixMatchResult from kv_index for production use
 pub use ::kv_index::PrefixMatchResult;
+// The cache namespace lives beside the trees it keys.
+pub use ::kv_index::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
-pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use engine_policy::EnginePolicy;
@@ -79,6 +79,17 @@ pub use round_robin::RoundRobinPolicy;
 // The periodic task lives beside the worker runtime. The path it had here is
 // kept: the policies name it.
 pub(crate) use smg_worker::periodic_task as utils;
+
+/// The cache namespace of a request's partition fields, as the protocol
+/// crate projects them: `None` where no field is set
+/// ([`CacheNamespace::derive`]).
+pub fn namespace_of(partition: &CachePartition<'_>) -> Option<CacheNamespace> {
+    CacheNamespace::derive(
+        partition.cache_salt,
+        partition.extra_key,
+        partition.lora_path,
+    )
+}
 
 /// Core trait for load balancing policies
 ///
