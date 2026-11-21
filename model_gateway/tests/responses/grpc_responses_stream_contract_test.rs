@@ -1059,3 +1059,32 @@ async fn engine_error_never_dispatches_mcp_calls() {
         assert_eq!(mcp.call_count(), 0);
     }
 }
+
+/// A server call under `require_approval: always` is held, streamed or not: the tool does not
+/// run and its call closes as failed with the approval error.
+#[tokio::test]
+async fn a_call_that_waits_for_approval_does_not_run() {
+    for stream in [false, true] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let (response, _) = responses_result_with_final_answer(
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"always"}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"), None, "completed", stream, Some(1),
+        ).await;
+        mcp.stop().await;
+
+        assert_eq!(mcp.call_count(), 0, "stream={stream}: {response}");
+        let call = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["type"] == "mcp_call")
+            .unwrap_or(&Value::Null);
+        assert_eq!(call["status"], "failed", "stream={stream}: {response}");
+        assert!(
+            call["error"].to_string().contains("requires approval"),
+            "stream={stream}: {response}"
+        );
+    }
+}
