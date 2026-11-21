@@ -7,58 +7,8 @@
 
 use crate::{
     engine::decision::{Decision, Target},
-    tracking::lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+    tracking::lease::{EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
 };
-
-/// The words on a lease a stage takes ([`Lifecycle::hears`]): which of the
-/// calls that tell a decision's issue, its dispatch and its end the stage
-/// implements.
-///
-/// A host that decides in its own process tells a word only where a stage
-/// of the document takes it, and keeps nothing for a word nobody takes: a
-/// document none of whose stages takes one costs a request no lease and no
-/// word.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Words {
-    /// [`Lifecycle::on_decision_issued`].
-    pub issue: bool,
-    /// [`Lifecycle::on_dispatched`].
-    pub dispatch: bool,
-    /// [`Lifecycle::on_completed`] or [`Lifecycle::on_released`].
-    pub end: bool,
-}
-
-impl Words {
-    /// No word: a stage that implements none of the four calls.
-    pub const NONE: Self = Self {
-        issue: false,
-        dispatch: false,
-        end: false,
-    };
-
-    /// Every word.
-    pub const ALL: Self = Self {
-        issue: true,
-        dispatch: true,
-        end: true,
-    };
-
-    /// The words either takes.
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        Self {
-            issue: self.issue || other.issue,
-            dispatch: self.dispatch || other.dispatch,
-            end: self.end || other.end,
-        }
-    }
-
-    /// Whether a word is taken.
-    #[must_use]
-    pub const fn any(self) -> bool {
-        self.issue || self.dispatch || self.end
-    }
-}
 
 /// The lifecycle a stateful stage implements. Every hook defaults to a
 /// no-op, so a stateless stage implements nothing.
@@ -163,21 +113,28 @@ pub trait Lifecycle: Send + Sync {
         false
     }
 
-    /// Which words on a lease the stage takes ([`Words`]): none by
-    /// default. A stage that implements [`Self::on_decision_issued`],
+    /// The kinds of event the stage takes ([`EventSet`]): none by default.
+    /// A stage that implements [`Self::on_decision_issued`],
     /// [`Self::on_dispatched`], [`Self::on_completed`] or
-    /// [`Self::on_released`] names the word here. The engine cannot see an
+    /// [`Self::on_released`] names that call's kind here
+    /// ([`EventSet::LEASE`] holds the four). The engine cannot see an
     /// overridden method, and a host that decides in its own process tells
-    /// a word only where a stage of the document takes it: a stage that
-    /// implements a call and does not name its word is not told there. The
-    /// engine asks once, at its build: the answer is the stage's for the
-    /// engine's life.
+    /// a word on a lease only where a stage of the document takes it, and
+    /// keeps nothing for a word nobody takes: a stage that implements one
+    /// of those calls and does not name its kind is not told there, and a
+    /// document none of whose stages names one costs a request no lease.
+    /// The engine asks once, at its build: the answer is the stage's for
+    /// the engine's life.
+    ///
+    /// A change of membership and a signal are told to every stage,
+    /// whatever it answers: no host reads those two kinds of the answer
+    /// yet. A plugin's stage answers every kind its plugin observes.
     ///
     /// This is not [`Self::needs_lifecycle`]. A stage that takes a word
     /// only to drop state early decides the same without the call, and
     /// still takes the word: untold, it would keep that state.
-    fn hears(&self) -> Words {
-        Words::NONE
+    fn hears(&self) -> EventSet {
+        EventSet::NONE
     }
 }
 
@@ -221,7 +178,7 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
         (**self).needs_lifecycle()
     }
 
-    fn hears(&self) -> Words {
+    fn hears(&self) -> EventSet {
         (**self).hears()
     }
 }
@@ -234,6 +191,7 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec, PRESETS},
         engine::view::{Health, WorkerId},
+        tracking::lease::EventKind,
     };
 
     /// A stage that counts what reached it, to prove the box forwards every
@@ -250,11 +208,8 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn hears(&self) -> Words {
-            Words {
-                end: true,
-                ..Words::NONE
-            }
+        fn hears(&self) -> EventSet {
+            EventSet::of([EventKind::Released, EventKind::Signal])
         }
     }
 
@@ -280,25 +235,28 @@ mod tests {
     }
 
     /// A stage takes no word unless it names one, and a box says what its
-    /// stage says. The two answers part: a stage that takes an end only to
-    /// drop state early needs no call, and takes the word.
+    /// stage says. The two answers part: a stage that takes a release only
+    /// to drop state early needs no call, and takes the word. A release is
+    /// a word on a lease, and a signal is none.
     #[test]
     fn a_stage_takes_the_words_it_names_and_no_other() {
+        use EventKind::{Completed, Dispatched, Issued, Released};
         let stateless: Box<dyn Lifecycle> = Box::new(Stateless);
-        assert_eq!(stateless.hears(), Words::NONE);
-        assert!(!stateless.hears().any());
+        assert_eq!(stateless.hears(), EventSet::NONE);
         let counting: Box<dyn Lifecycle> = Box::new(Counting::default());
         let ends = counting.hears();
-        assert_eq!((ends.issue, ends.dispatch, ends.end), (false, false, true));
-        assert!(ends.any() && !counting.needs_lifecycle());
+        assert!(ends.contains(Released) && !ends.contains(Completed));
+        assert!(ends.intersects(EventSet::LEASE) && !counting.needs_lifecycle());
+        assert!(!EventSet::of([EventKind::Signal]).intersects(EventSet::LEASE));
         let kept: Box<dyn Lifecycle> = Box::new(Kept);
-        assert!(kept.needs_lifecycle() && !kept.hears().any());
-        let both = ends.union(Words {
-            issue: true,
-            ..Words::NONE
-        });
-        assert_eq!((both.issue, both.dispatch, both.end), (true, false, true));
-        assert_eq!(both.union(Words::ALL), Words::ALL);
+        assert!(kept.needs_lifecycle() && kept.hears().is_empty());
+        let both = ends.with(Issued);
+        assert!(both.contains(Issued) && both.contains(Released) && !both.contains(Dispatched));
+        assert_eq!(both.union(EventSet::ALL), EventSet::ALL);
+        assert_eq!(
+            EventSet::LEASE,
+            EventSet::of([Issued, Dispatched, Completed, Released])
+        );
     }
 
     /// The stock policies by the words their documents take. A rotation, a
@@ -317,19 +275,17 @@ mod tests {
                 .hears()
         };
         for silent in ["round_robin", "random", "passthrough"] {
-            assert_eq!(hears(silent), Words::NONE, "{silent}");
+            assert_eq!(hears(silent), EventSet::NONE, "{silent}");
         }
-        let sends = Words {
-            dispatch: true,
-            ..Words::NONE
-        };
+        let sends = EventSet::of([EventKind::Dispatched]);
         for counted in ["power_of_two", "least_load"] {
             assert_eq!(hears(counted), sends, "{counted}");
         }
-        let bucket = hears("bucket");
-        assert!(bucket.issue && bucket.dispatch, "{bucket:?}");
+        let booked = EventSet::of([EventKind::Issued, EventKind::Dispatched]);
+        assert_eq!(hears("bucket"), booked);
         for name in PRESETS {
-            assert!(!hears(name).end, "{name}");
+            let ends = EventSet::of([EventKind::Completed, EventKind::Released]);
+            assert!(!hears(name).intersects(ends), "{name}");
         }
     }
 

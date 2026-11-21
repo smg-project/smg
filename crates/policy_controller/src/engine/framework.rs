@@ -29,13 +29,13 @@ use crate::{
     policies::random::Random,
     stages::{
         filters::RowTests,
-        lifecycle::{Lifecycle, Words},
+        lifecycle::Lifecycle,
         pickers::{target_of, Best},
         scorers::{FewestSessions, LeastRequests},
     },
     tracking::{
         dispatch_credit::DispatchCredit,
-        lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+        lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
     Draw,
 };
@@ -3295,11 +3295,11 @@ pub struct Engine {
     /// profiles' names: a later engine finds a profile's by its name
     /// ([`Engine::succeed`]).
     pub(crate) sent_credits: Vec<Arc<DispatchCredit>>,
-    /// The words on a lease the document takes, but for its counts of
-    /// sends ([`Lifecycle::hears`] adds those): each stage's answer, asked
-    /// once at the build, with the engine's own. A word of a request is
-    /// told to every profile's stages, so the answer is the document's.
-    words: Words,
+    /// The kinds of event the document takes, but for its counts of sends
+    /// ([`Lifecycle::hears`] adds those): each stage's answer, asked once at
+    /// the build, with the engine's own. A word of a request is told to
+    /// every profile's stages, so the answer is the document's.
+    hears: EventSet,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -4396,20 +4396,21 @@ impl Engine {
             .map(|(profile, &folded)| profile.named_by(folded))
             .collect();
         let keepers = Keeper::of(&profiles);
-        // The engine's own words: the session table follows a dispatch
-        // where a binding states a sessions rule, and the record of
-        // dispatched prefixes is written at an issue.
-        let own = Words {
-            issue: needs.sent_prefixes,
-            dispatch: bindings.iter().any(|binding| binding.sessions.is_some()),
-            end: false,
+        // The engine's own: the session table follows a dispatch where a
+        // binding states a sessions rule. At an issue the engine does
+        // nothing but tell its stages: the record of dispatched prefixes
+        // is its host's to write, where the host decides.
+        let own = if bindings.iter().any(|binding| binding.sessions.is_some()) {
+            EventSet::NONE.with(EventKind::Dispatched)
+        } else {
+            EventSet::NONE
         };
-        let words = profiles.iter().fold(own, |words, profile| {
+        let hears = profiles.iter().fold(own, |hears, profile| {
             let stages = profile
                 .scorers
                 .iter()
                 .map(|weighted| weighted.scorer.hears());
-            stages.fold(words.union(profile.picker.hears()), Words::union)
+            stages.fold(hears.union(profile.picker.hears()), EventSet::union)
         });
         let shadows = bindings
             .iter()
@@ -4514,7 +4515,7 @@ impl Engine {
             keepers,
             stating,
             sent_credits: Vec::new(),
-            words,
+            hears,
         }
     }
 
@@ -6941,10 +6942,11 @@ impl Lifecycle for Engine {
     /// dispatch under a sessions rule, the record of dispatched prefixes
     /// at an issue, and a count of sends at a dispatch. Folded at the
     /// build: one read here.
-    fn hears(&self) -> Words {
-        Words {
-            dispatch: self.words.dispatch || !self.sent_credits.is_empty(),
-            ..self.words
+    fn hears(&self) -> EventSet {
+        if self.sent_credits.is_empty() {
+            self.hears
+        } else {
+            self.hears.with(EventKind::Dispatched)
         }
     }
 }
