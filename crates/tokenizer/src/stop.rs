@@ -120,6 +120,9 @@ pub struct StopRules {
     hidden_stop_ids: StopIds,
     /// The config's visible stop token ids, sorted.
     visible_stop_ids: StopIds,
+    /// The bytes a stop sequence begins with, one bit a byte value: text with
+    /// none of them neither holds a stop sequence nor begins one.
+    starts: [u64; 4],
 }
 
 impl StopRules {
@@ -149,7 +152,13 @@ impl StopRules {
             Some(AhoCorasick::new(&patterns).expect("Failed to build Aho-Corasick automaton"))
         };
 
+        let mut starts = [0; 4];
+        for first in patterns.iter().filter_map(|pattern| pattern.bytes().next()) {
+            starts[usize::from(first >> 6)] |= 1 << (first & 63);
+        }
+
         Self {
+            starts,
             token_only: aho_corasick.is_none(),
             patterns: (!patterns.is_empty()).then(|| patterns.into()),
             visible_boundary_idx,
@@ -408,11 +417,47 @@ impl StopSequenceDecoder {
             return Ok((step, origin));
         }
 
-        // Under string stops the token's text goes through the jail.
-        let before = self.jail_buffer.len();
-        self.sequence
-            .append_token_into(token_id, &mut self.jail_buffer)?;
-        let origin = observe_atom(&mut self.decoded_bytes, &self.jail_buffer[before..], atom);
+        // Under string stops the token's text goes through the jail. With
+        // nothing held, text that agrees with no stop sequence at any
+        // position, as far as the text goes, would leave the jail whole: it
+        // is decoded into `out` and stays there. The automaton's entry and
+        // the jail's two copies cost more than the token's own decode.
+        let held = !self.jail_buffer.is_empty();
+        let buffer = if held {
+            &mut self.jail_buffer
+        } else {
+            &mut *out
+        };
+        let before = buffer.len();
+        self.sequence.append_token_into(token_id, buffer)?;
+        let origin = observe_atom(&mut self.decoded_bytes, &buffer[before..], atom);
+        if !held {
+            let text = &out.as_bytes()[before..];
+            let patterns = self.rules.patterns.as_deref().unwrap_or_default();
+            let starts =
+                |byte: &u8| (self.rules.starts[usize::from(byte >> 6)] >> (byte & 63)) & 1 == 1;
+            let may_stop = text.iter().position(starts).is_some_and(|first| {
+                (first..text.len()).any(|at| {
+                    starts(&text[at])
+                        && patterns.iter().any(|pattern| {
+                            text[at..]
+                                .iter()
+                                .zip(pattern.as_bytes())
+                                .all(|(a, b)| a == b)
+                        })
+                })
+            });
+            if !may_stop {
+                let step = if text.is_empty() {
+                    SequenceDecoderStep::Held
+                } else {
+                    SequenceDecoderStep::Text
+                };
+                return Ok((step, origin));
+            }
+            self.jail_buffer.push_str(&out[before..]);
+            out.truncate(before);
+        }
         Ok((self.release(out), origin))
     }
 
@@ -1102,6 +1147,25 @@ mod tests {
         let out = decoder.process_token(3).unwrap();
         assert_eq!(out, SequenceDecoderOutput::Text("Hello test".to_string()));
         assert_eq!(decoder.flush(), SequenceDecoderOutput::Held);
+    }
+
+    #[test]
+    fn a_stop_that_begins_past_the_first_candidate_byte_is_held() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        // In "Hello" the first 'l' ("llo") disagrees with the stop; the second
+        // ("lo") agrees as far as the text goes and must be held.
+        let config = StopSequenceConfig::default().with_stop_sequence("lo world");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        assert_eq!(
+            decoder.process_token(1).unwrap(),
+            SequenceDecoderOutput::Text("Hel".to_string())
+        );
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("lo world"));
     }
 
     #[test]
