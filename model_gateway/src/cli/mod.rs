@@ -325,7 +325,8 @@ struct RoutingArgs {
     /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
     /// grouped worker whose handshake awaits this many engines on one socket set
     /// (default: as many as the first engine to dial declares, one for an
-    /// engine that declares none).
+    /// engine that declares none). Under --dp-aware a worker given this count
+    /// registers as one worker per engine, which share the socket set.
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
