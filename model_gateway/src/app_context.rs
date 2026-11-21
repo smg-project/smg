@@ -156,6 +156,13 @@ pub struct AppContext {
     /// the policy store is present.
     pub(crate) policy_engine: Option<Arc<PolicyEngine>>,
     /// The membership feed over [`Self::policy_store`], present wherever the store is.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the follower and the policy engine each took what they read at the build"
+        )
+    )]
     pub(crate) policy_feed: Option<Feed>,
     /// What the start left a gateway that decides in its own process (the
     /// setting on and no controller's address): the policy engine the
@@ -1121,31 +1128,17 @@ impl AppContextBuilder {
             .clone();
         let interval = config.load_monitor_interval_secs;
         let (engine_metrics, conditional) = (config.engine_metrics, config.disable_load_monitoring);
-        // Where the controller was picked the collector says its facts to
-        // the feed's sink, which writes the store, and no classic policy
-        // reads a load. Else it keeps the classic sink, and its snapshot
-        // feeds every policy that consumes it; the monitor polls every group
-        // by default, conditionally under `--disable-load-monitoring`.
-        let monitor = match &self.policy_feed {
-            Some(feed) => Arc::new(WorkerMonitor::with_sink(
-                registry,
-                feed.load_sink(Duration::from_secs(interval.max(1))),
-                interval,
-                engine_metrics,
-                conditional,
-            )),
-            None => {
-                let monitor = Arc::new(WorkerMonitor::new(
-                    registry,
-                    Arc::clone(&policy_registry),
-                    interval,
-                    engine_metrics,
-                    conditional,
-                ));
-                policy_registry.set_load_receiver(Some(monitor.subscribe()));
-                monitor
-            }
-        };
+        // The monitor's snapshot feeds every policy that consumes it; the
+        // monitor polls every group by default, conditionally under
+        // `--disable-load-monitoring`.
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry,
+            Arc::clone(&policy_registry),
+            interval,
+            engine_metrics,
+            conditional,
+        ));
+        policy_registry.set_load_receiver(Some(monitor.subscribe()));
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
@@ -1217,12 +1210,12 @@ impl AppContextBuilder {
     /// model without an events subscription has no index and no index
     /// gauges.
     ///
-    /// Under the policy controller's feed none is built: the feed's own
-    /// follow reads the workers' cache events into the store's index and
-    /// their load records into the worker monitor, and each reader of this
-    /// monitor takes `None`.
+    /// A gateway that follows a controller builds none: the controller
+    /// reads its workers' cache events and load records, and each reader
+    /// of this monitor takes `None`.
     fn with_kv_event_monitor(mut self) -> Self {
-        // One collector a gateway: under the feed the store's follow is it.
+        // The feed stands where the gateway follows a controller, and such
+        // a gateway reads no worker's stream itself.
         if self.policy_feed.is_some() {
             return self;
         }
@@ -1714,76 +1707,6 @@ mod tests {
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
-    /// Under the policy controller the monitor says its facts to the feed's
-    /// sink: a pushed record lands on the store's row, and no classic
-    /// policy is handed the monitor's load feed.
-    #[tokio::test]
-    async fn under_the_feed_the_collectors_sink_is_the_feeds() {
-        use smg_policy_controller::{
-            engine::{Role, WireModes},
-            store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
-            worker_host::{Expect, Wrote},
-        };
-        use smg_worker::common_proto::EngineLoad;
-
-        use crate::policies::as_cache_aware;
-
-        const URL: &str = "http://worker:8000";
-        let config = RouterConfig {
-            policy_controller: true,
-            ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
-        };
-        let builder = AppContextBuilder::new()
-            .with_client(&config, 5)
-            .expect("client builds")
-            .with_worker_registry()
-            .with_policy_registry(&config)
-            .with_policy_controller(&config, None)
-            .expect("the policy controller starts")
-            .with_worker_monitor(&config)
-            .expect("worker monitor builds");
-        let feed = builder.policy_feed.as_ref().expect("the store has a feed");
-        let store = builder.policy_store.as_ref().expect("the store started");
-        let monitor = builder.worker_monitor.as_ref().expect("the monitor");
-        let registry = builder.worker_registry.as_ref().expect("the registry");
-
-        let facts = WorkerFacts {
-            key: URL.to_owned(),
-            engine: URL.to_owned(),
-            role: Role::Single,
-            wire_modes: WireModes::HTTP,
-            models: vec!["model-a".to_owned()],
-            dp_size: 1,
-            health: HealthPolicy {
-                probes: false,
-                ..HealthPolicy::default()
-            },
-            ..WorkerFacts::default()
-        };
-        let Ok(Wrote::Registered(row)) =
-            feed.door
-                .found(&Maker::Control, Expect::Nothing, URL, &|_| facts.clone())
-        else {
-            panic!("the worker registers at the feed's door");
-        };
-        let worker = registry.get_by_url(URL).expect("the row's worker stands");
-        let record = EngineLoad {
-            waiting_requests: 6,
-            ..EngineLoad::default()
-        };
-        monitor.apply_pushed_load(&worker, 0, &record, std::time::Instant::now());
-        let sample = LoadSink::load(&**store, row, 0).expect("the row holds the pushed sample");
-        assert_eq!(sample.row.queued, 6);
-
-        let policy = builder
-            .policy_registry
-            .as_ref()
-            .expect("policy registry set")
-            .get_default_policy();
-        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
-        assert!(!cache_aware.has_load_receiver_for_test());
-    }
-
     /// Every policy gets the monitor: a cache-aware one for its indexes, any
     /// other for the load stream of its gRPC workers, which the policies'
     /// load feed reads in place of the poll.
@@ -1821,14 +1744,24 @@ mod tests {
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
-    /// Under the policy controller's feed the classic monitor is not built:
-    /// the context holds none, and a cache-aware policy is handed none.
+    /// A gateway that follows a controller builds no classic monitor: the
+    /// context holds none, and a cache-aware policy is handed none.
     #[tokio::test]
-    async fn under_the_feed_the_classic_cache_event_monitor_is_not_built() {
+    async fn a_gateway_that_follows_a_controller_builds_no_cache_event_monitor() {
+        use std::net::{Ipv4Addr, SocketAddr};
+
         use crate::policies::as_cache_aware;
 
+        // A socket that never listens: the follower dials it and tells
+        // nothing.
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("a free port");
+        let address = socket.local_addr().expect("the socket's address");
         let config = RouterConfig {
             policy_controller: true,
+            policy_controller_address: Some(address.to_string()),
             ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
         };
         let builder = AppContextBuilder::new()
@@ -1848,6 +1781,10 @@ mod tests {
             .get_default_policy();
         let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
         assert!(!cache_aware.kv_event_monitor_is_set_for_test());
+
+        let follower = builder.policy_follower.as_ref().expect("a follower");
+        let follower = follower.lock().take().expect("the follower stands");
+        follower.stop().await;
     }
 
     /// A dropped context lets its worker monitor go: the monitor holds the

@@ -271,11 +271,10 @@ impl Bed {
         self.shown();
     }
 
-    /// Show what the store holds waiting, as the feed's loop does when the
-    /// store's instant comes: the cases run no loop.
+    /// Show what the store holds waiting, at the store's own instant.
     fn shown(&self) {
         if let Some(due) = StoreLoadSink::publish_due(&*self.store) {
-            self.feed.settle_at(due);
+            StoreLoadSink::publish(&*self.store, Instant::now().max(due));
         }
     }
 

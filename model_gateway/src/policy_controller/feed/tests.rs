@@ -1,5 +1,4 @@
-//! Cases of the gateway's membership feed, its load sink and its
-//! publication loop.
+//! Cases of the gateway's membership feed and its load sink.
 
 use std::{
     error::Error,
@@ -19,8 +18,7 @@ use smg_policy_controller::{
     engine::{Role, WireModes, WorkerId},
     store::{
         Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore,
-        Overload, ViewBuffers, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        Overload, ViewBuffers, WorkerFacts, WorkersStore,
     },
     worker_host::{
         Expect, Membership, Objects, Over, Refused, Remover, Standing, StoreDoor, Wrote,
@@ -28,14 +26,11 @@ use smg_policy_controller::{
 };
 use smg_worker::{
     connection::engine::EngineConnector,
-    health::port::{HealthSink, ProbeAnswer},
     identity::basic::Worker,
     load::port::{LoadSink, PollMode, PolledMember},
     registry::event::WorkerEvent,
-    runtime::StallReason,
     worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus},
 };
-use tokio::{task::yield_now, time::sleep_until};
 
 use super::{feed, Feed, FeedDoor};
 use crate::{
@@ -90,18 +85,6 @@ fn register_with(door: &dyn Membership, facts: fn() -> WorkerFacts) -> Result<Wo
     }
 }
 
-fn probed() -> WorkerFacts {
-    WorkerFacts {
-        health: HealthPolicy {
-            failure_threshold: 2,
-            success_threshold: 2,
-            probes: true,
-            ..HealthPolicy::default()
-        },
-        ..stated()
-    }
-}
-
 fn start_store() -> Result<Arc<MemoryStore>, Box<dyn Error>> {
     let store = start(&RouterConfig {
         policy_controller: true,
@@ -146,194 +129,6 @@ async fn a_written_row_is_in_force_for_the_next_decision() {
         .await
         .expect("the next decision picks the worker");
     assert_eq!(placed.id(), row);
-}
-
-#[tokio::test]
-async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
-    let store = start_store().expect("the store starts");
-    let (registry, feed) = bed(&store);
-    let policy_engine = PolicyEngine::new(Arc::clone(&store), Arc::clone(&feed.objects));
-    let row = register_with(&*feed.door, probed).expect("the worker registers");
-    let object = feed.objects.object(row).expect("the row has an object");
-    let worker = registry.get(&object).expect("the worker stands");
-    let revision = worker.revision();
-    let sink = feed.health_sink();
-
-    let assert_statuses = |row_status, object_status| {
-        assert_eq!(store.by_key(URL).map(|row| row.status), Some(row_status));
-        assert_eq!(worker.status(), object_status);
-    };
-    assert_statuses(RowStatus::Pending, WorkerStatus::Pending);
-    assert_eq!(
-        sink.connected(&object, revision),
-        Some((WorkerStatus::Pending, WorkerStatus::Ready))
-    );
-    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
-    let placed = policy_engine
-        .place(&ask(b"first"), Instant::now())
-        .await
-        .expect("the ready row takes a decision");
-    assert_eq!(placed.id(), row);
-    drop(placed);
-
-    let probe = |passed, launched| sink.probe_outcome(&object, passed, revision, launched);
-    assert_eq!(
-        probe(false, WorkerStatus::Ready),
-        ProbeAnswer::Stood(WorkerStatus::Ready)
-    );
-    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
-    assert_eq!(
-        probe(false, WorkerStatus::Ready),
-        ProbeAnswer::Moved {
-            old: WorkerStatus::Ready,
-            new: WorkerStatus::NotReady
-        }
-    );
-    assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
-    assert!(matches!(
-        policy_engine.ask(&ask(b"down"), &[], Instant::now()).await,
-        Err(Unplaced::Shed { .. })
-    ));
-
-    assert_eq!(
-        probe(true, WorkerStatus::NotReady),
-        ProbeAnswer::Stood(WorkerStatus::NotReady)
-    );
-    assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
-    assert_eq!(
-        probe(true, WorkerStatus::NotReady),
-        ProbeAnswer::Moved {
-            old: WorkerStatus::NotReady,
-            new: WorkerStatus::Ready
-        }
-    );
-    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
-    let placed = policy_engine
-        .place(&ask(b"back"), Instant::now())
-        .await
-        .expect("the recovered row takes a decision");
-    assert_eq!(placed.id(), row);
-}
-
-#[test]
-fn a_worker_with_no_row_keeps_the_registrys_health() {
-    let store = Arc::new(MemoryStore::default());
-    let (registry, feed) = bed(&store);
-    let classic = WorkerRegistry::new();
-    let pending = || -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(URL)
-                .status(WorkerStatus::Pending)
-                .build(),
-        )
-    };
-    let (worker, reference) = (pending(), pending());
-    let id = registry
-        .register(Arc::clone(&worker))
-        .expect("a worker without a row");
-    let reference_id = classic
-        .register(Arc::clone(&reference))
-        .expect("a classic worker");
-    let epoch = store.epoch();
-    let sink = feed.health_sink();
-
-    assert_eq!(
-        sink.connected(&id, worker.revision()),
-        classic.connected(&reference_id, reference.revision())
-    );
-    assert_eq!(worker.status(), WorkerStatus::Ready);
-    for _ in 0..2 {
-        assert_eq!(
-            sink.probe_outcome(&id, true, worker.revision(), WorkerStatus::Ready),
-            classic.probe_outcome(
-                &reference_id,
-                true,
-                reference.revision(),
-                WorkerStatus::Ready
-            )
-        );
-        assert_eq!(worker.status(), reference.status());
-    }
-    assert!(store.snapshot().1.is_empty());
-    assert_eq!(store.epoch(), epoch);
-}
-
-#[test]
-fn a_rows_object_takes_no_step_of_the_registrys_own() {
-    let store = Arc::new(MemoryStore::default());
-    let (registry, feed) = bed(&store);
-    let row = register_with(&*feed.door, probed).expect("the worker registers");
-    let object = feed.objects.object(row).expect("the row has an object");
-    let worker = registry.get(&object).expect("the worker stands");
-    let pass = |sink: &dyn HealthSink| {
-        sink.probe_outcome(&object, true, worker.revision(), WorkerStatus::Pending)
-    };
-
-    // Leave the object one pass short of ready while the row has counted none.
-    assert_eq!(
-        pass(registry.as_ref()),
-        ProbeAnswer::Stood(WorkerStatus::Pending)
-    );
-    assert_eq!(
-        pass(feed.health_sink().as_ref()),
-        ProbeAnswer::Stood(WorkerStatus::Pending)
-    );
-    assert_eq!(
-        store.by_key(URL).map(|row| row.status),
-        Some(RowStatus::Pending)
-    );
-    assert_eq!(worker.status(), WorkerStatus::Pending);
-    assert_eq!(
-        worker
-            .runtime_state()
-            .expect("the worker's state")
-            .total_pending_probes(),
-        1
-    );
-    assert_eq!(
-        pass(registry.as_ref()),
-        ProbeAnswer::Moved {
-            old: WorkerStatus::Pending,
-            new: WorkerStatus::Ready
-        }
-    );
-}
-
-/// Whether the next decision reads the pool's worker as stalled.
-fn stalled(store: &MemoryStore) -> bool {
-    let ask = ViewAsk {
-        gateway: GatewayId::LOCAL,
-        now: Instant::now(),
-        pinned: None,
-        affinity: false,
-        signal_cells: false,
-    };
-    store.deciding(|world| {
-        let mut view = ViewBuffers::default();
-        let built = world.build(MODEL, Role::Single, &ask, &mut view).is_some();
-        built && view.candidates.iter().any(|row| row.health.stalled)
-    })
-}
-
-/// The health loop tells the feed's sink each move of a worker's liveness
-/// veto. The adapter writes it as the row's stalled bit, and the next
-/// decision reads it there.
-#[test]
-fn a_move_of_a_rows_liveness_veto_is_written_on_the_row() {
-    let store = start_store().expect("the store starts");
-    let (registry, feed) = bed(&store);
-    let row = register(&*feed.door).expect("the worker registers");
-    let object = feed.objects.object(row).expect("the row has an object");
-    let worker = registry.get(&object).expect("the worker stands");
-    let sink = feed.health_sink();
-    assert!(!stalled(&store));
-
-    assert!(worker.set_stall(Some(StallReason::Unreachable)));
-    sink.liveness_moved(&object, worker.revision());
-    assert!(stalled(&store));
-    assert!(worker.set_stall(None));
-    sink.liveness_moved(&object, worker.revision());
-    assert!(!stalled(&store));
 }
 
 #[test]
@@ -970,50 +765,6 @@ fn a_worker_with_no_row_writes_no_load() {
     assert!(Arc::ptr_eq(&shown, &loads.store.world()));
 }
 
-#[tokio::test(start_paused = true)]
-async fn the_loop_shows_a_waiting_write_at_its_due_instant() {
-    let loads = Loads::new().expect("the bed stands");
-    let _publications = loads.feed.publications();
-    let now = Instant::now();
-    // The first record opens the store's window and is shown by itself.
-    loads.pushed(6, now);
-    assert_eq!(loads.vetoed(), Some(true));
-    // The loop reads no instant and waits for a wake.
-    yield_now().await;
-    // The second record lands inside the window, so it waits.
-    loads.pushed(0, now + PUBLISH_WINDOW / 4);
-    assert_eq!(loads.vetoed(), Some(true));
-    // No later write comes: the loop shows it when the window ends.
-    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
-    assert_eq!(loads.vetoed(), Some(false));
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_loop_writes_the_stores_overload_verdict_on_the_workers_object() {
-    let loads = Loads::new().expect("the bed stands");
-    let _publications = loads.feed.publications();
-    let over = || loads.registry.overloaded_worker_count(MODEL);
-    let now = Instant::now();
-    // The store shows the first record by itself. The object's flag does
-    // not move at the record: the loop writes it at its wake.
-    loads.pushed(6, now);
-    assert_eq!(loads.vetoed(), Some(true));
-    assert!(!loads.worker.is_overloaded());
-    yield_now().await;
-    assert!(loads.worker.is_overloaded());
-    assert_eq!(over(), 1);
-    // The queue drains inside the window. The verdict waits for the
-    // window's end, and the flag with it.
-    loads.pushed(0, now + PUBLISH_WINDOW / 4);
-    yield_now().await;
-    assert!(loads.worker.is_overloaded());
-    // The loop's publication shows the verdict cleared and clears the flag.
-    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
-    assert_eq!(loads.vetoed(), Some(false));
-    assert!(!loads.worker.is_overloaded());
-    assert_eq!(over(), 0);
-}
-
 #[test]
 fn a_settle_writes_the_stores_overload_verdict_on_a_replaced_object() {
     let loads = Loads::new().expect("the bed stands");
@@ -1061,103 +812,4 @@ async fn a_classic_selection_reads_the_stores_overload_verdict() {
         refused.err().map(|shed| shed.status()),
         Some(http::StatusCode::SERVICE_UNAVAILABLE)
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_forgotten_workers_eviction_is_shown_by_the_loop() {
-    let loads = Loads::new().expect("the bed stands");
-    let _publications = loads.feed.publications();
-    let now = Instant::now();
-    loads.pushed(6, now);
-    assert_eq!(loads.vetoed(), Some(true));
-    yield_now().await;
-    // The collector forgets a worker that left `Ready`. The store judges
-    // its engine again and names no instant, so the verdict waits.
-    loads.sink.forget(&loads.worker);
-    assert_eq!(loads.vetoed(), Some(true));
-    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
-    assert_eq!(loads.vetoed(), Some(false));
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_resets_eviction_is_shown_by_the_loop() {
-    let loads = Loads::new().expect("the bed stands");
-    let _publications = loads.feed.publications();
-    let now = Instant::now();
-    loads.pushed(6, now);
-    yield_now().await;
-    // The row left `Ready`. The collector lost the event, and resets.
-    let row = WorkersStore::get(&*loads.store, loads.row).expect("the row");
-    loads
-        .store
-        .set_status(loads.row, RowStatus::NotReady, row.revision)
-        .expect("the row stands");
-    loads.sink.reset();
-    assert_eq!(StoreLoadSink::ranks(&*loads.store, loads.row), 0);
-    assert!(loads.store.publish_due().is_some());
-    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
-    assert_eq!(loads.store.publish_due(), None);
-}
-
-/// What the registry's listener reads on the thread that lays a row's
-/// object: whether the feed's turn is held, and the members a decision
-/// sees.
-struct AtObject {
-    feed: Feed,
-    read: OnceLock<(bool, Option<usize>)>,
-}
-
-impl Wake for AtObject {
-    fn wake(self: Arc<Self>) {
-        self.read.get_or_init(|| {
-            (
-                self.feed.turn.try_lock().is_none(),
-                self.feed.store.world().members(MODEL, Role::Single),
-            )
-        });
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_loop_settles_a_row_written_past_the_door_under_the_feeds_turn() {
-    let store = start_store().expect("the store starts");
-    let (registry, feed) = bed(&store);
-    let _publications = feed.publications();
-    // The loop reads no instant and waits for a wake.
-    yield_now().await;
-    let at_object = Arc::new(AtObject {
-        feed: feed.clone(),
-        read: OnceLock::new(),
-    });
-    let waker = Waker::from(Arc::clone(&at_object));
-    let mut events = registry.subscribe_events();
-    let mut event = pin!(events.recv());
-    assert!(event
-        .as_mut()
-        .poll(&mut Context::from_waker(&waker))
-        .is_pending());
-
-    // A write past the door leaves a build owed, and the store wakes the
-    // loop. No load is written, and nobody settles.
-    store.upsert(stated());
-    assert!(registry.get_by_url(URL).is_none());
-    sleep_until((Instant::now() + PUBLISH_WINDOW).into()).await;
-    // The loop laid the object under the turn, then showed the row.
-    assert_eq!(at_object.read.get(), Some(&(true, None)));
-    assert!(registry.get_by_url(URL).is_some());
-    assert_eq!(store.world().members(MODEL, Role::Single), Some(1));
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_loop_ends_when_its_answer_is_dropped() {
-    let loads = Loads::new().expect("the bed stands");
-    let publications = loads.feed.publications();
-    yield_now().await;
-    drop(publications);
-    let now = Instant::now();
-    loads.pushed(6, now);
-    loads.pushed(0, now + PUBLISH_WINDOW / 4);
-    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
-    // The second record still waits: nobody shows it.
-    assert_eq!(loads.vetoed(), Some(true));
 }
