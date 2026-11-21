@@ -8,7 +8,7 @@
 //! on the worker objects. [`decide`] names a request's rows from them, hands
 //! them to the decision and, where the decision picked, writes the engine's
 //! record of the prefixes it sent. A pair decision reads a column a side in
-//! the rows' place ([`AffinityFacts`]): [`column`] fills one from the same
+//! the rows' place ([`AffinityFacts`]): [`column()`] fills one from the same
 //! data, and [`record_prefix`] writes the record behind the pair's pick.
 //!
 //! What is kept, and what guards it:
@@ -33,6 +33,8 @@
 //!
 //! No decision holds a lock across its stages: the naming ends before the
 //! decision runs, and the record is written after it answered.
+//!
+//! [`WarmUpRule`]: crate::engine::WarmUpRule
 
 use std::{
     cell::RefCell,
@@ -272,7 +274,7 @@ struct RecordRead {
 }
 
 /// What the fill of a column read of the record of sent prefixes
-/// ([`column`]). The write behind the pick made over that column stands on
+/// ([`column()`]). The write behind the pick made over that column stands on
 /// it ([`record_prefix`]).
 #[derive(Clone, Copy, Debug)]
 pub struct PrefixRead {
@@ -1000,7 +1002,7 @@ struct Asked<'a> {
 /// A profile whose stages read no affinity, and a request whose host filled
 /// a column or named rows itself, pass straight to `decide`. A profile that
 /// reads affinity and is named no row (it shows its rows to a plugin, whose
-/// stage reads the column whole) is handed the column [`column`] fills, in
+/// stage reads the column whole) is handed the column [`column()`] fills, in
 /// [`RequestFacts::affinity`].
 ///
 /// The rows live in the calling thread's buffers until this returns:
@@ -1080,7 +1082,7 @@ pub fn column(
     read
 }
 
-/// Behind a pick made over a column ([`column`]): records the request's
+/// Behind a pick made over a column ([`column()`]): records the request's
 /// prefix as sent to the picked worker `id`, where the record of sent
 /// prefixes speaks for that worker. The record says where a prefix was
 /// decided to go.
