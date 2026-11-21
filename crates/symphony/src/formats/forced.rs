@@ -115,9 +115,12 @@ mod tests {
 
     /// The forced call has no delimiter to close it: its value is the whole output, and the
     /// output's end is the call's own end where the value is whole there. A number or a literal
-    /// the bytes end on is whole only then, and its call ends closed, at the model's stop and
-    /// at the token limit alike, as the object that closed at its brace does; a value the end
-    /// found unfinished is the call the stop found open, or the one the limit cut.
+    /// the bytes end on is whole only then, and its call ends closed at the model's stop, as
+    /// the object that closed at its brace does. At a cut a literal is whole all the same,
+    /// since no byte could have followed it, and a number is not: `12` may be what the limit
+    /// left of `123`, so its call is the one the limit cut, its bytes delivered as they are.
+    /// A value the end found unfinished is the call the stop found open, or the one the limit
+    /// cut.
     #[test]
     fn a_value_whole_where_the_output_ends_closes_its_call_and_an_unfinished_one_does_not() {
         let declared = Declared::default().forcing("get_weather");
@@ -130,13 +133,14 @@ mod tests {
             )
         };
         for finish in [EngineFinish::Stop, EngineFinish::Length] {
-            for whole in [
-                "7",
-                "-12.5",
-                "true",
-                "null",
-                "{\"city\": \"Paris\"}",
-                "\"Paris\"",
+            for (whole, a_number) in [
+                ("7", true),
+                ("-12.5", true),
+                ("0", true),
+                ("true", false),
+                ("null", false),
+                ("{\"city\": \"Paris\"}", false),
+                ("\"Paris\"", false),
             ] {
                 let events = read(whole, finish.clone());
                 assert_eq!(
@@ -144,9 +148,17 @@ mod tests {
                     [("get_weather".to_string(), whole.to_string())],
                     "{whole}"
                 );
+                let cut_short = a_number && finish == EngineFinish::Length;
                 assert_eq!(
                     endings(&events),
-                    [(0, CallEnd::Closed)],
+                    [(
+                        0,
+                        if cut_short {
+                            CallEnd::Cut
+                        } else {
+                            CallEnd::Closed
+                        }
+                    )],
                     "{whole} under {finish:?}"
                 );
                 assert_eq!(losses(&events), [], "{whole}");
