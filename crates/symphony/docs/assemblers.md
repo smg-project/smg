@@ -517,19 +517,27 @@ What the syntax says, and what the assembler does with it:
   whole (`Assembler::ends_a_string`). Nothing of the string is held and nothing is taken
   back. Where the named parameter's type constrains its text (an integer, a number, a
   boolean, a null, an enumerated value), the tag ends the string only where a value of that
-  type begins behind it: the tag is held, with at most 64 bytes of whitespace and the bytes
-  the type needs, five at most, and anything else behind it leaves the tag the string's text
+  type stands behind it. A number begins with a digit, behind a sign or not, and is known
+  there. A boolean or a null is one of the words the template writes for it, and an
+  enumerated value one of the schema's values: whole, ended by whitespace, a tag or the
+  separator, so a longer word that only begins like one (`Truex`) is none. The tag is held
+  for that, with at most 64 bytes of whitespace and at most 64 bytes of the value behind it
+  (two for a number, the word and one byte for a boolean or a null, an enumerated value's
+  length and one byte), and anything else behind it leaves the tag the string's text
   (`Assembler::weigh_candidate`); a parameter typed `string`, or with no such type, cannot be
   told apart that way and ends the string at its tag. The call keeps one bit per declared
-  property for the parameters it has given (`Declared::place`), for the first 64; a property
-  past them is never taken for the next parameter. Every other opening tag behind a separator
+  property for the parameters it has given (`Declared::place`), for the first 64. A property
+  past them is never taken for the next parameter, and a string past them is never ended at
+  a tag: its own closing tag after all could not be seen to undo the reading. Every other
+  opening tag behind a separator
   stays the string's text: one that names no parameter of the tool, one that names a
   parameter the call gave already, and one with attributes or any tail after its name, which
   is no whole tag. Since nothing sent can be taken
   back, the rest of the call has to bear the reading out: the string's own closing tag after
   all, another repair in the call, a parameter the tool does not declare or one given twice,
   or an end other than the call's own closing tag makes the call no whole call, said once by
-  `Malformed { UnconfirmedStringEnd }`, a reason that loses a call.
+  `Malformed { UnconfirmedStringEnd }`, a reason that loses a call. The model's stop inside
+  such a call says that alone: no `OpenAtTheStop` announces a close the call does not get.
 - **A top-level null is never written.** The template leaves an argument whose value is `None`
   out (`for k, v in arguments.items() if v is not none`), so no output carries one; the
   parity test counts that as a corpus class.

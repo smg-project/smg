@@ -203,7 +203,8 @@ is a later step).
   (`Engine::wrapping_tags`; after text of the stay it is the prose's, and stays in it): one
   `Malformed { StrayClosingTag }` event of no bytes, the tag's bytes `Dropped { MalformedCall }`
   and never content. The tag is read across deltas, its bytes held from `</` while they can
-  still spell one; bytes that spell none after all are the stay's text, as before.
+  still spell one, up to 128 of them; a longer run, and bytes that spell none after all, are
+  the stay's text, as before.
 - A call given as data (`CallSyntax::Shaped`) opens only when the header after its terminal
   matches: the engine holds the terminal and every byte after it, and takes no row, until the
   header decides. A header that cannot match gives the terminal back: its first character is the

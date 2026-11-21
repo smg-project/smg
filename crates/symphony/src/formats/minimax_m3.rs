@@ -2350,12 +2350,12 @@ mod tests {
     }
 
     /// A tag that names a parameter whose type constrains its text ends the string only where
-    /// a value of that type begins behind it: a digit, or a sign and a digit, for an integer
-    /// and a number; one of the words the template writes for a boolean; the start of one of
-    /// an enumerated parameter's values. The tag is held for that, with at most 64 bytes of
-    /// whitespace behind it and the few bytes the type needs. Anything else behind it, a tag
-    /// or the call's end included, and the tag is the string's text, with what followed it:
-    /// the call reads as it did, whole, with no reason given.
+    /// a value of that type stands behind it: a digit, or a sign and a digit, for an integer
+    /// and a number; one of the words the template writes for a boolean; one of an enumerated
+    /// parameter's values. The tag is held for that, with at most 64 bytes of whitespace
+    /// behind it and the bytes the type needs, 64 at most. Anything else behind it, a tag or
+    /// the call's end included, and the tag is the string's text, with what followed it: the
+    /// call reads as it did, whole, with no reason given.
     #[test]
     fn a_tag_that_names_a_typed_parameter_ends_the_string_only_before_a_value_of_its_type() {
         let near = " ".repeat(64);
