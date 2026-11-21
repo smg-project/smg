@@ -32,6 +32,9 @@ const CUT_ANSWER: &str = "<|channel|>final<|message|>Hello wor";
 /// A call to a function the token limit cut inside its arguments.
 const CUT_CALL: &str =
     "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\": \"Par";
+/// A call the turn ended right behind the header of.
+const HEADER_ONLY_CALL: &str =
+    "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>";
 /// A call the turn ended on.
 const CLOSED_CALL: &str = "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\": \"Paris\"}<|call|>";
 
@@ -251,6 +254,30 @@ async fn a_streamed_call_the_finish_cut_reads_incomplete() {
         assert_eq!(
             terminal["response"]["output"][0]["status"], "incomplete",
             "{context}"
+        );
+    }
+}
+
+/// A turn that ends right behind a call's header, before any argument byte,
+/// keeps the call the stream announced: the call item reads `incomplete`
+/// with empty arguments, and the response with it.
+#[tokio::test]
+async fn a_streamed_call_that_ends_behind_its_header_reads_incomplete() {
+    let ids = tokens(HEADER_ONLY_CALL);
+    for (finish_reason, reason) in [
+        (Some("stop"), None),
+        (Some("length"), Some("max_output_tokens")),
+        (None, None),
+    ] {
+        let context = format!("finish {finish_reason:?}");
+        let (stored, terminal, _) = streamed(frames(&ids, finish_reason)).await;
+        assert_incomplete(&stored, reason, &format!("{context}, the stored object"));
+        assert_eq!(stored["output"][0]["type"], "function_call", "{context}");
+        assert_eq!(stored["output"][0]["status"], "incomplete", "{context}");
+        assert_eq!(stored["output"][0]["arguments"], "", "{context}");
+        assert_eq!(
+            terminal["type"], "response.incomplete",
+            "{context}: {terminal}"
         );
     }
 }

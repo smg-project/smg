@@ -1,6 +1,7 @@
 //! The ways a Harmony Responses turn ends on a call to a server tool in the
 //! plain and streamed forms. The outcomes are alike except when the token
-//! limit cuts the first call: only the streamed form recovers that call.
+//! limit cuts the first call inside its arguments: only the streamed form
+//! recovers that call.
 //! A turn that ended on its call runs it: the loop asks the model again and
 //! answers. A turn the token limit cut inside a tool's name read no call:
 //! nothing runs, and the response keeps the truncation.
@@ -103,6 +104,16 @@ fn exits() -> Vec<Exit> {
             None,
         )
         .stream_only(),
+        // The token limit cut the first call right behind its header: a
+        // server tool's call with no argument bytes is not read, nothing runs.
+        Exit::new(
+            "the token limit behind the first call's header",
+            &[CALL],
+            End::Finish("length"),
+            false,
+            "incomplete",
+            Some("max_output_tokens"),
+        ),
         // The call closed and the token limit cut a second one: the closed
         // call runs and the cut one is not read.
         Exit::new(
