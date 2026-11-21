@@ -13,7 +13,7 @@ use std::sync::Arc;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ResponseFormat, StreamOptions, StringOrArray, Tool, ToolChoice},
+    common::{ResponseFormat, StreamOptions, StringOrArray, Tool, ToolChoice, ToolChoiceValue},
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
@@ -131,6 +131,27 @@ pub(crate) struct ChatResponseSpec {
     /// parser's names); `None` when no resolution was made (a spec built from the
     /// request alone), and the readers resolve them as before.
     pub parser_names: Option<Names>,
+    /// Whether the request expects tool calls in the answer
+    /// ([`expects_tool_calls`]): what a wire that fails a request on a tool
+    /// call the reader could not read asks before it does
+    /// ([`Self::fails_on_unreadable_call`]).
+    pub expects_tool_calls: bool,
+}
+
+/// Whether the request expects tool calls in the answer: it has tools the
+/// model may call (its own list or a message's dynamic tools, non-empty), or
+/// its history holds a call and it leaves `tool_choice` to the model; never
+/// under `tool_choice: none`, where every call is dropped whole. `provider`
+/// is the model's profile as the request's preparation derived it once.
+fn expects_tool_calls(request: &ChatCompletionRequest, provider: ProviderProfile) -> bool {
+    if matches!(
+        request.tool_choice,
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+    ) {
+        return false;
+    }
+    request.effective_tools_for(provider).next().is_some()
+        || (request.tool_choice.is_none() && request.history_tool_calls_count() > 0)
 }
 
 /// Whether the response to a chat `request` is scanned for tool calls: the
@@ -201,7 +222,22 @@ impl ChatResponseSpec {
             reasoning_in_prefill: false,
             symphony: None,
             parser_names: None,
+            expects_tool_calls: expects_tool_calls(request, provider),
         }
+    }
+
+    /// Whether a tool call the reader could not read ends the request as a
+    /// failure in place of an answer (`wire::minimax::InvalidToolCallFormat`):
+    /// the request expects tool calls, a Symphony table reads the answer, and
+    /// the wire's contract fails a request on such a call for that table's
+    /// answers ([`Wire::fails_on_unreadable_tool_call`]: MiniMax's, for its
+    /// M3 table). Asked where a choice's reader is made; every other request
+    /// answers at the first test.
+    pub(crate) fn fails_on_unreadable_call(&self) -> bool {
+        self.expects_tool_calls
+            && self.symphony.as_ref().is_some_and(|assignment| {
+                self.wire.fails_on_unreadable_tool_call(assignment.table())
+            })
     }
 }
 
@@ -430,6 +466,69 @@ mod tests {
 
     fn chat_request(value: Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("request deserializes")
+    }
+
+    /// A request expects tool calls when it has tools the model may call, or
+    /// when its history holds a call and it leaves the choice to the model;
+    /// never under `tool_choice: none`, and not for an empty tool list.
+    #[test]
+    fn a_request_expects_tool_calls_with_tools_or_a_call_in_its_history() {
+        let lookup = json!([{"type": "function", "function": {"name": "lookup"}}]);
+        let history = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]);
+        let plain = json!([{"role": "user", "content": "hi"}]);
+        for (tools, tool_choice, messages, expected) in [
+            (Some(lookup.clone()), None, plain.clone(), true),
+            (
+                Some(lookup.clone()),
+                Some(json!("auto")),
+                plain.clone(),
+                true,
+            ),
+            (
+                Some(lookup.clone()),
+                Some(json!("required")),
+                plain.clone(),
+                true,
+            ),
+            (
+                Some(lookup.clone()),
+                Some(json!("none")),
+                plain.clone(),
+                false,
+            ),
+            (
+                Some(lookup.clone()),
+                Some(json!("none")),
+                history.clone(),
+                false,
+            ),
+            (None, None, plain.clone(), false),
+            (Some(json!([])), None, plain.clone(), false),
+            (None, None, history.clone(), true),
+            (None, Some(json!("auto")), history.clone(), false),
+        ] {
+            let mut request = json!({"model": "MiniMax-M3", "messages": messages});
+            if let Some(tools) = &tools {
+                request["tools"] = tools.clone();
+            }
+            if let Some(tool_choice) = &tool_choice {
+                request["tool_choice"] = tool_choice.clone();
+            }
+            let spec = ChatResponseSpec::from(&chat_request(request));
+            assert_eq!(
+                spec.expects_tool_calls, expected,
+                "tools {tools:?}, tool_choice {tool_choice:?}"
+            );
+            // No table reads the answer of a spec built from the request
+            // alone, so nothing fails on an unreadable call yet.
+            assert!(!spec.fails_on_unreadable_call());
+        }
     }
 
     fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {

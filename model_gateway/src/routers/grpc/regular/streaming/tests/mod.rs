@@ -18,6 +18,7 @@ mod sse_bytes;
 mod symphony_chat;
 mod symphony_choice;
 mod thinking_display;
+mod tool_call_format;
 mod usage;
 mod usage_chunk;
 

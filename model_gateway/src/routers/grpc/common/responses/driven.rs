@@ -49,7 +49,9 @@ use crate::{
 };
 
 /// How a reading ended: with its stream complete, or with the client told of
-/// a failure by the error event the stream ends with (before its `[DONE]`).
+/// a failure by the error event the stream ends with (before its `[DONE]`,
+/// or as the stream's last frame for the one failure that ends a chat stream
+/// so, `StreamFailure::ends_a_completed_answer`).
 /// The body hands the word on to the edge ([`BodyFailure`]), which then
 /// counts the response as a body that failed, what the client read, where
 /// the frames alone would say it went out in full.

@@ -73,7 +73,7 @@ use crate::{
             },
             utils,
             utils::{isolation::isolated, message_utils},
-            wire::StreamShape,
+            wire::{minimax::InvalidToolCallFormat, StreamShape},
         },
     },
 };
@@ -613,14 +613,7 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = &result {
-                        utils::send_stream_failure(&tx, failure, &source)
-                            .instrument(span)
-                            .await;
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                    ReadingEnd::of(&result)
+                    StreamingProcessor::close_chat_stream(&tx, &result, &source, span).await
                 })
             }
             context::ExecutionResult::PrefillDecode {
@@ -652,14 +645,7 @@ impl StreamingProcessor {
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
-                    if let Err(failure) = &result {
-                        utils::send_stream_failure(&tx, failure, &source)
-                            .instrument(span)
-                            .await;
-                    }
-
-                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-                    ReadingEnd::of(&result)
+                    StreamingProcessor::close_chat_stream(&tx, &result, &source, span).await
                 })
             }
             context::ExecutionResult::Embedding { .. } => Box::pin(async move {
@@ -694,6 +680,30 @@ impl StreamingProcessor {
             )),
             None => build_sse_response_from_stream(stream),
         })
+    }
+
+    /// The chat stream's end, after its read: the error event of a failed
+    /// read, under the request's span, then `[DONE]`, except after the one
+    /// failure whose own frame is the stream's last
+    /// ([`utils::StreamFailure::ends_a_completed_answer`]: a tool call the
+    /// reader could not read, on a wire whose contract ends the stream so).
+    /// The word on how the reading ended is the body's to hand to the edge.
+    pub(super) async fn close_chat_stream(
+        tx: &SseSender,
+        result: &Result<(), utils::StreamFailure>,
+        source: &utils::StreamSource,
+        span: Span,
+    ) -> ReadingEnd {
+        if let Err(failure) = result {
+            utils::send_stream_failure(tx, failure, source)
+                .instrument(span)
+                .await;
+            if failure.ends_a_completed_answer() {
+                return ReadingEnd::Failed;
+            }
+        }
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+        ReadingEnd::of(result)
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
@@ -776,6 +786,20 @@ impl StreamingProcessor {
                 let usage = stream.usage_snapshot();
                 stream.flush_parsers(usage.as_ref()).await?;
                 let final_usage = stream.final_usage();
+                // A tool call a choice's reader could not read, under a
+                // request that fails on one: the finish chunks are withheld,
+                // the usage chunk still goes out when the request asked for
+                // one (so a client accounts the tokens), and the failure
+                // ends the stream (`InvalidToolCallFormat`).
+                if let Some(failure) = stream.unreadable_call() {
+                    stream.write_usage_chunk(final_usage.as_ref());
+                    // The failure is the stream's outcome whatever the
+                    // frame's send did: a client gone by now ends the write,
+                    // not the account of the request.
+                    let _ =
+                        StreamingProcessor::flush_chunks(stream.tx, &mut stream.sse_buffer).await;
+                    return Err(utils::StreamFailure::ToolCallFormat(failure));
+                }
                 stream
                     .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
                     .await?;
@@ -788,8 +812,21 @@ impl StreamingProcessor {
             .await
         };
 
+        // An answer the engine completed and the request fails on ended whole
+        // for its worker: the lease of a placed dispatch is told so, as for
+        // an answer that went out, and the failure's own account charges no
+        // worker (`StreamSource::account`). No completion metric is recorded
+        // for it: the request did not complete.
+        let answered = terminal
+            .as_ref()
+            .is_err_and(utils::StreamFailure::ends_a_completed_answer);
         stream
-            .settle_and_record(reservation, client_left || terminal.is_err(), source)
+            .settle_and_record(
+                reservation,
+                client_left || terminal.is_err(),
+                source,
+                answered,
+            )
             .await;
         terminal
     }
@@ -842,7 +879,14 @@ impl StreamingProcessor {
         // well: a decode that failed leaves both streams to abort on drop; a
         // client that left ends the read with `Ok` too, its decode stream
         // aborting the request on drop, the prefill's own request complete.
-        if result.is_ok() {
+        // A read that ended as the tool-call contract's failure completed on
+        // the engine as well (the decode stream was released as completed
+        // before the reader's verdict), so the prefill side is not aborted
+        // for it (`StreamFailure::ends_a_completed_answer`).
+        if result
+            .as_ref()
+            .map_or_else(utils::StreamFailure::ends_a_completed_answer, |()| true)
+        {
             prefill_stream.mark_completed();
         }
 
@@ -4081,7 +4125,8 @@ impl<'a> ChatStream<'a> {
                             self.spec.tools.clone().unwrap_or_default(),
                             &mut events,
                         )?
-                        .first_call_only(self.spec.first_tool_call_only),
+                        .first_call_only(self.spec.first_tool_call_only)
+                        .failing_unreadable_calls(self.spec.fails_on_unreadable_call()),
                     ),
                 };
                 let stopped =
@@ -4337,7 +4382,8 @@ impl<'a> ChatStream<'a> {
                     self.spec.tools.clone().unwrap_or_default(),
                     &mut events,
                 )?
-                .first_call_only(self.spec.first_tool_call_only),
+                .first_call_only(self.spec.first_tool_call_only)
+                .failing_unreadable_calls(self.spec.fails_on_unreadable_call()),
             ),
         };
         if let Some(text) = flushed {
@@ -4756,6 +4802,25 @@ impl<'a> ChatStream<'a> {
         Ok(())
     }
 
+    /// The failure of a stream whose request fails on a tool call the reader
+    /// could not read (`ChatResponseSpec::fails_on_unreadable_call`): the
+    /// verdict of the lowest choice whose reader has one, so the same output
+    /// fails the same way, with the token limit blamed only where that
+    /// choice's finish says it cut the output. One such choice fails the
+    /// whole request. `None` for every other stream, at one test.
+    fn unreadable_call(&self) -> Option<InvalidToolCallFormat> {
+        if !self.spec.fails_on_unreadable_call() {
+            return None;
+        }
+        self.choices.iter().find_map(|choice| {
+            let unreadable = choice.reader.as_ref()?.unreadable_call()?;
+            Some(InvalidToolCallFormat::new(
+                unreadable,
+                choice.finish_reason.as_deref() == Some("length"),
+            ))
+        })
+    }
+
     /// Phase 3: the end-of-stream parser flush: first any text still buffered
     /// as a prospective tool call that never materialized (dropping it
     /// produced fully-empty streams), then any parsed-but-unstreamed tool
@@ -4943,11 +5008,14 @@ impl<'a> ChatStream<'a> {
     /// `client_left` says the read ended with the client's leaving, not with the engine's end:
     /// the reservation is still settled, but no terminal router metric is recorded for it, as
     /// the HTTP router has none for a disconnect (neither a completed request nor a failure).
+    /// `answered` says the engine completed an answer the request then failed on (a tool call
+    /// the reader could not read): its dispatch ended whole all the same, and is told so.
     async fn settle_and_record(
         self,
         reservation: Option<Arc<SharedReservationHandle>>,
         client_left: bool,
         source: Option<&utils::StreamSource>,
+        answered: bool,
     ) {
         let model = &self.dispatch.model;
         let counts = self.counts();
@@ -4961,7 +5029,7 @@ impl<'a> ChatStream<'a> {
             if let Some(handle) = reservation {
                 handle.settle_success(counts.settlement()).await;
             }
-            if let Some(source) = source.filter(|_| !client_left) {
+            if let Some(source) = source.filter(|_| !client_left || answered) {
                 source.completed(total_prompt, total_completion);
             }
         } else if let Some(handle) = reservation {
