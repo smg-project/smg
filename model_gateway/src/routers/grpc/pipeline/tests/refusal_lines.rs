@@ -54,9 +54,9 @@ async fn image_answer_over_model_config(config: &str) -> (Response, Vec<(Level, 
     image_answer_over_model_dir(model_dir.path()).await
 }
 
-/// The answer to one image for a model whose source is the local directory `model_dir`, under
-/// router-side processing over the mock tokenizer, with the lines at WARN or above the request
-/// wrote.
+/// The answer to one image for a model whose source is `model_dir` (a local directory, or a
+/// repository id for a test's hub), under router-side processing over the mock tokenizer, with
+/// the lines at WARN or above the request wrote.
 async fn image_answer_over_model_dir(model_dir: &Path) -> (Response, Vec<(Level, String)>) {
     let (pipeline, pooled, _) = chat_pipeline_over(RuntimeType::Sglang, &[], model_dir).await;
     let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
@@ -164,18 +164,20 @@ async fn media_for_a_vocabulary_without_the_placeholder_token_keeps_the_stages_e
     .await;
 }
 
-/// Media to a model whose configuration is found nowhere keeps the answer it had: no
-/// `config.json` in the model's directory on this host, and a hub that answers that it has none
-/// (404) or does not open it (401, 403). The gateway cannot tell whether such a model takes
-/// media, so the request may be the one at fault: a 400 that names the cause, unmarked, with the
-/// stage's ERROR line and none of the pipeline's. A hub that fails to serve the file (503) is
-/// the hub's fault, a 502. No network: the hub is a loopback listener.
+/// Media to a model whose configuration is found nowhere keeps the answer it had: a directory
+/// of this host with no `config.json`, which the hub is not asked for, or a repository the hub
+/// answers that it has none for (404) or does not open (401, 403). The gateway cannot tell
+/// whether such a model takes media, so the request may be the one at fault: a 400 that names
+/// the cause, unmarked, with the stage's ERROR line and none of the pipeline's. A hub that
+/// fails to serve a repository's file (503) is the hub's fault, a 502. No network: the hub is a
+/// loopback listener.
 #[tokio::test]
 async fn media_of_a_model_whose_config_is_found_nowhere_keeps_the_answer_it_had() {
     use std::sync::atomic::{AtomicU16, Ordering};
 
     let home = tempfile::tempdir().expect("a hub cache");
     let model_dir = tempfile::tempdir().expect("a model directory with no config.json");
+    let repository = Path::new("cell/absent");
     let hub_answer = Arc::new(AtomicU16::new(404));
     let endpoint = hub_answering(hub_answer.clone()).await;
     let _env = HubEnv::set(home.path(), &endpoint).await;
@@ -184,9 +186,15 @@ async fn media_of_a_model_whose_config_is_found_nowhere_keeps_the_answer_it_had(
         "Failed to prepare the multimodal prompt plan".to_string(),
     )];
 
-    for status in [404, 401, 403] {
+    // The directory's turn runs under the hub's 503: a lookup would make its answer a 502.
+    for (source, status) in [
+        (model_dir.path(), 503),
+        (repository, 404),
+        (repository, 401),
+        (repository, 403),
+    ] {
         hub_answer.store(status, Ordering::SeqCst);
-        let (response, lines) = image_answer_over_model_dir(model_dir.path()).await;
+        let (response, lines) = image_answer_over_model_dir(source).await;
 
         assert_eq!(
             response.status(),
@@ -211,7 +219,7 @@ async fn media_of_a_model_whose_config_is_found_nowhere_keeps_the_answer_it_had(
     }
 
     hub_answer.store(503, Ordering::SeqCst);
-    let (response, lines) = image_answer_over_model_dir(model_dir.path()).await;
+    let (response, lines) = image_answer_over_model_dir(repository).await;
     assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
     assert_eq!(
         error::extract_error_code_from_response(&response),
