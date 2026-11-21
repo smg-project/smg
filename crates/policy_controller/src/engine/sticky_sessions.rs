@@ -13,7 +13,7 @@
 //! ([`crate::engine::PinSource`]): a pin a dispatch made under an earlier
 //! generation is written back, and no claim is made.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
@@ -284,6 +284,11 @@ pub struct SessionTable {
     /// How many ids the list holds: what a dispatch reads ahead of the
     /// lock, so a table that renamed no worker asks nothing.
     renamed_len: AtomicUsize,
+    /// Whether a pass of the table's host sweeps it ([`Self::sweep_due`]):
+    /// set at the first such pass, for good. A read of a key then runs no
+    /// sweep. A host that runs no pass leaves it unset and its reads sweep
+    /// where one is due, so the table is always swept by one of the two.
+    swept_by_pass: AtomicBool,
 }
 
 impl SessionTable {
@@ -300,6 +305,7 @@ impl SessionTable {
             absence_micros: ABSENT_WORKER_PIN_TTL_MICROS,
             renamed: RwLock::new(FxHashMap::default()),
             renamed_len: AtomicUsize::new(0),
+            swept_by_pass: AtomicBool::new(false),
         }
     }
 
@@ -350,14 +356,18 @@ impl SessionTable {
     /// The pins of `key` at a decision taken at `now_micros` under `rule`,
     /// the key touched when its decision instant is not older (its TTL
     /// renewed, its recovery rule recorded) and the table swept when a sweep
-    /// is due. A key never seen, or one whose TTL passed, has empty pins:
+    /// is due, where no pass of the table's host sweeps it
+    /// ([`Self::sweep_due`]): under such a host a read walks no shard but
+    /// its key's. A key never seen, or one whose TTL passed, has empty pins:
     /// expiry is the key's own compare, the sweep only reclaims.
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
     #[inline(always)]
     pub(crate) fn lookup(&self, key: Session, now_micros: u64, rule: &SessionRule) -> SessionPins {
         let key = key.get();
-        self.sweep_if_due(now_micros);
+        if !self.swept_by_pass.load(Ordering::Relaxed) {
+            self.sweep_if_due(now_micros);
+        }
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
         if entry.expires_at_micros <= now_micros {
@@ -662,14 +672,21 @@ impl SessionTable {
         !held || entry.pins[0] != WorkerId(0)
     }
 
-    /// The sweep a decision's read of a key runs where one is due, for a
-    /// host that calls it on a timer of its own,
-    /// at `now_micros` on the decision clock: the keys past their end leave
-    /// the table and a worker whose absence ended is forgotten, off the path
-    /// of a request. One atomic compare-exchange claims a sweep, and the
-    /// walk takes each shard's mutex in turn. A read still sweeps where it
-    /// finds one due first.
+    /// The sweep that is due, for a host that calls it on a timer of its
+    /// own, at `now_micros` on the decision clock: the keys past their end
+    /// leave the table and a worker whose absence ended is forgotten, off
+    /// the path of a request. One atomic compare-exchange claims a sweep,
+    /// and the walk takes each shard's mutex in turn.
+    ///
+    /// From the first call every sweep is this pass's: a read of a key runs
+    /// none, however long one has been due. So a host that calls this goes
+    /// on calling it. What a sweep does waits for the pass then: a key past
+    /// its end is held until it, and reads as no pins meanwhile, and the
+    /// absence of a worker that left is timed from it.
     pub fn sweep_due(&self, now_micros: u64) {
+        if !self.swept_by_pass.load(Ordering::Relaxed) {
+            self.swept_by_pass.store(true, Ordering::Relaxed);
+        }
         self.sweep_if_due(now_micros);
     }
 
@@ -1729,5 +1746,35 @@ mod tests {
         table.sweep_due(1_100);
         assert_eq!(table.pins(mixed(1)), None);
         assert_eq!(table.pins(mixed(2)), Some([WorkerId(2), WorkerId(0)]));
+    }
+
+    /// A read sweeps where a sweep is due until a pass of the table's host
+    /// has run. From the pass's first run a read walks no shard but its
+    /// key's, however long a sweep has been due: a key past its end reads
+    /// as no pins and is held until the pass, which drops it.
+    #[test]
+    fn a_read_leaves_every_sweep_to_the_hosts_pass_once_one_has_run() {
+        let table = SessionTable::new(RULE.sweep_micros).with_shards(8);
+        let pin = |key: u64, at: u64| {
+            table.lookup(mixed(key), at, &RULE);
+            table.dispatched(mixed(key), SessionVerdict::Pinned, WorkerId(key));
+        };
+        // No pass has run: the read at 1 100 sweeps the key past its end.
+        pin(1, 0);
+        pin(2, 1_100);
+        assert_eq!(table.pins(mixed(1)), None, "a read swept");
+        assert_eq!(table.len(), 1);
+        // The pass runs, with no sweep due. Every sweep is its own now.
+        table.sweep_due(1_150);
+        assert_eq!(table.len(), 1);
+        // Far past the second key's end and many sweep intervals on: reads
+        // of other keys sweep nothing, and the key's own read finds none.
+        pin(3, 9_000);
+        pin(4, 9_500);
+        assert_eq!(table.pins_at(mixed(2), 9_500), [WorkerId(0); 2]);
+        assert_eq!(table.len(), 3, "the key past its end is held for the pass");
+        table.sweep_due(9_600);
+        assert_eq!(table.pins(mixed(2)), None, "the pass dropped it");
+        assert_eq!(table.len(), 2);
     }
 }
