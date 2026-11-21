@@ -142,6 +142,27 @@ impl BufferPool {
         let Some(capacity) = class_capacity(len) else {
             return vec![0u8; len];
         };
+        let mut buf = self.class_buffer(capacity);
+        buf.resize(len, 0);
+        #[cfg(debug_assertions)]
+        buf.fill(SENTINEL);
+        buf
+    }
+
+    /// An empty buffer with room for `len` bytes, for a producer that appends
+    /// them: nothing is filled here. Outside the pooled range it has no room,
+    /// and the producer's own reserve decides.
+    pub(crate) fn take_empty(&self, len: usize) -> Vec<u8> {
+        let Some(capacity) = class_capacity(len) else {
+            return Vec::new();
+        };
+        let mut buf = self.class_buffer(capacity);
+        buf.clear();
+        buf
+    }
+
+    /// The idle buffer of the class of `capacity`, or a fresh one.
+    fn class_buffer(&self, capacity: usize) -> Vec<u8> {
         let index = (capacity / SMALLEST).trailing_zeros() as usize;
         let kept = {
             let mut idle = self.idle();
@@ -154,11 +175,7 @@ impl BufferPool {
         // A fresh buffer is a zeroed allocation of the whole class: the pages
         // past `len` stay untouched, the ones below it are faulted in by the
         // producer's first write, once in the buffer's life.
-        let mut buf = kept.unwrap_or_else(|| vec![0u8; capacity]);
-        buf.resize(len, 0);
-        #[cfg(debug_assertions)]
-        buf.fill(SENTINEL);
-        buf
+        kept.unwrap_or_else(|| vec![0u8; capacity])
     }
 
     /// `buf` back for the next request: kept when it is a class's buffer and
@@ -204,6 +221,11 @@ impl BufferPool {
 /// [`BufferPool::take`] on the process's pool.
 pub(crate) fn take(len: usize) -> Vec<u8> {
     shared().take(len)
+}
+
+/// [`BufferPool::take_empty`] on the process's pool.
+pub(crate) fn take_empty(len: usize) -> Vec<u8> {
+    shared().take_empty(len)
 }
 
 /// A buffer back to the process's pool: kept for the next request of its

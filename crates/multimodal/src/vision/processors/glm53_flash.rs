@@ -378,7 +378,8 @@ fn prepare<'a, F: RgbSource>(
 }
 
 /// Append resized RGB frames to `values` as merged patch rows with temporal
-/// padding. After an error `values` holds a partial append.
+/// padding; a `values` with no allocation yet takes a pooled buffer first.
+/// After an error `values` holds a partial append.
 fn encode<F: RgbSource>(
     frames: &[F],
     budget_frames: usize,
@@ -409,7 +410,7 @@ fn encode<F: RgbSource>(
     )?;
     let expected = product(&[count, features], "GLM patch output size")?;
     if values.capacity() == 0 {
-        *values = patch_buffer(expected);
+        *values = buffer_pool::take_empty(expected);
     }
     values
         .try_reserve_exact(expected)
@@ -528,19 +529,6 @@ fn preprocess_video_frames<F: RgbSource>(
             shape: vec![1],
         },
     ))
-}
-
-/// An empty vector for `len` patch bytes: a buffer of the pool, emptied
-/// because `encode` appends, when a class serves the length. Any other length
-/// gets no buffer here, so the caller's reserve refuses a size the allocator
-/// cannot give, as before.
-fn patch_buffer(len: usize) -> Vec<u8> {
-    if !(buffer_pool::SMALLEST..=buffer_pool::LARGEST).contains(&len) {
-        return Vec::new();
-    }
-    let mut values = buffer_pool::take(len);
-    values.clear();
-    values
 }
 
 fn rgb_len(width: usize, height: usize) -> Result<usize, TransformError> {
@@ -695,7 +683,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
                 .checked_add(self.image_elements(image.width(), image.height())?)
                 .ok_or_else(|| shape("GLM image batch size overflow"))
         })?;
-        let mut values = patch_buffer(expected);
+        let mut values = buffer_pool::take_empty(expected);
         values
             .try_reserve_exact(expected)
             .map_err(|error| shape(format!("cannot reserve GLM image batch: {error}")))?;
