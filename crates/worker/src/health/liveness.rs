@@ -736,6 +736,12 @@ pub fn is_connection_code(code: tonic::Code) -> bool {
     )
 }
 
+/// The worker's veto, read off the runtime state in hand when it has one
+/// (the worker's own read loads that state again).
+fn stall_reason_of(worker: &Arc<dyn Worker>, state: Option<&WorkerRuntime>) -> Option<StallReason> {
+    state.map_or_else(|| worker.stall_reason(), WorkerRuntime::stall_reason)
+}
+
 /// A successful interaction over the transport (a poll answered, an event
 /// batch, a response): the worker is reachable, so an unreachable veto ends
 /// here. A worker the health checker demoted while it was gone (its probes
@@ -754,7 +760,7 @@ pub fn on_contact(worker: &Arc<dyn Worker>) {
     if let Some(state) = state {
         state.note_contact();
     }
-    if worker.stall_reason() != Some(StallReason::Unreachable) {
+    if stall_reason_of(worker, state) != Some(StallReason::Unreachable) {
         return;
     }
     set(worker, state, None, "contact");
@@ -985,7 +991,7 @@ fn on_load_report_with(
     // The grace of a cold shape arms no veto and lifts none: a worker vetoed
     // before the longer prompt reached it is judged as before until it
     // produces, so the grace never reads as the engine producing again.
-    let standing = worker.stall_reason().is_some();
+    let standing = stall_reason_of(worker, state).is_some();
     let grace = if standing {
         Duration::ZERO
     } else {
@@ -1013,7 +1019,7 @@ fn on_load_report_with(
     if let Some(state) = state {
         state.note_engine_stall(engine_stalled);
     }
-    match worker.stall_reason() {
+    match stall_reason_of(worker, state) {
         Some(StallReason::Wedged) => {
             // A clock that restarted with this gateway's first dispatch is
             // not progress while the engine still reports silence: a token
