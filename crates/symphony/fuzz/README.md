@@ -134,8 +134,8 @@ no input there, its shape is `prefix_breach`'s.
   value kept as a string) is a question of parity with each engine's own parser, on record as its
   own report, not a breach of this promise.
 - `empty-arguments` (left the allowance on 2026-11-08): a call that ended with no arguments fragment
-  at all and no `Malformed` word inside it other than a stop's (an `OpenAtTheStop` or
-  `OpenAtTheMarker` of no bytes), where the contract asks for `Malformed` before the end of a cut
+  at all and no `Malformed` word inside it other than one that loses no call
+  (`MalformedReason::loses_a_call`), where the contract asks for `Malformed` before the end of a cut
   call, or whole arguments (the harness names it at the call's end, as `ended_with("")` does). It
   was allowed for the pythonic reader's cut call, which a fix of October ended (#3791):
   `[get_weather(` ended by the stream says `Malformed { UnterminatedRegion }` before its end
