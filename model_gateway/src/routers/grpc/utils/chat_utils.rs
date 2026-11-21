@@ -1201,8 +1201,8 @@ pub fn request_as_rendered(
 ///
 /// [`Self::TemplateFailed`] is a render the model's chat template failed on
 /// its own account, whatever the request holds ([`TemplateFailure`]): the
-/// template is not there to render, or it asks the engine for another
-/// template, a filter, a test or a function that the engine does not have. A
+/// template is not there to render, or its source alone asks the engine for
+/// another template, a filter, a test or a function that is not there. A
 /// template is its deployment's to fix, so this one cause is answered in the
 /// server's class ([`Self::answer`]) and a broken template alerts instead of
 /// reading as its clients' mistakes.
