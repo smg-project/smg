@@ -169,46 +169,66 @@ struct Candidate {
     seen: String,
 }
 
-/// Whether `seen`, the first bytes behind a parameter's opening tag and its whitespace, begin a
-/// value of the type `schema` declares, for a type that constrains its text: a number begins
-/// with a digit, or a sign and a digit; a boolean and a null are one of the words the template
-/// writes for them; an enumerated value begins as one of its values does. `Some(true)` once the
-/// bytes do, `Some(false)` once they cannot, `None` while more bytes would say, which is at
-/// most [`LONGEST_WORD`] bytes. A type that leaves its text free (a string, an object, a list,
-/// none declared) is `Some(true)` with no byte seen.
-fn begins(schema: &serde_json::Value, seen: &str) -> Option<bool> {
-    fn one_of(words: &[&str], seen: &str) -> Option<bool> {
-        if seen.is_empty() {
-            None
-        } else if words.contains(&seen) {
-            Some(true)
-        } else if words.iter().any(|word| word.starts_with(seen)) {
+/// Whether `seen`, the first bytes behind a parameter's opening tag and its whitespace, are a
+/// value of the type `schema` declares, for a type that constrains its text; `ended` says the
+/// value's text ends there (whitespace, a tag or the separator comes next). A number begins
+/// with a digit, or a sign and a digit, and is known from there. A boolean and a null are one
+/// of the words the template writes for them, whole, and an enumerated value is one of the
+/// schema's values, whole: compared as the bytes arrive, and known where the word ends, so
+/// that a longer word that only begins like one (`Truex`, `fantastic` for `fast`) is none.
+/// `Some(true)` once the bytes are such a value, `Some(false)` once they cannot be, `None`
+/// while more bytes would say; never `None` once `ended`. A type that leaves its text free (a
+/// string, an object, a list, none declared) is `Some(true)` with no byte seen.
+fn begins(schema: &serde_json::Value, seen: &str, ended: bool) -> Option<bool> {
+    /// `seen` against a set of words, of which it `is` one or `begins` one.
+    fn whole_word(is: bool, begins: bool, seen: &str, ended: bool) -> Option<bool> {
+        if ended {
+            Some(is)
+        } else if seen.is_empty() || begins {
             None
         } else {
             Some(false)
         }
     }
+    fn one_of(words: &[&str], seen: &str, ended: bool) -> Option<bool> {
+        whole_word(
+            words.contains(&seen),
+            words.iter().any(|word| word.starts_with(seen)),
+            seen,
+            ended,
+        )
+    }
+    /// An enumerated value as the template writes it: a string's text, any other value's JSON.
+    fn text(value: &serde_json::Value) -> Cow<'_, str> {
+        match value {
+            serde_json::Value::String(text) => Cow::Borrowed(text.as_str()),
+            other => Cow::Owned(other.to_string()),
+        }
+    }
     if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) {
-        let first = seen.chars().next()?;
-        return Some(values.iter().any(|value| match value {
-            serde_json::Value::String(text) => text.starts_with(first),
-            other => other.to_string().starts_with(first),
-        }));
+        return whole_word(
+            values.iter().any(|value| text(value) == seen),
+            values.iter().any(|value| text(value).starts_with(seen)),
+            seen,
+            ended,
+        );
     }
     match schema.get("type").and_then(serde_json::Value::as_str) {
         Some("integer" | "number") => match seen.as_bytes() {
-            [] | [b'-' | b'+'] => None,
             [b'0'..=b'9', ..] | [b'-' | b'+', b'0'..=b'9', ..] => Some(true),
+            [] | [b'-' | b'+'] if !ended => None,
             _ => Some(false),
         },
-        Some("boolean") => one_of(&["true", "false", "True", "False"], seen),
-        Some("null") => one_of(&["null", "None"], seen),
+        Some("boolean") => one_of(&["true", "false", "True", "False"], seen, ended),
+        Some("null") => one_of(&["null", "None"], seen, ended),
         _ => Some(true),
     }
 }
 
-/// The bytes [`begins`] reads at most before it answers: the longest word a type is written as.
-const LONGEST_WORD: usize = "false".len();
+/// The bytes of a value a tag held undecided may have behind it before [`begins`] has to
+/// answer ([`Assembler::weigh_candidate`]): a number is known in two, a boolean or a null in
+/// its word, and an enumerated value in its own length, up to this.
+const HELD_VALUE: usize = 64;
 
 /// A closing tag held undecided inside a value: its bytes, then the whitespace after it.
 #[derive(Clone, Debug)]
@@ -301,12 +321,13 @@ impl Assembler {
     /// The table's ignored terminal arrived inside the call: a tag held before it is released, as
     /// the separator ends it, and what follows stands after a separator. Its own bytes are the
     /// engine's to place, in their order among the bytes this assembler holds.
-    pub fn ignored(&mut self, out: &mut Events) {
+    pub fn ignored(&mut self, declared: &Declared, out: &mut Events) {
         if self.done {
             return;
         }
-        // A separator behind a tag held undecided: a tag follows, not a value's text.
-        self.candidate_is_text(out);
+        // A separator behind a tag held undecided: a tag follows, so a value held behind an
+        // opening tag ends here, and a closing tag held is no text's neighbour.
+        self.settle_candidate(declared, out);
         self.settle_stray_close(true, out);
         self.release_tag(out);
         self.after_separator = true;
@@ -483,6 +504,7 @@ impl Assembler {
         let whole = !self.refused
             && !self.too_deep
             && self.tag.is_none()
+            && self.ended_early == 0
             && self
                 .open
                 .iter()
@@ -729,7 +751,7 @@ impl Assembler {
                 .function
                 .as_deref()
                 .and_then(|function| declared.parameter(function, key))
-                .is_none_or(|(_, schema)| begins(schema, "").is_some());
+                .is_none_or(|(_, schema)| begins(schema, "", false).is_some());
             if !free {
                 // The parameter's type constrains its text: what follows the tag says whether
                 // a value of it begins there, or the tag is the string's text.
@@ -856,30 +878,56 @@ impl Assembler {
     /// Reads `text` into the opening tag held undecided ([`Candidate`]) until the bytes behind
     /// it say whether a value of the named parameter's type begins there: whitespace joins the
     /// held run, up to [`HELD_SPACE`] bytes, and the bytes after it are weighed by the type
-    /// ([`begins`]). `text` is left at the first byte not taken. A longer run of whitespace, or
-    /// a tag where the value should begin, is no value. `None` while more bytes would say.
+    /// ([`begins`]), up to [`HELD_VALUE`] of them, and whole where whitespace or a tag ends
+    /// them. `text` is left at the first byte not taken. A longer run of either, or a tag
+    /// where the value should begin, is no value. `None` while more bytes would say.
     fn weigh_candidate(&mut self, text: &mut &str, declared: &Declared) -> Option<bool> {
         let function = self.function.as_deref()?;
         let candidate = self.candidate.as_mut()?;
         let (_, schema) = declared.parameter(function, &candidate.key)?;
         while let Some(next) = text.chars().next() {
-            if candidate.seen.is_empty() && next.is_whitespace() {
-                if candidate.space.len() + next.len_utf8() > HELD_SPACE {
-                    return Some(false);
-                }
-                candidate.space.push(next);
-            } else if next == '<' {
-                return Some(false);
-            } else {
-                candidate.seen.push(next);
+            let ends = next.is_whitespace() || next == '<';
+            if ends && !candidate.seen.is_empty() {
+                // The value's text ends here: whole, it is a value of the type or it is none.
+                return Some(begins(schema, &candidate.seen, true) == Some(true));
             }
+            if next == '<' {
+                return Some(false);
+            }
+            let held = if next.is_whitespace() {
+                &mut candidate.space
+            } else {
+                &mut candidate.seen
+            };
+            if held.len() + next.len_utf8() > HELD_SPACE.max(HELD_VALUE) {
+                return Some(false);
+            }
+            held.push(next);
             *text = &text[next.len_utf8()..];
-            if let Some(value) = begins(schema, &candidate.seen) {
+            if let Some(value) = begins(schema, &candidate.seen, false) {
                 return Some(value);
             }
-            debug_assert!(candidate.seen.len() < LONGEST_WORD);
         }
         None
+    }
+
+    /// The separator came behind the opening tag held undecided: the value's text, if any, ends
+    /// there, and whole it is a value of the parameter's type or the tag is the string's text.
+    fn settle_candidate(&mut self, declared: &Declared, out: &mut Events) {
+        let is_the_parameter =
+            self.function.as_deref().is_some_and(|function| {
+                self.candidate.as_ref().is_some_and(|candidate| {
+                    !candidate.seen.is_empty()
+                        && declared.parameter(function, &candidate.key).is_some_and(
+                            |(_, schema)| begins(schema, &candidate.seen, true) == Some(true),
+                        )
+                })
+            });
+        if is_the_parameter {
+            self.candidate_is_the_parameter(declared, out);
+        } else {
+            self.candidate_is_text(out);
+        }
     }
 
     /// The opening tag held undecided is the next parameter's: a value of its type begins
@@ -938,7 +986,9 @@ impl Assembler {
                     ..
                 })
         );
-        if !string.plain_string || !streams {
+        // A string with no bit of its own could not be seen to close after all: it is never
+        // ended at a tag.
+        if !string.plain_string || !streams || string.place.is_none() {
             return false;
         }
         self.function
@@ -1556,8 +1606,8 @@ impl crate::engine::CallAssembler for Assembler {
         text.len()
     }
 
-    fn ignored(&mut self, _text: &str, _declared: &Declared, out: &mut Events) {
-        self.ignored(out);
+    fn ignored(&mut self, _text: &str, declared: &Declared, out: &mut Events) {
+        self.ignored(declared, out);
     }
 
     /// Only the invoke's closing tag is a started call's end; the next invoke's opening and the
