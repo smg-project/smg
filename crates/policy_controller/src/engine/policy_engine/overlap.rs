@@ -9,7 +9,7 @@
 //! them to the decision and, where the decision picked, writes the engine's
 //! record of the prefixes it sent. A pair decision reads a column a side in
 //! the rows' place ([`AffinityFacts`]): [`column`] fills one from the same
-//! data, and [`sent`] writes the record behind the pair's pick.
+//! data, and [`record_prefix`] writes the record behind the pair's pick.
 //!
 //! What is kept, and what guards it:
 //!
@@ -161,14 +161,14 @@ pub struct Affinity {
     /// workers registered under. Locked where a list's table is read, where
     /// a worker left and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table.
-    sent: Mutex<FxHashMap<Box<str>, Arc<Sent>>>,
+    records: Mutex<FxHashMap<Box<str>, Arc<PrefixRecord>>>,
 }
 
 impl fmt::Debug for Affinity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Affinity")
             .field("indexes", &self.indexes.get().is_some())
-            .field("records", &self.sent.lock().len())
+            .field("records", &self.records.lock().len())
             .finish()
     }
 }
@@ -193,8 +193,8 @@ impl Affinity {
     /// prefixes forgets it. Takes the records' map and, for a record that
     /// holds the worker, that record's lock as a writer.
     pub fn forget(&self, worker: WorkerId) {
-        for sent in self.sent.lock().values() {
-            sent.forget(worker);
+        for record in self.records.lock().values() {
+            record.forget(worker);
         }
     }
 
@@ -203,10 +203,10 @@ impl Affinity {
     /// came down. For the engine's timer. A record a decision holds is
     /// passed over.
     pub fn sweep(&self) {
-        for sent in self.sent.lock().values() {
-            if sent.sweeping.load(Ordering::Relaxed) {
-                if let Some(mut record) = sent.record.try_write() {
-                    sent.sweep(&mut record);
+        for record in self.records.lock().values() {
+            if record.sweeping.load(Ordering::Relaxed) {
+                if let Some(mut predictor) = record.predictor.try_write() {
+                    record.sweep(&mut predictor);
                 }
             }
         }
@@ -217,34 +217,34 @@ impl Affinity {
     /// nobody and records nothing. For a host's own count beside its count
     /// of decisions, never for a decision.
     pub fn left_out(&self) -> u64 {
-        let records = self.sent.lock();
-        let left_out = |sent: &Arc<Sent>| sent.left_out.load(Ordering::Relaxed);
+        let records = self.records.lock();
+        let left_out = |record: &Arc<PrefixRecord>| record.left_out.load(Ordering::Relaxed);
         records.values().map(left_out).sum()
     }
 
     /// The record of `model`, made at its first asking and held to `bound`
     /// placements.
-    fn sent_of(&self, model: &str, bound: usize) -> Arc<Sent> {
-        let sent = {
-            let mut records = self.sent.lock();
-            if let Some(sent) = records.get(model) {
-                Arc::clone(sent)
+    fn record_of(&self, model: &str, bound: usize) -> Arc<PrefixRecord> {
+        let record = {
+            let mut records = self.records.lock();
+            if let Some(record) = records.get(model) {
+                Arc::clone(record)
             } else {
-                let sent = Arc::new(Sent::new(bound));
-                records.insert(model.into(), Arc::clone(&sent));
-                sent
+                let record = Arc::new(PrefixRecord::new(bound));
+                records.insert(model.into(), Arc::clone(&record));
+                record
             }
         };
         // Outside the map's mutex: a bound that moved takes the record.
-        sent.bound_to(bound);
-        sent
+        record.bound_to(bound);
+        record
     }
 }
 
 /// One model's record of the prefixes sent to its workers the index does
 /// not speak for, shared by every deciding thread.
-struct Sent {
-    record: RwLock<PrefixPredictor>,
+struct PrefixRecord {
+    predictor: RwLock<PrefixPredictor>,
     /// The record's bound as the last table set it: a table's read takes
     /// the record, which the deciders hold, only where the bound moved.
     bound: AtomicUsize,
@@ -267,15 +267,15 @@ struct RecordRead {
     whole: bool,
     /// The request's last block was used at this tick.
     fresh: bool,
-    /// [`Sent::left`] at the read.
+    /// [`PrefixRecord::left`] at the read.
     left: u64,
 }
 
 /// What the fill of a column read of the record of sent prefixes
 /// ([`column`]). The write behind the pick made over that column stands on
-/// it ([`sent`]).
+/// it ([`record_prefix`]).
 #[derive(Clone, Copy, Debug)]
-pub struct SentRead {
+pub struct PrefixRead {
     read: RecordRead,
     /// The rows sent the record's deepest block of the request, the first
     /// of them, as many as fit: a pick of one of them may be a repeat that
@@ -283,7 +283,7 @@ pub struct SentRead {
     deepest: [u32; Self::KEPT],
 }
 
-impl SentRead {
+impl PrefixRead {
     /// The deepest rows a read keeps. A pick of a row past them is written
     /// again, which costs a write and moves nothing a reader can see.
     const KEPT: usize = 8;
@@ -294,7 +294,7 @@ const fn tick_of(now_micros: u64) -> u16 {
     (now_micros >> 20) as u16
 }
 
-impl Sent {
+impl PrefixRecord {
     /// A write gives the lock back after this many blocks.
     const SLICE: usize = 16;
     /// A sweep's step.
@@ -302,7 +302,7 @@ impl Sent {
 
     fn new(bound: usize) -> Self {
         Self {
-            record: RwLock::new(PrefixPredictor::new(bound)),
+            predictor: RwLock::new(PrefixPredictor::new(bound)),
             bound: AtomicUsize::new(bound),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(0),
@@ -314,24 +314,24 @@ impl Sent {
     /// nothing here: the next writes and sweeps take the oldest blocks out.
     fn bound_to(&self, bound: usize) {
         if self.bound.swap(bound, Ordering::Relaxed) != bound {
-            self.record.write().set_bound(bound);
+            self.predictor.write().set_bound(bound);
             self.sweeping.store(true, Ordering::Relaxed);
         }
     }
 
     fn forget(&self, worker: WorkerId) {
-        if !self.record.read().holds(worker) {
+        if !self.predictor.read().holds(worker) {
             return;
         }
-        let mut record = self.record.write();
+        let mut predictor = self.predictor.write();
         self.left.fetch_add(1, Ordering::Relaxed);
-        record.forget(worker);
+        predictor.forget(worker);
         self.sweeping.store(true, Ordering::Relaxed);
     }
 
     /// One step of the work that waits, under the writer's guard.
-    fn sweep(&self, record: &mut PrefixPredictor) {
-        if self.sweeping.load(Ordering::Relaxed) && record.sweep(Self::SWEEP) < Self::SWEEP {
+    fn sweep(&self, predictor: &mut PrefixPredictor) {
+        if self.sweeping.load(Ordering::Relaxed) && predictor.sweep(Self::SWEEP) < Self::SWEEP {
             self.sweeping.store(false, Ordering::Relaxed);
         }
     }
@@ -347,8 +347,8 @@ impl Sent {
         }
         // A fresh repeat need not wait for a writer to sweep.
         if self.sweeping.load(Ordering::Relaxed) {
-            if let Some(mut record) = self.record.try_write() {
-                self.sweep(&mut record);
+            if let Some(mut predictor) = self.predictor.try_write() {
+                self.sweep(&mut predictor);
             }
         }
         true
@@ -371,10 +371,10 @@ impl Sent {
             .step_by(Self::SLICE)
             .chain(std::iter::once(keys.len()));
         for end in ends {
-            let mut record = if end > Self::SLICE {
-                self.record.write()
-            } else if let Some(record) = self.record.try_write() {
-                record
+            let mut predictor = if end > Self::SLICE {
+                self.predictor.write()
+            } else if let Some(predictor) = self.predictor.try_write() {
+                predictor
             } else {
                 self.left_out.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -382,11 +382,11 @@ impl Sent {
             if self.left.load(Ordering::Relaxed) != read.left {
                 return;
             }
-            record.record(&keys[..end], target, read.tick);
+            predictor.record(&keys[..end], target, read.tick);
             if end == keys.len() {
-                self.sweep(&mut record);
+                self.sweep(&mut predictor);
             }
-            RwLockWriteGuard::unlock_fair(record);
+            RwLockWriteGuard::unlock_fair(predictor);
         }
     }
 }
@@ -459,7 +459,7 @@ struct Table {
     heard_any: bool,
     unheard_any: bool,
     /// The model's record of sent prefixes, where the profile reads one.
-    sent: Option<Arc<Sent>>,
+    record: Option<Arc<PrefixRecord>>,
     /// The record's holders are named ahead of the index's: no prefix stage
     /// of the profile reads cache events.
     ahead: bool,
@@ -533,7 +533,7 @@ impl Table {
             heard: Box::default(),
             heard_any: false,
             unheard_any: false,
-            sent: None,
+            record: None,
             ahead: false,
             by_id: Box::default(),
             warming: Box::default(),
@@ -619,7 +619,7 @@ impl Table {
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
             let bound = (settings.max_size / u64::from(size)).max(1);
             let bound = usize::try_from(bound).unwrap_or(usize::MAX);
-            table.sent = Some(affinity.sent_of(registered, bound));
+            table.record = Some(affinity.record_of(registered, bound));
             table.ahead = ahead;
             let mut by_id: Vec<(WorkerId, u32)> = ids.iter().copied().zip(0u32..).collect();
             by_id.sort_unstable_by_key(|&(id, _)| id);
@@ -678,11 +678,14 @@ impl Table {
         let mut draw = Draw::new(facts.seed ^ HOLDERS_STREAM);
         let hashed = !facts.block_hashes.is_empty();
         // The record is read where it speaks for a row of the list.
-        let record = self.sent.as_deref().filter(|_| hashed && self.unheard_any);
+        let record = self
+            .record
+            .as_deref()
+            .filter(|_| hashed && self.unheard_any);
         let mut read = None;
         if self.ahead {
-            read =
-                record.map(|sent| self.name_sent(sent, facts, keys, deepest, holders, &mut draw));
+            read = record
+                .map(|record| self.name_recorded(record, facts, keys, deepest, holders, &mut draw));
         }
         let room = cap.saturating_sub(holders.len());
         // An engine's events are token blocks: a request hashed by windows
@@ -710,8 +713,8 @@ impl Table {
             }
         }
         if !self.ahead {
-            read =
-                record.map(|sent| self.name_sent(sent, facts, keys, deepest, holders, &mut draw));
+            read = record
+                .map(|record| self.name_recorded(record, facts, keys, deepest, holders, &mut draw));
         }
         holders.sort_unstable_by_key(|holder| holder.row);
         self.name_warming(facts, warming, picked, live);
@@ -723,9 +726,9 @@ impl Table {
     /// blocks, and the workers sent it, into `deepest`. The request's keys
     /// are folded into `keys`. The record's lock is held as a reader for
     /// the one read and given back before a row is chosen.
-    fn read_sent(
+    fn read_record(
         &self,
-        sent: &Sent,
+        record: &PrefixRecord,
         facts: &RequestFacts<'_>,
         keys: &mut Vec<u64>,
         deepest: &mut Vec<WorkerId>,
@@ -733,15 +736,15 @@ impl Table {
         PrefixPredictor::fold_into(keys, facts.namespace_seed, facts.block_hashes);
         let tick = tick_of(facts.now_micros);
         let usable = |id: WorkerId| self.spoken_row(id).is_some();
-        let record = sent.record.read();
-        let found = record.deepest_among(keys, &usable);
+        let predictor = record.predictor.read();
+        let found = predictor.deepest_among(keys, &usable);
         deepest.clear();
         deepest.extend(found.holders());
         let read = RecordRead {
             tick,
             whole: found.blocks() as usize == keys.len(),
             fresh: found.fresh(tick),
-            left: sent.left.load(Ordering::Relaxed),
+            left: record.left.load(Ordering::Relaxed),
         };
         (found.blocks(), read)
     }
@@ -750,16 +753,16 @@ impl Table {
     /// named and in the room the cap leaves: the workers sent the deepest
     /// block of it that a worker the record speaks for was sent, a draw of
     /// them where they would fill more than the room.
-    fn name_sent(
+    fn name_recorded(
         &self,
-        sent: &Sent,
+        record: &PrefixRecord,
         facts: &RequestFacts<'_>,
         keys: &mut Vec<u64>,
         deepest: &mut Vec<WorkerId>,
         holders: &mut Vec<AffinityHolder>,
         draw: &mut Draw,
     ) -> RecordRead {
-        let (blocks, read) = self.read_sent(sent, facts, keys, deepest);
+        let (blocks, read) = self.read_record(record, facts, keys, deepest);
         let base = holders.len();
         let room = self.cap.saturating_sub(base);
         if room == 0 {
@@ -846,7 +849,7 @@ impl Table {
         facts: &RequestFacts<'_>,
         buffers: &mut Buffers,
         column: &mut Vec<AffinityFacts>,
-    ) -> Option<SentRead> {
+    ) -> Option<PrefixRead> {
         let Buffers {
             kept,
             keys,
@@ -884,11 +887,11 @@ impl Table {
             }
         }
         // The record is read where it speaks for a row of the list.
-        let sent = self.sent.as_deref().filter(|_| self.unheard_any)?;
-        let (blocks, record) = self.read_sent(sent, facts, keys, deepest);
-        let mut read = SentRead {
-            read: record,
-            deepest: [NONE; SentRead::KEPT],
+        let record = self.record.as_deref().filter(|_| self.unheard_any)?;
+        let (blocks, found) = self.read_record(record, facts, keys, deepest);
+        let mut read = PrefixRead {
+            read: found,
+            deepest: [NONE; PrefixRead::KEPT],
         };
         let mut named = 0usize;
         for &id in deepest.iter() {
@@ -1042,7 +1045,7 @@ pub fn decide(
 /// The parameters are [`decide`]'s, and `phase` is the phase the list is
 /// decided at, which a pair's request does not carry for both its lists.
 /// Returns what was read of the record of sent prefixes, where the record
-/// speaks for a worker of the list: the caller hands it to [`sent`] behind
+/// speaks for a worker of the list: the caller hands it to [`record_prefix`] behind
 /// the pick. Nothing is allocated once `column` and the calling thread's
 /// buffers have grown, but where a table is read.
 #[expect(
@@ -1058,7 +1061,7 @@ pub fn column(
     phase: Phase,
     facts: &RequestFacts<'_>,
     column: &mut Vec<AffinityFacts>,
-) -> Option<SentRead> {
+) -> Option<PrefixRead> {
     debug_assert_eq!(workers.len(), ids.len(), "one id a worker of the list");
     let asked = Asked {
         affinity,
@@ -1086,11 +1089,11 @@ pub fn column(
 /// `read` is what that fill returned. A worker the index speaks for, a
 /// worker that is not of the list, and a list whose table was since read
 /// for another place write nothing.
-pub fn sent(
+pub fn record_prefix(
     pool: &PoolAffinity,
     phase: Phase,
     facts: &RequestFacts<'_>,
-    read: SentRead,
+    read: PrefixRead,
     id: WorkerId,
 ) {
     let standing = pool.table.load();
@@ -1098,16 +1101,16 @@ pub fn sent(
     let Some(table) = table.filter(|table| table.is_of(facts.model, phase)) else {
         return;
     };
-    let (Some(sent), Some(row)) = (table.sent.as_deref(), table.spoken_row(id)) else {
+    let (Some(record), Some(row)) = (table.record.as_deref(), table.spoken_row(id)) else {
         return;
     };
-    if sent.repeats(read.read, read.deepest.contains(&row)) {
+    if record.repeats(read.read, read.deepest.contains(&row)) {
         return;
     }
     with_buffers(|buffers| {
         // The keys are the request's own, whichever list was filled last.
         PrefixPredictor::fold_into(&mut buffers.keys, facts.namespace_seed, facts.block_hashes);
-        sent.write(&buffers.keys, read.read, id);
+        record.write(&buffers.keys, read.read, id);
     });
 }
 
@@ -1170,7 +1173,7 @@ impl Table {
             }),
             ..*facts
         });
-        let (Some(read), Some(sent)) = (read, self.sent.as_deref()) else {
+        let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
         let target = decision.pick().and_then(|pick| pick.targets.first());
@@ -1179,8 +1182,8 @@ impl Table {
         let Some(target) = target.filter(|target| !self.heard(target.position)) else {
             return decision;
         };
-        if !sent.repeats(read, buffers.deepest.contains(&target.id)) {
-            sent.write(&buffers.keys, read, target.id);
+        if !record.repeats(read, buffers.deepest.contains(&target.id)) {
+            record.write(&buffers.keys, read, target.id);
         }
         decision
     }
@@ -1201,15 +1204,15 @@ impl Table {
             ..*facts
         });
         buffers.column = column;
-        let (Some(read), Some(sent)) = (read, self.sent.as_deref()) else {
+        let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
         let target = decision.pick().and_then(|pick| pick.targets.first());
         let Some(target) = target.filter(|target| !self.heard(target.position)) else {
             return decision;
         };
-        if !sent.repeats(read.read, read.deepest.contains(&target.position)) {
-            sent.write(&buffers.keys, read.read, target.id);
+        if !record.repeats(read.read, read.deepest.contains(&target.position)) {
+            record.write(&buffers.keys, read.read, target.id);
         }
         decision
     }

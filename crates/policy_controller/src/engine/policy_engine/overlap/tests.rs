@@ -235,7 +235,7 @@ impl Bed {
         &self,
         facts: &RequestFacts<'_>,
         phase: Phase,
-    ) -> (Vec<AffinityFacts>, Option<SentRead>) {
+    ) -> (Vec<AffinityFacts>, Option<PrefixRead>) {
         let mut filled = vec![AffinityFacts {
             overlap_blocks: 99,
             ..AffinityFacts::default()
@@ -594,7 +594,7 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
     let (column_of, read) = prefills.column(&facts, Phase::Prefill);
     assert_eq!(held(&column_of), [(0, 0); 4]);
     let read = read.expect("the record speaks for the prefills");
-    sent(
+    record_prefix(
         &prefills.pool,
         Phase::Prefill,
         &facts,
@@ -607,8 +607,8 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
     // A worker that is not of the list writes nothing, and neither does a
     // write for another place than the list's table stands for.
     let read = read.expect("the record speaks for the prefills");
-    sent(&prefills.pool, Phase::Prefill, &facts, read, WorkerId(999));
-    sent(&prefills.pool, Phase::Decode, &facts, read, prefills.ids[2]);
+    record_prefix(&prefills.pool, Phase::Prefill, &facts, read, WorkerId(999));
+    record_prefix(&prefills.pool, Phase::Decode, &facts, read, prefills.ids[2]);
     assert_eq!(
         held(&prefills.column(&facts, Phase::Prefill).0),
         sent_to_one
@@ -634,7 +634,7 @@ fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
     let (holds, read) = decode_column();
     assert_eq!(holds, [(0, 0); 3]);
     let read = read.expect("the record speaks for the decodes");
-    sent(&decode_pool, Phase::Decode, &facts, read, decode_ids[2]);
+    record_prefix(&decode_pool, Phase::Decode, &facts, read, decode_ids[2]);
     assert_eq!(decode_column().0, [(0, 0), (0, 0), (0, 4)]);
     assert_eq!(
         held(&prefills.column(&facts, Phase::Prefill).0),
