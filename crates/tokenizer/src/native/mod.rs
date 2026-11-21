@@ -620,6 +620,10 @@ struct PieceCache {
     /// rest (`Self::judge_asks`). Set at the start of a call, and cleared
     /// where the thread starts to rest; the share does not hang on it.
     shares: bool,
+    /// The calls up to the one that reads the merge table through
+    /// (`NativeEncoder::piece_cache_for_text`): two in a new cache, zero
+    /// once the table is read.
+    calls_to_read: u8,
     /// The asks of the learned table since the thread last judged them
     /// (`Self::judge_asks`), and those of them the table answered.
     asked: u32,
@@ -627,10 +631,6 @@ struct PieceCache {
     /// The entries the count-bounded tiers must hold before a thread that
     /// rests asks again; zero for a thread that does not rest.
     asks_from: usize,
-    /// The calls up to the one that reads the merge table through
-    /// (`NativeEncoder::piece_cache_for_text`): two in a new cache, zero
-    /// once the table is read.
-    calls_to_read: u8,
 }
 
 impl PieceCache {
@@ -652,10 +652,10 @@ impl PieceCache {
             last_miss: 0,
             clears: 0,
             shares: false,
+            calls_to_read: 2,
             asked: 0,
             of_use: 0,
             asks_from: 0,
-            calls_to_read: 2,
         }
     }
 
