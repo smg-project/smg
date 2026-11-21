@@ -27,7 +27,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     document::spec::{
-        AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams,
+        standard_filters, AffinitySource, BestParams, KvPressureParams, Needs, PickStage,
+        PrefixAffinityParams, ProfileSpec, ScoreStage, WarmupSliceParams,
     },
     engine::{
         decision::{Overlap, OverlapSource},
@@ -44,6 +45,37 @@ use crate::{
     },
     Draw,
 };
+
+/// How the `cache_aware` policy is composed: its filters, its scorers and its
+/// picker.
+pub(crate) fn profile() -> ProfileSpec {
+    // Affinity first, the expected wait within the group: the slice
+    // and the diversion over everything when due, the holder tiers
+    // over the load, the fleet gate configuring both. The weights
+    // are ranks: each stage's values are 0, 0.5 or 1, so a stage
+    // outweighs everything after it.
+    ProfileSpec {
+        filter: standard_filters(),
+        score: vec![
+            ScoreStage::WarmupSlice(WarmupSliceParams {
+                weight: 8.0,
+                ..WarmupSliceParams::default()
+            })
+            .into(),
+            ScoreStage::PrefixAffinity(PrefixAffinityParams {
+                weight: 4.0,
+                ..PrefixAffinityParams::default()
+            })
+            .into(),
+            "kv-pressure".into(),
+            "least-load".into(),
+        ],
+        // A large pool is decided by a draw of sixteen rows and the
+        // rows the host names: its holders and its warming rows.
+        pick: PickStage::Best(BestParams { sample: 16 }).into(),
+        sent_ttl_ms: None,
+    }
+}
 
 /// The floor of the spill gate's swing-sized absolute margin: a handful of
 /// requests above the mean on an otherwise idle pool is not pressure.

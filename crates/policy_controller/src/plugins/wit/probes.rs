@@ -22,7 +22,7 @@ use crate::{
             RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
         },
     },
-    sessions::SessionVerdict,
+    policies::sticky_sessions::SessionVerdict,
     tracking::lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
 };
 

@@ -31,7 +31,7 @@
 //!   weighted [`Scorer`]s and one [`Picker`]; a [`Plan`] sequences profiles for
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
-//!   scorer owns its ring ([`ring`]), fed by the membership hooks. The
+//!   scorer owns its ring ([`policies::consistent_hashing`]), fed by the membership hooks. The
 //!   prefixes sent to a model's workers without cache events are kept by
 //!   the sent-prefix predictor ([`predictor`]). A profile that reads sent
 //!   prefixes reads that record at the naming through the in-process door.
@@ -162,16 +162,13 @@
 
 #[cfg(any(feature = "ingest", feature = "operator"))]
 mod address;
-pub mod affinity;
-pub mod bucket;
 pub mod document;
 pub mod engine;
 pub mod load;
 pub mod plugins;
+pub mod policies;
 pub mod predictor;
-pub mod ring;
 pub mod service;
-pub mod sessions;
 pub mod stages;
 pub mod store;
 pub mod tracking;

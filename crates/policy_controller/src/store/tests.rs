@@ -27,8 +27,8 @@ use crate::{
         demands::DemandFacts,
         view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
     },
+    policies::{sticky_sessions, sticky_sessions::SessionVerdict},
     service::replication::Log,
-    sessions::SessionVerdict,
     tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 
@@ -5207,7 +5207,7 @@ fn the_dispatch_deadlines_fall_due_in_their_own_order_whatever_order_they_were_f
 /// the shards' together.
 #[test]
 fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
-    let shards = crate::sessions::SHARDS;
+    let shards = sticky_sessions::SHARDS;
     let store = MemoryStore::new();
     let sessions: &dyn SessionsStore = &store;
     let now = Instant::now();

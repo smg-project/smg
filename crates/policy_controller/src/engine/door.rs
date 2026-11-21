@@ -53,7 +53,7 @@ use crate::{
             Phase, PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
         },
     },
-    sessions::{Forgets, SessionVerdict},
+    policies::sticky_sessions::{Forgets, SessionVerdict},
     store::{
         leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeIssue, DecodeRefused, DecodeSide, Dispatch,
         EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
@@ -4528,11 +4528,8 @@ pub(crate) mod tests {
             },
             DecisionRecord, References, Unmet,
         },
-        sessions::SessionVerdict,
-        stages::{
-            builtins::{Best, Random},
-            catalog::Catalog,
-        },
+        policies::{random::Random, sticky_sessions, sticky_sessions::SessionVerdict},
+        stages::{builtins::Best, catalog::Catalog},
         store::{
             Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
             HealthSink, HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink,
@@ -8181,7 +8178,7 @@ pub(crate) mod tests {
         let rule = document.bindings[0].sessions.as_mut();
         let rule = rule.expect("the preset's rule");
         rule.inflight_cap = cap;
-        rule.assignment = crate::sessions::Assignment::MinLoad;
+        rule.assignment = sticky_sessions::Assignment::MinLoad;
         document
     }
 
@@ -8362,7 +8359,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("manual");
         profile.expect("the preset's profile").pick = "counted".into();
         let rule = document.bindings[0].sessions.as_mut();
-        rule.expect("the preset's rule").assignment = crate::sessions::Assignment::Delegate;
+        rule.expect("the preset's rule").assignment = sticky_sessions::Assignment::Delegate;
         let digest = document.digest().expect("the document digests");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         let applied = store.apply(spec.expect("the catalog holds the stage"));

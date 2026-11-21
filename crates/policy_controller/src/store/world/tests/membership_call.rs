@@ -4,7 +4,7 @@
 use super::{facts, member, MODEL};
 use crate::{
     engine::view::{Role, Session, WorkerId},
-    sessions::SessionVerdict,
+    policies::sticky_sessions::SessionVerdict,
     store::{MemoryStore, WorkerFacts, WorkersStore},
 };
 
@@ -81,7 +81,7 @@ mod held {
             view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
             Scratch,
         },
-        ring::ConsistentHash,
+        policies::consistent_hashing::ConsistentHash,
         stages::Catalog,
         store::{
             tests::{booking, in_flight},

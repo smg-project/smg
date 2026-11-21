@@ -107,7 +107,6 @@ use std::{
 use rustc_hash::FxHashMap;
 
 use crate::{
-    affinity::WarmRule,
     document::spec::{AppliedSpec, IndexKind, Listed, Pairing},
     engine::{
         demands::DemandFacts,
@@ -119,6 +118,7 @@ use crate::{
         EncodePool, EncoderFacts,
     },
     load::signals::{SignalCell, SignalCells},
+    policies::cache_aware::WarmRule,
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
         health::LeaderBits,

@@ -31,7 +31,7 @@ use smg_policy_controller::{
     engine::{
         Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
     },
-    ring::Ring,
+    policies::consistent_hashing::Ring,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

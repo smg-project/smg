@@ -52,12 +52,18 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    affinity::Gates,
-    document::spec::{BoundedLoadParams, Needs},
+    document::spec::{
+        standard_filters, BoundedLoadParams, KeySourceSpec, Needs, ProfileSpec,
+        MANUAL_SESSION_HEADER,
+    },
     engine::{
         decision::MAX_TARGETS,
         framework::{Scorer, TieBand, DRAW_BOUND},
-        view::{fold_block, Candidate, PoolFacts, RequestFacts, WorkerId},
+        view::{Candidate, PoolFacts, RequestFacts, WorkerId},
+    },
+    policies::{
+        cache_aware::Gates,
+        prefix_hash::{prefix_key, Prefix},
     },
     tracking::{
         counts::with_counts,
@@ -65,6 +71,32 @@ use crate::{
     },
     Draw,
 };
+
+/// How the `consistent_hashing` policy is composed: its filters, its scorers
+/// and its picker.
+pub(crate) fn profile() -> ProfileSpec {
+    // The ring owner of the decision's key (an encode item's content
+    // hash, a request's routing key), the ring's next members as the
+    // alternates; a request with no session key is placed by its
+    // client's key, and one with neither is the picker's draw.
+    ProfileSpec {
+        filter: standard_filters(),
+        score: vec!["consistent-hash".into()],
+        pick: "best".into(),
+        sent_ttl_ms: None,
+    }
+}
+
+/// The headers the `consistent_hashing` policy reads a request's routing key
+/// from, in order. `header` makes one source from a header's name and whether
+/// the header tells one client from another.
+pub(crate) fn key_sources(header: impl Fn(&str, bool) -> KeySourceSpec) -> Vec<KeySourceSpec> {
+    vec![
+        header(MANUAL_SESSION_HEADER, false),
+        header("x-forwarded-for", true),
+        header("cookie", true),
+    ]
+}
 
 /// Positions per member: an even share of the key space per member for the
 /// fleets a gateway holds, as the host's ring had.
@@ -583,53 +615,6 @@ const FREE: u32 = u32::MAX;
 /// The member was ranked already.
 const TAKEN: u32 = 1 << 30;
 
-/// The key of a request's prefix at a depth of `tokens`: the fold of its
-/// block hashes through its last whole block at or under that depth, `0`
-/// where it carries no block that shallow. A request shorter than the
-/// depth is keyed through its own last whole block, and so is one whose
-/// hashes the host capped short of the depth.
-fn prefix_key(tokens: u32, gates: Gates, facts: &RequestFacts<'_>) -> u64 {
-    let depth = gates.whole_blocks(tokens, facts) as usize;
-    match depth.min(facts.block_hashes.len()) {
-        0 => 0,
-        blocks => folded(facts, blocks),
-    }
-}
-
-/// The key of the request's first `blocks` blocks, one at least, which it
-/// carries: the fold of their hashes under its cache namespace
-/// ([`fold_block`]), one multiplication a block.
-// Out of line: a request with nothing to hash carries no part of the loop.
-#[inline(never)]
-fn folded(facts: &RequestFacts<'_>, blocks: usize) -> u64 {
-    let hashes = facts.block_hashes[..blocks].iter();
-    hashes.fold(facts.namespace_seed, |key, &hash| fold_block(key, hash))
-}
-
-/// The prefix form of the ring: how a request with no routing key is keyed.
-#[derive(Debug)]
-struct Prefix {
-    /// The depth in tokens such a request is keyed at when it reaches no
-    /// boundary.
-    tokens: u32,
-    /// The gates that hold the view's block size.
-    gates: Gates,
-    /// The view's boundaries in tokens, ascending.
-    boundaries: Box<[u32]>,
-}
-
-impl Prefix {
-    /// The request's prefix at `boundary`, where it reaches it: the fold
-    /// through the boundary's last whole block ([`folded`]), made when the
-    /// boundary's turn comes. A request reaches a boundary by carrying
-    /// that block.
-    fn at(&self, boundary: u32, facts: &RequestFacts<'_>) -> Option<u64> {
-        let blocks = self.gates.whole_blocks(boundary, facts) as usize;
-        let reached = blocks != 0 && blocks <= facts.block_hashes.len();
-        reached.then(|| folded(facts, blocks))
-    }
-}
-
 /// The keys a decision is tried at, in order: a routing key alone, or under
 /// the prefix form the request's prefix at each boundary it reaches, the
 /// deepest first, and at the form's depth when it reaches none. A fold of
@@ -1109,7 +1094,7 @@ mod tests {
     use super::*;
     use crate::engine::{
         view,
-        view::{Health, Identity},
+        view::{fold_block, Health, Identity},
     };
 
     fn ids(n: u64) -> Vec<WorkerId> {

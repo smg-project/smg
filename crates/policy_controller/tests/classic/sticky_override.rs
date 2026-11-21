@@ -14,7 +14,7 @@ use smg_policy_controller::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
         WorkerId,
     },
-    sessions::{Assignment, Recovery},
+    policies::sticky_sessions::{Assignment, Recovery},
     tracking::{Lease, Lifecycle, Side},
 };
 

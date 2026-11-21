@@ -7,11 +7,12 @@ use std::time::Instant;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    document::{PolicySpec, PowerOfTwoMetric},
+    document::PolicySpec,
     engine::{
         Candidate, Constraints, Engine, Health, LoadRow, PoolFacts, RequestFacts, Role, Scratch,
         SignalSource, WorkerId,
     },
+    policies::power_of_two::PowerOfTwoMetric,
     tracking::{Lease, Lifecycle, Side},
 };
 

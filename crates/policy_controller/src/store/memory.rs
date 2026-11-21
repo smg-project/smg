@@ -1132,7 +1132,7 @@ impl MemoryStore {
     /// decision takes neither lock and meets the call at a stage's own lock
     /// alone. One that built its view before a leave's swap may still name
     /// the worker: a stage answers that from its own state, as the ring
-    /// fences a pruned id ([`crate::ring::FENCE`]).
+    /// fences a pruned id ([`crate::policies::consistent_hashing::FENCE`]).
     fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
             self.tell_engine(&change);

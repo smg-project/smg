@@ -36,8 +36,6 @@ use serde::{
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
-    bucket::Bucket,
     document::routing_key::KeySources,
     engine::{
         framework::{
@@ -50,12 +48,18 @@ use crate::{
         reports::Reports,
         signals::{column_named, SignalColumn},
     },
-    ring::ConsistentHash,
-    sessions::SessionRule,
+    policies,
+    policies::{
+        bucket::Bucket,
+        cache_aware::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
+        consistent_hashing::ConsistentHash,
+        least_load::LeastLoad,
+        sticky_sessions::SessionRule,
+    },
     stages::{
         builtins::{
             has_room_rule, with_report_age, FewestSessions, HasRoomRule, HasRoomSignals, LeastCost,
-            LeastCostSent, LeastCostSignals, LeastLoad, LeastRequests, ResidentWork, SampledBest,
+            LeastCostSent, LeastCostSignals, LeastRequests, ResidentWork, SampledBest,
             SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
             DEFAULT_THROUGHPUT,
         },
@@ -4702,12 +4706,8 @@ fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
         ..KeySourceSpec::default()
     };
     let sources = match name {
-        "prefix_hash" => vec![header(MANUAL_SESSION_HEADER, false)],
-        "consistent_hashing" => vec![
-            header(MANUAL_SESSION_HEADER, false),
-            header("x-forwarded-for", true),
-            header("cookie", true),
-        ],
+        "prefix_hash" => policies::prefix_hash::key_sources(header),
+        "consistent_hashing" => policies::consistent_hashing::key_sources(header),
         _ => return None,
     };
     Some(RoutingKeySpec {
@@ -4716,7 +4716,7 @@ fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
     })
 }
 
-fn standard_filters() -> Vec<FilterSpec> {
+pub(crate) fn standard_filters() -> Vec<FilterSpec> {
     vec![
         "healthy".into(),
         "not-overloaded".into(),
@@ -4724,182 +4724,27 @@ fn standard_filters() -> Vec<FilterSpec> {
     ]
 }
 
-/// The load metric the `power_of_two` preset compares its candidates by:
-/// one form of the preset each.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PowerOfTwoMetric {
-    /// Two draws, the lower expected wait: the preset under its bare name.
-    ExpectedWait,
-    /// Two draws, the fewer requests in flight, the expected wait between
-    /// equal counts.
-    Requests,
-    /// The fewest requests in flight over every candidate, the expected wait
-    /// between equal counts.
-    LeastRequests,
-    /// The least resident work over every candidate, each request priced at
-    /// `request_tokens` context tokens.
-    ResidentTokens { request_tokens: u32 },
-}
-
 impl PolicySpec {
-    /// The `power_of_two` preset in the form its load metric names, bound to
-    /// every model and phase: the count forms compare the requests in flight
-    /// before the score through the count-first pickers, and the resident
-    /// form scores every candidate and takes the best, with no draw of two.
-    pub fn power_of_two(metric: PowerOfTwoMetric) -> Result<Self, SpecError> {
-        const NAME: &str = "power_of_two";
-        let mut spec = Self::preset(NAME)?;
-        let profile = spec.profiles.get_mut(NAME).ok_or(SpecError::Empty)?;
-        match metric {
-            PowerOfTwoMetric::ExpectedWait => {}
-            PowerOfTwoMetric::Requests => profile.pick = "power-of-two-count-first".into(),
-            PowerOfTwoMetric::LeastRequests => profile.pick = "count-first".into(),
-            PowerOfTwoMetric::ResidentTokens { request_tokens } => {
-                profile.score = vec![ScoreStage::ResidentWork(ResidentWorkParams {
-                    weight: 1.0,
-                    request_tokens,
-                })
-                .into()];
-                profile.pick = "best".into();
-            }
-        }
-        Ok(spec)
-    }
-
     /// A spec of one preset profile bound to every model and phase.
     pub fn preset(name: &str) -> Result<Self, SpecError> {
         let profile = match name {
-            "random" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "random".into(),
-                sent_ttl_ms: None,
-            },
-            "round_robin" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "round-robin".into(),
-                sent_ttl_ms: None,
-            },
-            "passthrough" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "passthrough".into(),
-                sent_ttl_ms: None,
-            },
-            // The expected-wait form: two draws compared by least-load.
-            "power_of_two" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["least-load".into()],
-                pick: "power-of-two".into(),
-                sent_ttl_ms: None,
-            },
-            "least_load" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["least-load".into()],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
-            // The ring owner of the decision's key (an encode item's content
-            // hash, a request's routing key), the ring's next members as the
-            // alternates; a request with no session key is placed by its
-            // client's key, and one with neither is the picker's draw.
-            "consistent_hashing" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["consistent-hash".into()],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
-            // The ring owner of the request's key: its routing key, else its
-            // prefix at 256 tokens. An owner past the bounded-load rule is
-            // passed over and a request with no key has no owner: the
-            // fewest requests in flight take both. The ring's weight is by
-            // arithmetic: an owner leads the ring's next member by a
-            // quarter of the stage's score and the count ranges over one
-            // whole score, so any weight past four keeps a kept owner above
-            // the least loaded worker. The pick names no sample: the owner
-            // must be among the rows scored, so the pool is read whole.
-            "prefix_hash" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![
-                    ScoreStage::ConsistentHash(ConsistentHashParams {
-                        weight: 8.0,
-                        prefix_tokens: Some(256),
-                        bounded_load: Some(BoundedLoadParams {
-                            factor: Some(1.25),
-                            abs_margin: Some(10),
-                        }),
-                    })
-                    .into(),
-                    "least-requests".into(),
-                ],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
-            // Sticky sessions over a random assignment: a key stays with the
-            // first worker it was placed on, no in-flight cap, the first
-            // worker back in the lead when it recovers; the idle TTL of four
-            // hours swept each minute, as the keyed policy of today. The
-            // picker leaves the placement to the rule, so another assignment
-            // is the rule's one field and no other profile.
-            "manual" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "manual".into(),
-                sent_ttl_ms: None,
-            },
-            // Affinity first, the expected wait within the group: the slice
-            // and the diversion over everything when due, the holder tiers
-            // over the load, the fleet gate configuring both. The weights
-            // are ranks: each stage's values are 0, 0.5 or 1, so a stage
-            // outweighs everything after it.
-            "cache_aware" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![
-                    ScoreStage::WarmupSlice(WarmupSliceParams {
-                        weight: 8.0,
-                        ..WarmupSliceParams::default()
-                    })
-                    .into(),
-                    ScoreStage::PrefixAffinity(PrefixAffinityParams {
-                        weight: 4.0,
-                        ..PrefixAffinityParams::default()
-                    })
-                    .into(),
-                    "kv-pressure".into(),
-                    "least-load".into(),
-                ],
-                // A large pool is decided by a draw of sixteen rows and the
-                // rows the host names: its holders and its warming rows.
-                pick: PickStage::Best(BestParams { sample: 16 }).into(),
-                sent_ttl_ms: None,
-            },
-            // Prefill placement by request size: the worker whose range of
-            // sizes holds the prompt, the least booked survivor when the
-            // balance rule spills, each at the stage's defaults; any other
-            // phase is the picker's draw.
-            "bucket" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["bucket".into()],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
+            "random" => policies::random::profile(),
+            "round_robin" => policies::round_robin::profile(),
+            "passthrough" => policies::passthrough::profile(),
+            "power_of_two" => policies::power_of_two::profile(),
+            "least_load" => policies::least_load::profile(),
+            "consistent_hashing" => policies::consistent_hashing::profile(),
+            "prefix_hash" => policies::prefix_hash::profile(),
+            "manual" => policies::manual::profile(),
+            "cache_aware" => policies::cache_aware::profile(),
+            "bucket" => policies::bucket::profile(),
             other => return Err(SpecError::UnknownPreset(other.to_string())),
         };
         let manual = name == "manual";
-        let sessions = manual.then(|| SessionsSpec {
-            sticky_header: MANUAL_SESSION_HEADER.into(),
-            headers: vec![],
-            ttl_s: 14_400,
-            sweep_s: 60,
-            assignment: Assignment::Random,
-            inflight_cap: u16::MAX,
-            issue_session_id: false,
-            recovery: Recovery::Original,
-        });
+        let sessions = manual.then(policies::manual::sessions);
         let view = ViewSpec {
             headers: if manual {
-                vec![MANUAL_SESSION_HEADER.into()]
+                policies::manual::view_headers()
             } else {
                 vec![]
             },
@@ -7523,46 +7368,6 @@ mod tests {
                 })
             );
         }
-    }
-
-    #[test]
-    fn the_power_of_two_preset_has_four_forms_by_its_load_metric() {
-        let form = |metric| {
-            let spec = PolicySpec::power_of_two(metric).expect("a preset");
-            let engine = spec.validate().expect("validates");
-            assert!(engine.needs().loads, "{metric:?}");
-            let profile = spec.profiles["power_of_two"].clone();
-            (profile.score, profile.pick.name().to_string())
-        };
-        let least_load: Vec<ScoreSpec> = vec!["least-load".into()];
-        assert_eq!(
-            form(PowerOfTwoMetric::ExpectedWait),
-            (least_load.clone(), "power-of-two".to_string())
-        );
-        assert_eq!(
-            form(PowerOfTwoMetric::Requests),
-            (least_load.clone(), "power-of-two-count-first".to_string())
-        );
-        assert_eq!(
-            form(PowerOfTwoMetric::LeastRequests),
-            (least_load, "count-first".to_string())
-        );
-        let resident: Vec<ScoreSpec> = vec![ScoreStage::ResidentWork(ResidentWorkParams {
-            weight: 1.0,
-            request_tokens: 2048,
-        })
-        .into()];
-        assert_eq!(
-            form(PowerOfTwoMetric::ResidentTokens {
-                request_tokens: 2048
-            }),
-            (resident, "best".to_string())
-        );
-        // A request priced at nothing is a form too: the tokens alone.
-        PolicySpec::power_of_two(PowerOfTwoMetric::ResidentTokens { request_tokens: 0 })
-            .expect("a preset")
-            .validate()
-            .expect("the tokens alone");
     }
 
     /// A document that names no source reads each worker by what it has:

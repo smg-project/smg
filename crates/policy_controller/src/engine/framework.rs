@@ -6,7 +6,6 @@
 use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 
 use crate::{
-    affinity::{forget_judged, WarmRule},
     document::spec::Needs,
     engine::{
         decision::{
@@ -19,8 +18,13 @@ use crate::{
         },
     },
     load::signals::SignalCells,
-    sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
-    stages::builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
+    policies::{
+        cache_aware::{forget_judged, WarmRule},
+        random::Random,
+        sticky_sessions,
+        sticky_sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
+    },
+    stages::builtins::{target_of, Best, FewestSessions, LeastRequests, RowTests},
     tracking::{
         lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
         sent::SentCredit,
@@ -3420,9 +3424,9 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
 /// rules, a rule with none counting as [`ABSENCE_MICROS`], which is the
 /// time too where no binding has a rule.
 ///
-/// [`ABSENCE_MICROS`]: crate::sessions::ABSENCE_MICROS
+/// [`ABSENCE_MICROS`]: crate::policies::sticky_sessions::ABSENCE_MICROS
 fn absence(bindings: &[Binding]) -> u64 {
-    let stated = crate::sessions::ABSENCE_MICROS;
+    let stated = sticky_sessions::ABSENCE_MICROS;
     let rules = bindings.iter().filter_map(|b| b.sessions.as_ref());
     let longest = rules.map(|rule| rule.ttl_micros.unwrap_or(stated));
     longest.max().unwrap_or(stated)
@@ -6468,24 +6472,22 @@ mod tests {
 
     use super::*;
     use crate::{
-        affinity::{Gates, PrefixAffinity},
-        document::{
-            spec,
-            spec::{PolicySpec, PowerOfTwoMetric, PrefixAffinityParams, SpillParams},
-        },
+        document::spec::{self, PolicySpec, PrefixAffinityParams, SpillParams},
         engine::{
-            decision,
-            decision::Pair,
-            view,
-            view::{Health, Identity, MediaCounts, Role, Session, WorkerId},
+            decision::{self, Pair},
+            view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
         },
-        sessions::Recovery,
-        stages::{
-            builtins,
-            builtins::{
-                Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried,
-                Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
-            },
+        policies::{
+            cache_aware::{Gates, PrefixAffinity},
+            manual::Manual,
+            passthrough::Passthrough,
+            power_of_two::{PowerOfTwo, PowerOfTwoCountFirst, PowerOfTwoMetric},
+            random::Random,
+            round_robin::RoundRobin,
+            sticky_sessions::Recovery,
+        },
+        stages::builtins::{
+            self, Best, CountFirst, Healthy, LeastRequests, NotOverloaded, NotTried,
         },
         tracking::counts::tests::Lent,
     };

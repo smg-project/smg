@@ -714,7 +714,7 @@ mod tests {
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
             view::{Candidate, Identity, RequestFacts, WorkerId},
         },
-        stages::builtins::Random,
+        policies::random::Random,
         store::{
             DecodeRefused, Dispatch, HealthSink, LeaseState, LeasesStore, MemoryStore, Said,
             WorkersStore, World,

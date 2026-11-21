@@ -78,8 +78,8 @@ use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    affinity::{WarmRule, Warming},
     engine::view::{Candidate, HashKind, NamedAffinity, NamedHolder, Role, WorkerId},
+    policies::cache_aware::{WarmRule, Warming},
     predictor::Predictor,
     store::{
         kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},

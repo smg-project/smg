@@ -25,8 +25,9 @@ use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
 use smg_policy_controller::{
-    document::{PolicySpec, PowerOfTwoMetric},
+    document::PolicySpec,
     engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, Target},
+    policies::power_of_two::PowerOfTwoMetric,
     stages::Catalog,
     tracking::{Lease, Lifecycle, Side},
 };

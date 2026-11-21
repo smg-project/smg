@@ -35,7 +35,7 @@ use crate::{
         decision::{Decision, Lifted, Pick, Targets, Trace},
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
     },
-    sessions::SessionVerdict,
+    policies::sticky_sessions::SessionVerdict,
     stages::builtins::{Best, Healthy, LeastRequests, NotOverloaded},
 };
 
@@ -581,9 +581,12 @@ mod tests {
                 Phase, PoolFacts, RequestFacts, WorkerId,
             },
         },
-        ring::ConsistentHash,
-        sessions::{SessionRule, SessionVerdict},
-        stages::builtins::{Best, Healthy, Manual, NotOverloaded},
+        policies::{
+            consistent_hashing::ConsistentHash,
+            manual::Manual,
+            sticky_sessions::{SessionRule, SessionVerdict},
+        },
+        stages::builtins::{Best, Healthy, NotOverloaded},
         tracking::{
             counts::tests::Lent,
             lease::{Lease, Lifecycle, Side},

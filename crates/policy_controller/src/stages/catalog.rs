@@ -27,10 +27,14 @@ use crate::{
         reports::Reports,
         signals::{column_named, SignalColumn},
     },
-    stages::builtins::{
-        Best, CountFirst, HasCapacity, HasRoom, Healthy, Manual, NotOverloaded, NotTried,
-        Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
+    policies::{
+        manual::Manual,
+        passthrough::Passthrough,
+        power_of_two::{PowerOfTwo, PowerOfTwoCountFirst},
+        random::Random,
+        round_robin::RoundRobin,
     },
+    stages::builtins::{Best, CountFirst, HasCapacity, HasRoom, Healthy, NotOverloaded, NotTried},
     tracking::sent::SentCredit,
 };
 

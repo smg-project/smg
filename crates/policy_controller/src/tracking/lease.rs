@@ -15,7 +15,7 @@ use crate::{
         decision::{Decision, Target},
         view::{Health, LoadRow, Session, WorkerId},
     },
-    sessions::SessionVerdict,
+    policies::sticky_sessions::SessionVerdict,
     tracking::counts::Slot,
 };
 

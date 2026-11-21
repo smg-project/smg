@@ -272,6 +272,10 @@ pub(crate) mod tests {
             view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
             Constraints, PoolFacts, Scratch,
         },
+        policies::{
+            random::Random,
+            sticky_sessions::{SessionRule, SessionVerdict},
+        },
         service::{
             controller::gateways::tests::lease,
             proto::{
@@ -280,8 +284,7 @@ pub(crate) mod tests {
                 released::{Reason, What},
             },
         },
-        sessions::{SessionRule, SessionVerdict},
-        stages::{builtins::Random, catalog::Catalog},
+        stages::catalog::Catalog,
         store::{
             DecodeSide, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
             MemoryStore, Picked, SessionsStore, WorkerFacts, WorkersStore,

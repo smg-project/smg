@@ -136,8 +136,9 @@ use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
 use prost::Message as _;
 use smg_policy_controller::{
-    document::{BindingSpec, Match, PolicySpec, PowerOfTwoMetric, SpecError},
+    document::{BindingSpec, Match, PolicySpec, SpecError},
     engine::{Role, SignalSource, WireModes, WorkerId},
+    policies::{bucket, power_of_two::PowerOfTwoMetric},
     service::{
         client::{self, blocking, Answer, Client, Link, Unanswered},
         controller::{State, PROTOCOL_VERSION},
@@ -1815,7 +1816,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         harness
             .apply_document(by_size().expect("a form of this build's preset"))
             .expect("a form of this build's preset applies");
-        let third = smg_policy_controller::bucket::SPAN / 3;
+        let third = bucket::SPAN / 3;
         let mut owners = Vec::new();
         for part in 0u32..3 {
             let tokens = part * third + third / 2;

@@ -9,7 +9,7 @@ use smg_policy_controller::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
         WorkerId,
     },
-    sessions::Assignment,
+    policies::sticky_sessions::Assignment,
     tracking::{Lease, Lifecycle, Side},
 };
 

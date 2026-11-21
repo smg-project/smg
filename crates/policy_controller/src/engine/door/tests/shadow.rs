@@ -32,7 +32,7 @@ use crate::{
         framework::{EncodePlaced, PairSide, Picker, TieBand},
         view::{Candidate, LoadRow, Phase, RequestFacts, Role, WorkerId},
     },
-    sessions::{Assignment, SessionVerdict},
+    policies::sticky_sessions::{Assignment, SessionVerdict},
     stages::{builtins::target_of, catalog::Catalog},
     store::{
         BatchFacts, BatchOutcome, ContentHash, Dispatch, KvEvent, KvEventSink, LeasesStore,

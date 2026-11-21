@@ -16,7 +16,7 @@ use crate::{
         decision::{Decision, Pick, Targets, MAX_TARGETS},
         view::{Candidate, Constraints, Engines, PoolFacts, RequestFacts},
     },
-    sessions::SessionVerdict,
+    policies::sticky_sessions::SessionVerdict,
     stages::builtins::{draw_best, target_of},
     Draw,
 };

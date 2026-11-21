@@ -37,7 +37,8 @@ use smg_policy_controller::{
             Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
         },
     },
-    stages::{Best, Healthy, LeastRequests, PowerOfTwo, SessionAffinity},
+    policies::power_of_two::PowerOfTwo,
+    stages::{Best, Healthy, LeastRequests, SessionAffinity},
     tracking::{Lease, Lifecycle, Side},
     Draw,
 };
