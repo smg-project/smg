@@ -43,6 +43,7 @@ use crate::{
             attempt_ledger::AttemptLedger,
             header_utils::extract_target_worker,
             pair_index::{PdPairIndex, PdWire},
+            pair_lists::PairNarrowing,
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
                 RefusalSite,
@@ -2201,19 +2202,30 @@ impl WorkerSelectionStage {
         attempt: Attempt<'_>,
     ) -> Result<(PdAttempt, PrefillLoadGuard), Response> {
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
+        let in_process = policy_engine.in_process();
         let under_rule =
             matches!(attempt, Attempt::Retry(ctx) if ctx.constraint_decided_on.is_some());
         let media_input =
             media != MediaDemands::NONE || demand.prefill || demand.decode || demand.refs;
         let pools = [prefill_pool, decode_pool];
-        let shape = self.undecided(
-            model_id,
-            demand.context,
-            &pools,
-            media_input,
-            inputs.headers,
-            under_rule,
-        );
+        // A followed controller reads no demand of the request, so there
+        // the shape is refused by name. Where the engine of this process
+        // decides, the demands narrow the pair's two lists instead (below),
+        // and a target a side's policy keeps is the one shape still refused:
+        // no side under consistent hashing is decided there yet.
+        let shape = if in_process {
+            self.strict_target(model_id, inputs.headers)
+                .then_some(Shape::Target)
+        } else {
+            self.undecided(
+                model_id,
+                demand.context,
+                &pools,
+                media_input,
+                inputs.headers,
+                under_rule,
+            )
+        };
         if let Some(shape) = shape {
             return Err(shape.refusal(|| {
                 let snapshot = self.worker_registry.get_routing_snapshot(model_id);
@@ -2251,15 +2263,46 @@ impl WorkerSelectionStage {
         // type alone.
         let on_prefill = on_route(prefill_pool, wire, ledger);
         let on_decode = on_route(decode_pool, wire, ledger);
-        let (mut placed, guard) = policy_engine
-            .place_pair_where(
+        // Where the engine of this process decides, each decision is made
+        // over the workers the request may use: the checks and the
+        // candidate rule of the selection with no policy engine
+        // ([`Self::with_pd_pair_inputs`]) over the lists that decision
+        // reads, as that selection runs them at each wake of the prefill
+        // queue. A request the two pools can never serve leaves the engine
+        // nobody, and reads that selection's own answer below.
+        let unserved = parking_lot::Mutex::new(None);
+        let narrow = |snapshot: &ModelWorkerSnapshot, pairs: &PdPairIndex| {
+            let context = demand.context.left_by(snapshot, &pools, model_id);
+            let demand = demand.with_context(context);
+            let narrowed =
+                Self::with_pd_pair_inputs(model_id, inputs, wire, demand, pairs, |inputs| {
+                    Ok(placement::pair_candidates(pairs, wire, &inputs))
+                });
+            narrowed.unwrap_or_else(|failure| {
+                *unserved.lock() = Some(failure);
+                Some([Arc::from([]), Arc::from([])])
+            })
+        };
+        let among: Option<PairNarrowing<'_>> = if in_process { Some(&narrow) } else { None };
+        let placed = policy_engine
+            .place_pair_among(
                 &ask,
                 |worker| on_prefill(worker) || on_decode(worker),
+                among,
                 self.prefill_admission.as_deref(),
                 sticky_key,
             )
-            .await
-            .map_err(|unplaced| unplaced.answer(model_id))?;
+            .await;
+        let (mut placed, guard) = match placed {
+            Ok(placed) => placed,
+            Err(unplaced) => {
+                let unserved = unserved.lock().take();
+                return Err(unserved.map_or_else(
+                    || unplaced.answer(model_id),
+                    |failure| self.pd_selection_failure(model_id, failure, media),
+                ));
+            }
+        };
         let prefill = Arc::clone(placed.worker());
         let runtime = prefill.metadata().spec.runtime_type;
         let decode = placed

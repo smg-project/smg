@@ -19,6 +19,10 @@ use crate::routers::common::{pair_classes, snapshot::RoutingPool};
 /// A shared, immutable list of workers, as the routing snapshot holds them.
 type Workers = Arc<[Arc<dyn Worker>]>;
 
+/// The two sides of a pair as lists of their own, the prefills first: the
+/// workers of each side one request may take.
+pub(crate) type PairSides = [Arc<[Arc<dyn Worker>]>; 2];
+
 /// The wire a PD pair is drawn from: each has its own prefill and decode
 /// pools, since the rendezvous rides the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,13 +182,6 @@ impl PdPairIndex {
     /// and kept with the index, so a membership pays for it once and a
     /// gateway whose pairs no engine decides never does. A call that
     /// arrives during the first waits for it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the policy engine's pair decision asks, once it stands on the gateway's lists"
-        )
-    )]
     pub(crate) fn classes(&self) -> &PartnerClasses {
         self.classes.get_or_init(|| pair_classes::of(self))
     }

@@ -65,6 +65,7 @@ pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
 pub(crate) mod pair_classes;
 pub(crate) mod pair_index;
+pub(crate) mod pair_lists;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;

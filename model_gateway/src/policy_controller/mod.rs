@@ -215,19 +215,32 @@ impl InProcess {
     /// engine through, and no classic policy places one.
     ///
     /// They do where the engine decides every request of the document in
-    /// force whole today: single requests alone, under no sessions rule,
-    /// each place picked by its picker alone or decided by a profile that
-    /// asks nothing this process does not feed a whole decision
-    /// ([`fed`]). Under any other document the
+    /// force whole today: single requests and pairs, under no sessions
+    /// rule, each place picked by its picker alone or decided by a profile
+    /// that asks nothing this process does not feed a whole decision of
+    /// its plan ([`fed`], [`fed_a_pair`]). Under any other document the
     /// routers keep their classic placement pass, whose policies ask the
     /// engine for the pick. The set grows with what the engine decides
     /// whole, and this question goes when it decides every document.
     pub(crate) fn decides_whole(&self) -> bool {
-        self.engine.spec().engine().single_and_fed(fed())
+        decided_whole(&self.engine)
     }
 }
 
-/// What this process feeds a whole decision of the engine from its own
+/// Whether `engine` decides every request of its document whole in this
+/// process ([`InProcess::decides_whole`]).
+fn decided_whole(engine: &smg_policy_controller::engine::PolicyEngine) -> bool {
+    engine.spec().engine().decided_whole(fed(), fed_a_pair())
+}
+
+/// What this process feeds a pair's whole decision beyond its two lists'
+/// worker objects: nothing yet. A pair whose side reads a load report, who
+/// holds a prompt or the prompt's size keeps the classic placement pass.
+fn fed_a_pair() -> Needs {
+    Needs::default()
+}
+
+/// What this process feeds a single request's whole decision from its own
 /// data, beyond the worker objects' live state.
 ///
 /// The routers hash a request's prompt, by its tokens or its text, where
@@ -417,7 +430,7 @@ fn engine_for(
         // A place the engine does not pick alone is decided by its whole
         // pass where the routers ask the engine for every request of the
         // document, and by nothing where they do not.
-        let whole = engine.spec().engine().single_and_fed(fed());
+        let whole = decided_whole(&engine);
         if let Some(place) = engine.not_alone().filter(|_| !whole) {
             return Err(StartError::NotAlone {
                 profile: place.profile.to_owned(),

@@ -42,7 +42,7 @@ use crate::{
     routers::{
         common::{
             header_utils, overload,
-            pair_index::PdPairIndex,
+            pair_index::{PairSides, PdPairIndex},
             pd_admission,
             prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
             retry::mark_non_retryable,
@@ -1336,18 +1336,62 @@ pub(crate) fn select_pair(
         } else {
             &pairs.decode_pool
         };
-        let came_free = failed_pool.iter().any(|w| {
-            w.is_available()
-                && WireConstraint::admits(wire, w.as_ref())
-                && inputs
-                    .candidate_filter
-                    .is_none_or(|accepts| accepts(w.as_ref()))
-        });
+        let came_free = failed_pool
+            .iter()
+            .any(|w| w.is_available() && pair_admits(wire, &inputs, w.as_ref()));
         if !came_free {
             return Err(failure);
         }
         asked_again = true;
     }
+}
+
+/// Whether a pair placement may use `worker`: it is on `wire` when a retry
+/// pins one, and the request's candidate filter admits it. The one rule a
+/// pass of the pair placement admits a worker by, and the one a route
+/// narrows a pair's two pools by ahead of a policy engine
+/// ([`pair_candidates`]).
+#[inline]
+fn pair_admits(
+    wire: Option<WireConstraint>,
+    inputs: &PlacementInputs<'_>,
+    worker: &dyn Worker,
+) -> bool {
+    WireConstraint::admits(wire, worker)
+        && inputs
+            .candidate_filter
+            .is_none_or(|accepts| accepts(worker))
+}
+
+/// The workers of a pair's two pools a request may use, the prefills then
+/// the decodes, where its wire or its candidate filter refuses one of them
+/// ([`pair_admits`]). `None` where it refuses nobody: the pools stand as
+/// `pairs` holds them, with their partner lists.
+///
+/// For a route whose policy engine decides in the gateway's own process:
+/// it pairs these workers again and the engine decides over them.
+pub(crate) fn pair_candidates(
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    inputs: &PlacementInputs<'_>,
+) -> Option<PairSides> {
+    if wire.is_none() && inputs.candidate_filter.is_none() {
+        return None;
+    }
+    let admits = |worker: &dyn Worker| pair_admits(wire, inputs, worker);
+    let pools = [&pairs.prefill_pool, &pairs.decode_pool];
+    let narrowed = pools.map(|pool| accepted_by(pool, Some(&admits)));
+    if narrowed.iter().all(Option::is_none) {
+        return None;
+    }
+    let [prefill, decode] = narrowed;
+    let whole = |narrowed: Option<Vec<Arc<dyn Worker>>>, pool: &Arc<[Arc<dyn Worker>]>| {
+        narrowed.map_or_else(|| Arc::clone(pool), Arc::from)
+    };
+    Some([
+        whole(prefill, &pairs.prefill_pool),
+        whole(decode, &pairs.decode_pool),
+    ])
 }
 
 /// Why a pass of the pair placement placed no pair.
@@ -1374,12 +1418,7 @@ fn pair_pass(
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, PairMiss> {
-    let admitted = |w: &Arc<dyn Worker>| {
-        WireConstraint::admits(wire, w.as_ref())
-            && inputs
-                .candidate_filter
-                .is_none_or(|accepts| accepts(w.as_ref()))
-    };
+    let admitted = |w: &Arc<dyn Worker>| pair_admits(wire, &inputs, w.as_ref());
     // The overload thresholds steer a pool only while one of the workers the
     // request may use in it is under them. A pool whose every such worker
     // is over them (and some otherwise routable) has nowhere to be steered:

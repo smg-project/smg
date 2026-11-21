@@ -1016,11 +1016,15 @@ mod tests {
     /// read a worker's record and no more. Least load reads the workers'
     /// reports, and the default policy who holds the prompt beside them.
     /// A host that feeds less than a profile declares, a profile that
-    /// reads a hash ring, one under a sessions rule and a pair's plan are
-    /// not decided so.
+    /// reads a hash ring and one under a sessions rule are not decided so.
+    /// A pair's decision is fed apart from a single's: a pair is decided
+    /// whole where each side is picked alone or reads nothing the host
+    /// does not feed a pair's decision.
     #[test]
     fn a_document_is_decided_whole_where_each_place_is_picked_alone_or_fed() {
-        let whole = |engine: &PolicyEngine, fed: Needs| engine.spec().engine().single_and_fed(fed);
+        let whole = |engine: &PolicyEngine, fed: Needs| {
+            engine.spec().engine().decided_whole(fed, Needs::default())
+        };
         let nothing = Needs::default();
         for name in ["round_robin", "random", "passthrough"] {
             assert!(whole(&preset(name), nothing), "{name}");
@@ -1050,10 +1054,18 @@ mod tests {
         for name in ["consistent_hashing", "prefix_hash", "manual"] {
             assert!(!whole(&preset(name), declared), "{name}");
         }
-        let mut pair =
-            PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
-        pair.generation = 1;
-        assert!(!whole(&engine_of(&pair), declared));
+        let pair = |prefill, decode| {
+            let mut pair = PolicySpec::pair_presets(prefill, decode).expect("built-in presets");
+            pair.generation = 1;
+            engine_of(&pair)
+        };
+        assert!(whole(&pair("round_robin", "round_robin"), nothing));
+        // What a host feeds a single's decision says nothing of a pair's.
+        let scored = pair("least_load", "round_robin");
+        let reports = scored.spec().engine().needs_for(MODEL, Phase::Prefill);
+        assert!(reports.loads);
+        assert!(!whole(&scored, reports));
+        assert!(scored.spec().engine().decided_whole(nothing, reports));
     }
 
     /// A pick tests a worker's health whole, as the pass does. A profile

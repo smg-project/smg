@@ -7,14 +7,6 @@
 //! pair. This module numbers the classes from the index's partner lists, so
 //! the pairing rule is written once, in the index, whoever places the pair.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the policy engine's pair decision asks, once it stands on the gateway's lists"
-    )
-)]
-
 use std::{ptr, sync::Arc};
 
 use smg_policy_controller::engine::PartnerClasses;

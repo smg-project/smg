@@ -896,8 +896,9 @@ async fn the_regular_router_is_built_under_the_setting() -> Case {
     Ok(())
 }
 
-/// In process the HTTP pair router is the classic one, and the registry
-/// builds a policy for each of its sides.
+/// In process the HTTP pair router is its usual one. The engine decides a
+/// pair under the random policy whole: the router asks the context's engine
+/// object, and the registry builds no policy for a side.
 #[tokio::test]
 async fn the_http_pair_router_is_built_under_the_setting() -> Case {
     let mut config = picked(quiet());
@@ -912,10 +913,11 @@ async fn the_http_pair_router_is_built_under_the_setting() -> Case {
         .select_router_for_request(None)
         .ok_or("the HTTP pair router is missing")?;
     assert_eq!(router.router_type(), "pd");
+    assert!(context.policy_engine.is_some());
     let policies = &context.policy_registry;
     let unset = policies.get_default_policy();
-    assert!(!Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
-    assert!(!Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
     Ok(())
 }
 
@@ -1017,8 +1019,10 @@ async fn the_regular_grpc_router_is_built_under_the_setting() -> Case {
     Ok(())
 }
 
-/// In process the gRPC pair router is the classic one, and the registry
-/// builds a policy for each of its sides.
+/// In process the gRPC pair router is its usual one. The engine decides a
+/// pair under the random policy whole: the router's selection stage asks
+/// the context's engine object, and the registry builds no policy for a
+/// side.
 #[tokio::test]
 async fn the_grpc_pair_router_is_built_under_the_setting() -> Case {
     let mut config = picked(quiet());
@@ -1034,10 +1038,11 @@ async fn the_grpc_pair_router_is_built_under_the_setting() -> Case {
         .select_router_for_request(None)
         .ok_or("the gRPC pair router is missing")?;
     assert_eq!(router.router_type(), "grpc_pd");
+    assert!(context.policy_engine.is_some());
     let policies = &context.policy_registry;
     let unset = policies.get_default_policy();
-    assert!(!Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
-    assert!(!Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
     Ok(())
 }
 
@@ -1128,10 +1133,13 @@ async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case 
     Ok(())
 }
 
-/// A pair family of a gateway of one router. In process it is the classic
-/// router, with the registry's policy for each of its sides. Under a
-/// controller's address it refuses by name, and no pair policy is built
-/// for it.
+/// A pair family of a gateway of one router. In process it is its usual
+/// router. Where the engine decides every request of the document whole,
+/// as a pair under the random policy, that router asks the engine object
+/// and no pair policy is built. Under any other document, and for the
+/// encode pair family, the registry holds a policy for each of its sides.
+/// Under a controller's address it refuses by name, and no pair policy is
+/// built for it.
 #[tokio::test]
 async fn a_pair_family_serves_in_process_and_refuses_by_name_under_an_address() -> Case {
     let mut pair = picked(quiet());
@@ -1151,23 +1159,36 @@ async fn a_pair_family_serves_in_process_and_refuses_by_name_under_an_address() 
         prefill_policy: None,
         decode_policy: None,
     };
-    for (family, classic, config) in [
-        ("HTTP pair", "pd", pair),
-        ("gRPC encode pair", "grpc_epd", encode_pair),
+    // A side that reads who holds a prompt, which a pair's decision is not
+    // fed.
+    let mut held_pair = pair.clone();
+    held_pair.policy = PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 1 << 20);
+    for (family, classic, config, whole) in [
+        ("HTTP pair", "pd", pair, true),
+        (
+            "HTTP pair that reads who holds a prompt",
+            "pd",
+            held_pair,
+            false,
+        ),
+        ("gRPC encode pair", "grpc_epd", encode_pair, false),
     ] {
         let (context, gateway) = build(config.clone()).await?;
         let router = gateway
             .select_router_for_request(None)
             .ok_or("the router is missing")?;
         assert_eq!(router.router_type(), classic, "{family}");
+        assert_eq!(context.policy_engine.is_some(), whole, "{family}");
         let policies = &context.policy_registry;
         let unset = policies.get_default_policy();
-        assert!(
-            !Arc::ptr_eq(&policies.get_prefill_policy(), &unset),
+        assert_eq!(
+            Arc::ptr_eq(&policies.get_prefill_policy(), &unset),
+            whole,
             "{family}"
         );
-        assert!(
-            !Arc::ptr_eq(&policies.get_decode_policy(), &unset),
+        assert_eq!(
+            Arc::ptr_eq(&policies.get_decode_policy(), &unset),
+            whole,
             "{family}"
         );
         // The registry keeps one encode policy either way: the one the

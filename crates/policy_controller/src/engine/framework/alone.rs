@@ -158,33 +158,40 @@ impl Engine {
         })
     }
 
-    /// Whether every request of the document is a single request that a
-    /// host which feeds `fed` has decided whole in its own process. Each
-    /// binding plans single requests alone and states no sessions rule,
+    /// Whether every request of the document is one a host has decided
+    /// whole in its own process: a single request, whose decision the host
+    /// feeds `fed`, or a pair, whose decision it feeds `pair_fed`. Each
+    /// binding plans single requests or a pair and states no sessions rule,
     /// and each place of it is one of two:
     ///
     /// - one pick of its picker decides it ([`Self::not_alone`]), which
     ///   asks nothing of the host;
-    /// - its stages declare nothing a host must feed outside `fed`
-    ///   ([`Needs::within`]): the whole pass of a gateway's own process
-    ///   decides it over records written from the gateway's own data.
+    /// - its stages declare nothing a host must feed outside what the host
+    ///   feeds a decision of its plan ([`Needs::within`]): the whole pass
+    ///   of a gateway's own process decides it over records written from
+    ///   the gateway's own data.
     ///
     /// A host that feeds nothing still has decided whole a place whose
     /// stages read a worker's record and nothing more. The set of places
     /// grows with what a host feeds a whole decision.
     #[must_use]
-    pub fn single_and_fed(&self, fed: Needs) -> bool {
-        let single = |entry: &super::Entry| {
-            entry.binding.plan == Plan::Single && entry.binding.sessions.is_none()
+    pub fn decided_whole(&self, fed: Needs, pair_fed: Needs) -> bool {
+        let planned = |entry: &super::Entry| {
+            matches!(entry.binding.plan, Plan::Single | Plan::PdPair)
+                && entry.binding.sessions.is_none()
         };
-        let decided = |(_, phase, index, profile): (&Binding, Phase, u16, &Profile)| {
+        let decided = |(binding, phase, index, profile): (&Binding, Phase, u16, &Profile)| {
             if self.in_the_way(index, profile, phase).is_none() {
                 return true;
             }
+            let fed = match binding.plan {
+                Plan::Single => fed,
+                Plan::PdPair | Plan::Epd { .. } => pair_fed,
+            };
             let needs = self.profile_needs.get(usize::from(index));
             needs.is_some_and(|needs| needs.within(fed))
         };
-        self.bindings.iter().all(single) && self.places().all(decided)
+        self.bindings.iter().all(planned) && self.places().all(decided)
     }
 
     /// The first stage of `profile`, which stands at `index`, that asks

@@ -3809,6 +3809,9 @@ fn upstream_error_message(body: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod own_tests;
+
+#[cfg(test)]
 mod placed_tests;
 
 #[cfg(test)]

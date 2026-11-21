@@ -13,7 +13,10 @@
 //! the store builds the candidates, and the gateway sends none and keeps no
 //! view of the rows. A gateway that decides in its own process asks the
 //! engine of this process, over the list its registry publishes for the
-//! ask's route ([`Ask::pool`]) and the worker objects on it: no store.
+//! ask's route ([`Ask::pool`]) and the worker objects on it: no store. A
+//! pair is asked there over the registry's prefill list and decode list of
+//! the route's wire, with the pairs the snapshot's index holds
+//! ([`PolicyEngine::place_pair_where`]).
 //!
 //! Either engine decides on the calling thread. A pair can wait for
 //! prefill admission and asks again when the queue wakes it.
@@ -37,6 +40,7 @@ use std::{
     borrow::Cow,
     cell::Cell,
     fmt,
+    future::ready,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -55,12 +59,12 @@ use rustc_hash::FxHashMap;
 use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
     engine::{
-        worker_id, worker_rank, AlonePick, Constraints, DecideOutcome, Decided, Decision,
-        DecisionEngine, DecisionRefused, EncodeItems, EncodePlaced, HashSeeds, HeldDecision,
-        Identity, LiftedVeto, MediaCounts, Pair, Phase, Plain, PolicyEngine as OwnEngine,
-        PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind, ShedReason,
-        StoreBackedEngine, SweepOutcome, Target, Targets, Trace, WireModes, WorkerId, WorkerLists,
-        MAX_TARGETS,
+        prefills_full, worker_id, worker_rank, AlonePick, Constraints, DecideOutcome, Decided,
+        Decision, DecisionEngine, DecisionRefused, EncodeItems, EncodePlaced, HashSeeds,
+        HeldDecision, Identity, LiftedVeto, MediaCounts, Pair, PairLists, Phase, Plain,
+        PolicyEngine as OwnEngine, PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind,
+        ShedReason, StoreBackedEngine, SweepOutcome, Target, Targets, Trace, WireModes, WorkerId,
+        WorkerLists, MAX_TARGETS,
     },
     store::{pairing::Refusal, GatewayId, MemoryStore, Said},
     tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
@@ -83,6 +87,7 @@ use crate::{
     routers::{
         common::{
             overload::{routable_but_for_veto, WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE},
+            pair_lists::{PairNarrowing, PdPairRead},
             placement::{self, no_available_workers_because},
             prefill_admission::{
                 acquire_decided, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -397,6 +402,33 @@ impl RequestMaker for Made<'_, '_> {
     }
 }
 
+/// A pair's ask as the engine of this process takes it up: the ask, made as
+/// any other, over the two lists of its route's wire.
+struct MadeOver<'m, 'r, 'a>(&'m Made<'r, 'a>, PairLists<'m>);
+
+impl RequestMaker for MadeOver<'_, '_, '_> {
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        self.0.make(spec)
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        WorkerLists::Pair(self.1)
+    }
+}
+
+/// Whether the gateway can send to `worker` and the route's rule `holds`
+/// admits it: ready and let through by its circuit breaker, as a commit
+/// over a store's rows asks ([`routable_but_for_veto`]), on one read of the
+/// worker's state.
+fn sendable(worker: &Arc<dyn Worker>, holds: &impl Fn(&dyn Worker) -> bool) -> bool {
+    let state = worker.routing_state();
+    state.healthy && state.can_execute && holds(worker.as_ref())
+}
+
 /// Why an attempt has no worker.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Unplaced {
@@ -429,19 +461,33 @@ pub(crate) enum Unplaced {
     },
     /// A pair can be sent, but its prefill has no admission room.
     NoRoom,
+    /// The prefill a pair's commit took filled between the pair's decision
+    /// and its commit. The pair is decided again at once, and it waits for
+    /// room once those turns are spent.
+    RoomTaken,
     /// The prefill admission queue refused the request.
     Admission(PrefillAdmissionRejection),
 }
 
 impl PrefillCandidateError for Unplaced {
     fn is_at_capacity(&self) -> bool {
-        matches!(self, Self::NoRoom)
+        matches!(self, Self::NoRoom | Self::RoomTaken)
     }
 
     /// A decision with no target the gateway can send to is decided again
-    /// with those targets named, three passes at most at one wake.
+    /// with those targets named, and so is one whose prefill filled ahead
+    /// of its commit: three passes at most at one wake.
     fn decides_again(&self, again: usize) -> bool {
-        matches!(self, Self::NoTargetHolds) && again + 1 < ASKS
+        matches!(self, Self::NoTargetHolds | Self::RoomTaken) && again + 1 < ASKS
+    }
+}
+
+impl From<PrefillAcquireError<Self>> for Unplaced {
+    fn from(error: PrefillAcquireError<Self>) -> Self {
+        match error {
+            PrefillAcquireError::Candidate(verdict) => verdict,
+            PrefillAcquireError::Rejected(rejection) => Self::Admission(rejection),
+        }
     }
 }
 
@@ -484,7 +530,7 @@ impl Unplaced {
                 ),
                 0,
             ),
-            Self::NoRoom => hinted(
+            Self::NoRoom | Self::RoomTaken => hinted(
                 error::service_unavailable(
                     WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
                     format!("No prefill worker for model '{model}' has admission room"),
@@ -992,6 +1038,19 @@ impl PolicyEngine {
         }
     }
 
+    /// The registry's two lists for a pair's `ask` as they stand now, with
+    /// the engine of this process, where it decides over them. `None` under
+    /// a followed controller, whose engine reads its own rows.
+    fn pair_read(&self, ask: &Ask<'_>) -> Option<(PdPairRead, &OwnEngine)> {
+        match (&self.workers, &*self.door) {
+            (Workers::Listed(registry), Decider::Own(engine)) => {
+                let read = PdPairRead::of(registry, engine, ask.model, ask.wires, None);
+                Some((read, &**engine))
+            }
+            _ => None,
+        }
+    }
+
     /// The name of the profile `decision` was made under, for the counter
     /// that asks it the first time it sees the profile.
     fn named(&self, decision: Option<&Decision>) -> Option<Arc<str>> {
@@ -1073,6 +1132,36 @@ impl PolicyEngine {
             let id = worker_id(worker.as_ref());
             let decision = pick.decision(id, worker_rank(worker.as_ref()));
             self.traced(&decision, taken.then_some(worker))
+        });
+    }
+
+    /// The cache trace's two lines of a pair the engine of this process
+    /// decided for `model`: the decision with the prefill taken, then the
+    /// decode taken with it, under the profile the document resolves the
+    /// model's decode side to. A pair's trace is its prefill's, so the
+    /// decode's line names no candidate.
+    fn trace_pair(
+        &self,
+        engine: &OwnEngine,
+        model: &str,
+        decision: &Decision,
+        [prefill, decode]: [&Arc<dyn Worker>; 2],
+    ) {
+        self.trace_decision(decision, Some(prefill));
+        cache_trace::decided(|| {
+            let trace = decision.trace();
+            let side = engine.spec().engine().profile_for(model, Phase::Decode);
+            cache_trace::Decided {
+                profile: side.map(|(_, profile)| Arc::from(profile.name.as_str())),
+                outcome: outcome(decision),
+                generation: trace.generation,
+                survivors: None,
+                top: Vec::new(),
+                seed: trace.seed,
+                lifted: "none",
+                shed: None,
+                worker: Some(Arc::clone(decode)),
+            }
         });
     }
 
@@ -1328,7 +1417,6 @@ impl PolicyEngine {
                     kept: None,
                     decode: Arc::clone(decode),
                     side: pair,
-                    targets,
                     index,
                 })),
                 handle: Some(handle),
@@ -1362,7 +1450,9 @@ impl PolicyEngine {
     /// [`PolicyEngine::place_pair`], over [`PolicyEngine::commit_pair_where`].
     /// The pass that reads which prefills are full and the probe of a request
     /// behind a waiter count a worker the rule refuses as one the gateway
-    /// cannot send to.
+    /// cannot send to. Where the engine of this process decides, each pass
+    /// is one decision over the registry's two lists and its commit
+    /// ([`Self::place_pair_listed`]).
     pub(crate) async fn place_pair_where(
         &self,
         ask: &Ask<'_>,
@@ -1370,7 +1460,29 @@ impl PolicyEngine {
         admission: Option<&PrefillAdmission>,
         routing_key: Option<&str>,
     ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        self.place_pair_among(ask, holds, None, admission, routing_key)
+            .await
+    }
+
+    /// [`Self::place_pair_where`] on a route that narrows the pair's two
+    /// lists by its request. Where the engine of this process decides,
+    /// `among` is asked at each decision, of the lists that decision reads,
+    /// and the engine decides over the workers it leaves. A followed
+    /// controller's engine reads its own rows and no narrowing.
+    pub(crate) async fn place_pair_among(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        among: Option<PairNarrowing<'_>>,
+        admission: Option<&PrefillAdmission>,
+        routing_key: Option<&str>,
+    ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
         let holds = &holds;
+        if let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) {
+            let own = (&**registry, &**engine);
+            let placed = self.place_pair_listed(own, ask, holds, among, admission, routing_key);
+            return placed.await.map_err(Unplaced::from);
+        }
         let missed = Mutex::new(Vec::new());
         // The attempt's first ask, whichever half makes it: each wake's
         // decision starts from the attempt's list, which stays empty
@@ -1387,10 +1499,193 @@ impl PolicyEngine {
             },
         )
         .await
-        .map_err(|error| match error {
-            PrefillAcquireError::Candidate(verdict) => verdict,
-            PrefillAcquireError::Rejected(rejection) => Unplaced::Admission(rejection),
+        .map_err(Unplaced::from)
+    }
+
+    /// [`Self::place_pair_where`] where the engine of this process decides
+    /// over the lists the registry publishes (`own`). Each pass is one
+    /// decision and its commit ([`Self::pair_listed`]), made outside the
+    /// admission lock, so no pick waits on another's. Under the lock the
+    /// commit asks only whether the prefill it took still has room. One
+    /// that filled since the decision is decided again at once
+    /// ([`Unplaced::RoomTaken`]). A request behind a waiter joins the queue
+    /// with no decision, unless a side holds no worker it can be sent to
+    /// ([`Self::probe_listed`]). Each pass reads the registry anew, and
+    /// `among`, the route's narrowing by the request, is asked of that read.
+    async fn place_pair_listed(
+        &self,
+        (registry, engine): (&WorkerRegistry, &OwnEngine),
+        ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Sync),
+        among: Option<PairNarrowing<'_>>,
+        admission: Option<&PrefillAdmission>,
+        routing_key: Option<&str>,
+    ) -> Result<(Placed, PrefillLoadGuard), PrefillAcquireError<Unplaced>> {
+        // What the attempt's passes share: the workers its commits could
+        // not send to, and whether its first ask is still to make.
+        let attempt = (Mutex::new(Vec::new()), AtomicBool::new(true));
+        let read = || PdPairRead::of(registry, engine, ask.model, ask.wires, among);
+        acquire_decided(
+            admission,
+            routing_key,
+            Placed::worker,
+            || ready(self.probe_listed(engine, &read(), ask, holds, admission, &attempt)),
+            || ready(self.pair_listed(engine, &read(), ask, holds, admission, &attempt)),
+            |mut placed: Placed, room| {
+                let (Some(room), Some(admission)) = (room, admission) else {
+                    return Ok(placed);
+                };
+                if room.has_capacity(placed.worker()) {
+                    return Ok(placed);
+                }
+                // The prefill took its last room since the decision, or a
+                // request waits ahead of this one.
+                let taken = admission.reads_full(placed.worker());
+                placed.released(ReleaseReason::CommitFailed, Instant::now());
+                Err(if taken {
+                    Unplaced::RoomTaken
+                } else {
+                    Unplaced::NoRoom
+                })
+            },
+        )
+        .await
+    }
+
+    /// One pass of a pair's placement where `engine`, the engine of this
+    /// process, decides: one decision over the two lists of `read`, the
+    /// registry's as they stand now, and its commit.
+    ///
+    /// The decision stays where its guard holds it. Its targets are walked
+    /// there, best first: a target's workers are the ones at its two places
+    /// in the lists, and the first pair both of whose workers the gateway
+    /// can send to is taken. The placement is built once. Where no target
+    /// holds, the lease is given up by name and the workers that failed
+    /// join the attempt's missed, which its next pass names. A decision
+    /// that every prefill's limit emptied is a request that waits for room
+    /// ([`Unplaced::NoRoom`]).
+    fn pair_listed(
+        &self,
+        engine: &OwnEngine,
+        read: &PdPairRead,
+        ask: &Ask<'_>,
+        holds: &impl Fn(&dyn Worker) -> bool,
+        admission: Option<&PrefillAdmission>,
+        (missed, first): &(Mutex<Vec<WorkerId>>, AtomicBool),
+    ) -> Result<Placed, Unplaced> {
+        let pair = read.lists(engine, admission);
+        let mut missed = missed.lock();
+        let made = Made {
+            ask,
+            missed: &missed,
+            members: None,
+            // A pair's decision is fed no load report yet
+            // (`super::fed_a_pair`).
+            loads: None,
+            source: Cell::new(None),
+        };
+        let now = Instant::now();
+        let over = MadeOver(&made, pair.lists());
+        let decided = DecisionGuard::decide_under(Arc::clone(&self.door), GATEWAY, &over, now);
+        let seconds = now.elapsed().as_secs_f64();
+        // A key's source counts once an attempt, at its first ask.
+        let first = first.swap(false, Ordering::Relaxed);
+        if let Some(source) = made.source.get().filter(|_| first) {
+            Metrics::record_routing_key_source(source);
+        }
+        let decision = decided.as_ref().ok().map(DecisionGuard::decision);
+        Metrics::record_policy_decision(
+            ask.model,
+            labels(decision),
+            || self.named(decision),
+            seconds,
+        );
+        let mut handle = decided.map_err(Unplaced::Refused)?;
+        let pick = match handle.decision() {
+            Decision::Pick(pick) => pick,
+            Decision::Shed(shed) => {
+                self.trace_decision(handle.decision(), None);
+                if prefills_full(handle.decision()) {
+                    return Err(Unplaced::NoRoom);
+                }
+                // A fleet that pairs nothing reads the pair index's answer
+                // and not a missing endpoint.
+                let unpaired = (shed.reason == ShedReason::NoEndpoints)
+                    .then(|| pair.refusal())
+                    .flatten();
+                return Err(unpaired.map_or(
+                    Unplaced::Shed {
+                        reason: shed.reason,
+                        emptied_by: shed.emptied_by,
+                        retry_after_secs: shed.retry_after_secs,
+                    },
+                    |refusal| Unplaced::NoCompatiblePair {
+                        prefill: refusal.prefill.clone(),
+                        decode: refusal.decode.clone(),
+                        mismatches: refusal.mismatches.clone(),
+                    },
+                ));
+            }
+            Decision::Queue(_) => return Err(Unplaced::Queued),
+        };
+        let mut taken = None;
+        for (index, target) in pick.targets.iter().enumerate() {
+            let (Some(side), Some([prefill, decode])) = (target.pair, pair.workers(target)) else {
+                continue;
+            };
+            let (sends, takes) = (sendable(prefill, holds), sendable(decode, holds));
+            if sends && takes {
+                let workers = (Arc::clone(prefill), Arc::clone(decode));
+                taken = Some((index, Named::of(target), side, workers));
+                break;
+            }
+            missed.extend((!sends).then_some(target.id));
+            missed.extend((!takes).then_some(side.decode_id));
+        }
+        let Some((index, named, side, (worker, decode))) = taken else {
+            self.trace_decision(handle.decision(), None);
+            handle.released(ReleaseReason::CommitFailed, now);
+            return Err(Unplaced::NoTargetHolds);
+        };
+        handle.take(index);
+        self.trace_pair(engine, ask.model, handle.decision(), [&worker, &decode]);
+        Ok(Placed {
+            worker,
+            named,
+            pair: Some(Box::new(PlacedPair {
+                kept: None,
+                decode,
+                side,
+                index,
+            })),
+            handle: Some(handle),
         })
+    }
+
+    /// The verdict for a pair's request that arrives behind a waiter, where
+    /// the engine of this process decides: `None` joins the queue. It asks
+    /// for a decision only where a side holds no worker the gateway can
+    /// send to, and gives a pick up at once.
+    fn probe_listed(
+        &self,
+        engine: &OwnEngine,
+        read: &PdPairRead,
+        ask: &Ask<'_>,
+        holds: &impl Fn(&dyn Worker) -> bool,
+        admission: Option<&PrefillAdmission>,
+        attempt: &(Mutex<Vec<WorkerId>>, AtomicBool),
+    ) -> Option<Unplaced> {
+        let pair = read.lists(engine, admission);
+        if pair.each_side(|worker| sendable(worker, holds)) {
+            return None;
+        }
+        match self.pair_listed(engine, read, ask, holds, admission, attempt) {
+            Ok(mut placed) => {
+                placed.released(ReleaseReason::CommitFailed, Instant::now());
+                None
+            }
+            Err(verdict) => Some(verdict).filter(|verdict| !verdict.is_at_capacity()),
+        }
     }
 
     /// One pass of a pair's decision: full prefills are excluded for up to
@@ -1846,8 +2141,9 @@ const RING_POOLS: [RoutingPool; 2] = [RoutingPool::HttpRegular, RoutingPool::Grp
 /// What `engine` keeps of `pool`'s list in `snapshot`, the registry's value
 /// of one membership: made at the first call for the pool and kept in the
 /// snapshot's cell beside the list, for as long as the list stands. The one
-/// read of the cell, for a request and for the fill of the list's ring.
-fn members_of<'s>(
+/// read of the cell, for a request, for each list of a pair and for the fill
+/// of the list's ring.
+pub(crate) fn members_of<'s>(
     engine: &OwnEngine,
     snapshot: &'s ModelWorkerSnapshot,
     pool: RoutingPool,
@@ -2105,14 +2401,13 @@ impl KeptAsk {
 }
 
 /// What a placed pair holds beside its prefill: the decode worker with the
-/// decode side of the target taken, and the pick's targets with that
-/// target's index, for the next decode of the same prefill.
+/// decode side of the target taken, and that target's index in the pick
+/// its guard holds, for the next decode of the same prefill.
 struct PlacedPair {
     /// The first ask as its route kept it for the second ask of the decode.
     kept: Option<Box<KeptAsk>>,
     decode: Arc<dyn Worker>,
     side: Pair,
-    targets: Targets,
     index: usize,
 }
 
@@ -2241,7 +2536,11 @@ impl Placed {
         let (Some(placed), Some(handle)) = (self.pair.as_deref_mut(), &mut self.handle) else {
             return false;
         };
-        for (index, target) in placed.targets.iter().enumerate().skip(placed.index + 1) {
+        // The pick's targets, copied off the guard a take moves.
+        let Some(targets) = handle.decision().pick().map(|pick| pick.targets) else {
+            return false;
+        };
+        for (index, target) in targets.iter().enumerate().skip(placed.index + 1) {
             if target.id != prefill {
                 continue;
             }
@@ -2352,10 +2651,19 @@ impl Placed {
             loads: None,
             source: Cell::new(None),
         };
+        // Where the engine of this process decides, the call is made over
+        // the registry's two lists as they stand now, and a decode is the
+        // worker at its place in them.
+        let read = policy_engine.pair_read(ask);
+        let lists = read.as_ref().map(|(read, engine)| read.lists(engine, None));
         let started = Instant::now();
         // The call's request is made as the first ask's was: from the
         // world the door decides it under, by the sources of that document.
-        let decided = handle.decide_decode_under(&made, now).copied();
+        let decided = match &lists {
+            Some(lists) => handle.decide_decode_under(&MadeOver(&made, lists.lists()), now),
+            None => handle.decide_decode_under(&made, now),
+        }
+        .copied();
         let seconds = started.elapsed().as_secs_f64();
         // A pick issued the side. A shed and a refusal left it chosen: the
         // handle answers the first pick behind a shed, so the side tells
@@ -2375,14 +2683,17 @@ impl Placed {
             };
             let sendable =
                 |worker: &Arc<dyn Worker>| routable_but_for_veto(worker.as_ref()) && holds(worker);
-            let Some(worker) = policy_engine.worker(pair.decode_id).filter(sendable) else {
+            let listed = match &lists {
+                Some(lists) => lists.workers(target).map(|[_, decode]| Arc::clone(decode)),
+                None => policy_engine.worker(pair.decode_id),
+            };
+            let Some(worker) = listed.filter(sendable) else {
                 continue;
             };
             // The call took its first target. A later one is taken by name.
             if index == 0 || handle.take_decode(index).is_some() {
                 placed.decode = worker;
                 placed.side = pair;
-                placed.targets = pick.targets;
                 placed.index = index;
                 return Some(&placed.decode);
             }
@@ -2454,6 +2765,8 @@ mod ride;
 pub(crate) use ride::{BehindAnswer, Sent};
 #[cfg(test)]
 mod decode_again_tests;
+#[cfg(test)]
+mod own_pair_tests;
 #[cfg(test)]
 mod own_tests;
 #[cfg(test)]

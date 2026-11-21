@@ -1,7 +1,8 @@
-//! Regular selection and re-selection where the policy engine of this
-//! process decides. A demand of the request narrows the workers the engine
-//! decides over, as it narrows the candidates of the selection with no
-//! policy engine, and no shape of request is refused.
+//! Selection and re-selection where the policy engine of this process
+//! decides, for a regular request and for a pair. A demand of the request
+//! narrows the workers the engine decides over, as it narrows the candidates
+//! of the selection with no policy engine, and no shape of request is
+//! refused.
 
 use axum::body::to_bytes;
 use openai_protocol::worker::WorkerStatus;
@@ -34,15 +35,28 @@ fn classic_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> Worker
     )
 }
 
+/// The policy engine of this process under `document`, over `registry`.
+fn own_engine(registry: &Arc<WorkerRegistry>, mut document: PolicySpec) -> Arc<PolicyEngine> {
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = PolicyEngine::own(Arc::new(OwnEngine::new(spec)), Arc::clone(registry));
+    Arc::new(engine)
+}
+
 /// The same stage over the round robin engine of this process. Its attempts
 /// ask that engine, and the policy registry only says what the model's own
 /// policy keeps of a request.
 fn own_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> WorkerSelectionStage {
-    let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = PolicyEngine::own(Arc::new(OwnEngine::new(spec)), Arc::clone(registry));
-    classic_stage(registry, policy).with_policy_engine(Some(Arc::new(engine)))
+    let document = PolicySpec::preset("round_robin").expect("a built-in preset");
+    classic_stage(registry, policy).with_policy_engine(Some(own_engine(registry, document)))
+}
+
+/// The prefill-decode stage of `registry`, round robin on both sides, over
+/// the engine of this process under the stock pair document.
+fn own_pair_stage(registry: &Arc<WorkerRegistry>) -> WorkerSelectionStage {
+    let document = PolicySpec::pair_presets("round_robin", "round_robin");
+    let engine = own_engine(registry, document.expect("the pair presets"));
+    round_robin_pd_stage(Arc::clone(registry)).with_policy_engine(Some(engine))
 }
 
 /// A ready regular worker of [`MODEL`] on gRPC in `registry`, of `runtime`,
@@ -54,13 +68,26 @@ fn listed(
     window: Option<u32>,
     labels: &[(&str, &str)],
 ) -> Arc<dyn Worker> {
+    let regular = WorkerType::Regular;
+    listed_as(registry, url, regular, runtime, window, labels)
+}
+
+/// [`listed`] for a worker of `role`.
+fn listed_as(
+    registry: &WorkerRegistry,
+    url: &str,
+    role: WorkerType,
+    runtime: RuntimeType,
+    window: Option<u32>,
+    labels: &[(&str, &str)],
+) -> Arc<dyn Worker> {
     let card = ModelCard::new(MODEL);
     let mut builder = BasicWorkerBuilder::new(url)
         .model(match window {
             Some(window) => card.with_context_length(window),
             None => card,
         })
-        .worker_type(WorkerType::Regular)
+        .worker_type(role)
         .runtime_type(runtime)
         .connection_mode(ConnectionMode::Grpc)
         .health_config(no_health_check());
@@ -97,6 +124,16 @@ fn single(workers: Option<&WorkerSelection>) -> &Arc<dyn Worker> {
     match workers {
         Some(WorkerSelection::Single { worker }) => worker,
         _ => panic!("a regular selection"),
+    }
+}
+
+/// The prefill and the decode a selection left in `workers`.
+fn pair(workers: Option<&WorkerSelection>) -> [&Arc<dyn Worker>; 2] {
+    match workers {
+        Some(WorkerSelection::Disaggregated {
+            prefill, decode, ..
+        }) => [prefill, decode],
+        _ => panic!("a pair's selection"),
     }
 }
 
@@ -310,4 +347,181 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
         turns[place.expect("a worker of the pool")] += 1;
     }
     assert!(turns[0] == 0 && turns[1] > 0 && turns[2] > 0, "{turns:?}");
+}
+
+/// A pair's prompt past the window of one worker of each side is placed by
+/// the engine on the pair whose windows hold it, every time: the demand
+/// narrows both of the pair's lists. A prompt no pair holds is the client's
+/// to fix, and reads the answer of the selection with no policy engine.
+#[tokio::test]
+async fn a_pairs_context_demand_narrows_both_of_its_lists() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let vllm = RuntimeType::Vllm;
+    let side = |role: WorkerType, small: &str, large: &str| {
+        listed_as(&registry, small, role, vllm, Some(WINDOW), UNLABELED);
+        listed_as(&registry, large, role, vllm, None, UNLABELED)
+    };
+    let prefill = side(WorkerType::Prefill, "grpc://p-small:8000", "grpc://p:8000");
+    let decode = side(WorkerType::Decode, "grpc://d-small:8000", "grpc://d:8000");
+    let stage = own_pair_stage(&registry);
+    for _ in 0..PLACEMENTS {
+        let mut ctx = prompt_of(&registry, WINDOW as usize + 1);
+        stage.execute(&mut ctx).await.expect("a pair holds it");
+        assert!(ctx.state.placed.is_some(), "the engine placed it");
+        let [on_prefill, on_decode] = pair(ctx.state.workers.as_ref());
+        assert!(Arc::ptr_eq(on_prefill, &prefill) && Arc::ptr_eq(on_decode, &decode));
+    }
+
+    let registry = Arc::new(WorkerRegistry::new());
+    let (prefill, decode) = (WorkerType::Prefill, WorkerType::Decode);
+    listed_as(
+        &registry,
+        "grpc://p:8000",
+        prefill,
+        vllm,
+        Some(WINDOW),
+        UNLABELED,
+    );
+    listed_as(&registry, "grpc://d:8000", decode, vllm, None, UNLABELED);
+    let past = || prompt_of(&registry, WINDOW as usize + 1);
+    let refused = own_pair_stage(&registry).execute(&mut past()).await;
+    let own = answer_of(refused.expect_err("no prefill's window holds it")).await;
+    assert_eq!(own.0, StatusCode::BAD_REQUEST);
+    let classic = round_robin_pd_stage(Arc::clone(&registry));
+    let refused = classic.execute(&mut past()).await;
+    assert_eq!(answer_of(refused.expect_err("no window")).await, own);
+}
+
+/// A pair's image request is placed by the engine on the prefill with a
+/// vision encoder, every time. Where no prefill has one, the request reads
+/// the answer of the selection with no policy engine.
+#[tokio::test]
+async fn a_pairs_media_input_narrows_the_side_that_takes_it() {
+    let vllm = RuntimeType::Vllm;
+    let (prefill, decode) = (WorkerType::Prefill, WorkerType::Decode);
+    let image = |registry: &Arc<WorkerRegistry>| {
+        let mut ctx = prompt_of(registry, 3);
+        ctx.state.multimodal_intermediate = Some(image_intermediate(None));
+        ctx
+    };
+
+    let registry = Arc::new(WorkerRegistry::new());
+    listed_as(
+        &registry,
+        "grpc://p-blind:8000",
+        prefill,
+        vllm,
+        None,
+        NO_VISION_ENCODER,
+    );
+    let sees = listed_as(
+        &registry,
+        "grpc://p:8000",
+        prefill,
+        vllm,
+        None,
+        VISION_ENCODER,
+    );
+    listed_as(
+        &registry,
+        "grpc://d:8000",
+        decode,
+        vllm,
+        None,
+        VISION_ENCODER,
+    );
+    let stage = own_pair_stage(&registry);
+    for _ in 0..PLACEMENTS {
+        let mut ctx = image(&registry);
+        stage.execute(&mut ctx).await.expect("a vision encoder");
+        assert!(ctx.state.placed.is_some(), "the engine placed it");
+        assert!(Arc::ptr_eq(pair(ctx.state.workers.as_ref())[0], &sees));
+    }
+
+    let registry = Arc::new(WorkerRegistry::new());
+    listed_as(
+        &registry,
+        "grpc://p-blind:8000",
+        prefill,
+        vllm,
+        None,
+        NO_VISION_ENCODER,
+    );
+    listed_as(
+        &registry,
+        "grpc://d:8000",
+        decode,
+        vllm,
+        None,
+        VISION_ENCODER,
+    );
+    let refused = own_pair_stage(&registry)
+        .execute(&mut image(&registry))
+        .await;
+    let own = answer_of(refused.expect_err("no prefill has the encoder")).await;
+    assert_eq!(own.0, StatusCode::BAD_REQUEST);
+    assert_eq!(own.1["error"]["code"], "multimodal_not_supported");
+    let classic = round_robin_pd_stage(Arc::clone(&registry));
+    let refused = classic.execute(&mut image(&registry)).await;
+    assert_eq!(answer_of(refused.expect_err("no encoder")).await, own);
+}
+
+/// A pair's retry under a decoding rule is placed by the engine on the
+/// decode that decides the request's constraint as its first attempt's did
+/// and whose window holds the prompt: the rule and the demand narrow the
+/// decode list together. Where that decode is not ready the retry reads a
+/// 503.
+#[tokio::test]
+async fn a_pairs_retry_keeps_its_decoding_rule_and_its_context_demand() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let runtime = RuntimeType::TokenSpeed;
+    let decodes = [
+        ("grpc://d0:8000", WINDOW, "first_token"),
+        ("grpc://d1:8000", 4 * WINDOW, "after_reasoning"),
+        ("grpc://d2:8000", 4 * WINDOW, "first_token"),
+    ]
+    .map(|(url, window, start)| {
+        let labels = [
+            ("constrained_decoding", "always"),
+            ("constrained_decoding_start", start),
+        ];
+        let decode = WorkerType::Decode;
+        listed_as(&registry, url, decode, runtime, Some(window), &labels)
+    });
+    let prefill = WorkerType::Prefill;
+    listed_as(
+        &registry,
+        "grpc://p:8000",
+        prefill,
+        runtime,
+        None,
+        UNLABELED,
+    );
+    let stage = own_pair_stage(&registry);
+
+    let mut retry = dispatch_ctx(MODEL, grpc_wire(runtime));
+    let first = WorkerSelection::Single {
+        worker: Arc::clone(&decodes[2]),
+    };
+    retry.constraint_decided_on = Some(utils::WorkerDecoding::of(Some(&first)));
+    let request: GenerateRequest =
+        serde_json::from_value(serde_json::json!({"text": "Hello"})).expect("a request");
+    retry.routing.context_requirements = ContextRequirements::new(
+        &PreparationOutput::Generate {
+            original_text: None,
+            token_ids: vec![1; WINDOW as usize + 1],
+        },
+        &RequestType::Generate(Arc::new(request)),
+    );
+    let plan = retained_plan(&[1, 2, 3]);
+    for _ in 0..PLACEMENTS {
+        let reselected = stage.reselect(&mut retry, &plan).await;
+        reselected.expect("the decode that decides alike");
+        assert!(retry.placed.is_some(), "the engine placed the retry");
+        assert!(Arc::ptr_eq(pair(retry.workers.as_ref())[1], &decodes[2]));
+    }
+    decodes[2].set_status(WorkerStatus::NotReady);
+    let refused = stage.reselect(&mut retry, &plan).await;
+    let refused = refused.expect_err("the one decode left is not ready");
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

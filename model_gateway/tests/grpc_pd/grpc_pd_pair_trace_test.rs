@@ -77,14 +77,23 @@ async fn traced_picks(router: &dyn RouterTrait) -> Vec<(String, String)> {
 }
 
 /// One traced completion: the record lists the prefill pick, then the
-/// decode pick, each under round robin.
+/// decode pick, each under its side's policy. That is round robin where a
+/// side's policy picks, and the side's profile of the document in force
+/// where the policy engine decides the pair.
 #[tokio::test]
 async fn a_traced_pair_names_both_picks() {
     let (router, prefill, decode) = build_pd_router().await;
-    let pick = |port: u16| ("round_robin".to_owned(), format!("grpc://127.0.0.1:{port}"));
+    let picks = traced_picks(router.as_ref()).await;
+    let url = |port: u16| format!("grpc://127.0.0.1:{port}");
+    let workers: Vec<&str> = picks.iter().map(|(_, worker)| worker.as_str()).collect();
     assert_eq!(
-        traced_picks(router.as_ref()).await,
-        [pick(prefill), pick(decode)],
+        workers,
+        [url(prefill), url(decode)],
         "the prefill pick, then the decode pick"
+    );
+    let policies: Vec<&str> = picks.iter().map(|(policy, _)| policy.as_str()).collect();
+    assert!(
+        policies == ["round_robin", "round_robin"] || policies == ["prefill", "decode"],
+        "{policies:?}"
     );
 }
