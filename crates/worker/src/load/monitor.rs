@@ -709,10 +709,10 @@ impl<G: Generation> WorkerMonitor<G> {
         // its series under that sentinel.
         let ready =
             runtime.map_or_else(|| worker.status(), |state| state.status()) == WorkerStatus::Ready;
-        if !reports
-            .get(url)
-            .is_some_and(|file| Arc::ptr_eq(&file.pusher, worker))
-        {
+        let mut on_file = reports
+            .get_mut(url)
+            .filter(|file| Arc::ptr_eq(&file.pusher, worker));
+        if on_file.is_none() {
             // A report is on file for the registry's worker at its URL
             // alone, by identity, and holds that worker's records alone.
             // Its status is not read: a worker that is not `Ready` still
@@ -737,9 +737,10 @@ impl<G: Generation> WorkerMonitor<G> {
                 self.sink.forget(&left.pusher);
                 self.clear_series(&reports, &left.pusher, Some(&left.report));
             }
+            on_file = reports.get_mut(url);
         }
         // On file: made just above when it was not.
-        let Some(file) = reports.get_mut(url) else {
+        let Some(file) = on_file else {
             return;
         };
         let report = &mut file.report;
