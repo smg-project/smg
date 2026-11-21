@@ -3,8 +3,10 @@
 //!
 //! The provider profile (`openai_protocol::profile`) is the request-side
 //! contract: what a vendor's requests may say and how they are normalized.
-//! This module is the response side: the shape of a chat stream and the
-//! re-slicing of a relayed stream. A [`Wire`] is selected from the profile
+//! This module is the response side: the shape of a chat stream, the
+//! re-slicing of a relayed stream, and the one answer a vendor's contract
+//! fails instead of delivering (MiniMax's, for a tool call the reader could
+//! not read). A [`Wire`] is selected from the profile
 //! alone ([`Wire::of`]): in `ChatResponseSpec::for_request` for the stream,
 //! and at the HTTP relay for its re-chunking. It is a fieldless `Copy` enum,
 //! so carrying it costs nothing, and every vendor rule is one `match` whose
@@ -14,8 +16,8 @@
 //!
 //! One file per vendor holds that vendor's rules: [`deepseek`] and
 //! [`minimax`]. The OpenAI wire has no file: it is the unconditional code at
-//! each hook. Outside the object: the request side (the profile), the error
-//! bodies and the SSE error events inside a 200 stream.
+//! each hook. Outside the object: the request side (the profile), and the
+//! gateway's own error bodies and SSE error events inside a 200 stream.
 
 use openai_protocol::{common::StreamOptions, profile::ProviderProfile};
 
@@ -71,6 +73,20 @@ impl Wire {
         match self {
             Self::Minimax => Some(minimax::RECHUNK),
             Self::OpenAi | Self::DeepSeek => None,
+        }
+    }
+
+    /// Whether the vendor's contract fails a request whose answer, read by
+    /// `table`, holds a tool call the reader could not read, instead of
+    /// delivering the call partial or repaired or showing it as content:
+    /// MiniMax's, for the answers its M3 table reads
+    /// ([`minimax::InvalidToolCallFormat`]). The spec asks once per choice's
+    /// reader, for a request that expects tool calls
+    /// (`ChatResponseSpec::fails_on_unreadable_call`).
+    pub(crate) fn fails_on_unreadable_tool_call(self, table: &str) -> bool {
+        match self {
+            Self::Minimax => minimax::fails_on_unreadable_tool_call(table),
+            Self::OpenAi | Self::DeepSeek => false,
         }
     }
 }
@@ -241,5 +257,25 @@ mod tests {
             );
         }
         assert_eq!(Wire::Minimax.rechunk_policy(), Some(minimax::RECHUNK));
+    }
+
+    /// Only MiniMax's wire fails a request on a tool call the reader could
+    /// not read, and only for an answer its M3 table reads; every other wire
+    /// delivers the answer as its table read it, the M3 table's included.
+    #[test]
+    fn only_minimaxs_wire_fails_a_request_on_an_unreadable_tool_call() {
+        use symphony::formats::Table;
+
+        for wire in [Wire::OpenAi, Wire::DeepSeek, Wire::Minimax] {
+            assert_eq!(
+                wire.fails_on_unreadable_tool_call(Table::MinimaxM3.name()),
+                wire == Wire::Minimax,
+                "{wire:?}"
+            );
+            assert!(
+                !wire.fails_on_unreadable_tool_call(Table::MinimaxM2.name()),
+                "{wire:?}"
+            );
+        }
     }
 }
