@@ -1960,6 +1960,9 @@ async fn dispatch_pd_sides(
                 Err(error) if decode_result.is_none() => DispatchStep::Alone(PdSide::Prefill, error),
                 result => DispatchStep::Prefill(result),
             },
+            // A held prefill stream means the decode call is still pending.
+            error = prefill_failed_ahead(prefill_result.as_mut().and_then(|r| r.as_mut().ok()))
+                => DispatchStep::Alone(PdSide::Prefill, error),
         };
 
         match step {
@@ -2023,6 +2026,19 @@ async fn dispatch_pd_sides(
             },
         }
     }
+}
+
+/// The failure a prefill side's first item is, pulled ahead of its reader
+/// (see [`ProtoStream::first_item_ahead`]) while the decode call is still
+/// pending: the side's answer at once, as its call's failure is. Never
+/// completes on a response, on the end, or without a stream.
+async fn prefill_failed_ahead(prefill: Option<&mut ProtoStream>) -> tonic::Status {
+    if let Some(prefill) = prefill {
+        if let Some(Err(status)) = prefill.first_item_ahead().await {
+            return status.clone();
+        }
+    }
+    std::future::pending().await
 }
 
 /// Whether the parallel decode side's first item, pulled ahead of its reader
@@ -2832,7 +2848,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::routers::{
         common::{attempt_ledger::FailedSide, retry::is_retryable_response},
-        grpc::backend_client::BasicWorkerBuilder,
+        grpc::{
+            backend_client::BasicWorkerBuilder, regular::streaming::tests::eof::scripted_stream,
+        },
     };
 
     /// A boxed encode send, as the supervisor's tests build them.
@@ -3570,6 +3588,28 @@ pub(crate) mod tests {
             PdDispatchOutcome::FailedFirst { side, error, .. } => {
                 assert_eq!(side, PdSide::Prefill);
                 assert_eq!(error.message(), "bootstrap timeout");
+            }
+            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+    }
+
+    /// A prefill whose call returned a stream that fails at its first item
+    /// is answered the same way: the decode call is not waited for.
+    #[tokio::test]
+    async fn a_prefill_stream_that_fails_at_once_answers_without_waiting_for_the_decode_call() {
+        let (stream, _server) = scripted_stream(Vec::new(), "13").await;
+        let prefill: SideDispatch = Box::pin(async { Ok(stream) });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch_pd_sides(prefill, never_answers(), None, None),
+        )
+        .await
+        .expect("the prefill's failure must not wait on the decode call");
+
+        match outcome {
+            PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                assert_eq!(side, PdSide::Prefill);
+                assert_eq!(error.code(), tonic::Code::Internal);
             }
             PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
         }
