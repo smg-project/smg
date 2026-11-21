@@ -146,12 +146,9 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The pair router asks the policy engine where this gateway
-        // decides pairs in its own process. Its family refuses by name
-        // elsewhere.
-        if let Some(router) =
-            policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
-        {
+        // Where the gateway follows a controller the pair family refuses
+        // by name.
+        if let Some(router) = policy_controller::undecided(ctx) {
             return Ok(router);
         }
         Self::set_pd_policies(
@@ -184,17 +181,12 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The regular router and the pair router ask the policy engine
-        // in their selection stage. The pair router serves where the
-        // document in force plans pairs, and its family refuses by name
-        // elsewhere. The encode mode places no request through the policy
-        // engine yet.
+        // Where the gateway follows a controller the regular router asks
+        // the policy engine in its selection stage, and each pair family
+        // refuses by name.
         let refusing = match mode {
             Mode::Regular => None,
-            Mode::PrefillDecode => {
-                policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
-            }
-            Mode::EncodePrefillDecode => policy_controller::undecided(ctx),
+            Mode::PrefillDecode | Mode::EncodePrefillDecode => policy_controller::undecided(ctx),
         };
         if let Some(router) = refusing {
             return Ok(router);
@@ -205,9 +197,9 @@ impl RouterFactory {
     }
 
     /// Register the prefill/decode policies (HTTP PD, gRPC PD and gRPC EPD),
-    /// each from its own config or, when unset, the main policy. Under the
-    /// policy controller none is registered: no classic policy decides for a
-    /// pair there, and one built anyway would start its own tasks.
+    /// each from its own config or, when unset, the main policy. Where the
+    /// gateway follows a controller none is registered: the pair family
+    /// refuses there, and a policy built anyway would start its own tasks.
     fn set_pd_policies(
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
@@ -232,8 +224,9 @@ impl RouterFactory {
 
     /// Register the encode/prefill/decode policies for a gRPC EPD deployment.
     /// Encode defaults to consistent hashing over each item's content hash;
-    /// prefill/decode default to the main policy when unset. Under the policy
-    /// controller none is registered, as in [`Self::set_pd_policies`].
+    /// prefill/decode default to the main policy when unset. Where the
+    /// gateway follows a controller none is registered, as in
+    /// [`Self::set_pd_policies`].
     fn set_epd_policies(
         encode_policy_config: Option<&PolicyConfig>,
         prefill_policy_config: Option<&PolicyConfig>,
