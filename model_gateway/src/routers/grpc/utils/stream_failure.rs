@@ -244,8 +244,9 @@ pub(crate) enum StreamFailure {
     /// The answer ended with a tool call the reader could not read, under a
     /// request that fails on one (`ChatResponseSpec::fails_on_unreadable_call`):
     /// the request's outcome, ended as the wire's contract ends it
-    /// ([`InvalidToolCallFormat`]): the usage chunk when asked for, then the
-    /// contract's event as the last frame, no finish chunk and no `[DONE]`.
+    /// ([`InvalidToolCallFormat`]): after the answer as it was read, the
+    /// usage chunk when asked for, then the contract's event as the last
+    /// frame, no finish chunk and no `[DONE]`.
     ToolCallFormat(InvalidToolCallFormat),
 }
 

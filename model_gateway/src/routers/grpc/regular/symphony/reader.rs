@@ -604,10 +604,12 @@ pub(crate) struct Reader {
     /// every reader whose start the assignment knew, and from the deciding byte on: one branch
     /// per step.
     undecided: Option<Box<Undecided>>,
-    /// What the reader keeps for a request that fails on a tool call it could not read
-    /// ([`Self::failing_unreadable_calls`]): the call being read, held until its end, and the
-    /// verdict. `None` for every other request: one branch per step.
-    gate: Option<Box<Gate>>,
+    /// Whether the reader notes a tool call it could not read, for a request that fails on one
+    /// ([`Self::noting_unreadable_calls`]). Off for every other request: one branch per step.
+    notes_unreadable_calls: bool,
+    /// The first call the reader could not read, once an event said so
+    /// ([`Self::unreadable_call`]).
+    unreadable: Option<UnreadableCall>,
 }
 
 impl Reader {
@@ -664,7 +666,8 @@ impl Reader {
                     held: Delta::default(),
                 })
             }),
-            gate: None,
+            notes_unreadable_calls: false,
+            unreadable: None,
         };
         if reader.undecided.is_none() {
             reader.start(&assignment.prompt, None, out)?;
@@ -753,32 +756,28 @@ impl Reader {
     }
 
     /// For a request that fails on a tool call the reader could not read
-    /// (`ChatResponseSpec::fails_on_unreadable_call`): the reader delivers no call it has not
-    /// read whole, and keeps a verdict for the driver ([`Self::unreadable_call`]).
+    /// (`ChatResponseSpec::fails_on_unreadable_call`): the reader notes the first such call
+    /// for the driver ([`Self::unreadable_call`]), and delivers what it delivers without the
+    /// rule. Text, reasoning and a call's name and argument fragments go out as the table reads
+    /// them, so a call that ends unreadable has gone out as far as it was read; the verdict
+    /// changes how the driver ends the answer, not what the reader hands on.
     ///
-    /// A call's events are held from its start to its end ([`Gate`]). A call the model ended
-    /// (`CallEnd::Closed`) with nothing of it lost goes out then, whole, its events in order;
-    /// text and reasoning outside a call pass as they arrive. The first event that says a call
-    /// was not read ([`unread`]: a call the model's stop found open or a cut ended, a reason
-    /// that loses a call, bytes dropped as a malformed call's) is the output's verdict, asked of
-    /// the table's own events before the request's filters rewrite a forbidden or a later call.
-    /// From there nothing more of the output is delivered but its `Finish`: the call held is
-    /// dropped, and so are the refused bytes the reader otherwise releases as content at the
-    /// end ([`Self::end`]), so nothing of the call that failed reaches the client.
-    ///
-    /// What it costs: a tool call's first delta waits for the call's close, each held event is
-    /// copied once where it borrowed the step's delta, and a step's events pass through one
-    /// buffer the reader keeps. A reader without the rule pays one branch per step.
-    pub(crate) fn failing_unreadable_calls(mut self, on: bool) -> Self {
-        self.gate = on.then(Box::default);
+    /// The first event that says a call was not read ([`unread`]: a call the model's stop found
+    /// open or a cut ended, a reason that loses a call, bytes dropped as a malformed call's) is
+    /// the verdict, asked of the table's own events before the request's filters rewrite a
+    /// forbidden or a later call. It costs one pass over a step's events until the verdict is
+    /// known; nothing is held, delayed or copied. A reader without the rule pays one branch per
+    /// step.
+    pub(crate) fn noting_unreadable_calls(mut self, on: bool) -> Self {
+        self.notes_unreadable_calls = on;
         self
     }
 
     /// The tool call the reader could not read, once the output said so: the request's failure
-    /// where the reader was made to fail on one ([`Self::failing_unreadable_calls`]). `None`
-    /// for an output read whole so far, and for every reader without the rule.
+    /// where the reader was made to note one ([`Self::noting_unreadable_calls`]). `None` for an
+    /// output read whole so far, and for every reader without the rule.
     pub(crate) fn unreadable_call(&self) -> Option<UnreadableCall> {
-        self.gate.as_ref().and_then(|gate| gate.unreadable)
+        self.unreadable
     }
 
     /// Reads `token_ids` through `decoder` as one delta: the text the decoder releases, with each
@@ -909,7 +908,7 @@ impl Reader {
             let released = std::mem::take(&mut self.unshown);
             self.tally.released(released.len());
             release_before_the_finish(released, out);
-        } else if !self.refused.is_empty() && self.unreadable_call().is_none() {
+        } else if !self.refused.is_empty() {
             let released = std::mem::take(&mut self.refused);
             self.tally.released(released.len());
             release_before_the_finish(released, out);
@@ -939,42 +938,18 @@ impl Reader {
         SymphonyError::Read(why)
     }
 
-    /// Feeds `input` to the engine: the reader's one way in. The step's events go into `out`
-    /// after the ones already there ([`Self::feed_table`]); for a request that fails on a tool
-    /// call the reader could not read they go through the reader's gate first
-    /// ([`Self::failing_unreadable_calls`]), which holds a call until its end and passes the
-    /// rest.
-    fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
-        let Some(mut gate) = self.gate.take() else {
-            return self.feed_table(input, out, None);
-        };
-        // The step that ends the output: a call it finds unread is one the output ended inside.
-        let ends = matches!(input, Input::End { .. });
-        let mut staged: Events<'d> = std::mem::take(&mut gate.staged);
-        let mut unread_at = None;
-        let fed = self.feed_table(input, &mut staged, Some(&mut unread_at));
-        gate.pass(staged.consume(), unread_at, ends, out);
-        gate.staged = staged.recycle();
-        self.gate = Some(gate);
-        fed
-    }
-
-    /// Feeds `input` to the engine, its events into `out` after the ones already there. A call
-    /// the step started takes its family's id first, where the
+    /// Feeds `input` to the engine, its events into `out` after the ones already there: the
+    /// reader's one way in. A call the step started takes its family's id first, where the
     /// assignment gives one ([`Assignment::forced_ids`]). The events this step added are tallied,
     /// the calls the request's choice forbids are dropped ([`ForbiddenCalls`]), a call kept
     /// after a dropped one takes its family's id by the place it is returned in, and the rest are
     /// limited to the first call where the request asks. An output the engine refuses is
-    /// recorded as failed for the table, which the error names. `unread_at`, where the caller
-    /// asks, takes the place among the step's events of the first that says a call was not read
-    /// ([`unread`]), as the table gave them: the filters below rewrite a call the request drops,
-    /// and a call the model failed to write is one whichever function it named.
-    fn feed_table<'d>(
-        &mut self,
-        input: Input<'d>,
-        out: &mut Events<'d>,
-        unread_at: Option<&mut Option<usize>>,
-    ) -> Result<(), SymphonyError> {
+    /// recorded as failed for the table, which the error names. For a request that fails on a
+    /// tool call the reader could not read, the step's events are asked first, as the table
+    /// gave them, whether one says so ([`unread`]).
+    fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
+        // The step that ends the output: a call it finds unread is one the output ended inside.
+        let ends = matches!(input, Input::End { .. });
         let before = out.len();
         let last = out.as_slice().last().map_or(0, telemetry::bytes_of);
         self.engine.feed(input, out).map_err(|e| {
@@ -999,8 +974,12 @@ impl Reader {
                 }
             }
         }
-        if let Some(unread_at) = unread_at {
-            *unread_at = fresh.iter().position(unread);
+        if self.notes_unreadable_calls && self.unreadable.is_none() && fresh.iter().any(unread) {
+            self.unreadable = Some(if ends {
+                UnreadableCall::Incomplete
+            } else {
+                UnreadableCall::Malformed
+            });
         }
         // A step that adds no event ends here: nothing below acts on it.
         if fresh.is_empty() {
@@ -1177,7 +1156,9 @@ impl Reader {
 }
 
 /// The reader's verdict on an output whose tool call it could not read, for a request that fails
-/// on one ([`Reader::failing_unreadable_calls`]).
+/// on one ([`Reader::noting_unreadable_calls`]). The step that says so decides which: the step
+/// that ends the output finds a call, or a call block that named none, that the output ended
+/// inside; any earlier step finds one the model closed or went on past.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnreadableCall {
     /// The output ended inside a call, or inside a call block that named none: the token limit
@@ -1201,75 +1182,6 @@ fn unread(event: &Event<'_>) -> bool {
         Event::Malformed { why, .. } => why.loses_a_call(),
         Event::Dropped { why, .. } => matches!(why, DropReason::MalformedCall),
         _ => false,
-    }
-}
-
-/// What a reader keeps for a request that fails on a tool call it could not read
-/// ([`Reader::failing_unreadable_calls`]).
-#[derive(Default)]
-struct Gate {
-    /// The step's events on their way through: the table fills it, the gate empties it, and its
-    /// room stays for the next step.
-    staged: Events<'static>,
-    /// The events of the call being read, from its start, owned: held until its end says the
-    /// call is whole, then released in order.
-    held: Vec<Event<'static>>,
-    /// Whether a call is being held.
-    holding: bool,
-    /// The verdict: the first call the reader could not read. Once set, nothing more of the
-    /// output is delivered but its `Finish`.
-    unreadable: Option<UnreadableCall>,
-}
-
-impl Gate {
-    /// Takes a step's `events` in order, after the request's filters: an event outside a call
-    /// goes into `out` at once; a call's events are held from its start and go out, whole, at
-    /// its end. `unread_at` is the place of the step's first event that says a call was not
-    /// read ([`unread`]): from it on nothing is delivered but the `Finish`, the call held is
-    /// dropped, and the verdict is kept, `Incomplete` where the step `ends` the output (the
-    /// output ended inside the call or its block) and `Malformed` otherwise. A `Finish` that
-    /// finds a call held, which no table leaves, releases it: nothing is withheld without a
-    /// verdict.
-    fn pass<'d>(
-        &mut self,
-        events: impl Iterator<Item = Event<'d>>,
-        unread_at: Option<usize>,
-        ends: bool,
-        out: &mut Events<'d>,
-    ) {
-        for (at, event) in events.enumerate() {
-            if self.unreadable.is_some() {
-                if matches!(event, Event::Finish { .. }) {
-                    out.push(event);
-                }
-                continue;
-            }
-            if unread_at == Some(at) {
-                self.unreadable = Some(if ends {
-                    UnreadableCall::Incomplete
-                } else {
-                    UnreadableCall::Malformed
-                });
-                self.held.clear();
-                self.holding = false;
-                continue;
-            }
-            match event {
-                Event::ToolCallStart { .. } => {
-                    self.holding = true;
-                    self.held.push(event.into_owned());
-                }
-                Event::ToolCallEnd { .. } | Event::Finish { .. } if self.holding => {
-                    self.holding = false;
-                    for held in self.held.drain(..) {
-                        out.push(held);
-                    }
-                    out.push(event);
-                }
-                event if self.holding => self.held.push(event.into_owned()),
-                event => out.push(event),
-            }
-        }
     }
 }
 
@@ -1522,11 +1434,11 @@ mod tests {
         all
     }
 
-    /// A reader over `format` that fails on a call it could not read
-    /// ([`Reader::failing_unreadable_calls`]), under a choice that forbids `forbids`: fed
+    /// A reader over `format` that notes a call it could not read
+    /// ([`Reader::noting_unreadable_calls`]), under a choice that forbids `forbids`: fed
     /// `pieces` one by one and ended with `finish`. The events each step delivered, the end's
     /// last, and the reader's verdict.
-    fn read_failing(
+    fn read_noting(
         format: Format,
         forbids: Forbids,
         pieces: &[&str],
@@ -1548,7 +1460,7 @@ mod tests {
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, tools().into(), &mut events)
             .expect("a reader")
-            .failing_unreadable_calls(true);
+            .noting_unreadable_calls(true);
         steps.push(events.into_owned().drain());
         for piece in pieces {
             let mut delta = Delta::default();
@@ -1588,14 +1500,13 @@ mod tests {
         "is</city>\n</invoke>\n</tool_call>",
     ];
 
-    /// A reader that fails on a call it could not read holds a call from its start to its end:
-    /// the text before the call goes out in its own step, the steps inside the call deliver
-    /// nothing of it, and the step that closes it delivers the call whole, the events a reader
-    /// without the rule delivers, in their order. A whole output has no verdict.
+    /// A reader that notes unreadable calls delivers, step by step, what a reader without the
+    /// rule delivers: the call's start goes out in the step that reads its name, its arguments
+    /// as they are read, and nothing waits for the call's end. A whole output has no verdict.
     #[test]
-    fn a_held_call_goes_out_whole_at_its_end_and_text_passes_as_it_arrives() {
+    fn a_reader_that_notes_unreadable_calls_delivers_each_step_as_one_without_the_rule() {
         use symphony::formats::minimax_m3;
-        let (steps, verdict) = read_failing(
+        let (steps, verdict) = read_noting(
             minimax_m3(),
             Forbids::Nothing,
             &M3_PIECES,
@@ -1605,12 +1516,10 @@ mod tests {
         // The prompt's replay, the three pieces, the end.
         assert_eq!(steps.len(), 5);
         assert_eq!(content_of(&steps[1]), "Checking.");
-        assert_eq!(call_events(&steps[1]), [] as [&str; 0]);
-        assert_eq!(call_events(&steps[2]), [] as [&str; 0], "{:?}", steps[2]);
+        assert_eq!(call_events(&steps[2]), ["start 0 lookup"], "{:?}", steps[2]);
         assert_eq!(
             call_events(&steps[3]),
             [
-                "start 0 lookup",
                 "arguments 0 {\"city\": \"Paris\"",
                 "arguments 0 }",
                 "end 0 Closed",
@@ -1618,53 +1527,45 @@ mod tests {
             "{:?}",
             steps[3]
         );
-        assert!(matches!(
-            steps[4].last(),
-            Some(Event::Finish { tool_calls: 1, .. })
-        ));
         let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
-        let unheld = read_pieces(minimax_m3(), "", &M3_PIECES, EngineFinish::Stop);
-        assert_eq!(call_events(&delivered), call_events(&unheld));
-        assert_eq!(content_of(&delivered), content_of(&unheld));
+        let unnoted = read_pieces(minimax_m3(), "", &M3_PIECES, EngineFinish::Stop);
+        assert_eq!(call_events(&delivered), call_events(&unnoted));
+        assert_eq!(content_of(&delivered), content_of(&unnoted));
     }
 
-    /// The first call the reader could not read is the output's verdict, and from it on nothing
-    /// of the output is delivered but the `Finish`: the call held is dropped. A call the output
-    /// ended inside is incomplete, by the token limit or by the model's own stop, which a
-    /// reader without the rule closes and delivers; a block the model closed with text where a
-    /// tag goes is malformed, and the text the model wrote after it is not delivered either.
+    /// The first call the reader could not read is the output's verdict, and what the reader
+    /// delivers is what it delivers without the rule: the call has gone out as far as it was
+    /// read. A call the output ended inside is incomplete, by the token limit or by the model's
+    /// own stop (which closes the call for the model, as before); a block the model closed with
+    /// text where a tag goes is malformed, and the text after it is delivered as before.
     #[test]
-    fn the_first_unread_call_is_the_verdict_and_nothing_follows_it_but_the_finish() {
+    fn the_first_unread_call_is_the_verdict_and_the_delivery_is_what_it_was() {
         use symphony::formats::minimax_m3;
         for finish in [
             EngineFinish::Length,
             EngineFinish::Stop,
             EngineFinish::Abort,
         ] {
-            let (steps, verdict) = read_failing(
+            let (steps, verdict) = read_noting(
                 minimax_m3(),
                 Forbids::Nothing,
                 &M3_PIECES[..2],
                 finish.clone(),
             );
             assert_eq!(verdict, Some(UnreadableCall::Incomplete), "{finish:?}");
+            assert_eq!(call_events(&steps[2]), ["start 0 lookup"], "{finish:?}");
             let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
-            assert_eq!(content_of(&delivered), "Checking.", "{finish:?}");
-            assert_eq!(call_events(&delivered), [] as [&str; 0], "{finish:?}");
+            let unnoted = read_pieces(minimax_m3(), "", &M3_PIECES[..2], finish.clone());
+            assert_eq!(call_events(&delivered), call_events(&unnoted), "{finish:?}");
+            assert_eq!(content_of(&delivered), content_of(&unnoted), "{finish:?}");
             assert!(matches!(delivered.last(), Some(Event::Finish { .. })));
         }
-        // Without the rule the stop closes the call for the model and delivers it.
-        let unheld = read_pieces(minimax_m3(), "", &M3_PIECES[..2], EngineFinish::Stop);
-        assert_eq!(
-            call_events(&unheld).last().map(String::as_str),
-            Some("end 0 Stop")
-        );
         let malformed = [
             "Checking.",
             "<tool_call>\n<invoke name=\"lookup\">\nParis\n</invoke>\n</tool_call>",
             "Done.",
         ];
-        let (steps, verdict) = read_failing(
+        let (steps, verdict) = read_noting(
             minimax_m3(),
             Forbids::Nothing,
             &malformed,
@@ -1672,27 +1573,21 @@ mod tests {
         );
         assert_eq!(verdict, Some(UnreadableCall::Malformed));
         let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
-        assert_eq!(content_of(&delivered), "Checking.");
-        assert_eq!(call_events(&delivered), [] as [&str; 0]);
-        assert!(delivered.iter().all(|event| !matches!(
-            event,
-            Event::Dropped {
-                why: DropReason::MalformedCall,
-                ..
-            }
-        )));
-        assert!(matches!(delivered.last(), Some(Event::Finish { .. })));
+        let unnoted = read_pieces(minimax_m3(), "", &malformed, EngineFinish::Stop);
+        assert_eq!(call_events(&delivered), call_events(&unnoted));
+        assert_eq!(content_of(&delivered), "Checking.Done.");
+        assert_eq!(content_of(&unnoted), "Checking.Done.");
     }
 
-    /// What loses no call passes under the rule: a call to a function the request did not
-    /// declare goes out as the model named it, and a string the invoke's close found open goes
-    /// out closed. A call the request's own choice drops is judged as the table read it: whole,
-    /// it is dropped as before with no verdict; cut, it is the verdict.
+    /// What loses no call is no verdict: a call to a function the request did not declare, and
+    /// a string the invoke's close found open. A call the request's own choice drops is judged
+    /// as the table read it: whole, it is dropped as before with no verdict; cut, it is the
+    /// verdict, and it stays dropped.
     #[test]
-    fn what_loses_no_call_passes_and_a_forbidden_call_is_judged_as_the_table_read_it() {
+    fn what_loses_no_call_is_no_verdict_and_a_forbidden_call_is_judged_as_the_table_read_it() {
         use symphony::formats::minimax_m3;
         let undeclared = ["<tool_call>\n<invoke name=\"other\"><a>1</a></invoke>\n</tool_call>"];
-        let (steps, verdict) = read_failing(
+        let (steps, verdict) = read_noting(
             minimax_m3(),
             Forbids::Nothing,
             &undeclared,
@@ -1702,12 +1597,12 @@ mod tests {
         let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
         assert_eq!(call_events(&delivered)[0], "start 0 other");
         let (steps, verdict) =
-            read_failing(minimax_m3(), Forbids::Every, &M3_PIECES, EngineFinish::Stop);
+            read_noting(minimax_m3(), Forbids::Every, &M3_PIECES, EngineFinish::Stop);
         assert_eq!(verdict, None);
         let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
         assert_eq!(call_events(&delivered), [] as [&str; 0]);
         assert_eq!(content_of(&delivered), "Checking.");
-        let (steps, verdict) = read_failing(
+        let (steps, verdict) = read_noting(
             minimax_m3(),
             Forbids::Every,
             &M3_PIECES[..2],
@@ -1718,30 +1613,29 @@ mod tests {
         assert_eq!(call_events(&delivered), [] as [&str; 0]);
     }
 
-    /// An answer that ends in a call block the table refused is not released as content under
-    /// the rule, as it is without it: the block is the output's verdict, and nothing of it
-    /// reaches the client.
+    /// An answer that ends in a call block the table refused is the verdict, and its bytes are
+    /// released as content before the finish as they are without the rule.
     #[test]
-    fn a_refused_block_is_the_verdict_and_is_not_released_as_content() {
+    fn a_refused_block_is_the_verdict_and_is_released_as_before() {
         use symphony::formats::minimax_m3;
         let pieces = [
             "Checking.",
             "<tool_call>\n<invoke name=\"\"><city>Paris</city></invoke>\n</tool_call>",
         ];
-        let unheld = read_pieces(minimax_m3(), "", &pieces, EngineFinish::Stop);
+        let unnoted = read_pieces(minimax_m3(), "", &pieces, EngineFinish::Stop);
         assert!(
-            content_of(&unheld).contains("<invoke name=\"\">"),
-            "released as content without the rule: {unheld:?}"
+            content_of(&unnoted).contains("<invoke name=\"\">"),
+            "released as content without the rule: {unnoted:?}"
         );
         let (steps, verdict) =
-            read_failing(minimax_m3(), Forbids::Nothing, &pieces, EngineFinish::Stop);
+            read_noting(minimax_m3(), Forbids::Nothing, &pieces, EngineFinish::Stop);
         assert_eq!(verdict, Some(UnreadableCall::Malformed));
         let delivered: Vec<Event<'static>> = steps.into_iter().flatten().collect();
-        assert_eq!(content_of(&delivered), "Checking.");
+        assert_eq!(content_of(&delivered), content_of(&unnoted));
     }
 
-    /// A reader without the rule has no gate and no verdict, whatever the output: the events
-    /// it delivers are the table's, a cut call among them.
+    /// A reader without the rule has no verdict, whatever the output: the events it delivers
+    /// are the table's, a cut call among them.
     #[test]
     fn a_reader_without_the_rule_has_no_verdict() {
         use symphony::formats::minimax_m3;
@@ -1760,7 +1654,7 @@ mod tests {
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, tools().into(), &mut events)
             .expect("a reader")
-            .failing_unreadable_calls(false);
+            .noting_unreadable_calls(false);
         let mut delta = Delta::default();
         let mut step = Events::new();
         reader

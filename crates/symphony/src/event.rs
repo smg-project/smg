@@ -290,8 +290,8 @@ impl MalformedReason {
     /// Whether the reason says that the model wrote a tool call the syntax could not read
     /// whole: bytes written for a call that are in no call the output delivers (refused as a
     /// malformed call's, or returned as text where the syntax has a call, a name, a key, a value
-    /// or arguments), or a call that ends without its whole arguments. A driver that must not
-    /// hand on a call it could not read asks this of every `Malformed` event, beside the two
+    /// or arguments), or a call that ends without its whole arguments. A driver that fails its
+    /// request on a call it could not read asks this of every `Malformed` event, beside the two
     /// other words the events carry: [`DropReason::MalformedCall`] on bytes of a call block
     /// that were refused, and [`CallEnd`] on a call the model did not end.
     ///

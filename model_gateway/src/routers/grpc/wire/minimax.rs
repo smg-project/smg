@@ -63,9 +63,11 @@ pub(crate) const INVALID_TOOL_CALL_FORMAT: &str = metrics_labels::ERROR_INVALID_
 /// `{"error":{"message":<the sentence>,"type":"invalid_tool_call_format",
 /// "code":"invalid_tool_call_format","finish_reason":"length"|"error"}}`.
 ///
-/// Nothing of the call that failed reaches the client on either surface: the
-/// reader holds a call's events until its end is known and whole
-/// (`Reader::failing_unreadable_calls`).
+/// A stream has sent the answer as it was read by then: the text, the
+/// reasoning, and the call's name and argument fragments as far as the call
+/// went, exactly as a request outside the contract is sent them. The reader
+/// only notes the verdict (`Reader::noting_unreadable_calls`); the contract
+/// changes how the stream ends, not what streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InvalidToolCallFormat {
     /// The reader's verdict.
