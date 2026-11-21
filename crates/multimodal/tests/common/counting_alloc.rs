@@ -1,7 +1,7 @@
-//! A counting global allocator for the pins that read what a path allocates.
+//! A counting global allocator for the pins and benches that read what a path allocates.
 //! The binary that measures declares it as its allocator
 //! (`#[global_allocator] static GLOBAL: Counting = Counting;`) and reads the
-//! counters it needs.
+//! counters it needs; a bench takes this file by `#[path]`.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
