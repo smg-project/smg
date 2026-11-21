@@ -341,7 +341,7 @@ name = "ingest"
 required-features = ["controller"]
 
 [[test]]
-name = "membership_door"
+name = "membership_calls"
 required-features = ["controller", "worker-host"]
 
 [[test]]
@@ -421,7 +421,7 @@ name = "store_pair"
 harness = false
 
 [[bench]]
-name = "store_lent"
+name = "store_lent_rows"
 harness = false
 
 [[bench]]

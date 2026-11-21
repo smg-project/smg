@@ -5445,7 +5445,7 @@ fn a_pair_read_beside_a_walk_of_joins_and_reports_is_of_one_moment() {
         })
     };
     while !walk.is_finished() {
-        let counts = store.counts();
+        let counts = store.stats();
         let (outside, flips) = (u64::from(counts.outside.engines), counts.overload_flips);
         assert!(
             flips <= outside && outside <= flips + 1,
@@ -5453,7 +5453,7 @@ fn a_pair_read_beside_a_walk_of_joins_and_reports_is_of_one_moment() {
         );
     }
     walk.join().expect("the walk");
-    let end = store.counts();
+    let end = store.stats();
     assert_eq!(
         (u64::from(end.outside.engines), end.overload_flips),
         (MEMBERS, MEMBERS)

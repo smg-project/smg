@@ -12,7 +12,7 @@ use super::{found::paired, kv_feed::asks_events, RowRevision};
 use crate::{
     engine::view::WorkerId,
     store::{
-        membership::{self, Laid, NotMaker, Past},
+        membership::{self, Laid, NotRegistrant, Past},
         pairing::PairingDescriptor,
         HealthSink, MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
         WorkerStatus, WorkersStore,
@@ -42,8 +42,8 @@ impl MembershipWriteOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Refused {
-    /// Another maker's row, named by its maker.
-    NotMaker(String),
+    /// Another registrant's row, named by its registrant.
+    NotRegistrant(String),
     /// A fact the door does not take, or the row past its size. A fact is
     /// refused past its bound, under a key that is not the call's URL, or,
     /// at the controller's door, when its log does not carry it to a standby
@@ -78,8 +78,8 @@ impl Refused {
 /// Who asks to drain or remove a row.
 #[derive(Clone, Copy, Debug)]
 pub enum Remover<'a> {
-    /// A caller acting as the row's whole maker.
-    Maker(&'a Registrant),
+    /// A caller acting as the row's whole registrant.
+    Registrant(&'a Registrant),
     /// The host's discovery source, acting under a row's maker if it has
     /// this provider name. The guard names the row under any key.
     Provider(&'a str),
@@ -311,7 +311,7 @@ pub(crate) trait Turn {
 
 fn made_by(row: &WorkerRow, maker: &Registrant) -> Result<(), Refused> {
     row.made_by(maker)
-        .map_err(|not| Refused::NotMaker(not.to_string()))
+        .map_err(|not| Refused::NotRegistrant(not.to_string()))
 }
 
 /// The row an asker saw, where it still stands under the URL at the
@@ -665,18 +665,20 @@ fn removal_row(
 ) -> Result<WorkerRow, Refused> {
     let row = seen_row(store, url, seen)?;
     match by {
-        Remover::Maker(maker) => made_by(&row, maker)?,
+        Remover::Registrant(maker) => made_by(&row, maker)?,
         Remover::Provider(name) => match &row.maker {
             Registrant::Provider(provider) if provider.provider() == name => {}
             Registrant::Provider(provider) => {
-                return Err(Refused::NotMaker(
-                    NotMaker::Provider {
+                return Err(Refused::NotRegistrant(
+                    NotRegistrant::Provider {
                         provider: provider.provider(),
                     }
                     .to_string(),
                 ));
             }
-            Registrant::Control => return Err(Refused::NotMaker(NotMaker::Control.to_string())),
+            Registrant::Control => {
+                return Err(Refused::NotRegistrant(NotRegistrant::Control.to_string()))
+            }
         },
         Remover::Health(scope) => {
             let allowed = match scope {
@@ -1255,7 +1257,7 @@ pub(super) mod tests {
             .map(|facts| store.by_key(&facts.key).ok_or("the old rank"))
             .collect::<Result<_, _>>()?;
         for row in &old[..2] {
-            door.gone(Remover::Maker(&maker), &row.facts.key, standing(row))
+            door.gone(Remover::Registrant(&maker), &row.facts.key, standing(row))
                 .map_err(|_| "a low rank removed")?;
         }
         let epoch = store.epoch();
@@ -1373,7 +1375,7 @@ pub(super) mod tests {
         let before = store.all_rows();
         assert_eq!(
             find_rows(&*door, &provider, &ranked(4)),
-            Err(Refused::NotMaker(
+            Err(Refused::NotRegistrant(
                 "the row was made by a control call: its maker alone changes it".to_owned()
             ))
         );
@@ -1765,7 +1767,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             door.found_one_over(&pool, seen, URL, &unstated),
-            Err(Refused::NotMaker(
+            Err(Refused::NotRegistrant(
                 "the row was made by a control call: its maker alone changes it".to_owned()
             ))
         );
@@ -1810,7 +1812,7 @@ pub(super) mod tests {
         // which is told so. Another maker is told the row is not its own.
         let seen = standing(&next);
         assert_eq!(
-            door.drained(Remover::Maker(&control), URL, seen),
+            door.drained(Remover::Registrant(&control), URL, seen),
             Ok(MembershipWriteOutcome::Draining(next.id))
         );
         assert_eq!(
@@ -1819,7 +1821,7 @@ pub(super) mod tests {
         );
         assert!(matches!(
             door.found_one_over(&pool, Precondition::AtRevision(seen), URL, &unstated),
-            Err(Refused::NotMaker(_))
+            Err(Refused::NotRegistrant(_))
         ));
         assert_eq!(
             store.by_key(URL).map(|row| (row.id, row.status)),
@@ -1828,7 +1830,7 @@ pub(super) mod tests {
 
         // The row its asker saw left.
         assert_eq!(
-            door.gone(Remover::Maker(&control), URL, seen),
+            door.gone(Remover::Registrant(&control), URL, seen),
             Ok(MembershipWriteOutcome::Removed(next.id))
         );
         assert_eq!(
@@ -1894,7 +1896,7 @@ pub(super) mod tests {
     ) -> Result<(), &'static str> {
         let (store, door) = open();
         let maker = Registrant::Control;
-        let by = Remover::Maker(&maker);
+        let by = Remover::Registrant(&maker);
         assert!(door.found_one(&maker, URL, &|_| stated()).is_ok());
         let first = store.by_key(URL).ok_or("the first row")?;
         assert!(door
@@ -1952,7 +1954,7 @@ pub(super) mod tests {
             let by = Remover::Provider("pool");
             let seen = standing(&row);
             if let Some(refusal) = refusal {
-                let expected = Err(Refused::NotMaker(refusal.to_owned()));
+                let expected = Err(Refused::NotRegistrant(refusal.to_owned()));
                 assert_eq!(door.drained(by, URL, seen), expected);
                 assert_eq!(door.gone(by, URL, seen), expected);
                 assert_eq!(store.by_key(URL), Some(row));
@@ -2117,7 +2119,7 @@ pub(super) mod tests {
             let late = worker(built("bronze"));
             assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Moved));
             let seen = standing(&moved);
-            let by = Remover::Maker(maker);
+            let by = Remover::Registrant(maker);
             assert_eq!(
                 door.drained(by, URL, seen),
                 Ok(MembershipWriteOutcome::Draining(moved.id))
@@ -2386,8 +2388,8 @@ pub(super) mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         assert!(matches!(
-            door.gone(Remover::Maker(&Registrant::Control), URL, seen),
-            Err(Refused::NotMaker(_))
+            door.gone(Remover::Registrant(&Registrant::Control), URL, seen),
+            Err(Refused::NotRegistrant(_))
         ));
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
@@ -2594,17 +2596,17 @@ pub(super) mod tests {
             door.found_one(&maker, URL, &|_| stated())
                 .expect("registered");
             let row = store.by_key(URL).expect("the registered row");
-            let expected = Err(Refused::NotMaker(why.to_owned()));
+            let expected = Err(Refused::NotRegistrant(why.to_owned()));
             assert_eq!(
                 door.found_one(&caller, URL, &|_| panic!("only the maker states facts")),
                 expected
             );
             assert_eq!(
-                door.drained(Remover::Maker(&caller), URL, standing(&row)),
+                door.drained(Remover::Registrant(&caller), URL, standing(&row)),
                 expected
             );
             assert_eq!(
-                door.gone(Remover::Maker(&caller), URL, standing(&row)),
+                door.gone(Remover::Registrant(&caller), URL, standing(&row)),
                 expected
             );
             assert_eq!(store.by_key(URL), Some(row));
@@ -2880,7 +2882,7 @@ pub(super) mod tests {
             Err(Refused::Moved)
         );
         assert_eq!(
-            door.drained(Remover::Maker(&maker), URL, standing(&row)),
+            door.drained(Remover::Registrant(&maker), URL, standing(&row)),
             Ok(MembershipWriteOutcome::Draining(row.id))
         );
         assert_eq!(
@@ -2892,12 +2894,12 @@ pub(super) mod tests {
         );
         assert_eq!(store.epoch(), 2);
         assert_eq!(
-            door.drained(Remover::Maker(&maker), URL, standing(&row)),
+            door.drained(Remover::Registrant(&maker), URL, standing(&row)),
             Ok(MembershipWriteOutcome::Unmoved(row.id))
         );
         assert_eq!(store.epoch(), 2);
         assert_eq!(
-            door.gone(Remover::Maker(&maker), URL, standing(&row)),
+            door.gone(Remover::Registrant(&maker), URL, standing(&row)),
             Ok(MembershipWriteOutcome::Removed(row.id))
         );
         assert_eq!(store.epoch(), 3);
@@ -2909,11 +2911,11 @@ pub(super) mod tests {
         let (store, door) = door();
         let maker = Registrant::provider("pool", "first").expect("a maker");
         assert_eq!(
-            door.drained(Remover::Maker(&maker), URL, ABSENT),
+            door.drained(Remover::Registrant(&maker), URL, ABSENT),
             Err(Refused::Absent)
         );
         assert_eq!(
-            door.gone(Remover::Maker(&maker), URL, ABSENT),
+            door.gone(Remover::Registrant(&maker), URL, ABSENT),
             Err(Refused::Absent)
         );
         assert_eq!(store.epoch(), 0);
@@ -2931,7 +2933,7 @@ pub(super) mod tests {
                 let door = door.upgrade().expect("the calling door");
                 assert_eq!(
                     door.gone(
-                        Remover::Maker(&Registrant::Control),
+                        Remover::Registrant(&Registrant::Control),
                         "http://absent",
                         ABSENT
                     ),
@@ -2944,7 +2946,7 @@ pub(super) mod tests {
         let writer = thread::spawn(move || {
             let found = door.found_one(&maker, URL, &|_| stated());
             let seen = standing(&store.by_key(URL).expect("the registered row"));
-            let by = Remover::Maker(&maker);
+            let by = Remover::Registrant(&maker);
             let drained = door.drained(by, URL, seen);
             let gone = door.gone(by, URL, seen);
             done.send([found, drained, gone]).expect("the answers");
@@ -2980,7 +2982,7 @@ pub(super) mod tests {
         assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
         assert_eq!((row.status, row.revision), (WorkerStatus::Ready, 2));
 
-        door.gone(Remover::Maker(&maker), URL, standing(&row))
+        door.gone(Remover::Registrant(&maker), URL, standing(&row))
             .expect("removed");
         let wrote = door.found_one(&maker, URL, &|_| row.facts.clone());
         let fresh = store.by_key(URL).expect("the newly registered row");

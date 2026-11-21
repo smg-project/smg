@@ -2611,7 +2611,7 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
         }
         assert_eq!(harness.leases(GATEWAY), count);
         for (lease_id, side) in leases {
-            link.report(gateway_frame::Frame::Released(Released {
+            link.queue_frame(gateway_frame::Frame::Released(Released {
                 what: Some(released::What::LeaseId(lease_id)),
                 reason: released::Reason::ClientGone.into(),
                 side,
@@ -2665,13 +2665,13 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
         let first = linked_pick(&link, ask(b"first"))
             .await
             .expect("a first pick");
-        held.report(sent(first));
+        held.queue_frame(sent(first));
         within("the store reads the first lease dispatched", ROOM, || {
             harness.dispatched(GATEWAY, first.id)
         })
         .await
         .expect("the session said the dispatch");
-        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        link.queue_frame(gateway_frame::Frame::Hello(Hello::default()));
         tokio::time::timeout(ROOM, link.closed())
             .await
             .expect("the session ends");
@@ -2679,7 +2679,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
 
         // The request ends with no session standing. Its report waits, and
         // the link's next session says it.
-        held.report(ended(first));
+        held.queue_frame(ended(first));
         assert_eq!(harness.leases(GATEWAY), 1, "no session said the end");
         Box::pin(link.redial(endpoint.clone(), GATEWAY))
             .await
@@ -2695,7 +2695,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
         let second = linked_pick(&held, ask(b"second"))
             .await
             .expect("a pick on the next session");
-        held.report(sent(second));
+        held.queue_frame(sent(second));
         within("the store reads the second lease dispatched", ROOM, || {
             harness.dispatched(GATEWAY, second.id)
         })
@@ -2709,7 +2709,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
             1,
             "the lease stands through the redial"
         );
-        held.report(ended(second));
+        held.queue_frame(ended(second));
         within(
             "the report on the third session ends the lease",
             ROOM,
@@ -2718,7 +2718,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
         .await
         .expect("the third session said the report");
         assert!(held.stands());
-        assert_eq!(held.reports_dropped(), 0);
+        assert_eq!(held.frames_dropped(), 0);
         drop((link, held));
         harness.stop().await.expect("a clean stop");
     };
@@ -3139,7 +3139,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
             .open_on(&link)
             .await
             .expect("the link resumes the watch");
-        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        link.queue_frame(gateway_frame::Frame::Hello(Hello::default()));
         tokio::time::timeout(ROOM, link.closed())
             .await
             .expect("the second hello ends the link");

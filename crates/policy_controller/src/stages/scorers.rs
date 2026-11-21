@@ -1,7 +1,7 @@
 //! The scorers written for no one policy. Every stateful one keeps its state
 //! behind the lifecycle alone, and none allocates per decision.
 //!
-//! The credit of the sends since a worker's last report (`SinceReport`,
+//! The credit of the sends since a worker's last report (`RankCredit`,
 //! `Credits`) is in this file too. `ResidentWork` scores with it, and so does
 //! the scorer of `least_load`, through the sent record in `tracking`.
 
@@ -23,7 +23,7 @@ use crate::{
     engine::{
         decision::{Decision, Overlap, Target},
         framework::{DecisionScope, Front, Scorer, Spread, TieBand},
-        view::{Candidate, LoadRow, PoolFacts, ReportCutoff, RequestFacts, WorkerId},
+        view::{Candidate, LoadReportCutoff, LoadRow, PoolFacts, RequestFacts, WorkerId},
         warm_up::WarmRule,
     },
     load::signals::{SignalSums, SignalTerm},
@@ -33,7 +33,7 @@ use crate::{
     },
     tracking::{
         dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit},
-        in_flight::{with_counts, LentCounts, Pieces, WorkerSlot},
+        in_flight::{with_counts, Pieces, PoolInFlightCounts, WorkerSlot},
         lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     },
 };
@@ -75,22 +75,22 @@ pub(crate) trait ReadsLoad: Scorer {
 }
 
 #[derive(Debug)]
-struct ReportAge<S> {
+struct WithLoadReportAgeLimit<S> {
     stage: S,
     max_age_ms: u64,
 }
 
-pub(crate) fn with_report_age(
+pub(crate) fn with_load_report_age_limit(
     stage: impl ReadsLoad + 'static,
     max_age_ms: Option<u64>,
 ) -> Box<dyn Scorer> {
     match max_age_ms {
-        Some(max_age_ms) => Box::new(ReportAge { stage, max_age_ms }),
+        Some(max_age_ms) => Box::new(WithLoadReportAgeLimit { stage, max_age_ms }),
         None => Box::new(stage),
     }
 }
 
-impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
+impl<S: ReadsLoad> Lifecycle for WithLoadReportAgeLimit<S> {
     fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
         self.stage.on_decision_issued(lease, decision);
     }
@@ -131,7 +131,7 @@ impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
     }
 }
 
-impl<S: ReadsLoad> Scorer for ReportAge<S> {
+impl<S: ReadsLoad> Scorer for WithLoadReportAgeLimit<S> {
     fn name(&self) -> &'static str {
         self.stage.name()
     }
@@ -143,7 +143,7 @@ impl<S: ReadsLoad> Scorer for ReportAge<S> {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        let cutoff = LoadReportCutoff::new(facts.now_micros, self.max_age_ms);
         self.stage
             .score_with(facts, candidates, kept, out, |row| cutoff.load(row))
     }
@@ -156,7 +156,7 @@ impl<S: ReadsLoad> Scorer for ReportAge<S> {
         asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        let cutoff = LoadReportCutoff::new(facts.now_micros, self.max_age_ms);
         self.stage
             .score_front_with(facts, candidates, kept, asked, out, |row| cutoff.load(row))
     }
@@ -374,8 +374,9 @@ impl Scorer for FewestSessions {
     }
 }
 
-/// Dispatches to one rank row no report reflects yet, oldest first within
-/// each lane. What a decision reads (the held token-work and requests) rides
+/// The dispatches credited to one rank since its last load report, oldest
+/// first within each lane. What a decision reads (the held token-work and
+/// requests) rides
 /// one atomic word, so deciding threads read a row without a lock. The
 /// dispatches themselves sit in [`DISPATCH_LANES`] lanes, each behind its own
 /// lock and fed by the threads mapped to it: concurrent dispatches to one row
@@ -383,7 +384,7 @@ impl Scorer for FewestSessions {
 /// lock. `oldest_micros` tells a decision whether its report's sample reaches
 /// any held dispatch without taking one.
 #[derive(Debug)]
-pub(crate) struct SinceReport {
+pub(crate) struct RankCredit {
     /// The held token-work in the high bits and the held requests in the low
     /// [`REQUEST_BITS`]: one word, so a reader never sees a torn pair.
     held: AtomicU64,
@@ -480,7 +481,7 @@ const DISPATCH_LANES: usize = 8;
 /// one running lands only while the row is within a batch above the bound
 /// and waits for it past that, so the request count's [`REQUEST_BITS`] bits
 /// never fill.
-pub(crate) const SINCE_REPORT_KEPT: u64 = 8_192;
+pub(crate) const RANK_CREDIT_KEPT: u64 = 8_192;
 
 /// Dispatches an overflow retires, by instant across the lanes under every
 /// lane's lock: the eight locks and the merge cost once per batch rather
@@ -495,12 +496,12 @@ pub(crate) const SINCE_REPORT_KEPT: u64 = 8_192;
 /// load reports.
 pub(crate) const RETIRE_BATCH: usize = 256;
 
-/// The low bits of [`SinceReport::held`] that count requests: room for the
+/// The low bits of [`RankCredit::held`] that count requests: room for the
 /// kept dispatches, with the token-work above them.
 const REQUEST_BITS: u32 = 16;
 const REQUEST_MASK: u64 = (1 << REQUEST_BITS) - 1;
 
-/// The two numbers a held word says ([`SinceReport::held`]), each as wide
+/// The two numbers a held word says ([`RankCredit::held`]), each as wide
 /// as the word: what the crate's own passes price.
 #[derive(Clone, Copy)]
 pub(crate) struct HeldCredit {
@@ -571,7 +572,7 @@ impl DispatchLane {
     }
 }
 
-impl Default for SinceReport {
+impl Default for RankCredit {
     fn default() -> Self {
         Self {
             held: AtomicU64::new(0),
@@ -585,7 +586,7 @@ impl Default for SinceReport {
     }
 }
 
-impl SinceReport {
+impl RankCredit {
     /// One dispatch as the held word counts it.
     fn weight(tokens: u32) -> u64 {
         u64::from(tokens) << REQUEST_BITS | 1
@@ -597,7 +598,7 @@ impl SinceReport {
         // Past the bound the row's oldest batch retires before this dispatch
         // lands, by instant across the lanes: the newest credits stay,
         // whichever lane holds them, past a partial release.
-        if self.held.load(Ordering::Relaxed) & REQUEST_MASK >= SINCE_REPORT_KEPT {
+        if self.held.load(Ordering::Relaxed) & REQUEST_MASK >= RANK_CREDIT_KEPT {
             self.retire_oldest_batch();
         }
         let lane = &self.lanes[lane_of_this_thread()];
@@ -666,7 +667,7 @@ impl SinceReport {
         let _retiring = match self.retiring.try_lock() {
             Some(retiring) => retiring,
             None if self.held.load(Ordering::Relaxed) & REQUEST_MASK
-                < SINCE_REPORT_KEPT + RETIRE_BATCH as u64 =>
+                < RANK_CREDIT_KEPT + RETIRE_BATCH as u64 =>
             {
                 return;
             }
@@ -680,7 +681,7 @@ impl SinceReport {
         // The bound read again under the locks: a release between the
         // record path's read and these locks may have taken the row below
         // it, and then the newer credits stay.
-        if self.held.load(Ordering::Relaxed) & REQUEST_MASK < SINCE_REPORT_KEPT {
+        if self.held.load(Ordering::Relaxed) & REQUEST_MASK < RANK_CREDIT_KEPT {
             return;
         }
         let mut retired = 0;
@@ -853,7 +854,7 @@ impl SinceReport {
 // What a test in another file reads of a row. The row's words and its
 // retirement lock stay this file's own.
 #[cfg(test)]
-impl SinceReport {
+impl RankCredit {
     /// The held token-work and requests, and the sends of no stated size.
     pub(crate) fn held_for_test(&self) -> (HeldCredit, u16) {
         (
@@ -891,7 +892,7 @@ type RankKey = (WorkerId, u16);
 /// same minimum book the same rank, and one lock there queued them too.
 #[derive(Debug)]
 pub(crate) struct Credits {
-    pub(crate) tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
+    pub(crate) tally: ArcSwap<FxHashMap<RankKey, Arc<RankCredit>>>,
 }
 
 impl Default for Credits {
@@ -923,7 +924,7 @@ impl Credits {
 
     /// The entry of `rank`, entered where the tally did not know the rank.
     /// `None` where a membership change took the rank away meanwhile.
-    fn entry(&self, rank: RankKey) -> Option<Arc<SinceReport>> {
+    fn entry(&self, rank: RankKey) -> Option<Arc<RankCredit>> {
         if let Some(since) = self.tally.load().get(&rank) {
             return Some(Arc::clone(since));
         }
@@ -932,7 +933,7 @@ impl Credits {
                 return Arc::clone(tally);
             }
             let mut next = FxHashMap::clone(tally);
-            next.insert(rank, Arc::new(SinceReport::default()));
+            next.insert(rank, Arc::new(RankCredit::default()));
             Arc::new(next)
         });
         self.tally.load().get(&rank).map(Arc::clone)
@@ -942,8 +943,8 @@ impl Credits {
     /// membership change is rare and a decision never waits on it. Each
     /// entry that went is shown to `dropped` once the tally finds it no
     /// more: a word that reached it earlier may still hold it.
-    fn forget(&self, gone: impl Fn(&RankKey) -> bool, mut dropped: impl FnMut(&SinceReport)) {
-        let mut went: Vec<Arc<SinceReport>> = Vec::new();
+    fn forget(&self, gone: impl Fn(&RankKey) -> bool, mut dropped: impl FnMut(&RankCredit)) {
+        let mut went: Vec<Arc<RankCredit>> = Vec::new();
         self.tally.rcu(|tally| {
             went.clear();
             let mut next = FxHashMap::clone(tally);
@@ -964,7 +965,7 @@ impl Credits {
     /// Credits the rank a dispatch landed on. `credit` is handed the
     /// rank's entry with the dispatch's instant and the tokens its lease
     /// states, zero where it states none, and records it
-    /// ([`SinceReport::record`]). A count of sends records the zero, a
+    /// ([`RankCredit::record`]). A count of sends records the zero, a
     /// profile's and the one a `least-load` built by hand keeps: the
     /// entry counts the send as one of no stated size, and each reader
     /// prices it. `resident-work` keeps a tally of its own and records its
@@ -983,7 +984,7 @@ impl Credits {
         side: Side,
         since_decision_micros: u32,
         present: impl FnOnce() -> bool,
-        credit: impl FnOnce(&SinceReport, u64, u32),
+        credit: impl FnOnce(&RankCredit, u64, u32),
     ) {
         // The decode side of a pair target is the pair's decode rank; the
         // target itself is the prefill. The credit dates from the dispatch,
@@ -1013,7 +1014,7 @@ impl Credits {
 
     /// Drops the ranks a membership change takes away, each entry that
     /// goes shown to `dropped` first.
-    pub(crate) fn membership(&self, change: &Membership<'_>, dropped: impl FnMut(&SinceReport)) {
+    pub(crate) fn membership(&self, change: &Membership<'_>, dropped: impl FnMut(&RankCredit)) {
         match change {
             // Every rank of the worker goes with it. A resized worker's ranks
             // are a new set: what a vanished rank held would never release,
@@ -1087,7 +1088,7 @@ pub struct ResidentWork {
 }
 
 /// The entry bound to each slot's cell.
-type Bound = FxHashMap<WorkerSlot, Arc<SinceReport>>;
+type Bound = FxHashMap<WorkerSlot, Arc<RankCredit>>;
 
 /// A member's resident work as one number: the cost of the report its
 /// stage was told and of its credit, with no request beyond the two, and
@@ -1331,7 +1332,7 @@ impl ResidentWork {
     /// behind a dispatch it reflects or a later sample.
     #[cold]
     #[inline(never)]
-    fn settle(&self, cell: Option<&Kept>, since: &SinceReport, row: &Candidate, slot: WorkerSlot) {
+    fn settle(&self, cell: Option<&Kept>, since: &RankCredit, row: &Candidate, slot: WorkerSlot) {
         let told = since.told.lock();
         let kept_of = since.kept_of.load(Ordering::Relaxed);
         if kept_of != u64::MAX {
@@ -1369,7 +1370,7 @@ impl ResidentWork {
     #[inline(never)]
     fn settle_first(
         &self,
-        tally: &FxHashMap<RankKey, Arc<SinceReport>>,
+        tally: &FxHashMap<RankKey, Arc<RankCredit>>,
         cell: Option<&Kept>,
         row: &Candidate,
         slot: WorkerSlot,
@@ -1402,7 +1403,7 @@ impl ResidentWork {
     /// releases there too. So the cell awaits that decision
     /// ([`ResidentWork::settle`]), and until it each row is costed from
     /// its parts, as on a stage told nothing.
-    fn tell(&self, bound: &mut Bound, cell: &Kept, since: &Arc<SinceReport>, word: Told) {
+    fn tell(&self, bound: &mut Bound, cell: &Kept, since: &Arc<RankCredit>, word: Told) {
         let mut told = since.told.lock();
         let mut news = false;
         if told.slot != word.slot {
@@ -1454,7 +1455,7 @@ impl ResidentWork {
     #[inline(always)]
     fn cost_reported(
         &self,
-        tally: &FxHashMap<RankKey, Arc<SinceReport>>,
+        tally: &FxHashMap<RankKey, Arc<RankCredit>>,
         row: &Candidate,
         report: Option<&LoadRow>,
         in_flight: impl FnOnce() -> u32,
@@ -1491,12 +1492,12 @@ impl ResidentWork {
     /// releases from it.
     #[cold]
     #[inline(never)]
-    fn release(&self, since: &SinceReport, row: &Candidate) -> HeldCredit {
+    fn release(&self, since: &RankCredit, row: &Candidate) -> HeldCredit {
         let held = since.release_through(row.load_sampled_at_micros);
         if since.keeps_before(row.load_sampled_at_micros) {
             self.settle(None, since, row, WorkerSlot::NONE);
         }
-        SinceReport::credit_of(held)
+        RankCredit::credit_of(held)
     }
 }
 
@@ -1515,7 +1516,7 @@ impl ResidentWork {
     #[inline(always)]
     fn cost_lent(
         &self,
-        lent: &LentCounts<'_>,
+        lent: &PoolInFlightCounts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -1984,20 +1985,20 @@ impl ReadsLoad for LeastCost {
 /// [`LeastCost`], then the profile's sends. A document that names none is
 /// built as [`LeastCost`] alone and reads no count.
 #[derive(Debug)]
-pub(crate) struct LeastCostSent {
+pub(crate) struct LeastCostWithDispatches {
     cost: LeastCost,
     sent: Arc<DispatchCredit>,
 }
 
-impl LeastCostSent {
+impl LeastCostWithDispatches {
     pub(crate) fn new(cost: LeastCost, sent: Arc<DispatchCredit>) -> Self {
         Self { cost, sent }
     }
 }
 
-impl Lifecycle for LeastCostSent {}
+impl Lifecycle for LeastCostWithDispatches {}
 
-impl Scorer for LeastCostSent {
+impl Scorer for LeastCostWithDispatches {
     fn name(&self) -> &'static str {
         self.cost.name()
     }
@@ -2030,7 +2031,7 @@ impl Scorer for LeastCostSent {
     }
 }
 
-impl ReadsLoad for LeastCostSent {
+impl ReadsLoad for LeastCostWithDispatches {
     fn score_with(
         &self,
         facts: &RequestFacts<'_>,
@@ -2475,7 +2476,7 @@ pub(crate) mod tests {
         }
 
         let bare = Probe::default();
-        let wrapped = with_report_age(bare.clone(), Some(37));
+        let wrapped = with_load_report_age_limit(bare.clone(), Some(37));
         let facts = RequestFacts {
             now_micros: 71_337,
             ..RequestFacts::default()
@@ -3174,7 +3175,7 @@ pub(crate) mod tests {
         // rounds go on until a read lands inside one, a few at most.
         const HELD: u64 = 6_000;
         for _ in 0..32 {
-            let row = SinceReport::default();
+            let row = RankCredit::default();
             for at in 1..=HELD {
                 row.record(at, 0);
             }
@@ -4176,13 +4177,13 @@ pub(crate) mod tests {
         rows[2].load_sampled_at_micros = 20_000;
         let lent = Lent::take(&mut rows);
         let slots = [0, 1, 2].map(|at: usize| lent.slot_of(&rows[at]));
-        let limited = || ReportAge {
+        let limited = || WithLoadReportAgeLimit {
             stage: ResidentWork::new(700),
             max_age_ms: 10,
         };
         let (told, untold) = (limited(), limited());
         assert!(told.keeps_loads(), "the wrapper says what its stage keeps");
-        let scores = |stage: &ReportAge<ResidentWork>, now_micros: u64| {
+        let scores = |stage: &WithLoadReportAgeLimit<ResidentWork>, now_micros: u64| {
             let facts = lent.beside(&RequestFacts {
                 now_micros,
                 ..RequestFacts::default()
@@ -4336,7 +4337,7 @@ pub(crate) mod tests {
                         row.dp_rank ^= 1;
                     }
                     let times = if burst {
-                        SINCE_REPORT_KEPT + 2 * RETIRE_BATCH as u64 + 3
+                        RANK_CREDIT_KEPT + 2 * RETIRE_BATCH as u64 + 3
                     } else {
                         1
                     };
@@ -4475,7 +4476,7 @@ pub(crate) mod tests {
         for row in &pool {
             shown(&told, &lent, lent.slot_of(row), row);
         }
-        let over = SINCE_REPORT_KEPT + 2 * RETIRE_BATCH as u64 + 3;
+        let over = RANK_CREDIT_KEPT + 2 * RETIRE_BATCH as u64 + 3;
         for at in 0..over {
             let lease = Lease {
                 issued_micros: 2_000 + at,

@@ -38,7 +38,7 @@
 pub(crate) mod admin;
 pub(crate) mod config;
 mod decide;
-mod deciders;
+mod decision_slots;
 #[cfg(feature = "discovery")]
 mod discovery;
 pub(crate) mod election;
@@ -322,15 +322,15 @@ pub enum Error {
     ElectionThread(#[source] io::Error),
     /// A deciding thread could not be started.
     #[error("the deciding threads: {0}")]
-    Deciders(#[source] io::Error),
+    DecisionThreads(#[source] io::Error),
     /// The election thread ended before the shutdown: nothing renews the
     /// lease, so the controller stops.
     #[error("the election thread ended before the shutdown")]
     ElectionEnded,
     /// A deciding thread ended before the shutdown: the models it decided
-    /// have no decider, so the controller stops and gives the lead up.
+    /// have no decision slot, so the controller stops and gives the lead up.
     #[error("a deciding thread ended before the shutdown")]
-    DeciderEnded,
+    DecisionThreadEnded,
     /// A listener returned before the shutdown signal.
     #[error("a listener stopped before the shutdown")]
     Stopped,
@@ -479,7 +479,7 @@ impl Controller {
             Arc::clone(&catalog),
             config.decide_shards,
         )
-        .map_err(Error::Deciders)?;
+        .map_err(Error::DecisionThreads)?;
         shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
@@ -606,7 +606,7 @@ impl Controller {
     /// The stages a policy document may name in this controller, fixed at
     /// the bind: a spec file's document is validated against them
     /// ([`Controller::spec_file`]).
-    pub fn catalog(&self) -> &StageRegistry {
+    pub fn stage_registry(&self) -> &StageRegistry {
         &self.catalog
     }
 
@@ -636,7 +636,7 @@ impl Controller {
     ///
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages
-    /// the bind was handed ([`Controller::catalog`]), a host's own among
+    /// the bind was handed ([`Controller::stage_registry`]), a host's own among
     /// them. A controller that takes no spec source serves no spec call,
     /// watches nothing and renders no spec series, and one that took a spec
     /// store takes no file ([`SpecRejected::SecondSource`]).
@@ -1018,7 +1018,7 @@ impl Controller {
                 let _ = deciders_stop.wait_for(|stop| *stop).await;
             };
             tokio::select! {
-                true = told => Err(Error::DeciderEnded),
+                true = told => Err(Error::DecisionThreadEnded),
                 () = stopped => Ok(()),
             }
         });
@@ -1369,7 +1369,7 @@ mod tests {
 
     use super::{
         config::tests::valid,
-        deciders::tests as bed,
+        decision_slots::tests as bed,
         election::{self, ElectionObservation},
         following,
         membership::tests::Logged,
@@ -1760,7 +1760,7 @@ mod tests {
             .await
             .expect("the serve ends within twenty seconds");
             assert!(
-                matches!(served, Err(Error::DeciderEnded)),
+                matches!(served, Err(Error::DecisionThreadEnded)),
                 "told {told:?}: {served:?}"
             );
         }

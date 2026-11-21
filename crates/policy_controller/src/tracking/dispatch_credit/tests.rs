@@ -74,7 +74,7 @@ fn catalog() -> (StageRegistry, Readers) {
     let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("avoid-sent", move |build| {
-            let sent = build.sent();
+            let sent = build.dispatch_credit();
             kept.lock().push(Arc::clone(&sent));
             Ok(Box::new(AvoidSent(sent)))
         })
@@ -1067,7 +1067,7 @@ fn a_registered_filter_reads_the_sends_of_its_profile() {
     catalog
         .filter_with("sent-under", move |build| {
             let Most { requests } = build.params()?;
-            let sent = build.sent();
+            let sent = build.dispatch_credit();
             kept.lock().push(Arc::clone(&sent));
             Ok(Box::new(SentUnder {
                 sent,
@@ -1154,7 +1154,7 @@ fn a_registered_picker_reads_the_sends_of_its_profile() {
     let mut catalog = StageRegistry::builtin();
     catalog
         .picker_with("least-sent", move |build| {
-            let sent = build.sent();
+            let sent = build.dispatch_credit();
             kept.lock().push(Arc::clone(&sent));
             Ok(Box::new(LeastSent { sent }))
         })

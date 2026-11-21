@@ -1972,7 +1972,7 @@ mod tests {
     async fn under_the_policy_controller_a_post_that_fails_behind_its_row_takes_the_row_out() {
         use smg_policy_controller::{
             store::{Registrant, WorkersStore},
-            worker_host::{Precondition, WRITE_WORKERS_AT_DOOR_STEP},
+            worker_host::{Precondition, WRITE_WORKERS_TO_STORE_STEP},
         };
         use smg_worker::workflow::single_attempt;
         use wfaas::{
@@ -2031,7 +2031,7 @@ mod tests {
                 WorkflowDefinition::new("worker_registration", "Write the row, then fail")
                     .add_step(
                         StepDefinition::new(
-                            WRITE_WORKERS_AT_DOOR_STEP,
+                            WRITE_WORKERS_TO_STORE_STEP,
                             "Write the row",
                             Arc::new(write),
                         )

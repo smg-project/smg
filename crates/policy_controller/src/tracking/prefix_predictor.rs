@@ -29,10 +29,10 @@
 //! The in-process door
 //! ([`StoreBackedEngine`](crate::engine::store_backed_engine::StoreBackedEngine))
 //! seats a request by its calling thread unless the generation holds a stage
-//! that keeps state a decider (`Engine::keeps_deciders`). A stage that reads a
-//! predictor there joins that fact, or the predictor takes a shared owner: with
-//! neither, a door would split a model's predictor between its callers' seats,
-//! with no error.
+//! that keeps state a decider (`Engine::keeps_slot_state`). A stage that reads
+//! a predictor there joins that fact, or the predictor takes a shared owner:
+//! with neither, a door would split a model's predictor between its callers'
+//! seats, with no error.
 //!
 //! What is kept. A request carries its prefix as one hash a block of its
 //! content ([`RequestFacts::block_hashes`](crate::engine::RequestFacts::block_hashes)).
@@ -403,7 +403,7 @@ impl PrefixPredictor {
     /// place, and only [`PrefixPredictor::forget`] takes the place back: a
     /// write for a worker told gone gives it a place again, and nothing takes
     /// that one back until the worker is told gone once more.
-    pub fn sent(&mut self, keys: &[u64], worker: WorkerId, tick: u16) {
+    pub fn record(&mut self, keys: &[u64], worker: WorkerId, tick: u16) {
         let blocks = keys.len();
         if blocks == 0 {
             return;

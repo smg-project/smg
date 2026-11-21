@@ -129,7 +129,7 @@ use crate::{
         GatewayId,
     },
     tracking::{
-        in_flight::{Counts, KeptCounts, LentCounts, WorkerSlot},
+        in_flight::{InFlightBuffers, InFlightCounts, PoolInFlightCounts, WorkerSlot},
         lease::Signal,
     },
 };
@@ -230,7 +230,7 @@ pub struct ViewBuffers {
     /// view lent its rows with the leases' counts beside them
     /// ([`StoreSnapshot::view`]): a row's first read is kept here, so a
     /// decision reads one count a row.
-    pub kept: KeptCounts,
+    pub kept: InFlightBuffers,
     /// The signal cells of the rows a build wrote here, in the rows' order,
     /// under an ask that takes them ([`Ask::signal_cells`]); a view names
     /// the cells a decision reads ([`PoolView::signal_cells`]).
@@ -584,7 +584,7 @@ pub struct PoolView<'a> {
     /// What the leases on file book on each row, by position: what
     /// [`RequestFacts::lent_in_flight`](crate::engine::RequestFacts::lent_in_flight)
     /// takes. `None` where the rows carry their counts.
-    pub in_flight: Option<LentCounts<'a>>,
+    pub in_flight: Option<PoolInFlightCounts<'a>>,
     /// The pool's engines ([`Engines`]), where it holds one of several
     /// rows and the candidates stand at the pool's own positions: a pool
     /// that holds a host-local row hands none.
@@ -615,7 +615,7 @@ struct PoolShape {
     /// Each row's admission instant, in the rows' clock.
     admitted_micros: Box<[u64]>,
     /// Each row's worker's slot in the store's counts of the leases on
-    /// file ([`Counts`]): the slot its member keeps across membership
+    /// file ([`InFlightCounts`]): the slot its member keeps across membership
     /// builds.
     booked: Box<[WorkerSlot]>,
     /// The host-local rows, by index, each with the gateway that holds its
@@ -715,7 +715,7 @@ struct Derived {
     unpooled: Box<[(WorkerId, WorkerSlot)]>,
     /// The store's counts of the leases on file, which the pools' slots
     /// name: the one table of the store's life, lent with its shapes.
-    counts: Arc<Counts>,
+    counts: Arc<InFlightCounts>,
 }
 
 impl Derived {
@@ -2806,7 +2806,7 @@ pub(super) struct Writer {
     places: Vec<Place>,
     /// The store's counts of the leases on file: the one table of the
     /// store's life, which the leases' file writes and a world lends.
-    counts: Arc<Counts>,
+    counts: Arc<InFlightCounts>,
     vetoes: Arc<Vetoes>,
     /// The vetoes as the world carries them, by pool and by gateway. A
     /// veto's write builds its own gateway's runs again; a membership build
@@ -2962,7 +2962,7 @@ impl Writer {
 
     /// The store's counts of the leases on file, for the leases' file to
     /// write.
-    pub(super) fn counts(&self) -> Arc<Counts> {
+    pub(super) fn counts(&self) -> Arc<InFlightCounts> {
         Arc::clone(&self.counts)
     }
 

@@ -39,7 +39,7 @@ impl ByRequest for PrefixPredictor {
     fn sent_by(&mut self, seed: u64, hashes: &[u64], worker: WorkerId) {
         let tick = TICK.get().wrapping_add(1);
         TICK.set(tick);
-        self.sent(&keys(seed, hashes), worker, tick);
+        self.record(&keys(seed, hashes), worker, tick);
     }
 }
 
@@ -958,7 +958,7 @@ fn drawn_requests_under_a_small_bound_keep_every_rule() {
 fn a_read_writes_nothing() {
     let mut predictor = PrefixPredictor::new(64);
     let sent: Vec<u64> = (1..=8).collect();
-    predictor.sent(&keys(SEED, &sent), worker(1), 3);
+    predictor.record(&keys(SEED, &sent), worker(1), 3);
     let before = format!("{predictor:?}");
     let shared: &PrefixPredictor = &predictor;
     assert_eq!(shared.deepest(&keys(SEED, &sent)).blocks(), 8);
@@ -981,7 +981,7 @@ fn an_end_is_fresh_at_the_tick_it_was_written() {
     let mut predictor = PrefixPredictor::new(64);
     let sent: Vec<u64> = (1..=4).collect();
     let folded = keys(SEED, &sent);
-    predictor.sent(&folded, worker(1), 7);
+    predictor.record(&folded, worker(1), 7);
     let found = predictor.deepest(&folded);
     assert_eq!(
         (found.blocks(), found.fresh(7), found.fresh(8)),
@@ -1005,8 +1005,8 @@ fn a_request_sent_again_is_fresh_at_the_new_tick() {
     let mut predictor = PrefixPredictor::new(64);
     let sent: Vec<u64> = (1..=4).collect();
     let folded = keys(SEED, &sent);
-    predictor.sent(&folded, worker(1), 7);
-    predictor.sent(&folded, worker(1), 9);
+    predictor.record(&folded, worker(1), 7);
+    predictor.record(&folded, worker(1), 9);
     let found = predictor.deepest(&folded);
     assert_eq!((found.fresh(9), found.fresh(7)), (true, false));
     let part = predictor.deepest(&folded[..2]);
@@ -1045,9 +1045,9 @@ fn a_write_in_two_parts_leaves_what_one_write_leaves() {
     let hashes: Vec<u64> = (1..=64).collect();
     let folded = keys(SEED, &hashes);
     let (mut parts, mut whole) = (PrefixPredictor::new(256), PrefixPredictor::new(256));
-    parts.sent(&folded[..16], worker(1), 5);
-    parts.sent(&folded, worker(1), 5);
-    whole.sent(&folded, worker(1), 5);
+    parts.record(&folded[..16], worker(1), 5);
+    parts.record(&folded, worker(1), 5);
+    whole.record(&folded, worker(1), 5);
     assert_eq!(format!("{parts:?}"), format!("{whole:?}"));
     parts.check();
 }
@@ -1058,10 +1058,10 @@ fn a_write_in_two_parts_leaves_what_one_write_leaves() {
 fn a_swept_block_keeps_its_tick() {
     let mut predictor = PrefixPredictor::new(2);
     let first = keys(SEED, &[1, 2]);
-    predictor.sent(&first, worker(1), 4);
+    predictor.record(&first, worker(1), 4);
     // A third placement at the bound takes the deep block out, and the
     // block before it stands on the list of ends in its place.
-    predictor.sent(&keys(SEED, &[9]), worker(1), 6);
+    predictor.record(&keys(SEED, &[9]), worker(1), 6);
     let left = predictor.deepest(&first[..1]);
     assert_eq!(
         (left.blocks(), left.fresh(4), left.fresh(6)),

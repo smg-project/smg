@@ -632,7 +632,7 @@ async fn placed_after_one_poll(
     }
     // One value an engine was taken, and none dropped.
     let taken = u64::try_from(engines.len()).unwrap();
-    assert_eq!(store.counts().signal_writes, [taken, 0, 0, 0, 0, 0]);
+    assert_eq!(store.stats().signal_writes, [taken, 0, 0, 0, 0, 0]);
 
     let policy_engine = app.policy_engine.as_ref().unwrap();
     let ask = Ask::of(b"polled", MODEL_ID);

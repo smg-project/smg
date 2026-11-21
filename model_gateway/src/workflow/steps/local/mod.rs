@@ -30,7 +30,7 @@ use provider_workers::{
 pub use rediscover_labels::RediscoverLabelsStep;
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
-use smg_policy_controller::worker_host::{removal_at_door, REMOVE_WORKERS_AT_DOOR_STEP};
+use smg_policy_controller::worker_host::{removal_from_store, REMOVE_WORKERS_FROM_STORE_STEP};
 use smg_worker::{
     jobs::WorkerJobAsker,
     settings::UnhealthyRemovalScope,
@@ -138,7 +138,7 @@ pub(crate) fn worker_removal_line(
     // The feed's holder leaves a worker's status to the gateway's health
     // checks, so the drain's mark on the worker is this line's to make.
     let door = Arc::new(DrainingDoor::new(Arc::clone(&feed.door), Arc::clone(rows)));
-    removal_at_door::<AppContext>(door, Arc::clone(rows), scope)
+    removal_from_store::<AppContext>(door, Arc::clone(rows), scope)
         .add_step(
             StepDefinition::new(
                 DRAIN_PROVIDER_WORKERS_STEP,
@@ -148,7 +148,7 @@ pub(crate) fn worker_removal_line(
             // The window is the worker's own setting, as in the classic line.
             .with_timeout(SETTLE_STEP_TIMEOUT)
             .with_retry(single_attempt())
-            .depends_on(&[REMOVE_WORKERS_AT_DOOR_STEP]),
+            .depends_on(&[REMOVE_WORKERS_FROM_STORE_STEP]),
         )
         .add_step(
             StepDefinition::new(
@@ -331,7 +331,7 @@ mod tests {
     };
     use smg_policy_controller::{
         store::{MemoryStore, Registrant, WorkerStatus as RowStatus, WorkersStore},
-        worker_host::{facts, Precondition, Remover, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP},
+        worker_host::{facts, Precondition, Remover, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP},
     };
     use smg_worker::{
         identity::basic::{ConnectionMode, Worker},
@@ -711,7 +711,7 @@ mod tests {
         );
         assert!(stands(&second));
 
-        let by = Remover::Maker(&Registrant::Control);
+        let by = Remover::Registrant(&Registrant::Control);
         let drained = feed.door.drained(by, url, seen());
         assert!(drained.is_ok(), "{drained:?}");
         let leaving = step.refresh(seen(), &built("m", "c"), &second);
@@ -865,7 +865,7 @@ mod tests {
         let stood = registry.get_by_url(theirs).unwrap();
         let state = removal(theirs).await;
         assert_eq!(state.status, WorkflowStatus::Failed);
-        let drain = &state.step_states[&StepId::new(DRAIN_WORKERS_AT_DOOR_STEP)];
+        let drain = &state.step_states[&StepId::new(DRAIN_WORKERS_IN_STORE_STEP)];
         let refusal = drain.last_error.as_deref().unwrap_or_default();
         assert!(
             refusal.contains("its worker is changed at the provider's source"),

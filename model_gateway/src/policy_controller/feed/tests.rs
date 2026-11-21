@@ -787,7 +787,7 @@ async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
 
     let object = feed.objects.object(row).expect("the row has an object");
     let seen = feed.objects.standing(&object).expect("the object's row");
-    let by = Remover::Maker(&Registrant::Control);
+    let by = Remover::Registrant(&Registrant::Control);
     assert_eq!(
         feed.door.drained(by, URL, seen),
         Ok(MembershipWriteOutcome::Draining(row))
@@ -816,7 +816,7 @@ fn a_refused_write_tells_nobody() {
     assert!(matches!(
         feed.door
             .found(&another, Precondition::Any, URL, &|_| stated()),
-        Err(Refused::NotMaker(_))
+        Err(Refused::NotRegistrant(_))
     ));
     let after = registry.get_by_url(URL).expect("the worker still stands");
     assert!(Arc::ptr_eq(&before, &after));
@@ -883,7 +883,7 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
         row,
         revision: store.get(row).expect("the worker's row").revision,
     };
-    let by = Remover::Maker(&Registrant::Control);
+    let by = Remover::Registrant(&Registrant::Control);
     assert_eq!(
         door.drained(by, URL, seen),
         Ok(MembershipWriteOutcome::Draining(row))

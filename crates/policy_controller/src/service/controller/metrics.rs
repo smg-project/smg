@@ -22,13 +22,13 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, Prometheu
 use parking_lot::Mutex;
 
 use super::{
-    deciders::Counts,
+    decision_slots::DecideStats,
     generations::Generations,
     readiness::{Sample, State},
 };
 use crate::{
     load::ingest::loads::{Failures, Stats},
-    store::{SignalWriteOutcome, StoreCounts},
+    store::{SignalWriteOutcome, StoreStats},
 };
 
 /// `1` for the controller's state (`starting`, `leader`, `syncing`,
@@ -182,7 +182,7 @@ struct LoadCounters {
 /// The decide call's counts as the recorder's counters, set absolute from
 /// the deciders' and the streams' atomics at each render.
 struct DecideCounters {
-    /// In the order of [`Counts::BUSY`].
+    /// In the order of [`DecideStats::BUSY`].
     busy: [Counter; 9],
     /// `fault`, `pair_side`, `prompt_text`, `decider_gone`,
     /// `lease_ids_spent`, `document_awaited`.
@@ -190,7 +190,7 @@ struct DecideCounters {
     hashes_cut: Counter,
     /// `queue_full`, `stream_gone`.
     dropped: [Counter; 2],
-    /// `none`, `ended`: in the order of [`Counts::again`].
+    /// `none`, `ended`: in the order of [`DecideStats::again`].
     again: [Counter; 2],
     undialed: Counter,
     outlasted: Counter,
@@ -349,7 +349,7 @@ impl Metrics {
                 .register_counter(&Key::from_name(LOAD_VALUES_DROPPED_TOTAL), &metadata),
         };
         let decides = DecideCounters {
-            busy: Counts::BUSY.map(|reason| counter(DECIDE_BUSY_TOTAL, "reason", reason)),
+            busy: DecideStats::BUSY.map(|reason| counter(DECIDE_BUSY_TOTAL, "reason", reason)),
             no_decision: [
                 "fault",
                 "pair_side",
@@ -457,8 +457,8 @@ impl Metrics {
         &self,
         sample: impl FnOnce() -> S,
         loads: &Stats,
-        decides: &Counts,
-        store: impl FnOnce() -> StoreCounts,
+        decides: &DecideStats,
+        store: impl FnOnce() -> StoreStats,
     ) -> String {
         let _one = self.scrape.lock();
         let sample = sample().into();
@@ -469,7 +469,7 @@ impl Metrics {
         self.restores.absolute(sample.restores);
         self.observe_loads(loads);
         if let Some(spec) = self.spec.get() {
-            let counts = spec.generations.counts();
+            let counts = spec.generations.apply_counts();
             spec.generation.set(spec.generations.generation() as f64);
             spec.applied.absolute(counts.applied);
             spec.rejected.absolute(counts.rejected);
@@ -480,7 +480,7 @@ impl Metrics {
     }
 
     /// Sets the decide counters from the deciders' and the streams' atomics.
-    fn observe_decides(&self, counts: &Counts) {
+    fn observe_decides(&self, counts: &DecideStats) {
         let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
         for (counter, count) in self.decides.busy.iter().zip(&counts.busy) {
             counter.absolute(read(count));
@@ -509,7 +509,7 @@ impl Metrics {
     }
 
     /// Sets the store's series from one read of its counts.
-    fn observe_store(&self, counts: StoreCounts) {
+    fn observe_store(&self, counts: StoreStats) {
         let [engines, zones] = &self.outside;
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
@@ -563,14 +563,14 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
+        Generations, Metrics, StoreStats, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
         REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED, SIGNAL_WRITES_TOTAL,
         SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
         load::ingest::loads::Stats,
         service::controller::{
-            deciders::Counts,
+            decision_slots::DecideStats,
             readiness::{Sample, State},
         },
         store::OutsideLists,
@@ -589,8 +589,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Starting,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
@@ -605,8 +605,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Leader,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
@@ -623,8 +623,8 @@ mod tests {
                 &other.render(
                     || State::Starting,
                     &Stats::default(),
-                    &Counts::default(),
-                    StoreCounts::default
+                    &DecideStats::default(),
+                    StoreStats::default
                 ),
                 STATE,
                 "state=\"leader\""
@@ -669,8 +669,8 @@ mod tests {
                         State::Leader
                     },
                     &stats,
-                    &Counts::default(),
-                    StoreCounts::default,
+                    &DecideStats::default(),
+                    StoreStats::default,
                 )
             }
         });
@@ -685,8 +685,8 @@ mod tests {
                 State::Follower
             },
             &stats,
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         let waited = Instant::now();
         while !first.is_finished() {
@@ -723,8 +723,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Starting,
             &stats,
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 0"));
         assert!(rendered.contains("smg_policy_controller_load_rows_total 0"));
@@ -738,8 +738,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Starting,
             &stats,
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 3"));
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"suppressed\"} 2"));
@@ -761,18 +761,18 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let metrics = Metrics::new();
-        let counts = Counts::default();
+        let counts = DecideStats::default();
         let rendered = metrics.render(
             || State::Starting,
             &Stats::default(),
             &counts,
-            StoreCounts::default,
+            StoreStats::default,
         );
         // Every series stands at zero from the first scrape, by its labels.
         for (series, labels) in [
             (
                 "decide_busy_total",
-                &Counts::BUSY.map(|reason| format!("{{reason=\"{reason}\"}}"))[..],
+                &DecideStats::BUSY.map(|reason| format!("{{reason=\"{reason}\"}}"))[..],
             ),
             (
                 "decide_no_decision_total",
@@ -832,7 +832,7 @@ mod tests {
             || State::Starting,
             &Stats::default(),
             &counts,
-            StoreCounts::default,
+            StoreStats::default,
         );
         for line in [
             "decide_busy_total{reason=\"unspecified\"} 1",
@@ -869,8 +869,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Leader,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert_eq!(
             line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"engines\"").as_deref(),
@@ -880,7 +880,7 @@ mod tests {
         assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 0"));
         assert!(rendered.contains("# HELP smg_policy_controller_members_outside_list "));
 
-        let counts = StoreCounts {
+        let counts = StoreStats {
             outside: OutsideLists {
                 engines: 2,
                 zones: 5,
@@ -892,7 +892,7 @@ mod tests {
         let rendered = metrics.render(
             || State::Leader,
             &Stats::default(),
-            &Counts::default(),
+            &DecideStats::default(),
             || counts,
         );
         assert_eq!(
@@ -923,8 +923,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Leader,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert_eq!(
             line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
@@ -938,8 +938,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Starting,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         let start = rendered
             .lines()
@@ -967,8 +967,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Leader,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert!(!rendered.contains("smg_policy_spec"), "{rendered}");
 
@@ -981,8 +981,8 @@ mod tests {
             let rendered = metrics.render(
                 || State::Leader,
                 &Stats::default(),
-                &Counts::default(),
-                StoreCounts::default,
+                &DecideStats::default(),
+                StoreStats::default,
             );
             for line in [
                 format!("{SPEC_GENERATION} {generation}"),
@@ -1023,8 +1023,8 @@ mod tests {
                     restores: 0,
                 },
                 &Stats::default(),
-                &Counts::default(),
-                StoreCounts::default,
+                &DecideStats::default(),
+                StoreStats::default,
             );
             (
                 line(&rendered, REPLICATION_SYNCED, ""),
@@ -1053,8 +1053,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Leader,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert_eq!(
             (
@@ -1077,8 +1077,8 @@ mod tests {
                     ..Sample::from(State::Syncing)
                 },
                 &Stats::default(),
-                &Counts::default(),
-                StoreCounts::default,
+                &DecideStats::default(),
+                StoreStats::default,
             );
             line(&rendered, REPLICATION_RESTORES_ASKED_TOTAL, "")
         };
@@ -1096,8 +1096,8 @@ mod tests {
         let rendered = metrics.render(
             || State::Leader,
             &Stats::default(),
-            &Counts::default(),
-            StoreCounts::default,
+            &DecideStats::default(),
+            StoreStats::default,
         );
         assert!(rendered
             .contains("# TYPE smg_policy_controller_replication_restores_asked_total counter"));

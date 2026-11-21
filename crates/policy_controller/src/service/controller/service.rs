@@ -50,14 +50,14 @@ use tonic::{
 use super::{
     config::Scope,
     decide::{self, Streams},
-    deciders::{self, Deciders, Reads},
+    decision_slots::{self, DecisionSlots, Reads},
     election::{self, split_identity, ElectionObservation, Running},
     floor::Floors,
     gateways::Gateways,
     generations::{
         Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING, WRITES_WAITING,
     },
-    membership::Door,
+    membership::MembershipCalls,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
     session, snapshot,
@@ -67,7 +67,7 @@ use super::{
 };
 use crate::{
     document::{
-        operator::{DryRun, Enforced, NeedsRow, Turn, Unanswered as DoorUnanswered},
+        operator::{DryRun, Enforced, NeedsRow, Turn, Unanswered as ManagerUnanswered},
         spec::Digest,
     },
     engine::{framework::Engine, store_backed_engine::DecisionRecord},
@@ -169,11 +169,11 @@ pub(crate) struct Shared {
     pub(crate) hello_deadline: Duration,
     /// The membership door over that store: the control scope's
     /// registration calls.
-    pub(crate) door: Door,
+    pub(crate) door: MembershipCalls,
     /// The replication scope's calls over that store and its log.
     pub(crate) replication: Replication,
     /// The threads the decisions run on, a model's on one.
-    pub(crate) deciders: Deciders,
+    pub(crate) deciders: DecisionSlots,
     /// The decide streams each gateway holds open.
     pub(crate) streams: Arc<Streams>,
     /// The run loop's word that the listeners close: `true` from the end
@@ -241,9 +241,9 @@ impl Shared {
             elector.fence(),
             Arc::clone(&store),
         ));
-        let deciders = Deciders::start(
+        let deciders = DecisionSlots::start(
             deciders,
-            deciders::QUEUE_DEPTH,
+            decision_slots::QUEUE_DEPTH,
             &Reads {
                 store: Arc::clone(&store),
                 fence: elector.fence(),
@@ -260,7 +260,7 @@ impl Shared {
             fence: elector.fence(),
             standing,
             generations: Arc::clone(&generations),
-            door: Door::new(Arc::clone(&store), Arc::clone(&feed.log)),
+            door: MembershipCalls::new(Arc::clone(&store), Arc::clone(&feed.log)),
             replication: Replication::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),
@@ -735,7 +735,7 @@ fn verdict(
 /// end or a file that was not read as internal.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
-        Unanswered::Door(door @ DoorUnanswered::Guarded(..)) => {
+        Unanswered::Manager(door @ ManagerUnanswered::Guarded(..)) => {
             Status::failed_precondition(door.to_string())
         }
         Unanswered::Full => Status::resource_exhausted(format!(
@@ -746,7 +746,7 @@ fn unanswered(unanswered: Unanswered) -> Status {
             "{WRITES_WAITING} applies wait their turn: ask again later"
         )),
         Unanswered::Unwritten(join) => Status::internal(format!("the apply did not end: {join}")),
-        Unanswered::Door(DoorUnanswered::NotHeld(not_held)) => {
+        Unanswered::Manager(ManagerUnanswered::NotHeld(not_held)) => {
             Status::not_found(not_held.to_string())
         }
         Unanswered::Unread { generation, why } => Status::internal(format!(
@@ -1147,7 +1147,7 @@ mod tests {
             controller,
             controller::{
                 config::Scope,
-                deciders::{tests as bed, Job},
+                decision_slots::{tests as bed, Job},
                 election::{self, ElectionObservation, LeasePlace},
                 gateways::tests::PATIENT,
                 generations::{tests::LEAST_LOAD, Format, Unanswered},

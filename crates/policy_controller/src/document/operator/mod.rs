@@ -19,8 +19,8 @@ pub(crate) mod test_support;
 mod turn;
 
 pub use answers::{
-    Applied, Counts, Document, DryRun, Enforced, NeedsRow, NotHeld, OnFile, SpecRejected, Status,
-    Unanswered,
+    Applied, ApplyCounts, Document, DryRun, Enforced, NeedsRow, NotHeld, OnFile, SpecRejected,
+    Status, Unanswered,
 };
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use document_manager::needs_rows;

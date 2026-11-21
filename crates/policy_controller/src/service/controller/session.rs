@@ -53,7 +53,7 @@ use tracing::{debug, info, warn};
 use super::{
     decide,
     floor::{unbelieved, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
-    gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX},
+    gateways::{over_kinds, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX},
     lifecycle,
     principal::Principal,
     service::Shared,
@@ -528,7 +528,7 @@ fn listed(hello: &proto::Hello) -> Option<Status> {
 /// lifted by `clear`. A duration of zero ends at that instant, which the
 /// table reads as no veto: it lifts as `clear` does. `Some` ends the
 /// session: a veto of no kind is neither kept nor dropped in silence.
-fn vetoed(seat: &Seat, veto: &proto::GatewayVeto, now: Instant) -> Option<Status> {
+fn vetoed(seat: &SessionPlace, veto: &proto::GatewayVeto, now: Instant) -> Option<Status> {
     if veto.kind == 0 {
         return Some(Status::invalid_argument(
             "GatewayVeto names no kind: KIND_UNSPECIFIED is not a veto",
@@ -567,7 +567,7 @@ async fn judge(
     subject: &str,
     hand: &Hand,
     term: u64,
-    seat: &Seat,
+    seat: &SessionPlace,
     frame: &proto::GatewayFrame,
     answers: &mut Answers,
 ) -> Option<Status> {

@@ -9,7 +9,7 @@ use std::{
 
 use super::{
     identity, identity_of,
-    leases::{Counts, WorkerSlot, DISPATCH_TTL},
+    leases::{InFlightCounts, WorkerSlot, DISPATCH_TTL},
     Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide,
     Dispatch, GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink,
     LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource,
@@ -2298,7 +2298,7 @@ fn a_chosen_decode_side_books_nothing_and_waits_under_no_deadline() {
 
 #[test]
 fn a_call_issues_the_chosen_side_afresh_and_books_it_once() {
-    let store = MemoryStore::new().with_deciders(2);
+    let store = MemoryStore::new().with_decision_slots(2);
     let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
     let leases: &dyn LeasesStore = &store;
     let (gateway, now) = (GatewayId(1), Instant::now());
@@ -3318,7 +3318,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
 /// the lease, as a frame's end is told, whichever thread restores.
 #[test]
 fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
-    let store = MemoryStore::new().with_deciders(4);
+    let store = MemoryStore::new().with_decision_slots(4);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     store.tell_through(heard);
@@ -3818,7 +3818,7 @@ fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
 /// and books nothing.
 #[test]
 fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
-    let counts = Counts::default();
+    let counts = InFlightCounts::default();
     // The first piece holds 1,024 cells and the second 2,048: one slot
     // more stands in the third.
     let slots: Vec<WorkerSlot> = (0..3_073).map(|_| counts.claim()).collect();
@@ -5660,7 +5660,7 @@ fn a_full_ring_under_a_watch_is_applied_by_its_hand() {
 #[test]
 fn a_place_applies_what_waits_at_the_other_files_whose_threads_wait() {
     let now = Instant::now();
-    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let store = Arc::new(MemoryStore::new().with_decision_slots(2));
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     let (said, heard_of) = mpsc::sync_channel(1);
@@ -5726,7 +5726,7 @@ fn a_places_apply_takes_no_turn_at_a_file_that_shows_no_watch() {
         TOLD.set(TOLD.get() + 1);
     }
     let now = Instant::now();
-    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let store = Arc::new(MemoryStore::new().with_decision_slots(2));
     store.tell_through(under);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
@@ -5814,7 +5814,7 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
     }
 
     let now = Instant::now();
-    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let store = Arc::new(MemoryStore::new().with_decision_slots(2));
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     let (word, lease, left) = (AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false));
@@ -5912,7 +5912,7 @@ fn a_places_apply_at_the_other_files_measured() {
     let mut out = std::io::stdout();
     let now = Instant::now();
     for (files, watched) in [(1_u8, false), (2, false), (8, false), (2, true), (8, true)] {
-        let store = Arc::new(MemoryStore::new().with_deciders(usize::from(files)));
+        let store = Arc::new(MemoryStore::new().with_decision_slots(usize::from(files)));
         let a = ready(&store, "http://a:1");
         LeasesStore::set_term(&*store, 1);
         // A watch at each other file: a lease on it and its place's look.
@@ -6408,7 +6408,7 @@ fn a_leases_events_are_told_under_its_files_decider() {
         let issued = store.issue_decided(record, store.snapshot().booked_of(a), |_| ());
         issued.expect("minted under the store's term").id
     };
-    let store = MemoryStore::new().with_deciders(4);
+    let store = MemoryStore::new().with_decision_slots(4);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     store.tell_through(heard);
@@ -6530,8 +6530,8 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((found.record.lease.id, by));
     }
-    let store = Arc::new(MemoryStore::new().with_deciders(3));
-    assert_eq!(store.deciders(), 3);
+    let store = Arc::new(MemoryStore::new().with_decision_slots(3));
+    assert_eq!(store.decision_slots(), 3);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     store.tell_through(named);
@@ -6699,7 +6699,7 @@ fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
                 .expect("the case lets the teller go");
         }
     }
-    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let store = Arc::new(MemoryStore::new().with_decision_slots(2));
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     store.tell_through(parks);
@@ -6813,7 +6813,7 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((found.record.lease.id, by));
     }
-    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let store = Arc::new(MemoryStore::new().with_decision_slots(2));
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     store.tell_through(named);
@@ -6870,7 +6870,7 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
 /// its live count, its restore and its end reach every file.
 #[test]
 fn a_gateways_doors_reach_its_leases_in_every_file() {
-    let store = MemoryStore::new().with_deciders(3);
+    let store = MemoryStore::new().with_decision_slots(3);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     let (ours, theirs, now) = (GatewayId(1), GatewayId(2), Instant::now());
@@ -6904,7 +6904,7 @@ fn a_gateways_doors_reach_its_leases_in_every_file() {
 /// followed term. A start told again, or an older term's, raises nothing.
 #[test]
 fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
-    let standby = MemoryStore::new().with_deciders(2);
+    let standby = MemoryStore::new().with_decision_slots(2);
     let term: &dyn LeasesStore = &standby;
     term.set_term(3);
     let (gateway, now) = (GatewayId(1), Instant::now());
@@ -6939,7 +6939,7 @@ fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((found.record.lease.id, by));
     }
-    let store = MemoryStore::new().with_deciders(3);
+    let store = MemoryStore::new().with_decision_slots(3);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     store.tell_through(named);
@@ -6996,7 +6996,7 @@ fn a_streak_of_lifecycle_faults_says_its_first_alone() {
 fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     let by_hand = |term: u64, counter: u64| lease(gateway, term << 32 | counter, term.min(3), now);
-    let store = MemoryStore::new().with_deciders(2);
+    let store = MemoryStore::new().with_decision_slots(2);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 3);
     let doors: &dyn LeasesStore = &store;
@@ -7040,7 +7040,7 @@ fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
 #[test]
 fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
-    let store = MemoryStore::new().with_deciders(2);
+    let store = MemoryStore::new().with_decision_slots(2);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 3);
     let (store, booked) = (&store, store.snapshot().booked_of(a));
@@ -7087,7 +7087,7 @@ fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
 fn the_doors_file_every_id_once_the_term_is_past_31_bits() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     let by_hand = |term: u64, counter: u64| lease(gateway, term << 32 | counter, term, now);
-    let store = MemoryStore::new().with_deciders(2);
+    let store = MemoryStore::new().with_decision_slots(2);
     LeasesStore::set_term(&store, 4);
     let doors: &dyn LeasesStore = &store;
     let (unclaimed, never) = (by_hand(4, 9), by_hand(10, 5 << 20 | 1));
@@ -7108,7 +7108,7 @@ fn the_doors_file_every_id_once_the_term_is_past_31_bits() {
 /// of deciders hands a term over at its first leases.
 #[test]
 fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
-    let store = MemoryStore::new().with_deciders(256);
+    let store = MemoryStore::new().with_decision_slots(256);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     let (gateway, now) = (GatewayId(1), Instant::now());
@@ -7138,8 +7138,8 @@ fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
     let store = MemoryStore::new();
     store.tell_through(counted);
     assert!(store.call_faulted());
-    let store = store.with_deciders(2);
-    assert_eq!((store.deciders(), store.lifecycle_faults()), (2, 1));
+    let store = store.with_decision_slots(2);
+    assert_eq!((store.decision_slots(), store.lifecycle_faults()), (2, 1));
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     let (gateway, now) = (GatewayId(1), Instant::now());
@@ -7158,7 +7158,7 @@ fn a_store_with_a_lease_on_file_is_not_laid_for_deciders() {
     let store = MemoryStore::new();
     let filed = LeasesStore::issue(&store, lease(GatewayId(1), 1, 0, Instant::now()));
     filed.expect("a lease");
-    drop(store.with_deciders(2));
+    drop(store.with_decision_slots(2));
 }
 
 /// Nor is a store laid again with a lease on a later file: the guard
@@ -7166,7 +7166,7 @@ fn a_store_with_a_lease_on_file_is_not_laid_for_deciders() {
 #[test]
 #[should_panic(expected = "a store's files are laid before a lease is filed")]
 fn a_store_with_a_lease_on_a_later_file_is_not_laid_again() {
-    let store = MemoryStore::new().with_deciders(4);
+    let store = MemoryStore::new().with_decision_slots(4);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     {
@@ -7177,5 +7177,5 @@ fn a_store_with_a_lease_on_a_later_file_is_not_laid_again() {
         let issued = store.issue_decided(record, world.booked_of(a), |_| ());
         issued.expect("minted under the store's term");
     }
-    drop(store.with_deciders(8));
+    drop(store.with_decision_slots(8));
 }

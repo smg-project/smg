@@ -102,10 +102,9 @@ impl DecisionSlot {
     /// A stage kind that keeps state a decider reads it here. A door in
     /// process seats a request by its model only under a generation that
     /// holds a stage opening a decision's scope
-    /// ([`Engine::keeps_deciders`](crate::engine::framework::Engine::keeps_deciders)).
-    /// Under any other it seats the request by its caller's thread, and
-    /// state a stage keeps a decider then splits by thread, with no
-    /// error.
+    /// ([`Engine::keeps_slot_state`](crate::engine::framework::Engine::keeps_slot_state)).
+    /// Under any other it seats the request by its caller's thread, and state a
+    /// stage keeps a decider then splits by thread, with no error.
     #[must_use]
     pub fn acting() -> Option<Self> {
         ACTING.get()

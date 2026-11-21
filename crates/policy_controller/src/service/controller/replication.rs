@@ -139,7 +139,7 @@ pub(crate) fn journaled_for(
 
 /// The store and its feed with the log's places starting after `first`,
 /// the store with a file of leases a decider, `deciders` of them
-/// ([`MemoryStore::with_deciders`]): the one place the two are built.
+/// ([`MemoryStore::with_decision_slots`]): the one place the two are built.
 ///
 /// The log tells one listener, and that listener is made here: one
 /// callback that wakes the feed's one task and tells `objects`, each on a
@@ -166,7 +166,7 @@ pub(super) fn journaled_at(
     };
     let feed = watch_workers::Feed::of(Arc::new(log), landed);
     let journal: Arc<dyn Journal> = Arc::<Log>::clone(&feed.log);
-    let store = MemoryStore::journaled(journal).with_deciders(deciders);
+    let store = MemoryStore::journaled(journal).with_decision_slots(deciders);
     (Arc::new(store), feed)
 }
 

@@ -6,9 +6,9 @@ use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
 
 use super::workers::{Registrant, WorkerFacts, WorkerRow, WorkerStatus};
 
-/// A write of a row by a caller that did not make it.
+/// A write of a row by a caller that did not register it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NotMaker<'a> {
+pub enum NotRegistrant<'a> {
     /// A control call made the row.
     Control,
     /// The caller's own provider made the row, under another key.
@@ -17,7 +17,7 @@ pub enum NotMaker<'a> {
     Provider { provider: &'a str },
 }
 
-impl fmt::Display for NotMaker<'_> {
+impl fmt::Display for NotRegistrant<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control => {
@@ -51,20 +51,20 @@ impl WorkerRow {
     }
 
     /// Whether `caller` made the row. Check before writing a standing row.
-    pub fn made_by(&self, caller: &Registrant) -> Result<(), NotMaker<'_>> {
+    pub fn made_by(&self, caller: &Registrant) -> Result<(), NotRegistrant<'_>> {
         if self.maker == *caller {
             return Ok(());
         }
         Err(match (&self.maker, caller) {
-            (Registrant::Control, _) => NotMaker::Control,
+            (Registrant::Control, _) => NotRegistrant::Control,
             (Registrant::Provider(found), Registrant::Provider(own))
                 if found.provider() == own.provider() =>
             {
-                NotMaker::AnotherKey {
+                NotRegistrant::AnotherKey {
                     provider: found.provider(),
                 }
             }
-            (Registrant::Provider(found), _) => NotMaker::Provider {
+            (Registrant::Provider(found), _) => NotRegistrant::Provider {
                 provider: found.provider(),
             },
         })
@@ -275,7 +275,7 @@ pub fn base() -> u64 {
 mod tests {
     use std::time::Instant;
 
-    use super::{base, Laid, NotMaker, HALF};
+    use super::{base, Laid, NotRegistrant, HALF};
     use crate::{
         engine::{
             demands::DemandFacts,
@@ -293,15 +293,15 @@ mod tests {
             Registrant::provider("other", "first")?,
         ];
         let control = Err((
-            NotMaker::Control,
+            NotRegistrant::Control,
             "the row was made by a control call: its maker alone changes it",
         ));
         let another_key = Err((
-            NotMaker::AnotherKey { provider: "pool" },
+            NotRegistrant::AnotherKey { provider: "pool" },
             "the row is provider pool's under another key: that key's caller changes it",
         ));
         let provider = Err((
-            NotMaker::Provider { provider: "pool" },
+            NotRegistrant::Provider { provider: "pool" },
             "the row is provider pool's: its worker is changed at the provider's source",
         ));
         for (maker, expected) in [

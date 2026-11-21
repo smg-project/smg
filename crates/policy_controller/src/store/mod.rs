@@ -101,7 +101,7 @@ pub use leases::{
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub(crate) use memory::DecodeIssue;
-pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
+pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreStats, Watch};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use signals::{SignalSink, SignalWriteOutcome};

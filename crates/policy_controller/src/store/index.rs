@@ -628,7 +628,7 @@ impl Predicted {
             if !allowed.load(Ordering::Relaxed) {
                 return;
             }
-            record.sent(&keys[..end], target, named.sent.tick);
+            record.record(&keys[..end], target, named.sent.tick);
             #[cfg(test)]
             self.slices.fetch_add(1, Ordering::Relaxed);
             if end == keys.len() {

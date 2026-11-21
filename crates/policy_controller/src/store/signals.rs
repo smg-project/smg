@@ -106,7 +106,7 @@ pub enum SignalWriteOutcome {
 
 impl SignalWriteOutcome {
     /// Every outcome, in the order of the store's counts
-    /// ([`StoreCounts::signal_writes`](super::StoreCounts::signal_writes)).
+    /// ([`StoreStats::signal_writes`](super::StoreStats::signal_writes)).
     pub const EACH: [Self; 6] = [
         Self::Written,
         Self::Undeclared,

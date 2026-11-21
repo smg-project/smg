@@ -1551,7 +1551,7 @@ async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
     catalog
         .scorer_with("sent-score", move |build| {
             Ok(Box::new(SentScore {
-                sent: build.sent(),
+                sent: build.dispatch_credit(),
                 seen: Arc::clone(&scores),
             }))
         })

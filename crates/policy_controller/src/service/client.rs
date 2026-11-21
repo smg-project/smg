@@ -43,7 +43,7 @@
 //! A [`Link`] holds [`ANSWER_WAIT`] over its dial, its `Leader` ask and the
 //! opens of its session, decide stream and watch. An ask waits its
 //! caller's budget ([`Link::ask`]) and a report waits for nothing
-//! ([`Link::report`]). The readers of the session and decide stream wait
+//! ([`Link::queue_frame`]). The readers of the session and decide stream wait
 //! with no bound of their own. The link sets the channel's keepalive,
 //! which ends a session whose controller went silent ([`Link::connect`]).
 
@@ -183,9 +183,9 @@ pub enum Error {
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
     /// long as the queue covers. The session ended, and the reports its
-    /// queue held are lost with it ([`Link::report`]).
+    /// queue held are lost with it ([`Link::queue_frame`]).
     #[error("the link's report queue was full")]
-    ReportsFull,
+    FrameQueueFull,
     /// A watch was asked of a link with no session standing.
     /// [`Link::ended`] gives the cause.
     #[error("the link has ended")]

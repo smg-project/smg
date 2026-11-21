@@ -204,7 +204,7 @@ impl Feed {
     /// starts there shares it: a watch's start, and the operators'
     /// snapshot. Reads that come together or in a loop hold that lock once
     /// a write, and the feed keeps one copy of the rows while a reader can
-    /// share it ([`Feed::let_go`], [`Seat`], [`Watchers::unshared`]). The
+    /// share it ([`Feed::let_go`], [`WatchPlace`], [`Watchers::unshared`]). The
     /// kept cut is named by its place with its term, never by a sequence
     /// alone: a restore can leave one sequence over other rows.
     pub(crate) fn rows_at_head(&self, store: &MemoryStore) -> Arc<Cut> {
@@ -408,7 +408,7 @@ pub(crate) struct Watching {
     /// parks: a watcher that takes nothing for [`STALL`] from then is ended.
     handed: Option<time::Instant>,
     /// The watch's seat, given back when the transport lets the stream go.
-    _seat: Seat,
+    _seat: WatchPlace,
 }
 
 impl Watching {
@@ -448,11 +448,11 @@ pub(crate) struct Watchers {
     principals: usize,
 }
 
-/// One open watch's seat in the table, held by its stream and given back
-/// when the transport lets the stream go. The last seat given back lets
+/// One open watch's place in the table, held by its stream and given back
+/// when the transport lets the stream go. The last place given back lets
 /// the feed's kept cut go: no watch shares it.
 #[derive(Debug)]
-struct Seat {
+struct WatchPlace {
     watchers: Arc<Watchers>,
     of: GatewayId,
     kept: Arc<Mutex<Option<Arc<Cut>>>>,
@@ -469,7 +469,7 @@ impl Watchers {
 
     /// A seat for one more watch of `by`, or the refusal by name. The table
     /// has no gauge yet: the refusal and its line are its signal.
-    fn seat(self: &Arc<Self>, by: &Principal, feed: &Feed) -> Result<Seat, Status> {
+    fn seat(self: &Arc<Self>, by: &Principal, feed: &Feed) -> Result<WatchPlace, Status> {
         let of = by.gateway();
         let mut held = self.held.lock();
         let open = held.get(&of).copied().unwrap_or(0);
@@ -495,7 +495,7 @@ impl Watchers {
             )));
         }
         held.insert(of, open + 1);
-        Ok(Seat {
+        Ok(WatchPlace {
             watchers: Arc::clone(self),
             of,
             kept: Arc::clone(&feed.rows),
@@ -504,7 +504,7 @@ impl Watchers {
 
     /// Lets the feed's kept cut go where no watch is open: what the last
     /// snapshot call out does, once no other call is let in to share it.
-    /// The last seat given back does the same ([`Seat`]): a copy of every
+    /// The last seat given back does the same ([`WatchPlace`]): a copy of every
     /// row is held only while a reader can share it. The table's lock is
     /// given back first, as there: a watch that opens now takes a cut of
     /// its own at worst.
@@ -526,7 +526,7 @@ impl Watchers {
     }
 }
 
-impl Drop for Seat {
+impl Drop for WatchPlace {
     fn drop(&mut self) {
         let last = {
             let mut held = self.watchers.held.lock();

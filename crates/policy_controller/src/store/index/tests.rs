@@ -88,7 +88,7 @@ mod sent_prefixes {
     }
 
     fn predicted(store: &MemoryStore, id: WorkerId) -> Option<()> {
-        record(store)?.record.write().sent(&keys(&HASHES), id, 0);
+        record(store)?.record.write().record(&keys(&HASHES), id, 0);
         Some(())
     }
 
@@ -614,8 +614,8 @@ mod sent_prefixes {
         let grpc = plain(&store, "grpc", WireModes::GRPC, Reachability::Any);
         store.apply(applied(&merged(1)?)?)?;
         let record = record(&store).ok_or("the model's record")?;
-        record.record.write().sent(&keys(&HASHES), http, 0);
-        record.record.write().sent(&keys(&HASHES[..3]), grpc, 0);
+        record.record.write().record(&keys(&HASHES), http, 0);
+        record.record.write().record(&keys(&HASHES[..3]), grpc, 0);
         let (named, rows) = named(&store, Some(WireModes::GRPC), 16, 7);
         assert_eq!(rows, vec![grpc]);
         assert_eq!(named.holders.len(), 1);
@@ -815,7 +815,7 @@ mod sent_prefixes {
         store.apply(applied(&merged(1)?)?)?;
         let record = record(&store).ok_or("the model's record")?;
         let gone = keys(&(100..196).collect::<Vec<_>>());
-        record.record.write().sent(&gone, a, 0);
+        record.record.write().record(&gone, a, 0);
         predicted(&store, b).ok_or("a live placement")?;
 
         let row = store.get(a).ok_or("the registered row")?;
@@ -1098,7 +1098,7 @@ mod sent_prefixes {
         predicted
             .record
             .write()
-            .sent(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
+            .record(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),
@@ -1145,7 +1145,7 @@ mod sent_prefixes {
         predicted
             .record
             .write()
-            .sent(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
+            .record(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
         let mut smaller = merged(2)?;
         smaller.index.insert(
             MODEL.into(),

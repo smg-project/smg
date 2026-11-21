@@ -1258,7 +1258,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let source = SpecSource::Store(dir.path().to_owned());
         let controller = bind(config, stages, &[], source).await.expect("binds");
-        assert!(controller.catalog().filters().any(|name| name == "any"));
+        assert!(controller
+            .stage_registry()
+            .filters()
+            .any(|name| name == "any"));
         // The stock build holds no such stage.
         assert!(StageRegistry::builtin().filters().all(|name| name != "any"));
     }

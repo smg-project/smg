@@ -2964,7 +2964,7 @@ mod tests {
             spec_document(following.document(0).expect("held")),
             spec_document(leading.document(0).expect("held"))
         );
-        assert_eq!(following.counts().applied, 1, "the one that stood");
+        assert_eq!(following.apply_counts().applied, 1, "the one that stood");
 
         // An applier with no door does not apply a generation: its standby
         // leaves the synced state at that place, the term's start applied.

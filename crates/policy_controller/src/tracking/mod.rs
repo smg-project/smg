@@ -10,7 +10,7 @@ pub(crate) mod prefix_predictor;
 
 pub use decision_guard::DecisionGuard;
 pub use dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit, DispatchCreditPass};
-pub use in_flight::{KeptCounts, LentCounts, WorkerSlot};
+pub use in_flight::{InFlightBuffers, PoolInFlightCounts, WorkerSlot};
 pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Membership, Outcome, ReleaseReason, Side,
     Signal, TransportClass,

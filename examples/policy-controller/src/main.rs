@@ -522,11 +522,11 @@ mod tests {
         let own = Controller::bind_with(config(), stages)
             .await
             .expect("binds");
-        assert!(read(POLICY).validate_in(own.catalog(), &[]).is_ok());
+        assert!(read(POLICY).validate_in(own.stage_registry(), &[]).is_ok());
         // A controller bound with the stock stages refuses the same document
         // by the scorer's name.
         let stock = Controller::bind(config()).await.expect("binds");
-        match read(POLICY).validate_in(stock.catalog(), &[]) {
+        match read(POLICY).validate_in(stock.stage_registry(), &[]) {
             Err(SpecError::UnknownScorer { name, .. }) => assert_eq!(name, "pack"),
             other => panic!("the stock controller read the document as {other:?}"),
         }

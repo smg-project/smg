@@ -89,8 +89,8 @@ use super::{
     answers::OnFile,
     reader::Refused,
     spec_store::{Persisted, SpecStore},
-    Applied, Counts, Document, DryRun, Enforced, Format, NeedsRow, NotHeld, SpecRejected, Status,
-    Unanswered, MAX_DOCUMENT_BYTES,
+    Applied, ApplyCounts, Document, DryRun, Enforced, Format, NeedsRow, NotHeld, SpecRejected,
+    Status, Unanswered, MAX_DOCUMENT_BYTES,
 };
 use crate::{
     document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
@@ -879,8 +879,8 @@ impl DocumentManager {
     }
 
     /// The apply counter by result, as it stands.
-    pub fn counts(&self) -> Counts {
-        Counts {
+    pub fn apply_counts(&self) -> ApplyCounts {
+        ApplyCounts {
             applied: self.applied.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
         }

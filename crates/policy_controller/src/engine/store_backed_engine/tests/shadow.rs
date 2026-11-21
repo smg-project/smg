@@ -502,7 +502,7 @@ fn a_shadow_that_would_be_named_other_rows_is_skipped() {
 /// and `bare` hold none: under a ruling those are the pool's warming rows
 /// at the next window. The members' ids, the holders first.
 fn cached(document: &PolicySpec, holders: usize, bare: usize) -> (Arc<MemoryStore>, Vec<WorkerId>) {
-    let store = MemoryStore::new().with_deciders(1);
+    let store = MemoryStore::new().with_decision_slots(1);
     let spec = AppliedSpec::validate(document).expect("the document validates");
     store.apply(spec).expect("above the unbound start");
     let filled: Vec<u64> = (1..=1_100).collect();

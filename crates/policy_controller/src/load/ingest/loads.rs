@@ -77,7 +77,7 @@ pub struct LoadDriverConfig {
     /// also the freshness bound of the arbitration (a rank whose newest
     /// record is older than this is polled), and with a tick the period
     /// every ready rank is heard in, unless the poll's deadline is longer
-    /// ([`Self::report_period`]). The gateway's
+    /// ([`Self::load_report_period`]). The gateway's
     /// `--load-monitor-interval`, 10 s. An interval the clock cannot add to
     /// the present polls an engine once.
     pub poll_interval: Duration,
@@ -104,7 +104,7 @@ impl LoadDriverConfig {
     /// against its engine's newest, and a scrape reads only an engine of
     /// one rank, whose sample is its engine's newest at any age: the
     /// scrape's timeout is not in the period.
-    pub fn report_period(&self) -> Duration {
+    pub fn load_report_period(&self) -> Duration {
         self.poll_interval
             .max(self.poll_deadline)
             .saturating_add(self.tick)
@@ -440,11 +440,11 @@ where
     P: LoadProbe,
 {
     /// A driver over `store`. The store is told the report period
-    /// ([`LoadDriverConfig::report_period`]) here, where the driver is built
-    /// and not at its first poll: a store is aged by the period from its
+    /// ([`LoadDriverConfig::load_report_period`]) here, where the driver is
+    /// built and not at its first poll: a store is aged by the period from its
     /// first judged write.
     pub fn new(store: Arc<S>, probe: Arc<P>, config: LoadDriverConfig) -> Self {
-        let period = config.report_period();
+        let period = config.load_report_period();
         if !store.heard_every(period) {
             warn!(
                 ?period,

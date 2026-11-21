@@ -85,8 +85,8 @@ use crate::{
 
 /// Where a handle's decision came from, and where its reports go.
 enum Arm<D> {
-    /// The door of this process, and the gateway the decision was made for.
-    Door { door: D, gateway: GatewayId },
+    /// The engine of this process, and the gateway the decision was made for.
+    Engine { door: D, gateway: GatewayId },
     /// A controller, over the host's link. The link rides behind a
     /// pointer: a host embeds the handle in each request's context, and a
     /// handle of its door is the size it has in a build with no link.
@@ -179,7 +179,12 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     ) -> Result<Self, Refused> {
         let decided = door.decide(gateway, request, now)?;
         let later = request.constraints.decode_later;
-        Ok(Self::hold(Arm::Door { door, gateway }, decided, later, now))
+        Ok(Self::hold(
+            Arm::Engine { door, gateway },
+            decided,
+            later,
+            now,
+        ))
     }
 
     /// [`DecisionGuard::decide`] for a request its host makes from the world
@@ -195,7 +200,12 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
         now: Instant,
     ) -> Result<Self, Refused> {
         let (decided, later) = door.decide_under_stated(gateway, maker, now)?;
-        Ok(Self::hold(Arm::Door { door, gateway }, decided, later, now))
+        Ok(Self::hold(
+            Arm::Engine { door, gateway },
+            decided,
+            later,
+            now,
+        ))
     }
 
     /// Holds the decision made with the request's encode items
@@ -215,7 +225,12 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     ) -> Result<Self, Refused> {
         let decided = door.decide_encode_pair(gateway, request, items, placed, now)?;
         let later = request.constraints.decode_later;
-        Ok(Self::hold(Arm::Door { door, gateway }, decided, later, now))
+        Ok(Self::hold(
+            Arm::Engine { door, gateway },
+            decided,
+            later,
+            now,
+        ))
     }
 
     fn hold(arm: Arm<D>, decided: Decided, later: bool, now: Instant) -> Self {
@@ -334,7 +349,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
             _ => {}
         }
         let answer = match &self.arm {
-            Arm::Door { door, gateway } => call(door, *gateway, lease)?,
+            Arm::Engine { door, gateway } => call(door, *gateway, lease)?,
             // A controller over a link issued both sides at the first ask.
             #[cfg(feature = "client")]
             Arm::Link(_) => return Err(Refused::Decode(DecodeRefused::NotChosen)),
@@ -430,7 +445,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     )]
     fn say(&self, lease: LeaseId, side: Side, said: Said, now: Instant) {
         match &self.arm {
-            Arm::Door { door, gateway } => match said {
+            Arm::Engine { door, gateway } => match said {
                 Said::Completed(outcome) => {
                     store_backed_engine::completed(door.store(), *gateway, &outcome, now, |said| {
                         door.report(*gateway, lease, said);
@@ -443,7 +458,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
             #[cfg(feature = "client")]
             Arm::Link(link) => {
                 // With no session standing the report waits in the link's line.
-                link.report(wire::frame(lease, side, said));
+                link.queue_frame(wire::frame(lease, side, said));
             }
         }
     }

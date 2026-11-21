@@ -19,7 +19,9 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 
-use super::{deciders::Counts, metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
+use super::{
+    decision_slots::DecideStats, metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE,
+};
 use crate::{load::ingest::loads::Stats, store::MemoryStore};
 
 /// What `/version` answers.
@@ -48,7 +50,7 @@ pub(crate) struct Admin {
     /// The load driver's counts, rendered with the metrics.
     pub(crate) loads: Arc<Stats>,
     /// The decide call's counts, rendered with the metrics.
-    pub(crate) decides: Arc<Counts>,
+    pub(crate) decides: Arc<DecideStats>,
     /// The store, whose counts the metrics render reads.
     pub(crate) store: Arc<MemoryStore>,
 }
@@ -101,7 +103,7 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
             || admin.readiness.sample(),
             &admin.loads,
             &admin.decides,
-            || admin.store.counts(),
+            || admin.store.stats(),
         ),
     )
         .into_response()

@@ -85,7 +85,7 @@ fn engine(max_age_ms: Option<u64>, mut stages: Value) -> (Engine, Arc<Probe>) {
     let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("reported", move |build| {
-            let reports = build.reports();
+            let reports = build.load_report_reader();
             kept.handed.lock().push(reports);
             Ok(Box::new(Reported {
                 reports,
@@ -94,7 +94,7 @@ fn engine(max_age_ms: Option<u64>, mut stages: Value) -> (Engine, Arc<Probe>) {
         })
         .expect("a free name")
         .filter_with("has-report", |build| {
-            Ok(Box::new(HasReport(build.reports())))
+            Ok(Box::new(HasReport(build.load_report_reader())))
         })
         .expect("a free name");
     stages["pick"] = json!("best");

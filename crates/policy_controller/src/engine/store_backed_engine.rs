@@ -48,7 +48,7 @@ use crate::{
         demands::{self, DemandFacts, Demands},
         framework::{
             release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
-            KEEPS_DECIDERS, SAMPLES_DECISIONS, SHADOWS,
+            KEEPS_SLOT_STATE, SAMPLES_DECISIONS, SHADOWS,
         },
         sticky_sessions::{SessionExpiry, SessionVerdict},
         view::{
@@ -1904,7 +1904,7 @@ type Read<'a> = (
     (&'a [u32], &'a [u32]),
     &'a [AffinityFacts],
     Option<&'a crate::load::SignalCells>,
-    Option<crate::tracking::LentCounts<'a>>,
+    Option<crate::tracking::PoolInFlightCounts<'a>>,
     Option<Built>,
 );
 
@@ -2394,7 +2394,7 @@ pub(crate) struct Viewed<'a> {
     /// What the leases on file book on each row, by position, where the
     /// candidates are a publication's own rows; `None` where they were
     /// written for the decision and carry their counts.
-    pub(crate) in_flight: Option<crate::tracking::LentCounts<'a>>,
+    pub(crate) in_flight: Option<crate::tracking::PoolInFlightCounts<'a>>,
     /// How many of the request's block hashes the deciding generation
     /// reads.
     pub(crate) max_block_hashes: usize,
@@ -3028,7 +3028,7 @@ pub enum Refused {
 /// hopped.
 ///
 /// **Whose file.** The store holds a file of leases a decider
-/// ([`MemoryStore::with_deciders`]), and a host in process has no
+/// ([`MemoryStore::with_decision_slots`]), and a host in process has no
 /// deciding thread. The door keeps a seat a file, and the seat follows
 /// who owns what the decision reads.
 ///
@@ -3043,7 +3043,7 @@ pub enum Refused {
 ///
 /// Under a generation that holds such a stage, a plugin's, every request
 /// decides at its model's seat, by the rule the served controller keeps
-/// ([`Engine::keeps_deciders`]). Every profile's stages hear every lease,
+/// ([`Engine::keeps_slot_state`]). Every profile's stages hear every lease,
 /// so the stage's state has one writer a model and hears a model's
 /// leases whole, and a model's requests decide one at a time. The files
 /// a host lays past those its models name gain such a generation
@@ -3174,10 +3174,10 @@ struct SlotBuffers {
 }
 
 thread_local! {
-    /// The seat the calling thread took last at a door. Until it moves it
+    /// The slot the calling thread took last at an engine. Until it moves it
     /// is the thread's number among the threads that have called one, so
-    /// threads start at seats of their own.
-    static SEAT: Cell<usize> = Cell::new(CALLERS.fetch_add(1, Ordering::Relaxed));
+    /// threads start at slots of their own.
+    static LAST_SLOT: Cell<usize> = Cell::new(CALLERS.fetch_add(1, Ordering::Relaxed));
 }
 
 #[cfg(test)]
@@ -3221,7 +3221,7 @@ impl StoreBackedEngine {
     /// decides there, and tells what is said of its leases, as decider 0.
     #[must_use]
     pub fn new(store: Arc<MemoryStore>) -> Self {
-        let deciders = store.deciders();
+        let deciders = store.decision_slots();
         store.tell_through(quiet);
         if LeasesStore::term(&*store) == 0 {
             LeasesStore::set_term(&*store, 1);
@@ -3601,7 +3601,7 @@ impl StoreBackedEngine {
         let store = &*self.store;
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
         loop {
-            let (at, mut slot) = if seen & KEEPS_DECIDERS != 0 {
+            let (at, mut slot) = if seen & KEEPS_SLOT_STATE != 0 {
                 // A decode call's lease stands at another seat's file
                 // where a reload turned the keeping on between the pair's
                 // two decisions: the call reads that file from its
@@ -3637,7 +3637,7 @@ impl StoreBackedEngine {
                 // Writing only on a change keeps this line shared by all
                 // callers. Only a change of the kept bit moves the seat.
                 self.seat_flags.store(flags, Ordering::Relaxed);
-                if (flags ^ seen) & KEEPS_DECIDERS != 0 {
+                if (flags ^ seen) & KEEPS_SLOT_STATE != 0 {
                     drop(world);
                     self.leave(at, at_file);
                     seen = flags;
@@ -3785,7 +3785,7 @@ impl StoreBackedEngine {
         let seats = self.seats.len();
         // A thread at its end no longer has its own storage: it starts
         // at the first seat.
-        let last = SEAT.try_with(Cell::get).unwrap_or(0);
+        let last = LAST_SLOT.try_with(Cell::get).unwrap_or(0);
         let own = if last < seats { last } else { self.round(last) };
         match self.seats[own].slot.try_lock() {
             Some(slot) => (own, slot),
@@ -3799,7 +3799,7 @@ impl StoreBackedEngine {
     #[cold]
     fn round(&self, last: usize) -> usize {
         let own = last % self.seats.len();
-        let _ = SEAT.try_with(|seat| seat.set(own));
+        let _ = LAST_SLOT.try_with(|seat| seat.set(own));
         own
     }
 
@@ -3812,7 +3812,7 @@ impl StoreBackedEngine {
         for step in 1..seats {
             let at = (own + step) % seats;
             if let Some(slot) = self.seats[at].slot.try_lock() {
-                let _ = SEAT.try_with(|seat| seat.set(at));
+                let _ = LAST_SLOT.try_with(|seat| seat.set(at));
                 return (at, slot);
             }
         }
@@ -4539,7 +4539,7 @@ pub(crate) mod tests {
 
     use super::{
         decider_of, pinned, Refused, Request, RequestFromSnapshot, StoreBackedEngine,
-        StoreSnapshot, Swept, DISPATCH_TTL, ON_SAMPLE_READ, SEAT, TERM_MARK,
+        StoreSnapshot, Swept, DISPATCH_TTL, LAST_SLOT, ON_SAMPLE_READ, TERM_MARK,
     };
     use crate::{
         document::spec::{AppliedSpec, Needs, PolicySpec},
@@ -4581,7 +4581,7 @@ pub(crate) mod tests {
     /// A store of `deciders` files under the `random` preset, with three
     /// ready members that serve [`MODEL`].
     pub(crate) fn fleet(deciders: usize) -> Arc<MemoryStore> {
-        stocked(MemoryStore::new().with_deciders(deciders))
+        stocked(MemoryStore::new().with_decision_slots(deciders))
     }
 
     /// `store` under the `random` preset, with three ready members that
@@ -4958,7 +4958,7 @@ pub(crate) mod tests {
                 scope.spawn(move || {
                     seated(0);
                     let (lease, _) = leased(door, b"caller", 7);
-                    let _ = answer.send((door.store().file_of(lease), SEAT.get()));
+                    let _ = answer.send((door.store().file_of(lease), LAST_SLOT.get()));
                 });
                 assert_eq!(
                     answered.recv_timeout(PATIENCE),
@@ -5259,7 +5259,7 @@ pub(crate) mod tests {
 
     /// Places the calling thread at seat `at` of the doors it calls next.
     fn seated(at: usize) {
-        SEAT.set(at);
+        LAST_SLOT.set(at);
     }
 
     /// A completion that `served` answered.
@@ -6154,7 +6154,7 @@ pub(crate) mod tests {
     /// the file as it stood and be refused.
     #[test]
     fn a_decode_call_decides_behind_what_waits_at_its_leases_file() {
-        let files = MemoryStore::new().with_deciders(2);
+        let files = MemoryStore::new().with_decision_slots(2);
         let store = pair_fleet_over(files, 1, 1).expect("a pair fleet of two files");
         let door = Arc::new(StoreBackedEngine::new(Arc::clone(&store)));
         let now = Instant::now();
@@ -6209,7 +6209,7 @@ pub(crate) mod tests {
         let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
         let files = files.expect("the model names a later file under some count");
         let home = decider_of(MODEL, files);
-        let store = MemoryStore::new().with_deciders(files);
+        let store = MemoryStore::new().with_decision_slots(files);
         let store = pair_fleet_over(store, 1, 1).expect("a pair fleet");
         let door = Arc::new(StoreBackedEngine::new(Arc::clone(&store)));
         let now = Instant::now();
@@ -7292,7 +7292,7 @@ pub(crate) mod tests {
             kept(&[plain, host])
         );
         assert_eq!(decide(2, asks(false, References::Any)), kept(&[host, own]));
-        assert_eq!(decide(3, asks(false, References::Host)), kept(&[host]));
+        assert_eq!(decide(3, asks(false, References::Caller)), kept(&[host]));
         assert_eq!(decide(4, asks(false, References::Worker)), kept(&[own]));
         // One member takes no images, one processes no reference and one
         // runs the other pipeline: the last of the three is the pipeline.
@@ -7304,7 +7304,7 @@ pub(crate) mod tests {
         // Every member fails at its runtime, the first demand of the order.
         let elsewhere = Demands {
             runtime: 9,
-            ..asks(true, References::Host)
+            ..asks(true, References::Caller)
         };
         assert_eq!(decide(6, elsewhere), nobody(super::WIRES));
         assert_eq!(door.undialed(), 0);
@@ -9000,7 +9000,7 @@ pub(crate) mod tests {
                 loose.filter.pop();
                 document.profiles.insert("twin".into(), twin);
                 document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
-                let store = MemoryStore::with_publish_window(Duration::ZERO).with_deciders(1);
+                let store = MemoryStore::with_publish_window(Duration::ZERO).with_decision_slots(1);
                 let spec = AppliedSpec::validate(&document).expect("the document validates");
                 store.apply(spec).expect("above the unbound start");
                 let deep = holder(&store, "deep", 3);
@@ -9412,7 +9412,7 @@ pub(crate) mod tests {
         thread::spawn(move || {
             seated(0);
             let leases = [b"r-1", b"r-2"].map(|id| leased(&caller, id, 7).0);
-            asked.send((leases, SEAT.get())).ok();
+            asked.send((leases, LAST_SLOT.get())).ok();
         });
         let beside = decided.recv_timeout(PATIENCE);
         let (leases, kept) = beside.expect("it decides while the held decision stands");
@@ -9458,7 +9458,7 @@ pub(crate) mod tests {
         seated(5);
         let (lease, _) = leased(&door, b"r-1", 7);
         assert_eq!(store.file_of(lease), 1);
-        assert_eq!(SEAT.get(), 1, "counted once and kept");
+        assert_eq!(LAST_SLOT.get(), 1, "counted once and kept");
     }
 
     #[test]
@@ -9468,7 +9468,7 @@ pub(crate) mod tests {
         seated(2);
         let (lease, _) = leased(&door, b"at-the-count", 7);
         assert_eq!(store.file_of(lease), 0);
-        assert_eq!(SEAT.get(), 0);
+        assert_eq!(LAST_SLOT.get(), 0);
     }
 
     /// A picker that holds a decision's scope, as a plugin's stage does:
@@ -9523,7 +9523,7 @@ pub(crate) mod tests {
             assert_eq!(store.file_of(lease), 0);
             assert!(door.explain(GATEWAY, id).is_some());
         }
-        assert_eq!(SEAT.get(), 0);
+        assert_eq!(LAST_SLOT.get(), 0);
     }
 
     /// The seat follows who owns what a decision reads and what hears its
@@ -9550,7 +9550,7 @@ pub(crate) mod tests {
         // and sits at the model's. The next reads the door's word.
         let kept = [b"r-2", b"r-3"].map(|id| leased(&door, id, 8).0);
         assert_eq!(kept.map(|lease| store.file_of(lease)), [home, home]);
-        assert_eq!(SEAT.get(), 0, "the thread's seat is still its own");
+        assert_eq!(LAST_SLOT.get(), 0, "the thread's seat is still its own");
         // The seat it left is at rest: what is said of the lease on file
         // there is applied at once.
         assert_eq!(report(&door, own, gone()), 2, "applied at once");

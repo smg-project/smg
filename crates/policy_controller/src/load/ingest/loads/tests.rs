@@ -1684,14 +1684,14 @@ fn the_driver_tells_the_sink_the_longer_of_its_interval_and_its_poll_s_deadline_
     // tells the interval and a tick, where the deadline and a tick are
     // the same four seconds and one tick short.
     assert_eq!(
-        LoadDriverConfig::default().report_period(),
+        LoadDriverConfig::default().load_report_period(),
         Duration::from_secs(11)
     );
     let near = LoadDriverConfig {
         poll_interval: Duration::from_secs(4),
         ..LoadDriverConfig::default()
     };
-    assert_eq!(near.report_period(), Duration::from_secs(5));
+    assert_eq!(near.load_report_period(), Duration::from_secs(5));
 
     // The largest deadline a host can set saturates the sum, and so does
     // the largest interval, so the driver still builds.
@@ -1699,12 +1699,12 @@ fn the_driver_tells_the_sink_the_longer_of_its_interval_and_its_poll_s_deadline_
         poll_deadline: Duration::MAX,
         ..LoadDriverConfig::default()
     };
-    assert_eq!(largest.report_period(), Duration::MAX);
+    assert_eq!(largest.load_report_period(), Duration::MAX);
     let endless = LoadDriverConfig {
         poll_interval: Duration::MAX,
         ..LoadDriverConfig::default()
     };
-    assert_eq!(endless.report_period(), Duration::MAX);
+    assert_eq!(endless.load_report_period(), Duration::MAX);
 }
 
 /// One lost report does not end a polled rank's sample at an interval just
@@ -2167,7 +2167,7 @@ async fn a_polls_answer_writes_each_ranks_declared_values_behind_its_row() {
     // Each rank's row stands too, and the name no document declares was
     // never offered: no write counts it.
     assert!(row(&store, rank0, 0).is_some() && row(&store, rank1, 1).is_some());
-    assert_eq!(store.counts().signal_writes, [4, 0, 0, 0, 0, 0]);
+    assert_eq!(store.stats().signal_writes, [4, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2202,7 +2202,7 @@ async fn a_row_the_store_passes_over_takes_its_values_with_it() {
     assert_eq!(held[&rank1], [Some((5.0, store.micros(started)))]);
     let (stands, source) = row(&store, rank0, 0).expect("rank 0's record");
     assert_eq!((stands.running, source), (9, LoadSource::Stream));
-    assert_eq!(store.counts().signal_writes, [1, 0, 0, 0, 0, 0]);
+    assert_eq!(store.stats().signal_writes, [1, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2253,7 +2253,7 @@ async fn a_polled_list_is_put_under_the_bounds_before_it_is_read_and_what_left_i
     assert_eq!(held[&rank0], [None, None]);
     assert_eq!(held[&rank1], [Some((5.0, store.micros(started))), None]);
     assert_eq!(driver.stats().values_dropped.load(Ordering::Relaxed), 3);
-    assert_eq!(store.counts().signal_writes, [1, 0, 0, 0, 0, 0]);
+    assert_eq!(store.stats().signal_writes, [1, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2274,5 +2274,5 @@ async fn a_document_with_no_signal_takes_no_value_of_an_answer() {
         },
     );
     assert!(row(&store, rank0, 0).is_some() && row(&store, rank1, 1).is_some());
-    assert_eq!(store.counts().signal_writes, [0; 6]);
+    assert_eq!(store.stats().signal_writes, [0; 6]);
 }

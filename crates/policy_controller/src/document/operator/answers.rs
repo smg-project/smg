@@ -142,7 +142,7 @@ impl std::error::Error for NotHeld {}
 
 /// The apply counter by result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Counts {
+pub struct ApplyCounts {
     /// Documents applied as a new generation.
     pub applied: u64,
     /// Documents refused: by an apply or a write, or handed back by a

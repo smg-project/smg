@@ -65,7 +65,7 @@ pub(crate) fn applied(document: &PolicySpec) -> Result<AppliedSpec, spec::SpecEr
 }
 
 fn fleet() -> Arc<MemoryStore> {
-    Arc::new(MemoryStore::with_publish_window(Duration::ZERO).with_deciders(4))
+    Arc::new(MemoryStore::with_publish_window(Duration::ZERO).with_decision_slots(4))
 }
 
 fn worker(
@@ -906,7 +906,7 @@ fn a_profile_that_reads_sent_prefixes_keeps_no_decider() -> Case {
         assert!(spec.needs().sent_prefixes);
         assert!(spec.engine().reads_sent_for(MODEL, Phase::Single));
         assert!(!spec.engine().reads_sent_for("unbound", Phase::Single));
-        assert!(!spec.engine().keeps_deciders());
+        assert!(!spec.engine().keeps_slot_state());
     }
     // The preset names no source and reads them too. `index` does not.
     assert!(applied(&merged(1)?)?.needs().sent_prefixes);

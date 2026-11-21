@@ -528,7 +528,7 @@ fn a_write_that_is_not_taken_says_what_became_of_it_and_is_counted() {
         SignalWriteOutcome::EACH.map(SignalWriteOutcome::label)[1],
         "undeclared"
     );
-    assert_eq!(store.counts().signal_writes, [1, 1, 1, 2, 1, 1]);
+    assert_eq!(store.stats().signal_writes, [1, 1, 1, 2, 1, 1]);
     assert_eq!(
         values(&store),
         by_id([(a, Some(5.0)), (b, None), (c, None)])
@@ -556,7 +556,7 @@ fn a_value_past_the_magnitude_bound_is_refused_and_counted() {
         );
     }
     assert_eq!(
-        store.counts().signal_writes[SignalWriteOutcome::OutOfRange.place()],
+        store.stats().signal_writes[SignalWriteOutcome::OutOfRange.place()],
         4
     );
     assert_eq!(
@@ -789,7 +789,7 @@ fn a_write_under_a_column_read_before_a_document_lands_only_where_it_is_continue
     assert_eq!(write(&depth, "items", 3.0), SignalWriteOutcome::Undeclared);
     // Continued: taken, at the column's new place.
     assert_eq!(write(&heat, "celsius", 71.0), SignalWriteOutcome::Written);
-    let counts = store.counts().signal_writes;
+    let counts = store.stats().signal_writes;
     assert_eq!(
         (
             counts[SignalWriteOutcome::Written.place()],
@@ -966,7 +966,7 @@ fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_t
         told.recv_timeout(Duration::from_secs(10))
     });
     assert_eq!(answered, Ok(SignalWriteOutcome::Undeclared));
-    assert_eq!(store.counts().signal_writes, [0, 1, 0, 0, 0, 0]);
+    assert_eq!(store.stats().signal_writes, [0, 1, 0, 0, 0, 0]);
 }
 
 #[test]

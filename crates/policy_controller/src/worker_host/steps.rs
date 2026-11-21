@@ -44,8 +44,8 @@ pub enum Unasked {
     Unmade(#[from] Unmade),
 }
 
-/// The maker a job registers as, using the address as written in its spec.
-pub fn maker_of(asker: &WorkerJobAsker, address: &str) -> Result<Registrant, Unasked> {
+/// Who a job registers its workers as, using the address written in its spec.
+pub fn registrant_of(asker: &WorkerJobAsker, address: &str) -> Result<Registrant, Unasked> {
     match asker {
         WorkerJobAsker::Api | WorkerJobAsker::Startup => Ok(Registrant::Control),
         WorkerJobAsker::Discovery => Ok(Registrant::provider(DISCOVERY, address)?),
@@ -56,21 +56,21 @@ pub fn maker_of(asker: &WorkerJobAsker, address: &str) -> Result<Registrant, Una
 /// Who asks for a job's removal at the door.
 pub fn remover_of(asker: &WorkerJobAsker, scope: UnhealthyRemovalScope) -> Remover<'static> {
     match asker {
-        WorkerJobAsker::Api | WorkerJobAsker::Startup => Remover::Maker(&Registrant::Control),
+        WorkerJobAsker::Api | WorkerJobAsker::Startup => Remover::Registrant(&Registrant::Control),
         WorkerJobAsker::Discovery => Remover::Provider(DISCOVERY),
         WorkerJobAsker::Health => Remover::Health(scope),
     }
 }
 
-/// The step that writes the registration's created workers at the door.
-pub const WRITE_WORKERS_AT_DOOR_STEP: &str = "write_workers_at_door";
+/// The step that writes the registration's created workers into the store.
+pub const WRITE_WORKERS_TO_STORE_STEP: &str = "write_workers_at_door";
 /// The step that marks the selected workers' rows as draining.
-pub const DRAIN_WORKERS_AT_DOOR_STEP: &str = "drain_workers_at_door";
+pub const DRAIN_WORKERS_IN_STORE_STEP: &str = "drain_workers_at_door";
 /// The step that removes the drained workers' rows after they settle.
-pub const REMOVE_WORKERS_AT_DOOR_STEP: &str = "remove_workers_at_door";
+pub const REMOVE_WORKERS_FROM_STORE_STEP: &str = "remove_workers_at_door";
 
 /// Write the workers the preceding steps created in one registration.
-pub struct WriteWorkersAtDoor<G> {
+pub struct WriteWorkersToStore<G> {
     door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<G>>,
     keeping: Option<Keeping>,
@@ -89,29 +89,29 @@ struct Keeping {
     store: Arc<dyn WorkersStore>,
 }
 
-/// A registration line that keeps was asked over a holder built with no
-/// keeper ([`Objects::with_credentials`]). The objects such a holder
-/// builds would hold nothing of what the line kept.
+/// A registration that keeps credentials was asked over worker objects built
+/// to keep none ([`Objects::with_credentials`]). The objects built there
+/// would hold nothing of what the registration kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("the holder was built with no keeper, so its registration line can keep no credential")]
-pub struct NoKeeper;
+pub struct NoCredentials;
 
 /// Mark the rows that still stand for the workers this removal names.
-pub struct DrainWorkersAtDoor<G> {
+pub struct DrainWorkersInStore<G> {
     door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<G>>,
     scope: UnhealthyRemovalScope,
 }
 
 /// Remove the rows of the workers that drained and are still held.
-pub struct RemoveWorkersAtDoor<G> {
+pub struct RemoveWorkersFromStore<G> {
     door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<G>>,
     scope: UnhealthyRemovalScope,
 }
 
-/// Build the worker registration using the host's settings and write the
-/// created workers at the door. With an empty `behind`, the write follows
+/// Build the worker registration using the caller's settings and write the
+/// created workers into the store. With an empty `behind`, the write follows
 /// creation. Otherwise it waits for every step in `behind`.
 ///
 /// The write is the only next step after a step in `behind`. A step writes
@@ -129,9 +129,9 @@ pub struct RemoveWorkersAtDoor<G> {
 /// revision the job names.
 ///
 /// The write keeps no credential: the object the holder builds from a row
-/// carries none. [`registration_at_door_keeping`] is the line of a host
-/// that keeps its workers' credentials.
-pub fn registration_at_door<H: WorkflowHost>(
+/// carries none. [`registration_into_store_keeping_credentials`] is the line of
+/// a host that keeps its workers' credentials.
+pub fn registration_into_store<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
     door: Arc<dyn MembershipWriter>,
@@ -141,7 +141,7 @@ pub fn registration_at_door<H: WorkflowHost>(
     registration_line(settings, gates, door, objects, None, behind)
 }
 
-/// [`registration_at_door`] for a host that keeps its workers'
+/// [`registration_into_store`] for a caller that keeps its workers'
 /// credentials. The write keeps the credential each worker states ahead of
 /// the row, in the keeper `objects` was built with
 /// ([`Objects::with_credentials`]), and the holder builds the row's object
@@ -157,18 +157,18 @@ pub fn registration_at_door<H: WorkflowHost>(
 /// replacement by id is refused as moved, ahead of its keep, where another
 /// object stands under its URL by then.
 ///
-/// A holder built with no keeper is refused ([`NoKeeper`]). A holder that
+/// A holder built with no keeper is refused ([`NoCredentials`]). A holder that
 /// keeps built objects ([`Objects::with_built_kept`]) is one: a built
 /// object holds its own credential.
-pub fn registration_at_door_keeping<H: WorkflowHost>(
+pub fn registration_into_store_keeping_credentials<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
     door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<H::Generation>>,
     store: Arc<dyn WorkersStore>,
     behind: &[&'static str],
-) -> Result<WorkflowDefinition<WorkerRegistrationWorkflowData<H>>, NoKeeper> {
-    let credentials = Arc::clone(objects.credentials().ok_or(NoKeeper)?);
+) -> Result<WorkflowDefinition<WorkerRegistrationWorkflowData<H>>, NoCredentials> {
+    let credentials = Arc::clone(objects.credentials().ok_or(NoCredentials)?);
     let keeping = Keeping { credentials, store };
     Ok(registration_line(
         settings,
@@ -196,9 +196,9 @@ fn registration_line<H: WorkflowHost>(
     };
     worker_registration_workflow(settings, gates).add_step(
         StepDefinition::new(
-            WRITE_WORKERS_AT_DOOR_STEP,
+            WRITE_WORKERS_TO_STORE_STEP,
             "Write workers at the membership door",
-            Arc::new(WriteWorkersAtDoor {
+            Arc::new(WriteWorkersToStore {
                 door,
                 objects,
                 keeping,
@@ -221,19 +221,19 @@ fn registration_line<H: WorkflowHost>(
 /// took or found gone, and an object no row stands for. Where the door
 /// refuses the asker and the job drained nothing, the drain step fails with
 /// the door's sentence.
-pub fn removal_at_door<H: WorkflowHost>(
+pub fn removal_from_store<H: WorkflowHost>(
     door: Arc<dyn MembershipWriter>,
     objects: Arc<Objects<H::Generation>>,
     scope: UnhealthyRemovalScope,
 ) -> WorkflowDefinition<WorkerRemovalWorkflowData<H>> {
     worker_removal_workflow(RemovalOrder::Door {
-        drain: DRAIN_WORKERS_AT_DOOR_STEP,
+        drain: DRAIN_WORKERS_IN_STORE_STEP,
     })
     .add_step(
         StepDefinition::new(
-            DRAIN_WORKERS_AT_DOOR_STEP,
+            DRAIN_WORKERS_IN_STORE_STEP,
             "Drain workers at the membership door",
-            Arc::new(DrainWorkersAtDoor {
+            Arc::new(DrainWorkersInStore {
                 door: Arc::clone(&door),
                 objects: Arc::clone(&objects),
                 scope,
@@ -245,9 +245,9 @@ pub fn removal_at_door<H: WorkflowHost>(
     )
     .add_step(
         StepDefinition::new(
-            REMOVE_WORKERS_AT_DOOR_STEP,
+            REMOVE_WORKERS_FROM_STORE_STEP,
             "Remove workers at the membership door",
-            Arc::new(RemoveWorkersAtDoor {
+            Arc::new(RemoveWorkersFromStore {
                 door,
                 objects,
                 scope,
@@ -273,7 +273,7 @@ fn failed(step: &str, message: impl Into<String>) -> WorkflowError {
 
 fn registration_refusal(engine: &str, refusal: Refused) -> WorkflowError {
     let message = match refusal {
-        Refused::NotMaker(why) => why,
+        Refused::NotRegistrant(why) => why,
         Refused::Past(past) => format!("{}: {}", past.fact, past.why),
         Refused::Absent => ABSENT.to_owned(),
         Refused::NotLeading(_) => NOT_LEADING.to_owned(),
@@ -286,7 +286,7 @@ fn registration_refusal(engine: &str, refusal: Refused) -> WorkflowError {
         Refused::OutOfScope => Refused::OUT_OF_SCOPE.to_owned(),
         Refused::NotLabelsAlone => Refused::NOT_LABELS_ALONE.to_owned(),
     };
-    failed(WRITE_WORKERS_AT_DOOR_STEP, message)
+    failed(WRITE_WORKERS_TO_STORE_STEP, message)
 }
 
 /// The row behind the worker a replacement by id names: the registry's
@@ -302,7 +302,7 @@ fn replaced<G: Generation>(
 ) -> WorkflowResult<(RowRevision, Arc<dyn Worker>)> {
     let [worker] = workers else {
         return Err(failed(
-            WRITE_WORKERS_AT_DOOR_STEP,
+            WRITE_WORKERS_TO_STORE_STEP,
             format!(
                 "Replacing worker {worker_id} needs exactly one worker, got {}",
                 workers.len()
@@ -316,7 +316,7 @@ fn replaced<G: Generation>(
         .and_then(|held| Some((objects.standing_of(&id, &held)?, held)))
         .ok_or_else(|| {
             failed(
-                WRITE_WORKERS_AT_DOOR_STEP,
+                WRITE_WORKERS_TO_STORE_STEP,
                 format!(
                     "Worker {worker_id} at {} is no longer at revision {expected_revision}, \
                      so the replacement was dropped",
@@ -328,7 +328,7 @@ fn replaced<G: Generation>(
 
 #[async_trait]
 impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
-    for WriteWorkersAtDoor<H::Generation>
+    for WriteWorkersToStore<H::Generation>
 {
     async fn execute(
         &self,
@@ -342,8 +342,8 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_owned()))?;
-        let maker = maker_of(&data.asker, &data.config.url)
-            .map_err(|why| failed(WRITE_WORKERS_AT_DOOR_STEP, why.to_string()))?;
+        let maker = registrant_of(&data.asker, &data.config.url)
+            .map_err(|why| failed(WRITE_WORKERS_TO_STORE_STEP, why.to_string()))?;
         // A replacement by id names the worker it replaces beside the row.
         let (expect, over) = match &data.registration_mode {
             WorkerRegistrationMode::Upsert => (Precondition::Any, None),
@@ -379,7 +379,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
     }
 }
 
-impl<G: Generation> WriteWorkersAtDoor<G> {
+impl<G: Generation> WriteWorkersToStore<G> {
     /// Write a registration's workers at the door, in one call. A line
     /// that keeps runs the whole of it in its holder's turn
     /// ([`Objects::keeping`]): the keep, the door's write, the keeper's
@@ -436,7 +436,7 @@ impl<G: Generation> WriteWorkersAtDoor<G> {
             .credentials
             .keep(&facts(worker, None), worker.api_key().cloned())
             .map(Some)
-            .map_err(|_| failed(WRITE_WORKERS_AT_DOOR_STEP, IN_FLIGHT))
+            .map_err(|_| failed(WRITE_WORKERS_TO_STORE_STEP, IN_FLIGHT))
     }
 
     /// Answer the keeper at the door's answer, with no await between the
@@ -538,7 +538,7 @@ fn removal_answer(
             skipped(url, ABSENT);
             Left::Gone
         }
-        Err(Refused::NotMaker(why)) => refused(why),
+        Err(Refused::NotRegistrant(why)) => refused(why),
         Err(Refused::OutOfScope) => refused(Refused::OUT_OF_SCOPE.to_owned()),
         Err(Refused::NotLeading(_)) => return Err(failed(step, NOT_LEADING)),
         Err(Refused::Stands) => return Err(failed(step, "the door answered a removal as an add")),
@@ -556,7 +556,7 @@ fn removal_answer(
 
 #[async_trait]
 impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
-    for DrainWorkersAtDoor<H::Generation>
+    for DrainWorkersInStore<H::Generation>
 {
     async fn execute(
         &self,
@@ -617,7 +617,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 continue;
             };
             let answer = removal_answer(
-                DRAIN_WORKERS_AT_DOOR_STEP,
+                DRAIN_WORKERS_IN_STORE_STEP,
                 url,
                 self.door.drained(by, url, seen),
             )?;
@@ -630,7 +630,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 }
                 Left::Wrote(_) => {
                     return Err(failed(
-                        DRAIN_WORKERS_AT_DOOR_STEP,
+                        DRAIN_WORKERS_IN_STORE_STEP,
                         "the door did not answer a drain",
                     ))
                 }
@@ -644,7 +644,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
         // A refusal of the request itself reaches its asker, as a
         // registration's does, where the job drained nothing.
         if let (true, Some(why)) = (data.drained_workers.is_empty(), refusal) {
-            return Err(failed(DRAIN_WORKERS_AT_DOOR_STEP, why));
+            return Err(failed(DRAIN_WORKERS_IN_STORE_STEP, why));
         }
         if kept.len() != workers.len() {
             data.keep_only(kept);
@@ -661,7 +661,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
 
 #[async_trait]
 impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
-    for RemoveWorkersAtDoor<H::Generation>
+    for RemoveWorkersFromStore<H::Generation>
 {
     async fn execute(
         &self,
@@ -695,7 +695,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 continue;
             };
             let answer = removal_answer(
-                REMOVE_WORKERS_AT_DOOR_STEP,
+                REMOVE_WORKERS_FROM_STORE_STEP,
                 url,
                 self.door.gone(by, url, seen),
             )?;
@@ -705,7 +705,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 }
                 Left::Wrote(_) => {
                     return Err(failed(
-                        REMOVE_WORKERS_AT_DOOR_STEP,
+                        REMOVE_WORKERS_FROM_STORE_STEP,
                         "the door did not answer a removal",
                     ))
                 }
@@ -933,8 +933,8 @@ mod tests {
             Ok(answer)
         }
 
-        fn write(&self) -> WriteWorkersAtDoor<Members> {
-            WriteWorkersAtDoor {
+        fn write(&self) -> WriteWorkersToStore<Members> {
+            WriteWorkersToStore {
                 door: Arc::clone(&self.door),
                 objects: Arc::clone(&self.objects),
                 keeping: None,
@@ -952,9 +952,9 @@ mod tests {
         }
 
         /// The write that keeps in `credentials`.
-        fn write_keeping(&self, credentials: &Arc<Credentials>) -> WriteWorkersAtDoor<Members> {
+        fn write_keeping(&self, credentials: &Arc<Credentials>) -> WriteWorkersToStore<Members> {
             let store: Arc<dyn WorkersStore> = self.store.clone();
-            WriteWorkersAtDoor {
+            WriteWorkersToStore {
                 keeping: Some(Keeping {
                     credentials: Arc::clone(credentials),
                     store,
@@ -963,16 +963,16 @@ mod tests {
             }
         }
 
-        fn drain(&self) -> DrainWorkersAtDoor<Members> {
-            DrainWorkersAtDoor {
+        fn drain(&self) -> DrainWorkersInStore<Members> {
+            DrainWorkersInStore {
                 door: Arc::clone(&self.door),
                 objects: Arc::clone(&self.objects),
                 scope: SCOPE,
             }
         }
 
-        fn remove(&self) -> RemoveWorkersAtDoor<Members> {
-            RemoveWorkersAtDoor {
+        fn remove(&self) -> RemoveWorkersFromStore<Members> {
+            RemoveWorkersFromStore {
                 door: Arc::clone(&self.door),
                 objects: Arc::clone(&self.objects),
                 scope: SCOPE,
@@ -1113,27 +1113,27 @@ mod tests {
 
         for asker in [Api, Startup] {
             assert_eq!(
-                maker_of(&asker, URL).expect("a control maker"),
+                registrant_of(&asker, URL).expect("a control maker"),
                 Registrant::Control
             );
             assert!(matches!(
                 remover_of(&asker, SCOPE),
-                Remover::Maker(Registrant::Control)
+                Remover::Registrant(Registrant::Control)
             ));
         }
         assert_eq!(DISCOVERY, "discovery");
         let discovered = Registrant::provider("discovery", URL).expect("a provider and key");
         assert_eq!(
-            maker_of(&Discovery, URL).expect("the discovery maker"),
+            registrant_of(&Discovery, URL).expect("the discovery maker"),
             discovered
         );
         assert!(matches!(
             remover_of(&Discovery, SCOPE),
             Remover::Provider("discovery")
         ));
-        assert!(matches!(maker_of(&Health, URL), Err(Unasked::Health)));
+        assert!(matches!(registrant_of(&Health, URL), Err(Unasked::Health)));
         assert!(matches!(
-            maker_of(&Discovery, ""),
+            registrant_of(&Discovery, ""),
             Err(Unasked::Unmade(Unmade::Key(_)))
         ));
         for scope in [
@@ -1278,7 +1278,7 @@ mod tests {
         let f = Fixture::new();
         let built = worker(URL, "model");
         let maker = Registrant::Control;
-        let by = Remover::Maker(&maker);
+        let by = Remover::Registrant(&maker);
         for at_the_drain in [true, false] {
             f.seed(&maker, built.as_ref()).expect("registered");
             let live = f.host.registry.get_by_url(URL).expect("the held worker");
@@ -1402,7 +1402,7 @@ mod tests {
 
         let door: Arc<dyn MembershipWriter> =
             Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
-        let drain = DrainWorkersAtDoor {
+        let drain = DrainWorkersInStore {
             door: Arc::clone(&door),
             ..f.drain()
         };
@@ -1411,7 +1411,7 @@ mod tests {
         assert!(removal.data.drained_workers.is_empty());
 
         removal.data.drained_workers.push(live);
-        let remove = RemoveWorkersAtDoor { door, ..f.remove() };
+        let remove = RemoveWorkersFromStore { door, ..f.remove() };
         let error = remove.execute(&mut removal).await.expect_err("a follower");
         assert!(!StepExecutor::<Removal>::is_retryable(&remove, &error));
         assert!(removal.data.removed_workers.is_empty());
@@ -1427,7 +1427,7 @@ mod tests {
         ] {
             let f = Fixture::new();
             let mut cx = f.registration(WorkerJobAsker::Api, vec![worker(URL, "model")]);
-            let write = WriteWorkersAtDoor {
+            let write = WriteWorkersToStore {
                 door: Arc::new(Shut(refusal)),
                 ..f.write()
             };
@@ -1553,7 +1553,7 @@ mod tests {
         let f = Fixture::new();
         let store: Arc<dyn WorkersStore> = f.store.clone();
         let line = |objects: Objects<Members>| {
-            registration_at_door_keeping::<Host>(
+            registration_into_store_keeping_credentials::<Host>(
                 f.host.registration_settings(),
                 RegistrationGates::default(),
                 Arc::clone(&f.door),
@@ -1564,13 +1564,13 @@ mod tests {
         };
         let registry = || Arc::clone(&f.host.registry);
         let keeper = Arc::new(Credentials::new());
-        assert!(matches!(line(Objects::new(registry())), Err(NoKeeper)));
+        assert!(matches!(line(Objects::new(registry())), Err(NoCredentials)));
 
         let built_kept = Objects::new(registry())
             .with_credentials(Arc::clone(&keeper))
             .with_built_kept();
         assert!(built_kept.credentials().is_none());
-        assert!(matches!(line(built_kept), Err(NoKeeper)));
+        assert!(matches!(line(built_kept), Err(NoCredentials)));
 
         let keeping = Objects::new(registry())
             .with_built_kept()
@@ -1660,7 +1660,7 @@ mod tests {
             .expect("written");
         assert_eq!(held_key(&f, URL).as_deref(), Some("key-a"));
 
-        let write = WriteWorkersAtDoor {
+        let write = WriteWorkersToStore {
             door: Arc::new(MovedUnder {
                 door: Arc::clone(&f.door),
                 objects: Arc::clone(&f.objects),
@@ -1777,14 +1777,14 @@ mod tests {
     fn the_line_that_keeps_orders_its_steps_as_the_plain_line() {
         let (f, _) = Fixture::keeping();
         let store: Arc<dyn WorkersStore> = f.store.clone();
-        let plain = registration_at_door::<Host>(
+        let plain = registration_into_store::<Host>(
             f.host.registration_settings(),
             RegistrationGates::default(),
             Arc::clone(&f.door),
             Arc::clone(&f.objects),
             &[],
         );
-        let keeping = registration_at_door_keeping::<Host>(
+        let keeping = registration_into_store_keeping_credentials::<Host>(
             f.host.registration_settings(),
             RegistrationGates::default(),
             Arc::clone(&f.door),
@@ -1940,7 +1940,7 @@ mod tests {
         let live = f.host.registry.get(&id).expect("the worker");
         let seen = f.objects.standing_of(&id, &live).expect("its row");
         f.door
-            .drained(Remover::Maker(&Registrant::Control), URL, seen)
+            .drained(Remover::Registrant(&Registrant::Control), URL, seen)
             .expect("draining");
         let mut cx = f.registration(WorkerJobAsker::Api, vec![relabelled()]);
         cx.data.registration_mode = by_id(id.as_str(), live.revision());
@@ -2045,7 +2045,7 @@ mod tests {
         let live = f.host.registry.get(&second).expect("the worker");
         let seen = f.objects.standing_of(&second, &live).expect("its row");
         f.door
-            .gone(Remover::Maker(&Registrant::Control), URL, seen)
+            .gone(Remover::Registrant(&Registrant::Control), URL, seen)
             .expect("removed");
         f.objects.follow(&*f.store);
         assert!(matches!(held(&f.host.registry, &second, URL), Held::Gone));
@@ -2089,7 +2089,8 @@ mod tests {
         f.write().execute(&mut cx).await.expect("registered");
         f.objects.follow(&*f.store);
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
-        let workflow = removal_at_door::<Host>(Arc::clone(&f.door), Arc::clone(&f.objects), SCOPE);
+        let workflow =
+            removal_from_store::<Host>(Arc::clone(&f.door), Arc::clone(&f.objects), SCOPE);
         let engine = WorkflowEngine::new();
         engine
             .register_workflow(workflow)
@@ -2175,11 +2176,11 @@ mod tests {
             .expect("an object without a row");
         let door: Arc<dyn MembershipWriter> =
             Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
-        let drain = DrainWorkersAtDoor {
+        let drain = DrainWorkersInStore {
             door: Arc::clone(&door),
             ..f.drain()
         };
-        let remove = RemoveWorkersAtDoor { door, ..f.remove() };
+        let remove = RemoveWorkersFromStore { door, ..f.remove() };
         let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
         assert_eq!(
             drain.execute(&mut removal).await.expect("no standing"),
@@ -2241,7 +2242,7 @@ mod tests {
                 Left::Gone,
             ),
             (
-                Refused::NotMaker("another maker's row".to_owned()),
+                Refused::NotRegistrant("another maker's row".to_owned()),
                 "WARN",
                 "another maker's row",
                 Left::Refused("another maker's row".to_owned()),
@@ -2397,7 +2398,7 @@ mod tests {
                 &["check_local_worker", "create_external_workers"][..],
             ),
         ] {
-            let workflow = registration_at_door::<Host>(
+            let workflow = registration_into_store::<Host>(
                 f.host.registration_settings(),
                 RegistrationGates::default(),
                 Arc::clone(&f.door),
@@ -2449,7 +2450,7 @@ mod tests {
             );
         }
 
-        let gated = registration_at_door::<Host>(
+        let gated = registration_into_store::<Host>(
             f.host.registration_settings(),
             RegistrationGates {
                 detection: Some("classify_worker"),
@@ -2463,7 +2464,7 @@ mod tests {
         assert_eq!(gated.steps[0].delay, None);
         assert_eq!(gated.steps[4].depends_on, [StepId::new("prepare_worker")]);
 
-        let mut workflow = removal_at_door::<Host>(f.door, f.objects, SCOPE);
+        let mut workflow = removal_from_store::<Host>(f.door, f.objects, SCOPE);
         assert_eq!(workflow.id, WorkflowId::new("worker_removal"));
         assert!(workflow.validate().is_ok());
         let edges = [

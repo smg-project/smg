@@ -15,8 +15,8 @@ use crate::{
         prefix_pass::forget_prefix_pass,
         sticky_sessions::{self, Claim, SessionExpiry, SessionRule, SessionTable, SessionVerdict},
         view::{
-            mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
-            ReportCutoff, RequestFacts, WorkerId,
+            mean_in_flight, AffinityFacts, Candidate, Constraints, LoadReportCutoff, NamedAffinity,
+            Phase, PoolFacts, RequestFacts, WorkerId,
         },
         warm_up::WarmRule,
     },
@@ -3024,8 +3024,9 @@ impl Keeper {
     }
 }
 
-/// A stage keeps state a decider, so each model decides at its own seat.
-pub(crate) const KEEPS_DECIDERS: u8 = 1;
+/// A stage keeps state for each decision slot, so each model decides at its
+/// own slot.
+pub(crate) const KEEPS_SLOT_STATE: u8 = 1;
 /// The generation samples decisions at the seat where they were made.
 pub(crate) const SAMPLES_DECISIONS: u8 = 2;
 /// A binding of the generation names a shadow.
@@ -4154,7 +4155,7 @@ impl Engine {
             named_by,
             row_tests,
             orders,
-            seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
+            seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
             max_report_age_ms: None,
             keepers,
@@ -4315,8 +4316,8 @@ impl Engine {
     /// scope. A stage kind that keeps state a decider and opens none
     /// joins this fact: without it such a host would split that state by
     /// thread, with no error.
-    pub fn keeps_deciders(&self) -> bool {
-        self.seat_flags & KEEPS_DECIDERS != 0
+    pub fn keeps_slot_state(&self) -> bool {
+        self.seat_flags & KEEPS_SLOT_STATE != 0
     }
 
     pub(crate) fn seat_flags(&self) -> u8 {
@@ -6272,7 +6273,7 @@ impl Engine {
 
 #[inline(never)]
 fn all_reports_current(candidates: &[Candidate], now_micros: u64, max_age_ms: u64) -> bool {
-    let cutoff = ReportCutoff::new(now_micros, max_age_ms);
+    let cutoff = LoadReportCutoff::new(now_micros, max_age_ms);
     candidates.iter().all(|row| cutoff.load(row).is_some())
 }
 

@@ -2086,7 +2086,7 @@ impl Embedded {
     /// A store of `deciders` files of leases with `document` applied as
     /// its first generation, and no engine yet.
     pub fn start(deciders: usize, mut document: PolicySpec) -> Result<Self, String> {
-        let store = MemoryStore::new().with_deciders(deciders);
+        let store = MemoryStore::new().with_decision_slots(deciders);
         document.generation = 1;
         let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
         store.apply(spec).map_err(|error| error.to_string())?;

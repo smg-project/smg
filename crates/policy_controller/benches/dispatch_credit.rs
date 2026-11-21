@@ -88,9 +88,13 @@ impl Scorer for SentWhole {
 fn registered(name: &str) -> Engine {
     let mut catalog = StageRegistry::builtin();
     catalog
-        .scorer_with("sent-score", |build| Ok(Box::new(SentScore(build.sent()))))
+        .scorer_with("sent-score", |build| {
+            Ok(Box::new(SentScore(build.dispatch_credit())))
+        })
         .expect("a free name")
-        .scorer_with("sent-whole", |build| Ok(Box::new(SentWhole(build.sent()))))
+        .scorer_with("sent-whole", |build| {
+            Ok(Box::new(SentWhole(build.dispatch_credit())))
+        })
         .expect("a free name");
     let document: PolicySpec = serde_json::from_value(serde_json::json!({
         "apiVersion": API_VERSION,
@@ -198,7 +202,9 @@ fn cells(c: &mut Criterion, group: &str, engine: fn() -> Engine, in_flight_cycle
 fn least_load(reader: bool) -> Engine {
     let mut catalog = StageRegistry::builtin();
     catalog
-        .scorer_with("sent-score", |build| Ok(Box::new(SentScore(build.sent()))))
+        .scorer_with("sent-score", |build| {
+            Ok(Box::new(SentScore(build.dispatch_credit())))
+        })
         .expect("a free name");
     let score = if reader {
         serde_json::json!(["least-load", "sent-score"])

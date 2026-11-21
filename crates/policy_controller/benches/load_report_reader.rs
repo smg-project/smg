@@ -91,7 +91,7 @@ fn engine(name: &str, max_age_ms: Option<u64>) -> Engine {
         .scorer("from-row", || Box::new(FromRow))
         .expect("a free name")
         .scorer_with("through-reader", |build| {
-            Ok(Box::new(ThroughReader(build.reports())))
+            Ok(Box::new(ThroughReader(build.load_report_reader())))
         })
         .expect("a free name");
     let document: PolicySpec = serde_json::from_value(serde_json::json!({

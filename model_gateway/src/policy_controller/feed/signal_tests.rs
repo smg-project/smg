@@ -297,7 +297,7 @@ impl Bed {
     /// dropped one: written, undeclared, wrong unit, out of range, not a
     /// member, older.
     fn taken(&self) -> [u64; 6] {
-        self.store.counts().signal_writes
+        self.store.stats().signal_writes
     }
 
     /// The row a regular request is placed on at `now`, and what its

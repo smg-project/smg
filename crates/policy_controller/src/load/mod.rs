@@ -9,6 +9,6 @@ pub(crate) mod load_report_reader;
 pub(crate) mod signals;
 
 #[cfg(any(feature = "ingest", feature = "worker-host"))]
-pub use load_report::{load_row, signal_values, RankValues, ReportOf};
+pub use load_report::{load_row, signal_values, LoadReportRanks, RankValues};
 pub use load_report_reader::{LoadReportPass, LoadReportReader};
 pub use signals::{SignalCell, SignalCells, SignalColumn};

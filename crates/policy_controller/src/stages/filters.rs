@@ -7,7 +7,7 @@ use crate::{
     document::spec::Needs,
     engine::{
         framework::Filter,
-        view::{Candidate, Constraints, LoadRow, ReportCutoff, RequestFacts},
+        view::{Candidate, Constraints, LoadReportCutoff, LoadRow, RequestFacts},
     },
     load::signals::{SignalColumn, SignalSums, SignalTerm},
     stages::cost_terms::{Coefficients, CostTerm},
@@ -432,7 +432,7 @@ impl Filter for HasRoomWithin {
     }
 
     fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
-        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        let cutoff = LoadReportCutoff::new(facts.now_micros, self.max_age_ms);
         self.rule.keep_with(facts, c, cutoff.load(c))
     }
 
@@ -443,7 +443,7 @@ impl Filter for HasRoomWithin {
         _: &Constraints<'_>,
         kept: &mut Vec<u32>,
     ) {
-        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        let cutoff = LoadReportCutoff::new(facts.now_micros, self.max_age_ms);
         self.rule
             .retain_with(facts, candidates, kept, |row| cutoff.load(row));
     }
@@ -664,7 +664,7 @@ impl Filter for HasRoomSignals {
     fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
         match self.max_age_ms {
             Some(max_age_ms) => {
-                let cutoff = ReportCutoff::new(facts.now_micros, max_age_ms);
+                let cutoff = LoadReportCutoff::new(facts.now_micros, max_age_ms);
                 self.keep_with(facts, c, cutoff.load(c))
             }
             None => self.keep_with(facts, c, c.load.as_ref()),
@@ -680,7 +680,7 @@ impl Filter for HasRoomSignals {
     ) {
         match self.max_age_ms {
             Some(max_age_ms) => {
-                let cutoff = ReportCutoff::new(facts.now_micros, max_age_ms);
+                let cutoff = LoadReportCutoff::new(facts.now_micros, max_age_ms);
                 self.retain_with(facts, candidates, kept, |row| cutoff.load(row));
             }
             None => self.retain_with(facts, candidates, kept, |row| row.load.as_ref()),

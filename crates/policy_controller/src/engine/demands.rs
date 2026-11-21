@@ -41,9 +41,9 @@ pub enum References {
     /// By a worker that processes media by reference, whichever pipeline
     /// it runs.
     Any,
-    /// By a worker that processes it by its registering host's own
-    /// pipeline, and by no other.
-    Host,
+    /// By a worker that processes it by the pipeline of the caller that
+    /// registered it, and by no other.
+    Caller,
     /// By a worker that processes it by a pipeline of its own, and by no
     /// other.
     Worker,
@@ -104,7 +104,7 @@ impl Demands {
         let host = match self.references {
             References::None => None,
             References::Any => Some(facts.host_pipeline),
-            References::Host => Some(true),
+            References::Caller => Some(true),
             References::Worker => Some(false),
         };
         if let Some(host) = host {
@@ -281,7 +281,7 @@ mod tests {
         for demands in [
             asks(true, References::None),
             asks(false, References::Any),
-            asks(false, References::Host),
+            asks(false, References::Caller),
             asks(false, References::Worker),
         ] {
             assert!(!demands.is_none(), "{demands:?}");
@@ -297,8 +297,8 @@ mod tests {
             (asks(false, References::Any), plain, Some(Unmet::References)),
             (asks(false, References::Any), host, None),
             (asks(false, References::Any), own, None),
-            (asks(false, References::Host), host, None),
-            (asks(false, References::Host), own, Some(Unmet::Pipeline)),
+            (asks(false, References::Caller), host, None),
+            (asks(false, References::Caller), own, Some(Unmet::Pipeline)),
             (asks(false, References::Worker), host, Some(Unmet::Pipeline)),
             (asks(false, References::Worker), own, None),
             (
@@ -308,7 +308,7 @@ mod tests {
             ),
             // Vision is judged before media by reference.
             (asks(true, References::Any), own, Some(Unmet::Vision)),
-            (asks(true, References::Host), host, None),
+            (asks(true, References::Caller), host, None),
         ];
         for (demands, (vision, facts), unmet) in table {
             let judged = demands.unmet_by(vision, facts);
@@ -320,7 +320,7 @@ mod tests {
             runtime: 8,
             ..DemandFacts::default()
         };
-        let every = asks(true, References::Host);
+        let every = asks(true, References::Caller);
         assert_eq!(every.unmet_by(true, elsewhere), Some(Unmet::Runtime));
     }
 
@@ -359,7 +359,7 @@ mod tests {
             assert_eq!(unmet, judged, "{input} {output} {stated}");
         }
         let both = Demands {
-            references: References::Host,
+            references: References::Caller,
             ..asks(101, 0)
         };
         let own = DemandFacts {
@@ -382,7 +382,7 @@ mod tests {
         let asked = Demands {
             runtime: 7,
             vision: true,
-            references: References::Host,
+            references: References::Caller,
             input_window: 40,
             output_window: 400,
         };

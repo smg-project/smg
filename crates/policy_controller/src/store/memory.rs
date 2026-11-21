@@ -26,7 +26,7 @@ use crate::{
     document::spec::AppliedSpec,
     engine::{
         prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
-        view::{LoadRow, Role, Session, WorkerId, REPORT_CLOCK_HISTORY_MS},
+        view::{LoadRow, Role, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
     load::signals::{SignalCell, SignalColumn},
     stages::lifecycle::Lifecycle,
@@ -36,8 +36,8 @@ use crate::{
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
-            Counts, DecodeMark, DecodeRefused, DecodeSide, Dispatch, LeaseRecord, LeaseRefused,
-            LeaseState, LeasesStore, Said, Sides, WorkerSlot, DISPATCH_TTL,
+            DecodeMark, DecodeRefused, DecodeSide, Dispatch, InFlightCounts, LeaseRecord,
+            LeaseRefused, LeaseState, LeasesStore, Said, Sides, WorkerSlot, DISPATCH_TTL,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
@@ -70,7 +70,7 @@ const CHANGE_LOG: usize = 1_024;
 /// The store's counts one scrape reports: the first two of one state of
 /// the store.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct StoreCounts {
+pub struct StoreStats {
     /// The members outside the standing generation's lists.
     pub outside: OutsideLists,
     /// The load writes that moved an overload verdict.
@@ -142,7 +142,7 @@ pub struct MemoryStore {
     joined: Mutex<Vec<(WorkerId, WorkerSlot)>>,
     /// The store's counts of the leases on file, for the write that gives
     /// a joining member its slot.
-    counts: Arc<Counts>,
+    counts: Arc<InFlightCounts>,
     /// Where the rows' clock starts.
     origin: Instant,
     /// Where the term is told, and that a write's locks are let go; `None`
@@ -226,7 +226,7 @@ impl MemoryStore {
         // An hour before the store was made, where the host's clock reaches
         // that far: a sample older than the store keeps an instant of its
         // own.
-        let history = Duration::from_millis(u64::from(REPORT_CLOCK_HISTORY_MS));
+        let history = Duration::from_millis(u64::from(LOAD_REPORT_CLOCK_HISTORY_MS));
         let origin = now.checked_sub(history).unwrap_or(now);
         let kv = Arc::new(KvTables::default());
         let writer = Writer::new(window, origin).over(Arc::clone(&kv));
@@ -1352,9 +1352,9 @@ impl MemoryStore {
 
     /// The counts one scrape reports. The load table's two are read under
     /// one hold of the load lock, so they are of one state of the store.
-    pub fn counts(&self) -> StoreCounts {
+    pub fn stats(&self) -> StoreStats {
         let loads = self.loads.lock();
-        StoreCounts {
+        StoreStats {
             outside: loads.writer.outside(),
             overload_flips: loads.writer.flips(),
             lifecycle_faults: self.lifecycle_faults(),
@@ -1367,7 +1367,7 @@ impl MemoryStore {
     /// membership build and an applied generation judge again and count
     /// nothing.
     pub fn overload_flips(&self) -> u64 {
-        self.counts().overload_flips
+        self.stats().overload_flips
     }
 
     /// How many members of the standing membership name an engine family
@@ -1375,7 +1375,7 @@ impl MemoryStore {
     /// list. Such a worker is admitted and reads position 0 in that field;
     /// a generation that declares no list counts none.
     pub fn outside_lists(&self) -> OutsideLists {
-        self.counts().outside
+        self.stats().outside
     }
 
     /// `held`, run with the load lock held: a write that answers meanwhile
@@ -3624,7 +3624,7 @@ struct Leases {
     /// ([`Leases::leave`]): no other door lays or takes either.
     decodes: Decodes,
     /// The store's counts, a cell a worker: what the leases on file book.
-    counts: Arc<Counts>,
+    counts: Arc<InFlightCounts>,
     /// The store's sessions' tables: what the leases on file that a
     /// sessions rule governed book of their keys' requests in flight.
     sessions: Arc<SessionTables>,
@@ -3909,7 +3909,7 @@ fn state_after_deadline(state: LeaseState) -> LeaseState {
 
 /// Moves a side's booking to the slot `to`: the count it booked is free
 /// and `to`'s is booked.
-fn rebook(counts: &Counts, booked: &mut Option<WorkerSlot>, to: Option<WorkerSlot>) {
+fn rebook(counts: &InFlightCounts, booked: &mut Option<WorkerSlot>, to: Option<WorkerSlot>) {
     let first = *booked;
     *booked = to;
     counts.moved(first, to);
@@ -3940,7 +3940,7 @@ impl Leases {
     /// file that owns its turn.
     fn empty(
         term: u64,
-        counts: Arc<Counts>,
+        counts: Arc<InFlightCounts>,
         sessions: Arc<SessionTables>,
         origin: Instant,
     ) -> Self {
@@ -4304,7 +4304,7 @@ impl Leases {
     /// booking can move. A chosen decode books its target at dispatch.
     fn dispatched_side(
         slots: Slots<'_>,
-        counts: &Counts,
+        counts: &InFlightCounts,
         sessions: &SessionTables,
         held: &mut Held,
         decode: &mut HeldDecode,
@@ -4905,9 +4905,9 @@ impl MemoryStore {
 }
 
 impl MemoryStore {
-    /// The store with a file of leases a decider, for a host that decides
-    /// on `deciders` threads and names them
-    /// ([`crate::engine::DecisionSlot`]): each decider issues into its own
+    /// The store with a file of leases for each decision slot, for a caller
+    /// that decides on `deciders` threads and names them
+    /// ([`crate::engine::DecisionSlot`]): each slot issues into its own
     /// file under its own turn, and a lease's events are told under the
     /// name of the decider whose file it is on. The files start empty,
     /// under the store's term, and keep the word to the engine and the
@@ -4918,7 +4918,7 @@ impl MemoryStore {
     /// Where a lease is on file: its file would go with it, and the count
     /// it books would stand for good.
     #[must_use]
-    pub fn with_deciders(mut self, deciders: usize) -> Self {
+    pub fn with_decision_slots(mut self, deciders: usize) -> Self {
         // Every file is read, each under its own turn: a lease on any of
         // them would go with its file.
         let empty = self.files.iter().all(|file| file.take().records.is_empty());
@@ -4935,9 +4935,9 @@ impl MemoryStore {
         self
     }
 
-    /// How many files of leases the store holds: one a decider.
+    /// How many files of leases the store holds: one for each decision slot.
     #[must_use]
-    pub fn deciders(&self) -> usize {
+    pub fn decision_slots(&self) -> usize {
         self.files.len()
     }
 
@@ -5364,7 +5364,7 @@ mod tests {
 
     #[test]
     fn the_lease_sweep_takes_only_a_file_with_a_due_lease() {
-        let store = MemoryStore::new().with_deciders(256);
+        let store = MemoryStore::new().with_decision_slots(256);
         let clear_takes = || store.files.iter().for_each(turn::File::clear_takes);
         let takes = || store.files.iter().map(turn::File::takes).sum::<usize>();
         let now = Instant::now();
@@ -5419,7 +5419,7 @@ mod tests {
     /// the sweep emptied is passed.
     #[test]
     fn a_file_is_asked_once_and_then_at_the_deadline_the_sweep_read() {
-        let store = MemoryStore::new().with_deciders(256);
+        let store = MemoryStore::new().with_decision_slots(256);
         let clear_takes = || store.files.iter().for_each(turn::File::clear_takes);
         let takes = || store.files.iter().map(turn::File::takes).sum::<usize>();
         let now = Instant::now();

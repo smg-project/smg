@@ -5,7 +5,7 @@
 //! `least-load`.
 //!
 //! Most of the scorer's mechanism is the credit of the sends since a worker's
-//! last report. That credit is shared code: `SinceReport` among the shared
+//! last report. That credit is shared code: `RankCredit` among the shared
 //! stages, and the sent record in `tracking`.
 
 #[cfg(test)]
@@ -15,7 +15,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::stages::scorers::HeldCredit;
 #[cfg(test)]
-use crate::stages::scorers::SinceReport;
+use crate::stages::scorers::RankCredit;
 use crate::{
     document::spec::{Needs, ProfileSpec},
     engine::{
@@ -139,7 +139,7 @@ impl LeastLoad {
 
     /// The rank row, for a test that holds its retire lock.
     #[cfg(test)]
-    fn row(&self, worker: WorkerId, dp_rank: u16) -> Arc<SinceReport> {
+    fn row(&self, worker: WorkerId, dp_rank: u16) -> Arc<RankCredit> {
         self.sent
             .credits
             .tally
@@ -506,7 +506,7 @@ mod tests {
             scorers::{
                 take_lane,
                 tests::{candidate, kept, report, RETIRE_WAITS},
-                SessionAffinity, RETIRE_BATCH, SINCE_REPORT_KEPT,
+                SessionAffinity, RANK_CREDIT_KEPT, RETIRE_BATCH,
             },
         },
     };
@@ -1072,7 +1072,7 @@ mod tests {
                 });
             });
         };
-        book(0, 2_000, SINCE_REPORT_KEPT, 7);
+        book(0, 2_000, RANK_CREDIT_KEPT, 7);
         book(1, 20_000, 1_000, 70);
         let mut scores = vec![0.0f32; 1];
         let mut sampled = pool.clone();
@@ -1114,9 +1114,9 @@ mod tests {
             });
         };
         book(0, 2_000, 10);
-        book(1, 3_000, SINCE_REPORT_KEPT - 10);
+        book(1, 3_000, RANK_CREDIT_KEPT - 10);
         book(2, 30_000, 1);
-        let kept = SINCE_REPORT_KEPT as usize - RETIRE_BATCH + 1;
+        let kept = RANK_CREDIT_KEPT as usize - RETIRE_BATCH + 1;
         assert_eq!(ll.held(pool[0].id), kept, "a whole batch retired");
         assert_eq!(
             ll.held_word_at(pool[0].id, 0),
@@ -1155,7 +1155,7 @@ mod tests {
         };
         let recent = RETIRE_BATCH as u64 - 1;
         book(0, 2_000, 1);
-        book(1, 3_000, SINCE_REPORT_KEPT - RETIRE_BATCH as u64);
+        book(1, 3_000, RANK_CREDIT_KEPT - RETIRE_BATCH as u64);
         book(0, 20_000, recent);
         book(2, 30_000, 1);
         let mut scores = vec![0.0f32; 1];
@@ -1196,7 +1196,7 @@ mod tests {
                 });
             });
         };
-        book(0, 2_000, SINCE_REPORT_KEPT - 1);
+        book(0, 2_000, RANK_CREDIT_KEPT - 1);
         book(1, 20_000, 100);
         let mut scores = vec![0.0f32; 1];
         let mut sampled = pool.clone();
@@ -1268,8 +1268,8 @@ mod tests {
                 });
             });
         };
-        let bound = SINCE_REPORT_KEPT as usize;
-        book(0, 2_000, SINCE_REPORT_KEPT);
+        let bound = RANK_CREDIT_KEPT as usize;
+        book(0, 2_000, RANK_CREDIT_KEPT);
         let row = ll.row(pool[0].id, 0);
         let in_progress = row.retiring_for_test();
         book(1, 20_000, RETIRE_BATCH as u64);

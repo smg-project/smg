@@ -60,7 +60,10 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert_eq!(rolled.standing, (1, Some(digest)));
     assert_eq!(rolled.ran, refused.ran);
     assert_eq!(door.document(0), Ok(held));
-    assert_eq!((door.counts().applied, door.counts().rejected), (1, 2));
+    assert_eq!(
+        (door.apply_counts().applied, door.apply_counts().rejected),
+        (1, 2)
+    );
 
     for (key, model) in [
         ("grpc://b:8000", "served"),
@@ -158,7 +161,10 @@ fn a_host_counts_each_document_it_cannot_apply() {
     };
     let unpublished = door.apply_where(START.to_vec(), json, |_| None, |_, _| Err(stale));
     assert_eq!(unpublished, Err(SpecRejected::Stale(stale)));
-    assert_eq!((door.counts().applied, door.counts().rejected), (0, 3));
+    assert_eq!(
+        (door.apply_counts().applied, door.apply_counts().rejected),
+        (0, 3)
+    );
 }
 
 /// A null under a built-in rule's name, the slip of a bare name written

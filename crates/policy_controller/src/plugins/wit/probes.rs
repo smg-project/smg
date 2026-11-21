@@ -84,7 +84,7 @@ wit! {
     Option<NamedAffinity<'_>> => "host-only",
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
-    Option<&crate::tracking::LentCounts<'_>> => "host-only",
+    Option<&crate::tracking::PoolInFlightCounts<'_>> => "host-only",
     // Host-only: a guest reads a candidate's count of the request's session
     // key as the candidate's own field, written there or lent beside it.
     Option<&[crate::engine::KeyedRow]> => "host-only",

@@ -148,7 +148,7 @@ struct RowJson<'a> {
     signals: SignalsJson,
     health_policy: HealthPolicyJson,
     admitted_age_ms: u64,
-    maker: Option<MakerJson<'a>>,
+    maker: Option<RegistrantJson<'a>>,
 }
 
 /// From where a row is reachable: every gateway, or the one that holds its
@@ -202,7 +202,7 @@ struct HealthPolicyJson {
 }
 
 #[derive(Serialize)]
-struct MakerJson<'a> {
+struct RegistrantJson<'a> {
     provider: &'a str,
     key: &'a str,
 }
@@ -275,7 +275,7 @@ impl<'a> RowJson<'a> {
             admitted_age_ms: u64::try_from(age).unwrap_or(u64::MAX),
             maker: match &row.maker {
                 Registrant::Control => None,
-                Registrant::Provider(maker) => Some(MakerJson {
+                Registrant::Provider(maker) => Some(RegistrantJson {
                     provider: maker.provider(),
                     key: maker.key(),
                 }),

@@ -52,8 +52,8 @@
 //! the rows its registrations wrote: a row no registration of this host
 //! stated takes none. Where a registration's answer says so, the host has
 //! the holder lay the address's objects again ([`Objects::lay_again`]).
-//! [`registration_at_door_keeping`] makes these calls with the keeper the
-//! host's holder was built with.
+//! [`registration_into_store_keeping_credentials`] makes these calls with the
+//! keeper the host's holder was built with.
 //!
 //! A host whose registrations run in its own process needs none of that.
 //! Its registration built a whole object a row, and the holder keeps each
@@ -89,9 +89,9 @@
 //! [`StoreMembershipWriter`]. A replica that may lead uses the controller's
 //! door.
 //!
-//! [`registration_at_door`] writes the created workers' rows, and hands
+//! [`registration_into_store`] writes the created workers' rows, and hands
 //! each built worker to the door with its write.
-//! [`removal_at_door`] marks the selected rows draining, waits for the
+//! [`removal_from_store`] marks the selected rows draining, waits for the
 //! workers to settle and removes their rows. The steps write the store
 //! through the door. [`Objects`] remains the registry's one writer.
 //!
@@ -144,7 +144,8 @@ pub use membership_writer::{
 pub use object::object;
 pub use objects::{Members, Objects, RowRevision};
 pub use steps::{
-    maker_of, registration_at_door, registration_at_door_keeping, removal_at_door, remover_of,
-    DrainWorkersAtDoor, NoKeeper, RemoveWorkersAtDoor, Unasked, WriteWorkersAtDoor, DISCOVERY,
-    DRAIN_WORKERS_AT_DOOR_STEP, REMOVE_WORKERS_AT_DOOR_STEP, WRITE_WORKERS_AT_DOOR_STEP,
+    registrant_of, registration_into_store, registration_into_store_keeping_credentials,
+    removal_from_store, remover_of, DrainWorkersInStore, NoCredentials, RemoveWorkersFromStore,
+    Unasked, WriteWorkersToStore, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP,
+    REMOVE_WORKERS_FROM_STORE_STEP, WRITE_WORKERS_TO_STORE_STEP,
 };

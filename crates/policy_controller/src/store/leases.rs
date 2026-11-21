@@ -6,7 +6,7 @@ use std::time::Instant;
 /// The table of counts the leases on file book and a member's place in
 /// it, named here for the store's files that write it: their home is the
 /// counts' own module.
-pub(super) use crate::tracking::in_flight::{Counts, WorkerSlot};
+pub(super) use crate::tracking::in_flight::{InFlightCounts, WorkerSlot};
 use crate::{
     engine::{
         decision::{Targets, MAX_TARGETS},

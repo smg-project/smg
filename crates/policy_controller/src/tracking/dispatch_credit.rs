@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     engine::{Candidate, RequestFacts, Target, WorkerId},
-    stages::scorers::{Credits, SinceReport},
+    stages::scorers::{Credits, RankCredit},
     tracking::{Lease, Membership, Side},
 };
 
@@ -148,7 +148,7 @@ impl DispatchCredit {
     }
 }
 
-type Tally = FxHashMap<(WorkerId, u16), Arc<SinceReport>>;
+type Tally = FxHashMap<(WorkerId, u16), Arc<RankCredit>>;
 
 /// A pass over a profile's send tally at one request's clock.
 pub struct DispatchCreditPass<'a> {

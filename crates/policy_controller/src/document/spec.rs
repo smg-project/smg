@@ -42,7 +42,7 @@ use crate::{
             Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
         },
         sticky_sessions::SessionRule,
-        view::{blocks_within, threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
+        view::{blocks_within, threshold_permille, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
     },
     load::{
         load_report_reader::LoadReportReader,
@@ -61,9 +61,9 @@ use crate::{
         pickers::SampledBest,
         registry::{profile_sent, FilterFactory, Found, PickerFactory, StageBuild, StageRegistry},
         scorers::{
-            with_report_age, FewestSessions, LeastCost, LeastCostSent, LeastCostSignals,
-            LeastRequests, ResidentWork, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT,
-            DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+            with_load_report_age_limit, FewestSessions, LeastCost, LeastCostSignals,
+            LeastCostWithDispatches, LeastRequests, ResidentWork, SessionAffinity,
+            DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
         },
     },
     tracking::dispatch_credit::DispatchCredit,
@@ -342,12 +342,12 @@ pub struct ViewSpec {
     /// `least-cost` and the KV-pressure gates of `prefix-affinity` and
     /// `warmup-slice` treat older reports as missing. A report exactly at
     /// the limit still counts. A host-registered stage reads a report
-    /// under the limit through its build context's `reports()`, and one
-    /// that reads the row's report itself sees it at any age. Overload
-    /// verdicts can still reflect older reports, and plugins interpret
-    /// report age themselves. Omit it to use reports of any age.
+    /// under the limit through its build context's `load_report_reader()`,
+    /// and one that reads the row's report itself sees it at any age.
+    /// Overload verdicts can still reflect older reports, and plugins
+    /// interpret report age themselves. Omit it to use reports of any age.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
+    #[schemars(range(min = 1, max = MAX_LOAD_REPORT_AGE_MS))]
     pub max_report_age_ms: Option<u64>,
     /// The worker labels a stage may read, each a selector of one label
     /// key: `key` (the worker carries the label, whatever its value) or
@@ -2392,7 +2392,7 @@ pub struct SignalSpec {
     /// under a longer limit it would read as fresh. Absent: a value does
     /// not end by its age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
+    #[schemars(range(min = 1, max = MAX_LOAD_REPORT_AGE_MS))]
     pub max_age_ms: Option<u32>,
     /// How one row's value is made where its report holds several ranks.
     /// Absent: the sum.
@@ -2801,7 +2801,7 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
     at.number(
         "max_report_age_ms",
         view.max_report_age_ms,
-        |ms| (1..=u64::from(MAX_REPORT_AGE_MS)).contains(&ms),
+        |ms| (1..=u64::from(MAX_LOAD_REPORT_AGE_MS)).contains(&ms),
         "a whole number from 1 to 3599999",
     )?;
     if view.boundaries.first() == Some(&0) {
@@ -2944,7 +2944,7 @@ fn check_signals(signals: &BTreeMap<String, SignalSpec>) -> Result<(), SpecError
         }
         match spec.max_age_ms {
             Some(0) => return Err(at().bad("max_age_ms", 0, "above zero")),
-            Some(ms) if ms > MAX_REPORT_AGE_MS => {
+            Some(ms) if ms > MAX_LOAD_REPORT_AGE_MS => {
                 return Err(at().bad("max_age_ms", ms, "a whole number from 1 to 3599999"));
             }
             _ => {}
@@ -3220,11 +3220,11 @@ fn least_cost_of(
             reads_sent.then(sent),
             signal_terms.into_boxed_slice(),
         );
-        with_report_age(scorer, max_age_ms)
+        with_load_report_age_limit(scorer, max_age_ms)
     } else if reads_sent {
-        with_report_age(LeastCostSent::new(scorer, sent()), max_age_ms)
+        with_load_report_age_limit(LeastCostWithDispatches::new(scorer, sent()), max_age_ms)
     } else {
-        with_report_age(scorer, max_age_ms)
+        with_load_report_age_limit(scorer, max_age_ms)
     })
 }
 
@@ -3341,7 +3341,7 @@ fn scorer_of(
 ) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
     let max_age = view.max_report_age_ms;
     Ok(match stage {
-        ScoreStage::LeastLoad(p) => Resolved::Built(with_report_age(
+        ScoreStage::LeastLoad(p) => Resolved::Built(with_load_report_age_limit(
             LeastLoad::of_profile(
                 p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
                 p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
@@ -3366,13 +3366,15 @@ fn scorer_of(
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
-        ScoreStage::PrefixAffinity(p) => {
-            Resolved::Built(with_report_age(PrefixAffinity::new(p, gates), max_age))
-        }
+        ScoreStage::PrefixAffinity(p) => Resolved::Built(with_load_report_age_limit(
+            PrefixAffinity::new(p, gates),
+            max_age,
+        )),
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
-        ScoreStage::WarmupSlice(p) => {
-            Resolved::Built(with_report_age(WarmupSlice::new(p, gates), max_age))
-        }
+        ScoreStage::WarmupSlice(p) => Resolved::Built(with_load_report_age_limit(
+            WarmupSlice::new(p, gates),
+            max_age,
+        )),
         ScoreStage::Bucket(p) => built_scorer(Bucket::new(p)),
         ScoreStage::ConsistentHash(p) => {
             let ring = ConsistentHash::new(p.bounded_load.as_ref());
@@ -3381,7 +3383,7 @@ fn scorer_of(
                 None => ring,
             })
         }
-        ScoreStage::ResidentWork(p) => Resolved::Built(with_report_age(
+        ScoreStage::ResidentWork(p) => Resolved::Built(with_load_report_age_limit(
             ResidentWork::new(p.request_tokens),
             max_age,
         )),

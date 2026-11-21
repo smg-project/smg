@@ -1,13 +1,12 @@
-//! The deciders (design 5.5): the threads the controller's decisions run
-//! on, each behind one bounded queue.
+//! The decision slots (design 5.5): the threads the controller's decisions
+//! run on, each behind one bounded queue.
 //!
-//! A model's decisions all run on one decider ([`Deciders::of`]): the model
-//! is the key, so what a model's decisions write has one writer, and the
-//! requests a stream sends for one model are decided in the order it sent
-//! them. No runtime thread decides and none waits for a decision: a
-//! stream's reader hands a request over ([`Deciders::submit`]) or is told
-//! at once that the queue is full, and the answer comes back on the
-//! stream's own queue.
+//! A model's decisions all run on one decider ([`DecisionSlots::of`]): the
+//! model is the key, so what a model's decisions write has one writer, and the
+//! requests a stream sends for one model are decided in the order it sent them.
+//! No runtime thread decides and none waits for a decision: a stream's reader
+//! hands a request over ([`DecisionSlots::submit`]) or is told at once that the
+//! queue is full, and the answer comes back on the stream's own queue.
 //!
 //! One invariant: **an answer leaves under the term it was made under, or
 //! it does not leave.** A decider reads the fence twice: before it builds
@@ -38,7 +37,7 @@
 //!    and handing the answer over: a decision whose budget ended while it was
 //!    made, its lease's filing and the stages' hearing of it included,
 //!    leaves as `Busy` under the reason a late arrival is told, and under
-//!    a count of its own ([`Counts`]). So does a pick whose lease has
+//!    a count of its own ([`DecideStats`]). So does a pick whose lease has
 //!    under a millisecond of its dispatch span left at that read: the span
 //!    counts from the first read, and the answer's lease carries what is
 //!    left of it. The lease of an answer that does not leave is given up
@@ -103,7 +102,7 @@
 //! dispatch deadline would end it ([`MemoryStore::asked_again`]), and
 //! decides the request as any other. The earlier lease is on that
 //! decider's file: a model's requests go to one decider for the process's
-//! life ([`Deciders::of`]). A request sent twice under one id without the
+//! life ([`DecisionSlots::of`]). A request sent twice under one id without the
 //! word is two requests and is issued two leases: a lease is keyed by its
 //! gateway and the id the store mints, and no two asks are joined by the
 //! id their asker states. A repeat its stream answers `Busy` before a
@@ -124,7 +123,7 @@
 //! A term mints 2^32 - 1 ids, and under every term but the last a leader
 //! leaves before they end. The first answer a term hands over with an id at
 //! or past its mark ([`past_mark`], three quarters of the ids) tells the
-//! election to hand the lease over ([`Deciders::leave_through`]), once a
+//! election to hand the lease over ([`DecisionSlots::leave_through`]), once a
 //! term whichever decider's it is: the next take brings a term whose ids
 //! start again. The counter's end stands as the last guard, where a pick is
 //! answered `Busy`: under the last term a replica can take no word is said.
@@ -141,7 +140,7 @@
 //! What this build has no decision for is answered `Busy` with no reason,
 //! and its gateway decides it locally at once: a shed is a policy's word
 //! and reaches the client, and no policy spoke. Four arms, each counted
-//! by its cause ([`Counts`]): a decision that panics, a request for a side
+//! by its cause ([`DecideStats`]): a decision that panics, a request for a side
 //! of a pair plan that is not the pair's one request (decode under either
 //! pair plan, encode under the plan that has an encode side: a pair is
 //! decided at its prefill, and its alternates ride that answer), a
@@ -160,7 +159,7 @@
 //! where the engine is told ([`lifecycle`]), whoever applies the lease's
 //! event: it costs no request its decision and ends no decider.
 //! A decider's thread that unwinds anywhere else leaves its models with no
-//! decider: the deciders tell it ([`Deciders::ended`]), for the controller
+//! decider: the deciders tell it ([`DecisionSlots::ended`]), for the controller
 //! to stop, since a leader that cannot decide for a model must not keep
 //! the lead.
 //!
@@ -221,7 +220,7 @@ use crate::{
 /// is decided inside both, with its hashes inside the cap and every
 /// candidate one its gateway can dial, moves none of them.
 #[derive(Debug, Default)]
-pub(crate) struct Counts {
+pub(crate) struct DecideStats {
     /// `Busy` answers, each at its reason's number on the wire.
     pub(crate) busy: [AtomicU64; 9],
     /// Decisions that panicked.
@@ -241,8 +240,8 @@ pub(crate) struct Counts {
     /// them still in its queue.
     pub(crate) dropped_gone: AtomicU64,
     /// What a decision that is made may count, each decider's in a part of
-    /// its own: read whole by [`Counts::undialed`] and
-    /// [`Counts::hashes_cut`].
+    /// its own: read whole by [`DecideStats::undialed`] and
+    /// [`DecideStats::hashes_cut`].
     parts: [Part; PARTS],
     /// Decisions cut at their last read, with under a microsecond of the
     /// budget or under a millisecond of the lease's dispatch span left. Each
@@ -267,7 +266,7 @@ pub(crate) struct Counts {
 /// one at its index, and deciders past this many share one.
 const PARTS: usize = 16;
 
-impl Counts {
+impl DecideStats {
     /// The reasons of a `Busy`, in the order of their numbers on the wire.
     pub(crate) const BUSY: [&'static str; 9] = [
         "unspecified",
@@ -337,7 +336,8 @@ pub(crate) type Leave = Box<dyn Fn(u64) + Send + Sync>;
 /// it was said under, so one decider says it and once.
 #[derive(Default)]
 struct Mark {
-    /// The word ([`Deciders::leave_through`]): none until the election runs.
+    /// The word ([`DecisionSlots::leave_through`]): none until the election
+    /// runs.
     leave: OnceLock<Leave>,
     /// The highest term whose word was said, or was found to have none to
     /// say: the last term a replica can take.
@@ -394,7 +394,7 @@ pub(crate) struct Reads {
     /// carries.
     pub(crate) standing: watch::Receiver<ElectionObservation>,
     pub(crate) clock: Clock,
-    pub(crate) counts: Arc<Counts>,
+    pub(crate) counts: Arc<DecideStats>,
 }
 
 impl Reads {
@@ -438,9 +438,9 @@ pub(crate) enum Refused {
     Gone,
 }
 
-/// The deciders. Their drop ends each thread, after the requests its queue
-/// still holds.
-pub(crate) struct Deciders {
+/// The decision slots. Their drop ends each thread, after the requests its
+/// queue still holds.
+pub(crate) struct DecisionSlots {
     /// Each decider's queue, at its index.
     queues: Box<[SyncSender<Job>]>,
     /// Shows `true` once a decider's thread unwound.
@@ -464,7 +464,7 @@ impl Drop for Unwound {
     }
 }
 
-impl Deciders {
+impl DecisionSlots {
     /// Starts `deciders` threads, each behind a queue of `depth` requests:
     /// at least one thread and at most `DecisionSlot::COUNT`, and a queue of at
     /// least one. Refused over a store whose files were laid for another
@@ -473,7 +473,7 @@ impl Deciders {
         // A decider issues into a file of its own: the store was made for
         // this count of deciders, or its one file would have two writers.
         let deciders = deciders.clamp(1, DecisionSlot::COUNT);
-        if reads.store.deciders() != deciders {
+        if reads.store.decision_slots() != deciders {
             let files = "the store's files of leases are not one a decider";
             return Err(io::Error::new(io::ErrorKind::InvalidInput, files));
         }
@@ -565,7 +565,7 @@ impl Deciders {
     }
 
     /// What the deciders and their streams count.
-    pub(crate) fn counts(&self) -> &Arc<Counts> {
+    pub(crate) fn counts(&self) -> &Arc<DecideStats> {
         &self.reads.counts
     }
 
@@ -708,9 +708,9 @@ impl Deciding {
     /// thread that has work, and a wait under a period costs a decision
     /// more than a wait with no bound. The count read here does not
     /// change under a decider: a store's files are laid where it is
-    /// built ([`MemoryStore::with_deciders`]), before a thread shares it.
+    /// built ([`MemoryStore::with_decision_slots`]), before a thread shares it.
     fn wait(&mut self, jobs: &Receiver<Job>) -> Option<Job> {
-        if self.reads.store.deciders() == 1 {
+        if self.reads.store.decision_slots() == 1 {
             self.rest();
             return jobs.recv().ok();
         }
@@ -802,7 +802,7 @@ impl Deciding {
     /// the mark comes here, and the first alone goes on. Under the last
     /// term below the ceiling no word is said: a hand-over there leaves no
     /// term to take, and the counter runs on to its end, where a pick is
-    /// answered `Busy` ([`Counts::unleased`]).
+    /// answered `Busy` ([`DecideStats::unleased`]).
     #[cold]
     fn leave_at(&self, term: u64) {
         // A read first: past the mark every answer comes here until the
@@ -1101,7 +1101,7 @@ impl Deciding {
         store.deciding(|world| {
             if world.samples_decisions() {
                 self.shared.sampled(
-                    (self.index, store.deciders()),
+                    (self.index, store.decision_slots()),
                     &mut self.sample_count,
                     world.spec().engine(),
                     &taken,
@@ -1306,8 +1306,8 @@ pub(crate) mod tests {
     };
 
     use super::{
-        decode_side, watched, Buffers, Clock, Counts, Deciders, Deciding, DecisionCall, Job, Part,
-        Reads, Refused, LOOK_CAP, LOOK_FLOOR, PARTS,
+        decode_side, watched, Buffers, Clock, DecideStats, Deciding, DecisionCall, DecisionSlots,
+        Job, Part, Reads, Refused, LOOK_CAP, LOOK_FLOOR, PARTS,
     };
     use crate::{
         document::spec::{self, AppliedSpec, PolicySpec},
@@ -1455,8 +1455,8 @@ pub(crate) mod tests {
         script: Arc<Script>,
         /// What the bed's deciders read, for a decider of the case's own.
         reads: Reads,
-        counts: Arc<Counts>,
-        deciders: Deciders,
+        counts: Arc<DecideStats>,
+        deciders: DecisionSlots,
         /// The members serving [`MODEL`] in the single role, ready.
         workers: Vec<WorkerId>,
         sender: mpsc::Sender<wire::Decided>,
@@ -1557,7 +1557,7 @@ pub(crate) mod tests {
         (deciders, depth): (usize, usize),
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
-        let store = Arc::new(MemoryStore::new().with_deciders(deciders));
+        let store = Arc::new(MemoryStore::new().with_decision_slots(deciders));
         let (workers, _sides) = fleet(&store);
         if let Some(spec) = spec {
             store.apply(spec).expect("above the unbound start");
@@ -1592,7 +1592,7 @@ pub(crate) mod tests {
             clock,
             counts: Arc::default(),
         };
-        let deciders = Deciders::start(deciders, depth, &reads).expect("the threads start");
+        let deciders = DecisionSlots::start(deciders, depth, &reads).expect("the threads start");
         let (sender, answers) = mpsc::channel(64);
         Bed {
             counts: Arc::clone(&reads.counts),
@@ -1629,8 +1629,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_deciders_do_not_start_over_a_store_made_for_another_count() {
         let bed = leading([]);
-        assert_eq!(bed.store.deciders(), 2);
-        let refused = Deciders::start(3, 8, &bed.reads).err();
+        assert_eq!(bed.store.decision_slots(), 2);
+        let refused = DecisionSlots::start(3, 8, &bed.reads).err();
         let refused = refused.expect("two files of leases, three deciders");
         assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
     }
@@ -1837,7 +1837,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_door_and_the_served_path_decide_alike() {
         let mut bed = bed(Some(preset("random", 1)), true, (1, 8), []);
-        let beside = Arc::new(MemoryStore::new().with_deciders(1));
+        let beside = Arc::new(MemoryStore::new().with_decision_slots(1));
         fleet(&beside);
         let applied = beside.apply(preset("random", 1));
         applied.expect("above the unbound start");
@@ -2226,7 +2226,7 @@ pub(crate) mod tests {
     /// Sixteen requests of one stream in flight at once, and their answers:
     /// a pick's lease id, or the reason of a `Busy`.
     pub(crate) async fn burst(
-        deciders: &Deciders,
+        deciders: &DecisionSlots,
         sender: &mpsc::Sender<wire::Decided>,
         answers: &mut mpsc::Receiver<wire::Decided>,
     ) -> Vec<Result<u64, Reason>> {
@@ -3552,7 +3552,7 @@ pub(crate) mod tests {
         use crate::{engine::decision_slot::DecisionSlot, store::Watch};
 
         const SPOKEN: &str = "model-http";
-        let store = Arc::new(MemoryStore::new().with_deciders(2));
+        let store = Arc::new(MemoryStore::new().with_decision_slots(2));
         store
             .apply(preset("random", 1))
             .expect("above the unbound start");
@@ -3623,7 +3623,7 @@ pub(crate) mod tests {
                 serde_json::from_str(&document).expect("a document of this build");
             let digest = document.digest().expect("the document digests");
             let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
-            let store = Arc::new(MemoryStore::new().with_deciders(2));
+            let store = Arc::new(MemoryStore::new().with_decision_slots(2));
             let (singles, _) = fleet(&store);
             store
                 .apply(spec.expect("the catalog holds the stage"))
@@ -3649,7 +3649,7 @@ pub(crate) mod tests {
 
     /// One model a decider, in the deciders' order: the first names of an
     /// endless run whose requests each of `count` deciders takes.
-    fn a_model_each(deciders: &Deciders, count: usize) -> Vec<String> {
+    fn a_model_each(deciders: &DecisionSlots, count: usize) -> Vec<String> {
         let mut models: Vec<Option<String>> = vec![None; count];
         for name in (0_u32..).map(|at| format!("model-{at}")) {
             if models.iter().all(Option::is_some) {
@@ -4007,7 +4007,7 @@ pub(crate) mod tests {
             answers.try_recv().is_err(),
             "the third found the queue full"
         );
-        let dropped = |counts: &Counts| {
+        let dropped = |counts: &DecideStats| {
             [&counts.dropped_full, &counts.dropped_gone].map(|count| count.load(Ordering::Relaxed))
         };
         assert_eq!(dropped(&bed.counts), [1, 0]);
@@ -4038,7 +4038,7 @@ pub(crate) mod tests {
             Step::At(FENCED),
         ];
         let mut bed = bed(Some(preset("random", 1)), true, (1, 8), steps);
-        let counted = |counts: &Counts| {
+        let counted = |counts: &DecideStats| {
             counts
                 .busy
                 .each_ref()
@@ -4056,12 +4056,15 @@ pub(crate) mod tests {
             assert_eq!(busy(&bed.ask(frame(id, 1)).await), Reason::NotLeader);
         }
         // In the order of the reasons' numbers on the wire.
-        assert_eq!(Counts::BUSY[3..5], ["budget_gone_on_arrival", "not_leader"]);
+        assert_eq!(
+            DecideStats::BUSY[3..5],
+            ["budget_gone_on_arrival", "not_leader"]
+        );
         assert_eq!(counted(&bed.counts), [1, 0, 0, 1, 2, 0, 0, 0, 0]);
         // The counts are sized by hand beside the wire's enum: every reason
         // the contract names has a place, and the number past them is no
         // reason. A reason added to the contract fails here, not silently.
-        let places = i32::try_from(Counts::BUSY.len()).expect("a handful of reasons");
+        let places = i32::try_from(DecideStats::BUSY.len()).expect("a handful of reasons");
         assert!((0..places).all(|number| Reason::try_from(number).is_ok()));
         assert!(Reason::try_from(places).is_err());
     }
@@ -4232,10 +4235,10 @@ pub(crate) mod tests {
 
     /// The deciders as they stand once their one thread ended: its queue
     /// has no reader.
-    pub(crate) fn gone(reads: &Reads) -> Deciders {
+    pub(crate) fn gone(reads: &Reads) -> DecisionSlots {
         let (queue, jobs) = std_mpsc::sync_channel(1);
         drop(jobs);
-        Deciders {
+        DecisionSlots {
             queues: Box::new([queue]),
             told: Arc::new(watch::Sender::new(false)),
             reads: reads.clone(),
@@ -5671,7 +5674,7 @@ pub(crate) mod tests {
             (Reason::Unspecified, &[3][..], 1)
         );
         let counted = |count: &AtomicU64| count.load(Ordering::Relaxed);
-        let Counts {
+        let DecideStats {
             busy: busies,
             faults,
             pair_sides,
@@ -6614,7 +6617,7 @@ pub(crate) mod tests {
     async fn a_decider_counts_what_its_decisions_move_in_its_own_part() {
         let mut bed = leading([]);
         let store = Arc::clone(&bed.store);
-        let part = |counts: &Counts, index| {
+        let part = |counts: &DecideStats, index| {
             let part = counts.part(index);
             let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
             (read(&part.undialed), read(&part.hashes_cut))
@@ -6658,7 +6661,7 @@ pub(crate) mod tests {
         // A part stands on cache lines of its own, so two deciders' parts
         // share none.
         assert_eq!((size_of::<Part>(), align_of::<Part>()), (128, 128));
-        let counts = Counts::default();
+        let counts = DecideStats::default();
         for index in 0..PARTS + 2 {
             let part = counts.part(index);
             part.undialed.fetch_add(1 << index, Ordering::Relaxed);

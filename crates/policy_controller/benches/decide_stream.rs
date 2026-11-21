@@ -2259,7 +2259,7 @@ fn door_over(members: u32, files: usize, told: bool) -> StoreBackedEngine {
         !told || least_alone(members),
         "a fleet of {members} members holds more than one row in its least band"
     );
-    let store = MemoryStore::new().with_deciders(files);
+    let store = MemoryStore::new().with_decision_slots(files);
     fill(&store, Shape::bar(members, 1, Fleet::Shared, told, 0, 0));
     StoreBackedEngine::new(Arc::new(store))
 }
@@ -2279,7 +2279,7 @@ const BLOCKED: usize = 16;
 /// preset's cap names the sixteen deepest. The `refused` deepest are not
 /// ready: the pass refuses them.
 fn named_fleet(members: u32, refused: usize) -> (StoreBackedEngine, Vec<u64>, Vec<WorkerId>) {
-    let store = MemoryStore::new().with_deciders(1);
+    let store = MemoryStore::new().with_decision_slots(1);
     let document = PolicySpec::preset("cache_aware").expect("a preset of this build");
     let spec = AppliedSpec::validate(&document).expect("a preset validates");
     store.apply(spec).expect("above the unbound start");

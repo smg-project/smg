@@ -620,7 +620,7 @@ pub(crate) mod tests {
         }
 
         fn rejected(&self) -> u64 {
-            self.generations.counts().rejected
+            self.generations.apply_counts().rejected
         }
 
         /// The number, the format and the bytes the read call answers.
@@ -2013,7 +2013,7 @@ pub(crate) mod tests {
         elector.at_take(move || stepped.at_take());
         elector.tick(Instant::now()).expect("a take");
         assert_eq!(door.generation(), 0, "refused at the take");
-        assert_eq!(door.counts().rejected, 1);
+        assert_eq!(door.apply_counts().rejected, 1);
         assert!(awaits(), "the mark stays");
         assert!(door.bound(), "the door keeps its source");
         assert_eq!(settle(&mut file), Ok(Applied::Generation(1)));

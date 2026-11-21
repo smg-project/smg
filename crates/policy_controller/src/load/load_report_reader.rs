@@ -3,13 +3,13 @@
 //! where the document builds them, so each reads a report past the view's
 //! maximum age as none. A registered stage is not wrapped. It takes
 //! [`LoadReportReader`] from its build context
-//! ([`StageBuild::reports`](crate::stages::StageBuild::reports)) and reads each
-//! row through it, one pass a decision ([`LoadReportPass`]). The boundary is
-//! the view's one cutoff, the one the wrapped stages decide through: this
-//! module holds no copy of it.
+//! ([`StageBuild::load_report_reader`](crate::stages::StageBuild::load_report_reader))
+//! and reads each row through it, one pass a decision ([`LoadReportPass`]). The
+//! boundary is the view's one cutoff, the one the wrapped stages decide
+//! through: this module holds no copy of it.
 
 use crate::engine::{
-    view::{Candidate, LoadRow, ReportCutoff},
+    view::{Candidate, LoadReportCutoff, LoadRow},
     RequestFacts,
 };
 
@@ -20,8 +20,8 @@ use crate::engine::{
 /// read a report read every row that way. Nothing wraps a stage of your
 /// own: `row.load` hands it the report as the host holds it, at any age.
 /// A stage that should see what the built-in stages see takes this value
-/// from its build context ([`StageBuild::reports`]), keeps it, and asks
-/// it for each row's report.
+/// from its build context ([`StageBuild::load_report_reader`]), keeps it, and
+/// asks it for each row's report.
 ///
 /// ```
 /// use smg_policy_controller::{
@@ -59,7 +59,7 @@ use crate::engine::{
 /// }
 ///
 /// let mut stages = StageRegistry::builtin();
-/// stages.scorer_with("reported", |build| Ok(Box::new(Reported(build.reports()))))?;
+/// stages.scorer_with("reported", |build| Ok(Box::new(Reported(build.load_report_reader()))))?;
 /// # Ok::<(), smg_policy_controller::stages::StageRegistryError>(())
 /// ```
 ///
@@ -69,7 +69,7 @@ use crate::engine::{
 /// built-in stages hold, decided in the one place they decide it. Under a
 /// document that sets no maximum, every report is read as it stands.
 ///
-/// [`StageBuild::reports`]: crate::stages::StageBuild::reports
+/// [`StageBuild::load_report_reader`]: crate::stages::StageBuild::load_report_reader
 #[derive(Clone, Copy, Debug)]
 pub struct LoadReportReader {
     max_age_ms: Option<u64>,
@@ -86,9 +86,11 @@ impl LoadReportReader {
     #[inline]
     pub fn pass(&self, facts: &RequestFacts<'_>) -> LoadReportPass {
         LoadReportPass {
-            cutoff: self.max_age_ms.map_or(ReportCutoff::ANY_AGE, |max_age_ms| {
-                ReportCutoff::new(facts.now_micros, max_age_ms)
-            }),
+            cutoff: self
+                .max_age_ms
+                .map_or(LoadReportCutoff::ANY_AGE, |max_age_ms| {
+                    LoadReportCutoff::new(facts.now_micros, max_age_ms)
+                }),
         }
     }
 
@@ -104,7 +106,7 @@ impl LoadReportReader {
 /// ([`LoadReportReader::pass`]).
 #[derive(Clone, Copy, Debug)]
 pub struct LoadReportPass {
-    cutoff: ReportCutoff,
+    cutoff: LoadReportCutoff,
 }
 
 impl LoadReportPass {

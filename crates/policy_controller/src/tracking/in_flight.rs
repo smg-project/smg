@@ -1,11 +1,11 @@
 //! The counts of requests in flight: one cell a worker, booked by the
 //! leases the store holds on file and read by a decision beside its rows.
 //!
-//! The store keeps the table (`Counts`) and books it under its leases'
+//! The store keeps the table (`InFlightCounts`) and books it under its leases'
 //! lock. A decision over a publication's own rows is lent the table with
-//! the pool's slots ([`LentCounts`]) and reads a row's count by the row's
-//! position: nothing is written into a row and no lock is taken. A row's
-//! first read in a decision is kept ([`KeptCounts`]) and every later read
+//! the pool's slots ([`PoolInFlightCounts`]) and reads a row's count by the
+//! row's position: nothing is written into a row and no lock is taken. A row's
+//! first read in a decision is kept ([`InFlightBuffers`]) and every later read
 //! returns it, so a decision reads one count a row.
 
 use std::sync::{
@@ -120,14 +120,14 @@ impl<T> Pieces<T> {
 ///
 /// [`RequestFacts::in_flight`]: crate::engine::view::RequestFacts::in_flight
 #[derive(Debug, Default)]
-pub(crate) struct Counts {
+pub(crate) struct InFlightCounts {
     /// A cell a slot, its piece laid when its first slot is given.
     cells: Pieces<AtomicU32>,
     /// The slots given so far.
     given: AtomicU32,
 }
 
-impl Counts {
+impl InFlightCounts {
     /// The next slot of the table, its cell at zero. A table that gave
     /// every slot gives the one that names no cell ([`WorkerSlot::NONE`]).
     pub(crate) fn claim(&self) -> WorkerSlot {
@@ -209,16 +209,20 @@ impl Counts {
     pub(crate) fn lend<'a>(
         &'a self,
         slots: &'a [WorkerSlot],
-        kept: &'a mut KeptCounts,
-    ) -> LentCounts<'a> {
+        kept: &'a mut InFlightBuffers,
+    ) -> PoolInFlightCounts<'a> {
         kept.open(slots.len());
         self.lent(slots, kept)
     }
 
     /// The table beside `slots` with the cells a decision keeps its reads
     /// in, as they stand.
-    fn lent<'a>(&'a self, slots: &'a [WorkerSlot], kept: &'a KeptCounts) -> LentCounts<'a> {
-        LentCounts {
+    fn lent<'a>(
+        &'a self,
+        slots: &'a [WorkerSlot],
+        kept: &'a InFlightBuffers,
+    ) -> PoolInFlightCounts<'a> {
+        PoolInFlightCounts {
             counts: self,
             slots,
             kept,
@@ -245,16 +249,16 @@ impl Counts {
 /// read of that row returns it, whatever is booked meanwhile. A row no
 /// stage reads costs nothing.
 #[derive(Clone, Copy)]
-pub struct LentCounts<'a> {
-    counts: &'a Counts,
+pub struct PoolInFlightCounts<'a> {
+    counts: &'a InFlightCounts,
     /// Each row's slot, by the row's position.
     slots: &'a [WorkerSlot],
     /// What the decision read of each row, by the row's position, under
     /// its stamp.
-    kept: &'a KeptCounts,
+    kept: &'a InFlightBuffers,
 }
 
-impl<'a> LentCounts<'a> {
+impl<'a> PoolInFlightCounts<'a> {
     /// The count of the row at `position`, one number for the decision:
     /// zero past the rows.
     #[inline]
@@ -316,7 +320,7 @@ pub(crate) use with_counts;
 pub(crate) struct LentRun<'a> {
     /// The table's first piece, read with no search.
     first: &'a [AtomicU32],
-    counts: &'a Counts,
+    counts: &'a InFlightCounts,
     slots: &'a [WorkerSlot],
     /// The decision's cells and the stamp its reads are kept under.
     kept: &'a [AtomicU64],
@@ -373,7 +377,7 @@ impl LentRun<'_> {
 /// unread and none is cleared between decisions. The cells are read and
 /// written with no lock and no order: one decision runs on one thread.
 #[derive(Debug, Default)]
-pub struct KeptCounts {
+pub struct InFlightBuffers {
     /// A stamp in the high half, the count it read in the low half.
     cells: Vec<AtomicU64>,
     /// The stamp of the decision the cells are open for; zero before the
@@ -381,7 +385,7 @@ pub struct KeptCounts {
     stamp: u32,
 }
 
-impl KeptCounts {
+impl InFlightBuffers {
     /// Opens the cells for one decision over `rows` rows: each reads as
     /// unread. One add a decision. The stamps come round once in 2^32
     /// decisions, and every cell is cleared then: a count kept under the
@@ -400,9 +404,9 @@ impl KeptCounts {
     }
 }
 
-impl std::fmt::Debug for LentCounts<'_> {
+impl std::fmt::Debug for PoolInFlightCounts<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LentCounts")
+        f.debug_struct("PoolInFlightCounts")
             .field("rows", &self.slots.len())
             .finish_non_exhaustive()
     }
@@ -419,7 +423,7 @@ pub(crate) mod tests {
         thread,
     };
 
-    use super::{Counts, KeptCounts, LentCounts, WorkerSlot};
+    use super::{InFlightBuffers, InFlightCounts, PoolInFlightCounts, WorkerSlot};
     use crate::engine::view::{Candidate, RequestFacts};
 
     thread_local! {
@@ -429,12 +433,12 @@ pub(crate) mod tests {
     /// A pool's counts taken out of its rows into a table of their own: the
     /// lent form of rows a case wrote its counts into.
     pub(crate) struct Lent<'a> {
-        counts: Counts,
+        counts: InFlightCounts,
         slots: Vec<WorkerSlot>,
         /// The cells of the one decision a case's reads stand for.
-        kept: KeptCounts,
+        kept: InFlightBuffers,
         /// The table as a case's facts name it, lent at the first ask.
-        lent: OnceCell<LentCounts<'a>>,
+        lent: OnceCell<PoolInFlightCounts<'a>>,
     }
 
     impl<'a> Lent<'a> {
@@ -442,7 +446,7 @@ pub(crate) mod tests {
         /// row's position: the rows read zero after it. A worker a case
         /// lists twice has one count.
         pub(crate) fn take(rows: &mut [Candidate]) -> Self {
-            let counts = Counts::default();
+            let counts = InFlightCounts::default();
             let places = rows.iter().map(|row| row.position as usize + 1).max();
             let mut slots = vec![WorkerSlot::NONE; places.unwrap_or(0)];
             for row in rows {
@@ -456,7 +460,7 @@ pub(crate) mod tests {
                 }
                 assert_eq!(counts.in_flight(*place), held, "one count a position");
             }
-            let mut kept = KeptCounts::default();
+            let mut kept = InFlightBuffers::default();
             kept.open(slots.len());
             Self {
                 counts,
@@ -490,10 +494,10 @@ pub(crate) mod tests {
     /// row anew.
     #[test]
     fn a_rows_first_read_stands_for_its_decision_alone() {
-        let counts = Counts::default();
+        let counts = InFlightCounts::default();
         let slots = [counts.claim(), counts.claim()];
         counts.book(slots[0]);
-        let mut kept = KeptCounts::default();
+        let mut kept = InFlightBuffers::default();
         let first = counts.lend(&slots, &mut kept);
         assert_eq!(first.at(0), 1);
         counts.book(slots[0]);
@@ -512,9 +516,9 @@ pub(crate) mod tests {
     /// count of the decision that opens under that stamp again.
     #[test]
     fn a_count_kept_under_a_stamp_is_not_read_when_the_stamps_come_round() {
-        let counts = Counts::default();
+        let counts = InFlightCounts::default();
         let slots = [counts.claim()];
-        let mut kept = KeptCounts::default();
+        let mut kept = InFlightBuffers::default();
         assert_eq!(counts.lend(&slots, &mut kept).at(0), 0);
         counts.book(slots[0]);
         // The last stamp before the round.
@@ -551,10 +555,10 @@ pub(crate) mod tests {
     /// decision reads the same cells.
     #[test]
     fn a_runs_reader_and_a_single_read_share_a_decisions_one_number() {
-        let counts = Counts::default();
+        let counts = InFlightCounts::default();
         let slots = [counts.claim(), counts.claim()];
         counts.book(slots[0]);
-        let mut kept = KeptCounts::default();
+        let mut kept = InFlightBuffers::default();
         let lent = counts.lend(&slots, &mut kept);
         let run = lent.run();
         // A row beside a lent table: no reader returns its own field.
@@ -580,7 +584,7 @@ pub(crate) mod tests {
     /// past the rows.
     #[test]
     fn a_lent_count_is_read_at_its_rows_position() {
-        let counts = Counts::default();
+        let counts = InFlightCounts::default();
         // Slots through the third piece: 1,024 in the first, 2,048 in the
         // second.
         let slots: Vec<WorkerSlot> = (0..3_073).map(|_| counts.claim()).collect();
@@ -597,7 +601,7 @@ pub(crate) mod tests {
                 counts.book(slot);
             }
         }
-        let mut kept = KeptCounts::default();
+        let mut kept = InFlightBuffers::default();
         let lent = counts.lend(&rows, &mut kept);
         let read: Vec<u32> = (0..6).map(|position| lent.at(position)).collect();
         assert_eq!(read, [4, 1, 0, 2, 3, 0]);
@@ -609,10 +613,10 @@ pub(crate) mod tests {
     #[test]
     fn two_writers_of_one_cell_lose_no_count() {
         const EACH: u32 = 400_000;
-        let counts = Counts::default();
+        let counts = InFlightCounts::default();
         let slot = counts.claim();
         let start = Barrier::new(2);
-        let both = |write: fn(&Counts, WorkerSlot)| {
+        let both = |write: fn(&InFlightCounts, WorkerSlot)| {
             thread::scope(|scope| {
                 for _ in 0..2 {
                     scope.spawn(|| {
@@ -625,8 +629,12 @@ pub(crate) mod tests {
             });
             counts.in_flight(slot)
         };
-        assert_eq!(both(Counts::book), 2 * EACH, "every booking of both");
-        assert_eq!(both(Counts::free), 0, "and each one given back");
+        assert_eq!(
+            both(InFlightCounts::book),
+            2 * EACH,
+            "every booking of both"
+        );
+        assert_eq!(both(InFlightCounts::free), 0, "and each one given back");
     }
 
     /// A booking that moves is added before it is taken: a reader beside the
@@ -640,7 +648,7 @@ pub(crate) mod tests {
     #[test]
     fn a_moved_booking_is_never_read_on_neither_worker() {
         const MOVES: usize = 50_000;
-        let counts = Counts::default();
+        let counts = InFlightCounts::default();
         // A pair of workers a move, the booking on the first of them.
         let pairs: Vec<[WorkerSlot; 2]> = (0..MOVES)
             .map(|_| [counts.claim(), counts.claim()])

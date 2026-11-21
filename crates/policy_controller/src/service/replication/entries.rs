@@ -174,7 +174,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "prompt_hashes", Fate::Read),
     ("MemoryStore", "micros", Fate::Read),
     ("MemoryStore", "publish_now", Fate::Rebuilt(PUBLISHED)),
-    ("MemoryStore", "counts", Fate::Read),
+    ("MemoryStore", "stats", Fate::Read),
     ("MemoryStore", "overload_flips", Fate::Read),
     ("MemoryStore", "outside_lists", Fate::Read),
     ("MemoryStore", "publication_allocations", Fate::Read),

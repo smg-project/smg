@@ -1,5 +1,5 @@
 //! The cost of the sent-prefix predictor's two calls,
-//! `PrefixPredictor::deepest` and `PrefixPredictor::sent`, on a predictor at
+//! `PrefixPredictor::deepest` and `PrefixPredictor::record`, on a predictor at
 //! its bound: a write there takes out as many old blocks as it adds. One
 //! predictor holds 4,096 requests of 64 blocks, sent to 8 workers, behind a
 //! head of 8 blocks they all share. The `cold` turns run on another, which
@@ -83,7 +83,7 @@ fn read(held: &PrefixPredictor, keys: &mut Vec<u64>, request: &[u64]) -> u32 {
 /// The write behind a read, by the keys the read folded, at a new tick.
 fn write(held: &mut PrefixPredictor, keys: &[u64], worker: WorkerId, tick: &mut u16) {
     *tick = tick.wrapping_add(1);
-    held.sent(keys, worker, *tick);
+    held.record(keys, worker, *tick);
 }
 
 /// The predictor that holds every request's first turn, at its bound.

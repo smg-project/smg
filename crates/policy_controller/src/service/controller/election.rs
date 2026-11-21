@@ -18,15 +18,15 @@
 //! lease at once, or after the wait this thread's own take still owed; it
 //! then stops and never takes again.
 //!
-//! A word to leave (`Door::hand_over` for a planned hand-over, `Door::saw`
-//! for a term a caller says it saw) is taken by the same thread between two
-//! steps: the fence closed, the lease released, no take for one lease
-//! duration (a replica alone over a lease in its own process takes it again
-//! at once: its next step follows the word). The thread goes on stepping. A
-//! decider says the planned hand-over itself where its term's lease ids pass
-//! their mark: the next take brings a term whose ids start again. The
-//! hand-over names that term, and the thread drops one whose term this
-//! replica no longer holds the lease under: that lease is left already.
+//! A word to leave (`ElectionNotifier::hand_over` for a planned hand-over,
+//! `ElectionNotifier::saw` for a term a caller says it saw) is taken by the
+//! same thread between two steps: the fence closed, the lease released, no take
+//! for one lease duration (a replica alone over a lease in its own process
+//! takes it again at once: its next step follows the word). The thread goes on
+//! stepping. A decider says the planned hand-over itself where its term's lease
+//! ids pass their mark: the next take brings a term whose ids start again. The
+//! hand-over names that term, and the thread drops one whose term this replica
+//! no longer holds the lease under: that lease is left already.
 
 use std::{
     fmt, io,
@@ -374,8 +374,8 @@ enum Word {
     /// ended.
     Stop,
     /// Leave and stay in the election: a term a caller says it saw
-    /// ([`Door::saw`]). With no term it is the leave itself, which the
-    /// thread makes of a hand-over of the term held: cases alone send it.
+    /// ([`ElectionNotifier::saw`]). With no term it is the leave itself, which
+    /// the thread makes of a hand-over of the term held: cases alone send it.
     StepDown(Option<u64>),
     /// The planned hand-over of the lease held under this term: a replica
     /// that no longer holds the lease under it keeps on as it is.
@@ -403,8 +403,8 @@ impl Running {
     /// shared state holds, so a session says a gateway's term floor and a
     /// decider the planned hand-over. The door keeps nothing alive: this
     /// handle dropped, the election ends as before.
-    pub(crate) fn door(&self) -> Door {
-        Door {
+    pub(crate) fn door(&self) -> ElectionNotifier {
+        ElectionNotifier {
             words: Arc::downgrade(&self.words),
         }
     }
@@ -431,11 +431,11 @@ fn leave(words: &mpsc::Sender<Word>, above: u64) -> Result<(), ElectError> {
     Ok(())
 }
 
-/// The door for a word from outside the run loop, a term a caller saw or
-/// the planned hand-over, apart from the handle the run loop keeps: the
-/// election's words, held weakly. The handle alone keeps the channel open,
+/// Tells the election a term from outside its run loop: one a caller saw,
+/// or the planned hand-over. It holds the election's channel weakly, apart
+/// from the run loop's handle. The handle alone keeps the channel open,
 /// so a host that drops the election without a stop ends it while the
-/// service's shared state still holds this door.
+/// service's shared state still holds this notifier.
 ///
 /// The thread counts a term said among the terms this replica saw. Where it
 /// leads under a lower term, or no term is said, it closes the fence,
@@ -445,11 +445,11 @@ fn leave(words: &mpsc::Sender<Word>, above: u64) -> Result<(), ElectError> {
 /// So does one that holds no lease: where it saw the lease released under a
 /// lower term, it writes that release again under the highest term it saw.
 #[derive(Clone)]
-pub(crate) struct Door {
+pub(crate) struct ElectionNotifier {
     words: Weak<mpsc::Sender<Word>>,
 }
 
-impl Door {
+impl ElectionNotifier {
     /// A term `above` that a caller says it saw, a gateway's floor or a
     /// standby's. A word may not spend the last term: a term whose next is
     /// not below the ceiling ([`crate::service::elector::TERM_CEILING`]) is the term
@@ -488,10 +488,10 @@ pub(crate) struct Said {
 #[cfg(test)]
 impl Said {
     /// The door, and what is said through it.
-    pub(crate) fn door() -> (Door, Self) {
+    pub(crate) fn door() -> (ElectionNotifier, Self) {
         let (words, heard) = mpsc::channel();
         let words = Arc::new(words);
-        let door = Door {
+        let door = ElectionNotifier {
             words: Arc::downgrade(&words),
         };
         let said = Self {

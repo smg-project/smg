@@ -30,7 +30,7 @@ pub use shared::{
     UpdatePoliciesStep, WorkerList,
 };
 use shared::{RegisterBesideRowsStep, REGISTER_WORKERS_STEP};
-use smg_policy_controller::worker_host::{registration_at_door, WRITE_WORKERS_AT_DOOR_STEP};
+use smg_policy_controller::worker_host::{registration_into_store, WRITE_WORKERS_TO_STORE_STEP};
 use smg_worker::{
     jobs::WorkerJobAsker,
     workflow::{
@@ -177,7 +177,7 @@ pub(crate) fn worker_registration_line(
             "Register Workers",
             Arc::new(RegisterBesideRowsStep::new(Arc::clone(&feed.objects))),
         )
-        .depends_on(&[WRITE_WORKERS_AT_DOOR_STEP, "create_external_workers"]),
+        .depends_on(&[WRITE_WORKERS_TO_STORE_STEP, "create_external_workers"]),
     }
     .with_timeout(Duration::from_secs(5))
     .with_failure_action(FailureAction::FailWorkflow);
@@ -192,7 +192,7 @@ pub(crate) fn worker_registration_line(
         None => {
             worker_registration_workflow::<AppContext>(&settings, gates("classify_worker_type"))
         }
-        Some(feed) => registration_at_door::<AppContext>(
+        Some(feed) => registration_into_store::<AppContext>(
             &settings,
             gates("classify_worker_type"),
             Arc::clone(&feed.door),

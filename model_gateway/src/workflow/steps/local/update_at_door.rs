@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use smg_policy_controller::worker_host::{
-    maker_of, MembershipWriter, Objects, Over, Precondition, Refused, RowRevision,
+    registrant_of, MembershipWriter, Objects, Over, Precondition, Refused, RowRevision,
 };
 use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -85,7 +85,8 @@ impl UpdateAtDoorStep {
         updated: &Arc<dyn Worker>,
         found: &Arc<dyn Worker>,
     ) -> WorkflowResult<()> {
-        let maker = maker_of(asker, updated.url()).map_err(|why| step_failed(why.to_string()))?;
+        let maker =
+            registrant_of(asker, updated.url()).map_err(|why| step_failed(why.to_string()))?;
         self.door
             .found_built(
                 &maker,
@@ -123,7 +124,7 @@ fn dropped(worker: &dyn Worker, refusal: Refused) -> String {
     let url = worker.redacted_url();
     match refusal {
         // The store's sentence, word for word.
-        Refused::NotMaker(why) => why,
+        Refused::NotRegistrant(why) => why,
         Refused::Past(past) => format!("{}: {}", past.fact, past.why),
         Refused::Moved | Refused::Absent => format!(
             "worker {url} was replaced or removed since this update found it, so the \

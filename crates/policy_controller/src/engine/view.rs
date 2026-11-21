@@ -769,16 +769,16 @@ pub struct Candidate {
 }
 
 /// How far back the store's decision clock starts.
-pub(crate) const REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
+pub(crate) const LOAD_REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
 
 /// A sample clipped to the clock's origin must already be past the limit.
-pub(crate) const MAX_REPORT_AGE_MS: u32 = REPORT_CLOCK_HISTORY_MS - 1;
+pub(crate) const MAX_LOAD_REPORT_AGE_MS: u32 = LOAD_REPORT_CLOCK_HISTORY_MS - 1;
 
 /// The oldest sample a decision can use under a report age limit.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReportCutoff(u64);
+pub(crate) struct LoadReportCutoff(u64);
 
-impl ReportCutoff {
+impl LoadReportCutoff {
     /// The cutoff of a view that sets no limit: no sample is older than
     /// the clock's origin, so every report is read.
     pub(crate) const ANY_AGE: Self = Self(0);
@@ -951,7 +951,7 @@ pub struct RequestFacts<'a> {
     /// the count itself. A pair takes none: a position is a place in one
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
-    pub lent_in_flight: Option<&'a in_flight::LentCounts<'a>>,
+    pub lent_in_flight: Option<&'a in_flight::PoolInFlightCounts<'a>>,
     /// The rows that carry requests of this request's session key, each
     /// with its count, where the host did not write the count into the
     /// rows ([`Candidate::session_in_flight`]): a host that keeps the

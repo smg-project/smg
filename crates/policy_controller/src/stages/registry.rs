@@ -174,7 +174,7 @@ impl StageBuild<'_> {
 
     /// The profile's count of sends. The first call for a profile makes
     /// its tally under that profile's `sent_ttl_ms`.
-    pub fn sent(&mut self) -> Arc<DispatchCredit> {
+    pub fn dispatch_credit(&mut self) -> Arc<DispatchCredit> {
         profile_sent(self.sent, self.profile, self.sent_ttl_ms)
     }
 
@@ -183,7 +183,7 @@ impl StageBuild<'_> {
     /// reads as none, as it does for the built-in stages. A stage that
     /// reads `row.load` itself sees the report at any age. The value is
     /// `Copy`, and asking for it makes nothing.
-    pub fn reports(&self) -> LoadReportReader {
+    pub fn load_report_reader(&self) -> LoadReportReader {
         self.reports
     }
 

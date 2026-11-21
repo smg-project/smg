@@ -35,8 +35,8 @@ fn roll_back(generations: &DocumentManager, wanted: u64) -> Result<(u64, Digest)
     generations.roll_back(wanted).expect("on file").ran
 }
 
-fn applied(applied: u64, rejected: u64) -> Counts {
-    Counts { applied, rejected }
+fn applied(applied: u64, rejected: u64) -> ApplyCounts {
+    ApplyCounts { applied, rejected }
 }
 
 /// What an enforce of `document` with no guard, as YAML, ran.
@@ -241,20 +241,20 @@ fn a_document_that_only_changed_its_form_is_no_change() {
 #[test]
 fn the_counts_follow_the_outcomes() {
     let (_store, generations) = generations();
-    let counts = |applied, rejected| Counts { applied, rejected };
-    assert_eq!(generations.counts(), counts(0, 0));
+    let counts = |applied, rejected| ApplyCounts { applied, rejected };
+    assert_eq!(generations.apply_counts(), counts(0, 0));
     assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
     assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Unchanged(1)));
-    assert_eq!(generations.counts(), counts(1, 0));
+    assert_eq!(generations.apply_counts(), counts(1, 0));
 
     let refused = yaml(&generations, with_line(RANDOM, 1));
     assert!(matches!(
         refused,
         Err(SpecRejected::ChangedUnderItsLine { .. })
     ));
-    assert_eq!(generations.counts(), counts(1, 1));
+    assert_eq!(generations.apply_counts(), counts(1, 1));
     assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Generation(2)));
-    assert_eq!(generations.counts(), counts(2, 1));
+    assert_eq!(generations.apply_counts(), counts(2, 1));
 }
 
 /// A source that finds its document running already (a controller built
@@ -851,18 +851,22 @@ fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
         (vec![b'#'; over], ""),
     ];
     for (document, path) in rows {
-        let before = generations.counts();
+        let before = generations.apply_counts();
         let refused = generations
             .dry_run("", &document, Format::Yaml)
             .expect("no guard")
             .would_run
             .expect_err("refused");
         assert_eq!(refused.field_path(), path, "{refused}");
-        assert_eq!(generations.counts(), before, "a dry run counts nothing");
+        assert_eq!(
+            generations.apply_counts(),
+            before,
+            "a dry run counts nothing"
+        );
         assert_eq!(yaml(&generations, document), Err(refused));
-        assert_eq!(generations.counts(), applied(1, before.rejected + 1));
+        assert_eq!(generations.apply_counts(), applied(1, before.rejected + 1));
     }
-    let before = generations.counts();
+    let before = generations.apply_counts();
     let lower = generations
         .dry_run("", &with_line(RANDOM, 3), Format::Yaml)
         .expect("no guard");
@@ -872,7 +876,11 @@ fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
     };
     assert_eq!(lower.would_run, Err(SpecRejected::Stale(stale)));
     assert!(lower.needs.is_none(), "a refused document carries no diff");
-    assert_eq!(generations.counts(), before, "a dry run counts nothing");
+    assert_eq!(
+        generations.apply_counts(),
+        before,
+        "a dry run counts nothing"
+    );
 }
 
 /// The bound fails fast: a document one byte over it is refused by its
@@ -941,7 +949,7 @@ fn an_enforce_with_no_store_bound_is_refused_and_nothing_applied() {
         SpecRejected::Unpersisted("no spec store is bound".to_owned())
     );
     assert_eq!(standing(&store), (0, None));
-    assert_eq!(generations.counts(), applied(0, 1));
+    assert_eq!(generations.apply_counts(), applied(0, 1));
 }
 
 /// The guard: an enforce names the digest its caller read as standing,
@@ -1008,7 +1016,7 @@ fn a_line_is_a_claim_of_the_next_number_under_a_store() {
     // Nothing of the four is on file, and the running generation stays.
     assert_eq!(names(dir.path()).len(), 2);
     assert_eq!(standing(&store), (2, Some(stands)));
-    assert_eq!(generations.counts(), applied(2, 4));
+    assert_eq!(generations.apply_counts(), applied(2, 4));
 
     let dry = |line| {
         generations
@@ -1045,7 +1053,7 @@ fn a_document_that_does_not_run_is_refused_with_nothing_on_file() {
 
     assert_eq!(names(dir.path()), BTreeSet::from([name_of(1, "yaml")]));
     assert_eq!(standing(&store), (1, Some(stands)));
-    assert_eq!(generations.counts(), applied(1, 2));
+    assert_eq!(generations.apply_counts(), applied(1, 2));
 }
 
 /// A start: the newest generation on file runs under the number its
@@ -1068,7 +1076,7 @@ fn a_start_runs_the_newest_generation_on_file_under_its_number() {
         (read.generation, read.document.as_slice()),
         (3, LEAST_LOAD.as_bytes())
     );
-    assert_eq!(after.counts(), applied(1, 0));
+    assert_eq!(after.apply_counts(), applied(1, 0));
     assert_eq!(enforce(&after, RANDOM).map(|(number, _)| number), Ok(4));
 }
 
@@ -1095,7 +1103,7 @@ fn a_start_takes_the_files_number_for_a_document_the_store_runs_under_a_lower_on
     let again = DocumentManager::new(Arc::clone(&store), stock(), Vec::new());
     bind(&again, same.path());
     assert_eq!(standing(&store).0, 3);
-    assert_eq!(again.counts(), applied(0, 0));
+    assert_eq!(again.apply_counts(), applied(0, 0));
 }
 
 /// A dry run reads the standing generation and its source's rule on one
@@ -1208,7 +1216,7 @@ fn a_generation_on_file_already_is_not_written_over() {
     assert_eq!(refused, SpecRejected::Unpersisted(taken));
     assert_eq!(standing(&store).0, 1);
     assert_eq!(std::fs::read(&theirs).expect("the file"), b"theirs");
-    assert_eq!(generations.counts(), applied(1, 1));
+    assert_eq!(generations.apply_counts(), applied(1, 1));
 }
 
 /// A directory that does not take the write: nothing is applied, the
@@ -1235,7 +1243,7 @@ fn a_document_the_directory_does_not_take_is_not_applied() {
     );
     assert_eq!(refused.field_path(), "");
     assert_eq!(standing(&store), (1, Some(stands)));
-    assert_eq!(generations.counts(), applied(1, 1));
+    assert_eq!(generations.apply_counts(), applied(1, 1));
 }
 
 /// The entry's refusal takes the persisted generation off file before
@@ -1272,7 +1280,7 @@ fn a_generation_the_entry_refuses_goes_off_file_again() {
     };
     assert_eq!(refused, SpecRejected::Stale(stale));
     assert_eq!(names(dir.path()), BTreeSet::from([name_of(1, "yaml")]));
-    assert_eq!(generations.counts(), applied(1, 1));
+    assert_eq!(generations.apply_counts(), applied(1, 1));
 }
 
 /// A generation the entry refuses whose name does not come off file: the
@@ -1331,7 +1339,7 @@ fn a_refused_generation_that_stays_on_file_is_told_and_goes_at_the_next_write() 
     );
     let on_file = BTreeSet::from([name_of(1, "yaml"), name_of(3, "yaml")]);
     assert_eq!(names(dir.path()), on_file);
-    assert_eq!(generations.counts(), applied(2, 1));
+    assert_eq!(generations.apply_counts(), applied(2, 1));
 }
 
 /// Two enforces that read one digest as standing: one lands, and the
@@ -1512,7 +1520,7 @@ fn a_write_at_the_last_number_is_refused_as_its_dry_run_is() {
     assert_eq!(enforce(&generations, RANDOM), Err(stale()));
     assert_eq!(roll_back(&generations, last - 1), Err(stale()));
     assert_eq!(names(dir.path()), on_file);
-    assert_eq!(generations.counts(), applied(1, 2));
+    assert_eq!(generations.apply_counts(), applied(1, 2));
 }
 
 /// A generation that is not on file is not held: one never applied, and
@@ -1545,7 +1553,7 @@ fn a_rollback_to_a_generation_not_on_file_is_not_held() {
         );
     }
     assert_eq!(standing(&store).0, last);
-    assert_eq!(generations.counts(), applied(last, 0));
+    assert_eq!(generations.apply_counts(), applied(last, 0));
 }
 
 /// A rollback mints its number whatever line the generation's bytes
@@ -1566,7 +1574,7 @@ fn a_rollback_mints_its_number_and_refuses_a_document_that_does_not_run() {
     assert!(matches!(refused, SpecRejected::Invalid(_)), "{refused:?}");
     assert_eq!(standing(&store).0, 3);
     assert_eq!(names(dir.path()).len(), 3);
-    assert_eq!(generations.counts(), applied(3, 1));
+    assert_eq!(generations.apply_counts(), applied(3, 1));
 }
 
 #[test]
@@ -1619,7 +1627,7 @@ fn a_publication_that_waits_keeps_the_document_counts_and_log_as_they_were() {
     assert_eq!(waited, Ok(Applied::Waits(1)));
     assert_eq!(standing(&store), (1, Some(stood.digest)));
     assert_eq!(door.document(0), Ok(stood));
-    assert_eq!(door.counts(), applied(1, 0));
+    assert_eq!(door.apply_counts(), applied(1, 0));
     assert!(lines.0.lock().is_empty());
 }
 
@@ -1820,5 +1828,5 @@ fn the_standing_document_again_is_no_change_under_a_store() {
     }
     assert_eq!(standing(&store).0, 1);
     assert_eq!(names(dir.path()).len(), 1);
-    assert_eq!(generations.counts(), applied(1, 0));
+    assert_eq!(generations.apply_counts(), applied(1, 0));
 }
