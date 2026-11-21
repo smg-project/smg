@@ -45,7 +45,7 @@ use llm_multimodal::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processors::{NemotronOmniProcessor, Qwen3VLProcessor},
-        transforms::{resize_bicubic_pil, resize_lanczos_pil},
+        transforms::{resize_bicubic_pil, resize_bilinear_pil, resize_lanczos_pil},
         VideoClipOptions, VisionPreProcessor,
     },
     Modality, Parallelism,
@@ -666,7 +666,7 @@ fn a_pillow_resize_copies_no_rgb8_image() {
     });
     let rgb = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
     let rgba = DynamicImage::ImageRgba8(rgba);
-    for resize in [resize_bicubic_pil, resize_lanczos_pil] {
+    for resize in [resize_bicubic_pil, resize_lanczos_pil, resize_bilinear_pil] {
         let mut counts = Vec::new();
         for image in [&rgb, &rgba] {
             // Warm: the first pass pays for the thread-local scratch.
