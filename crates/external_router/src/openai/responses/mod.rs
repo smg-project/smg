@@ -17,6 +17,10 @@ pub(crate) mod route;
 mod streaming;
 pub(crate) mod utils;
 
+tokio::task_local! {
+    static STREAMING_REQUEST_TIMEOUT: std::time::Duration;
+}
+
 // Re-exported for openai::mcp::tool_handler (cross-module dependency)
 pub(crate) use accumulator::StreamingResponseAccumulator;
 pub(crate) use common::{extract_output_index, get_event_type};

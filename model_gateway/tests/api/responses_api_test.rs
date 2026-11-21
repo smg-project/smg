@@ -3363,6 +3363,133 @@ async fn stream_body(router: &dyn smg::routers::RouterTrait, req: ResponsesReque
     String::from_utf8(bytes.to_vec()).expect("utf-8")
 }
 
+/// A tool that runs longer than the request timeout does not fail the
+/// request: the timeout is the deadline of one upstream request, and no
+/// upstream request waits on a tool. The search here takes longer than the
+/// client's deadline for the turn that asked for it, and the stream ends as
+/// the same request ends with a fast tool: the call that fit ran, the one
+/// over the limit is closed, then the terminal. A loop that left the turn's
+/// upstream stream unread while the tool ran would read it again past its
+/// deadline and end the stream with the stream's error.
+#[tokio::test]
+async fn a_tool_that_outruns_the_request_timeout_does_not_fail_the_stream() {
+    use std::{sync::Arc, time::Duration};
+
+    let mut mcp = MockMCPServer::start_with_latency(Duration::from_millis(3500))
+        .await
+        .expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (_, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+    // A running gateway gives the router and its shared client the same
+    // configured request timeout; set both explicitly in this test context.
+    let mut ctx = (*ctx).clone();
+    ctx.router_config.request_timeout_secs = 3;
+    ctx.client = smg::server::http_client_builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("a client with a deadline");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), Some(1))).await;
+
+    let events = frame_events(&body);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "error" | "response.failed")),
+        "{body}"
+    );
+    assert_eq!(types.last().copied(), Some("response.completed"), "{body}");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    assert_eq!(mcp.call_count(), 1, "the one call that fit ran: {body}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// A turn whose rest is larger than the loop's read-ahead while its tool
+/// runs: the loop stops reading ahead at its bound, the rest of the turn
+/// waits unread until the call is done, and the stream ends as the same
+/// request ends without the padding: the call that fit ran, the one over
+/// the limit is closed, then the terminal. The padding is nine mebibytes of
+/// comment blocks, which the relay drops, behind the first turn's call.
+#[tokio::test]
+async fn a_turn_larger_than_the_read_ahead_ends_as_the_same_turn_under_it() {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    let padding = format!(": {}\n\n", "x".repeat(1020)).repeat(9 * 1024);
+    let turns = Arc::new(AtomicUsize::new(0));
+    let padded_first_turn = axum::routing::post(move || {
+        let turn = turns.fetch_add(1, Ordering::SeqCst) + 1;
+        let events = function_call_turn_events(turn);
+        let events = match events.rsplit_once("event: response.completed") {
+            Some((calls, terminal)) if turn == 1 => {
+                format!("{calls}{padding}event: response.completed{terminal}")
+            }
+            _ => events,
+        };
+        async move { ([(CONTENT_TYPE, "text/event-stream")], events) }
+    });
+    let mut mcp = MockMCPServer::start_with_latency(Duration::from_millis(3500))
+        .await
+        .expect("start mcp");
+    let (upstream, server) = stub_upstream(padded_first_turn).await;
+    let (_, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+    let mut ctx = (*ctx).clone();
+    ctx.router_config.request_timeout_secs = 3;
+    ctx.client = smg::server::http_client_builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("a client with a deadline");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), Some(1))).await;
+
+    let events = frame_events(&body);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "error" | "response.failed")),
+        "{types:?}"
+    );
+    let failed_at = types
+        .iter()
+        .position(|kind| *kind == "response.mcp_call.failed")
+        .expect("the skipped call's failed event");
+    assert_eq!(
+        &types[failed_at..],
+        [
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "response.completed"
+        ],
+        "{types:?}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{types:?}");
+    assert_eq!(mcp.call_count(), 1, "the one call that fit ran: {types:?}");
+    server.abort();
+    mcp.stop().await;
+}
+
 /// An upstream status answered before the first byte of the first turn: the
 /// stream is the one typed error event, the upstream's own code and message,
 /// at sequence number 0; no event name, no sentinel.
