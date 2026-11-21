@@ -160,16 +160,31 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
 | `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
 | `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
-| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD 1-GPU chat and Go SDK e2e jobs; both require `SMG_RUN_AMD_LEGS=true`, and Go also requires `SMG_RUN_AMD_GO_LEGS=true` |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
+| `SMG_RUN_AMD_GO_LEGS` | `false` | Opt in to AMD Go SDK e2e; also requires `SMG_RUN_AMD_LEGS=true` and, for same-repository PRs, `SMG_RUN_AMD_ON_PRS=true`. See the qualification and runner trust requirements below |
 | `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
+
+The AMD Go same-repository condition is an eligibility filter in this workflow.
+A fork that changes the workflow can remove it; it does not isolate inherited
+runner HF credentials. That trust boundary must come from admission outside
+PR-controlled code, such as reviewed fork-run approval, or from runners without
+those credentials for untrusted jobs. Labels and this condition alone do not
+establish that boundary.
+
+For an approved first qualification, after the native environment and Go FFI
+checks pass, the normal Go job may be enabled to qualify its original Llama
+model and all 23 test methods. Keep the original assertions and expected-failure
+rules. Require actual model results and complete owned cleanup before accepting
+GPU coverage or steady rollout. Shared-host admission, lease, time windows and
+approved CI limits still apply to this first run.
 
 ### Container-mode GPU runners
 

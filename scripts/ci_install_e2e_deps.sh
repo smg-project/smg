@@ -16,6 +16,7 @@ echo "Installing e2e test dependencies..."
 # Resolve the mock's HTTP dependencies with the installed engine's requirements.
 engine_http_requirements="$(python3 -c '
 import importlib.metadata
+import os
 import re
 
 for engine in ("vllm", "tensorrt-llm", "sglang", "tokenspeed"):
@@ -27,6 +28,14 @@ for engine in ("vllm", "tensorrt-llm", "sglang", "tokenspeed"):
         name = re.split(r"[\[<>=!~;\s]", requirement, maxsplit=1)[0].lower()
         if name in {"mcp", "fastapi", "starlette"}:
             print(requirement)
+# Only pinned ROCm image setup publishes this companion. Resolve it together
+# with FastMCP, so pip can backtrack within the supported e2e_test version range;
+# never downgrade the API after installing an incompatible FastMCP.
+otel_api = os.environ.get("SMG_CI_OTEL_API_VERSION", "")
+if otel_api:
+    from packaging.version import Version
+
+    print("opentelemetry-api==" + str(Version(otel_api)))
 ')"
 engine_http_args=()
 if [ -n "$engine_http_requirements" ]; then
