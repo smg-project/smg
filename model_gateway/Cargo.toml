@@ -236,11 +236,6 @@ harness = false
 path = "benches/tokenizer_benchmark.rs"
 
 [[bench]]
-name = "tool_parser_benchmark"
-harness = false
-path = "benches/tool_parser_benchmark.rs"
-
-[[bench]]
 name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"

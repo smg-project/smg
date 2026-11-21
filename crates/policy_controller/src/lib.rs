@@ -44,6 +44,8 @@
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists. A binding names where a request's
 //!   routing key comes from, and one function derives it ([`document`]).
+//!   A gateway's routing settings mean a document too, and
+//!   [`document::RoutingSettings`] writes it.
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
 //!   which the controller's store is fed (membership, health, loads, KV

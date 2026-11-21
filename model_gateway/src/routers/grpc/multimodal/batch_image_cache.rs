@@ -150,7 +150,17 @@ pub(super) async fn preprocess(
             }
             // An allocation that fills the budget leaves no room for entries.
             // Let the owned split copy those slices in parallel.
-            batch.encoder_input.share_wire(budget.saturating_sub(1));
+            let limit = budget.saturating_sub(1);
+            // A pooled buffer's class can be over the budget while its bytes
+            // fit: share one exact-length copy, so a replay reads the entries
+            // without a gather, and return the buffer to the pool.
+            if let EncoderInput::Wire { bytes, .. } = &mut batch.encoder_input {
+                if bytes.capacity() > limit && bytes.len() <= limit {
+                    let exact = bytes.to_vec();
+                    buffer_pool::recycle(std::mem::replace(bytes, exact));
+                }
+            }
+            batch.encoder_input.share_wire(limit);
             let mut items = split_batch(&batch, &layouts, misses.len())?;
             // When pooled capacity leaves insufficient room for metadata,
             // compact the cache entries while retaining the request output.
