@@ -438,7 +438,8 @@ fn tile_blocks(
 ) {
     let splitter = RgbSplitter::detect();
     let block = tile * tile;
-    let mut bytes = vec![0u8; 3 * block];
+    // A pooled buffer: a full tile covers it, a partial one clears it first.
+    let mut bytes = buffer_pool::take(3 * block);
     for tile_y in 0..rows {
         for tile_x in 0..columns {
             let left = (tile_x * tile).min(width);
@@ -459,6 +460,7 @@ fn tile_blocks(
             }
         }
     }
+    buffer_pool::recycle(bytes);
 }
 
 impl VisionPreProcessor for Llama4VisionProcessor {
@@ -823,5 +825,18 @@ mod tests {
             }
         }
         assert_eq!(got, want);
+    }
+
+    /// The block buffer of `tile_blocks` is the pool's and goes back to it.
+    #[test]
+    fn the_tile_blocks_buffer_goes_back_to_the_pool() {
+        static MINE: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        let tile = 336;
+        let rgb = vec![1u8; tile * tile * 3];
+        buffer_pool::with_pool(&MINE, || {
+            tile_blocks(&rgb, (tile, tile), (1, 1), tile, |_, _| {});
+        });
+        // Three channels of a 336x336 tile, 338,688 bytes: the 512 KiB class.
+        assert_eq!(MINE.held(), 512 << 10);
     }
 }
