@@ -185,7 +185,8 @@ const WORD_SCAN_MIN_BYTES: usize = PARALLEL_CHUNK_BYTES;
 /// Bytes at the head of a unit that `NativeEncoder::opens_as_ascii` reads.
 const ASCII_HEAD_BYTES: usize = 256;
 /// A thread's share of one encoder's piece cache, at most; see
-/// `PIECE_CACHE_TOTAL_CAPACITY`. A share cut for more than sixteen threads
+/// `PIECE_CACHE_TOTAL_CAPACITY`. A share cut for more than sixteen threads,
+/// or to a part where the threads share what they merge,
 /// is a count of entries over the three tiers. At this full share the wide
 /// table and the map hold a share between them and the packed table is
 /// counted apart, by the fill bound of the slots the share takes (one and
@@ -233,10 +234,14 @@ const ASCII_HEAD_BYTES: usize = 256;
 /// grew by 8 MB on a 128k-token vocabulary and did not move on three
 /// larger ones, whose peak is the file load.
 const PIECE_CACHE_CAPACITY: usize = 262_144;
+/// Packed entries a thread at the full share holds before its tiers are
+/// cleared: the fill bound of the slots that share takes.
+const FULL_SHARE_PACKED: usize = ShortPieceTable::slots_for(PIECE_CACHE_CAPACITY) / 4 * 3;
 /// Entries all threads together hold for one encoder once more than sixteen
 /// have encoded with it: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
-/// (and never more than `PIECE_CACHE_CAPACITY`). Up to sixteen threads are
+/// (and never more than `PIECE_CACHE_CAPACITY`). Up to sixteen threads that
+/// do not share what they merge are
 /// each at the full cap, where the packed table is counted apart and a
 /// thread holds up to two and a half caps of entries: their total is the
 /// bytes below, not this count. Where the threads share
@@ -306,7 +311,9 @@ const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// most, so 2,097,152 entries: its 64 parts of 65,536 slots are 132 MiB of
 /// packed slots, and the ids past four an entry in their spills). The
 /// quarter of every thread and that half are three quarters of the
-/// entries, and of the packed slots, the threads held before the table: a
+/// packed slots the threads held before the table, and three tenths of the
+/// entries a full share lets a thread hold with its packed table counted
+/// apart: a
 /// thread of eight to sixteen holds 131,072 packed slots, and the table
 /// 262,144 for each of them, where a thread held 524,288; the maps and the
 /// wide tables, bounded by the same share, hold a quarter. An encoder that
@@ -676,17 +683,25 @@ impl PieceCache {
         self.packed.len() + self.wide.len() + self.short.len()
     }
 
+    /// The entries counted against `share`: all three tiers under a share
+    /// that was cut, the wide table and the map alone at the full share,
+    /// where the packed table is bounded by its slots.
+    fn counted_entries(&self, share: usize) -> usize {
+        if share < PIECE_CACHE_CAPACITY {
+            self.short_entries()
+        } else {
+            self.wide.len() + self.short.len()
+        }
+    }
+
     /// Whether the tiers bounded by count are full under `share`. At the
     /// full share the packed table is counted by its slots, apart from the
     /// other two: one count over the three cleared them all while those
-    /// slots were at most half full. A share cut for more threads keeps the
-    /// one count, so those threads hold together what they held.
+    /// slots were at most half full. A share that was cut keeps the one
+    /// count, so those threads hold together what they held.
     fn short_full(&self, share: usize) -> bool {
-        if share < PIECE_CACHE_CAPACITY {
-            return self.short_entries() >= share;
-        }
-        self.packed.len() >= ShortPieceTable::slots_for(share) / 4 * 3
-            || self.wide.len() + self.short.len() >= share
+        self.counted_entries(share) >= share
+            || (share >= PIECE_CACHE_CAPACITY && self.packed.len() >= FULL_SHARE_PACKED)
     }
 
     /// Counts `asked` asks of the learned table, `of_use` of them answered
@@ -4535,14 +4550,7 @@ impl NativeEncoder {
         cache.share = share;
         cache.waiting.clear();
         let slots = ShortPieceTable::slots_for(share);
-        // As `PieceCache::short_full` counts: the packed table apart at the
-        // full share.
-        let counted = if share < PIECE_CACHE_CAPACITY {
-            cache.short_entries()
-        } else {
-            cache.wide.len() + cache.short.len()
-        };
-        if counted > share
+        if cache.counted_entries(share) > share
             || cache.packed_slots() > slots
             || cache.wide_slots() > WidePieceTable::slots_for(share)
             || cache.map_capacity() > 2 * share
