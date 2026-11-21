@@ -572,6 +572,29 @@ fn walk<T>(
     None
 }
 
+/// The ring the request's host lent ([`RequestFacts::ring`]), for a decision
+/// over a list of `rows` rows: `None` where none is lent.
+///
+/// A host lends the ring of the list it hands as the candidates and no
+/// other, so a lent ring of another length is its caller's error. A debug
+/// build stops at it. Any other build passes the ring over
+/// ([`ring_of_these`]): the scorer then places by its own ring, behind its
+/// lock, and teaches it the members.
+fn lent_ring<'a>(facts: &RequestFacts<'a>, rows: usize) -> Option<&'a PoolRing> {
+    let lent = facts.ring?;
+    debug_assert_eq!(
+        lent.len(),
+        rows,
+        "a lent ring is the ring of the list the candidates are"
+    );
+    ring_of_these(lent, rows)
+}
+
+/// `lent` where it is the ring of a list of `rows` rows, by its length.
+fn ring_of_these(lent: &PoolRing, rows: usize) -> Option<&PoolRing> {
+    (lent.len() == rows).then_some(lent)
+}
+
 thread_local! {
     /// The slots of the decision in progress on this thread: per ring
     /// member, the kept index of the candidate it is, with the marks of the
@@ -1022,10 +1045,10 @@ impl Scorer for ConsistentHash {
         // The ring of the list the candidates are, where their host lent
         // one, names each member by its row's place: no pool is shown to
         // this stage's own ring, which learns nothing.
-        if let Some(lent) = facts.ring {
-            if lent.len() != candidates.len() {
+        if facts.ring.is_some() {
+            let Some(lent) = lent_ring(facts, candidates.len()) else {
                 return false;
-            }
+            };
             let mut places = [0; MAX_TARGETS];
             let by_place = |place: u32| candidates.get(place as usize).is_some_and(&mut *keep);
             let handed = lent.walk(key, by_place, &mut places);
@@ -1062,8 +1085,7 @@ impl Scorer for ConsistentHash {
     /// ([`RequestFacts::ring`]), for a host that reads a row when the walk
     /// asks about it. The ring names a member by its row's place, so the
     /// walk reads no row itself. Nothing is placed where no ring is lent,
-    /// where the lent ring is of another length than the pool, or where
-    /// [`Self::own`] would place nothing.
+    /// or where [`Self::own`] would place nothing.
     fn own_by_place(
         &self,
         facts: &RequestFacts<'_>,
@@ -1072,10 +1094,8 @@ impl Scorer for ConsistentHash {
         out: &mut [u32; MAX_TARGETS],
     ) -> usize {
         let key = self.own_key(facts);
-        match facts.ring {
-            Some(lent) if key != 0 && self.owns() && lent.len() == rows => {
-                lent.walk(key, keep, out)
-            }
+        match lent_ring(facts, rows) {
+            Some(lent) if key != 0 && self.owns() => lent.walk(key, keep, out),
             _ => 0,
         }
     }
@@ -1105,7 +1125,7 @@ impl Scorer for ConsistentHash {
             // The ring of the list the candidates are, where their host
             // lent one: read with no lock, and this stage's own ring is
             // neither read nor taught.
-            if let Some(lent) = facts.ring.filter(|lent| lent.len() == candidates.len()) {
+            if let Some(lent) = lent_ring(facts, candidates.len()) {
                 lent.fill(kept, &mut slots);
                 self.rank_by(
                     facts, lent, candidates, kept, &mut slots, first, &mut keys, out,
@@ -2483,7 +2503,7 @@ mod tests {
     /// written for the decision, its walk by place, and the membership's
     /// words, which find no member to take away. The walks hand out the
     /// pass's best rows in its order, with the pool's engines listed or
-    /// not. A ring of another list is not the rows', and is not read.
+    /// not.
     #[test]
     fn a_scorer_under_lent_rings_keeps_no_ring_of_its_own() {
         let rows = listed(64, 9);
@@ -2528,30 +2548,49 @@ mod tests {
             scorer.ring().is_empty(),
             "no member learned, none taken away"
         );
+    }
 
-        // A ring of another list: no walk goes by it, and the pass is the
-        // scorer's own ring's, which learns the rows as it does with no
-        // ring lent, and scores them alike.
-        let other = ring_of_list(&rows[..63]);
+    /// A ring of another list than the rows is no ring of theirs, by its
+    /// length. A host lends the ring of the list it hands and no other, so
+    /// a debug build stops at such a ring wherever the scorer reads one:
+    /// in its pass over the rows, in its walk over rows written for the
+    /// decision, and in its walk by place.
+    #[test]
+    fn a_lent_ring_of_another_list_is_not_the_rows() {
+        let rows = listed(64, 9);
+        let (theirs, other) = (ring_of_list(&rows), ring_of_list(&rows[..63]));
+        assert!(ring_of_these(&theirs, 64).is_some());
+        assert!(ring_of_these(&other, 64).is_none());
+        if !cfg!(debug_assertions) {
+            return;
+        }
         let astray = RequestFacts {
             ring: Some(&other),
             ..keyed(77)
         };
-        assert_eq!(
-            scorer.own_by_place(&astray, 64, &mut |_| true, &mut walked),
-            0
-        );
-        let unsaid = PoolFacts::default();
-        assert!(!scorer.own(
-            &astray,
-            &unsaid,
-            &rows,
-            &mut |_: &Candidate| true,
-            &mut Vec::new()
-        ));
-        assert!(scorer.ring().is_empty());
-        assert_eq!(scored_among(&scorer, &astray, &rows, &kept), by_pass);
-        assert_eq!(scorer.ring().len(), 64);
+        let kept: Vec<u32> = (0..64).collect();
+        let stopped = |read: &dyn Fn(&ConsistentHash)| {
+            let scorer = ConsistentHash::new(None);
+            let read = std::panic::AssertUnwindSafe(|| read(&scorer));
+            assert!(std::panic::catch_unwind(read).is_err());
+            assert!(scorer.ring().is_empty(), "no member learned on the way");
+        };
+        stopped(&|scorer| {
+            scored_among(scorer, &astray, &rows, &kept);
+        });
+        stopped(&|scorer| {
+            let pool = PoolFacts::default();
+            scorer.own(
+                &astray,
+                &pool,
+                &rows,
+                &mut |_: &Candidate| true,
+                &mut Vec::new(),
+            );
+        });
+        stopped(&|scorer| {
+            scorer.own_by_place(&astray, 64, &mut |_| true, &mut [0; MAX_TARGETS]);
+        });
     }
 
     /// A list where two rows carry one id holds one member twice over. The

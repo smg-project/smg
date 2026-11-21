@@ -486,7 +486,7 @@ fn a_kept_keys_pin_is_followed_with_the_veto_as_it_stands() {
 /// What is not decided here is left to the whole decision, and nothing is
 /// read or written for it: a request with no key, a request that carries
 /// an affinity column, a key with no pin, a document none of whose bindings
-/// pins a key or reads a ring, and a pool the list's ring is not of.
+/// pins a key or reads a ring.
 #[test]
 fn a_request_the_key_does_not_decide_is_left_whole_to_the_whole_decision() {
     let rows = pool(16, 41, 0, 0);
@@ -522,14 +522,6 @@ fn a_request_the_key_does_not_decide_is_left_whole_to_the_whole_decision() {
             .is_none());
         assert_eq!(listed.read(), 0, "no row is read for it");
     }
-    // A ring of another list than the rows is not walked.
-    let fewer = ring_of(&rows[..15]);
-    let astray = Listed::of(&rows, &fewer);
-    assert!(by_ring
-        .engine()
-        .decide_keyed(&mut { keyed }, &astray, &cx)
-        .is_none());
-    assert_eq!(astray.read(), 0);
     // A key the table holds no pin of: the rule's whole decision places
     // and claims it, and nothing is written for it here.
     let manual = stock("manual");
