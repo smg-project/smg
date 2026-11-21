@@ -568,9 +568,9 @@ What the table says beyond `inkling`, whose rows it shares:
   consumed them with the kind's marker. Without the lead the derivation, which starts from the
   turn's own state, wrote Inkling's tag: from the first token it owed the thought's or the
   answer's marker where the model writes `<|message_model|>`, a marker with no row out of the
-  state the turn starts in. The forced call's tag is Inkling's unchanged: the call marker
-  triggers it inside whatever message the model is writing, and the opener before it is free
-  text.
+  state the turn starts in. A forced call's tag takes the opener too: owed before the call's
+  marker where the engine starts at the first token, optional otherwise; a call the request does
+  not owe keeps Inkling's tag, the opener written in its free text.
 - **The opener said again inside a message is the opener.** A row on `<|message_model|>` from
   each body back into it, framing as a kind said again is, the kind marker after it the kind.
   The answer tag's optional way in admits the opener and the kind marker after an engine that
