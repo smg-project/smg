@@ -25,13 +25,13 @@ use crate::{
     },
     policies::standard_filters,
     stages::{
-        lifecycle::{Lifecycle, Words},
+        lifecycle::Lifecycle,
         scorers::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
     },
     tracking::{
         dispatch_credit::{DispatchCredit, DispatchCreditPass},
         in_flight::with_counts,
-        lease::{Lease, Membership, Side},
+        lease::{EventKind, EventSet, Lease, Membership, Side},
     },
 };
 
@@ -393,10 +393,11 @@ impl Lifecycle for LeastLoad {
     }
 
     /// The dispatch, where the stage feeds its own count of sends.
-    fn hears(&self) -> Words {
-        Words {
-            dispatch: self.feeds,
-            ..Words::NONE
+    fn hears(&self) -> EventSet {
+        if self.feeds {
+            EventSet::NONE.with(EventKind::Dispatched)
+        } else {
+            EventSet::NONE
         }
     }
 }

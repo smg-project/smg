@@ -80,11 +80,8 @@ use crate::{
         view::{Candidate, Phase, RequestFacts, WorkerId},
     },
     policies::standard_filters,
-    stages::{
-        lifecycle::{Lifecycle, Words},
-        retired_workers::RetiredWorkers,
-    },
-    tracking::lease::{Lease, Membership, Side},
+    stages::{lifecycle::Lifecycle, retired_workers::RetiredWorkers},
+    tracking::lease::{EventKind, EventSet, Lease, Membership, Side},
 };
 
 /// How the `bucket` policy is composed: its filters, its scorers and its
@@ -919,13 +916,11 @@ impl Lifecycle for Bucket {
     }
 
     /// The issue books and the dispatch books again where the request went
-    /// elsewhere. A booking ages off: no end is taken.
-    fn hears(&self) -> Words {
-        Words {
-            issue: true,
-            dispatch: true,
-            end: false,
-        }
+    /// elsewhere. A booking ages off: neither end is taken.
+    fn hears(&self) -> EventSet {
+        EventSet::NONE
+            .with(EventKind::Issued)
+            .with(EventKind::Dispatched)
     }
 }
 

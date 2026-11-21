@@ -45,7 +45,7 @@ use crate::{
     },
     stages::Lifecycle,
     store::{leases::DISPATCH_TTL, Said},
-    tracking::lease::{Lease, LeaseId, LeaseKind, Side},
+    tracking::lease::{EventKind, EventSet, Lease, LeaseId, LeaseKind, Side},
 };
 
 /// The stage a request that states a hard demand is declined under: no
@@ -128,7 +128,7 @@ pub(super) fn noted(
         }),
         decode_session: Session::NONE,
     };
-    if own.hears.issue {
+    if own.hears.contains(EventKind::Issued) {
         own.spec
             .engine()
             .on_decision_issued(&lease, &decided.decision);
@@ -222,7 +222,8 @@ pub(super) fn issued(
     now: Instant,
 ) -> DecideOutcome {
     let facts = &request.facts;
-    let noted = decision.pick().filter(|_| own.hears.any());
+    let leased = own.hears.intersects(EventSet::LEASE);
+    let noted = decision.pick().filter(|_| leased);
     let lease = noted.and_then(|pick| {
         let first = pick.targets.first()?;
         Some(Lease {
@@ -238,7 +239,8 @@ pub(super) fn issued(
             tokens: facts.prompt_tokens,
         })
     });
-    if let Some(lease) = lease.as_ref().filter(|_| own.hears.issue) {
+    let issue = own.hears.contains(EventKind::Issued);
+    if let Some(lease) = lease.as_ref().filter(|_| issue) {
         own.spec.engine().on_decision_issued(lease, &decision);
     }
     DecideOutcome {
@@ -306,7 +308,7 @@ mod tests {
             view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
         },
         policies::random::Random,
-        stages::{registry::StageRegistry, Words},
+        stages::registry::StageRegistry,
         store::GatewayId,
         tracking::{
             lease::{Outcome, ReleaseReason, TransportClass},
@@ -439,7 +441,7 @@ mod tests {
     /// session, and is told to the stage that takes the issue.
     #[test]
     fn a_place_picked_under_a_document_that_takes_a_word_is_noted() {
-        let (engine, heard) = hearing_as(false, true, Words::ALL);
+        let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
         let place = engine.place(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
@@ -640,11 +642,11 @@ mod tests {
         heard: Heard,
         panics: bool,
         alone: bool,
-        takes: Words,
+        takes: EventSet,
     }
 
     impl Lifecycle for Hears {
-        fn hears(&self) -> Words {
+        fn hears(&self) -> EventSet {
             self.takes
         }
 
@@ -709,12 +711,12 @@ mod tests {
     /// The engine of the `random` preset with [`Hears`] in its pick's place,
     /// taking every word of a lease, and what it heard.
     fn hearing(panics: bool) -> (PolicyEngine, Heard) {
-        hearing_as(panics, false, Words::ALL)
+        hearing_as(panics, false, EventSet::LEASE)
     }
 
     /// [`hearing`] with a picker that places by itself where `alone`, and
     /// that names the words `takes`.
-    fn hearing_as(panics: bool, alone: bool, takes: Words) -> (PolicyEngine, Heard) {
+    fn hearing_as(panics: bool, alone: bool, takes: EventSet) -> (PolicyEngine, Heard) {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let mut stages = StageRegistry::builtin();
@@ -791,43 +793,47 @@ mod tests {
     }
 
     /// A word of a lease is told where a stage takes it and to nobody
-    /// where none does: under a document whose one stage takes the dispatch
-    /// alone, the issue, the end and the release of its leases are not
-    /// told.
+    /// where none does. One request is sent and completed and one is given
+    /// up unsent: a document whose one stage takes one kind of word hears
+    /// that kind of the two leases and no other. A completion and a release
+    /// are told apart.
     #[test]
     fn a_word_no_stage_takes_is_told_to_nobody() {
-        let takes = Words {
-            dispatch: true,
-            ..Words::NONE
+        let told = |kind: EventKind| {
+            let (engine, heard) = hearing_as(false, false, EventSet::NONE.with(kind));
+            let list = pool(4);
+            let members = engine.pool_members(&list);
+            let asks = Asks::of(request(), Some(&members));
+            let now = Instant::now();
+            let mut handle = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                .expect("a decision");
+            let first = handle.take(0).expect("the first target");
+            handle.dispatched(now);
+            handle.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: first.id,
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    duration_micros: 0,
+                },
+                now,
+            );
+            drop(handle);
+            let unsent = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                .expect("a decision");
+            drop(unsent);
+            assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+            let words: Vec<&'static str> = heard.lock().iter().map(|heard| heard.0).collect();
+            words
         };
-        let (engine, heard) = hearing_as(false, false, takes);
-        let list = pool(4);
-        let members = engine.pool_members(&list);
-        let asks = Asks::of(request(), Some(&members));
-        let now = Instant::now();
-        let mut handle =
-            DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
-        let first = handle.take(0).expect("the first target");
-        handle.dispatched(now);
-        handle.completed(
-            &Outcome {
-                side: Side::Single,
-                served: first.id,
-                status: 200,
-                class: TransportClass::Ok,
-                ttft_micros: 0,
-                tokens_in: 0,
-                tokens_out: 0,
-                duration_micros: 0,
-            },
-            now,
-        );
-        drop(handle);
-        let unsent =
-            DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
-        drop(unsent);
-        assert_eq!(*heard.lock(), [("dispatched", first.id, 0)]);
-        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+        assert_eq!(told(EventKind::Issued), ["issued", "issued"]);
+        assert_eq!(told(EventKind::Dispatched), ["dispatched"]);
+        assert_eq!(told(EventKind::Completed), ["completed"]);
+        assert_eq!(told(EventKind::Released), ["released"]);
     }
 
     /// A decision that panics costs its request alone and is counted.

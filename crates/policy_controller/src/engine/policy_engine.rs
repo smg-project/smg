@@ -71,9 +71,9 @@ use crate::{
     document::spec::AppliedSpec,
     names::intern,
     policies::consistent_hashing::PoolRing,
-    stages::{Lifecycle, Words},
+    stages::Lifecycle,
     store::{pairing::Refusal, GatewayId, Said},
-    tracking::lease::Side,
+    tracking::lease::{EventKind, EventSet, Side},
 };
 
 /// The engine of one policy document, for a gateway that decides in its own
@@ -97,11 +97,11 @@ pub struct PolicyEngine {
     /// The id of the last lease issued. A pick that is issued one writes
     /// it: one atomic step, on cache lines of its own.
     leases: OwnWord,
-    /// The words on a lease the document takes ([`Lifecycle::hears`]),
-    /// read once, here. A document that takes none costs a request no
-    /// lease, no id and no word, and its plain requests are answered a
-    /// place ([`Decided::Alone`]).
-    hears: Words,
+    /// The kinds of event the document takes ([`Lifecycle::hears`]), read
+    /// once, here. A document that takes no word on a lease
+    /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
+    /// and its plain requests are answered a place ([`Decided::Alone`]).
+    hears: EventSet,
 }
 
 /// One pool of one model as the engine keeps it: the gateway's shared list
@@ -454,7 +454,7 @@ impl DecisionEngine for PolicyEngine {
                 if let Some(pick) = single::alone(self, maker.model(), plain, members) {
                     // No stage takes a word of the request: the place is
                     // the whole answer.
-                    if !self.hears.any() {
+                    if !self.hears.intersects(EventSet::LEASE) {
                         return Ok(Decided::Alone(pick));
                     }
                     if let Some(decided) = single::noted(self, pick, members, plain, now) {
@@ -521,11 +521,12 @@ impl DecisionEngine for PolicyEngine {
     fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
         // A single's word no stage takes is told to nobody. A pair's
         // dispatch may carry its decode's issue: every word of one is told.
-        let taken = match said {
-            Said::Dispatched(..) => self.hears.dispatch,
-            Said::Completed(_) | Said::Released(..) => self.hears.end,
+        let kind = match said {
+            Said::Dispatched(..) => EventKind::Dispatched,
+            Said::Completed(_) => EventKind::Completed,
+            Said::Released(..) => EventKind::Released,
         };
-        if held.lease.side == Side::Single && !taken {
+        if held.lease.side == Side::Single && !self.hears.contains(kind) {
             return;
         }
         let engine = self.spec.engine();

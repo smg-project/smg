@@ -16,7 +16,7 @@ pub(crate) mod retired_workers;
 pub(crate) mod scorers;
 
 pub use filters::{HasCapacity, HasRoom, Healthy, NotOverloaded, NotTried};
-pub use lifecycle::{Lifecycle, Words};
+pub use lifecycle::Lifecycle;
 pub use pickers::{Best, CountFirst, SampledBest};
 pub use registry::{StageBuild, StageError, StageKind, StageRegistry, StageRegistryError};
 pub use retired_workers::RETIRED_WORKER_TTL;
