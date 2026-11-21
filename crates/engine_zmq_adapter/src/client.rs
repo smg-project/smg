@@ -3,6 +3,7 @@
 //! plus the connect entry points and metadata reads.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, OnceLock},
@@ -63,9 +64,9 @@ use crate::{
     },
     vllm::{
         constraint_ref as vllm_constraint_ref, fan_out_requests, has_media, kv_transfer_params,
-        now_secs, ranked_candidate_count, refuse_greedy_choices, translate_media,
-        translate_request_with_media, translated_from_processed, ProcessedMedia, TranslatedMedia,
-        VllmGenerateStream,
+        now_secs, pulls_on_do_remote_prefill, ranked_candidate_count, refuse_greedy_choices,
+        translate_media, translate_request_with_media, translated_from_processed,
+        validate_token_ids, ProcessedMedia, TranslatedMedia, VllmGenerateStream, VocabBounds,
     },
 };
 
@@ -178,6 +179,16 @@ pub(crate) struct ZmqConnectionMeta {
     /// is the engine's `auto`, every kind taken
     /// ([`StructuredOutputsSupport::default`]).
     structured_outputs: OnceLock<StructuredOutputsSupport>,
+    /// The model's and the tokenizer's vocabulary bounds, set once by the
+    /// caller that knows them (the servicer); unset skips the out-of-vocab
+    /// token-id checks.
+    vocab_bounds: OnceLock<VocabBounds>,
+    /// Set once by the caller that knows it (the servicer that launched the
+    /// engine) when the engine's KV connector pulls a PD decode side's prompt
+    /// KV on `do_remote_prefill`: only then does a request's handoff claim
+    /// loosen its prompt bound
+    /// (see [`ZmqEngineClient::note_kv_transfer_config`]).
+    engine_pulls_remote_kv: OnceLock<()>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
     supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
@@ -437,6 +448,8 @@ impl ZmqEngineClient {
                 eos,
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs: OnceLock::new(),
+                vocab_bounds: OnceLock::new(),
+                engine_pulls_remote_kv: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
@@ -572,6 +585,41 @@ impl ZmqEngineClient {
             .request_timeout
             .get()
             .map(|timeout| RequestDeadline::after(*timeout))
+    }
+
+    /// Bound client-supplied token ids (prompt, `stop_token_ids`,
+    /// `logit_bias`) by the model's vocabulary, as vLLM's frontend does: an
+    /// out-of-range id reaching the engine faults the GPU. The tokenizer's
+    /// largest id (added tokens included) widens the bound where vLLM's does,
+    /// at the prompt positions whose embedding comes from elsewhere; unknown,
+    /// those positions get the model's. A zero `model_vocab_size` leaves the
+    /// checks off. The first call wins.
+    pub fn set_vocab_size(&self, model_vocab_size: u32, tokenizer_max_token_id: Option<u32>) {
+        if model_vocab_size > 0 {
+            let _ = self
+                .meta
+                .vocab_bounds
+                .set(VocabBounds::new(model_vocab_size, tokenizer_max_token_id));
+        }
+    }
+
+    /// The vocabulary bounds, once [`Self::set_vocab_size`] set them.
+    pub(crate) fn vocab_bounds(&self) -> Option<VocabBounds> {
+        self.meta.vocab_bounds.get().copied()
+    }
+
+    /// Note the engine's KV connector and role, as the servicer reports
+    /// them for PD (`kv_connector` projects a `MultiConnector` onto its one
+    /// P2P child). When that connector pulls a decode side's prompt KV on
+    /// `do_remote_prefill: true` (NIXL, Mooncake, MoRIIO, as a consumer), a
+    /// request claiming that handoff has its prompt held to vLLM's own bound
+    /// rather than the model's (see `validate_token_ids`). Any other
+    /// configuration leaves the claim changing nothing: such an engine
+    /// computes the prompt itself. The first matching call wins.
+    pub fn note_kv_transfer_config(&self, kv_connector: &str, kv_role: &str) {
+        if pulls_on_do_remote_prefill(kv_connector, kv_role) {
+            let _ = self.meta.engine_pulls_remote_kv.set(());
+        }
     }
 
     /// The tasks the engine's model runner serves (vLLM's
@@ -818,7 +866,7 @@ impl ZmqEngineClient {
         // and unlinked, a single time) and off the runtime: `/dev/shm` reads
         // and the dtype casts of multi-megabyte tensors would otherwise hold a
         // worker thread per request, starving token forwarding and health.
-        let media = if let Some(processed) = processed {
+        let mut media = if let Some(processed) = processed {
             if processed.is_batches() {
                 let (returned, media) = tokio::task::spawn_blocking(move || {
                     let media = translated_from_processed(&req, processed, model_dtype);
@@ -858,6 +906,26 @@ impl ZmqEngineClient {
             refuse_unenforceable_constraint(vllm_constraint_ref(sp), support)
                 .map_err(constraint_refused_status)?;
         }
+        // After the media translation, not before: an SHM payload must be read
+        // (and so unlinked) even when the request is then refused, and the
+        // translation says which prompt positions the media fills. Taken out
+        // of the media: nothing past this check reads them, and the fan-out
+        // below copies the media per choice.
+        let embed_positions = std::mem::take(&mut media.embed_positions);
+        let bounds = self.vocab_bounds();
+        if let Some(bounds) = bounds {
+            let pulls_remote_kv = self.meta.engine_pulls_remote_kv.get().is_some();
+            validate_token_ids(&req, &embed_positions, bounds, pulls_remote_kv)
+                .map_err(tonic::Status::invalid_argument)?;
+        }
+        drop(embed_positions);
+        // The EOS ids every sub carries, past-vocabulary ones dropped: they
+        // ride `_all_stop_token_ids` even under `ignore_eos`, where they would
+        // index the logits as surely as a caller's id the check refused.
+        let eos = match bounds {
+            Some(bounds) => self.effective_eos().within_vocab(bounds.model),
+            None => Cow::Borrowed(self.effective_eos()),
+        };
         let subs = fan_out_requests(req);
         let last = subs.len().saturating_sub(1);
         let mut media = Some(media);
@@ -873,14 +941,9 @@ impl ZmqEngineClient {
             // Worker-processed tensors ride as aux frames; each choice's
             // message carries them (shared bytes, not copies).
             let aux_frames = sub_media.aux_frames.clone();
-            let mut request = translate_request_with_media(
-                sub,
-                sub_media,
-                max_model_len,
-                self.effective_eos(),
-                support,
-            )
-            .map_err(tonic::Status::invalid_argument)?;
+            let mut request =
+                translate_request_with_media(sub, sub_media, max_model_len, &eos, support)
+                    .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             // The engine returns the sampled/prompt token's logprob
             // plus the requested ranked candidates per position; carry
@@ -2852,6 +2915,15 @@ mod tests {
     /// `count` mock ranks behind one vLLM-dialect client, kept alive so they
     /// can answer utility calls.
     async fn connected_ranks(dir: &Path, count: usize) -> (ZmqEngineClient, Vec<MockEngine>) {
+        connected_ranks_with_eos(dir, count, EosTokenIds::default()).await
+    }
+
+    /// [`connected_ranks`] with a connect-time EOS set.
+    async fn connected_ranks_with_eos(
+        dir: &Path,
+        count: usize,
+        eos: EosTokenIds,
+    ) -> (ZmqEngineClient, Vec<MockEngine>) {
         let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
         let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
         let ranks = (0..count as u32).map(|rank| {
@@ -2871,7 +2943,7 @@ mod tests {
                 &output,
                 count,
                 "org/repo".to_string(),
-                EosTokenIds::default(),
+                eos,
                 RuntimeType::Vllm,
                 Duration::from_secs(10)
             ),
@@ -3267,6 +3339,385 @@ mod tests {
             None,
             "a request without a grammar carries nothing"
         );
+    }
+
+    /// Once the vocabulary is known, an out-of-vocab id is refused as
+    /// INVALID_ARGUMENT before any frame reaches the engine (where it would
+    /// fault the GPU); unset, the request goes through as before.
+    #[tokio::test]
+    async fn out_of_vocab_ids_never_reach_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let request = || vllm::GenerateRequest {
+            request_id: "oov".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 3],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                logit_bias: [(999_999_999, 5.0)].into_iter().collect(),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+
+        client.set_vocab_size(1000, None);
+        let Err(status) = client.generate_vllm_streams(request()).await else {
+            panic!("an out-of-vocab logit_bias key was accepted");
+        };
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("[999999999] in logit_bias"));
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        // The size is set once: a later zero (an unknown size) cannot clear it.
+        client.set_vocab_size(0, None);
+        assert!(client.generate_vllm_streams(request()).await.is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (unsized_client, mut engines) = connected_ranks(dir.path(), 1).await;
+        unsized_client.set_vocab_size(0, None);
+        let _streams = unsized_client
+            .generate_vllm_streams(request())
+            .await
+            .expect("an unknown vocabulary skips the check");
+        assert!(matches!(
+            engines[0].recv().await.expect("inbound"),
+            EngineInbound::Add(_)
+        ));
+    }
+
+    /// The vocabulary bound reads the positions the engine's features fill: a
+    /// placeholder id past the model's vocabulary but within the tokenizer's
+    /// reaches the engine where an image is attached, the same id at a text
+    /// position is refused before it does, and so is one under a tensor-less
+    /// identity batch, which attaches nothing. An image position still has a
+    /// bound, the tokenizer's, and `prompt_logprobs`, which scores every
+    /// prompt id against the model's logits, refuses the placeholder.
+    #[tokio::test]
+    async fn an_out_of_vocab_placeholder_id_passes_only_where_the_image_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        // The model's 1000 rows; the tokenizer's placeholder token is 1000.
+        client.set_vocab_size(1000, Some(1000));
+        // One image, its token 1000 at 1..3, its pixels inline.
+        let image = || vllm::MultimodalInputs {
+            pixel_values: Some(vllm::TensorData {
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+                payload: Some(vllm::tensor_data::Payload::Inline(
+                    [0.0f32, 1.0, 2.0, 3.0]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                        .into(),
+                )),
+            }),
+            im_token_id: Some(1000),
+            mm_placeholders: vec![vllm::PlaceholderRange {
+                offset: 1,
+                length: 2,
+            }],
+            mm_hashes: vec!["h0".to_string()],
+            batched_keys: vec!["pixel_values".to_string()],
+            ..Default::default()
+        };
+        let scored = |input_ids: Vec<u32>, mm: vllm::MultimodalInputs, prompt_logprobs| {
+            vllm::GenerateRequest {
+                request_id: "mm".to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids,
+                    },
+                )),
+                mm_inputs: Some(mm),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(4),
+                    prompt_logprobs,
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            }
+        };
+        let request = |input_ids, mm| scored(input_ids, mm, None);
+        let identity = vllm::MultimodalInputs {
+            pixel_values: None,
+            batched_keys: Vec::new(),
+            ..image()
+        };
+
+        let spoofed = vllm::MultimodalInputs {
+            im_token_id: Some(999_999_999),
+            ..image()
+        };
+        for (req, refusal) in [
+            (
+                request(vec![1000, 1000, 1000, 6], image()),
+                "Token id 1000 is out of vocabulary",
+            ),
+            (
+                request(vec![5, 1000, 1000, 6], identity),
+                "Token id 1000 is out of vocabulary",
+            ),
+            (
+                request(vec![5, 999_999_999, 999_999_999, 6], spoofed),
+                "Token id 999999999 is out of vocabulary",
+            ),
+            (
+                scored(vec![5, 1000, 1000, 6], image(), Some(0)),
+                "prompt_logprobs cannot score token id 1000",
+            ),
+        ] {
+            let Err(status) = client.generate_vllm_streams(req).await else {
+                panic!("an out-of-vocab id was accepted ({refusal})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert!(
+                status.message().starts_with(refusal),
+                "{}",
+                status.message()
+            );
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        let _streams = client
+            .generate_vllm_streams(request(vec![5, 1000, 1000, 6], image()))
+            .await
+            .expect("the image's positions are not bounded by the vocabulary");
+        let EngineInbound::Add(add) = engines[0].recv().await.expect("inbound") else {
+            panic!("expected the add");
+        };
+        assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
+        assert!(add.mm_features.is_some(), "the image rides along");
+    }
+
+    /// EOS ids past the vocabulary never reach the engine: not the primary
+    /// (`_eos_token_id`), not the extras folded into `stop_token_ids`, and not
+    /// `_all_stop_token_ids`, which carries them even under `ignore_eos` and
+    /// which the engine's `min_tokens` mask indexes the logits with. That
+    /// holds for a connect-time set and for one adopted from the tokenizer;
+    /// in-range ids keep their places.
+    #[tokio::test]
+    async fn eos_ids_past_the_vocabulary_never_reach_the_engine() {
+        // Each request its own id: a dropped stream's abort is asynchronous.
+        let request = |id: &str, ignore_eos: bool| vllm::GenerateRequest {
+            request_id: id.to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 3],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                min_tokens: 1,
+                stop_token_ids: vec![9],
+                ignore_eos,
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        async fn sent(
+            client: &ZmqEngineClient,
+            engine: &mut MockEngine,
+            req: vllm::GenerateRequest,
+        ) -> EngineCoreSamplingParams {
+            let _streams = client.generate_vllm_streams(req).await.expect("accepted");
+            // Skip the abort a previous request's dropped streams sent.
+            loop {
+                if let EngineInbound::Add(add) = engine.recv().await.expect("inbound") {
+                    return add.sampling_params.expect("sampling params");
+                }
+            }
+        }
+
+        // Connect-time set: primary 1500 and extra 1600 lie past the vocabulary.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(1500), vec![7, 1600]))
+                .await;
+        client.set_vocab_size(1000, None);
+        let sp = sent(&client, &mut engines[0], request("a", false)).await;
+        assert_eq!(sp.eos_token_id, None);
+        assert_eq!(sp.stop_token_ids, vec![9, 7]);
+        assert_eq!(sp.all_stop_token_ids, [7, 9].into_iter().collect());
+        let sp = sent(&client, &mut engines[0], request("b", true)).await;
+        assert_eq!(sp.eos_token_id, None);
+        assert_eq!(sp.stop_token_ids, vec![9]);
+        assert_eq!(sp.all_stop_token_ids, [7, 9].into_iter().collect());
+
+        // An in-range primary stays; only the out-of-range extra goes.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(2), vec![1500, 7])).await;
+        client.set_vocab_size(1000, None);
+        let sp = sent(&client, &mut engines[0], request("c", false)).await;
+        assert_eq!(sp.eos_token_id, Some(2));
+        assert_eq!(sp.stop_token_ids, vec![9, 7]);
+        assert_eq!(sp.all_stop_token_ids, [2, 7, 9].into_iter().collect());
+
+        // Adopted from the tokenizer: MockTokenizer's EOS is 999, past a
+        // vocabulary of 500.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        client.adopt_tokenizer_eos(Some(&tokenizer));
+        client.set_vocab_size(500, None);
+        for (id, ignore_eos) in [("d", false), ("e", true)] {
+            let sp = sent(&client, &mut engines[0], request(id, ignore_eos)).await;
+            assert_eq!(sp.eos_token_id, None);
+            assert_eq!(sp.stop_token_ids, vec![9]);
+            assert_eq!(sp.all_stop_token_ids, [9].into_iter().collect());
+        }
+
+        // An unknown vocabulary leaves the set as configured.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(1500), vec![1600])).await;
+        let sp = sent(&client, &mut engines[0], request("f", false)).await;
+        assert_eq!(sp.eos_token_id, Some(1500));
+        assert_eq!(sp.all_stop_token_ids, [9, 1500, 1600].into_iter().collect());
+    }
+
+    /// A request shaped like the gateway's language-model-only PD decode
+    /// leg (the prefill side's expanded prompt, image-token run past the
+    /// model's vocabulary included, the per-image hashes, `do_remote_prefill`)
+    /// reaches a NIXL consumer engine, held to the tokenizer's
+    /// bound; the same prompt without the handoff, with an id past the
+    /// tokenizer's too, ending in an id past the model's vocabulary (that
+    /// token is computed locally), or with an out-of-vocab `logit_bias` key,
+    /// does not.
+    /// On an engine that would not pull on the claim (no connector, a
+    /// producer, an unprojected wrapper) the claim changes nothing, nor does
+    /// the legacy host/port pair on a consumer: the engine would compute the
+    /// prompt itself, so these are refused.
+    #[tokio::test]
+    async fn a_pd_decode_leg_is_held_to_the_tokenizers_bound() {
+        let request = |input_ids: Vec<u32>,
+                       kv_transfer_params_json: Option<&str>,
+                       logit_bias: Option<i32>| vllm::GenerateRequest {
+            request_id: "decode".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids,
+                },
+            )),
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["h0".to_string()],
+                ..Default::default()
+            }),
+            kv_transfer_params_json: kv_transfer_params_json.map(str::to_string),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                logit_bias: logit_bias.map(|id| (id, 1.0)).into_iter().collect(),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        const DECODE: Option<&str> = Some(r#"{"do_remote_prefill":true}"#);
+        let leg = || vec![5, 1000, 1000, 6];
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        client.set_vocab_size(1000, Some(1000));
+        client.note_kv_transfer_config("NixlConnector", "kv_both");
+        for (req, refusal) in [
+            (
+                request(leg(), None, None),
+                "Token id 1000 is out of vocabulary",
+            ),
+            (
+                request(vec![5, 999_999_999, 6], DECODE, None),
+                "Token id 999999999 is out of vocabulary",
+            ),
+            (
+                request(leg(), DECODE, Some(999_999_999)),
+                "[999999999] in logit_bias",
+            ),
+            // The last prompt token is computed locally even on a full KV
+            // hit, so it keeps the model's bound.
+            (
+                request(vec![5, 1000, 1000], DECODE, None),
+                "Token id 1000 is out of vocabulary",
+            ),
+        ] {
+            let Err(status) = client.generate_vllm_streams(req).await else {
+                panic!("an out-of-vocab id was accepted ({refusal})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert!(status.message().contains(refusal), "{}", status.message());
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        let _streams = client
+            .generate_vllm_streams(request(leg(), DECODE, None))
+            .await
+            .expect("a decode side's placeholder is within the tokenizer's bound");
+        let EngineInbound::Add(add) = engines[0].recv().await.expect("inbound") else {
+            panic!("expected the add");
+        };
+        assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
+
+        // On the same consumer, the legacy host/port pair alone: the
+        // connector pulls only on `do_remote_prefill`, so the engine would
+        // compute this prompt itself.
+        let mut legacy = request(leg(), None, None);
+        legacy.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: "10.0.0.1".to_string(),
+            remote_port: 8998,
+        });
+        let Err(status) = client.generate_vllm_streams(legacy).await else {
+            panic!("a legacy host/port pair lifted the bound on a NIXL consumer");
+        };
+        assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
+
+        // The forged claim on engines that would not pull on it: no KV
+        // connector, a producer, an unprojected wrapper.
+        for config in [
+            None,
+            Some(("NixlConnector", "kv_producer")),
+            Some(("MultiConnector", "kv_both")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (other, mut engines) = connected_ranks(dir.path(), 1).await;
+            other.set_vocab_size(1000, Some(1000));
+            if let Some((connector, role)) = config {
+                other.note_kv_transfer_config(connector, role);
+            }
+            let Err(status) = other
+                .generate_vllm_streams(request(leg(), DECODE, None))
+                .await
+            else {
+                panic!("a forged handoff claim lifted the bound ({config:?})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
+            let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+            assert!(
+                quiet.is_err(),
+                "a refused request reached the engine: {quiet:?}"
+            );
+        }
     }
 
     /// Answer each rank's next utility call with its entry in `answers`,

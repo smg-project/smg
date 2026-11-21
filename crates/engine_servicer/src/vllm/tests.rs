@@ -3513,7 +3513,7 @@ async fn embed_answers_from_the_engines_pooling_output() {
     let mut h = harness(pooling_model_info(), None).await;
     let (response, request) = tokio::join!(
         h.client
-            .embed(embed_request("emb-1", vec![101, 7592, 2088, 102])),
+            .embed(embed_request("emb-1", vec![101, 592, 88, 102])),
         async {
             answer_supported_tasks(&mut h.engine_in, &mut h.engine_out, &["embed"]).await;
             let request = recv_add(&mut h.engine_in).await;
@@ -3525,7 +3525,7 @@ async fn embed_answers_from_the_engines_pooling_output() {
         }
     );
     assert_eq!(request.request_id, "emb-1");
-    assert_eq!(request.prompt_token_ids, Some(vec![101, 7592, 2088, 102]));
+    assert_eq!(request.prompt_token_ids, Some(vec![101, 592, 88, 102]));
     assert!(request.sampling_params.is_none());
     assert_eq!(request.pooling_params, Some(PoolingParams::embed()));
     let response = response.expect("embed").into_inner();

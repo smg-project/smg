@@ -1496,6 +1496,19 @@ impl TokenizerTrait for TiktokenTokenizer {
         self.vocab_size
     }
 
+    /// The largest of the ranks' last id (`vocab_size - 1`), the special
+    /// tokens' and the added tokens': a built-in encoding's size counts its
+    /// ranks only (`cl100k_base` is 100256 while `<|endoftext|>` is 100257).
+    fn max_token_id(&self) -> Option<TokenIdType> {
+        let ranks = self
+            .vocab_size
+            .checked_sub(1)
+            .map(|id| TokenIdType::try_from(id).unwrap_or(TokenIdType::MAX));
+        let specials = self.skip_token_ids.iter().copied().max();
+        let added = self.added_texts.keys().copied().max();
+        ranks.max(specials).max(added)
+    }
+
     fn get_special_tokens(&self) -> &SpecialTokens {
         &self.special_tokens
     }
@@ -3914,5 +3927,15 @@ mod tests {
                 .contains("tiktoken decode failed for unknown token id"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A built-in encoding's size counts its ranks only; its special tokens
+    /// lie past them, and `max_token_id` reaches the largest
+    /// (`<|endofprompt|>`, 100276, on `cl100k_base`).
+    #[test]
+    fn max_token_id_reaches_a_built_in_encodings_special_tokens() {
+        let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
+        assert_eq!(tokenizer.vocab_size(), 100256);
+        assert_eq!(tokenizer.max_token_id(), Some(100276));
     }
 }

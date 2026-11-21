@@ -438,6 +438,9 @@ struct EncoderCore {
     /// Whether the pipeline matches an added token after normalization,
     /// read on first use (see [`Self::matches_after_normalization`]).
     matches_after_normalization: OnceLock<bool>,
+    /// The largest id of the vocabulary, added tokens included, read on
+    /// first use (see `max_token_id`): a walk of the whole vocabulary.
+    max_token_id: OnceLock<Option<TokenIdType>>,
 }
 
 impl EncoderCore {
@@ -456,6 +459,7 @@ impl EncoderCore {
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
             matches_after_normalization: OnceLock::new(),
+            max_token_id: OnceLock::new(),
         }
     }
 
@@ -2759,6 +2763,23 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     /// the model's piece), which `token_to_id` maps back to the id.
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
         self.token_text(id)
+    }
+
+    /// The largest id of the vocabulary, the model's and the added tokens'
+    /// alike, as vLLM reads it (the maximum over `get_vocab()`, and at least
+    /// `vocab_size - 1`): [`Self::vocab_size`] counts the model's entries
+    /// and leaves the added tokens out, and a multimodal placeholder is often
+    /// one of them, or an id far past a sparse vocabulary's count. Read once,
+    /// on first use.
+    fn max_token_id(&self) -> Option<TokenIdType> {
+        *self.core.max_token_id.get_or_init(|| {
+            let tokenizer = &self.core.tokenizer;
+            let counted = tokenizer
+                .get_vocab_size(false)
+                .checked_sub(1)
+                .map(|id| TokenIdType::try_from(id).unwrap_or(TokenIdType::MAX));
+            crate::byte_level::max_token_id(tokenizer, None).max(counted)
+        })
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

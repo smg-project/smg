@@ -4,7 +4,8 @@
 //! vLLM's frontend (`AsyncLLM.encode` through `InputProcessor`) is bypassed
 //! here, so what it would do to `PoolingParams(task="embed")` before the
 //! engine sees it is what [`PoolingParams::embed`] encodes; the prompt-length
-//! check it performs is repeated in [`translate_embed_request`].
+//! check it performs is repeated in [`translate_embed_request`], and its
+//! prompt-id bound in [`ZmqEngineClient::embed`].
 
 use engine_zmq_client::protocol::vllm::{
     output::EngineCoreFinishReason,
@@ -17,7 +18,7 @@ use tonic::Status;
 
 use crate::{
     client::{no_engine, zmq_status, ZmqEngineClient},
-    vllm::{finish_reason_str, now_secs},
+    vllm::{finish_reason_str, now_secs, validate_prompt_ids},
 };
 
 /// Translate a vLLM-proto embed request into a pooling `EngineCoreRequest`:
@@ -75,6 +76,12 @@ impl ZmqEngineClient {
             .ok_or_else(no_engine)?;
         let request = translate_embed_request(req, PoolingParams::embed_for(pooler), max_model_len)
             .map_err(Status::invalid_argument)?;
+        // A pooling prompt indexes the same embedding table as a generate one
+        // (text only: no position takes a multimodal embedding).
+        if let (Some(bounds), Some(ids)) = (self.vocab_bounds(), &request.prompt_token_ids) {
+            validate_prompt_ids(ids, &[], bounds.model, bounds.model)
+                .map_err(Status::invalid_argument)?;
+        }
         // vLLM's frontend refuses a task the model runner does not serve
         // (`InputProcessor._validate_params`, in its words); the engine's own
         // check raises on its busy loop and takes EngineCore down with it.
@@ -240,6 +247,30 @@ mod tests {
         let (client, engine) = connected_pair_in(dir, RuntimeType::Vllm).await;
         let (engine_in, engine_out) = engine.split();
         (client, engine_in, engine_out)
+    }
+
+    /// An out-of-vocab prompt id is refused before anything reaches the
+    /// engine, as for a generate request: it indexes the embedding table.
+    #[tokio::test]
+    async fn embed_refuses_an_out_of_vocab_prompt_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engine_in, _engine_out) = connected(dir.path()).await;
+        client.set_vocab_size(1000, None);
+        let status = client
+            .embed(
+                embed_request("e1", vec![1, 1000]),
+                PoolerDefaults::default(),
+            )
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), engine_in.recv())
+                .await
+                .is_err(),
+            "nothing reached the engine"
+        );
     }
 
     /// The engine's task list gates the request before anything reaches the

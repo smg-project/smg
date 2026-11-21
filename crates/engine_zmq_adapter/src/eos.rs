@@ -1,7 +1,7 @@
 //! EOS stop ids for the tokenizer-less EngineCore: resolved from the model
 //! directory at connect time, backstopped from the tokenizer per request.
 
-use std::{path::Path, sync::Arc};
+use std::{borrow::Cow, path::Path, sync::Arc};
 
 use llm_tokenizer::traits::Tokenizer;
 use smg_grpc_client::vllm_proto as vllm;
@@ -35,6 +35,23 @@ impl EosTokenIds {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.primary.is_none() && self.extra.is_empty()
+    }
+
+    /// The ids below `vocab_size`, the ones the model can sample. An EOS id
+    /// past the vocabulary is never generated, so it stops nothing, but the
+    /// engine still indexes the logits with every id of
+    /// `_all_stop_token_ids` (the `min_tokens` mask), so one there faults the
+    /// GPU. A primary past it leaves no primary; the extras keep their order.
+    /// Borrowed when every id is in range.
+    pub(crate) fn within_vocab(&self, vocab_size: u32) -> Cow<'_, Self> {
+        let sampleable = |id: &u32| *id < vocab_size;
+        if self.primary.as_ref().is_none_or(sampleable) && self.extra.iter().all(sampleable) {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Self {
+            primary: self.primary.filter(sampleable),
+            extra: self.extra.iter().copied().filter(sampleable).collect(),
+        })
     }
 
     /// Resolve from `config.json` + `generation_config.json` in a local model
