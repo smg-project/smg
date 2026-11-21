@@ -378,7 +378,9 @@ pub enum CallEnd {
     /// The model ended the call: its closing marker arrived, or what the syntax reads as the
     /// call's end (the next call's opener, the block's close, the brace that closes a call's
     /// object), or the stream's stop where the table's stop row stands for the closing marker
-    /// the stop decoder hides.
+    /// the stop decoder hides. Or the output ended where a call with no delimiter of its own
+    /// was whole: the forced arguments, which are the whole output, when their value is a
+    /// number or a literal the bytes end on.
     #[default]
     Closed,
     /// The model's own end of output found the call open, in a state the table has no stop row

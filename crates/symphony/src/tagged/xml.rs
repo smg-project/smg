@@ -220,7 +220,7 @@ impl Assembler {
         if self.stage != Stage::Body || !self.started() {
             self.hold_tag();
             self.carried.push_str(terminal);
-            self.report(MalformedReason::CallWithoutName, out);
+            self.report_unnamed(MalformedReason::CallWithoutName, out);
             return;
         }
         self.close_open_string(MalformedReason::OpenAtTheMarker, out);
@@ -283,7 +283,8 @@ impl Assembler {
     /// UnterminatedRegion }` event that carries everything held and says that its arguments are
     /// no whole value ([`end_cut_call`]); what a block that named no call held is refused as
     /// `UnterminatedRegion` too, as the keyed assembler refuses it, so that the reader's release
-    /// of a refused output that made no call takes the whole slice.
+    /// of a refused output that made no call takes the whole slice. An invoke the cut found
+    /// before any byte of its name says the same with no bytes ([`Self::report_unnamed`]).
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -292,7 +293,7 @@ impl Assembler {
         if self.started() {
             end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
         } else {
-            self.report(MalformedReason::UnterminatedRegion, out);
+            self.report_unnamed(MalformedReason::UnterminatedRegion, out);
         }
     }
 
@@ -868,6 +869,25 @@ impl Assembler {
         super::refuse(std::mem::take(&mut self.carried), why, out);
         self.released = true;
         self.refused |= self.started();
+    }
+
+    /// What an invoke that named no call held, refused with `why` at the invoke's end
+    /// ([`Self::report`]). An invoke the output ended in before any byte of its name holds
+    /// nothing to refuse, and is an invoke the model began all the same: its opening marker
+    /// came, and the call it opened never did. It says so by the one `Malformed` event of no
+    /// bytes, with nothing dropped after it, so that a reader counts the call lost there as it
+    /// does one byte further, where the same end refuses the byte under the same reason. An
+    /// invoke that reported its missing name already ([`Self::start_call`]) and holds nothing
+    /// says nothing twice.
+    fn report_unnamed(&mut self, why: MalformedReason, out: &mut Events) {
+        if self.carried.is_empty() && self.stage == Stage::Name {
+            out.push(Event::Malformed {
+                text: Text::uncounted(String::new()),
+                why,
+            });
+            return;
+        }
+        self.report(why, out);
     }
 
     /// `text` the syntax has no place for (a word between tags, a tag out of its place), refused
