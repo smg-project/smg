@@ -173,8 +173,8 @@ impl BufferPool {
         let turned_away = {
             let mut idle = self.idle();
             // The top class stays out of the bound, where one of its buffers
-            // took the room of many smaller ones, and keeps a single idle
-            // buffer, since the pool never frees what it keeps.
+            // would take the room of many smaller ones, and keeps a single
+            // idle buffer, since the pool never frees what it keeps.
             let top = capacity == LARGEST;
             let full = if top {
                 !idle.classes[index].is_empty()
@@ -306,8 +306,8 @@ mod tests {
 
     #[test]
     fn a_buffer_between_64_and_128_mib_is_kept_and_handed_out_again() {
-        // The first length past the former 64 MiB top class, where it was
-        // allocated zero-filled on every request.
+        // The first length of the top class: one byte past 64 MiB sits in
+        // the 128 MiB class.
         let len = (64 << 20) + 1;
         let pool = BufferPool::new();
         let first = pool.take(len);
