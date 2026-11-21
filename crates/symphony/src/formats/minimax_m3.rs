@@ -856,6 +856,76 @@ mod tests {
         assert_eq!(losses(&events), []);
     }
 
+    /// An invoke the output ended in before any byte of its name is an invoke the model began
+    /// all the same: it says so by one `Malformed` event of no bytes, with the reason the same
+    /// end gives one byte further (`UnterminatedRegion` under a cut, `CallWithoutName` at the
+    /// model's stop), and with nothing dropped as a malformed call's, since no byte was held.
+    /// The template's separator before the end changes nothing. No call starts and none ends.
+    #[test]
+    fn an_invoke_the_output_ended_in_before_any_byte_of_its_name_says_a_call_was_lost() {
+        let read = |output: &str, finish: EngineFinish| {
+            drive_to(
+                &mut Engine::new(minimax_m3(), get_weather()),
+                "",
+                &[output],
+                finish,
+            )
+        };
+        // Each output with the text it wrote ahead of the block.
+        for (output, before) in [
+            ("<tool_call>\n<invoke name=\"", ""),
+            (
+                "Checking.]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"",
+                "Checking.",
+            ),
+            ("<tool_call>\n<invoke name=\"]<]minimax[>[", ""),
+        ] {
+            for (finish, why) in [
+                (EngineFinish::Length, MalformedReason::UnterminatedRegion),
+                (EngineFinish::Abort, MalformedReason::UnterminatedRegion),
+                (EngineFinish::Stop, MalformedReason::CallWithoutName),
+            ] {
+                let events = read(output, finish.clone());
+                assert_eq!(bytes(&events), output, "{output:?} under {finish:?}");
+                assert_eq!(
+                    malformed(&events),
+                    [(String::new(), why)],
+                    "{output:?} under {finish:?}"
+                );
+                assert_eq!(losses(&events), [why]);
+                assert_eq!(refused_bytes(&events), [] as [&str; 0]);
+                assert_eq!(endings(&events), []);
+                assert_eq!(names(&events), [] as [&str; 0]);
+                assert!(matches!(
+                    events.last(),
+                    Some(Event::Finish { tool_calls: 0, .. })
+                ));
+                // The report carries no byte, so a chat client reads what it read before it:
+                // the text ahead of the block and nothing more, streamed and whole.
+                assert_eq!(streamed(&events), before, "{output:?}");
+                assert_eq!(content(&events), before, "{output:?}");
+                assert_eq!(shown(&events).unwrap_or_default(), before, "{output:?}");
+            }
+        }
+        // One byte further the same end reports the same reason, with the byte refused.
+        let cut = read("<tool_call>\n<invoke name=\"g", EngineFinish::Length);
+        assert_eq!(losses(&cut), [MalformedReason::UnterminatedRegion]);
+        assert_eq!(refused_bytes(&cut), ["g"]);
+        let stopped = read("<tool_call>\n<invoke name=\"g", EngineFinish::Stop);
+        assert_eq!(losses(&stopped), [MalformedReason::CallWithoutName]);
+        // An invoke the model closed, or another opened after, held its closing marker: said
+        // once, as before, with the marker's bytes refused.
+        let closed = read(
+            "<tool_call>\n<invoke name=\"</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(losses(&closed), [MalformedReason::CallWithoutName]);
+        assert_eq!(refused_bytes(&closed), ["</tool_call>"]);
+        // A block the output ended in before any invoke began reports nothing: no call began.
+        let block = read("<tool_call>\n", EngineFinish::Length);
+        assert_eq!(malformed(&block), []);
+    }
+
     #[test]
     fn text_that_is_not_a_tag_is_a_values_text_and_text_between_tags_is_refused() {
         let output = concat!(
