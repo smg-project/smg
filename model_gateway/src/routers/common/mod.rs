@@ -238,7 +238,7 @@ pub mod bench_support {
     use crate::{
         config::RouterConfig,
         observability::cache_trace,
-        policies::{EnginePolicy, PolicyRegistry},
+        policies::{EnginePolicy, PolicyRegistry, Side},
         policy_controller::start_in_process,
         routers::common::{
             pair_index::{PdPairIndex, PdWire},
@@ -260,12 +260,23 @@ pub mod bench_support {
         policies.set_load_receiver(loads);
     }
 
+    /// Sets a pair gateway's side policies on `policies` as the router
+    /// factory sets them at the start: each side's own policy of `config`,
+    /// or its main policy.
+    pub fn set_pair_sides(policies: &PolicyRegistry, config: &RouterConfig) {
+        let main = &config.policy;
+        policies.set_side_policy(Side::Prefill, config.mode.get_prefill_policy(main));
+        policies.set_side_policy(Side::Decode, config.mode.get_decode_policy(main));
+    }
+
     /// The classic policy registry of `config`'s policy, its policies
     /// asking the policy engine of the document in force under `config`,
     /// built as a gateway's start builds both under the setting, whatever
     /// `config` says of the setting: [`route_classic`] then runs the
     /// classic placement, and the pass asks the policy object that asks the
-    /// engine where it asks a classic policy.
+    /// engine where it asks a classic policy. Under a pair mode the
+    /// registry holds a pair's two side policies ([`set_pair_sides`]), and
+    /// [`route_pair`] runs the classic pair placement over them.
     ///
     /// # Errors
     ///
@@ -287,7 +298,15 @@ pub mod bench_support {
             started.engine,
             started.origin,
         );
-        if policies.get_default_policy().as_any().is::<EnginePolicy>() {
+        let asked = if config.mode.is_pd_mode() {
+            set_pair_sides(&policies, config);
+            [policies.get_prefill_policy(), policies.get_decode_policy()]
+                .iter()
+                .all(|side| side.as_any().is::<EnginePolicy>())
+        } else {
+            policies.get_default_policy().as_any().is::<EnginePolicy>()
+        };
+        if asked {
             Ok(policies)
         } else {
             Err(format!(
@@ -330,6 +349,33 @@ pub mod bench_support {
         }
         let guard = WorkerLoadGuard::with_key(worker, policies.sticky_key(None, None));
         drop(guard);
+        true
+    }
+
+    /// One request's routing through a pair gateway's classic placement
+    /// on the gRPC wire: the pair index of the model's snapshot, the pair
+    /// placed over it by the registry's two side policies, and each side's
+    /// load guard from the send to the request's end. `false` where the
+    /// request had no pair.
+    pub fn route_pair(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        tokens: Option<&[u32]>,
+    ) -> bool {
+        let pairs = registry
+            .get_routing_snapshot(model)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let Ok(pair) = select_pair(registry, policies, model, &pairs, None, None, inputs) else {
+            return false;
+        };
+        let prefill = WorkerLoadGuard::with_key(pair.prefill, policies.sticky_key(None, None));
+        let decode = WorkerLoadGuard::with_key(pair.decode, policies.sticky_key(None, None));
+        drop((prefill, decode));
         true
     }
 

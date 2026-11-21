@@ -29,6 +29,12 @@
 //! steered to that worker by the rule for a pool with no worker under its
 //! thresholds.
 //!
+//! `--pair true` makes the cell a pair gateway's: the fleet is the cell's
+//! size of prefill workers and as many decode workers, on the gRPC wire,
+//! and a request is placed as a pair by the classic pair placement, its
+//! two side policies the classic ones or the objects that ask the engine.
+//! `--not-ready` and `--ready` then hold for each side.
+//!
 //! `--models N` serves `N` models, each with a fleet of its own of the
 //! cell's size: a caller's requests name the models in turn, as the
 //! requests of a gateway that serves many models do, so no two requests in
@@ -64,19 +70,25 @@ use openai_protocol::{
     worker::{HealthCheckConfig, WorkerLoadResponse, WorkerStatus},
 };
 use smg::{
-    config::{types::PolicyConfig, RouterConfig},
+    config::{
+        types::{PolicyConfig, RoutingMode},
+        RouterConfig,
+    },
     observability::metrics::{start_prometheus, PrometheusConfig},
     policies::PolicyRegistry,
     routers::{
         common::{
-            bench_support::{attach_loads, policies_asking_the_engine, route_classic, Route},
+            bench_support::{
+                attach_loads, policies_asking_the_engine, route_classic, route_pair,
+                set_pair_sides, Route,
+            },
             snapshot::WorkerRegistry,
         },
         grpc::backend_client::BasicWorkerBuilder,
     },
 };
 use smg_worker::{
-    identity::basic::{ConnectionMode, Worker, WorkerType},
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load::state::{one_rank_load, TestFeed},
 };
 
@@ -117,6 +129,9 @@ struct Cell {
     overloaded: bool,
     /// The models served, each with a fleet of `workers` workers.
     models: usize,
+    /// A pair gateway: `workers` prefill workers and as many decode
+    /// workers a model, and a request placed as a pair.
+    pair: bool,
 }
 
 fn cell() -> Cell {
@@ -132,6 +147,7 @@ fn cell() -> Cell {
         ready: 0,
         overloaded: false,
         models: 1,
+        pair: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -160,6 +176,7 @@ fn cell() -> Cell {
             "--ready" => cell.ready = value.parse().unwrap(),
             "--overloaded" => cell.overloaded = value.parse().unwrap(),
             "--models" => cell.models = value.parse().unwrap(),
+            "--pair" => cell.pair = value.parse().unwrap(),
             other => panic!("no flag {other}"),
         }
     }
@@ -196,6 +213,32 @@ fn fleet(route: Route, model: &str, count: usize) -> Vec<Arc<dyn Worker>> {
                     .model(ModelCard::new(model))
                     .worker_type(WorkerType::Regular)
                     .connection_mode(mode)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect()
+}
+
+/// One side of a pair fleet of `model`: `count` ready workers of `role` on
+/// the gRPC wire, with no health checker behind them.
+fn side(model: &str, role: WorkerType, count: usize) -> Vec<Arc<dyn Worker>> {
+    let name = if role == WorkerType::Prefill {
+        "prefill"
+    } else {
+        "decode"
+    };
+    (0..count)
+        .map(|i| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://{model}-{name}-{i:04}:9000"))
+                    .model(ModelCard::new(model))
+                    .worker_type(role)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Vllm)
                     .health_config(HealthCheckConfig {
                         disable_health_check: true,
                         ..Default::default()
@@ -275,34 +318,59 @@ type Routing = Box<dyn Fn(&[u32], u64) -> bool + Send + Sync>;
 /// A cell's path, built: a registry with the fleet, the policies a
 /// registration leaves (the model's policy and each worker's completion
 /// sink), and the load feed the monitor would publish. On the `object` path
-/// the registry's policies ask the policy engine of the same policy.
+/// the registry's policies ask the policy engine of the same policy. A
+/// pair cell's registry holds the two side policies a pair gateway's start
+/// sets, and each model's fleet is its two sides.
 fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
     let registry = Arc::new(WorkerRegistry::new());
-    let config = RouterConfig {
+    let mut config = RouterConfig {
         policy_controller: true,
         policy: policy_config(&cell.policy),
         ..RouterConfig::default()
     };
+    if cell.pair {
+        config.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+    }
     let policies = Arc::new(match cell.path.as_str() {
-        "classic" => PolicyRegistry::new(policy_config(&cell.policy)),
+        "classic" => {
+            let policies = PolicyRegistry::new(policy_config(&cell.policy));
+            if cell.pair {
+                set_pair_sides(&policies, &config);
+            }
+            policies
+        }
         "object" => policies_asking_the_engine(&config).unwrap(),
         other => panic!("no path {other}"),
     });
     let models = model_ids(cell.models);
     let mut every = Vec::with_capacity(models.len() * cell.workers);
     for model in &models {
-        let fleet = fleet(cell.route, model, cell.workers);
-        for worker in &fleet {
-            registry.register(Arc::clone(worker)).unwrap();
-            policies.on_worker_added(model, None);
-            worker.set_completion_sink(Some(policies.completion_sink()));
+        let fleets = if cell.pair {
+            vec![
+                side(model, WorkerType::Prefill, cell.workers),
+                side(model, WorkerType::Decode, cell.workers),
+            ]
+        } else {
+            vec![fleet(cell.route, model, cell.workers)]
+        };
+        for fleet in fleets {
+            for worker in &fleet {
+                registry.register(Arc::clone(worker)).unwrap();
+                policies.on_worker_added(model, None);
+                worker.set_completion_sink(Some(policies.completion_sink()));
+            }
+            leave_not_ready(&fleet, cell.not_ready);
+            leave_ready(&fleet, cell.ready);
+            if cell.overloaded {
+                overload(&fleet);
+            }
+            every.extend(fleet);
         }
-        leave_not_ready(&fleet, cell.not_ready);
-        leave_ready(&fleet, cell.ready);
-        if cell.overloaded {
-            overload(&fleet);
-        }
-        every.extend(fleet);
     }
     let feed = cell.reports.then(|| {
         let feed = TestFeed::attached_to(|rx| attach_loads(&policies, rx));
@@ -313,10 +381,14 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
         feed.publish(&loads);
         feed
     });
-    let route = cell.route;
+    let (route, pair) = (cell.route, cell.pair);
     let routing: Routing = Box::new(move |tokens, turn| {
         let model = &models[(turn % models.len() as u64) as usize];
-        route_classic(&registry, &policies, model, route, Some(tokens))
+        if pair {
+            route_pair(&registry, &policies, model, Some(tokens))
+        } else {
+            route_classic(&registry, &policies, model, route, Some(tokens))
+        }
     });
     (routing, feed)
 }
@@ -396,7 +468,7 @@ fn main() {
     let per_second = total as f64 / wall.as_secs_f64();
     let nanos = busy.as_nanos() as f64 / total as f64;
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -407,6 +479,7 @@ fn main() {
         cell.ready,
         cell.overloaded,
         cell.models,
+        cell.pair,
         total,
         wall.as_secs_f64(),
         per_second,
