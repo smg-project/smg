@@ -376,6 +376,15 @@ pub(super) fn sort_tool_results_by_call_order(messages: Vec<Value>) -> Vec<Value
     out
 }
 
+/// The roles V4 and V4.1 keep whole in [`drop_thinking_messages`].
+pub(super) const KEPT_ROLES: &[&str] = &[
+    "user",
+    "system",
+    "tool",
+    "latest_reminder",
+    "direct_search_results",
+];
+
 /// Drop reasoning_content from earlier assistant turns and remove non-essential
 /// developer messages before the last user.
 ///
@@ -383,17 +392,19 @@ pub(super) fn sort_tool_results_by_call_order(messages: Vec<Value>) -> Vec<Value
 /// revisions disagree on what the "last user turn" is: V4 counts only
 /// user/developer messages ([`find_last_user_index`]), while V4.1 also counts
 /// mid-conversation system messages. The filtering itself is identical.
+///
+/// `kept_roles` are the roles a revision keeps whole wherever they stand:
+/// [`KEPT_ROLES`] for V4 and V4.1; V3.2 has no reminder and search-result
+/// roles and drops such a message before the last user turn.
 pub(super) fn drop_thinking_messages(
     messages: &[Value],
     last_user_idx: Option<usize>,
+    kept_roles: &[&str],
 ) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for (idx, msg) in messages.iter().enumerate() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let always_keep = matches!(
-            role,
-            "user" | "system" | "tool" | "latest_reminder" | "direct_search_results"
-        ) || at_or_after_last_user(idx, last_user_idx);
+        let always_keep = kept_roles.contains(&role) || at_or_after_last_user(idx, last_user_idx);
         if always_keep {
             out.push(msg.clone());
             continue;
