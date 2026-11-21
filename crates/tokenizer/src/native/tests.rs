@@ -4516,11 +4516,12 @@ fn a_thread_keeps_a_quarter_of_its_share_once_enough_threads_call() {
     );
 }
 
-/// Only a miss that waits asks the learned table, so where misses do not
-/// wait (the sentencepiece path, and a byte-level table that lacks a byte's
-/// token) the threads share nothing however many of them call: a thread
-/// keeps its whole share, one that has cleared merges for itself and
-/// encodes as it did, and no learned table is made.
+/// Only a miss that waits asks the learned table. The sentencepiece path
+/// waits by its own rule on a far seed with `misses_wait` off, so its threads
+/// do not share; a byte-level table that lacks a byte's token does not wait.
+/// However many threads call, each keeps its whole share, one that has
+/// cleared merges for itself and encodes as it did, and no learned table is
+/// made.
 #[test]
 fn a_thread_keeps_its_whole_share_where_no_miss_asks_the_learned_table() {
     let mut state = 0x5EED_5EED_5EED_5EEDu64;
@@ -6746,6 +6747,53 @@ fn ids_match_tokenizers_on_random_text_for_every_sentencepiece_shape() {
             }
         }
     }
+}
+
+/// A sentencepiece miss of a young thread close behind another waits only on
+/// a far seed (`NEAR_SEED_SLOTS`): there it takes a hole and is answered from
+/// its character symbols; on the near seed it is answered where it is met.
+#[test]
+fn a_sentencepiece_miss_waits_only_on_a_far_seed() {
+    let mut state = 0x5EA7_ED0F_A125_EED5u64;
+    let tokenizer = sentencepiece_tokenizer(&sentencepiece_shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let mut far = seeded(&tokenizer);
+    assert!(far.seed.slots() <= NEAR_SEED_SLOTS);
+    // A test vocabulary's seed is near: an empty table of far size stands in.
+    far.seed = ShortPieceTable::for_entries(NEAR_SEED_SLOTS);
+    let mut cache = far.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let key = ShortPieceKey::of(b" zq").expect("a short piece");
+    let vacancy = cache.packed.lookup(key, &mut ids).expect("a miss");
+    assert!(
+        far.seeded_raw(vacancy, &mut ids, &mut cache),
+        "far: it waits"
+    );
+    assert_eq!(ids, [7, 0]);
+    assert_eq!(cache.waiting.len(), 1);
+    far.answer_waiting(&mut ids, &mut cache);
+    let mut expected = vec![7];
+    expected.extend(
+        model
+            .tokenize(&format!("{WORD_MARKER}zq"))
+            .expect("the model tokenizes")
+            .iter()
+            .map(|token| token.id),
+    );
+    assert_eq!(ids, expected, "the character-symbol merge answers");
+
+    let near = seeded(&tokenizer);
+    let mut cache = near.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let vacancy = cache.packed.lookup(key, &mut ids).expect("a miss");
+    assert!(
+        !near.seeded_raw(vacancy, &mut ids, &mut cache),
+        "near: it answers in place"
+    );
+    assert_eq!(ids, [7]);
+    assert!(cache.waiting.is_empty());
 }
 
 #[test]
