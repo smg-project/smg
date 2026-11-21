@@ -954,21 +954,33 @@ impl TiktokenTokenizer {
 /// Format: each line is `<base64-encoded-token-bytes> <rank>`
 fn load_tiktoken_bpe(path: &str) -> Result<FxHashMap<Vec<u8>, Rank>> {
     let content = std::fs::read_to_string(path)?;
-    let mut encoder =
-        FxHashMap::with_capacity_and_hasher(content.lines().count(), Default::default());
+    // As many as `lines()` counts: one a line feed, and a last line without one.
+    let lines = content.bytes().filter(|&byte| byte == b'\n').count()
+        + usize::from(!content.is_empty() && !content.ends_with('\n'));
+    let mut encoder = FxHashMap::with_capacity_and_hasher(lines, Default::default());
     for line in content.lines() {
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let token_b64 = parts
-            .next()
-            .ok_or_else(|| Error::msg("missing token in tiktoken file"))?;
-        let rank_str = parts
-            .next()
-            .ok_or_else(|| Error::msg("missing rank in tiktoken file"))?;
-        let token_bytes = STANDARD.decode(token_b64)?;
-        let rank: Rank = rank_str.parse()?;
+        // The format's line has ONE space between its two fields; a line
+        // that does not read so takes the general split, errors included.
+        let direct = line
+            .split_once(' ')
+            .filter(|(token, _)| !token.is_empty())
+            .and_then(|(token, rank)| Some((STANDARD.decode(token).ok()?, rank.parse().ok()?)));
+        let (token_bytes, rank): (Vec<u8>, Rank) = match direct {
+            Some(entry) => entry,
+            None => {
+                let mut parts = line.split_whitespace();
+                let token_b64 = parts
+                    .next()
+                    .ok_or_else(|| Error::msg("missing token in tiktoken file"))?;
+                let rank_str = parts
+                    .next()
+                    .ok_or_else(|| Error::msg("missing rank in tiktoken file"))?;
+                (STANDARD.decode(token_b64)?, rank_str.parse()?)
+            }
+        };
         encoder.insert(token_bytes, rank);
     }
     Ok(encoder)
@@ -2061,6 +2073,21 @@ mod tests {
         assert_eq!(encoder.len(), 2);
         assert_eq!(encoder.get(&vec![0x21u8]), Some(&0));
         assert_eq!(encoder.get(&vec![0x22u8]), Some(&1));
+    }
+
+    #[test]
+    fn a_rank_line_that_is_not_one_space_reads_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.tiktoken");
+        std::fs::write(&path, "IQ==\t0\nIg==  1\nIw== 2 extra\n").unwrap();
+        let encoder = load_tiktoken_bpe(path.to_str().unwrap()).unwrap();
+        assert_eq!(encoder.get(&vec![0x21u8]), Some(&0));
+        assert_eq!(encoder.get(&vec![0x22u8]), Some(&1));
+        assert_eq!(encoder.get(&vec![0x23u8]), Some(&2));
+
+        std::fs::write(&path, " 0\n").unwrap();
+        let error = load_tiktoken_bpe(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.to_string(), "missing rank in tiktoken file");
     }
 
     #[test]

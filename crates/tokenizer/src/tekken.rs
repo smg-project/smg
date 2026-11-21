@@ -21,7 +21,7 @@
 //! tests `a_control_spelling_typed_into_a_message_stays_text` and
 //! `encode_reads_a_special_spelling_as_its_token` pin the two readings.
 
-use std::{collections::HashMap, path::Path};
+use std::{borrow::Cow, collections::HashMap, path::Path};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -81,9 +81,10 @@ pub(crate) fn has_tekken_file(dir: &Path) -> bool {
 /// The file as written: the configuration block, the ranked tokens and the
 /// special tokens; the image, audio and model-settings blocks are not read.
 #[derive(Deserialize)]
-struct File {
+struct File<'a> {
     config: Config,
-    vocab: Vec<Token>,
+    #[serde(borrow)]
+    vocab: Vec<Token<'a>>,
     #[serde(default)]
     special_tokens: Option<Vec<SpecialToken>>,
 }
@@ -100,9 +101,12 @@ struct Config {
 /// A ranked token; its `token_str` is a rendering of the bytes, null where
 /// they are not UTF-8, and is not read.
 #[derive(Deserialize)]
-struct Token {
+struct Token<'a> {
     rank: u32,
-    token_bytes: String,
+    // Borrowed from the file's text; owned only where the writer escaped a
+    // character.
+    #[serde(borrow)]
+    token_bytes: Cow<'a, str>,
 }
 
 /// A special token; its `is_control` flag reaches neither the encoder nor
@@ -134,15 +138,20 @@ impl Vocabulary {
 /// Reads the file at `path`.
 pub(crate) fn read(path: &Path) -> Result<Vocabulary> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let file: File = serde_json::from_slice(&bytes)
-        .with_context(|| format!("{} is not a tekken vocabulary file", path.display()))?;
+    // One UTF-8 check of the whole file in place of one a string; a file
+    // that is not UTF-8 in a place the reader skips is read as before.
+    let file: File = match std::str::from_utf8(&bytes) {
+        Ok(text) => serde_json::from_str(text),
+        Err(_) => serde_json::from_slice(&bytes),
+    }
+    .with_context(|| format!("{} is not a tekken vocabulary file", path.display()))?;
     vocabulary(file).with_context(|| format!("{} is not a valid tekken vocabulary", path.display()))
 }
 
 /// The vocabulary of a parsed file, checked as the reference reader checks
 /// it: the ranks in order, the first 256 tokens the single bytes, no token
 /// twice, the special tokens distinct and inside their block.
-fn vocabulary(file: File) -> Result<Vocabulary> {
+fn vocabulary(file: File<'_>) -> Result<Vocabulary> {
     let File {
         config,
         vocab,
@@ -176,7 +185,7 @@ fn vocabulary(file: File) -> Result<Vocabulary> {
             );
         }
         let bytes = STANDARD
-            .decode(&token.token_bytes)
+            .decode(token.token_bytes.as_bytes())
             .with_context(|| format!("token {index}: token_bytes is not base64"))?;
         if u8::try_from(index).is_ok_and(|byte| bytes.as_slice() != [byte]) {
             bail!("token {index} is not the byte {index:#04x}");
@@ -514,6 +523,33 @@ mod tests {
         };
         assert!(
             format!("{error:#}").contains("lists no special tokens"),
+            "{error:#}"
+        );
+    }
+
+    /// The reader skips a ranked token's `token_str`: a byte that is not
+    /// UTF-8 there does not stop the load; in a field it reads, the file is
+    /// refused.
+    #[test]
+    fn a_file_that_is_not_utf8_where_the_reader_skips_still_loads() {
+        let text = testing::minimal();
+        let dir = testing::dir_with(&text);
+        let path = dir.path().join(FILE_NAME);
+        let whole = read(&path).unwrap().ranks;
+
+        let mut bytes = text.clone().into_bytes();
+        bytes[text.find("\"token_str\":\"A\"").unwrap() + 13] = 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read(&path).unwrap().ranks, whole);
+
+        let mut bytes = text.clone().into_bytes();
+        bytes[text.find("\"token_bytes\":\"QQ==\"").unwrap() + 15] = 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let Err(error) = read(&path) else {
+            panic!("a token whose bytes are not UTF-8 loaded");
+        };
+        assert!(
+            format!("{error:#}").contains("is not a tekken vocabulary file"),
             "{error:#}"
         );
     }
