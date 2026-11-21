@@ -4,22 +4,27 @@
 //! places in them.
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use axum::http::StatusCode;
-use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{WorkerLoadResponse, WorkerStatus},
+};
 use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, Pairing, PolicySpec},
     engine::{Phase, PolicyEngine as OwnEngine, ShedReason, WireModes},
 };
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    load::state::{one_rank_load, TestFeed},
     test_support::no_health_check,
 };
 
-use super::{mark, profile_of, Ask, DecisionGuard, PolicyEngine, Unplaced};
+use super::{mark, profile_of, Ask, DecisionGuard, PolicyEngine, Prompt, Unplaced};
 use crate::{
     observability::cache_trace,
     routers::{
@@ -374,6 +379,72 @@ async fn a_fleet_that_pairs_nothing_reads_the_pair_indexs_refusal() {
         matches!(&unplaced, Some(Unplaced::NoCompatiblePair { mismatches, .. }) if *mismatches == transport),
         "{unplaced:?}"
     );
+}
+
+/// A pair under least load on both sides is placed by the reports the load
+/// monitor publishes. The engine object reads the monitor's feed, and each
+/// decision is lent the snapshot current at that instant, which the records
+/// of both lists read: the prefill and the decode that report an empty
+/// queue take every pair, and the next publication moves the placement at
+/// the next decision.
+#[tokio::test]
+async fn a_least_load_pair_is_placed_by_the_reports_the_monitor_publishes() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let prefills = side(&registry, WorkerType::Prefill, 3, None);
+    let decodes = side(&registry, WorkerType::Decode, 3, None);
+    let document = PolicySpec::pair_presets("least_load", "least_load");
+    let policy_engine = object_of(&registry, document.expect("the pair presets"));
+    let feed = TestFeed::attached_to(|receiver| {
+        policy_engine.read_loads(receiver.expect("the feed's receiver"));
+    });
+    assert!(policy_engine.reads_loads());
+    // One worker a side reports an empty queue, every other a long one.
+    let reports = |idle: [usize; 2]| -> HashMap<String, WorkerLoadResponse> {
+        let listed = [&prefills, &decodes].into_iter().zip(idle);
+        let reported = listed.flat_map(|(side, idle)| {
+            side.iter().enumerate().map(move |(at, worker)| {
+                let queued = if at == idle { 0 } else { 400_000 };
+                (worker.url().to_owned(), one_rank_load(queued, 0.1, 1_000.0))
+            })
+        });
+        reported.collect()
+    };
+    for idle in [[2, 0], [0, 1], [1, 2]] {
+        feed.publish(&reports(idle));
+        for _ in 0..8 {
+            let id = mark();
+            let placed = policy_engine.place_pair(&pair_ask(&id), None, None).await;
+            let (placed, _guard) = placed.expect("a pair");
+            let on = [
+                place_of(&prefills, placed.worker()),
+                place_of(&decodes, placed.decode().expect("a decode")),
+            ];
+            assert_eq!(on, idle);
+        }
+    }
+    assert_eq!(policy_engine.faults(), 0);
+}
+
+/// A pair under the bucket policy states the size of its prompt: the bucket
+/// stage places a prefill by that size and declares it. The route's hashing
+/// counts the tokens it read, and the pair's lease states that count.
+#[tokio::test]
+async fn a_bucket_pair_states_the_size_of_its_prompt() {
+    let registry = Arc::new(WorkerRegistry::new());
+    side(&registry, WorkerType::Prefill, 2, None);
+    side(&registry, WorkerType::Decode, 2, None);
+    let document = PolicySpec::pair_presets("bucket", "round_robin");
+    let policy_engine = object_of(&registry, document.expect("the pair presets"));
+    let tokens: Vec<u32> = (0..600).collect();
+    let hashes = policy_engine.hashes(MODEL, &Prompt::of(Some(&tokens), None));
+    let id = mark();
+    let ask = Ask {
+        hashes: Some(&hashes),
+        ..pair_ask(&id)
+    };
+    let placed = policy_engine.place_pair(&ask, None, None).await;
+    let (placed, _guard) = placed.expect("a pair");
+    assert_eq!(placed.lease_tokens(), Some(600));
 }
 
 /// A pair is made by the pairing rule of the document that decides it. The

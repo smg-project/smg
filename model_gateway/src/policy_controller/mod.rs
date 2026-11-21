@@ -265,11 +265,23 @@ fn fed_whole(plan: PlanName) -> Option<Needs> {
     }
 }
 
-/// What this process feeds a pair's whole decision beyond its two lists'
-/// worker objects: nothing yet. A pair whose side reads a load report, who
-/// holds a prompt or the prompt's size keeps the classic placement pass.
+/// What this process feeds a pair's whole decision from its own data,
+/// beyond its two lists' worker objects.
+///
+/// Both pair routes read a request's prompt and state its size. Each
+/// worker's load report is read in the load monitor's snapshot, lent once a
+/// decision ([`engine::PolicyEngine::read_loads`]), by the records of both
+/// lists.
+///
+/// Not fed yet, so a pair whose side reads one keeps the classic placement
+/// pass: who holds a prompt, a hash ring, a header of the request, a named
+/// signal's cells.
 fn fed_a_pair() -> Needs {
-    Needs::default()
+    Needs {
+        prompt_size: true,
+        loads: true,
+        ..Needs::default()
+    }
 }
 
 /// What this process feeds a single request's whole decision from its own

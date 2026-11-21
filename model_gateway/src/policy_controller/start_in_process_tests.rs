@@ -877,3 +877,34 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
     );
     Ok(())
 }
+
+/// A pair gateway's document is decided whole where each side's stages read
+/// nothing this process does not feed a pair's decision: a worker's record,
+/// its load report or the prompt's size. A side that reads who holds the
+/// prompt or a hash ring keeps the classic pass, and the routing settings
+/// refuse the manual policy on a side.
+#[test]
+fn the_engine_decides_whole_a_pair_this_process_feeds() -> Case {
+    for policy in policies() {
+        let name = policy.name();
+        let config = RouterConfig {
+            policy_controller: true,
+            policy,
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..RouterConfig::default()
+        };
+        let Ok(started) = start_in_process(&config, None) else {
+            assert_eq!(name, "manual");
+            continue;
+        };
+        let started = started.ok_or("the setting starts an engine")?;
+        let classic = matches!(name, "cache_aware" | "consistent_hashing" | "prefix_hash");
+        assert_eq!(started.decides_whole(), !classic, "{name}");
+    }
+    Ok(())
+}

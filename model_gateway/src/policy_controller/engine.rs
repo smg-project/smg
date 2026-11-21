@@ -418,6 +418,10 @@ impl RequestMaker for MadeOver<'_, '_, '_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Pair(self.1)
     }
+
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        self.0.loads()
+    }
 }
 
 /// Whether the gateway can send to `worker` and the route's rule `holds`
@@ -1575,13 +1579,14 @@ impl PolicyEngine {
     ) -> Result<Placed, Unplaced> {
         let pair = read.lists(engine, admission);
         let mut missed = missed.lock();
+        // The monitor's snapshot for this decision, where the document
+        // reads load reports: lent once, and both lists' records read it.
+        let lent = self.loads.lend();
         let made = Made {
             ask,
             missed: &missed,
             members: None,
-            // A pair's decision is fed no load report yet
-            // (`super::fed_a_pair`).
-            loads: None,
+            loads: lent.snapshot(),
             source: Cell::new(None),
         };
         let now = Instant::now();
@@ -2643,12 +2648,14 @@ impl Placed {
         if !handle.decode_chosen() {
             return None;
         }
+        // The monitor's snapshot of this call's instant, as at a first ask.
+        let lent = policy_engine.loads.lend();
         let made = Made {
             ask,
             missed: &[],
             // A pair's decode call hands no list of a regular pool.
             members: None,
-            loads: None,
+            loads: lent.snapshot(),
             source: Cell::new(None),
         };
         // Where the engine of this process decides, the call is made over

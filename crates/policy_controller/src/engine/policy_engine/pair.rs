@@ -370,7 +370,9 @@ pub(super) fn issue_decode(
 /// next id ([`issue`]). With the view of the guard that holds the first it
 /// is the decode asked again behind the prefill that view names, and a pick
 /// issues the decode side under the held lease, dated at this call
-/// ([`issue_decode`]). A lease's dispatch is due as a single's.
+/// ([`issue_decode`]). A lease's dispatch is due as a single's. Both lists'
+/// records read their workers' reports in `loads`, the host's snapshot for
+/// this decision, where it lent one.
 ///
 /// A request held to wires is its host's to hand lists for. Where a worker
 /// of either list is dialed on a wire the request does not state, the
@@ -380,6 +382,7 @@ pub(super) fn decided(
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     held: Option<&HeldDecision<'_>>,
+    loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> DecideOutcome {
     let wires = request.constraints.wire_modes;
@@ -393,7 +396,7 @@ pub(super) fn decided(
     }
     let (spec, later) = (&own.spec, request.constraints.decode_later);
     let prefill = held.map(|held| held.target.id);
-    let decision = lists.decide(spec, None, &own.clock, now, request, prefill);
+    let decision = lists.decide(spec, loads, &own.clock, now, request, prefill);
     let (engine, facts) = (spec.engine(), &request.facts);
     let issued = match held {
         // A shed writes no word that every pick shares.
