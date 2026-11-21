@@ -15,7 +15,7 @@
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::{ContentHash, XXH3_SEED};
+use crate::{block::hash_token_ids, ContentHash, XXH3_SEED};
 
 /// The XXH3 seed for a cache namespace; [`XXH3_SEED`] when there is none.
 pub fn namespace_seed(lora_name: Option<&str>, cache_salt: Option<&str>) -> u64 {
@@ -30,37 +30,13 @@ pub fn namespace_seed(lora_name: Option<&str>, cache_salt: Option<&str>) -> u64 
 }
 
 /// [`crate::compute_content_hash`] under an explicit seed, in the same form:
-/// one shot over a stack buffer for blocks up to 256 tokens. The streaming
-/// hasher derives a seeded secret per instance before it sees a byte, which
-/// outweighs hashing a 16-token block. Same digest either way (the tests pin
-/// that). The plain hash keeps its own copy of this body: routed through
-/// here, its seed can no longer fold as a constant, and it costs more. The
-/// buffer is the smallest of three sizes that holds the block.
+/// one shot over the block's bytes. The streaming hasher derives a seeded
+/// secret per instance before it sees a byte, which outweighs hashing a
+/// 16-token block. Same digest either way (the tests pin that). The plain
+/// hash and this one share one inlined body, so the plain hash's seed folds
+/// as a constant.
 pub fn content_hash_with_seed(token_ids: &[u32], seed: u64) -> ContentHash {
-    const STACK_BYTES: usize = 1024;
-    let len = token_ids.len() * 4;
-    if len <= STACK_BYTES {
-        return match len {
-            0..=128 => hash_on_stack::<128>(token_ids, seed),
-            129..=256 => hash_on_stack::<256>(token_ids, seed),
-            _ => hash_on_stack::<STACK_BYTES>(token_ids, seed),
-        };
-    }
-    let bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
-    ContentHash(xxh3_64_with_seed(&bytes, seed))
-}
-
-/// [`content_hash_with_seed`] over a zeroed stack buffer of `N` bytes, which
-/// holds the block.
-#[inline]
-fn hash_on_stack<const N: usize>(token_ids: &[u32], seed: u64) -> ContentHash {
-    let mut bytes = [0u8; N];
-    let len = token_ids.len() * 4;
-    let (slots, _) = bytes[..len].as_chunks_mut::<4>();
-    for (slot, token) in slots.iter_mut().zip(token_ids) {
-        *slot = token.to_le_bytes();
-    }
-    ContentHash(xxh3_64_with_seed(&bytes[..len], seed))
+    ContentHash(hash_token_ids(token_ids, seed))
 }
 
 /// [`crate::compute_request_content_hashes`] under an explicit seed (see
@@ -239,7 +215,9 @@ mod tests {
         let tokens: Vec<u32> = (0..300).map(|i| i * 7919 + 3).collect();
         let namespace = namespace_seed(Some("adapter"), Some("salty"));
         for seed in [0, XXH3_SEED, namespace, u64::MAX] {
-            // Both sides of every buffer bound (32, 64 and 256 tokens).
+            // Each regime of the hash (up to 16 bytes, up to 128, up to 240
+            // and beyond). On a target of another byte order, both sides of
+            // every bound of its copy too (32, 64 and 256 tokens).
             for len in [0, 1, 16, 32, 33, 64, 65, 255, 256, 257, 300] {
                 assert_eq!(
                     content_hash_with_seed(&tokens[..len], seed),
@@ -247,6 +225,34 @@ mod tests {
                     "seed {seed}, {len} tokens"
                 );
             }
+        }
+    }
+
+    /// Six blocks' hashes as values, plain and under a namespace. Workers
+    /// report their blocks under these hashes and stored snapshots hold
+    /// them, so a change in how a block is hashed may not move one. The
+    /// lengths take each regime of the hash: up to 16 bytes, up to 128, up
+    /// to 240, and beyond that up to 1,200.
+    #[test]
+    fn block_hashes_are_the_recorded_values() {
+        let tokens: Vec<u32> = (0..300).map(|i| i * 7919 + 3).collect();
+        let namespace = namespace_seed(Some("adapter"), Some("salty"));
+        let recorded: [(usize, u64, u64); 6] = [
+            (1, 0x8020_bf96_9d17_68ca, 0xeb4c_1e87_7ab1_a673),
+            (16, 0x5232_5333_90ea_4d1e, 0x24cf_7f3e_4dd1_08b1),
+            (33, 0x6822_087f_c70d_046a, 0x1b6c_1dfb_43f0_3eb1),
+            (64, 0x4baf_d877_ac9f_d0a1, 0xf325_60f0_3962_ee10),
+            (256, 0x1bb3_97e2_fe40_51ec, 0x2db7_b5a4_7ed0_6f9a),
+            (300, 0xc837_2a8c_c85e_f860, 0xf164_947b_61d5_fd41),
+        ];
+        for (len, plain, namespaced) in recorded {
+            let block = &tokens[..len];
+            assert_eq!(compute_content_hash(block).0, plain, "{len} tokens");
+            assert_eq!(
+                content_hash_with_seed(block, namespace).0,
+                namespaced,
+                "{len} tokens under a namespace"
+            );
         }
     }
 }
