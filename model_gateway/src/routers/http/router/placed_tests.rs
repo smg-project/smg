@@ -1209,12 +1209,14 @@ async fn a_request_keyed_by_a_header_is_streamed_to_its_keys_worker() -> Case {
 /// a classic policy that needs the text does: the request goes back to the
 /// buffered path with its body whole. A valid tokens hint states the prompt
 /// in a header, so a hinted request is streamed, and the prefix ring keeps
-/// one hint on one worker.
+/// one hint on one worker. The bucket stage reads no hash of the prompt and
+/// places by its size, which it declares: the body is kept for it too, where
+/// a streamed request would state a size of zero.
 #[tokio::test]
 async fn a_document_that_reads_the_prompt_buffers_the_body_unless_a_hint_states_it() -> Case {
     let hint: Vec<String> = (1..=64_u32).map(|id| id.to_string()).collect();
     let hint = hint.join(",");
-    for preset in ["cache_aware", "prefix_hash"] {
+    for preset in ["cache_aware", "prefix_hash", "bucket"] {
         let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
         let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
         let router = own_router(preset, &[&a, &b])?;

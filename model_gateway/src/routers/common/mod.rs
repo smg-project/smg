@@ -336,11 +336,13 @@ pub mod bench_support {
         let started = start_in_process(&picked, None)
             .map_err(|refused| refused.to_string())?
             .ok_or("this configuration places its requests by no routing policy")?;
+        let whole = started.decides_whole();
         let policies = PolicyRegistry::with_policy_engine(
             config.policy.clone(),
             config.routing_key_override.clone(),
             started.engine,
             started.origin,
+            whole,
         );
         let asked = if config.mode.is_pd_mode() {
             set_pair_sides(&policies, config);

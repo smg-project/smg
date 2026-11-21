@@ -217,8 +217,8 @@ impl InProcess {
     /// They do where the engine decides every request of the document in
     /// force whole today: single requests alone, under no sessions rule,
     /// each place picked by its picker alone or decided by a profile that
-    /// reads who holds the prompt and asks nothing this process does not
-    /// feed a whole decision ([`fed`]). Under any other document the
+    /// asks nothing this process does not feed a whole decision
+    /// ([`fed`]). Under any other document the
     /// routers keep their classic placement pass, whose policies ask the
     /// engine for the pick. The set grows with what the engine decides
     /// whole, and this question goes when it decides every document.
@@ -231,17 +231,31 @@ impl InProcess {
 /// data, beyond the worker objects' live state.
 ///
 /// The routers hash a request's prompt, by its tokens or its text, where
-/// the document's stages read the hashes. The engine reads the cache-event
-/// index this process keeps, and keeps its own record of the prefixes it
-/// sent: together they name a request's holders and a pool's warming
-/// workers. The workers' load reports are not handed to a whole decision
-/// yet, so a profile that reads them is not decided whole.
+/// the document's stages read the hashes, and state the media it carries.
+/// They count the prompt's size where they read the prompt: a typed route
+/// reads it for each request it asks the engine about, and a route that
+/// sends a body on unread must read it where a stage declares the size
+/// ([`Needs::prompt_size`]), as the classic arm buffers a body for a policy
+/// that needs its text.
+/// The engine reads the cache-event index this process keeps, and keeps
+/// its own record of the prefixes it sent: together they name a request's
+/// holders and a pool's warming workers. Each worker's load report is read
+/// in the load monitor's snapshot, lent once an ask
+/// ([`engine::PolicyEngine::read_loads`]), and a worker's count of session
+/// keys in flight on the worker object, with the rest of its record.
+///
+/// Not fed yet, so a profile that reads one keeps the classic placement
+/// pass: a hash ring, a header of the request, a named signal's cells.
 fn fed() -> Needs {
     Needs {
         token_hashes: true,
         text_hashes: true,
+        prompt_size: true,
+        loads: true,
         events: true,
         sent_prefixes: true,
+        media: true,
+        active_sessions: true,
         affinity: true,
         ..Needs::default()
     }

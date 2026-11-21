@@ -327,6 +327,7 @@ mod tests {
             RoutingKeyOverrideConfig::default(),
             Arc::new(PolicyEngine::new(spec)),
             DocumentOrigin::Supplied,
+            false,
         );
         context_with(policy, Some(Arc::new(registry)))
     }

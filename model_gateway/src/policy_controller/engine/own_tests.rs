@@ -2,19 +2,23 @@
 //! decided over the list the registry publishes for its route's pool, and a
 //! target is the worker at its place in that list.
 
-use std::{cell::Cell, sync::Arc, time::Instant};
+use std::{cell::Cell, collections::HashMap, sync::Arc, time::Instant};
 
-use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{WorkerLoadResponse, WorkerStatus},
+};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
         worker_id, Phase, Plain, PolicyEngine as OwnEngine, RequestMaker, ShedReason, WireModes,
-        WorkerId,
+        WorkerId, TEXT_BYTES_PER_TOKEN,
     },
     tracking::TransportClass,
 };
 use smg_worker::{
     identity::basic::{ConnectionMode, Worker},
+    load::state::{one_rank_load, TestFeed},
     test_support::no_health_check,
 };
 
@@ -106,6 +110,7 @@ fn a_first_ask_is_plain_and_states_the_size_its_request_would() {
             ask,
             missed,
             members: None,
+            loads: None,
             source: Cell::new(None),
         };
         made.plain()
@@ -431,4 +436,77 @@ async fn the_default_policys_attempt_goes_back_to_the_worker_its_prompt_was_sent
     }
     assert!(others.iter().any(|&at| at != others[0]));
     assert_eq!(policy_engine.faults(), 0);
+}
+
+/// An attempt under least load is placed by the reports the load monitor
+/// publishes. The engine object reads the monitor's feed, the one a classic
+/// policy reads, and each ask is lent the snapshot current at that
+/// instant: the worker that reports an empty queue takes every attempt, and
+/// the next publication moves the placement at the next ask. With no feed
+/// handed, no record carries a report and no worker is singled out.
+#[tokio::test]
+async fn a_least_load_attempt_is_placed_by_the_reports_the_monitor_publishes() {
+    let prompt = [1_u32, 2, 3];
+    let (unfed, workers) = own("least_load", 4);
+    assert!(!unfed.reads_loads());
+    let mut drawn = Vec::new();
+    for _ in 0..32 {
+        drawn.push(placed_on(&unfed, &workers, &prompt).await);
+    }
+    assert!(drawn.iter().any(|&at| at != drawn[0]), "{drawn:?}");
+
+    let (policy_engine, workers) = own("least_load", 4);
+    let feed = TestFeed::attached_to(|receiver| {
+        policy_engine.read_loads(receiver.expect("the feed's receiver"));
+    });
+    assert!(policy_engine.reads_loads());
+    // One worker reports an empty queue, every other a long one.
+    let reports = |idle: usize| -> HashMap<String, WorkerLoadResponse> {
+        let report = |at| one_rank_load(if at == idle { 0 } else { 400_000 }, 0.1, 1_000.0);
+        let listed = workers.iter().enumerate();
+        listed
+            .map(|(at, worker)| (worker.url().to_owned(), report(at)))
+            .collect()
+    };
+    for idle in [2, 0, 3] {
+        feed.publish(&reports(idle));
+        for _ in 0..8 {
+            assert_eq!(placed_on(&policy_engine, &workers, &prompt).await, idle);
+        }
+    }
+    assert_eq!(policy_engine.faults(), 0);
+}
+
+/// An attempt under the bucket policy states the real size of its prompt.
+/// The bucket stage places a prefill by that size and declares it, so a
+/// route that would send a body on unread reads it under this document,
+/// unless a tokens hint states the prompt. The route's hashing counts the
+/// text it read, and the decision's lease states that count: a body sent on
+/// unread would state zero, and every prefill would go to the owner of the
+/// smallest sizes.
+#[tokio::test]
+async fn a_bucket_attempt_states_the_size_of_the_prompt_its_route_read() {
+    let (policy_engine, _workers) = own("bucket", 4);
+    assert!(policy_engine.reads_body(|| false));
+    assert!(!policy_engine.reads_body(|| true));
+    let (turns, _workers) = own("round_robin", 4);
+    assert!(!turns.reads_body(|| false));
+
+    let text = "a prompt of a size the bucket stage places by. ".repeat(32);
+    let prompt = Prompt {
+        text: Some(&text),
+        ..Prompt::default()
+    };
+    let hashes = policy_engine.hashes(MODEL, &prompt);
+    let id = mark();
+    let ask = Ask {
+        pool: Some(RoutingPool::HttpRegular),
+        hashes: Some(&hashes),
+        ..Ask::of(&id, MODEL)
+    };
+    let placed = policy_engine.place(&ask, Instant::now()).await;
+    let placed = placed.expect("a worker");
+    let counted = u32::try_from(text.len()).expect("a short text") / TEXT_BYTES_PER_TOKEN;
+    assert!(counted > 256);
+    assert_eq!(placed.lease_tokens(), Some(counted));
 }

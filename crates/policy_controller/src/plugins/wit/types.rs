@@ -320,7 +320,8 @@ pub(crate) const TYPES: &[Item] = &[
             " `zone`, `engine-kind` and `connector`); `budget-micros` is relative to",
             " the host's receipt; `seed` is the only randomness (see `host`).",
             " `block-hashes` is empty unless the plugin's row declares `token_hashes` or",
-            " `text_hashes` among its needs.",
+            " `text_hashes` among its needs. `prompt-tokens` is zero unless the row",
+            " declares `prompt_size`: a plugin that reads the request's size declares it.",
         ],
         fields: &[
             Field {

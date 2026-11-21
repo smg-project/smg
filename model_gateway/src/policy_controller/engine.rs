@@ -63,7 +63,10 @@ use smg_policy_controller::{
     tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
     worker_host::Objects,
 };
-use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
+use smg_worker::{
+    identity::basic::{Worker, WorkerLoadGuard, WorkerType},
+    load::state::{LoadReceiver, LoadSnapshot},
+};
 
 use crate::{
     middleware::{
@@ -90,6 +93,7 @@ use crate::{
 };
 
 mod hashes;
+mod loads;
 
 pub(crate) use hashes::Prompt;
 pub(crate) use smg_policy_controller::engine::PromptHashes as Hashes;
@@ -317,6 +321,9 @@ struct Made<'r, 'a> {
     /// The list the ask is decided over, where the engine of this process
     /// decides it: the policy engine's value of the ask's pool.
     members: Option<&'r PoolMembers>,
+    /// The load monitor's snapshot for this ask, where the engine of this
+    /// process reads load reports: lent once an ask ([`loads::Loads`]).
+    loads: Option<&'r Arc<LoadSnapshot>>,
     /// Where the key of the last making came from, under the label the
     /// gateway counts it by. The door may make the request a second time,
     /// behind a lease the store refused: the policy engine counts after the
@@ -361,6 +368,10 @@ impl RequestMaker for Made<'_, '_> {
 
     fn workers(&self) -> WorkerLists<'_> {
         self.members.map_or(WorkerLists::None, WorkerLists::Single)
+    }
+
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+        self.loads
     }
 }
 
@@ -678,6 +689,10 @@ impl DecisionEngine for Decider {
 pub(crate) struct PolicyEngine {
     door: Arc<Decider>,
     workers: Workers,
+    /// The load monitor's feed, where the engine of this process decides
+    /// under a document that reads load reports
+    /// ([`Self::read_loads`]).
+    loads: loads::Loads,
 }
 
 /// Where the policy engine finds the worker of a target.
@@ -701,6 +716,7 @@ impl PolicyEngine {
         Self {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::Held(objects),
+            loads: loads::Loads::default(),
         }
     }
 
@@ -711,7 +727,28 @@ impl PolicyEngine {
         Self {
             door: Arc::new(Decider::Own(engine)),
             workers: Workers::Listed(registry),
+            loads: loads::Loads::default(),
         }
+    }
+
+    /// Hands the policy engine the load monitor's feed, at the gateway's
+    /// start: the one feed the classic policies read. The engine of this
+    /// process reads its workers' reports there, one look an ask, where
+    /// its document reads load reports. Under any other document, and
+    /// where the gateway follows a controller, the feed is not kept: the
+    /// controller's rows carry the reports there.
+    pub(crate) fn read_loads(&self, feed: LoadReceiver) {
+        if let Decider::Own(engine) = &*self.door {
+            if engine.spec().needs().loads {
+                self.loads.read(feed);
+            }
+        }
+    }
+
+    /// Whether the engine was handed the monitor's feed and kept it.
+    #[cfg(test)]
+    pub(crate) fn reads_loads(&self) -> bool {
+        self.loads.reads_a_feed()
     }
 
     /// One pass of the door's clock at `now`: the call of the policy engine's
@@ -746,10 +783,14 @@ impl PolicyEngine {
     /// out here.
     ///
     /// A stage reads the prompt as its block hashes, which a route makes
-    /// from the body's token ids or text. A valid tokens hint states the
-    /// ids in a header, so `hinted` lifts the read: it is asked only where
-    /// a stage reads the hashes. The text itself, which no stage of this
-    /// build reads, is in the body alone.
+    /// from the body's token ids or text, or as its size, which the route
+    /// counts where it makes the hashes (a stage that places by the size
+    /// declares it, as the bucket stage does). A valid tokens hint states
+    /// the ids in a header, and with them their count, so `hinted` lifts
+    /// the read: it is asked only where a stage reads the hashes or the
+    /// size. The hint's count then stands for the size, 512 ids at most,
+    /// as a hint lifts every classic policy's read of the body. The text
+    /// itself, which no stage of this build reads, is in the body alone.
     ///
     /// A key source that is the request's own id reads the body too. The
     /// routing settings name one under the sticky override alone, and the
@@ -758,7 +799,8 @@ impl PolicyEngine {
         let needs = self
             .door
             .with_spec(|spec| spec.engine().needs_for_phase(Phase::Single));
-        needs.text || ((needs.token_hashes || needs.text_hashes) && !hinted())
+        let prompt = needs.token_hashes || needs.text_hashes || needs.prompt_size;
+        needs.text || (prompt && !hinted())
     }
 
     /// An attempt's prompt hashes for `model`, under the generation in force.
@@ -775,6 +817,7 @@ impl PolicyEngine {
         Self {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::AtKey(registry),
+            loads: loads::Loads::default(),
         }
     }
 
@@ -976,6 +1019,7 @@ impl PolicyEngine {
             ask,
             missed,
             members: None,
+            loads: None,
             source: Cell::new(None),
         };
         let started = Instant::now();
@@ -1400,10 +1444,15 @@ impl PolicyEngine {
                 });
             let members = dialed.as_ref().or(whole);
             let list = members.map(PoolMembers::workers);
+            // The monitor's snapshot for this ask, where the document reads
+            // load reports: lent once, and every record of the decision is
+            // read in it. The ask's instant was read before it.
+            let lent = self.loads.lend();
             let made = Made {
                 ask,
                 missed: &missed,
                 members,
+                loads: lent.snapshot(),
                 source: Cell::new(None),
             };
             let decided = engine.decide_under(GATEWAY, &made, now);
@@ -1972,6 +2021,7 @@ impl Placed {
             missed: &[],
             // A pair's decode call hands no list of a regular pool.
             members: None,
+            loads: None,
             source: Cell::new(None),
         };
         let started = Instant::now();

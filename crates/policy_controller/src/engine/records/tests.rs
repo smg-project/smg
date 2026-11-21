@@ -826,6 +826,44 @@ fn what_a_worker_object_says_and_a_reports_age_are_read_at_every_decision() {
     );
 }
 
+/// An ask is lent the snapshot current when it reads the feed, which is
+/// behind the instant the ask was made: a report in it can be sampled
+/// after that instant. Such a report is of age zero in a record found by
+/// look-up, in the whole write and in a record read from the list's rows:
+/// never an age that wrapped, which a stage would read as a stale report.
+#[test]
+fn a_report_sampled_after_the_decisions_instant_is_of_age_zero() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let workers = fleet(2);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let now = Instant::now();
+    let sampled_at = now + Duration::from_millis(30);
+    let loads = (0..2)
+        .map(|at| {
+            let mut report = one_rank_load(100, 0.1, 1_000.0);
+            report.sampled_at = Some(sampled_at);
+            (url(at), report)
+        })
+        .collect();
+    let loads = LoadSnapshot::from_loads_for_test(loads);
+    let live = Live::at(spec.engine(), &clock, now, Some(&loads), None);
+
+    let found = pool.read(&workers, &live, 1).expect("a worker");
+    assert!(held(&pool).is_none(), "one read converts no list");
+    assert!(found.load_sampled_at_micros > live.now_micros());
+    assert_eq!(found.load.expect("a report").report_age_ms, 0);
+
+    let mut rows = Vec::new();
+    let (written, _) = pool.write(&workers, &live, &mut rows);
+    for row in written {
+        assert_eq!(row.load.expect("a report").report_age_ms, 0);
+    }
+    assert!(held(&pool).is_some());
+    let copied = pool.read(&workers, &live, 0).expect("a worker");
+    assert_eq!(copied.load.expect("a report").report_age_ms, 0);
+}
+
 #[test]
 fn a_workers_place_is_found_by_its_id_and_by_no_id_two_rows_carry() {
     let spec = applied("least_load");

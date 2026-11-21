@@ -28,9 +28,12 @@
 //! not, a subset hint and a hard demand are declined under the stage that
 //! would have run them.
 
-use std::{sync::atomic::Ordering, time::Instant};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Instant,
+};
 
-use smg_worker::runtime::RoutingState;
+use smg_worker::{load::state::LoadSnapshot, runtime::RoutingState};
 
 use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
@@ -139,14 +142,16 @@ pub(super) fn noted(
 /// One made request's decision over `members`, the list its host handed,
 /// at `now`: by the rows its key names where they answer
 /// ([`keys::decide`]), and else the engine's whole decision over records
-/// written for the request from the list's workers. A request that states
-/// what no stage here runs is declined under that stage's name. The list is
-/// borrowed as long as the request: its ring is lent into the request's
-/// facts.
+/// written for the request from the list's workers. Each worker's report
+/// is read from `loads`, the host's load snapshot for this decision. A
+/// request that states what no stage here runs is declined under that
+/// stage's name. The list is borrowed as long as the request: its ring is
+/// lent into the request's facts.
 pub(super) fn decide<'r>(
     own: &PolicyEngine,
     request: &mut Request<'r>,
     members: &'r PoolMembers,
+    loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> Decision {
     let spec = &own.spec;
@@ -161,10 +166,12 @@ pub(super) fn decide<'r>(
         return declined(own, request, WIRES);
     }
     let records = members.records(spec, &own.clock);
-    // No load snapshot and no session key's text are handed to this call
-    // yet: a record carries no report and no count of a key's requests.
-    let live = records::Live::at(spec.engine(), &own.clock, now, None, None);
     let facts = &mut request.facts;
+    // One value for every record of the decision: its instant, the host's
+    // snapshot as the host holds it, and the key's text for a stage that
+    // counts the key's requests on a worker.
+    let key = facts.session_key.plain;
+    let live = records::Live::at(spec.engine(), &own.clock, now, loads, key);
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin, or its key's owner on the
@@ -306,7 +313,9 @@ mod tests {
     use std::{cell::Cell, sync::Arc};
 
     use parking_lot::Mutex;
-    use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+    use smg_worker::{
+        identity::basic::Worker, load::state::one_rank_load, test_support::ready_worker,
+    };
 
     use super::*;
     use crate::{
@@ -360,6 +369,7 @@ mod tests {
     struct Asks<'a> {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
+        loads: Option<Arc<LoadSnapshot>>,
         made: Cell<u32>,
     }
 
@@ -368,6 +378,7 @@ mod tests {
             Self {
                 request,
                 members,
+                loads: None,
                 made: Cell::new(0),
             }
         }
@@ -389,6 +400,10 @@ mod tests {
 
         fn workers(&self) -> WorkerLists<'_> {
             self.members.map_or(WorkerLists::None, WorkerLists::Single)
+        }
+
+        fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+            self.loads.as_ref()
         }
     }
 
@@ -533,6 +548,48 @@ mod tests {
             assert!(decided(&engine, &asks).decision.pick().is_some());
             assert_eq!(asks.made.get(), made);
         }
+    }
+
+    /// A place that scores by load reads each worker's report in the
+    /// snapshot its host hands for the decision: the worker with the
+    /// shortest queue is picked at every seed. Handed no snapshot, the same
+    /// engine reads no report, and its picks spread over the list.
+    #[test]
+    fn a_place_that_scores_by_load_reads_the_reports_its_host_hands() {
+        let engine = preset("least_load");
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let reports = (0..4)
+            .map(|at| {
+                let queued = if at == 2 { 0 } else { 90_000 };
+                let url = format!("http://worker-{at}:8000");
+                (url, one_rank_load(queued, 0.1, 1_000.0))
+            })
+            .collect();
+        let picked_at = |loads: Option<Arc<LoadSnapshot>>, seed: u64| {
+            let mut request = request();
+            request.facts.seed = seed;
+            let asks = Asks {
+                loads,
+                ..Asks::of(request, Some(&members))
+            };
+            let decided = decided(&engine, &asks);
+            let pick = decided.decision.pick().expect("a pick");
+            pick.targets.first().expect("a target").position
+        };
+        let snapshot = LoadSnapshot::from_loads_for_test(reports);
+        for seed in 0..32 {
+            assert_eq!(
+                picked_at(Some(Arc::clone(&snapshot)), seed),
+                2,
+                "seed {seed}"
+            );
+        }
+        let mut unread = [0_u32; 4];
+        for seed in 0..64 {
+            unread[picked_at(None, seed) as usize] += 1;
+        }
+        assert!(unread.iter().all(|&picks| picks > 0), "{unread:?}");
     }
 
     /// A request stated ahead is plain where it is a first attempt that

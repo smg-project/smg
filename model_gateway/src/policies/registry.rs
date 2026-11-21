@@ -87,6 +87,10 @@ impl Side {
 struct AskedEngine {
     engine: Arc<PolicyEngine>,
     origin: DocumentOrigin,
+    /// Whether the routers ask the engine for each request's whole
+    /// decision under its document. The start log says so of a policy the
+    /// engine does not pick by itself.
+    whole: bool,
 }
 
 impl AskedEngine {
@@ -339,14 +343,22 @@ impl PolicyRegistry {
     /// the policy is built. `origin` says how that document came to be:
     /// under one made from the routing settings a worker's `policy` label
     /// chooses a model's policy as ever, and under a supplied one the
-    /// binding that names the model does.
+    /// binding that names the model does. `whole` says whether the routers
+    /// ask the engine for each request's whole decision under the document:
+    /// the start log's line for a policy the engine does not pick by itself
+    /// says who decides it by that.
     pub fn with_policy_engine(
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
         engine: Arc<PolicyEngine>,
         origin: DocumentOrigin,
+        whole: bool,
     ) -> Self {
-        let asked = AskedEngine { engine, origin };
+        let asked = AskedEngine {
+            engine,
+            origin,
+            whole,
+        };
         Self::build(default_policy_config, routing_key_override, Some(asked))
     }
 
@@ -1086,7 +1098,11 @@ impl PolicyRegistry {
     /// `config`'s name only labels it. Where the engine does not pick the
     /// profile so yet, or no binding names the place, it is the classic
     /// policy. The log says which: one line for each policy this registry
-    /// builds and keeps with an engine asked.
+    /// builds and keeps with an engine asked. Under a document the routers
+    /// ask the engine whole for, the line of a profile the engine does not
+    /// pick by itself says the engine decides it by its whole pass: the
+    /// classic policy is built all the same, for a route with no arm to
+    /// the engine.
     fn policy_at(
         asked: Option<&AskedEngine>,
         config: &PolicyConfig,
@@ -1101,10 +1117,18 @@ impl PolicyRegistry {
         match asked.engine.place(model, phase) {
             Place::Alone(profile) => Self::engine_object(asked, profile, name, &place),
             Place::NotAlone { profile, stage } => {
-                info!(
-                    "Policy `{name}` of {place}: the classic policy decides it, \
-                     the policy engine does not pick the profile `{profile}` by itself yet ({stage})"
-                );
+                if asked.whole {
+                    info!(
+                        "Policy `{name}` of {place}: the policy engine decides it by its whole \
+                         pass (the profile `{profile}`); the classic policy is kept for a route \
+                         with no arm to the engine"
+                    );
+                } else {
+                    info!(
+                        "Policy `{name}` of {place}: the classic policy decides it, \
+                         the policy engine does not pick the profile `{profile}` by itself yet ({stage})"
+                    );
+                }
                 PolicyFactory::create_from_config(config)
             }
             Place::Unbound => {
