@@ -3487,6 +3487,18 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
         .unwrap_or(0)
 }
 
+/// The shards of the session table of an engine of `bindings`
+/// ([`SessionTable::with_shards`]): four a core of the host where a binding
+/// has a sessions rule, since every keyed decision takes its key's shard's
+/// mutex, and one where no rule looks a key up.
+fn session_shards(bindings: &[Binding]) -> usize {
+    if bindings.iter().any(|binding| binding.sessions.is_some()) {
+        sticky_sessions::shards_for_this_host()
+    } else {
+        1
+    }
+}
+
 /// How long a worker that left keeps its pins in the session table
 /// ([`SessionTable::left`]): the longest TTL among the bindings' sessions
 /// rules, a rule with none counting as [`ABSENT_WORKER_PIN_TTL_MICROS`], which
@@ -4099,8 +4111,9 @@ impl Engine {
                 break;
             }
         }
-        let sessions =
-            SessionTable::new(shortest_sweep(&bindings)).with_absence(absence(&bindings));
+        let sessions = SessionTable::new(shortest_sweep(&bindings))
+            .with_absence(absence(&bindings))
+            .with_shards(session_shards(&bindings));
         let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
         let marks: Vec<Marks> = profiles
             .iter()

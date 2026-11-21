@@ -190,13 +190,35 @@ impl Entry {
     }
 }
 
-/// Shards of the table, by the key's low bits: keyed decisions on different
-/// keys take different locks.
+/// Shards of a table no host sized ([`SessionTable::new`]), and of the
+/// store's pins of record, by the key's low bits: keyed decisions on
+/// different keys take different locks.
 pub(crate) const SHARDS: usize = 16;
 
-/// The shard of `key`, in this table and in the store's pins of record.
+/// The shard of `key` in the store's pins of record.
 pub(crate) fn shard_of(key: u64) -> usize {
     (key % SHARDS as u64) as usize
+}
+
+/// The shards of a table whose keyed decisions run on every core of the
+/// host at once ([`SessionTable::with_shards`]): four a core, rounded up to
+/// a power of two, so two decisions of different keys seldom meet on one
+/// lock.
+pub(crate) fn shards_for_this_host() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    cores.saturating_mul(4).next_power_of_two()
+}
+
+/// One shard of the table, on cache lines of its own: a decision whose key
+/// falls in the next shard writes neither this shard's lock nor its map's
+/// header.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct Shard(Mutex<FxHashMap<u64, Entry>>);
+
+/// `count` empty shards.
+fn empty_shards(count: usize) -> Box<[Shard]> {
+    (0..count).map(|_| Shard::default()).collect()
 }
 
 /// How long a worker that left keeps its pins where no rule says a TTL:
@@ -214,9 +236,18 @@ pub(crate) const ABSENT_WORKERS: usize = 4_096;
 pub(crate) const RENAMED_WORKERS: usize = 4_096;
 
 /// The session table: every key's pins, swept on the decision clock.
+///
+/// A decision of a key takes one lock, the mutex of its key's shard. The
+/// read of the pins is a write: it renews the key's idle time, and starts a
+/// key over whose time has passed, so a shard is behind a mutex and not a
+/// lock readers share. The claim of a key no pin takes is under the same
+/// mutex, and so is a dispatch. Two decisions meet on a mutex only where
+/// their keys fall in one shard.
 #[derive(Debug)]
 pub struct SessionTable {
-    shards: Vec<Mutex<FxHashMap<u64, Entry>>>,
+    /// The shards, a power of two of them: a key's shard is named by the
+    /// key's bits above its low word ([`Self::shard`]).
+    shards: Box<[Shard]>,
     /// The decision clock at the next sweep, of the idle keys or of a
     /// worker that left: `u64::MAX` while neither is owed.
     next_sweep_micros: AtomicU64,
@@ -261,9 +292,7 @@ impl SessionTable {
     /// when none sweeps.
     pub fn new(sweep_micros: u64) -> Self {
         Self {
-            shards: (0..SHARDS)
-                .map(|_| Mutex::new(FxHashMap::default()))
-                .collect(),
+            shards: empty_shards(SHARDS),
             next_sweep_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
             next_pass_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
             sweep_micros,
@@ -289,8 +318,33 @@ impl SessionTable {
         self.absence_micros
     }
 
+    /// The table with `shards` shards, rounded up to a power of two and one
+    /// at the least: what an engine asks for the table its decisions read,
+    /// four shards a core of the host, and one shard for a table no rule
+    /// looks a key up in. Called where the table is built, while it holds
+    /// no key.
+    #[must_use]
+    pub fn with_shards(mut self, shards: usize) -> Self {
+        debug_assert!(self.is_empty(), "a table is sized before it holds a key");
+        self.shards = empty_shards(shards.max(1).next_power_of_two());
+        self
+    }
+
+    /// How many shards the table holds.
+    pub fn shards(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// The shard of `key`, by the key's bits above its low word: a session's
+    /// value is mixed over all its bits ([`RequestFacts::session`]), and the
+    /// shard's own map buckets a key by other bits than these.
+    ///
+    /// [`RequestFacts::session`]: crate::engine::view::RequestFacts::session
+    #[inline]
     fn shard(&self, key: u64) -> &Mutex<FxHashMap<u64, Entry>> {
-        &self.shards[shard_of(key)]
+        // A power of two of shards, so the mask names one of them.
+        let at = (key >> 32) as usize & (self.shards.len() - 1);
+        &self.shards[at].0
     }
 
     /// The pins of `key` at a decision taken at `now_micros` under `rule`,
@@ -518,7 +572,7 @@ impl SessionTable {
         // lands ahead of it reads a pin the walk renames.
         self.remember(old, new);
         for shard in &self.shards {
-            for entry in shard.lock().values_mut() {
+            for entry in shard.0.lock().values_mut() {
                 for pin in &mut entry.pins {
                     if *pin == old {
                         *pin = new;
@@ -587,6 +641,7 @@ impl SessionTable {
     fn drop_pins(&self, workers: &[WorkerId]) {
         for shard in &self.shards {
             shard
+                .0
                 .lock()
                 .retain(|_, entry| Self::unpinned(entry, workers));
         }
@@ -607,10 +662,22 @@ impl SessionTable {
         !held || entry.pins[0] != WorkerId(0)
     }
 
+    /// The sweep a decision's read of a key runs where one is due, for a
+    /// host that calls it on a timer of its own,
+    /// at `now_micros` on the decision clock: the keys past their end leave
+    /// the table and a worker whose absence ended is forgotten, off the path
+    /// of a request. One atomic compare-exchange claims a sweep, and the
+    /// walk takes each shard's mutex in turn. A read still sweeps where it
+    /// finds one due first.
+    pub fn sweep_due(&self, now_micros: u64) {
+        self.sweep_if_due(now_micros);
+    }
+
     /// Whether a sweep is due: of the keys whose TTL passed, once per the
     /// table's sweep interval, or of a worker that left. A table that owes
-    /// neither never walks its shards. Always inlined with its one caller
-    /// ([`Self::lookup`]): the check is one compare on the pin's path.
+    /// neither never walks its shards. Always inlined with its callers
+    /// ([`Self::lookup`], [`Self::sweep_due`]): the check is one compare on
+    /// the pin's path.
     #[inline(always)]
     fn sweep_if_due(&self, now_micros: u64) {
         let due = self.next_sweep_micros.load(Ordering::Relaxed);
@@ -673,7 +740,7 @@ impl SessionTable {
             return;
         }
         for shard in &self.shards {
-            shard.lock().retain(|_, entry| {
+            shard.0.lock().retain(|_, entry| {
                 let stays = !idle || entry.expires_at_micros > now_micros;
                 stays && Self::unpinned(entry, &ended)
             });
@@ -703,7 +770,7 @@ impl SessionTable {
 
     /// Keys the table holds.
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().len()).sum()
+        self.shards.iter().map(|s| s.0.lock().len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1535,5 +1602,84 @@ mod tests {
         assert_eq!(table.absent(), ABSENT_WORKERS);
         assert_eq!(table.pins(s(1)), None, "the first to leave");
         assert_eq!(table.pins(s(2)), Some([WorkerId(9_999), WorkerId(0)]));
+    }
+
+    /// A session of the sizing cases: a counter mixed over every bit, as a
+    /// session's value is.
+    fn mixed(count: u64) -> Session {
+        s(count.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+    }
+
+    #[test]
+    fn a_table_of_any_size_keeps_every_key_and_is_sized_by_a_power_of_two() {
+        for (asked, shards) in [(0, 1), (1, 1), (3, 4), (16, 16), (1_000, 1_024)] {
+            let table = SessionTable::new(RULE.sweep_micros).with_shards(asked);
+            assert_eq!(table.shards(), shards, "{asked} shards asked");
+            for count in 1..=200 {
+                let key = mixed(count);
+                assert_eq!(table.lookup(key, 10, &RULE), [WorkerId(0); 2]);
+                table.dispatched(key, SessionVerdict::Pinned, WorkerId(count));
+                assert_eq!(table.lookup(key, 11, &RULE)[0], WorkerId(count));
+            }
+            assert_eq!(table.len(), 200);
+            // A walk of the table reaches every shard.
+            table.forget_workers(&[WorkerId(200)]);
+            assert_eq!(table.pins(mixed(200)), None);
+            assert_eq!(table.len(), 199);
+        }
+        // A table no host sized holds the count it always held.
+        assert_eq!(SessionTable::new(0).shards(), SHARDS);
+        assert!(shards_for_this_host().is_power_of_two());
+        assert!(shards_for_this_host() >= 4);
+    }
+
+    /// The keys of a sized table spread over its shards: no shard holds
+    /// many times its share, so two decisions of different keys seldom
+    /// take one mutex.
+    #[test]
+    fn a_sized_tables_keys_spread_over_its_shards() {
+        let table = SessionTable::new(0).with_shards(64);
+        let rule = SessionRule {
+            ttl_micros: None,
+            sweep_micros: 0,
+            ..RULE
+        };
+        let keys = 64 * 100;
+        for count in 1..=keys {
+            table.lookup(mixed(count), 10, &rule);
+        }
+        let held: Vec<usize> = table.shards.iter().map(|s| s.0.lock().len()).collect();
+        assert_eq!(held.iter().sum::<usize>(), keys as usize);
+        let (least, most) = (held.iter().min(), held.iter().max());
+        assert!(
+            least >= Some(&50) && most <= Some(&200),
+            "a share of 100 a shard: {least:?} to {most:?}"
+        );
+    }
+
+    #[test]
+    fn a_shard_stands_on_cache_lines_of_its_own() {
+        assert_eq!(align_of::<Shard>(), 128);
+        assert_eq!(size_of::<Shard>(), 128);
+    }
+
+    /// A host that sweeps on a timer of its own drops the keys past their
+    /// end with no decision's read, and a sweep that is not due walks
+    /// nothing.
+    #[test]
+    fn a_hosts_sweep_drops_the_keys_past_their_end_with_no_read() {
+        let table = SessionTable::new(RULE.sweep_micros).with_shards(8);
+        table.lookup(mixed(1), 0, &RULE);
+        table.dispatched(mixed(1), SessionVerdict::Pinned, WorkerId(1));
+        table.lookup(mixed(2), 900, &RULE);
+        table.dispatched(mixed(2), SessionVerdict::Pinned, WorkerId(2));
+        // The read at 900 swept and set the next pass a sweep interval on:
+        // a host's call ahead of it walks nothing.
+        table.sweep_due(950);
+        assert_eq!(table.len(), 2);
+        // Past the interval and the first key's end.
+        table.sweep_due(1_100);
+        assert_eq!(table.pins(mixed(1)), None);
+        assert_eq!(table.pins(mixed(2)), Some([WorkerId(2), WorkerId(0)]));
     }
 }
