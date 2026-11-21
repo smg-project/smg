@@ -463,8 +463,9 @@ impl LlavaNextProcessor {
         )))
     }
 
-    /// The crop `divide_to_samples` steps by: `crop_size`, else the square
-    /// target.
+    /// The crop a sample ends as, `(height, width)`: `crop_size`, else the
+    /// square target. `divide_to_samples` steps by its height on both sides:
+    /// the reference cuts squares of the crop height.
     fn sample_crop(&self) -> (u32, u32) {
         let target = self.base.target_side();
         self.base.transforms.crop_size.unwrap_or((target, target))
@@ -607,7 +608,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
 
         let filter = self.base.transforms.filter;
         let target_size = self.base.target_side();
-        let crop_size = self.sample_crop();
+        let (sample_side, _) = self.sample_crop();
 
         for image in images {
             let original_size = image.dimensions();
@@ -619,7 +620,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
                 resize_as_reference(image, target_size, target_size, filter).into_owned();
 
             let mut samples = vec![image_original_resize];
-            samples.extend(self.divide_to_samples(&image_padded, crop_size));
+            samples.extend(self.divide_to_samples(&image_padded, (sample_side, sample_side)));
 
             samples_per_image.push(samples);
 
@@ -1098,6 +1099,24 @@ mod tests {
         assert_eq!(result.batch_size(), 1);
         // Should have multiple patches (original + crops) in the second dimension
         assert!(result.encoder_input.shape()[1] > 1);
+    }
+
+    /// The anyres cut is a square of the crop height, whatever the crop
+    /// width: a 672x672 image gives four samples beside the resized
+    /// original, each center-cropped to the crop.
+    #[test]
+    fn the_anyres_cut_is_a_square_of_the_crop_height() {
+        let config = PreProcessorConfig::from_json(
+            r#"{"crop_size": {"height": 336, "width": 224}, "do_center_crop": true,
+                "do_resize": true, "size": {"shortest_edge": 336}}"#,
+        )
+        .unwrap();
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
+
+        let image = create_test_image(672, 672, Rgb([128, 128, 128]));
+        let result = processor.preprocess(&[&image]).unwrap();
+
+        assert_eq!(result.encoder_input.shape(), &[1, 5, 3, 336, 224]);
     }
 
     #[test]
