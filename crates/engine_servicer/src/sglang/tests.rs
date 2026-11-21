@@ -2142,6 +2142,72 @@ async fn video_and_audio_references_reach_the_encoders_over_http_and_are_refused
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A DeepSeek-V4.1 grid (`vit_grid`) beside an image reference, with no
+/// pixels, is not the encoders' input: a language-side worker refuses it as
+/// the caller's error before the dispatch (no call, the scheduler idle), where
+/// it would have gone to the encoders and on to the scheduler without its
+/// grid. The reference alone still dispatches.
+#[tokio::test]
+async fn a_v41_grid_beside_a_reference_is_refused_before_the_dispatch() {
+    let dispatcher = ScriptedDispatcher::new(DispatchAnswer::Encoders);
+    let mut h = harness_with(vision_model(1), dispatcher.configure(1)).await;
+    let mut marked = media_reference_request("grid", 1);
+    marked
+        .mm_inputs
+        .as_mut()
+        .unwrap()
+        .model_specific_tensors
+        .insert(
+            "vit_grid".to_string(),
+            sg::TensorData {
+                dtype: "int64".to_string(),
+                shape: vec![1, 2],
+                data: [1i64, 2]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>()
+                    .into(),
+            },
+        );
+    let status = h
+        .client
+        .generate(marked)
+        .await
+        .expect_err("a grid without its pixels is refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{}", status.message());
+    assert!(dispatcher.calls().is_empty(), "refused before the dispatch");
+    assert_scheduler_idle(&mut h.engine_in).await;
+    // The id is free again, and the reference alone still dispatches.
+    let mut stream = h
+        .client
+        .generate(media_reference_request("grid", 1))
+        .await
+        .expect("a reference alone dispatches")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.need_wait_for_mm_inputs),
+        ("grid", Some(true))
+    );
+    assert_eq!(
+        dispatcher.calls(),
+        vec![("grid".to_string(), image_reference_media())]
+    );
+    wait_until(|| dispatcher.released() == 1).await;
+    send(
+        &mut h.engine_out,
+        &batch("grid", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// On a language-side worker a request's image references go to the
 /// encoders before the request goes to its scheduler rank, one dispatch per
 /// choice under the choice's own id; the scheduler's request carries the

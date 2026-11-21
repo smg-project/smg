@@ -23,6 +23,43 @@ including nearest-grid frame alignment before normalization. This differs from t
 vLLM source-size policy, which remains unchanged. Engine support for the checkpoint's
 quantization and Python processor API is required independently of SMG.
 
+## DeepSeek-V4.1 image batches
+
+The router sends a DeepSeek-V4.1 image batch in the layout vLLM splits: one tensor
+of every image's patches, with each image's grid (`vit_grid`), patch count
+(`patches_per_image`) and token count (`types_per_image`) beside it. SGLang's V4.1
+model encodes one image per item and reads that image's grid as `n_vit_h` /
+`n_vit_w`, so both SGLang servicers cut the batch into one item per image, the
+shape SGLang's own processor builds: the image's patch rows, its placeholder
+range and its grid. A batch is a V4.1 batch when it carries `vit_grid`, which no
+other family sends (GLM-5.3 Flash sends `patches_per_image` too). A V4.1 batch
+is refused with `INVALID_ARGUMENT` before the scheduler when:
+
+- its grids, patch counts, token counts and placeholders disagree (when it
+  sends `types_per_image`, each span must be as long as its count);
+- it carries no images, no patch counts, no pixels or no `im_token_id` (SGLang
+  pads the image positions only when the request names the id);
+- its pixel tensor is not rows of patches, each row with at least one value;
+- it is labelled as a video batch (SGLang's V4.1 model encodes images only);
+- its placeholders are out of prompt order or overlap (SGLang writes the items'
+  embeddings over the placeholders in prompt order);
+- its patch rows or spans do not fit the served model, when that model's
+  geometry is known: each row must hold 3 x `vision_patch_size`^2 values, and
+  each span must be as long as SGLang's V4.1 model makes the image's grid with
+  `vision_downsample_ratio`.
+
+The geometry is those two values in the model config SGLang loads from the
+server arguments, with `--json-model-override-args` applied. The scheduler,
+its model and the Python servicer each load it that way. The scheduler declares
+the two values at its handshake for the Rust servicer and for a router
+connected to it directly. The two geometry checks are skipped when the loaded
+config is not a `deepseek_v41` one or does not hold both values as integers
+above zero, and on the Rust side also when the scheduler's plugin predates the
+two handshake fields, or when the scheduler ranks of a connection do not all
+declare the same two values (a request without a pin is placed on a rank after
+it is checked). The other checks do not need the geometry. Other families keep
+one item per batch.
+
 ## Mixed images and videos
 
 The native worker processor accepts mixed images and videos in either order.
