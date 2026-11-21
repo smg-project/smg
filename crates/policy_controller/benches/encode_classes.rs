@@ -48,8 +48,8 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use smg_policy_controller::{
     engine::{Role, WireModes},
     store::{
-        encoding::EncodeMember, Ask, EncodeClasses, EncodeHandoff, EncodeOffer, EncodePairBuffers,
-        GatewayId, MemoryStore, PairBuffers, WorkerFacts, WorkersStore,
+        Ask, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer, EncodePairBuffers, GatewayId,
+        MemoryStore, PairBuffers, WorkerFacts, WorkersStore,
     },
 };
 

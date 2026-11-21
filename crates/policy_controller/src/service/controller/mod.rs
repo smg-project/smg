@@ -35,13 +35,13 @@
 //! Every socket a listener accepts is set to send at once: a small answer
 //! never waits for the peer's acknowledgement of the write before it.
 
-pub mod admin;
-pub mod config;
+pub(crate) mod admin;
+pub(crate) mod config;
 mod decide;
 mod deciders;
 #[cfg(feature = "discovery")]
 mod discovery;
-pub mod election;
+pub(crate) mod election;
 mod floor;
 mod gateways;
 mod generations;
@@ -51,17 +51,16 @@ mod lifecycle;
 mod membership;
 pub mod metrics;
 mod principal;
-pub mod readiness;
+pub(crate) mod readiness;
 mod replication;
 mod run;
 mod service;
 mod session;
 mod snapshot;
 mod spec_file;
-pub(crate) use crate::document::operator::spec_store;
-pub use crate::document::operator::SpecRejected;
+pub(crate) use crate::document::operator::{spec_store, SpecRejected};
 mod standby;
-pub mod tls;
+pub(crate) mod tls;
 mod watch_workers;
 pub(crate) mod wire;
 mod worker_objects;
@@ -88,7 +87,7 @@ use tracing::{error, info, warn};
 pub(crate) use self::wire::{MAX_FRAME, MAX_REQUEST_ID};
 pub use self::{
     admin::{Version, VERSION},
-    config::{Config, ConfigError, Listener, Scope, Tls},
+    config::{Config, ConfigError, DiscoverySettings, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},

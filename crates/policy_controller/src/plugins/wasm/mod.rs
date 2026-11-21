@@ -185,20 +185,16 @@
 //! reference pulled at validation), and the gRPC plugin service.
 
 mod bindings;
-pub mod config;
+pub(crate) mod config;
 mod plugin;
 mod view;
 
-pub use config::{
-    Abi, BreakerSpec, EventKind, EventSet, Exposure, Failure, HeaderSet, LogLimit, PluginSpec,
-    Reveal,
-};
+pub use config::{Abi, LogLimit, PluginSpec};
 pub use plugin::{Binder, Bound, LoadError, Plugin, Runtime, Stats, World};
 /// The packed form's layout, as the WIT's table names it.
 pub use view::layout;
 
 use crate::plugins::shared;
-pub use crate::plugins::shared::Counters;
 
 /// The plugin's `filter` stage: the adapter every plugin kind shares, over
 /// this kind's [`Bound`].

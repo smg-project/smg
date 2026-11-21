@@ -3314,7 +3314,7 @@ impl MemoryStore {
 impl KvEventSink for MemoryStore {
     /// The batch's events as its collector decoded them: the store applies
     /// them to the index of the worker's model
-    /// ([`index`](crate::store::index)).
+    /// (`index`).
     type Batch = [KvEvent];
 
     fn admit(

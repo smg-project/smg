@@ -133,9 +133,9 @@ mod tests {
     };
 
     use smg_policy_controller::{
-        document::{PolicySpec, SpecError, OVERLOAD_WAITING_REQUESTS},
+        document::{operator::SpecRejected, PolicySpec, SpecError, OVERLOAD_WAITING_REQUESTS},
         engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scorer, Scratch, WorkerId},
-        service::controller::{Config, Controller, Election, Error, Listener, Scope, SpecRejected},
+        service::controller::{Config, Controller, Election, Error, Listener, Scope},
         store::{
             Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers,
             WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,

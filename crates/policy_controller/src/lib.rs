@@ -52,7 +52,7 @@
 //!   events, reservations, sessions, leases), the one-process
 //!   [`store::MemoryStore`] behind them and the contract tests over it. The
 //!   KV events feed the index the store holds for each model
-//!   ([`store::index`]), which no decision reads yet. A
+//!   ([`store`]), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
 //!   structures. The store publishes what a decision reads
 //!   ([`store::StoreSnapshot`]: every pool as whole candidate rows) and builds
@@ -134,13 +134,13 @@
 //! The in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 //!
-//! Import paths follow two rules. The folders `engine`, `document`, `load`,
-//! `tracking` and `stages` list their public items themselves, so an item is
-//! at its folder: `engine::WorkerId`. A folder of named things keeps the name
-//! in the path: a policy (`policies::least_load::LeastLoad`), a plugin kind
-//! (`plugins::wasm::Plugin`). `store`, `worker_host`, `service` and `plugins`
-//! are not under one path yet: some of their items have a second path,
-//! through their file, such as `plugins::wasm::config::PluginSpec`.
+//! Every public item has one import path. A folder lists the public items of
+//! its files, so an item is at its folder: `engine::WorkerId`,
+//! `store::MemoryStore`. A module that is a named thing keeps its name in the
+//! path: a policy (`policies::least_load::LeastLoad`), a plugin kind
+//! (`plugins::wasm::Plugin`), a part of the service
+//! (`service::controller::Config`). So does a file whose names read only
+//! with its own: `store::pairing::key`, `service::controller::metrics::STATE`.
 //!
 //! [`RequestFacts`]: engine::RequestFacts
 //! [`Candidate`]: engine::Candidate

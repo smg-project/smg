@@ -117,7 +117,7 @@ mod loads;
 mod membership_writer;
 mod object;
 mod objects;
-pub mod steps;
+pub(crate) mod steps;
 
 pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
 pub use found::facts;

@@ -13,8 +13,8 @@ use smg_policy_controller::{
     document::{operator::Turn, PolicySpec},
     engine::WireModes,
     store::{
-        EncodeOffer, GatewayId, Overload, PairingDescriptor, Reachability, Registrant, WorkerFacts,
-        WorkersStore,
+        pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Reachability, Registrant,
+        WorkerFacts, WorkersStore,
     },
 };
 use tower::ServiceExt;

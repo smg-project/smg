@@ -149,7 +149,7 @@ pub struct WorkerFacts {
     /// the default states none. The store derives the encode classes from
     /// it, with the engine kind as the runtime, where a membership write
     /// moves a member or an offer and where a generation moves the pairing
-    /// mode ([`encoding`](super::encoding)). The door drops a blank
+    /// mode (`encoding`). The door drops a blank
     /// connector and reads its name past its blanks.
     pub encode: EncodeOffer,
     /// The worker takes images, as its registration states: an encoder

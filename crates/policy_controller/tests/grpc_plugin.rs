@@ -47,15 +47,14 @@ use smg_policy_controller::{
     },
     plugins::{
         grpc::{
-            Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
-            GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls,
-            Transport,
+            Bound, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, LoadError, Plugin, Runtime,
+            Tls, Transport,
         },
-        shared::OpenDecisions,
+        shared::{BreakerSpec, Exposure, Failure, HeaderSet, OpenDecisions, Reveal},
     },
     service::proto,
     stages::{Best, Healthy, LeastRequests, Lifecycle},
-    tracking::{Lease, Membership, ReleaseReason, Side, Signal},
+    tracking::{EventKind, EventSet, Lease, Membership, ReleaseReason, Side, Signal},
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},

@@ -631,7 +631,7 @@ mod tests {
         use crate::{
             engine::view::WorkerId,
             store::{
-                EncodeOffer, GatewayId, Overload, PairingDescriptor, Signals, WorkerFacts,
+                pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Signals, WorkerFacts,
                 WorkerStatus,
             },
         };

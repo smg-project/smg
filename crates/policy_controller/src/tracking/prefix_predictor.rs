@@ -1,7 +1,7 @@
 //! The sent-prefix predictor (design 4.4): which workers each prefix of a
 //! model's requests was sent to. A worker the store hears no cache events
 //! from is remembered by what it was sent, and a decision reads that as it reads
-//! the holders of the event-fed index ([`crate::store::index`]): the
+//! the holders of the event-fed index ([`crate::store`]): the
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
 //!

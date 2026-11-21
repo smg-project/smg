@@ -8,8 +8,8 @@ use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, PolicySpec},
     engine::{LoadRow, Role, WireModes, TEXT_BYTES_PER_TOKEN},
     store::{
-        GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MemoryStore, PairingDescriptor,
-        WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        pairing::PairingDescriptor, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource,
+        MemoryStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
 };
 use smg_worker::identity::basic::{ConnectionMode, MORIIO_CONNECTOR};

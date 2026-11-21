@@ -33,8 +33,8 @@ use smg_policy_controller::{
     },
     stages::Lifecycle,
     store::{
-        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
-        PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        pairing::PairingDescriptor, Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore,
+        PairBuffers, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     tracking::{DecisionGuard, Lease, Outcome, Side, TransportClass},
 };

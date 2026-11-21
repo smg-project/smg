@@ -12,10 +12,10 @@ use super::{found::paired, kv_feed::asks_events, RowRevision};
 use crate::{
     engine::view::WorkerId,
     store::{
-        membership::{self, NotMaker, Past},
+        membership::{self, Laid, NotMaker, Past},
         pairing::PairingDescriptor,
-        HealthSink, Laid, MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch,
-        WorkerRow, WorkerStatus, WorkersStore,
+        HealthSink, MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
 };
 

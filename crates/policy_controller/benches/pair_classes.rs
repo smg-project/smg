@@ -61,9 +61,10 @@ use smg_policy_controller::{
     document::{AppliedSpec, Pairing, PolicySpec},
     engine::{Constraints, LoadRow, RequestFacts, Role, Scratch, SignalSource, WireModes},
     store::{
-        identity, pairing::Member, Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers,
-        PairClasses, PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        identity,
+        pairing::{Member, PairClasses, PairingDescriptor},
+        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, ViewBuffers, WorkerFacts,
+        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 

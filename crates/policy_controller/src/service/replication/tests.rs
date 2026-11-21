@@ -19,11 +19,11 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::view::{Health, LoadRow, Role, WireModes, WorkerId},
     store::{
-        identity, Ask, BatchFacts, BatchOutcome, ContentHash, Cut, GatewayId, HealthSink, Journal,
-        Kinds, KvEvent, KvEventSink, LeasesStore, LoadSample, LoadSink, LoadSource,
-        MembershipChange, MembershipTail, MemoryStore, OutsideLists, PairingDescriptor, Position,
-        SequenceHash, Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        identity, pairing::PairingDescriptor, Ask, BatchFacts, BatchOutcome, ContentHash, Cut,
+        GatewayId, HealthSink, Journal, Kinds, KvEvent, KvEventSink, LeasesStore, LoadSample,
+        LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, OutsideLists,
+        Position, SequenceHash, Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus, WorkersStore,
     },
     tracking::lease::TransportClass,
 };

@@ -1041,7 +1041,7 @@ mod tests {
     use crate::{
         document::spec::MAX_BLOCK_HASHES,
         engine::view::{Header, MediaCounts, NamedAffinity, NamedHolder, WorkerId},
-        plugins::wasm::config::HeaderSet,
+        plugins::shared::config::HeaderSet,
     };
 
     fn candidate_row() -> Candidate {

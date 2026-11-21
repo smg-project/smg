@@ -43,9 +43,9 @@ use smg_policy_controller::{
     },
     stages::{Lifecycle, StageRegistry},
     store::{
-        Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
-        LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
-        WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+        pairing::PairingDescriptor, Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink,
+        LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, PairBuffers, SessionsStore,
+        WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
     tracking::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };

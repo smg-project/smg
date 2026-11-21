@@ -51,10 +51,10 @@ use smg_policy_controller::{
     },
     plugins::{
         shared::OpenDecisions,
-        wasm::{EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+        wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
     },
     stages::{Best, Healthy, LeastRequests, Lifecycle},
-    tracking::{Lease, Membership, Side},
+    tracking::{EventSet, Lease, Membership, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

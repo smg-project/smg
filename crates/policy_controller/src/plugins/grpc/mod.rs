@@ -145,21 +145,17 @@
 //! stream carries many decisions at once (its window holds one decision's
 //! frames today).
 
-pub mod config;
+pub(crate) mod config;
 mod plugin;
 mod runtime;
 mod unit;
 mod view;
 
-pub use config::{
-    BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls,
-    Transport,
-};
+pub use config::{GrpcPluginSpec, Tls, Transport};
 pub use plugin::{Binder, Bound, LoadError, Plugin, Stats};
 pub use runtime::Runtime;
 
 use crate::plugins::shared;
-pub use crate::plugins::shared::Counters;
 
 /// The plugin's stages over its bound decision: the stage adapters every
 /// plugin kind shares ([`crate::plugins::shared`]), over [`Bound`].

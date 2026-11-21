@@ -28,9 +28,11 @@ use crate::{
     },
     stages::{lifecycle::Lifecycle, scorers::ResidentWork},
     store::{
-        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeaderBits, LeasesStore,
-        LoadSink, LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor,
-        Reachability, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        loads::LoadSample,
+        pairing::{PairingDescriptor, Refusal},
+        GatewayId, HealthSink, LeaderBits, LeasesStore, LoadSink, LoadSource, MembershipTail,
+        MemoryStore, Overload, Reachability, VetoWrite, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     tracking::{
         in_flight::WorkerSlot,

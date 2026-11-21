@@ -21,14 +21,11 @@ use smg_policy_controller::{
         RequestFacts, Scratch, ShedReason, Weighted, WorkerId,
     },
     plugins::{
-        shared::OpenDecisions,
-        wasm::{
-            EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
-            WasmPicker, WasmScorer, World,
-        },
+        shared::{Failure, OpenDecisions},
+        wasm::{LoadError, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer, World},
     },
     stages::Lifecycle,
-    tracking::{Lease, Outcome, ReleaseReason, Side, TransportClass},
+    tracking::{EventKind, EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 /// What the example's build line writes.

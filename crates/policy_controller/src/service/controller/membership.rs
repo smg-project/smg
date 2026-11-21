@@ -83,8 +83,8 @@ use crate::{
         replication::Log,
     },
     store::{
-        membership::{self, life},
-        HealthSink, Kinds, Laid, MemoryStore, Position, Registrant, WorkerRow, WorkerStatus,
+        membership::{self, life, Laid},
+        HealthSink, Kinds, MemoryStore, Position, Registrant, WorkerRow, WorkerStatus,
         WorkersStore,
     },
 };
@@ -2456,7 +2456,7 @@ pub(crate) mod tests {
     #[test]
     fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written() {
         use super::super::worker_wire;
-        use crate::store::{EncodeHandoff, EncodeOffer, PairingDescriptor};
+        use crate::store::{pairing::PairingDescriptor, EncodeHandoff, EncodeOffer};
         type State = fn(&mut WorkerFacts);
 
         let (store, door) = door();

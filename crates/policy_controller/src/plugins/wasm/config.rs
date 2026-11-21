@@ -6,8 +6,9 @@
 use std::fmt;
 
 use crate::document::spec::Needs;
-pub use crate::plugins::shared::config::{
-    BreakerSpec, EventKind, EventSet, Exposure, Failure, FrameBudget, HeaderSet, Reveal,
+pub(crate) use crate::{
+    plugins::shared::config::{BreakerSpec, EventSet, Exposure, Failure, FrameBudget, Reveal},
+    tracking::lease::EventKind,
 };
 
 /// The `smg:policy` package versions the host accepts: one major, the

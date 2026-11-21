@@ -2,13 +2,13 @@
 //! spec's `plugins` section (a row naming an address beside a module's)
 //! deserializes into these; until that row lands a host builds them
 //! directly. The parts a row has whatever its kind are the shared ones of
-//! [`crate::plugins::shared::config`], re-exported here.
+//! [`crate::plugins::shared`], re-exported here.
 
 use std::{fmt, path::PathBuf};
 
 use crate::document::spec::Needs;
-pub use crate::plugins::shared::config::{
-    BreakerSpec, EventKind, EventSet, Exposure, Failure, FrameBudget, HeaderSet, Reveal,
+pub(crate) use crate::plugins::shared::config::{
+    BreakerSpec, EventSet, Exposure, Failure, FrameBudget,
 };
 
 /// The client side of mutual TLS: the authority that signed the plugin's

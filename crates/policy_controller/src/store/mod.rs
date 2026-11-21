@@ -49,7 +49,7 @@
 //!   behind [`KvEventSink::Batch`], with the header facts the cursor reads
 //!   beside it. [`MemoryStore`] takes a batch as the events its collector
 //!   decoded ([`KvEvent`]) and applies them to the index of the worker's
-//!   model ([`index`]).
+//!   model (`index`).
 //!
 //! [`MemoryStore`] is the one-process store behind every trait: the
 //! controller's own store once its drivers move in, and the double the
@@ -58,33 +58,33 @@
 //!
 //! A decision reads none of the tables behind those traits. The store
 //! derives a [`StoreSnapshot`] from them (every pool as whole candidate rows)
-//! and publishes it by pointer swap: [`snapshot`] holds the read side and the
+//! and publishes it by pointer swap: `snapshot` holds the read side and the
 //! build of one decision's view. Every world is published under the generation
 //! the store holds, which [`MemoryStore::apply`] alone replaces: a decision
 //! reads its rows and its engine in one load.
 //!
 //! [`LoadRow`]: crate::engine::view::LoadRow
 
-pub mod encoding;
-pub mod health;
-pub mod index;
-pub mod journal;
-pub mod kv_events;
-pub mod leases;
-pub mod loads;
+pub(crate) mod encoding;
+pub(crate) mod health;
+pub(crate) mod index;
+pub(crate) mod journal;
+pub(crate) mod kv_events;
+pub(crate) mod leases;
+pub(crate) mod loads;
 pub mod membership;
-pub mod memory;
+pub(crate) mod memory;
 pub mod pairing;
-pub mod reservations;
-pub mod sessions;
-pub mod signals;
-pub mod snapshot;
-pub mod workers;
+pub(crate) mod reservations;
+pub(crate) mod sessions;
+pub(crate) mod signals;
+pub(crate) mod snapshot;
+pub(crate) mod workers;
 
 #[cfg(test)]
 mod tests;
 
-pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
+pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, LeaderBits, VetoWrite};
 pub use index::{
     ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, Named, SequenceHash,
@@ -93,17 +93,15 @@ pub use index::{
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
-    SnapshotChunk,
+    SnapshotChunk, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,
 };
 pub use leases::{
     DecodeMark, DecodeRefused, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState,
     LeasesStore, Picked, Said, Sides,
 };
-pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use membership::{Laid, NotMaker};
+pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
-pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use signals::{SignalSink, SignalWriteOutcome};

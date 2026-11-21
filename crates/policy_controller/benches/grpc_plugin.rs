@@ -40,14 +40,11 @@ use smg_policy_controller::{
         Scorer, Scratch, Target, Weighted,
     },
     plugins::{
-        grpc::{
-            BreakerSpec, EventSet, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin,
-            Runtime, Transport,
-        },
-        shared::OpenDecisions,
+        grpc::{GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin, Runtime, Transport},
+        shared::{BreakerSpec, OpenDecisions},
     },
     stages::{Best, Healthy, LeastRequests, Lifecycle},
-    tracking::{Lease, Side},
+    tracking::{EventSet, Lease, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
