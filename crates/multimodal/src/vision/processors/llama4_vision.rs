@@ -771,4 +771,42 @@ mod tests {
             }
         }
     }
+
+    /// `tile_blocks` against the canvas read pixel by pixel: the image's byte
+    /// inside it, black (0) beyond it, no stale byte in a full tile behind a
+    /// partial one (no pixel byte here is 0).
+    #[test]
+    fn the_tile_blocks_are_the_canvas_pixel_by_pixel() {
+        let (width, height, tile, (rows, columns)) = (7, 7, 3, (3, 4));
+        let rgb: Vec<u8> = (1..=251).cycle().take(width * height * 3).collect();
+        let mut got = Vec::new();
+        tile_blocks(
+            &rgb,
+            (width, height),
+            (rows, columns),
+            tile,
+            |channel, bytes| {
+                got.push((channel, bytes.to_vec()));
+            },
+        );
+        let mut want = Vec::new();
+        for tile_y in 0..rows {
+            for tile_x in 0..columns {
+                for channel in 0..3 {
+                    let block: Vec<u8> = (0..tile * tile)
+                        .map(|i| (tile_x * tile + i % tile, tile_y * tile + i / tile))
+                        .map(|(x, y)| {
+                            if x < width && y < height {
+                                rgb[(y * width + x) * 3 + channel]
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    want.push((channel, block));
+                }
+            }
+        }
+        assert_eq!(got, want);
+    }
 }
