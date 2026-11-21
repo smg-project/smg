@@ -138,6 +138,20 @@ pub(crate) enum StartError {
         model: String,
         phase: &'static str,
     },
+    /// The document its operator supplied states a rule that nothing in
+    /// this process would run ([`rule_not_run`]): the start names the
+    /// binding, by its place in the document and its model pattern, and
+    /// the field.
+    #[error(
+        "the policy document's binding {at} (`{model}`) states `{field}`, \
+         which is not run in this process yet: {because}"
+    )]
+    RuleNotRun {
+        at: usize,
+        model: String,
+        field: &'static str,
+        because: &'static str,
+    },
 }
 
 /// What a start in this process leaves it ([`start_in_process`]): the
@@ -236,7 +250,8 @@ pub(crate) fn start_with(
 /// picks the place's profile by itself, and by the classic policy of the
 /// setting elsewhere. A document its operator supplied has no setting
 /// behind a place, so a place of it the engine does not pick by itself
-/// is refused here ([`StartError::NotAlone`]).
+/// is refused here ([`StartError::NotAlone`]), and so is a rule of a
+/// binding that nothing in this process would run ([`rule_not_run`]).
 pub(crate) fn start_in_process(
     config: &RouterConfig,
     stages: Option<Catalog>,
@@ -269,6 +284,7 @@ pub(crate) fn start_in_process(
                 phase: place.phase.name(),
             });
         }
+        rule_not_run(config, &document)?;
     }
     info!(
         "The policy controller is picked for this gateway and runs in this process, over the gateway's own worker data: \
@@ -281,6 +297,62 @@ pub(crate) fn start_in_process(
         applied: SystemTime::now(),
         stages: Arc::new(stages),
     }))
+}
+
+/// Refuses a supplied `document` by its first rule that nothing in this
+/// process would run.
+///
+/// The engine is asked for picks, and the gateway's own placement holds
+/// every other rule of a request. It keeps sessions, reads a request's
+/// routing key and judges a worker's overload as the routing settings say.
+/// It runs no shadow profile. Its registry keeps one policy for each side
+/// of a pair, for every model. So a binding that states `overload`,
+/// `routing_key` or `sessions` otherwise than the settings' own document
+/// does, a binding that names a `shadow`, a pair binding that names some
+/// models and a second pair binding would each start with a rule no code
+/// runs, and the gateway would run the settings' value in silence.
+fn rule_not_run(config: &RouterConfig, document: &PolicySpec) -> Result<(), StartError> {
+    use smg_policy_controller::document::{BindingSpec, PlanName};
+
+    const BY_SETTINGS: &str = "the gateway's placement runs the routing settings' own";
+    const ONE_A_SIDE: &str = "one policy places each side of a pair, for every model";
+    // What the routing settings say of a binding's own rules: the one
+    // binding of their document.
+    let settings = config.policy_document()?;
+    let run = settings.bindings.first().cloned().unwrap_or_default();
+    let mut pair_planned = false;
+    for (at, binding) in document.bindings.iter().enumerate() {
+        let refused = |field, because| StartError::RuleNotRun {
+            at: at + 1,
+            model: binding.matcher.model.clone(),
+            field,
+            because,
+        };
+        // An absent overload block is the block's defaults.
+        let overload = |binding: &BindingSpec| binding.overload.clone().unwrap_or_default();
+        if overload(binding) != overload(&run) {
+            return Err(refused("overload", BY_SETTINGS));
+        }
+        if binding.routing_key != run.routing_key {
+            return Err(refused("routing_key", BY_SETTINGS));
+        }
+        if binding.sessions != run.sessions {
+            return Err(refused("sessions", BY_SETTINGS));
+        }
+        if binding.shadow.is_some() {
+            return Err(refused("shadow", "no shadow profile runs here"));
+        }
+        if matches!(binding.plan, Some(PlanName::PdPair | PlanName::Epd)) {
+            if binding.matcher.model != "*" {
+                return Err(refused("match.model", ONE_A_SIDE));
+            }
+            if pair_planned {
+                return Err(refused("plan", "an earlier binding plans the pair"));
+            }
+            pair_planned = true;
+        }
+    }
+    Ok(())
 }
 
 /// The document a start runs, and the stages it is validated over: the
@@ -404,5 +476,7 @@ pub(crate) fn undecided_without(
     undecided(context).filter(|_| context.follows_controller() || !planned())
 }
 
+#[cfg(test)]
+mod start_in_process_tests;
 #[cfg(test)]
 mod tests;
