@@ -15,7 +15,7 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
     document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec},
-    engine::PolicyEngine as OwnEngine,
+    engine::{worker_id, PolicyEngine as OwnEngine},
     policies::power_of_two::PowerOfTwoMetric,
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
@@ -1059,6 +1059,23 @@ fn own_router(preset: &str, urls: &[&str]) -> Case<Router> {
     // its one list here.
     assert!(policy_engine.fill_rings(MODEL));
     Ok(router(registry, Some(policy_engine)))
+}
+
+/// A retry names the worker of a failed attempt as tried where its route
+/// kept no placement of it. Under the engine of this process a place owes
+/// nothing and is its worker alone to its route: the worker is named by the
+/// id a whole decision names it by. The classic line names no row.
+#[test]
+fn a_retry_names_the_worker_of_a_placement_its_route_did_not_keep() -> Case {
+    let hosted = own_router("round_robin", &["http://127.0.0.1:1"])?;
+    let worker = hosted.worker_registry.get_all().pop().ok_or("no worker")?;
+    assert_eq!(
+        hosted.tried_row(&worker, None),
+        Some(worker_id(worker.as_ref()))
+    );
+    let classic = router(Arc::clone(&hosted.worker_registry), None);
+    assert_eq!(classic.tried_row(&worker, None), None);
+    Ok(())
 }
 
 /// `request` put to `router`'s streamed path on the generate route, with

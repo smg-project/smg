@@ -536,6 +536,36 @@ mod tests {
         assert_eq!(asks.made.get(), 1);
     }
 
+    /// The entry reads its host's clock where a decision is dated and
+    /// nowhere else: a place reads none, and a retry's whole pass, a profile
+    /// that scores and a place noted for a stage that takes a word read it
+    /// once each.
+    #[test]
+    fn a_place_reads_no_clock_and_a_dated_decision_reads_it_once() {
+        let list = pool(4);
+        let tried = [worker_id(list[0].as_ref())];
+        let read = |engine: &PolicyEngine, retried: bool| {
+            let members = engine.pool_members(&list);
+            let mut stated = request();
+            if retried {
+                stated.facts.tried = &tried;
+            }
+            let asks = Asks::of(stated, Some(&members));
+            let reads = Cell::new(0_u32);
+            let decided = engine.decide_at(&asks, || {
+                reads.set(reads.get() + 1);
+                Instant::now()
+            });
+            let place = matches!(decided.expect("an answer"), Decided::Alone(_));
+            (place, reads.get())
+        };
+        assert_eq!(read(&preset("round_robin"), false), (true, 0));
+        assert_eq!(read(&preset("round_robin"), true), (false, 1));
+        assert_eq!(read(&preset("least_load"), false), (false, 1));
+        let (noting, _) = hearing_as(false, true, EventSet::LEASE);
+        assert_eq!(read(&noting, false), (false, 1));
+    }
+
     /// A place whose profile scores is never picked ahead of its request:
     /// the request is made for every decision, plain or not.
     #[test]

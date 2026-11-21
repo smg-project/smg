@@ -2,7 +2,16 @@
 //! decided over the list the registry publishes for its route's pool, and a
 //! target is the worker at its place in that list.
 
-use std::{cell::Cell, collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    thread,
+    time::Instant,
+};
 
 use axum::http::{HeaderMap, HeaderValue};
 use openai_protocol::{
@@ -23,7 +32,7 @@ use smg_worker::{
     test_support::no_health_check,
 };
 
-use super::{mark, Ask, End, Made, PolicyEngine, Prompt, Unplaced, Workers};
+use super::{mark, Ask, End, Made, PolicyEngine, Prompt, Sent, Unplaced, Workers};
 use crate::routers::{
     common::snapshot::{RoutingPool, WorkerRegistry},
     grpc::backend_client::BasicWorkerBuilder,
@@ -246,6 +255,71 @@ async fn a_place_holds_no_lease_and_names_its_worker_where_asked() {
     assert_eq!(again.id(), worker_id(again.worker().as_ref()));
     assert_ne!(again.id(), placed.id());
     assert_eq!(policy_engine.faults(), 0);
+}
+
+/// A place reads no clock, and it is its worker and nothing else to its
+/// route: nothing of it is kept to its answer's end, and a retry names the
+/// worker by the id its placement would. A retry's whole decision is dated
+/// by one read of the clock and owes nothing either. Under least load, which
+/// takes the dispatch, a placement is dated and kept.
+#[tokio::test]
+async fn a_place_reads_no_clock_and_its_route_keeps_its_worker_alone() {
+    let reads = AtomicU32::new(0);
+    let clock = || {
+        reads.fetch_add(1, Ordering::Relaxed);
+        Instant::now()
+    };
+    let (policy_engine, _workers) = own("round_robin", 3);
+    let id = mark();
+    let ask = || Ask {
+        pool: Some(RoutingPool::HttpRegular),
+        prompt_tokens: 9,
+        ..Ask::of(&id, MODEL)
+    };
+    let placed = policy_engine.place_at(&ask(), |_| true, &clock).await;
+    let placed = placed.expect("a worker");
+    assert_eq!(reads.load(Ordering::Relaxed), 0, "a place is dated nowhere");
+    let row = placed.id();
+    let (worker, kept) = Sent::of(placed);
+    assert!(kept.is_none(), "nothing is owed of a place");
+    assert_eq!(policy_engine.row_of(worker.as_ref()), Some(row));
+
+    let tried = [row];
+    let retry = Ask {
+        tried: &tried,
+        ..ask()
+    };
+    let again = policy_engine.place_at(&retry, |_| true, &clock).await;
+    let again = again.expect("another worker");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "one read dates a decision"
+    );
+    let row = again.id();
+    let (worker, kept) = Sent::of(again);
+    assert!(kept.is_none(), "no stage takes a word of it");
+    assert_eq!(policy_engine.row_of(worker.as_ref()), Some(row));
+    assert_ne!(row, tried[0]);
+
+    let (policy_engine, _workers) = own("least_load", 3);
+    let placed = policy_engine.place_at(&ask(), |_| true, &clock).await;
+    let placed = placed.expect("a worker");
+    assert_eq!(reads.load(Ordering::Relaxed), 2);
+    let (worker, kept) = Sent::of(placed);
+    let kept = kept.expect("a placement that owes a word is kept");
+    assert!(Arc::ptr_eq(&worker, kept.worker()));
+}
+
+/// An ask's number is its thread's own count under the thread's number: a
+/// thread's asks count up, and two threads' asks share no number.
+#[test]
+fn an_asks_number_is_its_threads_own() {
+    let here = [mark(), mark()].map(u64::from_be_bytes);
+    assert_eq!(here[1], here[0] + 1);
+    let there = thread::spawn(|| u64::from_be_bytes(mark()));
+    let there = there.join().expect("the thread ends");
+    assert_ne!(there >> 40, here[0] >> 40);
 }
 
 /// Under a document a stage of which takes a word of a request, as least

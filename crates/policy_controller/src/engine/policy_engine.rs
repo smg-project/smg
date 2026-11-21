@@ -61,7 +61,9 @@ use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 use self::overlap::{Affinity, PoolAffinity};
 use super::{
     decision::ShadowKind,
-    decision_engine::{Decided, DecisionEngine, HeldDecision, RequestMaker, WorkerLists},
+    decision_engine::{
+        AlonePick, Decided, DecisionEngine, HeldDecision, RequestMaker, WorkerLists,
+    },
     framework::{
         release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
     },
@@ -497,6 +499,84 @@ impl PolicyEngine {
             }
         }
     }
+
+    /// The one entry ([`DecisionEngine::decide_under`]) for a host that
+    /// hands a clock and no instant: `clock` is read once, where the
+    /// decision is dated. A place ([`Decided::Alone`]) dates nothing, so it
+    /// is answered with no read of a clock, and with no copy of a decision:
+    /// the catch hands the place back, and a whole decision is written
+    /// beside it.
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionRefused`]: the engine made no decision for the request.
+    pub fn decide_at(
+        &self,
+        maker: &impl RequestMaker,
+        clock: impl FnOnce() -> Instant,
+    ) -> Result<Decided, DecisionRefused> {
+        let mut whole = None;
+        let alone = self.caught(|| self.placed_or(maker, clock, &mut whole))?;
+        match (alone, whole) {
+            (Some(pick), _) => Ok(Decided::Alone(pick)),
+            (None, Some((decided, later))) => Ok(Decided::Whole(decided, later)),
+            // The pass writes its decision ahead of every answer but a
+            // place.
+            (None, None) => Err(DecisionRefused::Faulted),
+        }
+    }
+
+    /// The decision's pass: the place it answers, or its whole decision
+    /// written into `whole` with whether the request made stated the later
+    /// decode.
+    fn placed_or(
+        &self,
+        maker: &impl RequestMaker,
+        clock: impl FnOnce() -> Instant,
+        whole: &mut Option<(DecideOutcome, bool)>,
+    ) -> Result<Option<AlonePick>, DecisionRefused> {
+        // A plain request of a place one pick decides is decided ahead
+        // of its making: the pick reads no fact of it.
+        let mut picked = None;
+        if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
+            if let Some(pick) = single::alone(self, maker.model(), plain, members) {
+                // No stage takes a word of the request: the place is
+                // the whole answer.
+                if !self.hears.intersects(EventSet::LEASE) {
+                    return Ok(Some(pick));
+                }
+                picked = Some((pick, members, plain));
+            }
+        }
+        let now = clock();
+        if let Some((pick, members, plain)) = picked {
+            if let Some(decided) = single::noted(self, pick, members, plain, now) {
+                *whole = Some((decided, false));
+                return Ok(None);
+            }
+        }
+        let mut request = maker.make(&self.spec);
+        let later = request.constraints.decode_later;
+        let decided = match (request.facts.phase, maker.workers()) {
+            (Phase::Single, WorkerLists::Single(members)) => {
+                single::decide(self, &mut request, members, maker.loads(), now)
+            }
+            // A pair is decided at its prefill, over its host's two
+            // lists.
+            (Phase::Prefill, WorkerLists::Pair(lists)) => {
+                let decided = pair::decided(self, &lists, &mut request, None, now);
+                *whole = Some((decided, later));
+                return Ok(None);
+            }
+            // A request that hands no list of its own is decided over
+            // no worker.
+            (Phase::Single | Phase::Prefill, _) => single::over_none(self, &request),
+            (Phase::Decode | Phase::Encode, _) => return Err(DecisionRefused::PairSide),
+        };
+        let decided = single::issued(self, decided, &request, now);
+        *whole = Some((decided, later));
+        Ok(None)
+    }
 }
 
 /// The engine of a gateway's own process, asked for whole decisions.
@@ -523,41 +603,7 @@ impl DecisionEngine for PolicyEngine {
         maker: &impl RequestMaker,
         now: Instant,
     ) -> Result<Decided, DecisionRefused> {
-        self.caught(|| {
-            // A plain request of a place one pick decides is decided ahead
-            // of its making: the pick reads no fact of it.
-            if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
-                if let Some(pick) = single::alone(self, maker.model(), plain, members) {
-                    // No stage takes a word of the request: the place is
-                    // the whole answer.
-                    if !self.hears.intersects(EventSet::LEASE) {
-                        return Ok(Decided::Alone(pick));
-                    }
-                    if let Some(decided) = single::noted(self, pick, members, plain, now) {
-                        return Ok(Decided::Whole(decided, false));
-                    }
-                }
-            }
-            let mut request = maker.make(&self.spec);
-            let later = request.constraints.decode_later;
-            let decided = match (request.facts.phase, maker.workers()) {
-                (Phase::Single, WorkerLists::Single(members)) => {
-                    single::decide(self, &mut request, members, maker.loads(), now)
-                }
-                // A pair is decided at its prefill, over its host's two
-                // lists.
-                (Phase::Prefill, WorkerLists::Pair(lists)) => {
-                    let decided = pair::decided(self, &lists, &mut request, None, now);
-                    return Ok(Decided::Whole(decided, later));
-                }
-                // A request that hands no list of its own is decided over
-                // no worker.
-                (Phase::Single | Phase::Prefill, _) => single::over_none(self, &request),
-                (Phase::Decode | Phase::Encode, _) => return Err(DecisionRefused::PairSide),
-            };
-            let decided = single::issued(self, decided, &request, now);
-            Ok(Decided::Whole(decided, later))
-        })
+        self.decide_at(maker, move || now)
     }
 
     // The guard asks only where the pair's prefill is held and its decode

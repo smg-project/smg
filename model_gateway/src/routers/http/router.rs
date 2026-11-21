@@ -748,7 +748,7 @@ impl Router {
                 (worker, None)
             }
             Some(policy_engine) => match self.place_attempt(policy_engine, attempt).await {
-                Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
+                Ok(placed) => Sent::of(placed),
                 Err(refusal) => return refusal,
             },
         };
@@ -782,7 +782,7 @@ impl Router {
 
         let response =
             self.account_attempt_outcome(attempt, &worker, response, head_success_recorded, || {
-                placed.as_ref().map(|sent| sent.id())
+                self.tried_row(&worker, placed.as_ref())
             });
 
         match placed {
@@ -792,6 +792,17 @@ impl Router {
                 placed.ended_by(&response, Instant::now());
                 response
             }
+        }
+    }
+
+    /// The row a retry names an attempt's worker by, as tried. A placement
+    /// the route kept names it. One that owed its engine nothing was not
+    /// kept ([`Sent::of`]): the policy engine names its worker
+    /// ([`PolicyEngine::row_of`]). The classic line names no row.
+    fn tried_row(&self, worker: &Arc<dyn Worker>, placed: Option<&Sent>) -> Option<WorkerId> {
+        match placed {
+            Some(sent) => Some(sent.id()),
+            None => self.policy_engine.as_ref()?.row_of(worker.as_ref()),
         }
     }
 
@@ -888,10 +899,10 @@ impl Router {
         };
         let ledger = attempt.ledger;
         let placed = policy_engine
-            .place_where(
+            .place_at(
                 &ask,
                 |worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker),
-                Instant::now(),
+                Instant::now,
             )
             .await;
         placed.map_err(|unplaced| {
@@ -1348,7 +1359,7 @@ impl Router {
                 .place_transcription(policy_engine, headers, body.rid(), model_id, is_stream)
                 .await
             {
-                Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
+                Ok(placed) => Sent::of(placed),
                 Err(refusal) => {
                     outcome.pre_send_error(&refusal);
                     return refusal;
@@ -1452,10 +1463,10 @@ impl Router {
             ..Ask::of(&id, model_id)
         };
         policy_engine
-            .place_where(
+            .place_at(
                 &ask,
                 |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
-                Instant::now(),
+                Instant::now,
             )
             .await
             .map_err(|unplaced| {
@@ -2605,7 +2616,7 @@ impl Router {
                     .place_streamed(policy_engine, req.headers(), hinted_tokens.as_deref())
                     .await;
                 match placed {
-                    Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
+                    Ok(placed) => Sent::of(placed),
                     Err(Unstreamed::Refused(refusal)) => return Ok(*refusal),
                     Err(Unstreamed::Buffered(reason)) => {
                         Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
@@ -2770,10 +2781,10 @@ impl Router {
             ..Ask::of(&id, &model)
         };
         let placed = policy_engine
-            .place_where(
+            .place_at(
                 &ask,
                 |worker| RoutingPool::HttpRegular.matches(worker),
-                Instant::now(),
+                Instant::now,
             )
             .await;
         placed.map_err(|_| Unstreamed::Buffered(REASON_NO_AVAILABLE_WORKER))
