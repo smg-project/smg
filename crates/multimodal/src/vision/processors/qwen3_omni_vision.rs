@@ -129,6 +129,11 @@ impl Qwen3OmniVisionProcessor {
         self
     }
 
+    /// See [`QwenVLProcessorBase::validate`].
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        self.inner.validate()
+    }
+
     /// Build a processor for a resolved image or video configuration.
     pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
         if modality == Modality::Video && !config.is_image_only_processor_type() {
