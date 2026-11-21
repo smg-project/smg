@@ -677,7 +677,7 @@ mod tests {
         // parser, which has read the thought and its close, the block comes at once, the same tag
         // as with the thought closed; from the first token, the thought's text, which writes none
         // of the table's terminals nor the separator, ends at `</think>` and the block follows;
-        // where the engine does not say, free text that may close the thought comes first.
+        // where the engine does not say, that thought or nothing of it comes first.
         let closed = payload(
             &[forecast()],
             forced(false, true, GrammarStart::AfterReasoning),
@@ -707,10 +707,7 @@ mod tests {
             payload(&[forecast()], forced(true, true, GrammarStart::Unknown)).expect("a tag");
         assert_eq!(
             unknown["format"]["elements"][0],
-            value!({"type": "any_text", "excludes": [
-                "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>", "<｜tool▁call▁begin｜>",
-                "<｜tool▁call▁end｜>",
-            ]})
+            value!({"type": "optional", "content": first["format"]["elements"][0].clone()})
         );
         assert_eq!(unknown["format"]["elements"][1], closed["format"]);
     }

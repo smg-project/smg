@@ -393,14 +393,17 @@ mod tests {
             .payload();
         assert_eq!(payload["format"]["type"], "sequence");
         let prefix = &payload["format"]["elements"][0];
-        assert_eq!(prefix["type"], "any_text");
-        assert!(
-            prefix.get("end").is_none(),
-            "nothing owed at the prefix's end: {prefix}"
+        assert_eq!(prefix["type"], "optional");
+        let thought = &prefix["content"];
+        assert_eq!(
+            thought["end"], "</think>",
+            "the thought's close is owed: {thought}"
         );
         assert_eq!(
-            prefix["excludes"],
+            thought["content"]["excludes"],
             value!([
+                "<think>",
+                "</think>",
                 "<tool_call>",
                 "</tool_call>",
                 "<function=",

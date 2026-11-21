@@ -381,7 +381,9 @@ mod tests {
         let parts = with_prefix["format"]["elements"]
             .as_array()
             .expect("prefix, then the block");
-        let excludes = parts[0]["excludes"].as_array().expect("the excluded tags");
+        let excludes = parts[0]["content"]["content"]["excludes"]
+            .as_array()
+            .expect("the excluded tags");
         for tag in [
             "<ifm|tool_calls>",
             "</ifm|tool_calls>",
@@ -402,25 +404,27 @@ mod tests {
 
     #[test]
     fn hy4_with_the_reasoning_open_takes_the_prefix_and_its_one_way_in() {
-        // Hy4's prompt opens the thought, so this is the path it takes most: the prefix is free
-        // text that can write none of the four call terminals nor the four suffixed tags, the
-        // thought's own two allowed so the model may close it where the engine runs the grammar
-        // from the first token, and nothing owed at its end; the block behind it has its one way
-        // in, from content, with no close of its own before the opener.
+        // Hy4's prompt opens the thought, so this is the path it takes most: the prefix is the
+        // thought closed by its own marker, or nothing of it, and its text can write none of its
+        // own two markers, the four call terminals or the four suffixed tags; the block behind it
+        // has its one way in, from content, with no close of its own before the opener.
         let payload = formats::hy4()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();
         assert_eq!(payload["format"]["type"], "sequence");
         let prefix = &payload["format"]["elements"][0];
-        assert_eq!(prefix["type"], "any_text");
-        assert!(
-            prefix.get("end").is_none(),
-            "nothing owed at the prefix's end: {prefix}"
+        assert_eq!(prefix["type"], "optional");
+        let thought = &prefix["content"];
+        assert_eq!(
+            thought["end"], "</think:opensource>",
+            "the thought's close is owed: {thought}"
         );
         assert_eq!(
-            prefix["excludes"],
+            thought["content"]["excludes"],
             value!([
+                "<think:opensource>",
+                "</think:opensource>",
                 "<tool_calls:opensource>",
                 "</tool_calls:opensource>",
                 "<tool_call:opensource>",
@@ -473,15 +477,17 @@ mod tests {
         assert_eq!(ping[0]["value"], "<tool_call>ping<tool_sep>\n");
         assert_eq!(ping[1]["type"], "star");
         assert_eq!(ping[2]["value"], "</tool_call>");
-        // The separator is no tag: the prefix before the block excludes the block's markers and
-        // the four tags, and nothing else.
+        // The separator is no tag: the thought's text before the block excludes its own two
+        // markers, the block's markers and the four tags, and nothing else.
         let with_prefix = formats::hy_v3()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();
         assert_eq!(
-            with_prefix["format"]["elements"][0]["excludes"],
+            with_prefix["format"]["elements"][0]["content"]["content"]["excludes"],
             value!([
+                "<think>",
+                "</think>",
                 "<tool_calls>",
                 "</tool_calls>",
                 "<tool_call>",

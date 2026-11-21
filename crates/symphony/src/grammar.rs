@@ -603,7 +603,9 @@ pub struct Options {
 /// engine starts, since free text before a schema constrains nothing
 /// ([`Format::answer_grammar_for`]). Engines of either kind, one starting at the first token
 /// beside one that does not among those a request may run on, keep the prefix for the answer too,
-/// loosely, since no other tag fits both. Where the
+/// loosely, since no other tag fits both. Before a call the request owes, both cases get the
+/// thought closed by its own marker, or nothing of it, in place of the free text, which would
+/// not hold the model to the call. Where the
 /// prompt opens no thought, the start is read by the answer tag of a table whose thought is a
 /// message of its own alone, and only where it names the first token
 /// ([`Format::answer_grammar`]): an engine that starts after its parser may gate on it whatever
@@ -777,7 +779,9 @@ impl Format {
     /// (`tool_choice` `required`, a named function, or an allowed-tools list in `required` mode).
     /// With `reasoning_open`, the prompt left the model inside its thought, and the tag follows a
     /// prefix of free text without the call markers, nothing owed at its end (the thought and its
-    /// close, or nothing, by where the engine starts the grammar); a table without a thought has
+    /// close, or nothing, by where the engine starts the grammar); before a call the request owes
+    /// where no start is named, the prefix is that thought closed by its own marker or nothing of
+    /// it, no free text; a table without a thought has
     /// no prefix, and the tag comes back as it is; a table whose thought closes only into the
     /// block has no prefix, its close being its own way in, and gives `None`; one whose thought
     /// closes into the text after it (MiniMax M3's) takes the prefix. Kimi K3's tag has a way in per state
@@ -945,6 +949,7 @@ impl Format {
             options.reasoning_open,
             options.thought_closed,
             prefixed,
+            options.at_least_one,
             options.start,
             after,
         )
@@ -985,7 +990,7 @@ impl Format {
     /// the answer begins where its grammar does; one that starts at the first token gets the
     /// thought, closed, before the schema (`Self::led`); one that does not say gets the schema
     /// alone as well, its own constraint applied where it starts, and engines of either kind
-    /// ([`GrammarStart::Either`]) keep the prefix a forced call takes, loosely, since no one tag
+    /// ([`GrammarStart::Either`]) keep the prefix of free text, loosely, since no one tag
     /// fits both. The node shares `schema` with its keeper instead of copying it: a tag that keeps
     /// the schema builds its grammar at every worker start and retry at no copy.
     pub fn answer_grammar_for(
@@ -1015,7 +1020,7 @@ impl Format {
                 1 => parts.remove(0),
                 _ => Grammar::Sequence(parts),
             };
-            // A prefix of free text cannot lead an answer. It leads a forced call because the
+            // A prefix of free text cannot lead an answer. It leads a call not owed because the
             // call's marker is excluded from it, so the marker the model writes can only open
             // the tag; an answer has no marker, nothing in the prefix says where the schema
             // begins, and the model writes what it likes before and after its JSON (a fence, a
@@ -1033,7 +1038,7 @@ impl Format {
                 start => start,
             };
             return self
-                .led(answer, reasoning_open, false, true, start, "")
+                .led(answer, reasoning_open, false, true, false, start, "")
                 .map(|grammar| self.bounded(grammar));
         }
         // The model starts in its thought when the prompt opened it, and otherwise in the turn's
@@ -1149,6 +1154,7 @@ impl Format {
             reasoning_open,
             false,
             false,
+            false,
             start,
             "",
         )
@@ -1158,7 +1164,8 @@ impl Format {
     /// `body` after what the model writes before it. With the prompt's thought open, the prefix
     /// for a tag that takes one (`prefixed`, [`Self::after_the_thought`]), and nothing for a tag
     /// whose ways in close the thought themselves, when the engine does not say where it starts
-    /// the grammar; nothing either way for one that starts after its reasoning parser, and the
+    /// the grammar (in its place, where the tag owes a call, `call_owed`, the closed thought or
+    /// nothing of it); nothing either way for one that starts after its reasoning parser, and the
     /// thought closed by its own marker either way for one that starts at the first token
     /// ([`Self::after_the_closed_thought`]). With the thought not open, the thought itself
     /// where the table writes one before every call and answer ([`Format::thinks_first`]): the
@@ -1180,12 +1187,17 @@ impl Format {
     /// the caller writes `after` itself (an answer's tag). Where the prompt closed the thought
     /// itself and wrote `after` (`thought_closed`: a request with thinking switched off), the tag
     /// owes it on no start ([`Self::thought_the_model_may_write_first`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each one decides what precedes the tag"
+    )]
     fn led(
         &self,
         body: Grammar,
         reasoning_open: bool,
         thought_closed: bool,
         prefixed: bool,
+        call_owed: bool,
         start: GrammarStart,
         after: &str,
     ) -> Option<Grammar> {
@@ -1199,7 +1211,12 @@ impl Format {
                 // the thought, closed by its own marker, comes first whether or not the tag takes
                 // a prefix, else the engine would force the tag's first text (a way in restating
                 // the close, or the body itself) before the model has thought.
-                GrammarStart::FirstToken => self.after_the_closed_thought(body, after),
+                GrammarStart::FirstToken => self.after_the_closed_thought(body, after, true),
+                // No one start is named and a call is owed: the two tags above side by side. Free
+                // text would not hold the model to the call; here it ends at the thought's close.
+                GrammarStart::Unknown | GrammarStart::Either if prefixed && call_owed => {
+                    self.after_the_closed_thought(body, after, false)
+                }
                 // The engine does not say, or the engines that may take the request are of
                 // either kind: the prefix that fits both where the tag takes one.
                 GrammarStart::Unknown | GrammarStart::Either if prefixed => {
@@ -1270,10 +1287,12 @@ impl Format {
     /// first token: the thought's text, which writes none of the table's terminals, ends at one
     /// of the thought's closes, and `after` and `body` follow at once ([`Self::led`]), so the
     /// engine neither forces `body` into the thought nor lets free text run on after the close.
+    /// Not `owed`, the thought may be left out whole: this tag beside the one of an engine that
+    /// starts after its reasoning parser, for an engine that names no one start.
     /// A table without a thought has no prefix, and gives `body` as it is; a thought that closes
     /// only into the block has no prefix, its close being its own way in, and gives `None`
     /// ([`Self::thought_markers`]).
-    fn after_the_closed_thought(&self, body: Grammar, after: &str) -> Option<Grammar> {
+    fn after_the_closed_thought(&self, body: Grammar, after: &str, owed: bool) -> Option<Grammar> {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(body);
         };
@@ -1286,6 +1305,11 @@ impl Format {
             excludes: self.excluded_but(&[]),
         };
         let thought = Grammar::Tag(Tag::bounded("", text, end));
+        let thought = if owed {
+            thought
+        } else {
+            Grammar::Optional(Box::new(thought))
+        };
         let mut elements = vec![thought];
         elements.extend(after_the_close_then(after, body));
         Some(Grammar::Sequence(elements))
@@ -1946,11 +1970,9 @@ mod tests {
     }
 
     #[test]
-    fn the_reasoning_prefix_wraps_the_tag_as_the_gateway_does() {
-        // `wrap_in_reasoning_prefix(tag, Glm4MoeParser::reasoning_prefix(..))`: a sequence of free
-        // text that writes none of the call markers, with nothing owed at its end (an engine that
-        // runs a reasoning parser applies the grammar only after the model's own `</think>`, so a
-        // prefix closed by `</think>` would be owed a second time), then the tag.
+    fn the_open_thought_or_nothing_of_it_precedes_the_tag() {
+        // The thought closed by `</think>`, or nothing of it (an engine that runs a reasoning
+        // parser applies the grammar only after the model's own `</think>`), then the tag.
         let grammar = formats::glm()
             .grammar(&weather_tools(), true, true)
             .expect("a grammar");
@@ -1961,13 +1983,15 @@ mod tests {
             .expect("two elements");
         assert_eq!(
             elements[0],
-            value!({
-                "type": "any_text",
-                "excludes": [
-                    "<tool_call>", "</tool_call>",
+            value!({"type": "optional", "content": {
+                "type": "tag",
+                "begin": "",
+                "content": {"type": "any_text", "excludes": [
+                    "<think>", "</think>", "<tool_call>", "</tool_call>",
                     "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
-                ],
-            })
+                ]},
+                "end": "</think>",
+            }})
         );
         assert_eq!(elements[1]["type"], "triggered_tags");
     }
@@ -1996,11 +2020,9 @@ mod tests {
 
     #[test]
     fn the_prefix_excludes_each_tables_own_terminals_and_inner_tags() {
-        // No old builder wraps these two, so the derived shape is pinned here: the prefix is free
-        // text whose excludes are the table's terminals in order, the thought's own two left out
-        // so the model may close it where the engine runs the grammar from the first token, and
-        // the syntax's inner tags; nothing is owed at its end; the second element is the tag as
-        // derived without it.
+        // No old builder wraps these two, so the derived shape is pinned here: the prefix is the
+        // first-token thought or nothing of it, its text excluding the table's terminals and the
+        // syntax's inner tags; the second element is the tag as derived without it.
         let tools = weather_tools();
         for (format, excludes) in [
             (
@@ -2043,14 +2065,37 @@ mod tests {
                 .expect("a grammar")
                 .to_json();
             assert_eq!(wrapped["type"], "sequence", "{}", format.name());
+            let first = format
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open: true,
+                        thought_closed: false,
+                        one_call: false,
+                        start: GrammarStart::FirstToken,
+                    },
+                )
+                .expect("a grammar")
+                .to_json();
             assert_eq!(
                 wrapped["elements"][0],
-                value!({"type": "any_text", "excludes": excludes}),
+                value!({"type": "optional", "content": first["elements"][0].clone()}),
                 "{}",
                 format.name()
             );
+            // The thought's text can write none of the listed texts.
+            let text = wrapped["elements"][0]["content"]["content"]["excludes"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{}: {wrapped}", format.name()));
+            let listed = excludes.as_array().expect("the listed texts");
+            assert!(
+                listed.iter().all(|excluded| text.contains(excluded)),
+                "{}: {text:?}",
+                format.name()
+            );
             // The calls come last: a table whose layout writes text after the thought's close
-            // (Qwen3's two newlines) puts it between the prefix and them.
+            // (Qwen3's two newlines) puts it between the thought and them.
             let last = wrapped["elements"]
                 .as_array()
                 .and_then(|elements| elements.last())
@@ -2537,22 +2582,29 @@ mod tests {
                 ],
             }})
         );
-        // With the thought open, the lead is free text that may close it, then the same block.
+        // With the thought open, the closed thought or nothing of it leads the same block.
         let open = formats::deepseek_v4()
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
         assert_eq!(
             open["format"]["elements"][0],
-            value!({"type": "any_text", "excludes": [
-                "<｜DSML｜tool_calls>",
-                "\n\n<｜DSML｜tool_calls>",
-                "</｜DSML｜tool_calls>",
-                "<｜DSML｜invoke name=\"",
-                "</｜DSML｜invoke>",
-                "<｜DSML｜parameter name=\"",
-                "</｜DSML｜parameter>",
-            ]})
+            value!({"type": "optional", "content": {
+                "type": "tag",
+                "begin": "",
+                "content": {"type": "any_text", "excludes": [
+                    "<think>",
+                    "</think>",
+                    "<｜DSML｜tool_calls>",
+                    "\n\n<｜DSML｜tool_calls>",
+                    "</｜DSML｜tool_calls>",
+                    "<｜DSML｜invoke name=\"",
+                    "</｜DSML｜invoke>",
+                    "<｜DSML｜parameter name=\"",
+                    "</｜DSML｜parameter>",
+                ]},
+                "end": "</think>",
+            }})
         );
         assert_eq!(
             open["format"]["elements"][1]["elements"],
@@ -2788,8 +2840,8 @@ mod tests {
     fn llama_nemotron_derives_one_tag_around_the_list_of_calls() {
         // No hand-written tag to pin to: the gateway's older parsers have none for this syntax.
         // One tag: `<TOOLCALL>` begins it, xLAM's list of the tools' calls is its content and
-        // `</TOOLCALL>` ends it. With the thought open, the tag follows a prefix of free text
-        // without the call's markers, the thought's own still writable.
+        // `</TOOLCALL>` ends it. With the thought open, the tag follows that thought closed by its
+        // own marker, or nothing of it; the thought's text writes none of the markers.
         let tools = weather_tools();
         let payload = formats::llama_nemotron()
             .grammar(&tools, true, false)
@@ -2820,11 +2872,12 @@ mod tests {
             &open,
             Grammar::Sequence(parts)
                 if parts.len() == 2
-                    && matches!(&parts[0], Grammar::AnyText { excludes }
-                        if excludes.contains(&"<TOOLCALL>".to_string())
-                            && excludes.contains(&"</TOOLCALL>".to_string())
-                            && !excludes.contains(&"<think>".to_string())
-                            && !excludes.contains(&"</think>".to_string()))
+                    && matches!(&parts[0], Grammar::Optional(thought)
+                        if matches!(&**thought, Grammar::Tag(tag)
+                            if matches!(&*tag.content, Grammar::AnyText { excludes }
+                                if excludes.contains(&"<TOOLCALL>".to_string())
+                                    && excludes.contains(&"</TOOLCALL>".to_string())
+                                    && excludes.contains(&"</think>".to_string()))))
         ));
     }
 
@@ -2939,7 +2992,7 @@ mod tests {
         // name and `[ARGS]` begin the tag, the tool's schema is its content, and nothing ends it:
         // the template writes no closing marker, so the object ends the tag and the next opener
         // or the end of the turn follows. Mistral's prompt never leaves the thought open, and the
-        // tag with it open is the same tag after a prefix of free text.
+        // tag with it open is the same tag after that thought, closed, or nothing of it.
         let tools = weather_tools();
         let payload = formats::mistral_v13()
             .grammar(&tools, true, false)
@@ -2967,8 +3020,8 @@ mod tests {
                 "at_least_one": true,
             }})
         );
-        // The free text keeps the thought's own markers, and the arguments marker too: `[ARGS]`
-        // opens no call without `[TOOL_CALLS]` before it, which the text cannot write.
+        // The thought's text keeps the arguments marker: `[ARGS]` opens no call without
+        // `[TOOL_CALLS]` before it, which the text cannot write.
         let open = formats::mistral_v13()
             .grammar(&tools, true, true)
             .expect("a grammar");
@@ -2976,10 +3029,12 @@ mod tests {
             &open,
             Grammar::Sequence(parts)
                 if parts.len() == 2
-                    && matches!(&parts[0], Grammar::AnyText { excludes }
-                        if excludes.contains(&"[TOOL_CALLS]".to_string())
-                            && !excludes.contains(&"[ARGS]".to_string())
-                            && !excludes.contains(&"[THINK]".to_string()))
+                    && matches!(&parts[0], Grammar::Optional(thought)
+                        if matches!(&**thought, Grammar::Tag(tag)
+                            if matches!(&*tag.content, Grammar::AnyText { excludes }
+                                if excludes.contains(&"[TOOL_CALLS]".to_string())
+                                    && !excludes.contains(&"[ARGS]".to_string())
+                                    && excludes.contains(&"[THINK]".to_string()))))
         ));
     }
 
@@ -3458,12 +3513,11 @@ mod tests {
 
     #[test]
     fn with_the_thought_open_and_the_engine_silent_the_answer_is_the_schema_alone() {
-        // A forced call takes a prefix of free text with its markers excluded, so the marker the
-        // model writes can only open the tag; an answer has no marker, and free text before the
+        // An answer has no marker, and free text before the
         // schema would let the model write a fence, a note, anything, with the end of the turn
         // masked until a whole JSON follows. So where the engine does not say where it starts
         // the grammar, the answer is the schema alone, as after the reasoning parser's gate,
-        // while the forced call keeps its prefix.
+        // while the forced call takes the closed thought or nothing of it.
         let alone = value!({"format": {"type": "json_schema", "json_schema": answer_schema()}});
         let tools = weather_tools();
         for format in [
@@ -3493,8 +3547,8 @@ mod tests {
                 .payload();
             assert_eq!(
                 call["format"]["elements"][0]["type"],
-                "any_text",
-                "{}: the forced call keeps its prefix",
+                "optional",
+                "{}: the forced call takes the thought or nothing of it",
                 format.name()
             );
         }
@@ -3509,7 +3563,7 @@ mod tests {
     fn with_the_thought_open_and_engines_of_either_kind_the_answer_keeps_the_prefix() {
         // The engines a request may run on name different starts: one would force the schema
         // from the first token, inside the open thought, the other applies it after its gate,
-        // and no one tag fits both. The answer keeps the prefix a forced call takes, the
+        // and no one tag fits both. The answer keeps the prefix a tag that owes no call takes, the
         // thought's own markers writable so the model closes it, loosely, as before.
         let schema = value!({"type": "json_schema", "json_schema": answer_schema()});
         let tools = weather_tools();
@@ -3520,11 +3574,11 @@ mod tests {
             formats::minimax_m2(),
             formats::deepseek_v4_1(),
         ] {
-            let call = format
+            let auto = format
                 .grammar_for(
                     &tools,
                     Options {
-                        at_least_one: true,
+                        at_least_one: false,
                         reasoning_open: true,
                         thought_closed: false,
                         one_call: false,
@@ -3538,16 +3592,16 @@ mod tests {
                     .answer_grammar_for(&shared_schema(), true, GrammarStart::Either)
                     .map(|grammar| grammar.payload()),
                 Some(value!({"format": {"type": "sequence", "elements": [
-                    call["format"]["elements"][0].clone(),
+                    auto["format"]["elements"][0].clone(),
                     schema,
                 ]}})),
                 "{}",
                 format.name()
             );
             assert_eq!(
-                call["format"]["elements"][0]["type"],
+                auto["format"]["elements"][0]["type"],
                 "any_text",
-                "{}: the forced call's prefix",
+                "{}: the prefix of a tag that owes no call",
                 format.name()
             );
         }
@@ -3801,7 +3855,7 @@ mod tests {
                     .expect("a tag")
                     .payload();
                 assert_eq!(call["format"]["type"], "sequence", "{table:?}");
-                assert_eq!(call["format"]["elements"][0]["type"], "any_text");
+                assert_eq!(call["format"]["elements"][0]["type"], "optional");
             }
             let answer = answer(&format, reasoning_open).expect("an answer");
             assert_eq!(answer["format"]["type"], "json_schema", "{table:?}");
@@ -3812,14 +3866,14 @@ mod tests {
             .grammar(&tools, true, reasoning_open)
             .expect("a tag")
             .payload();
-        assert_eq!(call["format"]["elements"][0]["type"], "any_text");
+        assert_eq!(call["format"]["elements"][0]["type"], "optional");
     }
 
     #[test]
     fn where_the_engine_starts_the_grammar_decides_what_precedes_the_answer_and_the_calls() {
         // DeepSeek V4's template leaves the model inside its thought. An engine that does not say
-        // where it starts gets the prefix of free text, the thought's own markers writable and
-        // nothing owed at its end; one that starts after its reasoning parser has seen the close
+        // where it starts gets, before a call that is owed, the thought closed by `</think>` or
+        // nothing of it; one that starts after its reasoning parser has seen the close
         // gets the schema alone and the bare block of calls, as its own server forces them; one
         // that starts at the first token gets the thought as a tag closed by `</think>` and then
         // the schema or the calls, so free text cannot run on after the close.
@@ -3851,16 +3905,19 @@ mod tests {
                 .payload()
         };
         // Where the engine does not say where it starts, the answer is the schema alone, as
-        // after the gate: a free-text prefix would let the answer run on unconstrained, where a
-        // forced call's prefix still takes it, its markers excluded from the free text.
+        // after the gate: a free-text prefix would let the answer run on unconstrained; a
+        // forced call takes the closed thought or nothing of it.
         assert_eq!(
             answer_for(GrammarStart::Unknown),
             value!({"format": schema}),
             "the schema alone where the engine does not say"
         );
         assert_eq!(
-            calls_for(GrammarStart::Unknown)["format"]["elements"][0]["type"],
-            "any_text"
+            calls_for(GrammarStart::Unknown)["format"]["elements"][0],
+            value!({
+                "type": "optional",
+                "content": calls_for(GrammarStart::FirstToken)["format"]["elements"][0].clone(),
+            })
         );
         assert_eq!(
             answer_for(GrammarStart::AfterReasoning),
@@ -4249,7 +4306,10 @@ mod tests {
         assert_eq!(closed["format"]["elements"][1], newline);
         assert_eq!(closed["format"]["elements"][2], *calls);
         let unknown = calls_for(true, GrammarStart::Unknown);
-        assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
+        assert_eq!(
+            unknown["format"]["elements"][0],
+            value!({"type": "optional", "content": closed["format"]["elements"][0].clone()})
+        );
         assert_eq!(unknown["format"]["elements"][1], newline);
         assert_eq!(unknown["format"]["elements"][2], *calls);
         // The tag for any number of calls the same way, and the `auto` tag (no call owed).
@@ -4416,7 +4476,7 @@ mod tests {
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
-        assert_eq!(open["format"]["elements"][0]["type"], "any_text");
+        assert_eq!(open["format"]["elements"][0]["type"], "optional");
         assert_eq!(
             open["format"]["elements"][1],
             closed["format"]["elements"][1]
@@ -4701,15 +4761,22 @@ mod tests {
             answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
             Some(value!("<e></t><a>"))
         );
-        // With the thought open, the prefix a forced call takes keeps both of the thought's closes
-        // writable, and `<e>` inside the one the template renders, but no other marker.
+        // With the thought open, the thought a forced call takes or leaves out ends at either of
+        // its closes, and its text writes none of the table's markers.
         let wrapped = format
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .to_json();
         assert_eq!(
             wrapped["elements"][0],
-            value!({"type": "any_text", "excludes": ["<a>", "<c>", "</c>"]})
+            value!({"type": "optional", "content": {
+                "type": "tag",
+                "begin": "",
+                "content": {"type": "any_text", "excludes": [
+                    "<t>", "<u>", "<e></t>", "<a>", "<e>", "<c>", "</c>",
+                ]},
+                "end": ["<u>", "<e></t>"],
+            }})
         );
         // Either close ends the thought, and `<e>` alone is the thought's text.
         let json = "{\"city\": \"Paris\"}";

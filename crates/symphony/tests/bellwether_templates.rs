@@ -1587,6 +1587,18 @@ fn a_required_tag_takes_its_calls_and_no_text_after_them() {
                 !accepts(&one, &format!("{before}{CALL}{CALL}")),
                 "{what}: a second call"
             );
+            // Where the start is unnamed the grammar may begin inside the open thought.
+            if reasoning_open && matches!(start, GrammarStart::Unknown | GrammarStart::Either) {
+                let thought = "\nNo tool fits.\n</think>\n\n";
+                assert!(
+                    accepts(&required, &format!("{thought}{CALL}")),
+                    "{what}: a thought, its close, the call"
+                );
+                assert!(
+                    !accepts(&required, &format!("{thought}Prose.\n\n{CALL}")),
+                    "{what}: prose between the close and the call"
+                );
+            }
         }
     }
 }
