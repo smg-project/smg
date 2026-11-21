@@ -51,7 +51,8 @@ as of `tokenizer/src/*`.
 ## Backend Implementations
 ### HuggingFaceTokenizer (`huggingface.rs`)
 - Reads `tokenizer.json` (or similar) into memory and deserializes it there (the two steps of
-  `tokenizers::Tokenizer::from_file`), keeping the text for a second read of its model section.
+  `tokenizers::Tokenizer::from_file`), keeping the text so a Unigram model section can be read
+  a second time for the scores the reference reads.
 - Caches vocab forward and reverse maps for `token_to_id`/`id_to_token` support.
 - Extracts special tokens using common patterns (e.g. `<s>`, `[CLS]`).
 - Adds special tokens on request the way the checkpoint's configuration prescribes: `encode(text, true)`
