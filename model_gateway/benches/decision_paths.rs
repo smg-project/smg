@@ -1,16 +1,13 @@
 //! One request's routing, head to head, over one fleet of workers a model,
-//! every one ready unless the cell says otherwise. Four paths:
+//! every one ready unless the cell says otherwise. Three paths:
 //!
 //! - `classic`: the classic policies over the worker registry.
-//! - `engine`: the policy engine over that same registry, asked ahead of
-//!   the classic placement's pass. Everything is built as `classic` builds
-//!   it (the registry, the policies a registration leaves, each worker's
-//!   completion sink, the load feed) and the request runs the same
-//!   function; the one difference is the engine set to the placement.
 //! - `object`: the policy engine asked where the classic placement's pass
-//!   asks its policy. Everything is built as `classic` builds it and the
-//!   request runs the same function, pass and all; the one difference is
-//!   the policy the registry hands the pass, which asks the engine.
+//!   asks its policy. Everything is built as `classic` builds it (the
+//!   registry, the policies a registration leaves, each worker's completion
+//!   sink, the load feed) and the request runs the same function, pass and
+//!   all; the one difference is the policy the registry hands the pass,
+//!   which asks the engine.
 //! - `controller`: the policy controller over its own store in this
 //!   process, registered and reported to as that mode does it.
 //!
@@ -24,9 +21,9 @@
 //! stretches. The binary runs on the gateway's stock allocator, as the
 //! serving binary does.
 //!
-//! `--not-ready N` leaves one worker in `N` not ready, on the `classic`,
-//! `engine` and `object` paths: a request is then placed among the others, and a turn or
-//! a draw that lands on a worker that is not ready is part of the cell.
+//! `--not-ready N` leaves one worker in `N` not ready, on the `classic`
+//! and `object` paths: a request is then placed among the others, and a
+//! turn that lands on a worker that is not ready is part of the cell.
 //! `--ready N` leaves `N` workers of the fleet ready and every other not
 //! ready: with `1`, nearly every request is placed by a pass over the pool.
 //! `--overloaded true` puts every worker over its overload thresholds, each
@@ -35,14 +32,9 @@
 //! thresholds.
 //!
 //! `--models N` serves `N` models, each with a fleet of its own of the
-//! cell's size, on the `classic`, `engine` and `object` paths: a caller's requests
+//! cell's size, on the `classic` and `object` paths: a caller's requests
 //! name the models in turn, as the requests of a gateway that serves many
 //! models do, so no two requests in a row are for one model.
-//!
-//! `--draw-from N` turns the pool size from which the engine's decision
-//! draws its worker first, for the run that sets that size. The binary
-//! reads the size from a word the flag writes, one load a decision on the
-//! `engine` path, where a product build reads a constant.
 //!
 //! No Criterion harness: a cell runs a fixed count of decisions, so the same
 //! binary counts instructions under callgrind (two counts, one difference).
@@ -80,15 +72,13 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, set_policy_engine_of,
-                ControllerPath, Route,
+                attach_loads, policies_asking_the_engine, route_classic, ControllerPath, Route,
             },
             snapshot::WorkerRegistry,
         },
         grpc::backend_client::BasicWorkerBuilder,
     },
 };
-use smg_policy_controller::engine::turn_live_draw_from;
 use smg_worker::{
     identity::basic::{ConnectionMode, Worker, WorkerType},
     load::state::{one_rank_load, TestFeed},
@@ -122,7 +112,6 @@ struct Cell {
     callers: usize,
     decisions: u64,
     reports: bool,
-    draw_from: Option<usize>,
     /// One worker in this many is not ready; `0` for a fleet all ready.
     not_ready: usize,
     /// This many workers of the fleet are ready and every other is not;
@@ -143,7 +132,6 @@ fn cell() -> Cell {
         callers: 1,
         decisions: 1_000_000,
         reports: true,
-        draw_from: None,
         not_ready: 0,
         ready: 0,
         overloaded: false,
@@ -172,7 +160,6 @@ fn cell() -> Cell {
             "--callers" => cell.callers = value.parse().unwrap(),
             "--decisions" => cell.decisions = value.parse().unwrap(),
             "--reports" => cell.reports = value.parse().unwrap(),
-            "--draw-from" => cell.draw_from = Some(value.parse().unwrap()),
             "--not-ready" => cell.not_ready = value.parse().unwrap(),
             "--ready" => cell.ready = value.parse().unwrap(),
             "--overloaded" => cell.overloaded = value.parse().unwrap(),
@@ -294,9 +281,8 @@ type Upkeep = Box<dyn Fn()>;
 
 /// The classic path: a registry with the fleet, the policies a registration
 /// leaves (the model's policy and each worker's completion sink), and the
-/// load feed the monitor would publish. On the `engine` path, the same, and
-/// the policy engine of the same policy set to the placement. On the
-/// `object` path, the same, and the registry's policies ask that engine.
+/// load feed the monitor would publish. On the `object` path, the same, and
+/// the registry's policies ask the policy engine of the same policy.
 fn classic(cell: &Cell) -> (Routing, Option<TestFeed>) {
     let registry = Arc::new(WorkerRegistry::new());
     let config = RouterConfig {
@@ -308,9 +294,6 @@ fn classic(cell: &Cell) -> (Routing, Option<TestFeed>) {
         "object" => policies_asking_the_engine(&config).unwrap(),
         _ => PolicyRegistry::new(policy_config(&cell.policy)),
     });
-    if cell.path == "engine" {
-        set_policy_engine_of(&policies, &config).unwrap();
-    }
     let models = model_ids(cell.models);
     let mut every = Vec::with_capacity(models.len() * cell.workers);
     for model in &models {
@@ -356,7 +339,7 @@ fn controller(cell: &Cell) -> (Routing, Upkeep) {
     assert_eq!(
         (cell.not_ready, cell.ready, cell.overloaded, cell.models),
         (0, 0, false, 1),
-        "--not-ready, --ready, --overloaded and --models are for the classic and engine paths"
+        "--not-ready, --ready, --overloaded and --models are for the classic and object paths"
     );
     let path = Arc::new(ControllerPath::start(&config, MODEL).unwrap());
     let fleet = fleet(cell.route, MODEL, cell.workers);
@@ -377,11 +360,8 @@ fn main() {
     let cell = cell();
     let recorder = start_prometheus(PrometheusConfig::default());
     let tokens: Vec<u32> = (0..1_024).collect();
-    if let Some(rows) = cell.draw_from {
-        turn_live_draw_from(rows);
-    }
     let (routing, upkeep, _feed): (Routing, Upkeep, Option<TestFeed>) = match cell.path.as_str() {
-        "classic" | "engine" | "object" => {
+        "classic" | "object" => {
             let (routing, feed) = classic(&cell);
             (routing, Box::new(|| {}), feed)
         }

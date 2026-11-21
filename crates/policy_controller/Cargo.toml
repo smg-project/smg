@@ -220,9 +220,9 @@ worker-host = [
 discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
 
 # The engine in a gateway's own process: one front over the gateway's worker
-# objects, which reads a worker's health and its requests in flight where the
-# worker crate keeps them. It names nothing of the store. Off by default: it
-# brings the worker crate's runtime.
+# objects, which reads a worker's health where the worker crate keeps it. It
+# names nothing of the store. Off by default: it brings the worker crate's
+# runtime.
 in-process = ["dep:smg-worker", "smg-worker/runtime"]
 
 default = ["wasm"]
@@ -231,9 +231,7 @@ wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 # A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
 # host that takes the thread's core. The package's own tests and benches
 # turn it on through the dev-dependency on the package itself; no build of
-# a product has it. It also holds the knob of the run that sets the pool
-# size a decision over live rows draws first from, which the gateway's
-# benches turn through the gateway's own `test-util`.
+# a product has it.
 test-util = ["smg-worker?/test-util"]
 
 [dev-dependencies]

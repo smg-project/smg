@@ -1626,60 +1626,6 @@ fn policy_decisions_read_the_profile_again_after_a_miss() {
     }
 }
 
-/// The picks of one pool count through the handles kept with the pool: one
-/// link a model id as spelled and a profile, each built once, and every
-/// pick counted as a decision of its model and profile.
-#[test]
-fn the_picks_of_a_pool_count_through_the_handles_kept_with_it() {
-    let rendered = render_with_recorder(|| {
-        handles::force_on_this_thread(Some(true));
-        let kept = KeptPicks::default();
-        let pick = |model, profile, name: &'static str| {
-            let pick = PolicyDecision {
-                profile: Some(profile),
-                ..decision(1, "pick")
-            };
-            Metrics::count_engine_pick(&kept, model, pick, || Some(name.into()));
-        };
-        for model in ["kept-m1", "kept-alias", "kept-m1"] {
-            pick(model, 0, "round_robin");
-            pick(model, 0, "round_robin");
-        }
-        assert_eq!(kept.links(), 2, "one link a spelling");
-        pick("kept-m1", 1, "random");
-        assert_eq!(kept.links(), 3, "and one a profile");
-        handles::reset();
-    });
-    for line in [
-        "smg_policy_decisions_total{model=\"kept-m1\",profile=\"round_robin\",outcome=\"pick\",mode=\"embedded\"} 4",
-        "smg_policy_decisions_total{model=\"kept-alias\",profile=\"round_robin\",outcome=\"pick\",mode=\"embedded\"} 2",
-        "smg_policy_decisions_total{model=\"kept-m1\",profile=\"random\",outcome=\"pick\",mode=\"embedded\"} 1",
-    ] {
-        assert!(rendered.lines().any(|sample| sample == line), "{line}\n{rendered}");
-    }
-}
-
-/// Where handles are not kept (no recorder installed), a pick keeps none
-/// with the pool and counts the same series.
-#[test]
-fn a_pick_keeps_no_handle_where_handles_are_not_kept() {
-    let rendered = render_with_recorder(|| {
-        handles::force_on_this_thread(Some(false));
-        let kept = KeptPicks::default();
-        for _ in 0..3 {
-            let name = || Some("round_robin".into());
-            Metrics::count_engine_pick(&kept, "unkept-m1", decision(1, "pick"), name);
-        }
-        assert_eq!(kept.links(), 0);
-        handles::reset();
-    });
-    let line = "smg_policy_decisions_total{model=\"unkept-m1\",profile=\"round_robin\",outcome=\"pick\",mode=\"embedded\"} 3";
-    assert!(
-        rendered.lines().any(|sample| sample == line),
-        "{line}\n{rendered}"
-    );
-}
-
 /// The cost of the chat path's per-request records with and without the
 /// kept handles, for the Numbers table; run with `--ignored --nocapture`.
 #[test]

@@ -37,13 +37,8 @@ provider-gemini = ["smg-external-router/gemini"]
 providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
 # Client-injection seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
-# It turns on the worker crate's test support, which the gateway's re-exports,
-# and the policy crate's, for the knob the decision-path bench turns.
-test-util = [
-    "smg-worker/test-util",
-    "smg-service-discovery/test-util",
-    "smg-policy-controller/test-util",
-]
+# It turns on the worker crate's test support, which the gateway's re-exports.
+test-util = ["smg-worker/test-util", "smg-service-discovery/test-util"]
 
 vendored-openssl = ["openssl/vendored"]
 

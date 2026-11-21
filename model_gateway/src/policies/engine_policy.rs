@@ -73,8 +73,7 @@ impl LoadBalancingPolicy for EnginePolicy {
                     std::ptr::eq(&named.list[..], workers),
                     "a list named whole is the slice handed"
                 );
-                let members =
-                    cell.get_or_init(|| Box::new(self.engine.pool_members("", named.list)));
+                let members = cell.get_or_init(|| Box::new(self.engine.pool_members(named.list)));
                 return self
                     .engine
                     .pick(self.profile, members, info.overload_lifted);
@@ -97,6 +96,8 @@ impl LoadBalancingPolicy for EnginePolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Barrier, thread};
+
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_policy_controller::document::{AppliedSpec, PolicySpec};
     use smg_worker::test_support::{no_health_check, render_with_recorder};
@@ -220,6 +221,110 @@ mod tests {
                 members.workers(),
                 snapshot.pool(RoutingPool::HttpRegular)
             ));
+        }
+    }
+
+    /// What the engine keeps of a pool stands on the registry's snapshot,
+    /// over the pool's own list: one value a membership, borrowed by every
+    /// pick, and a new one after a change. Nothing is made for a pool before
+    /// its first pick.
+    #[test]
+    fn the_engines_value_of_a_pool_stands_until_the_membership_changes() {
+        let (registry, fleet) = fleet(3);
+        let policies = asking("round_robin");
+        let pool = RoutingPool::HttpRegular;
+        let snapshot = registry.get_routing_snapshot(MODEL);
+        assert!(snapshot.pool_members_cell(pool).get().is_none());
+        let pick = || placed(&registry, &policies, &fleet, PlacementInputs::default());
+        assert!(pick().is_some());
+        let members = snapshot
+            .pool_members_cell(pool)
+            .get()
+            .expect("the first pick filled the cell");
+        assert!(pick().is_some());
+        let again = registry.get_routing_snapshot(MODEL);
+        let kept = again.pool_members_cell(pool).get().expect("the value");
+        assert!(std::ptr::eq(&**members, &**kept), "one value a membership");
+
+        let joined: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://asked-new:8000")
+                .model(ModelCard::new(MODEL))
+                .health_config(no_health_check())
+                .build(),
+        );
+        joined.set_status(WorkerStatus::Ready);
+        assert!(registry.register(joined).is_some());
+        let changed = registry.get_routing_snapshot(MODEL);
+        assert!(changed.pool_members_cell(pool).get().is_none());
+        assert!(pick().is_some());
+        let fresh = changed.pool_members_cell(pool).get().expect("a new value");
+        assert_eq!((members.workers().len(), fresh.workers().len()), (3, 4));
+    }
+
+    /// A model nobody serves is placed on nobody, and nothing is kept for
+    /// it on the snapshot every unknown model shares.
+    #[test]
+    fn a_model_nobody_serves_is_placed_on_nobody() {
+        let (registry, _fleet) = fleet(2);
+        let policies = asking("round_robin");
+        let pool = RoutingPool::HttpRegular;
+        let nobody = select_single(
+            &registry,
+            &policies,
+            "no-such-model",
+            pool,
+            None,
+            PlacementInputs::default(),
+        );
+        assert!(nobody.is_none());
+        let shared = registry.get_routing_snapshot("no-such-model");
+        assert!(shared.pool_members_cell(pool).get().is_none());
+    }
+
+    /// Callers that pick at the same moment do not pile on one worker.
+    /// Four callers pick together, a barrier a round, over 256 idle
+    /// workers, 64 rounds: every worker takes exactly one request, by the
+    /// classic policy and by the object alike. No lock orders the callers
+    /// on either path: a rotation is one atomic step.
+    #[test]
+    fn callers_that_pick_at_once_take_each_idle_worker_once() {
+        const CALLERS: usize = 4;
+        const ROUNDS: usize = 64;
+        for by_engine in [false, true] {
+            let (registry, fleet) = fleet(CALLERS * ROUNDS);
+            let policies = if by_engine {
+                asking("round_robin")
+            } else {
+                PolicyRegistry::new(PolicyConfig::RoundRobin)
+            };
+            let round = Barrier::new(CALLERS);
+            let taken: Vec<usize> = thread::scope(|scope| {
+                let callers: Vec<_> = (0..CALLERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let pick = |_| {
+                                round.wait();
+                                placed(&registry, &policies, &fleet, PlacementInputs::default())
+                                    .expect("an idle fleet takes every request")
+                            };
+                            (0..ROUNDS).map(pick).collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                callers
+                    .into_iter()
+                    .flat_map(|caller| caller.join().expect("a caller ends"))
+                    .collect()
+            });
+            let mut times = vec![0usize; fleet.len()];
+            for at in taken {
+                times[at] += 1;
+            }
+            let piled = times.iter().filter(|&&times| times != 1).count();
+            assert_eq!(
+                piled, 0,
+                "workers that took no request or more than one, by the engine: {by_engine}"
+            );
         }
     }
 

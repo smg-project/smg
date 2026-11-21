@@ -49,8 +49,7 @@ mod handles {
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        is_sentinel, keep_handles, kept, nested, recorder_installed, with_handle,
-        with_model_handle, ByLabels,
+        keep_handles, kept, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
 
     /// Handles by the matched path (the only label a request computes: the
@@ -339,9 +338,6 @@ pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
 
 const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
 const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
-/// The engine in the gateway's own process times one decision in this many
-/// (`smg_policy_decision_seconds`), and counts every one.
-pub const POLICY_DECISIONS_PER_TIMED: u32 = 64;
 const POLICY_SHADOW_DECISIONS_TOTAL: &str = "smg_policy_shadow_decisions_total";
 const POLICY_DECISION_FAULTS_TOTAL: &str = "smg_policy_decision_faults_total";
 
@@ -816,10 +812,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         POLICY_DECISION_SECONDS,
-        "Seconds spent asking the policy controller for one decision, by mode and outcome. \
-         Sampled where the gateway decides over its own worker registry: one decision in 64 is \
-         timed there, so this histogram's count is not the count of decisions \
-         (smg_policy_decisions_total is)"
+        "Seconds spent asking the policy controller for one decision, by mode and outcome"
     );
     describe_counter!(
         POLICY_SHADOW_DECISIONS_TOTAL,
@@ -1412,58 +1405,6 @@ pub(crate) mod allocator_stats {
 /// - Dynamic labels use string interning (single allocation per unique value)
 /// - Static labels use the metrics crate's internal caching
 pub struct Metrics;
-
-/// `smg_policy_decisions_total` under one set of labels.
-fn policy_decisions(
-    model: Arc<str>,
-    profile: Option<Arc<str>>,
-    outcome: &'static str,
-    mode: &'static str,
-) -> metrics::Counter {
-    let profile = profile.map_or_else(|| "".into(), metrics::SharedString::from);
-    counter!(
-        POLICY_DECISIONS_TOTAL,
-        "model" => model,
-        "profile" => profile,
-        "outcome" => outcome,
-        "mode" => mode
-    )
-}
-
-/// The handles the picks of one routing pool count through
-/// ([`Metrics::count_engine_pick`]), kept by the placement with the pool:
-/// the registry's snapshot holds one for each of its pools, and a new
-/// snapshot starts with none. The value is a short chain, one link for each
-/// model id as a request spelled it and each profile that picked, built by
-/// the first pick that needed it. The ids that reach one pool are the
-/// model's own and its aliases, so the chain is as long as the spellings an
-/// operator gave the model.
-#[derive(Debug, Default)]
-pub struct KeptPicks {
-    first: std::sync::OnceLock<Box<PickHandles>>,
-}
-
-impl KeptPicks {
-    /// How many links the chain holds.
-    #[cfg(test)]
-    pub(crate) fn links(&self) -> usize {
-        std::iter::successors(self.first.get(), |handles| handles.next.get()).count()
-    }
-}
-
-/// One link of [`KeptPicks`]: the handle of the picks under one model id
-/// and one profile.
-#[derive(Debug)]
-struct PickHandles {
-    /// The model id the handle was built for, as the request spelled it.
-    model: Box<str>,
-    generation: u64,
-    profile: Option<u16>,
-    /// `smg_policy_decisions_total` of the picks.
-    decided: metrics::Counter,
-    /// The handle of another spelling of the model, or of another profile.
-    next: std::sync::OnceLock<Box<PickHandles>>,
-}
 
 /// A decision of the policy controller as its series label it.
 #[derive(Clone, Copy, Debug)]
@@ -2455,80 +2396,6 @@ impl Metrics {
             || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
             |time| time.record(seconds),
         );
-    }
-
-    /// Count one pick of the policy engine in this process, a worker of
-    /// one routing pool for `model_id` (`smg_policy_decisions_total`),
-    /// through the handle `kept` holds for the pool, found with no lookup:
-    /// a compare of the model id and one atomic step. The first pick under
-    /// a model id and a profile builds their handle and keeps it, where
-    /// handles are kept at all and the model's label is its own. Any other
-    /// pick counts by a lookup of its series
-    /// ([`Self::count_policy_decision_by_lookup`]).
-    ///
-    /// Every pick of the engine in this process says one outcome and one
-    /// mode, so the kept handle is found by the model id, the document's
-    /// generation and the profile, and counts under the first pick's two.
-    pub fn count_engine_pick(
-        kept: &KeptPicks,
-        model_id: &str,
-        pick: PolicyDecision,
-        profile_name: impl FnOnce() -> Option<Arc<str>>,
-    ) {
-        let mut link = &kept.first;
-        while let Some(handles) = link.get() {
-            if handles.generation == pick.generation
-                && handles.profile == pick.profile
-                && *handles.model == *model_id
-            {
-                handles.decided.increment(1);
-                return;
-            }
-            link = &handles.next;
-        }
-        let name = profile_name();
-        let label = intern_model_label(model_id);
-        if name.is_none() || !handles::keep_handles() || handles::is_sentinel(&label) {
-            let name = pick.profile.and(name);
-            return policy_decisions(label, name, pick.outcome, pick.mode).increment(1);
-        }
-        let decided = policy_decisions(label, name, pick.outcome, pick.mode);
-        decided.increment(1);
-        // A caller another one's handle got ahead of has counted through
-        // its own, which is a handle to the same series, and drops it.
-        let _ = link.set(Box::new(PickHandles {
-            model: model_id.into(),
-            generation: pick.generation,
-            profile: pick.profile,
-            decided,
-            next: std::sync::OnceLock::new(),
-        }));
-    }
-
-    /// Count one policy decision for `model_id` by a lookup of its series
-    /// (`smg_policy_decisions_total`): no handle is kept for it. For the
-    /// decisions of the engine in this process that place no worker, which
-    /// no pool's kept handle counts ([`Self::count_engine_pick`]).
-    pub fn count_policy_decision_by_lookup(
-        model_id: &str,
-        decision: PolicyDecision,
-        profile_name: impl FnOnce() -> Option<Arc<str>>,
-    ) {
-        let name = decision.profile.and_then(|_| profile_name());
-        let label = intern_model_label(model_id);
-        policy_decisions(label, name, decision.outcome, decision.mode).increment(1);
-    }
-
-    /// Record the `seconds` one policy decision took, by a lookup of its
-    /// series (`smg_policy_decision_seconds`): no handle is kept for it.
-    /// For the engine in the gateway's own process, which times one
-    /// decision in [`POLICY_DECISIONS_PER_TIMED`]: there the histogram's
-    /// count is a sample's and the counter's is the decisions'. A caller
-    /// that times every decision keeps its handle
-    /// ([`Self::record_policy_decision`]), and that record stays the one
-    /// reader of the kept handles.
-    pub fn time_policy_decision(mode: &'static str, outcome: &'static str, seconds: f64) {
-        histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome).record(seconds);
     }
 
     /// The count of the shadow decisions that said `kind` beside a live

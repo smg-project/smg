@@ -10,7 +10,7 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_policy_controller::engine::{PolicyEngine, PoolMembers};
+use smg_policy_controller::engine::PoolMembers;
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -20,7 +20,6 @@ use smg_worker::{
 use symphony::grammar::GrammarStart;
 
 use crate::{
-    observability::metrics::KeptPicks,
     policies::hash_ring::HashRing,
     routers::common::pair_index::{PdPairIndex, PdWire},
 };
@@ -189,14 +188,11 @@ pub struct ModelWorkerSnapshot {
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
-    /// What the policy engine reads of each pool's members (see
-    /// [`Self::pool_members`]), each in a box of its own: the value stands
-    /// on cache lines of its own, and a snapshot no engine reads holds the
-    /// empty cells alone.
+    /// What the policy engine keeps of each pool (see
+    /// [`Self::pool_members_cell`]), each in a box of its own: the value
+    /// stands on cache lines of its own, and a snapshot no engine picks
+    /// over holds the empty cells alone.
     pool_members: [OnceLock<Box<PoolMembers>>; RoutingPool::COUNT],
-    /// The metric handles each pool's picks by the policy engine count
-    /// through (see [`Self::pool_picks`]).
-    pool_picks: [KeptPicks; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -210,7 +206,6 @@ impl ModelWorkerSnapshot {
             labels: OnceLock::new(),
             hash_ring: OnceLock::new(),
             pool_members: std::array::from_fn(|_| OnceLock::new()),
-            pool_picks: std::array::from_fn(|_| KeptPicks::default()),
         }
     }
 
@@ -365,48 +360,19 @@ impl ModelWorkerSnapshot {
             .clone()
     }
 
-    /// What the policy engine reads of `pool`'s members: `engine` reads the
-    /// pool's workers on the first request after the membership change,
-    /// every request after it borrows the kept value, so a decision builds
-    /// nothing of the fleet, whatever its size. The value holds the pool's
-    /// own list ([`Self::pool`]), the one a classic policy is handed, and
-    /// nothing that changes while the membership stands: a worker's health
-    /// and its requests in flight stay on the worker, where a decision
-    /// reads them.
-    ///
-    /// `model_id` is the id the first request spelled. The engine keeps
-    /// what it reads of an id with that spelling and reads a request under
-    /// another by its own, so the first spelling to arrive decides nothing
-    /// for the others (an alias and its canonical id share one snapshot).
-    /// The gateway holds one engine, set once at its start: no other is
-    /// handed the value.
-    pub(crate) fn pool_members(
-        &self,
-        pool: RoutingPool,
-        model_id: &str,
-        engine: &PolicyEngine,
-    ) -> &PoolMembers {
-        self.pool_members[pool.index()]
-            .get_or_init(|| Box::new(engine.pool_members(model_id, self.pool(pool))))
-    }
-
-    /// The cell of [`Self::pool_members`] for `pool`, as the placement hands
-    /// it on beside the pool's name ([`NamedList::members`]): the policy
-    /// object that asks the engine fills it at its first pick over the pool
-    /// and borrows the value at each pick after. Nothing is built for a
-    /// pool no such policy picks over.
+    /// The cell for what the policy engine keeps of `pool`, as the placement
+    /// hands it on beside the pool's name ([`NamedList::members`]): the
+    /// pool's own list ([`Self::pool`]) and the word a rotation counts its
+    /// turns in. The policy object that asks the engine fills the cell at
+    /// its first pick over the pool and borrows the value at each pick
+    /// after. A registry holds one engine, the one its policies ask, so
+    /// one engine fills a snapshot's cells. Nothing is built for a pool no
+    /// such policy picks over, and nothing that changes while the
+    /// membership stands is kept: a worker's health stays on the worker.
     ///
     /// [`NamedList::members`]: crate::policies::NamedList::members
     pub(crate) fn pool_members_cell(&self, pool: RoutingPool) -> &OnceLock<Box<PoolMembers>> {
         &self.pool_members[pool.index()]
-    }
-
-    /// The metric handles the picks of `pool` by the policy engine count
-    /// through: built by the first pick after the membership change, found
-    /// by every pick after it with no lookup. A new snapshot starts with
-    /// none.
-    pub(crate) fn pool_picks(&self, pool: RoutingPool) -> &KeptPicks {
-        &self.pool_picks[pool.index()]
     }
 
     /// The workers of `pool`, projected once per snapshot and borrowed from

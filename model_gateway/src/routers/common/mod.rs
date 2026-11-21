@@ -28,9 +28,6 @@
 //! - `placement` — policy-driven worker placement over the routing
 //!   pools (single worker and prefill/decode pairs), the one sequence the
 //!   HTTP and gRPC families used to each carry a copy of
-//! - `policy_placement` — that placement decided by the policy engine,
-//!   where the gateway keeps it in its own process: the same pools of the
-//!   same registry, read in place
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - `test_support` (test builds only) — the fast retry policy the HTTP
@@ -71,7 +68,6 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
-pub(crate) mod policy_placement;
 pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
@@ -256,23 +252,6 @@ pub mod bench_support {
         policies.set_load_receiver(loads);
     }
 
-    /// Sets `policies` the policy engine of the document in force under
-    /// `config`, validated as the gateway's start validates it: from then on
-    /// [`route_classic`] is placed by the engine, over the same registry,
-    /// the same policies and the same workers.
-    ///
-    /// # Errors
-    ///
-    /// A configuration no policy document says, and a document the engine
-    /// refuses, each in its own words.
-    pub fn set_policy_engine_of(
-        policies: &PolicyRegistry,
-        config: &RouterConfig,
-    ) -> Result<(), String> {
-        policies.set_policy_engine(policy_engine_of(config)?);
-        Ok(())
-    }
-
     /// The classic policy registry of `config`'s policy, its policies
     /// asking the policy engine of the document in force under `config`:
     /// [`route_classic`] then runs the classic placement, and the pass asks
@@ -281,9 +260,10 @@ pub mod bench_support {
     ///
     /// # Errors
     ///
-    /// As [`set_policy_engine_of`], and a policy the engine does not pick
-    /// by itself: the registry would hand out the classic policy, and a
-    /// cell named for the object would time that one.
+    /// A configuration no policy document says, a document the engine
+    /// refuses, and a policy the engine does not pick by itself: the
+    /// registry would hand out the classic policy, and a cell named for
+    /// the object would time that one.
     pub fn policies_asking_the_engine(config: &RouterConfig) -> Result<PolicyRegistry, String> {
         let policies = PolicyRegistry::with_policy_engine(
             config.policy.clone(),

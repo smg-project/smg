@@ -5,11 +5,11 @@ use crate::{
     document::spec::ProfileSpec,
     engine::{
         decision::{Targets, MAX_TARGETS},
-        framework::{Picker, TieBand, LIVE_DRAWS},
+        framework::{Picker, TieBand},
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::{draw_kept, draw_kept_live, push_drawn, target_of},
+    stages::builtins::{draw_kept, push_drawn, target_of},
     tracking::lease::Lifecycle,
     Draw,
 };
@@ -43,33 +43,6 @@ impl Picker for Random {
     }
 
     fn draws_first(&self) -> bool {
-        true
-    }
-
-    // Reads no fact of a row: its draw is its whole rule.
-    fn reads_no_live_fact(&self) -> bool {
-        true
-    }
-
-    /// The pick alone: a uniform draw over the pool, drawn again while its
-    /// row is refused, [`LIVE_DRAWS`] draws at the most. A draw kept is a
-    /// uniform draw over the rows the whole pass keeps, and the whole pass
-    /// behind sixteen refused draws picks uniformly over them too, so the
-    /// pick's law is one whichever made it. The gateway's own random policy
-    /// draws so, by the same bound.
-    fn draw_live(
-        &self,
-        _: &RequestFacts<'_>,
-        _: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        keep: &mut dyn FnMut(&Candidate) -> bool,
-        kept: &mut Vec<u32>,
-        draw: &mut Draw,
-    ) -> bool {
-        let Some(pick) = draw_kept_live(draw, candidates, LIVE_DRAWS, keep) else {
-            return false;
-        };
-        kept.push(pick as u32);
         true
     }
 

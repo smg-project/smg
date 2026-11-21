@@ -43,7 +43,7 @@ use crate::{
         common::{
             header_utils, overload,
             pair_index::PdPairIndex,
-            pd_admission, policy_placement,
+            pd_admission,
             prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
             retry::mark_non_retryable,
             snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
@@ -364,11 +364,6 @@ pub(crate) fn candidates(
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
 /// selectable. Records the selection metric under the chosen worker's own
 /// transport label.
-///
-/// Where the gateway keeps the policy engine in its own process the engine
-/// decides here, over the same pool of the same registry
-/// ([`policy_placement::single`]), and the decision is counted as the
-/// engine's.
 pub(crate) fn select_single(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -377,9 +372,6 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
-    if let Some(engine) = policies.policy_engine() {
-        return policy_placement::single(engine, registry, model_id, pool, wire, inputs);
-    }
     let snapshot = registry.get_routing_snapshot(model_id);
     select_single_of(registry, policies, model_id, &snapshot, pool, wire, inputs)
 }

@@ -154,8 +154,6 @@ impl RoundRobin {
     /// fingerprint where the request carries it and its name's bytes where
     /// it does not: a host that carries it on some requests alone turns two
     /// rotations of the pool, each whole.
-    // In line in the draw over either kind of rows, as it was in its one caller.
-    #[inline(always)]
     fn pool_key(facts: &RequestFacts<'_>, pool: &PoolFacts<'_>, rows: usize) -> u64 {
         let mut key = FxHasher::default();
         if facts.model_fingerprint == ModelFingerprint::NONE {
@@ -225,48 +223,6 @@ impl Picker for RoundRobin {
         true
     }
 
-    // Reads no fact of a row: its rotation is its whole rule.
-    fn reads_no_live_fact(&self) -> bool {
-        true
-    }
-
-    /// The pool's own turn, and no alternate: the row the pool's rotation
-    /// lands on is the pick when every filter keeps it. A turn that lands
-    /// on a refused row takes the pool's next turn, as many turns as the
-    /// pool's size earns (`live_turns`), and the first row kept is the
-    /// pick. Each turn is one step of the pool's rotation and one read of a
-    /// worker, and no step is taken twice: over a turn of the pool each
-    /// kept row is the pick of exactly one request, as in the survivors'
-    /// own rotation, and no request reads the pool whole while a kept row
-    /// stands within those turns. The requests are served in the pool's
-    /// order, where the whole pass serves them in the survivors'. Past a
-    /// run of refused rows that long the whole pass decides: none of the
-    /// turns taken stood on a kept row, so no kept row lost its turn. No
-    /// value of the seed's stream is read.
-    fn draw_live(
-        &self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        keep: &mut dyn FnMut(&Candidate) -> bool,
-        kept: &mut Vec<u32>,
-        _: &mut Draw,
-    ) -> bool {
-        let rows = candidates.len();
-        if rows == 0 {
-            return false;
-        }
-        let key = Self::pool_key(facts, pool, rows);
-        for _ in 0..live_turns(rows) {
-            let turn = self.advance(key) as usize % rows;
-            if keep(&candidates[turn]) {
-                kept.push(turn as u32);
-                return true;
-            }
-        }
-        false
-    }
-
     // Its rotation is its whole rule, and a pool's own word counts it.
     fn picks_live(&self) -> bool {
         true
@@ -276,8 +232,8 @@ impl Picker for RoundRobin {
     /// one read of the worker the turn lands on. A turn that lands on a
     /// refused worker takes the pool's next turn, as many turns as the
     /// pool's size earns (`live_turns`), and the first worker kept is the
-    /// pick, as [`Self::draw_live`] takes them over rows. No table is
-    /// looked up: the caller keeps the pool's rotation beside the pool.
+    /// pick. No table is looked up: the caller keeps the pool's rotation
+    /// beside the pool.
     fn pick_live(&self, pool: &LivePool<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
         let rows = pool.rows;
         if rows == 0 {

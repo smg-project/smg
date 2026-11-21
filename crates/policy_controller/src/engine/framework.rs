@@ -43,9 +43,6 @@ mod vetoed;
 
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
-#[cfg(feature = "test-util")]
-pub use live::turn_live_draw_from;
-pub use live::{LIVE_DRAWS, LIVE_DRAW_FROM};
 use vetoed::AllVetoed;
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -394,15 +391,6 @@ pub trait Scorer: Lifecycle + Debug {
     fn warm_rule(&self) -> Option<WarmRule> {
         None
     }
-
-    /// Whether the scorer answers over rows that carry no live fact
-    /// ([`Engine::decide_live`]): it reads no health bit, no count and no
-    /// report off a row. The default is no, and a profile that holds a
-    /// scorer that says no is decided over rows written for the decision.
-    /// The engine reads it once per profile when it is built.
-    fn reads_no_live_fact(&self) -> bool {
-        false
-    }
 }
 
 /// What a picker's narrowing left of the survivors: the first `compared` are
@@ -646,38 +634,6 @@ pub trait Picker: Lifecycle + Debug {
         false
     }
 
-    /// Whether the picker decides over rows that carry no live fact
-    /// ([`Engine::decide_live`]): it reads no health bit, no count and no
-    /// report off a row, and it draws its pick by [`Picker::draw_live`].
-    /// The default is no, and a profile under a picker that says no is
-    /// decided over rows written for the decision. The engine reads it
-    /// once per profile when it is built.
-    fn reads_no_live_fact(&self) -> bool {
-        false
-    }
-
-    /// [`Picker::draw_first`] for a decision over live rows
-    /// ([`Engine::decide_live`]). There each row `keep` is asked about is
-    /// one read of a worker, and one target is taken a decision: the picker
-    /// draws its pick and no alternate, and where the row drawn is refused
-    /// it goes on by its own rule, as far as its own bound. A rotation
-    /// takes the pool's next turn, and a random pick draws again
-    /// ([`LIVE_DRAWS`]). A whole pass reads every worker of the pool, so it
-    /// is this draw's last resort. On `true`, `kept` holds the pick. On
-    /// `false` nothing is decided, what `kept` holds is dropped and the
-    /// whole pass runs. The default is the picker's own draw.
-    fn draw_live(
-        &self,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        keep: &mut dyn FnMut(&Candidate) -> bool,
-        kept: &mut Vec<u32>,
-        draw: &mut Draw,
-    ) -> bool {
-        self.draw_first(facts, pool, candidates, keep, kept, draw)
-    }
-
     /// Whether the picker places a request over a pool's workers by itself
     /// ([`Picker::pick_live`]): its own rule is its whole pick, and it
     /// reads no row, no score and no count. A caller that keeps a worker's
@@ -690,7 +646,7 @@ pub trait Picker: Lifecycle + Debug {
     }
 
     /// One pick over `pool` by the picker's own rule alone
-    /// ([`Picker::picks_live`]). `keep` asks the profile's tests of the
+    /// ([`Picker::picks_live`]). `keep` asks the caller's test of the
     /// worker at a position of the pool: one read of that worker. `Some`
     /// is the position picked, which `keep` kept. `None` where the rule's
     /// own bound ran out before a worker was kept, as a rotation's turns
@@ -3064,11 +3020,6 @@ pub struct Engine {
     /// pass keeps the rows of the single plan's pool by it
     /// ([`keep_folded`]).
     row_tests: Vec<Option<RowTests>>,
-    /// Per profile, whether its stages decide over rows that carry no live
-    /// fact ([`live::reads_no_live_fact`]), said once at the build. A
-    /// decision over live rows reads it ([`Self::decide_live`]), and no
-    /// other does.
-    reads_no_live_fact: Vec<bool>,
     /// Per profile, which of its leading stages are ranks ([`Order`]). A
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
@@ -4153,11 +4104,6 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
-        let reads_no_live_fact: Vec<bool> = profiles
-            .iter()
-            .zip(&row_tests)
-            .map(|(profile, &folded)| live::reads_no_live_fact(profile, folded))
-            .collect();
         let named_by: Vec<NamedBy> = profiles
             .iter()
             .zip(&row_tests)
@@ -4257,7 +4203,6 @@ impl Engine {
             profile_needs,
             named_by,
             row_tests,
-            reads_no_live_fact,
             orders,
             seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,

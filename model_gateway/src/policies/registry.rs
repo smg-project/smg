@@ -185,13 +185,6 @@ pub struct PolicyRegistry {
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
 
-    /// The policy engine that places requests in the policies' stead, over
-    /// the same registry and the same workers (set once at startup,
-    /// lock-free reads via OnceLock). Empty unless the `policy_controller`
-    /// setting is on with no controller address: the placement asks it
-    /// where it stands, and the policies above where it does not.
-    policy_engine: Arc<OnceLock<Arc<PolicyEngine>>>,
-
     /// The policy engine the policies built here ask, where the gateway
     /// keeps one in its own process ([`Self::with_policy_engine`]): a policy
     /// whose name is a profile the engine picks by itself is built as the
@@ -314,7 +307,6 @@ impl PolicyRegistry {
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
-            policy_engine: Arc::new(OnceLock::new()),
             asked_engine,
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
@@ -993,21 +985,6 @@ impl PolicyRegistry {
 
     pub fn get_dp_rank_policy(&self) -> Option<Arc<dyn DPRankLoadPolicy>> {
         self.dp_rank_policy.get().map(Arc::clone)
-    }
-
-    /// Hand the placement `engine`, the policy engine that decides in this
-    /// registry's stead from then on (set once at startup). Nothing else
-    /// of the registry changes: its policies stay built, and the workers'
-    /// completions still reach them.
-    pub fn set_policy_engine(&self, engine: Arc<PolicyEngine>) {
-        debug!("set policy engine");
-        let _ = self.policy_engine.set(engine);
-    }
-
-    /// The policy engine that places requests, where one was set
-    /// ([`Self::set_policy_engine`]): one read, no count taken.
-    pub(crate) fn policy_engine(&self) -> Option<&PolicyEngine> {
-        self.policy_engine.get().map(|engine| &**engine)
     }
 
     /// Set the decode policy for PD mode (set once at startup).
