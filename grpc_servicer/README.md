@@ -127,8 +127,15 @@ and never schedules. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any public host the router
-forwards. The worker reads that list as the router reads its own, for vLLM's
-check of the first URL and for its own check of every redirect: entries are
+forwards. The router holds a forwarded media URL to its own media fetch policy
+by what the URL names: a host off the router's `--mm-allowed-media-domains`
+and, unless the router runs with `--mm-allow-private-media-hosts` for a
+deployment whose media origin is internal, a loopback, link-local or private
+address literal or a loopback name is refused with a 400 before a worker is
+selected. The router fetches nothing and looks nothing up for a forwarded URL,
+so the address a name resolves to and the target of a redirect are judged on
+the worker. The worker reads its allow-list as the router reads its own, for
+vLLM's check of the first URL and for its own check of every redirect: entries are
 trimmed and compared case-insensitively (an entry with padding or capitals,
 which used to match no host, now matches its host), and an IPv6 address is
 listed in brackets (`[2001:db8::1]`). vLLM's check wants the first URL to spell

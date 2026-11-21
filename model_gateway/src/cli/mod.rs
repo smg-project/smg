@@ -956,14 +956,21 @@ struct WorkerArgs {
     /// processes media itself, by name, comma-separated; a redirect to any
     /// other host is refused. Unset allows any host the address policy
     /// passes (public addresses, or private ones with
-    /// `--mm-allow-private-media-hosts`).
+    /// `--mm-allow-private-media-hosts`). A URL the gRPC router forwards to
+    /// a worker under worker-side processing (`--mm-processing worker` or
+    /// `auto`) is held to the list by the host it names; the worker's own
+    /// allow-list bounds the redirects it follows.
     #[arg(long, value_delimiter = ',', help_heading = "Multimodal")]
     mm_allowed_media_domains: Option<Vec<String>>,
 
     /// Allow client-supplied media URLs that name or resolve to a loopback,
     /// link-local or private address, for a deployment whose media origin is
     /// internal; by default such URLs are refused before anything is
-    /// connected. Falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
+    /// connected. A URL the gRPC router forwards to a worker under
+    /// worker-side processing (`--mm-processing worker` or `auto`) is
+    /// refused by what it names (an address literal, a loopback name); the
+    /// address a name resolves to is judged by the worker that fetches.
+    /// Falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     mm_allow_private_media_hosts: bool,
 

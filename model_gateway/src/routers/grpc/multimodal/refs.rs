@@ -92,7 +92,9 @@ pub(crate) enum MmRefsError {
     /// url that is empty or begins with whitespace or a control character, a
     /// data URL whose header names no base64 payload or whose payload is
     /// empty, an inline part whose media type is not one `type/subtype` pair
-    /// or whose payload itself opens with a data URL header. The request's
+    /// or whose payload itself opens with a data URL header, a URL whose host
+    /// the media fetch policy refuses by what the URL itself says (see
+    /// `check_forwarded_hosts`). The request's
     /// own fault, under the code the router-side pipeline answers invalid
     /// media with (`invalid_multimodal_request`); the media type read has no
     /// router-side counterpart (see `check_forwarded_references`).
@@ -597,6 +599,9 @@ pub(crate) fn resolve_mm_processing(
         // a shape no engine serves is refused here, in the connector's
         // words, before a worker is selected.
         check_forwarded_references(plan)?;
+        // And their hosts, held to the media fetch policy the router-side
+        // placement fetches under, as far as a URL's own text says.
+        check_forwarded_hosts(plan, &components.media_connector)?;
     }
 
     if resolved == MmProcessing::Router && placeholders.is_worker_only() {
@@ -913,6 +918,40 @@ fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// The hosts of the URLs a forwarded plan carries, held to the media fetch
+/// policy by what each URL's text says, in the router-side fetch's words.
+/// Nothing is fetched or looked up here: the worker that fetches judges the
+/// address a name resolves to and the target of a redirect.
+fn check_forwarded_hosts(
+    plan: &MediaPlan,
+    connector: &media::MediaConnector,
+) -> Result<(), MmRefsError> {
+    for (index, part) in plan.parts().iter().enumerate() {
+        let (MediaContentPart::ImageUrl { url, .. }
+        | MediaContentPart::VideoUrl { url, .. }
+        | MediaContentPart::AudioUrl { url, .. }) = part
+        else {
+            continue;
+        };
+        if opens_a_data_url(url) {
+            continue;
+        }
+        connector
+            .check_as_written(url)
+            .map_err(|cause| MmRefsError::InvalidReference {
+                index,
+                cause: match cause {
+                    MediaConnectorError::InvalidUrl(_) => {
+                        MediaConnectorError::InvalidUrl(echoed_url(url))
+                    }
+                    cause => cause,
+                }
+                .to_string(),
+            })?;
     }
     Ok(())
 }
@@ -2386,5 +2425,93 @@ mod tests {
             Some(6)
         );
         assert_eq!(data_url_payload_bytes("DATA:text/plain,hello"), Some(5));
+    }
+
+    /// Under either placement that forwards, the door holds a forwarded URL
+    /// to the media fetch policy by what the URL says: the router-side
+    /// fetch's sentence under its code, the item named.
+    #[test]
+    fn a_forwarded_url_is_held_to_the_media_fetch_policy_at_the_door() {
+        const UNLESS: &str =
+            "which media is not fetched from unless private media hosts are allowed";
+        let placeholders = expandable_placeholders();
+        let registry = registry_with(vec![capable("grpc://127.0.0.1:9440")]);
+        let decide = |components: &MultimodalComponents, url: &str| {
+            resolve_mm_processing(
+                components,
+                &registry,
+                MODEL,
+                &plan(vec![
+                    image_url("https://media.example/1.png"),
+                    image_url(url),
+                ]),
+                &placeholders,
+            )
+        };
+        let refused = |cause: String| MmRefsError::InvalidReference { index: 1, cause };
+        for mode in [MmProcessingMode::Worker, MmProcessingMode::Auto] {
+            let strict = components(mode);
+            for (url, cause) in [
+                (
+                    "http://127.0.0.1:8000/1.png",
+                    format!("media host '127.0.0.1' resolves to 127.0.0.1, a loopback address, {UNLESS}"),
+                ),
+                (
+                    "http://localhost:8000/1.png",
+                    format!("media host 'localhost' resolves to 127.0.0.1, a loopback address, {UNLESS}"),
+                ),
+                (
+                    "https://[fd00::1]/1.png",
+                    format!("media host '[fd00::1]' resolves to fd00::1, a unique local address, {UNLESS}"),
+                ),
+                (
+                    "http://media.example\\@10.0.0.5/1.png",
+                    "invalid media URL: http://media.example\\@10.0.0.5/1.png".to_string(),
+                ),
+            ] {
+                let err = decide(&strict, url).expect_err(url);
+                assert_eq!(err.code(), "invalid_multimodal_request", "{mode} {url}");
+                assert_eq!(err, refused(cause), "{mode} {url}");
+            }
+            assert_eq!(
+                decide(&strict, "https://media.example/2.png").expect("a public name is forwarded"),
+                MmProcessing::Worker,
+                "{mode}"
+            );
+
+            // Private hosts allowed, and an allow-list that names one.
+            let mut settings = MultimodalSettings::default();
+            settings.allow_private_media_hosts.value = true;
+            settings.allowed_media_domains.value =
+                Some(vec!["media.example".to_string(), "127.0.0.1".to_string()]);
+            let mut internal = MultimodalComponents::new(
+                Arc::new(MultimodalConfigRegistry::new()),
+                None,
+                None,
+                &settings,
+            )
+            .expect("components");
+            internal.processing = mode;
+            assert_eq!(
+                decide(&internal, "http://127.0.0.1:8000/1.png").expect("a listed private host"),
+                MmProcessing::Worker,
+                "{mode}"
+            );
+            assert_eq!(
+                decide(&internal, "http://other.example/1.png").expect_err("off the allow-list"),
+                refused("media domain 'other.example' is not in the allow list".to_string()),
+                "{mode}"
+            );
+        }
+        // The router placement forwards nothing: its own fetch judges the
+        // host, at every hop.
+        assert_eq!(
+            decide(
+                &components(MmProcessingMode::Router),
+                "http://127.0.0.1:8000/1.png"
+            )
+            .expect("the router fetches"),
+            MmProcessing::Router
+        );
     }
 }
