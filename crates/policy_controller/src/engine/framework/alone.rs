@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use super::{Engine, Marks, Profile};
+use super::{profile_index, Engine, Marks, Profile};
 use crate::{engine::view::Phase, stages::builtins::RowTests};
 
 /// A profile whose whole decision is one pick of its picker
@@ -31,6 +31,20 @@ pub enum Place<'a> {
         /// The first of its stages that asks more.
         stage: InTheWay,
     },
+}
+
+/// A place a binding of a document names whose profile asks more of a
+/// decision than one pick of its picker ([`Engine::not_alone`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotAlone<'a> {
+    /// The model pattern of the binding that names the place.
+    pub model: &'a str,
+    /// The place's phase.
+    pub phase: Phase,
+    /// The profile the binding resolves the phase to.
+    pub profile: &'a str,
+    /// The first of the profile's stages that asks more.
+    pub stage: InTheWay,
 }
 
 /// What stands between a profile and a pick its picker makes alone, by the
@@ -94,6 +108,34 @@ impl Engine {
                 stage,
             },
         }
+    }
+
+    /// The first place a binding of the document names whose profile is
+    /// not decided by one pick of its picker ([`Self::place_for`]): each
+    /// binding in the document's order, at each phase it covers and its
+    /// plan has a side for. `None` where every such place is picked so. A
+    /// caller that asks the engine for picks alone refuses a document that
+    /// holds such a place, by what this names.
+    #[must_use]
+    pub fn not_alone(&self) -> Option<NotAlone<'_>> {
+        const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+        self.bindings.iter().find_map(|entry| {
+            let binding = &entry.binding;
+            PHASES.into_iter().find_map(|phase| {
+                if !binding.covers(phase) {
+                    return None;
+                }
+                let index = profile_index(binding, phase)?;
+                let profile = self.profiles.get(usize::from(index))?;
+                let stage = self.in_the_way(index, profile, phase)?;
+                Some(NotAlone {
+                    model: &binding.model,
+                    phase,
+                    profile: &profile.name,
+                    stage,
+                })
+            })
+        })
     }
 
     /// The first stage of `profile`, which stands at `index`, that asks

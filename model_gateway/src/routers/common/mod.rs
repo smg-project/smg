@@ -225,7 +225,6 @@ pub(crate) fn attach_sized_body(
 pub mod bench_support {
     use std::sync::Arc;
 
-    use smg_policy_controller::{document::AppliedSpec, engine::PolicyEngine, stages::Catalog};
     use smg_worker::{
         identity::basic::{Worker, WorkerLoadGuard},
         load::state::LoadReceiver,
@@ -238,9 +237,10 @@ pub mod bench_support {
     };
     pub use crate::policy_controller::bench_support::{ControllerPath, Route};
     use crate::{
-        config::{RouterConfig, RoutingKeyOverrideConfig},
+        config::RouterConfig,
         observability::cache_trace,
-        policies::{DocumentOrigin, EnginePolicy, PolicyRegistry},
+        policies::{EnginePolicy, PolicyRegistry},
+        policy_controller::start_in_process,
         routers::common::{
             pair_index::{PdPairIndex, PdWire},
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
@@ -253,10 +253,11 @@ pub mod bench_support {
     }
 
     /// The classic policy registry of `config`'s policy, its policies
-    /// asking the policy engine of the document in force under `config`:
-    /// [`route_classic`] then runs the classic placement, and the pass asks
-    /// the policy object that asks the engine where it asks a classic
-    /// policy.
+    /// asking the policy engine of the document in force under `config`,
+    /// built as a gateway's start builds both under the setting, whatever
+    /// `config` says of the setting: [`route_classic`] then runs the
+    /// classic placement, and the pass asks the policy object that asks the
+    /// engine where it asks a classic policy.
     ///
     /// # Errors
     ///
@@ -265,11 +266,18 @@ pub mod bench_support {
     /// registry would hand out the classic policy, and a cell named for
     /// the object would time that one.
     pub fn policies_asking_the_engine(config: &RouterConfig) -> Result<PolicyRegistry, String> {
+        let picked = RouterConfig {
+            policy_controller: true,
+            ..config.clone()
+        };
+        let started = start_in_process(&picked, None)
+            .map_err(|refused| refused.to_string())?
+            .ok_or("this configuration places its requests by no routing policy")?;
         let policies = PolicyRegistry::with_policy_engine(
             config.policy.clone(),
-            RoutingKeyOverrideConfig::default(),
-            policy_engine_of(config)?,
-            DocumentOrigin::Settings,
+            config.routing_key_override.clone(),
+            started.engine,
+            started.origin,
         );
         if policies.get_default_policy().as_any().is::<EnginePolicy>() {
             Ok(policies)
@@ -279,21 +287,6 @@ pub mod bench_support {
                 config.policy.name()
             ))
         }
-    }
-
-    /// The policy engine of the document in force under `config`, validated
-    /// as the gateway's start validates it.
-    fn policy_engine_of(config: &RouterConfig) -> Result<Arc<PolicyEngine>, String> {
-        let document = config
-            .policy_document_in_force()
-            .map_err(|refused| refused.to_string())?;
-        let spec = AppliedSpec::validate_in(
-            &document,
-            &Catalog::builtin(),
-            &config.denied_view_headers(),
-        )
-        .map_err(|refused| refused.to_string())?;
-        Ok(Arc::new(PolicyEngine::new(spec)))
     }
 
     /// One request's routing under the classic policies on `route`: the

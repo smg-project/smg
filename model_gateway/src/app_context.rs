@@ -44,7 +44,7 @@ use crate::{
         feed::Feed,
         follower::{Follower, Settings},
         operators::Operators,
-        Started,
+        InProcess, Started,
     },
     rate_limit::RateLimitManager,
     rl_adapter,
@@ -156,6 +156,21 @@ pub struct AppContext {
     pub(crate) policy_engine: Option<Arc<PolicyEngine>>,
     /// The membership feed over [`Self::policy_store`], present wherever the store is.
     pub(crate) policy_feed: Option<Feed>,
+    /// What the start left a gateway that decides in its own process (the
+    /// setting on and no controller's address): the policy engine the
+    /// policies of [`Self::policy_registry`] ask, and the document it
+    /// decides under as written. Nothing else of the policy controller is
+    /// built there: the store, its door, its feed, the follower and
+    /// [`Self::policy_engine`] are a gateway's that follows a controller.
+    /// `None` with the setting off and under an address.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the control plane's policy routes read what the start left"
+        )
+    )]
+    pub(crate) in_process: Option<InProcess>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -256,6 +271,9 @@ pub struct AppContextBuilder {
     /// The policy engine over the feed's holder, built with the feed.
     policy_engine: Option<Arc<PolicyEngine>>,
     policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
+    /// What a start in this process left: the policy engine the policy
+    /// registry is built with.
+    in_process: Option<InProcess>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -425,6 +443,7 @@ impl AppContextBuilder {
             policy_feed: None,
             policy_engine: None,
             policy_follower: None,
+            in_process: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -750,6 +769,7 @@ impl AppContextBuilder {
             policy_follower: self.policy_follower,
             policy_engine: self.policy_engine,
             policy_feed: self.policy_feed,
+            in_process: self.in_process,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -804,8 +824,8 @@ impl AppContextBuilder {
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
             .with_worker_registry()
-            .with_policy_registry(&router_config)
             .with_policy_controller(&router_config, stages)?
+            .with_policy_registry(&router_config)
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -979,15 +999,36 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy store with its operators' door, its membership feed,
-    /// its policy engine with the engine's timer and, under a controller's
-    /// address, the follower of that controller's workers. A start the door
-    /// refuses stops this one, by name.
+    /// Start the policy controller as the configuration picks it.
+    ///
+    /// With no controller's address the gateway decides in its own
+    /// process: the start builds the policy engine of the document in
+    /// force and nothing else, and the policy registry is built with it
+    /// ([`Self::with_policy_registry`]). The store, its door, its feed, the
+    /// follower and the gateway's own engine object stay unset, so every
+    /// site that asks for one of them takes its classic arm: the worker
+    /// registry, the health checks, the load monitor and the worker
+    /// workflows are the classic ones.
+    ///
+    /// Under a controller's address it starts the policy store with its
+    /// operators' door, its membership feed, its policy engine with the
+    /// engine's timer and the follower of that controller's workers. A
+    /// start the document's check refuses stops this one, by name.
     fn with_policy_controller(
         mut self,
         config: &RouterConfig,
         stages: Option<Catalog>,
     ) -> Result<Self, String> {
+        if config.policy_controller_address.is_none() {
+            self.in_process = policy_controller::start_in_process(config, stages)
+                .map_err(|refusal| refusal.to_string())?;
+            // A registry built ahead of this step is built again, with
+            // the engine.
+            if self.in_process.is_some() && self.policy_registry.is_some() {
+                self = self.with_policy_registry(config);
+            }
+            return Ok(self);
+        }
         let started =
             policy_controller::start_with(config, stages).map_err(|refusal| refusal.to_string())?;
         if let Some(Started { store, door }) = started {
@@ -1018,14 +1059,23 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create policy registry
+    /// Create policy registry: the classic one, whose policies ask the
+    /// policy engine where the gateway decides in its own process
+    /// ([`Self::with_policy_controller`]).
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
+        let policy = config.policy.clone();
+        let routing_key_override = config.routing_key_override.clone();
+        let registry = match &self.in_process {
+            Some(started) => PolicyRegistry::with_policy_engine(
+                policy,
+                routing_key_override,
+                Arc::clone(&started.engine),
+                started.origin,
+            ),
+            None => PolicyRegistry::with_override(policy, routing_key_override),
+        };
         self.policy_registry = Some(Arc::new(
-            PolicyRegistry::with_override(
-                config.policy.clone(),
-                config.routing_key_override.clone(),
-            )
-            .with_pd_pairing_mode(config.pd_pairing_mode),
+            registry.with_pd_pairing_mode(config.pd_pairing_mode),
         ));
         self
     }
@@ -1250,6 +1300,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
+    use smg_policy_controller::document::PolicySpec;
     use smg_worker::{
         connection::engine::NO_ENGINE_CONNECTOR,
         identity::basic::{ConnectionMode, Worker, WorkerType},
@@ -1261,6 +1312,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        policies::{DocumentOrigin, EnginePolicy},
         routers::{
             common::{
                 prefill_admission::{test_support::select_worker, PrefillAdmissionAttempt},
@@ -1270,20 +1322,107 @@ mod tests {
         },
     };
 
+    /// With the setting on and no controller's address the gateway decides
+    /// in its own process. The context holds the policy engine and nothing
+    /// else of the policy controller: no store, no door, no feed, no
+    /// follower and no engine object of the gateway's own. Its policy
+    /// registry is the classic one, and the default policy it built is the
+    /// object that asks the engine. With the setting off it holds neither.
     #[tokio::test]
-    async fn a_context_without_a_controller_address_has_no_follower() {
+    async fn a_context_in_process_holds_the_policy_engine_and_nothing_else_of_the_controller() {
         for policy_controller in [false, true] {
             let config = RouterConfig {
                 policy_controller,
+                policy: PolicyConfig::RoundRobin,
                 ..Default::default()
             };
             let context = AppContext::from_config(config, 10, None, None)
                 .await
                 .unwrap();
             assert!(context.policy_follower.is_none());
-            assert_eq!(context.policy_store.is_some(), policy_controller);
+            assert!(context.policy_store.is_none());
+            assert!(context.policy_operators.is_none());
+            assert!(context.policy_feed.is_none());
+            assert!(context.policy_engine.is_none());
+            assert!(!context.follows_controller());
+            assert_eq!(context.in_process.is_some(), policy_controller);
+            let default = context.policy_registry.get_default_policy();
+            assert_eq!(default.name(), "round_robin");
+            assert_eq!(default.as_any().is::<EnginePolicy>(), policy_controller);
             assert!(context.worker_monitor.is_some());
         }
+    }
+
+    /// A policy the engine does not pick by itself yet stays the classic
+    /// policy of its setting under the setting, and the start is not
+    /// refused: the document the routing settings mean has that policy
+    /// behind each place.
+    #[tokio::test]
+    async fn a_setting_the_engine_does_not_pick_yet_starts_on_its_classic_policy() {
+        let config = RouterConfig {
+            policy_controller: true,
+            policy: PolicyConfig::Random,
+            ..Default::default()
+        };
+        let context = AppContext::from_config(config, 10, None, None)
+            .await
+            .unwrap();
+        let default = context.policy_registry.get_default_policy();
+        assert_eq!(default.name(), "random");
+        assert!(!default.as_any().is::<EnginePolicy>());
+
+        // What the control plane's read of the document answers from, with
+        // no store: the engine's document under the number a gateway's
+        // first document takes, its YAML as the start wrote it, the time
+        // it took effect and the stages it was validated over.
+        let started = context
+            .in_process
+            .as_ref()
+            .expect("the start left its engine");
+        assert_eq!(started.origin, DocumentOrigin::Settings);
+        assert_eq!(started.engine.spec().generation(), 1);
+        let read: PolicySpec = serde_yaml::from_str(&started.written).expect("YAML");
+        assert!(read.profiles.contains_key("random"));
+        assert!(started.applied <= std::time::SystemTime::now());
+        assert!(Arc::strong_count(&started.stages) >= 1);
+    }
+
+    /// A document its operator supplied has no setting behind a place. One
+    /// whose every place the engine picks by itself starts, and its
+    /// bindings place the models. One that holds a place the engine does
+    /// not decide in this process yet is refused at the start, by the
+    /// profile, the stage of it that asks more, the binding and the phase.
+    #[tokio::test]
+    async fn a_supplied_document_starts_where_the_engine_picks_each_of_its_places() {
+        let supplied = |name: &str| RouterConfig {
+            policy_controller: true,
+            policy_spec: Some(PolicySpec::preset(name).expect("a built-in preset")),
+            ..Default::default()
+        };
+        let context = AppContext::from_config(supplied("round_robin"), 10, None, None)
+            .await
+            .unwrap();
+        assert!(context.policy_store.is_none());
+        let default = context.policy_registry.get_default_policy();
+        assert!(default.as_any().is::<EnginePolicy>());
+        // A supplied document that names no number takes 1, as at the door.
+        let started = context
+            .in_process
+            .as_ref()
+            .expect("the start left its engine");
+        assert_eq!(started.origin, DocumentOrigin::Supplied);
+        assert_eq!(started.engine.spec().generation(), 1);
+
+        let started = AppContext::from_config(supplied("least_load"), 10, None, None).await;
+        let Err(refused) = started else {
+            panic!("the start is not refused");
+        };
+        assert!(
+            refused.contains("profile `least_load` is not decided in this process yet"),
+            "{refused}"
+        );
+        assert!(refused.contains("it holds the scorer `"), "{refused}");
+        assert!(refused.contains("(binding `*`, phase single)"), "{refused}");
     }
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
@@ -2065,6 +2204,7 @@ pub(crate) mod testing {
             policy_follower: None,
             policy_engine: None,
             policy_feed: None,
+            in_process: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

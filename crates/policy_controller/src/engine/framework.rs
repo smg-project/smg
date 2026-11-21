@@ -41,7 +41,7 @@ mod encode;
 mod engines;
 mod vetoed;
 
-pub use alone::{AloneProfile, InTheWay, Place};
+pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
 use vetoed::AllVetoed;

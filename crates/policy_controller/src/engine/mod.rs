@@ -35,9 +35,9 @@ pub use door::{
 };
 pub use framework::{
     AloneProfile, Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts,
-    Engine, Filter, Front, InTheWay, Narrowed, OverloadThresholds, PairPools, PairSide, PairTable,
-    PairTableError, Picker, Place, Plan, PoolWord, Profile, Scorer, Scratch, Spread, TieBand, Unit,
-    Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
+    Engine, Filter, Front, InTheWay, Narrowed, NotAlone, OverloadThresholds, PairPools, PairSide,
+    PairTable, PairTableError, Picker, Place, Plan, PoolWord, Profile, Scorer, Scratch, Spread,
+    TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 #[cfg(feature = "in-process")]
 pub use policy_engine::{PolicyEngine, PoolMembers};

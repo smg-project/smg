@@ -41,7 +41,7 @@ use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
 use super::{
-    framework::{AloneProfile, Picker, Place, PoolWord},
+    framework::{AloneProfile, NotAlone, Picker, Place, PoolWord},
     view::Phase,
 };
 use crate::document::spec::AppliedSpec;
@@ -139,6 +139,18 @@ impl PolicyEngine {
     #[must_use]
     pub fn place(&self, model: &str, phase: Phase) -> Place<'_> {
         self.spec.engine().place_for(model, phase)
+    }
+
+    /// The first place a binding of the document names whose profile the
+    /// engine does not decide by one pick ([`Engine::not_alone`]). `None`
+    /// where it decides every place of the document so. A gateway that
+    /// starts under a document its operator supplied refuses the start by
+    /// what this names: nothing else would decide that place.
+    ///
+    /// [`Engine::not_alone`]: super::framework::Engine::not_alone
+    #[must_use]
+    pub fn not_alone(&self) -> Option<NotAlone<'_>> {
+        self.spec.engine().not_alone()
     }
 
     /// One pick under `profile` over `members`, the value this engine made

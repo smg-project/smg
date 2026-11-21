@@ -33,8 +33,18 @@
 //! control plane reads the document in force through it and checks another
 //! against it ([`operators`]). Nothing is applied after the start.
 //!
-//! One site reads the setting, [`start_with`]. Every other site asks what
-//! the start left in the context.
+//! One site reads the setting, the start. Every other site asks what the
+//! start left in the context.
+//!
+//! With no controller's address the gateway decides in its own process
+//! ([`start_in_process`]). The start then builds the policy engine of the
+//! document in force and nothing else of what is described above: no
+//! store, no feed, no door and no engine object of the gateway's own. The
+//! gateway's worker registry, its health checks, its load monitor and its
+//! worker workflows are the classic ones, and the classic policy registry
+//! asks the engine where it asks a classic policy
+//! ([`crate::policies::EnginePolicy`]). The store and what stands on it
+//! are a gateway's that follows a controller ([`start_with`]).
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
@@ -43,11 +53,14 @@
 //! Each row has its worker object in the registry before the gateway
 //! reports a fleet, and the object's status is the row's ([`feeds`]).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 
 pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
-    document::operator::{Format, SpecDoor, SpecRejected},
+    document::{
+        operator::{Format, SpecDoor, SpecRejected, MAX_DOCUMENT_BYTES},
+        AppliedSpec, PolicySpec,
+    },
     stages::Catalog,
     store::MemoryStore,
 };
@@ -57,6 +70,7 @@ use tracing::info;
 use crate::{
     app_context::AppContext,
     config::{validation::ConfigValidator, ConfigError, PolicyDocumentError, RouterConfig},
+    policies::DocumentOrigin,
     routers::{common::snapshot::WorkerRegistry, RouterTrait},
 };
 
@@ -112,6 +126,48 @@ pub(crate) enum StartError {
     /// it, or its view reads a header the gateway keeps to itself.
     #[error(transparent)]
     Spec(#[from] SpecRejected),
+    /// The document its operator supplied holds a place the engine does
+    /// not decide in this process yet. Nothing else would decide that
+    /// place, so the start names it: the profile, the stage of it that
+    /// asks more than one pick, and the binding and phase that reach it.
+    #[error(
+        "the policy document's profile `{profile}` is not decided in this process yet: \
+         it holds {stage} (binding `{model}`, phase {phase})"
+    )]
+    NotInProcess {
+        profile: String,
+        stage: String,
+        model: String,
+        phase: String,
+    },
+}
+
+/// What a start in this process leaves it ([`start_in_process`]): the
+/// policy engine of the document in force, which the classic policy
+/// registry's policies ask, and what the control plane's policy routes
+/// read of the document where no store holds it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the control plane's policy routes read the written document, its time and the stages"
+    )
+)]
+#[derive(Clone)]
+pub(crate) struct InProcess {
+    /// The engine of the document in force, under the number the
+    /// operators' door would give it: its own, and 1 where it names none.
+    pub(crate) engine: Arc<smg_policy_controller::engine::PolicyEngine>,
+    /// How the document came to be.
+    pub(crate) origin: DocumentOrigin,
+    /// The document as the start wrote it, in YAML: the bytes
+    /// `--print-policy-spec` prints where the routing settings mean it.
+    pub(crate) written: String,
+    /// When the start built the engine: the time the document took effect.
+    pub(crate) applied: SystemTime,
+    /// The stages the document was validated over, a host's own among
+    /// them: a check of another document against this one reads them.
+    pub(crate) stages: Arc<Catalog>,
 }
 
 /// What a start leaves the process: the controller's store, and the
@@ -156,6 +212,89 @@ pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<Catalog>,
 ) -> Result<Option<Started>, StartError> {
+    let Some((document, stages)) = document_in_force(config, stages)? else {
+        return Ok(None);
+    };
+    // A given document may hold what its YAML does not say, a `kind` line.
+    // The typed check refuses it by the door's own word before the door
+    // reads the YAML, over the same stages and denied headers.
+    document
+        .validate_in(&stages, &config.denied_view_headers())
+        .map_err(SpecRejected::Invalid)?;
+    let written = serde_yaml::to_string(&document)?;
+    let started = hosted(config, Some(stages), &written)?;
+    info!("The policy controller is picked for this gateway");
+    Ok(Some(started))
+}
+
+/// The start of a gateway that decides in its own process: the setting on
+/// and no controller's address. It reads the setting and the document in
+/// force as [`start_with`] does and refuses what that start refuses, in
+/// the same words. It then builds the policy engine of the document, over
+/// `stages` where a host hands its own, and nothing else: no store, no
+/// door, no feed. `None` where the setting is off or moves nothing.
+///
+/// A document the routing settings mean is decided by the engine where it
+/// picks the place's profile by itself, and by the classic policy of the
+/// setting elsewhere. A document its operator supplied has no setting
+/// behind a place, so a place of it the engine does not pick by itself
+/// is refused here ([`StartError::NotInProcess`]).
+pub(crate) fn start_in_process(
+    config: &RouterConfig,
+    stages: Option<Catalog>,
+) -> Result<Option<InProcess>, StartError> {
+    let Some((mut document, stages)) = document_in_force(config, stages)? else {
+        return Ok(None);
+    };
+    // The bound the operators' door holds a written document to.
+    let written = serde_yaml::to_string(&document)?;
+    let bytes = u64::try_from(written.len()).unwrap_or(u64::MAX);
+    if bytes > MAX_DOCUMENT_BYTES {
+        return Err(SpecRejected::TooLarge(bytes).into());
+    }
+    // The number the door gives a gateway's first document: its own, and
+    // 1 where it names none.
+    if document.generation == 0 {
+        document.generation = 1;
+    }
+    let spec = AppliedSpec::validate_in(&document, &stages, &config.denied_view_headers())
+        .map_err(SpecRejected::Invalid)?;
+    let engine = Arc::new(smg_policy_controller::engine::PolicyEngine::new(spec));
+    let origin = if config.policy_spec.is_some() {
+        DocumentOrigin::Supplied
+    } else {
+        DocumentOrigin::Settings
+    };
+    if origin == DocumentOrigin::Supplied {
+        if let Some(place) = engine.not_alone() {
+            return Err(StartError::NotInProcess {
+                profile: place.profile.to_owned(),
+                stage: place.stage.to_string(),
+                model: place.model.to_owned(),
+                phase: format!("{:?}", place.phase).to_lowercase(),
+            });
+        }
+    }
+    info!(
+        "The policy controller is picked for this gateway: its engine decides in this process, over the gateway's own worker data"
+    );
+    Ok(Some(InProcess {
+        engine,
+        origin,
+        written,
+        applied: SystemTime::now(),
+        stages: Arc::new(stages),
+    }))
+}
+
+/// The document a start runs, and the stages it is validated over: the
+/// stock ones where a host hands none. `None` where the setting is off,
+/// and where it is on and moves nothing. The one site that reads the
+/// setting.
+fn document_in_force(
+    config: &RouterConfig,
+    stages: Option<Catalog>,
+) -> Result<Option<(PolicySpec, Catalog)>, StartError> {
     ConfigValidator::validate_policy_document(config)?;
     if !config.policy_controller {
         return Ok(None);
@@ -175,17 +314,7 @@ pub(crate) fn start_with(
         return Ok(None);
     }
     let document = config.policy_document_in_force()?;
-    let stages = stages.unwrap_or_else(Catalog::builtin);
-    // A given document may hold what its YAML does not say, a `kind` line.
-    // The typed check refuses it by the door's own word before the door
-    // reads the YAML, over the same stages and denied headers.
-    document
-        .validate_in(&stages, &config.denied_view_headers())
-        .map_err(SpecRejected::Invalid)?;
-    let written = serde_yaml::to_string(&document)?;
-    let started = hosted(config, Some(stages), &written)?;
-    info!("The policy controller is picked for this gateway");
-    Ok(Some(started))
+    Ok(Some((document, stages.unwrap_or_else(Catalog::builtin))))
 }
 
 /// A new store and the operators' door over it, holding `written` as the

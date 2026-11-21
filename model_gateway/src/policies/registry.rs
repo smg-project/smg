@@ -87,6 +87,29 @@ struct AskedEngine {
     origin: DocumentOrigin,
 }
 
+/// A place as the start log names it: the model, or every model, and the
+/// phase.
+struct Placed<'a> {
+    model: &'a str,
+    phase: Phase,
+}
+
+impl std::fmt::Display for Placed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let phase = match self.phase {
+            Phase::Single => "single",
+            Phase::Prefill => "prefill",
+            Phase::Decode => "decode",
+            Phase::Encode => "encode",
+        };
+        if self.model == EVERY_MODEL {
+            write!(f, "every model ({phase} requests)")
+        } else {
+            write!(f, "model {} ({phase} requests)", self.model)
+        }
+    }
+}
+
 /// The model id a policy that serves every model is asked for with: the
 /// bindings of every model match it, and no other binding does.
 const EVERY_MODEL: &str = "";
@@ -966,6 +989,11 @@ impl PolicyRegistry {
                         );
                     }
                     let name = self.default_policy_config.name();
+                    let place = Placed {
+                        model: model_id,
+                        phase: Phase::Single,
+                    };
+                    info!("Policy `{name}` of {place}: the policy engine decides it");
                     return Arc::new(EnginePolicy::of(&asked.engine, profile, name));
                 }
                 (Place::Unbound, _) if supplied => warn!(
@@ -1028,7 +1056,8 @@ impl PolicyRegistry {
     /// that profile's picker is its whole decision, the policy is the
     /// object that asks the engine ([`EnginePolicy`]), and `config`'s name
     /// only labels it. Where the engine does not pick the profile so yet,
-    /// or no binding names the place, it is the classic policy.
+    /// or no binding names the place, it is the classic policy. The log
+    /// says which, once for each policy built with an engine asked.
     fn policy_at(
         asked: Option<&AskedEngine>,
         config: &PolicyConfig,
@@ -1038,11 +1067,27 @@ impl PolicyRegistry {
         let Some(asked) = asked else {
             return PolicyFactory::create_from_config(config);
         };
+        let name = config.name();
+        let place = Placed { model, phase };
         match asked.engine.place(model, phase) {
             Place::Alone(profile) => {
-                Arc::new(EnginePolicy::of(&asked.engine, profile, config.name()))
+                info!("Policy `{name}` of {place}: the policy engine decides it");
+                Arc::new(EnginePolicy::of(&asked.engine, profile, name))
             }
-            Place::Unbound | Place::NotYet { .. } => PolicyFactory::create_from_config(config),
+            Place::NotYet { profile, stage } => {
+                info!(
+                    "Policy `{name}` of {place}: the classic policy decides it, \
+                     the policy engine does not pick the profile `{profile}` by itself yet ({stage})"
+                );
+                PolicyFactory::create_from_config(config)
+            }
+            Place::Unbound => {
+                info!(
+                    "Policy `{name}` of {place}: the classic policy decides it, \
+                     no binding of the policy document names the place"
+                );
+                PolicyFactory::create_from_config(config)
+            }
         }
     }
 
