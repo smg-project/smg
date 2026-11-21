@@ -340,6 +340,7 @@ const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
 const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
 const POLICY_SHADOW_DECISIONS_TOTAL: &str = "smg_policy_shadow_decisions_total";
 const POLICY_DECISION_FAULTS_TOTAL: &str = "smg_policy_decision_faults_total";
+const POLICY_UNBOUND_MODELS_TOTAL: &str = "smg_policy_unbound_models_total";
 
 /// Time to first token on edges that resolve it. The same observation as
 /// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
@@ -825,6 +826,11 @@ pub(crate) fn init_metrics() {
         POLICY_DECISION_FAULTS_TOTAL,
         "Policy controller decisions that panicked, with the shadow decisions that panicked \
          beside a live decision that stood"
+    );
+    describe_counter!(
+        POLICY_UNBOUND_MODELS_TOTAL,
+        "Models that got their first worker while no binding of the supplied policy document \
+         names them: the classic policies place their requests"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -2443,6 +2449,13 @@ impl Metrics {
             "stage" => stage
         )
         .increment(1);
+    }
+
+    /// A model got its first worker while no binding of the supplied
+    /// policy document plans its single requests: the classic policies
+    /// place them.
+    pub fn record_policy_unbound_model() {
+        counter!(POLICY_UNBOUND_MODELS_TOTAL).increment(1);
     }
 
     /// Record a request placed although every worker it could use is

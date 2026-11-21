@@ -125,6 +125,11 @@
 //!   follows its own store, on a leader and on a standby alike, and hands
 //!   each object a gRPC connector: an object connects to its engine at its
 //!   first use.
+//! - Behind the `in-process` feature, the engine in a gateway's own process
+//!   (`engine::PolicyEngine`): it gives the gateway's own placement its pick
+//!   over the gateway's worker objects, read in place. It keeps no worker
+//!   list, no health and no count of requests in flight, and names nothing
+//!   of the store.
 //! - Behind the `discovery` feature, worker discovery under the controller:
 //!   the binary takes the discovery flags, and the replica that leads runs
 //!   the selected provider over the replica's worker objects. A pass asks
@@ -172,6 +177,8 @@ mod address;
 pub mod document;
 pub mod engine;
 pub mod load;
+#[cfg(any(feature = "wasm", feature = "controller", feature = "in-process"))]
+mod names;
 pub mod plugins;
 pub mod policies;
 pub mod service;

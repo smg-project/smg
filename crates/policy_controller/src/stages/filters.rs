@@ -7,7 +7,7 @@ use crate::{
     document::spec::Needs,
     engine::{
         framework::Filter,
-        view::{Candidate, Constraints, LoadReportCutoff, LoadRow, RequestFacts},
+        view::{Candidate, Constraints, LoadReportCutoff, LoadRow, Phase, RequestFacts},
     },
     load::signals::{SignalColumn, SignalSums, SignalTerm},
     stages::cost_terms::{Coefficients, CostTerm},
@@ -779,6 +779,54 @@ impl RowTests {
             };
         }
         Some(Self(tests))
+    }
+
+    /// The empty set.
+    pub(crate) const fn none() -> Self {
+        Self(0)
+    }
+
+    /// The set with `other`'s tests added.
+    pub(crate) const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The tests a placement pass that asks for one pick holds itself at a
+    /// place of `phase`, so that the pick leaves them to the pass: the
+    /// test of the workers a retry tried at every place, the prefill
+    /// window's at a prefill place and the decode rooms' at a decode
+    /// place. The two windows are bits a host supplies, and such a pass
+    /// is the host: it narrows a side's candidates by them before it asks.
+    /// At an encode place no pass narrows by the workers a retry tried,
+    /// and none has to: a retry's list names the prefill and the decode it
+    /// tried and never an encoder, so that test passes every candidate
+    /// there.
+    pub(crate) const fn held_by_a_pass(phase: Phase) -> Self {
+        let side = match phase {
+            Phase::Prefill => Self::HAS_CAPACITY,
+            Phase::Decode => Self::HAS_ROOM,
+            Phase::Single | Phase::Encode => 0,
+        };
+        Self(Self::NOT_TRIED | side)
+    }
+
+    /// Whether every test of the set is a test of a row's health bits or
+    /// one of `held`.
+    pub(crate) const fn health_or(self, held: Self) -> bool {
+        self.0 & !(Self::HEALTHY | Self::NOT_OVERLOADED | held.0) == 0
+    }
+
+    /// The test of a row's health bits the set leaves out, by its filter's
+    /// name. A caller that tests a worker as the worker tests itself for
+    /// routing asks both, so it would add the one left out.
+    pub(crate) fn health_test_left_out(self) -> Option<&'static str> {
+        if self.0 & Self::HEALTHY == 0 {
+            Some(Healthy.name())
+        } else if self.0 & Self::NOT_OVERLOADED == 0 {
+            Some(NotOverloaded.name())
+        } else {
+            None
+        }
     }
 
     /// The set as one decision asks it: without the overload test where

@@ -46,7 +46,7 @@ use crate::{
             pd_admission,
             prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
             retry::mark_non_retryable,
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
     },
@@ -194,6 +194,7 @@ impl Candidates {
     }
 
     /// The snapshot's own list, when the candidates are that list whole.
+    #[cfg(test)]
     fn shared(&self) -> Option<&Arc<[Arc<dyn Worker>]>> {
         match self {
             Self::Shared(shared) => Some(shared),
@@ -266,6 +267,7 @@ impl<'a> Narrowed<'a> {
         NamedList {
             list: self.list,
             positions: Some(&self.positions),
+            members: None,
         }
     }
 
@@ -370,29 +372,43 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
-    let pool = registry.get_routing_pool(model_id, pool);
-    select_single_of(registry, policies, model_id, pool, wire, inputs)
+    let snapshot = registry.get_routing_snapshot(model_id);
+    select_single_of(registry, policies, model_id, &snapshot, pool, wire, inputs)
 }
 
-/// [`select_single`] over a pool the caller drew from a snapshot it read
-/// something else from too (the pool's window floor), so that both come from
-/// one membership generation. The pool keeps its name on the way to the
-/// policy, as in [`select_single`].
+/// [`select_single`] over `pool` of a snapshot the caller read something
+/// else from too (the pool's window floor), so that both come from one
+/// membership generation. The pool is borrowed from the snapshot: the
+/// selection takes no count of the list. It keeps its name on the way to
+/// the policy, and beside the name the snapshot's cell for what the policy
+/// engine keeps of the list ([`NamedList::members`]).
 pub(crate) fn select_single_of(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
-    pool: Arc<[Arc<dyn Worker>]>,
+    snapshot: &ModelWorkerSnapshot,
+    pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
-    let candidates = Candidates::of(pool, wire);
+    let list = snapshot.pool(pool);
+    if wire.is_none() {
+        let whole = NamedList {
+            list,
+            positions: None,
+            members: Some(snapshot.pool_members_cell(pool)),
+        };
+        return select_among(registry, policies, model_id, list, Some(whole), inputs);
+    }
+    // A retry pinned to its retained plan's wire: a list of its own, which
+    // nobody names.
+    let pinned = Candidates::of(Arc::clone(list), wire);
     select_among(
         registry,
         policies,
         model_id,
-        candidates.as_slice(),
-        candidates.shared(),
+        pinned.as_slice(),
+        None,
         inputs,
     )
 }
@@ -437,7 +453,7 @@ fn select_among(
     policies: &PolicyRegistry,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
-    whole: Option<&Arc<[Arc<dyn Worker>]>>,
+    whole: Option<NamedList<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     // At most two rounds. The pass has this one caller, so it compiles into
@@ -462,7 +478,7 @@ fn select_among(
     }
 }
 
-/// One pass of the single-worker selection. `whole` is the
+/// One pass of the single-worker selection. `whole` names the
 /// snapshot's own list when `candidates` is that list as the registry holds
 /// it: the policy is told the list's name when the candidates reach it as
 /// that list, and reads which workers it was handed once something narrowed
@@ -474,7 +490,7 @@ fn select_pass(
     policies: &PolicyRegistry,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
-    whole: Option<&Arc<[Arc<dyn Worker>]>>,
+    whole: Option<NamedList<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Arc<dyn Worker>, Miss> {
     let policy = policies.get_policy_or_default(model_id);
@@ -575,12 +591,7 @@ fn select_pass(
     // The name goes with the list itself, read here and nowhere above:
     // whatever narrowed the candidates handed on a list of its own, at
     // another address, and nobody names that one.
-    info.named = whole
-        .filter(|list| std::ptr::eq(&list[..], available))
-        .map(|list| NamedList {
-            list,
-            positions: None,
-        });
+    info.named = whole.filter(|named| std::ptr::eq(&named.list[..], available));
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
@@ -4196,7 +4207,12 @@ mod tests {
                 ..Default::default()
             };
             let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
-            let (drawn, whole) = (pool.as_slice(), pool.shared());
+            let drawn = pool.as_slice();
+            let whole = pool.shared().map(|list| NamedList {
+                list,
+                positions: None,
+                members: None,
+            });
             assert_eq!(
                 select_pass(&registry, &policies, MODEL, drawn, whole, inputs).err(),
                 Some(Miss::Declined),

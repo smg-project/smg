@@ -120,9 +120,9 @@ mod objects;
 pub(crate) mod steps;
 
 pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
-pub use found::facts;
 #[cfg(feature = "controller")]
 pub(crate) use found::stated;
+pub use found::{facts, pairing_descriptor};
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;

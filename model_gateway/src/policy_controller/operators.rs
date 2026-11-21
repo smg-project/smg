@@ -1,14 +1,19 @@
 //! The policy controller on the control plane: `GET /policy/spec` tells the
 //! document in force, `POST /policy/spec:validate` says what an apply of
 //! another would do, with nothing applied, and `GET /policy/snapshot` tells
-//! the worker rows the controller's store holds.
+//! the workers the policy controller decides over.
 //!
-//! The three stand on the policy crate's operators' door ([`DocumentManager`])
-//! and its snapshot of the rows, which the start leaves in the context
-//! beside the controller's store. Under the classic policies none stands,
-//! and each route refuses by one code that names the setting. Nothing is
-//! applied in this process after the start: the document in force is the
-//! start's, and a restart reads the routing configuration again.
+//! The three read what the start left in the context ([`Source`]). A
+//! gateway that decides in its own process holds the policy engine and no
+//! store. Its document is the engine's, told with the YAML the start wrote,
+//! a dry run runs against that document ([`dry_run_against`]), and its
+//! workers are the worker registry's. A gateway that follows a controller
+//! holds a policy store, and the three stand on the policy crate's
+//! operators' door ([`DocumentManager`]) and the store's worker rows. Under the
+//! classic policies neither stands, and each route refuses by one code that
+//! names the setting. Nothing is applied in this process after the start:
+//! the document in force is the start's, and a restart reads the routing
+//! configuration again.
 //!
 //! A dry run validates a whole document and a snapshot copies rows. Each
 //! runs on the blocking pool, one at a time of its kind, and a bounded
@@ -31,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use smg_policy_controller::{
     document::{
         operator::{
+            dry_run_against,
             snapshot::{self, Rows, WorkerRowsQuery},
             Document, DocumentManager, DryRun, EnforceRefused, Format, NeedsRow, SerialTurn,
             MAX_DOCUMENT_BYTES,
@@ -38,13 +44,23 @@ use smg_policy_controller::{
         Digest, Needs,
     },
     engine::Phase,
-    store::MemoryStore,
+    store::{identity, MemoryStore, WorkerFacts, WorkerRow, WorkerStatus as RowStatus},
+    worker_host::{facts, pairing_descriptor, registrant_of},
+};
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker},
+    jobs::WorkerJobAsker,
+    labels::DISCOVERY_PROVIDER_LABEL,
+    worker::WorkerStatus,
 };
 use tracing::error;
 
+use super::InProcess;
 use crate::{
     admin::{json::refusal, params::AdminQuery},
+    config::RouterConfig,
     middleware::SHED_RETRY_AFTER_SECS,
+    routers::common::snapshot::WorkerRegistry,
     server::AppState,
 };
 
@@ -60,23 +76,188 @@ const SNAPSHOTS_WAITING: usize = 32;
 /// caller names none. A fleet past it is read by model.
 const SNAPSHOT_ROWS: usize = 1_024;
 
-/// The operators' door over the controller's store, and the store for its
-/// rows, each call behind the turn of its kind.
+/// Where the three routes read.
+enum Source {
+    /// A gateway that follows a controller: the operators' door over its
+    /// policy store, and the store for its worker rows.
+    Store {
+        door: Arc<DocumentManager>,
+        store: Arc<MemoryStore>,
+    },
+    /// A gateway that decides in its own process: what its start left, the
+    /// header names it denies a document's view, and its worker registry.
+    InProcess {
+        started: InProcess,
+        denied_headers: Vec<String>,
+        registry: Arc<WorkerRegistry>,
+    },
+}
+
+/// What the three routes read, each call behind the turn of its kind.
 pub(crate) struct Operators {
-    door: Arc<DocumentManager>,
-    store: Arc<MemoryStore>,
+    source: Arc<Source>,
     dry_runs: SerialTurn,
     snapshots: SerialTurn,
 }
 
 impl Operators {
+    /// Over the policy store of a gateway that follows a controller, and
+    /// the operators' door that applied the start's document to it.
     pub(crate) fn new(store: Arc<MemoryStore>, door: Arc<DocumentManager>) -> Self {
+        Self::over(Source::Store { door, store })
+    }
+
+    /// Over what the start of a gateway that decides in its own process
+    /// left, and the gateway's worker registry.
+    pub(crate) fn in_process(
+        started: InProcess,
+        config: &RouterConfig,
+        registry: Arc<WorkerRegistry>,
+    ) -> Self {
+        Self::over(Source::InProcess {
+            started,
+            denied_headers: config.denied_view_headers().map(str::to_owned).into(),
+            registry,
+        })
+    }
+
+    fn over(source: Source) -> Self {
         Self {
-            door,
-            store,
+            source: Arc::new(source),
             dry_runs: SerialTurn::new(DRY_RUNS_WAITING),
             snapshots: SerialTurn::new(SNAPSHOTS_WAITING),
         }
+    }
+}
+
+impl Source {
+    /// The document in force as the read tells it: the one the door holds,
+    /// or the engine's under the YAML and the time the start kept.
+    fn document(&self) -> Result<Document, String> {
+        match self {
+            Self::Store { door, .. } => door.document(0).map_err(|not_held| not_held.to_string()),
+            Self::InProcess { started, .. } => {
+                let spec = started.engine.spec();
+                Ok(Document {
+                    generation: spec.generation(),
+                    digest: spec.digest().ok_or("the engine's document has no digest")?,
+                    document: started.written.clone().into_bytes(),
+                    format: Format::Yaml,
+                    applied: started.applied,
+                })
+            }
+        }
+    }
+
+    /// What an apply of `document` would do against the document in force.
+    fn dry_run(
+        &self,
+        expected: &str,
+        document: &[u8],
+        format: Format,
+    ) -> Result<DryRun, EnforceRefused> {
+        match self {
+            Self::Store { door, .. } => door.dry_run(expected, document, format),
+            Self::InProcess {
+                started,
+                denied_headers,
+                ..
+            } => {
+                let denied: Vec<&str> = denied_headers.iter().map(String::as_str).collect();
+                let standing = started.engine.spec();
+                dry_run_against(
+                    standing,
+                    &started.stages,
+                    &denied,
+                    expected,
+                    document,
+                    format,
+                )
+            }
+        }
+    }
+
+    /// The page `asked` for, taken at `now`, under the generation that runs.
+    fn snapshot(&self, asked: &WorkerRowsQuery, now: Instant) -> Snapshot {
+        let (generation, (rows, serving)) = match self {
+            Self::Store { store, .. } => (
+                store.snapshot().spec().generation(),
+                store.rows_serving(&asked.models, asked.limit),
+            ),
+            Self::InProcess {
+                started, registry, ..
+            } => (
+                started.engine.spec().generation(),
+                workers_serving(registry, asked, now),
+            ),
+        };
+        Snapshot {
+            generation,
+            page: snapshot::worker_rows_page(asked, Rows::Told(rows, serving), now),
+        }
+    }
+}
+
+/// The registry's workers as a page tells them: the first `asked.limit` in
+/// the order of their addresses as registered, of the ones that serve a
+/// model `asked` names, with the count that serve one. No model asked is
+/// every worker. A model matches by an equal id among the worker's own, as
+/// the store's read matches a row's, so a worker that names no model is
+/// told under no model's name. A hosted provider's worker is left out: no
+/// routing policy places a request on it.
+fn workers_serving(
+    registry: &WorkerRegistry,
+    asked: &WorkerRowsQuery,
+    now: Instant,
+) -> (Vec<WorkerRow>, usize) {
+    let named = |worker: &Arc<dyn Worker>| {
+        let models = &asked.models;
+        models.is_empty() || worker.models().iter().any(|card| models.contains(&card.id))
+    };
+    let mut serving: Vec<Arc<dyn Worker>> = registry
+        .get_all()
+        .into_iter()
+        .filter(|worker| worker.metadata().spec.runtime_type != RuntimeType::External)
+        .filter(named)
+        .collect();
+    let count = serving.len();
+    serving.sort_by(|one, other| one.metadata().spec.url.cmp(&other.metadata().spec.url));
+    serving.truncate(asked.limit);
+    let rows = serving.iter().map(|worker| row_of(worker.as_ref(), now));
+    (rows.collect(), count)
+}
+
+/// One worker object as a page tells a worker: the facts the object states
+/// with its own pairing facts, under the id the policy crate derives from
+/// its address. The registry numbers no life of a worker, so the id and
+/// the incarnation are those of a first one. The revision counts the
+/// object's replacements at its address. The age is the time since the
+/// worker last became routable, and none for a worker that tracks none.
+/// The maker is the one a registration by discovery states, for a worker
+/// that carries a discovery source's provenance label.
+fn row_of(worker: &dyn Worker, now: Instant) -> WorkerRow {
+    let facts = WorkerFacts {
+        pairing: pairing_descriptor(worker),
+        ..facts(worker, None)
+    };
+    let labels = &worker.metadata().spec.labels;
+    let maker = labels
+        .contains_key(DISCOVERY_PROVIDER_LABEL)
+        .then(|| registrant_of(&WorkerJobAsker::Discovery, &facts.engine).ok())
+        .flatten();
+    WorkerRow {
+        id: identity(&facts.key, facts.incarnation),
+        status: match worker.status() {
+            WorkerStatus::Pending => RowStatus::Pending,
+            WorkerStatus::Ready => RowStatus::Ready,
+            WorkerStatus::NotReady => RowStatus::NotReady,
+            WorkerStatus::Failed => RowStatus::Failed,
+            WorkerStatus::Draining => RowStatus::Draining,
+        },
+        revision: worker.revision(),
+        admitted_at: now.checked_sub(worker.admitted_age()).unwrap_or(now),
+        maker: maker.unwrap_or_default(),
+        facts,
     }
 }
 
@@ -86,8 +267,8 @@ pub(crate) fn document_bytes() -> usize {
     usize::try_from(MAX_DOCUMENT_BYTES).unwrap_or(usize::MAX)
 }
 
-/// The door, or the 409 of a gateway whose classic policies decide: it
-/// holds no policy document.
+/// What the routes read, or the 409 of a gateway whose classic policies
+/// decide: it holds no policy document.
 fn operators(state: &AppState) -> Result<&Arc<Operators>, Response> {
     state.context.policy_operators.as_ref().ok_or_else(|| {
         refusal(
@@ -131,16 +312,16 @@ struct SpecInForce<'a> {
 }
 
 /// `GET /policy/spec`: the document in force as the gateway holds it, with
-/// its generation, its digest and when it was applied. `ETag` is the
-/// digest: the guard a dry run takes in `If-Match`. 409 under the classic
-/// policies.
+/// its generation, its digest and when it was applied: the start's time,
+/// for a gateway that decides in its own process. `ETag` is the digest: the
+/// guard a dry run takes in `If-Match`. 409 under the classic policies.
 pub(crate) async fn spec(State(state): State<Arc<AppState>>) -> Response {
     let operators = match operators(&state) {
         Ok(operators) => operators,
         Err(refused) => return refused,
     };
     // The start's document stands: nothing is applied after it.
-    let held = match operators.door.document(0) {
+    let held = match operators.source.document() {
         Ok(held) => held,
         Err(not_held) => {
             error!(%not_held, "the policy document in force is not held");
@@ -268,14 +449,14 @@ pub(crate) async fn validate(
             "As many dry runs wait as may; try again",
         );
     };
-    let door = Arc::clone(&operators.door);
+    let source = Arc::clone(&operators.source);
     // The pass keeps its turn to its own end, off the runtime's workers: a
     // client that leaves never stops a pass. Where the control plane records
     // its mutations this handler runs on in a task of its own, so a call
     // that waits keeps its place after its client left.
     let ran = tokio::task::spawn_blocking(move || {
         let _turn = turn;
-        door.dry_run(&expected, &body, format)
+        source.dry_run(&expected, &body, format)
     })
     .await;
     match ran {
@@ -351,7 +532,7 @@ pub(crate) struct SnapshotQuery {
 }
 
 /// The answer of `GET /policy/snapshot`: the page as the policy crate
-/// writes one, under the generation the store runs.
+/// writes one, under the generation that runs.
 #[derive(Serialize)]
 struct Snapshot {
     generation: u64,
@@ -359,8 +540,10 @@ struct Snapshot {
     page: snapshot::WorkerRowsPage,
 }
 
-/// `GET /policy/snapshot`: the worker rows the controller's store holds,
-/// in registration key order, each address without its userinfo. `models`
+/// `GET /policy/snapshot`: the workers the policy controller decides
+/// over, in registration key order, each address without its userinfo: the
+/// registry's own workers where the gateway decides in its own process,
+/// and the policy store's rows where it follows a controller. `models`
 /// keeps the rows that serve one of the models it names, comma separated.
 /// `limit` caps the rows, at most 1,024, which is the default too.
 /// `truncated` says that a matching row was left out, by the cap or by
@@ -390,17 +573,12 @@ pub(crate) async fn snapshot(
             "As many snapshots wait as may; try again",
         );
     };
-    let store = Arc::clone(&operators.store);
+    let source = Arc::clone(&operators.source);
     // The rows are copied and written as JSON off the runtime's workers,
     // the turn kept to the writing's own end.
     let taken = tokio::task::spawn_blocking(move || {
         let _turn = turn;
-        let now = Instant::now();
-        let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
-        serde_json::to_vec(&Snapshot {
-            page: snapshot::worker_rows_page(&asked, Rows::Told(rows, serving), now),
-            generation: store.snapshot().spec().generation(),
-        })
+        serde_json::to_vec(&source.snapshot(&asked, Instant::now()))
     })
     .await;
     match taken {

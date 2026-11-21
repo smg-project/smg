@@ -2094,6 +2094,7 @@ impl WorkerSelectionStage {
         let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
         let ask = Ask {
             wires: route_wires(wire),
+            pool: Some(RoutingPool::GrpcPipelineRegular),
             ..attempt.ask(model_id, &id, &hashes)
         };
         let placed = policy_engine
@@ -2386,7 +2387,8 @@ impl WorkerSelectionStage {
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            Arc::clone(snapshot.pool(RoutingPool::GrpcPipelineRegular)),
+            snapshot,
+            RoutingPool::GrpcPipelineRegular,
             wire,
             PlacementInputs {
                 text,
