@@ -1704,7 +1704,7 @@ impl std::error::Error for TemplateRefusal {}
 /// A render that failed on the template's own account, whatever its caller
 /// handed it: the compiled template is not there to render, or the engine
 /// stopped on something the template's source alone decides
-/// ([`is_the_templates_own`]: another template it asks for, a filter, a test,
+/// (`is_the_templates_own`: another template it asks for, a filter, a test,
 /// a function or a block the engine does not have). Output that is not UTF-8
 /// is typed the same: the engine writes text alone, so no value makes it.
 /// The model's template is the one to fix, which its deployment can and no
@@ -1772,9 +1772,11 @@ fn is_the_templates_own(error: &MinijinjaError) -> bool {
         // their kin, the error has no detail, and the value may be the
         // caller's.
         ErrorKind::UnknownFilter | ErrorKind::UnknownTest => error.detail().is_some(),
-        // A write to the output failed, the one thing the engine makes this
-        // kind from. A render writes into memory, where a write does not
-        // fail, so no value brings it about.
+        // A write failed, to the output or of a value as text: the engine
+        // makes this kind of every `fmt::Error`, the ones `python_formatter`
+        // passes up among them. A render writes into memory, where a write
+        // does not fail, and the values of its context format without fail,
+        // so no value brings it about.
         ErrorKind::WriteFailure => true,
         // An operation on values the engine or a function could not run: an
         // operator over the wrong kinds, a value that is not callable or not
