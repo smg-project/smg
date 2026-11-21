@@ -102,11 +102,9 @@ pub enum WorkerLists<'a> {
     None,
     /// A single request's list.
     Single(&'a super::policy_engine::PoolMembers),
-    /// A pair's two lists: its prefills and its decodes.
-    Pair {
-        prefill: &'a super::policy_engine::PoolMembers,
-        decode: &'a super::policy_engine::PoolMembers,
-    },
+    /// A pair's two lists, its prefills and its decodes, with the pair
+    /// classes of their workers and the host's reads of its admission.
+    Pair(super::policy_engine::pair::PairLists<'a>),
 }
 
 /// What a guard holds of its decision, lent to its engine for one word
