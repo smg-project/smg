@@ -712,7 +712,7 @@ impl MergeTable {
 
     /// Reads one word of every line of the table, the buckets first, then
     /// the grid and the filter (the small, hot tables last, so they stay in
-    /// the nearer caches), and keeps nothing: a thread's first encode with
+    /// the nearer caches), and keeps nothing: an early encode of a thread with
     /// the encoder calls it so that the table's lines come in as one stream
     /// then rather than one dependent probe at a time during the first-sight
     /// pieces of the texts after it. In a fresh process the table was built
