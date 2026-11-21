@@ -145,9 +145,10 @@ pub struct AppContext {
     /// The policy controller's store, where the controller was picked to
     /// decide for this process; `None` under the classic policies.
     pub policy_store: Option<Arc<MemoryStore>>,
-    /// The operators' door over the policy store: the control plane's
-    /// policy document routes stand on it. `None` under the classic
-    /// policies.
+    /// What the control plane's policy routes read: the engine's document
+    /// and the worker registry where the gateway decides in its own
+    /// process, the operators' door over the policy store where it follows
+    /// a controller. `None` under the classic policies.
     pub(crate) policy_operators: Option<Arc<Operators>>,
     /// The worker watch, owned by the context until server teardown.
     pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
@@ -167,7 +168,7 @@ pub struct AppContext {
         not(test),
         expect(
             dead_code,
-            reason = "the control plane's policy routes read what the start left"
+            reason = "the policy registry and the policy routes each took what they read at the build"
         )
     )]
     pub(crate) in_process: Option<InProcess>,
@@ -998,6 +999,16 @@ impl AppContextBuilder {
         if config.policy_controller_address.is_none() {
             self.in_process = policy_controller::start_in_process(config, stages)
                 .map_err(|refusal| refusal.to_string())?;
+            // The control plane's policy routes read the engine's document
+            // and the worker registry.
+            if let Some(started) = &self.in_process {
+                let registry = self.worker_registry.as_ref().ok_or_else(|| {
+                    "worker_registry must be set before the policy controller".to_string()
+                })?;
+                let operators =
+                    Operators::in_process(started.clone(), config, Arc::clone(registry));
+                self.policy_operators = Some(Arc::new(operators));
+            }
             return Ok(self);
         }
         let started =
@@ -1315,7 +1326,7 @@ mod tests {
                 .unwrap();
             assert!(context.policy_follower.is_none());
             assert!(context.policy_store.is_none());
-            assert!(context.policy_operators.is_none());
+            assert_eq!(context.policy_operators.is_some(), policy_controller);
             assert!(context.policy_feed.is_none());
             assert!(context.policy_engine.is_none());
             assert!(!context.follows_controller());
@@ -1421,7 +1432,6 @@ mod tests {
             ("wasm_manager", context.wasm_manager.is_some()),
             ("kv_event_monitor", context.kv_event_monitor.is_some()),
             ("policy_store", context.policy_store.is_some()),
-            ("policy_operators", context.policy_operators.is_some()),
             ("policy_follower", context.policy_follower.is_some()),
             ("policy_engine", context.policy_engine.is_some()),
             ("policy_feed", context.policy_feed.is_some()),
@@ -1433,7 +1443,8 @@ mod tests {
     /// the setting off is: the same storage, and the same objects handed to
     /// the same places. Under one configuration, the setting off against
     /// on: the context holds and leaves out the same parts, but for what
-    /// the start left (the policy engine); and a classic policy is handed
+    /// the start left (the policy engine, and what the control plane's
+    /// policy routes read of its document); and a classic policy is handed
     /// the load feed and the cache-event monitor under both. The worker
     /// workflows read nothing of the context: the server builds the one
     /// line of each under both.
@@ -1458,6 +1469,8 @@ mod tests {
         assert_eq!(parts(&off), parts(&on));
         assert!(off.in_process.is_none());
         assert!(on.in_process.is_some());
+        assert!(off.policy_operators.is_none());
+        assert!(on.policy_operators.is_some());
 
         for context in [&off, &on] {
             let policy = context.policy_registry.get_default_policy();
