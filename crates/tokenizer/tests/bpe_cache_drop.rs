@@ -16,7 +16,7 @@
 mod common;
 
 use std::{
-    sync::{atomic::Ordering, mpsc, Arc, Mutex, PoisonError},
+    sync::{atomic::Ordering, mpsc, Arc, Mutex, MutexGuard, PoisonError},
     thread,
 };
 
@@ -71,8 +71,13 @@ fn word(i: usize) -> String {
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// Loads, encodes with and drops `CYCLES` tokenizers from `load` in turn on
-/// `THREADS` long-lived threads, and checks what the threads keep.
-fn leaves_nothing_behind(load: impl Fn() -> HuggingFaceTokenizer) {
+/// `THREADS` long-lived threads, and checks what the threads keep. It borrows
+/// the caller's [`ONE_AT_A_TIME`] guard: no test counts without the lock, and
+/// the guard still outlives everything the test made.
+fn leaves_nothing_behind(
+    _one_at_a_time: &MutexGuard<'_, ()>,
+    load: impl Fn() -> HuggingFaceTokenizer,
+) {
     let (done, reports) = mpsc::channel::<()>();
     let workers: Vec<_> = (0..THREADS)
         .map(|thread| {
@@ -126,15 +131,17 @@ fn leaves_nothing_behind(load: impl Fn() -> HuggingFaceTokenizer) {
 
 #[test]
 fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
-    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
-    leaves_nothing_behind(|| HuggingFaceTokenizer::from_tokenizer(byte_level_bpe()));
+    let one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    leaves_nothing_behind(&one_at_a_time, || {
+        HuggingFaceTokenizer::from_tokenizer(byte_level_bpe())
+    });
 }
 
 /// The file loader bounds the model it reads in place (no copy of it): the
 /// same holds for the tokenizer read from its `tokenizer.json`.
 #[test]
 fn a_dropped_tokenizer_read_from_a_file_leaves_nothing_on_the_threads_either() {
-    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("tokenizer.json");
     std::fs::write(
@@ -145,7 +152,7 @@ fn a_dropped_tokenizer_read_from_a_file_leaves_nothing_on_the_threads_either() {
     )
     .expect("the tokenizer file");
     let path = path.to_str().expect("a utf-8 path").to_string();
-    leaves_nothing_behind(move || {
+    leaves_nothing_behind(&one_at_a_time, move || {
         HuggingFaceTokenizer::from_file(&path).expect("the tokenizer loads")
     });
 }
