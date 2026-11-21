@@ -1192,6 +1192,81 @@ async fn a_pinned_retry_moves_to_another_engine_after_an_unavailable_start() {
     panic!("no key hashed to the refusing engine");
 }
 
+/// PD twin: a request pinned by a routing key whose prefill engine cannot
+/// start it (UNAVAILABLE) is retried on another prefill engine, not replayed
+/// on the one that just refused: one call there, one on the other prefill,
+/// 200.
+#[tokio::test]
+async fn a_pinned_pd_retry_moves_to_another_prefill_after_an_unavailable_start() {
+    let seen_refusing = Arc::new(Mutex::new(Vec::new()));
+    let seen_serving = Arc::new(Mutex::new(Vec::new()));
+    let refusing_port = spawn_stub(GatedScheduler {
+        fail_always: true,
+        seen_request_ids: Arc::clone(&seen_refusing),
+        ..Default::default()
+    })
+    .await;
+    let serving_port = spawn_stub(GatedScheduler {
+        seen_request_ids: Arc::clone(&seen_serving),
+        ..Default::default()
+    })
+    .await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let calls =
+        |seen: &Mutex<Vec<String>>| seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, refusing_port, WorkerType::Prefill);
+    register_worker(&worker_registry, serving_port, WorkerType::Prefill);
+    register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let components = components(worker_registry).await;
+    let retry = fast_retry_config(3);
+
+    // Keys hash to either prefill engine; the first one owned by the
+    // refusing engine is the case under test (the others succeed in one
+    // call).
+    for key in (0..64).map(|i| format!("session-{i}")) {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", key.parse().unwrap());
+        let refused_before = calls(&seen_refusing);
+        let served_before = calls(&seen_serving);
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                Some(headers),
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                Some(&retry),
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK, "key {key}");
+        let refused_now = calls(&seen_refusing) - refused_before;
+        let served_now = calls(&seen_serving) - served_before;
+        if refused_now == 0 {
+            assert_eq!(served_now, 1, "a key owned by the serving engine: one call");
+            continue;
+        }
+        assert_eq!(
+            refused_now, 1,
+            "the refusing engine sees the request once, not once per retry"
+        );
+        assert_eq!(served_now, 1, "the retry landed on the other engine");
+        return;
+    }
+    panic!("no key hashed to the refusing engine");
+}
+
 async fn run_and_drain(
     pipeline: RequestPipeline,
     components: Arc<SharedComponents>,
