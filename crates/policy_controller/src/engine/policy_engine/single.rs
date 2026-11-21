@@ -9,7 +9,13 @@
 //! picker's turns land, and it reads no fact of a request: the engine asks
 //! it before the request is made, so such a request is never made.
 //!
-//! **The whole pass, behind it** ([`decide`]). Every other request is made
+//! **A key's rows, between** ([`keys::decide`]). A request that is made,
+//! under a sessions rule or a ring, is decided by the rows its key names:
+//! its key's pin, which is one worker's record, or its key's owner on the
+//! list's ring and the members behind it. It answers where those rows say
+//! what the whole pass would, and nothing where they do not.
+//!
+//! **The whole pass, behind them** ([`decide`]). Every other request is made
 //! and put to the engine's whole decision over records written for it from
 //! the gateway's own data ([`records::decide`]): a retry that names the
 //! workers it tried, a list the picker's turns find no eligible worker of,
@@ -26,7 +32,7 @@ use std::{sync::atomic::Ordering, time::Instant};
 
 use smg_worker::runtime::RoutingState;
 
-use super::{PolicyEngine, PoolMembers};
+use super::{keys, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace},
@@ -141,14 +147,17 @@ pub(super) fn noted(
     Some(decided)
 }
 
-/// One single request's whole pass over `members`, the list its host
-/// handed, at `now`: the engine's whole decision over records written for
-/// the request from the list's workers. A request that states what no
-/// stage here runs is declined under that stage's name.
-pub(super) fn decide(
+/// One made request's decision over `members`, the list its host handed,
+/// at `now`: by the rows its key names where they answer
+/// ([`keys::decide`]), and else the engine's whole decision over records
+/// written for the request from the list's workers. A request that states
+/// what no stage here runs is declined under that stage's name. The list is
+/// borrowed as long as the request: its ring is lent into the request's
+/// facts.
+pub(super) fn decide<'r>(
     own: &PolicyEngine,
-    request: &mut Request<'_>,
-    members: &PoolMembers,
+    request: &mut Request<'r>,
+    members: &'r PoolMembers,
     now: Instant,
 ) -> Decision {
     let spec = &own.spec;
@@ -167,7 +176,14 @@ pub(super) fn decide(
     // yet: a record carries no report and no count of a key's requests.
     let live = records::Live::at(spec.engine(), &own.clock, now, None, None);
     let facts = &mut request.facts;
-    records::decide(spec.engine(), records, members.workers(), &live, facts, &cx)
+    let (engine, workers) = (spec.engine(), members.workers());
+    // A keyed request is decided by the rows its key names, where they say
+    // what the whole pass would: its key's pin, or its key's owner on the
+    // list's ring and the members behind it.
+    if let Some(keyed) = keys::decide(engine, members.ring(), records, workers, &live, facts, &cx) {
+        return keyed;
+    }
+    records::decide(engine, records, workers, &live, facts, &cx)
 }
 
 /// The answer for a request whose host handed no list: a pool of no worker,

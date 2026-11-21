@@ -37,6 +37,7 @@
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation.
 
+mod keys;
 pub mod overlap;
 pub(super) mod pair;
 mod single;
@@ -69,6 +70,7 @@ use super::{
 use crate::{
     document::spec::AppliedSpec,
     names::intern,
+    policies::consistent_hashing::PoolRing,
     store::{pairing::Refusal, GatewayId, Said},
     tracking::lease::Side,
 };
@@ -120,6 +122,9 @@ pub struct PoolMembers {
     /// engine picks alone for it, where the document holds one
     /// ([`Self::alone`]).
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
+    /// The list's hash ring ([`Self::ring`]): built at the first decision
+    /// that reads a ring over the list, and by no other.
+    ring: OnceLock<PoolRing>,
 }
 
 /// A word every pick over a pool writes, on cache lines of its own: what
@@ -160,6 +165,18 @@ impl PoolMembers {
                 wires.union(WireModes::from(*worker.connection_mode()))
             })
         })
+    }
+
+    /// The cell of the list's hash ring: each worker of the list at its
+    /// positions, by its id and its stable key. Empty until a decision
+    /// whose binding places by a ring is made over the list, which builds
+    /// the ring once from the list's records and lends it to that decision
+    /// and to every later one. A list no ring policy decides builds none.
+    /// The ring is never changed: a membership change publishes another
+    /// list, which takes a ring of its own.
+    #[must_use]
+    pub fn ring(&self) -> &OnceLock<PoolRing> {
+        &self.ring
     }
 
     /// The profile the engine picks alone for a single request of `model`
@@ -240,6 +257,7 @@ impl PolicyEngine {
             records: OnceLock::new(),
             wires: OnceLock::new(),
             alone: OnceLock::new(),
+            ring: OnceLock::new(),
         }
     }
 
@@ -461,9 +479,12 @@ impl DecisionEngine for PolicyEngine {
         }
     }
 
-    // Nothing is filed, so no pass ends anything: a lease ends at its
-    // guard's word or drop.
-    fn sweep(&self, _: Instant) -> SweepOutcome {
+    // No lease is filed, so no pass ends one: a lease ends at its guard's
+    // word or drop. The session keys past their end leave the engine's
+    // table here, off the path of a request.
+    fn sweep(&self, now: Instant) -> SweepOutcome {
+        let sessions = self.spec.engine().sessions();
+        sessions.sweep_due(self.clock.micros(now));
         SweepOutcome::default()
     }
 
