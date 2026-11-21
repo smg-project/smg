@@ -84,13 +84,13 @@ wit! {
     Option<NamedAffinity<'_>> => "host-only",
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
-    Option<&crate::LentCounts<'_>> => "host-only",
+    Option<&crate::tracking::LentCounts<'_>> => "host-only",
     // Host-only: a guest reads a candidate's count of the request's session
     // key as the candidate's own field, written there or lent beside it.
-    Option<&[crate::KeyedRow]> => "host-only",
+    Option<&[crate::engine::KeyedRow]> => "host-only",
     // Host-only: the signal cells stand beside the rows of the host that
     // decides, and no contract carries them yet.
-    Option<&crate::SignalCells> => "host-only",
+    Option<&crate::load::SignalCells> => "host-only",
     // Host-only: the engines a host lists beside its rows name the rows by
     // position, and a guest is shown rows.
     Engines<'_> => "host-only",

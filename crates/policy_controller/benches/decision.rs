@@ -36,8 +36,12 @@ use criterion::{
 use placed::page_start_buffer;
 use preset::SIZES;
 use smg_policy_controller::{
-    Constraints, Decision, Identity, Lease, Lifecycle, Lifted, ModelFingerprint, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, Side, Target, PRESETS,
+    document::{PolicySpec, PRESETS},
+    engine::{
+        Constraints, Decision, Identity, Lifted, ModelFingerprint, PoolFacts, RequestFacts,
+        Scratch, Target,
+    },
+    tracking::{Lease, Lifecycle, Side},
 };
 
 fn view_build(c: &mut Criterion) {

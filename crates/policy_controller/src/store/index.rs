@@ -532,7 +532,7 @@ impl Default for RecordRead {
 
 impl Named {
     /// The lists as a request carries them
-    /// ([`RequestFacts::named`](crate::RequestFacts::named)).
+    /// ([`RequestFacts::named`](crate::engine::RequestFacts::named)).
     pub fn affinity(&self) -> NamedAffinity<'_> {
         NamedAffinity {
             holders: &self.holders,

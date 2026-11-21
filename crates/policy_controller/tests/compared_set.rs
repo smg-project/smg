@@ -38,9 +38,13 @@
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 use smg_policy_controller::{
-    Candidate, Constraints, Engine, Health, LoadRow, PolicySpec, PoolFacts,
-    PowerOfTwoMetric::{self, ExpectedWait, LeastRequests, Requests},
-    RequestFacts, Scratch, WorkerId,
+    document::{
+        PolicySpec,
+        PowerOfTwoMetric::{self, ExpectedWait, LeastRequests, Requests},
+    },
+    engine::{
+        Candidate, Constraints, Engine, Health, LoadRow, PoolFacts, RequestFacts, Scratch, WorkerId,
+    },
 };
 
 const DRAWS: u32 = 6_000;

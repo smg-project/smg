@@ -52,7 +52,7 @@
 //!
 //! A lease is what the next decisions read. The store counts the leases on
 //! file by the worker each books, and a decision reads that count as each
-//! row's requests in flight ([`crate::RequestFacts::in_flight`]): beside
+//! row's requests in flight ([`crate::engine::RequestFacts::in_flight`]): beside
 //! the rows where the store lent them, in the row where they were written
 //! for the request. A decision is made over what the decisions before it
 //! left on file. Each decider issues into a file of leases of its own,
@@ -4562,9 +4562,9 @@ pub(crate) mod tests {
             &store,
             owner,
             0,
-            crate::LoadRow {
+            crate::engine::LoadRow {
                 queued: 1,
-                ..crate::LoadRow::default()
+                ..crate::engine::LoadRow::default()
             },
             now,
             crate::store::LoadSource::Stream,
@@ -4790,7 +4790,7 @@ pub(crate) mod tests {
     /// whatever the request's seed.
     #[test]
     fn a_placement_by_the_fewest_requests_reads_the_leases_on_file() {
-        let ruled = |assignment: crate::Assignment, pick: &str| {
+        let ruled = |assignment: crate::sessions::Assignment, pick: &str| {
             let mut document = PolicySpec::preset("manual").expect("a preset of this build");
             let rule = document.bindings[0].sessions.as_mut();
             rule.expect("the preset's rule").assignment = assignment;
@@ -4801,7 +4801,10 @@ pub(crate) mod tests {
         let unruled = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"manual"}}}"#;
         let mut unruled: PolicySpec = serde_json::from_str(unruled).expect("a document");
         unruled.generation = 1;
-        let (delegate, min_load) = (crate::Assignment::Delegate, crate::Assignment::MinLoad);
+        let (delegate, min_load) = (
+            crate::sessions::Assignment::Delegate,
+            crate::sessions::Assignment::MinLoad,
+        );
         let cases = [
             ("no rule", unruled, false),
             ("a rule that delegates", ruled(delegate, "manual"), false),
@@ -5243,7 +5246,7 @@ pub(crate) mod tests {
     /// side, which reads the column and samples sixteen here.
     #[test]
     fn the_hand_caps_the_rows_it_names_by_the_profile_that_decides() {
-        use crate::Phase;
+        use crate::engine::Phase;
 
         // What the hand gives a decode request asked alone under `pick`:
         // the holders named with the rows handed, and the column's length.
@@ -6856,7 +6859,7 @@ pub(crate) mod tests {
         rule.inflight_cap = 2;
         // The rule places a key on the worker with the fewest requests: a
         // request placed again at the cap leaves the key's worker.
-        rule.assignment = crate::Assignment::MinLoad;
+        rule.assignment = crate::sessions::Assignment::MinLoad;
         let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
         let at = bed.script.taken;
         let verdict = |bed: &Bed, answer: &proto::DecideAnswer| {

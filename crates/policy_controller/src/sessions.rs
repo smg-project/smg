@@ -10,7 +10,7 @@
 //! commit is a fresh key's claim of the worker its decision chose, so
 //! concurrent first requests agree on one. A key the table holds no pin of
 //! asks the host's pins of record first, where the host lends them
-//! ([`crate::PinSource`]): a pin a dispatch made under an earlier
+//! ([`crate::engine::PinSource`]): a pin a dispatch made under an earlier
 //! generation is written back, and no claim is made.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

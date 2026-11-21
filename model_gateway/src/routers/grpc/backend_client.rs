@@ -38,7 +38,7 @@ use smg_grpc_client::{
     tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
     SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
 };
-use smg_policy_controller::tracking::lease::TransportClass;
+use smg_policy_controller::tracking::TransportClass;
 use smg_worker::{
     connection::engine::{
         AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, HealthAnswer, LoadSource,

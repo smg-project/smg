@@ -25,7 +25,7 @@
 //! unit or reduction. A worker that leaves and joins again starts with no
 //! value.
 //!
-//! [`AppliedSpec::signal_columns`]: crate::AppliedSpec::signal_columns
+//! [`AppliedSpec::signal_columns`]: crate::document::AppliedSpec::signal_columns
 //! [`LoadSink`]: super::LoadSink
 
 use std::{

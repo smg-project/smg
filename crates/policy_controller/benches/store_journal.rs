@@ -60,12 +60,12 @@ use criterion::{
 #[cfg(feature = "worker-host")]
 use smg_policy_controller::worker_host::{Members, Objects};
 use smg_policy_controller::{
+    engine::{LoadRow, Role, SignalSource, WorkerId},
     service::replication::Log,
     store::{
         Ask, GatewayId, Kinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position,
         ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    LoadRow, Role, SignalSource, WorkerId,
 };
 #[cfg(feature = "worker-host")]
 use smg_worker::registry::WorkerRegistry;

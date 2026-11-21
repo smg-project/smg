@@ -272,7 +272,7 @@ pub struct Trace {
     /// The top candidates and their combined scores, best first: of the set
     /// the picker compared, which is every candidate the filters left unless
     /// the picker narrows them. Where a profile's ranks put rows in front
-    /// ([`Scorer::score_front`](crate::Scorer::score_front)) the scores are
+    /// ([`Scorer::score_front`](crate::engine::Scorer::score_front)) the scores are
     /// those rows' sums among themselves: a stage asked of them alone
     /// normalizes over them, so a score need not be the one the whole pass
     /// gives its row. The rows are the whole pass's, and their order too
@@ -325,7 +325,7 @@ impl Trace {
 
     /// Whether the decision drew first: its picker drew the rows it hands
     /// out and every filter of the profile was asked about each of them
-    /// alone ([`Picker::draw_first`](crate::Picker::draw_first)). No pass
+    /// alone ([`Picker::draw_first`](crate::engine::Picker::draw_first)). No pass
     /// over the pool ran, so the trace counts nothing of the pool:
     /// `survivors` holds no count, which is the mark read here, and `top`
     /// is of the rows drawn.
@@ -379,7 +379,7 @@ pub enum OverlapSource {
 /// held is `blocks` over `of`, and a miss reads zero of `of`. `of` is zero
 /// only where no stage said: the profile holds no such stage, or the
 /// decision was made at an entry that asks none
-/// ([`Engine::decide_stated`](crate::Engine::decide_stated) asks). A
+/// ([`Engine::decide_stated`](crate::engine::Engine::decide_stated) asks). A
 /// stage counts a request as one block at the least.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
@@ -417,7 +417,7 @@ impl Overlap {
 /// A pick: ordered targets, the trace, and what a sessions rule did with
 /// the request's key (`None` without one). The host copies that verdict
 /// onto the lease it commits, and fills the lease's session from the
-/// request ([`crate::RequestFacts::session`]) for every keyed request, rule
+/// request ([`crate::engine::RequestFacts::session`]) for every keyed request, rule
 /// or no rule: the verdict alone says whether the commit moves a pin.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pick {

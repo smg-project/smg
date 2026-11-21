@@ -28,6 +28,7 @@ mod tests {
     use tokio_stream::StreamExt as _;
 
     use crate::{
+        document::{AppliedSpec, PolicySpec},
         engine::view::{Role, WireModes, WorkerId as RowId},
         service::controller::{
             config::tests::valid,
@@ -39,7 +40,6 @@ mod tests {
             ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         },
         worker_host::{Expect, KvFeed, Members, Membership as _, Objects, StoreDoor},
-        AppliedSpec, PolicySpec,
     };
 
     const MODEL: &str = "m";

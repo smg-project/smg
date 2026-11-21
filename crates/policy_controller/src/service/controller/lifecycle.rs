@@ -270,6 +270,7 @@ pub(crate) mod tests {
             decision::{Pair, Target, Targets},
             framework::{Picker, TieBand},
             view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
+            Constraints, PoolFacts, Scratch,
         },
         service::{
             controller::gateways::tests::lease,
@@ -288,7 +289,6 @@ pub(crate) mod tests {
         tracking::lease::{
             Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass,
         },
-        Constraints, PoolFacts, Scratch,
     };
 
     const A: GatewayId = GatewayId(11);

@@ -1,8 +1,12 @@
 //! A document supplies the parameters of a scorer registered by its host.
 
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Health, Lifecycle, PolicySpec, PoolFacts, RequestFacts,
-    Scorer, Scratch, StageBuild, TieBand, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Health, PoolFacts, RequestFacts, Scorer, Scratch, TieBand, WorkerId,
+    },
+    stages::{Catalog, StageBuild},
+    tracking::Lifecycle,
 };
 
 #[derive(Debug, serde::Deserialize)]

@@ -26,11 +26,13 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    fingerprint,
+    document::PolicySpec,
+    engine::{
+        fingerprint, Candidate, Constraints, Decision, EncodeItems, EncodePlaced, EncodePool,
+        EncoderFacts, Engine, Health, Identity, MediaCounts, PairPools, PairTable, PoolFacts,
+        RequestFacts, Role, Scratch, WorkerId,
+    },
     store::encoding::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
-    Candidate, Constraints, Decision, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine,
-    Health, Identity, MediaCounts, PairPools, PairTable, PolicySpec, PoolFacts, RequestFacts, Role,
-    Scratch, WorkerId,
 };
 
 /// The classic policy these rows record, as a sheet's head names it.

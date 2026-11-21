@@ -2058,6 +2058,7 @@ mod tests {
             Side, TransportClass, WorkerId, PATIENCE,
         };
         use crate::{
+            engine::Demands,
             service::{
                 client::{poll, Error, Peer, Unanswered},
                 proto::{
@@ -2070,7 +2071,7 @@ mod tests {
                     released::{Reason, What},
                 },
             },
-            Demands, ReleaseReason,
+            tracking::ReleaseReason,
         };
 
         fn picked() -> proto::Decision {
@@ -2455,7 +2456,7 @@ mod tests {
             let decode = alternate.pair.expect("a decode").decode_id;
             assert_eq!(decode, WorkerId(49));
             handle.completed(
-                &crate::Outcome {
+                &crate::tracking::Outcome {
                     side: Side::Encode,
                     ..outcome(WorkerId(47), TransportClass::Ok)
                 },
@@ -2465,7 +2466,7 @@ mod tests {
             handle.completed(&prefill, sent);
             handle.completed(&prefill, sent);
             let ended = now + Duration::from_micros(200);
-            let decoded = crate::Outcome {
+            let decoded = crate::tracking::Outcome {
                 side: Side::Decode,
                 ..outcome(decode, TransportClass::Ok)
             };

@@ -998,13 +998,14 @@ impl Scorer for Bucket {
 mod tests {
     use super::*;
     use crate::{
+        document::{PolicySpec, SpecError},
         engine::{
             decision::{Pair, Pick, Target, Targets},
-            view,
-            view::Health,
+            view::{self, Health},
+            Constraints, PoolFacts, Scratch,
         },
         ring::FENCE,
-        Catalog, Constraints, PolicySpec, PoolFacts, Scratch, SpecError,
+        stages::Catalog,
     };
 
     const SECOND: u64 = 1_000_000;

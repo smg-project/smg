@@ -3,13 +3,13 @@
 //! where the document builds them, so each reads a report past the view's
 //! maximum age as none. A registered stage is not wrapped. It takes
 //! [`Reports`] from its build context
-//! ([`StageBuild::reports`](crate::StageBuild::reports)) and reads each
+//! ([`StageBuild::reports`](crate::stages::StageBuild::reports)) and reads each
 //! row through it, one pass a decision ([`ReportReads`]). The boundary is
 //! the view's one cutoff, the one the wrapped stages decide through: this
 //! module holds no copy of it.
 
-use crate::{
-    engine::view::{Candidate, LoadRow, ReportCutoff},
+use crate::engine::{
+    view::{Candidate, LoadRow, ReportCutoff},
     RequestFacts,
 };
 
@@ -25,7 +25,10 @@ use crate::{
 ///
 /// ```
 /// use smg_policy_controller::{
-///     Candidate, Catalog, Lifecycle, Reports, RequestFacts, Scorer, TieBand,
+///     engine::{Candidate, RequestFacts, Scorer, TieBand},
+///     load::Reports,
+///     stages::Catalog,
+///     tracking::Lifecycle,
 /// };
 ///
 /// /// Favors the rows whose report the view still reads.
@@ -58,7 +61,7 @@ use crate::{
 ///
 /// let mut stages = Catalog::builtin();
 /// stages.scorer_with("reported", |build| Ok(Box::new(Reported(build.reports()))))?;
-/// # Ok::<(), smg_policy_controller::CatalogError>(())
+/// # Ok::<(), smg_policy_controller::stages::CatalogError>(())
 /// ```
 ///
 /// A report's age at a decision is the request's `now_micros` less the
@@ -67,7 +70,7 @@ use crate::{
 /// built-in stages hold, decided in the one place they decide it. Under a
 /// document that sets no maximum, every report is read as it stands.
 ///
-/// [`StageBuild::reports`]: crate::StageBuild::reports
+/// [`StageBuild::reports`]: crate::stages::StageBuild::reports
 #[derive(Clone, Copy, Debug)]
 pub struct Reports {
     max_age_ms: Option<u64>,

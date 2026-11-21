@@ -125,6 +125,40 @@
 //!
 //! The in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
+//!
+//! [`RequestFacts`]: engine::RequestFacts
+//! [`Candidate`]: engine::Candidate
+//! [`engine::view`]: crate::engine
+//! [`LoadRow`]: engine::LoadRow
+//! [`AffinityFacts`]: engine::AffinityFacts
+//! [`Constraints`]: engine::Constraints
+//! [`PoolFacts`]: engine::PoolFacts
+//! [`SignalColumn`]: load::SignalColumn
+//! [`load::signals`]: crate::load
+//! [`Pick`]: engine::Pick
+//! [`engine::decision`]: crate::engine
+//! [`MAX_TARGETS`]: engine::MAX_TARGETS
+//! [`Shed`]: engine::Shed
+//! [`Queue`]: engine::Queue
+//! [`Lease`]: tracking::Lease
+//! [`tracking::lease`]: crate::tracking
+//! [`Lifecycle`]: tracking::Lifecycle
+//! [`Profile`]: engine::Profile
+//! [`Filter`]: engine::Filter
+//! [`engine::framework`]: crate::engine
+//! [`Scorer`]: engine::Scorer
+//! [`Picker`]: engine::Picker
+//! [`Plan`]: engine::Plan
+//! [`Engine`]: engine::Engine
+//! [`Catalog`]: stages::Catalog
+//! [`stages::catalog`]: crate::stages
+//! [`PolicySpec::validate_in`]: document::PolicySpec::validate_in
+//! [`PolicySpec`]: document::PolicySpec
+//! [`document::spec`]: crate::document
+//! [`Needs`]: document::Needs
+//! [`document::routing_key`]: crate::document
+//! [`engine::door`]: crate::engine
+//! [`tracking::handle`]: crate::tracking
 
 #[cfg(any(feature = "ingest", feature = "operator"))]
 mod address;
@@ -143,51 +177,6 @@ pub mod store;
 pub mod tracking;
 #[cfg(feature = "worker-host")]
 pub mod worker_host;
-
-pub use document::{
-    routing_key::{DerivedKey, KeySource, KeySources},
-    spec::{
-        AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION,
-        PRESETS,
-    },
-};
-pub use engine::{
-    decision::{
-        Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
-        Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
-    },
-    demands::{DemandFacts, Demands, References, Unmet},
-    door::{DecisionRecord, Explained, Names},
-    framework::{
-        Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine,
-        Filter, Front, Narrowed, PairPools, PairSide, PairTable, PairTableError, Picker, Plan,
-        Profile, Scorer, Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM,
-        RANK_FROM,
-    },
-    view::{
-        fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
-        Identity, KeyedRow, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder,
-        OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource,
-        WireModes, WorkerId, ZoneCapacity,
-    },
-};
-pub use load::{
-    reports::{ReportReads, Reports},
-    signals::{SignalCell, SignalCells, SignalColumn},
-};
-pub use ring::{ConsistentHash, Ring};
-pub use sessions::{
-    Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
-};
-pub use stages::catalog::{Catalog, CatalogError, StageBuild, StageError, StageKind};
-pub use tracking::{
-    counts::{KeptCounts, LentCounts},
-    lease::{
-        EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome,
-        ReleaseReason, Side, Signal, TransportClass,
-    },
-    sent::{Sent, SentCounts, SentCredit},
-};
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
 /// decision replays from its trace.

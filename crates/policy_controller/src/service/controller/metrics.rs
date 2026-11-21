@@ -976,7 +976,7 @@ mod tests {
 
         let generations = Arc::new(Generations::new(
             Arc::new(MemoryStore::new()),
-            Arc::new(crate::Catalog::builtin()),
+            Arc::new(crate::stages::Catalog::builtin()),
         ));
         metrics.spec(Arc::clone(&generations));
         let series = |generation: u64, applied: u64, rejected: u64| {

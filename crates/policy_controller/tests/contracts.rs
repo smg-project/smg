@@ -25,10 +25,15 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    document::spec::DENIED_HEADERS, fingerprint, AffinityFacts, Candidate, Constraints, HashKind,
-    Health, Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome,
-    OverloadRegime, Pair, Phase, PolicySpec, PoolFacts, Queue, ReleaseReason, RequestFacts, Role,
-    Shed, ShedReason, Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    document::{PolicySpec, DENIED_HEADERS},
+    engine::{
+        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, Lifted,
+        LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
+        Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
+    },
+    tracking::{
+        Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass,
+    },
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 

@@ -14,11 +14,12 @@ use crate::{
             fingerprint, Candidate, Constraints, Engines, Health, Identity, PoolFacts,
             RequestFacts, WorkerId,
         },
+        Scratch, DRAW_BOUND,
     },
     ring::ConsistentHash,
     stages::builtins::{Best, CountFirst, NotOverloaded, PowerOfTwo, Random, SampledBest},
     tracking::lease::{Lifecycle, Membership},
-    Draw, Scratch, DRAW_BOUND,
+    Draw,
 };
 
 thread_local! {

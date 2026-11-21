@@ -15,6 +15,11 @@
 use std::sync::Arc;
 
 use smg_policy_controller::{
+    document::Needs,
+    engine::{
+        Binding, Candidate, Constraints, Decision, Engine, Health, Plan, PoolFacts, Profile,
+        RequestFacts, Scratch, ShedReason, Weighted, WorkerId,
+    },
     plugins::{
         shared::OpenDecisions,
         wasm::{
@@ -22,9 +27,7 @@ use smg_policy_controller::{
             WasmPicker, WasmScorer, World,
         },
     },
-    Binding, Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, Needs, Outcome,
-    Plan, PoolFacts, Profile, ReleaseReason, RequestFacts, Scratch, ShedReason, Side,
-    TransportClass, Weighted, WorkerId,
+    tracking::{Lease, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 /// What the example's build line writes.

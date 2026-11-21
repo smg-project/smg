@@ -3976,7 +3976,7 @@ impl Picker for Best {
 
 /// The best of a sample: `best` over the rows it draws first. Where the
 /// host named the request's holders and the pool's warming rows
-/// ([`NamedAffinity`](crate::NamedAffinity)) and the pool holds more than
+/// ([`NamedAffinity`](crate::engine::NamedAffinity)) and the pool holds more than
 /// twice the sample, and at least the sixteen rows the engine asks a draw
 /// from, it draws `sample` rows the filters keep, uniformly and with
 /// replacement (a repeat or a refused row costs one of its `2 * sample`

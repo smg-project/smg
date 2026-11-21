@@ -8,7 +8,7 @@
 //! The document has an `apiVersion` and no `kind`: its forms are a file and
 //! the API. An unknown field is refused by name, never ignored. The one
 //! exception is the parameters of a scorer or filter a host registers, which
-//! its factory's own type reads ([`crate::StageBuild::params`]). A field this
+//! its factory's own type reads ([`crate::stages::StageBuild::params`]). A field this
 //! build cannot honour yet (a stage, a plan, a matcher or a binding rule of a
 //! later step) is checked in shape like every other field and then refused
 //! by name as not in this build, so a document written against the published
@@ -85,7 +85,7 @@ pub const MAX_HEADERS: usize = 256;
 /// Header names no routing key source may carry: the credentials of
 /// [`DENIED_HEADERS`]. `cookie` may be a source, and stays off every
 /// allow-list: a key read from it leaves as its fingerprint alone
-/// ([`DerivedKey`](crate::DerivedKey)). A host's tenant header is refused
+/// ([`DerivedKey`](crate::document::DerivedKey)). A host's tenant header is refused
 /// here as there.
 pub const DENIED_KEY_HEADERS: [&str; 6] = [
     "authorization",
@@ -227,16 +227,16 @@ pub struct Needs {
     pub active_sessions: bool,
     /// The request's own key's in-flight count per worker (a sessions rule
     /// with an in-flight cap). A host that writes it says so on the request
-    /// ([`RequestFacts::session_counted`](crate::RequestFacts::session_counted)).
+    /// ([`RequestFacts::session_counted`](crate::engine::RequestFacts::session_counted)).
     pub session_in_flight: bool,
     /// The affinity column
-    /// ([`RequestFacts::affinity`](crate::RequestFacts::affinity)): one
-    /// [`AffinityFacts`](crate::AffinityFacts) a candidate. A stage that
+    /// ([`RequestFacts::affinity`](crate::engine::RequestFacts::affinity)): one
+    /// [`AffinityFacts`](crate::engine::AffinityFacts) a candidate. A stage that
     /// reads any of the five declares this, whatever feeds them: `events`
     /// asks for the index and the hash fields for the request's hashes, and
     /// neither stands for the column. A host fills the column where this is
     /// declared and may hand an empty column elsewhere. Rows it names in
-    /// the column's place ([`NamedAffinity`](crate::NamedAffinity)) answer
+    /// the column's place ([`NamedAffinity`](crate::engine::NamedAffinity)) answer
     /// the crate's own affinity stages and no other reader: a named row
     /// says its two depths and nothing of its age, growth or index size, so
     /// a host fills the column for a profile with a stage that reads those,
@@ -248,24 +248,24 @@ pub struct Needs {
     /// The sample of a picker that decides a large pool by a draw of this
     /// many rows and the rows the host names; `0` for none. A host that can
     /// name the request's holders and the pool's warming rows
-    /// ([`NamedAffinity`](crate::NamedAffinity)) hands those in the
+    /// ([`NamedAffinity`](crate::engine::NamedAffinity)) hands those in the
     /// column's place, each list capped at this many rows: the holders by
     /// depth, whole depth groups from the deepest while they fit and the
     /// group at the cap's edge by a uniform draw from the decision's seed;
     /// the warming rows by that draw over their whole list. A host that
     /// cannot fills the column, and the pool is read whole. The cap of a
     /// decision is its own profile's, which
-    /// [`Engine::sample_for`](crate::Engine::sample_for) says: the engine's
+    /// [`Engine::sample_for`](crate::engine::Engine::sample_for) says: the engine's
     /// summary holds the largest sample of every profile, and a decode
     /// worker's needs the larger of its two profiles'.
     pub sample: u32,
     /// The signal cells beside the rows
-    /// ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)).
+    /// ([`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)).
     /// A stage that keeps a signal's column declares this, and no other
     /// stage does: the validator holds every stage a catalog adds to both.
     /// One a factory builds under a build context resolves its column
     /// there
-    /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)).
+    /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)).
     /// One built with no context resolves none, so it declares none.
     /// A host hands the cells where this is declared and none elsewhere.
     pub signal_cells: bool,
@@ -4999,7 +4999,7 @@ impl PolicySpec {
     /// honour (a stage, a plan, a matcher or a binding rule of a later step)
     /// is then refused by name as [`SpecError::NotInBuild`], and so is a
     /// stage that needs the lifecycle's calls
-    /// ([`crate::Lifecycle::needs_lifecycle`]) under the standalone
+    /// ([`crate::tracking::Lifecycle::needs_lifecycle`]) under the standalone
     /// controller, which makes the membership call alone.
     pub fn validate_in(
         &self,
@@ -5497,7 +5497,7 @@ impl AppliedSpec {
 
     /// The document's signals, resolved, in column order: a signal's place
     /// here is its column's number. What a stage's build answered from
-    /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)),
+    /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)),
     /// and the one reading of the names for a store that keeps the cells.
     /// Empty for a document that declares none and for the unbound start.
     pub fn signal_columns(&self) -> &[SignalColumn] {
@@ -5620,7 +5620,7 @@ impl AppliedSpec {
     /// from: those of the first binding that matches it, a pair request's
     /// by its prefill lookup. The host reads the request by them
     /// ([`KeySources::derive`]) and hands the engine the one key
-    /// ([`RequestFacts::session_key`](crate::RequestFacts::session_key)).
+    /// ([`RequestFacts::session_key`](crate::engine::RequestFacts::session_key)).
     /// `None` where no binding matches or the binding names no source: the
     /// request carries no key.
     #[must_use]
@@ -5777,7 +5777,8 @@ impl ViewLists {
 mod tests {
     use super::*;
     use crate::{
-        Candidate, Constraints, Filter, Lifecycle, PoolFacts, RequestFacts, Targets, TieBand,
+        engine::{Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand},
+        tracking::Lifecycle,
     };
 
     #[test]
@@ -6287,7 +6288,7 @@ mod tests {
         #[derive(Debug)]
         struct Scoped;
 
-        impl crate::DecisionScope for Scoped {
+        impl crate::engine::DecisionScope for Scoped {
             fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
             fn close(&self) {}
         }
@@ -6301,7 +6302,7 @@ mod tests {
             fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
                 true
             }
-            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+            fn scope(&self) -> Option<&dyn crate::engine::DecisionScope> {
                 Some(self)
             }
         }
@@ -6319,7 +6320,7 @@ mod tests {
             ) -> TieBand {
                 TieBand::NORMALIZED
             }
-            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+            fn scope(&self) -> Option<&dyn crate::engine::DecisionScope> {
                 Some(self)
             }
         }
@@ -6338,7 +6339,7 @@ mod tests {
                 _: &mut Targets,
             ) {
             }
-            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+            fn scope(&self) -> Option<&dyn crate::engine::DecisionScope> {
                 Some(self)
             }
         }
@@ -6979,7 +6980,7 @@ mod tests {
         };
         let cx = Constraints::default();
         let mut scratch = Scratch::new();
-        let first = |decision: &crate::Decision| {
+        let first = |decision: &crate::engine::Decision| {
             decision
                 .pick()
                 .expect("a pick")
@@ -8452,7 +8453,7 @@ mod tests {
         let derived = rule
             .derive(|name| (name == "x-session-id").then_some(&b"s-1"[..]), None)
             .expect("a key");
-        assert_eq!(derived.key, crate::Identity::plain("s-1"));
+        assert_eq!(derived.key, crate::engine::Identity::plain("s-1"));
         assert!(AppliedSpec::unbound()
             .key_sources_for("chat/a", Phase::Single)
             .is_none());
@@ -9144,7 +9145,7 @@ mod tests {
     /// default (1.5, plus the margin) it spills.
     #[test]
     fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
-        use crate::{
+        use crate::engine::{
             AffinityFacts, Candidate, Constraints, Health, PoolFacts, RequestFacts, Scratch,
             WorkerId,
         };
@@ -9449,7 +9450,10 @@ mod tests {
 
     #[test]
     fn validate_in_builds_the_registered_scorer_for_a_store_decision() {
-        use crate::{store::MemoryStore, Health, PoolFacts, Scratch, WorkerId};
+        use crate::{
+            engine::{Health, PoolFacts, Scratch, WorkerId},
+            store::MemoryStore,
+        };
 
         const SCORER: &str = "prefer-idle";
 
@@ -9662,12 +9666,12 @@ mod tests {
     /// reads another count beside lent rows, and parts here. The same
     /// lists hold each stock stage to its word on what the gateways
     /// report of leases
-    /// ([`Filter::refuses_by_reports`](crate::Filter::refuses_by_reports)).
+    /// ([`Filter::refuses_by_reports`](crate::engine::Filter::refuses_by_reports)).
     #[test]
     fn every_catalog_stage_reads_a_lent_count_as_a_rows_own() {
         use crate::{
-            engine::view::Identity, tracking::counts::tests::Lent, Health, PoolFacts, Scratch,
-            WorkerId,
+            engine::{view::Identity, Health, PoolFacts, Scratch, WorkerId},
+            tracking::counts::tests::Lent,
         };
         let sessions = r#""score":["fewest-sessions"]"#;
         let scored = |pick: &str| format!(r#"{{{sessions},"pick":{pick}}}"#);

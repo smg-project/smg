@@ -7,10 +7,10 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
 use smg_policy_controller::{
-    document::spec::{
-        MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
+    document::{
+        PolicySpec, MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES,
     },
-    Catalog, PolicySpec,
+    stages::Catalog,
 };
 
 /// A signal's name as a sum writes it: `signal.` before a name of the

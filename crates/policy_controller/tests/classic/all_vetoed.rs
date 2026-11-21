@@ -12,9 +12,13 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    document::spec::OverloadSpec, Assignment, Candidate, Constraints, Decision, Engine, Health,
-    Identity, Lease, Lifecycle, PolicySpec, PoolFacts, RequestFacts, Scratch, ShedReason, Side,
-    WorkerId,
+    document::{OverloadSpec, PolicySpec},
+    engine::{
+        Candidate, Constraints, Decision, Engine, Health, Identity, PoolFacts, RequestFacts,
+        Scratch, ShedReason, WorkerId,
+    },
+    sessions::Assignment,
+    tracking::{Lease, Lifecycle, Side},
 };
 
 use crate::{Outcome, Recorded, Replayed};

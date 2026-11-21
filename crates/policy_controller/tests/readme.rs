@@ -21,7 +21,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use smg_policy_controller::{Catalog, PolicySpec, PRESETS};
+use smg_policy_controller::{
+    document::{PolicySpec, PRESETS},
+    stages::Catalog,
+};
 
 /// The mark on the line before a document the validator refuses.
 const REFUSED: &str = "<!-- refused -->";

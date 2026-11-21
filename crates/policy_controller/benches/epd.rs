@@ -27,8 +27,11 @@ use std::{hint::black_box, time::Instant};
 use common::{build_view, fleet, WorkerState};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use smg_policy_controller::{
-    Candidate, Constraints, Identity, Phase, PolicySpec, PoolFacts, RequestFacts, Ring, Role,
-    Scratch, WorkerId,
+    document::PolicySpec,
+    engine::{
+        Candidate, Constraints, Identity, Phase, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+    },
+    ring::Ring,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

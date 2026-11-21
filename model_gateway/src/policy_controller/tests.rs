@@ -20,14 +20,11 @@ use openai_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::operator::SpecRejected,
-    engine::{
-        framework::{Scorer, TieBand},
-        view::{Candidate, RequestFacts, Role, WireModes, WorkerId},
-    },
+    document::{operator::SpecRejected, AppliedSpec, PolicySpec, SpecError},
+    engine::{Candidate, RequestFacts, Role, Scorer, TieBand, WireModes, WorkerId},
+    stages::{Catalog, CatalogError},
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
-    tracking::lease::Lifecycle,
-    AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
+    tracking::Lifecycle,
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
 

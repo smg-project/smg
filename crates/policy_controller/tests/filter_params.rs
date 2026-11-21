@@ -1,8 +1,12 @@
 //! A document supplies the parameters of a filter registered by its host.
 
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Decision, Filter, Health, PolicySpec, PoolFacts, RequestFacts,
-    Scratch, StageBuild, StageError, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Decision, Filter, Health, PoolFacts, RequestFacts, Scratch,
+        WorkerId,
+    },
+    stages::{Catalog, StageBuild, StageError},
 };
 
 /// Keeps the workers with `slots` of their eight request slots free.

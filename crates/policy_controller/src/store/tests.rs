@@ -3525,8 +3525,13 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
 #[test]
 fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     use crate::{
-        engine::view::{Candidate, RequestFacts},
-        AppliedSpec, Catalog, Lifecycle, PolicySpec, Scorer, TieBand,
+        document::{AppliedSpec, PolicySpec},
+        engine::{
+            view::{Candidate, RequestFacts},
+            Scorer, TieBand,
+        },
+        stages::Catalog,
+        tracking::Lifecycle,
     };
 
     #[derive(Debug)]

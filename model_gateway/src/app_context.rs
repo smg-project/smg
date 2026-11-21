@@ -15,7 +15,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::{store::MemoryStore, Catalog};
+use smg_policy_controller::{stages::Catalog, store::MemoryStore};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -1523,7 +1523,7 @@ mod tests {
     #[tokio::test]
     async fn under_the_feed_the_collectors_sink_is_the_feeds() {
         use smg_policy_controller::{
-            engine::view::{Role, WireModes},
+            engine::{Role, WireModes},
             store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
             worker_host::{Expect, Wrote},
         };

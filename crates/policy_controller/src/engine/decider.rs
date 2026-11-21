@@ -24,7 +24,7 @@
 //! decider is a decider of its own.
 //!
 //! ```
-//! use smg_policy_controller::engine::decider::Decider;
+//! use smg_policy_controller::engine::Decider;
 //!
 //! // The holder of the third decider's turn: a decision made here, and a
 //! // lease's event told here, reach what that decider keeps.
@@ -118,7 +118,7 @@ impl Decider {
 ///
 /// ```compile_fail
 /// fn sent<T: Send>(_: T) {}
-/// sent(smg_policy_controller::engine::decider::Decider::new(0).enter());
+/// sent(smg_policy_controller::engine::Decider::new(0).enter());
 /// ```
 #[derive(Debug)]
 pub struct Acting {

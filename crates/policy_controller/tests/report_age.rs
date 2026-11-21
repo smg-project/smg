@@ -5,13 +5,17 @@
 use std::time::{Duration, Instant};
 
 use smg_policy_controller::{
+    document::{PolicySpec, SpecError, API_VERSION},
+    engine::{
+        AffinityFacts, Candidate, Constraints, Decision, Engine, Front, Health, LoadRow,
+        NamedAffinity, NamedHolder, PairPools, Phase, PoolFacts, RequestFacts, Role, Scratch,
+        Target, WorkerId,
+    },
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
-    AffinityFacts, Candidate, Constraints, Decision, Engine, Front, Health, Lease, Lifecycle,
-    LoadRow, Membership, NamedAffinity, NamedHolder, PairPools, Phase, PolicySpec, PoolFacts,
-    RequestFacts, Role, Scratch, Side, SpecError, Target, WorkerId, API_VERSION,
+    tracking::{Lease, Lifecycle, Membership, Side},
 };
 
 const LIMIT_MS: u64 = 27;
@@ -81,7 +85,7 @@ fn the_report_age_limit_is_optional_and_validated_by_name() {
     with_view.view.block_size = Some(16);
     let view = serde_json::to_value(&with_view).expect("JSON");
     assert!(view["view"].get("max_report_age_ms").is_none());
-    for name in smg_policy_controller::PRESETS {
+    for name in smg_policy_controller::document::PRESETS {
         assert_eq!(
             PolicySpec::preset(name)
                 .expect("a preset")

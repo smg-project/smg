@@ -183,7 +183,7 @@ impl StageBuild<'_> {
     /// The column of a signal the document declares, by its name. A name
     /// the document does not declare is refused at the stage's entry. A
     /// stage that keeps a column says so in its needs
-    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and a stage
+    /// ([`Needs::signal_cells`](crate::document::Needs::signal_cells)), and a stage
     /// that keeps none does not: the validator refuses either mismatch, so
     /// a host hands the cells to the profiles that read them and to no
     /// other.
@@ -314,13 +314,13 @@ pub enum CatalogError {
 
 /// The stages a build knows by name. [`Catalog::builtin`] is the stock
 /// build's; a host adds its own under new names and hands the catalog to
-/// the validator ([`crate::PolicySpec::validate_in`]).
+/// the validator ([`crate::document::PolicySpec::validate_in`]).
 pub struct Catalog {
     filters: Vec<(&'static str, FilterBuild)>,
     scorers: Vec<(&'static str, ScorerBuild)>,
     pickers: Vec<(&'static str, PickerBuild)>,
     /// Whether the host makes the lifecycle's calls: a stage that needs
-    /// them ([`crate::Lifecycle::needs_lifecycle`]) is in no other build.
+    /// them ([`crate::tracking::Lifecycle::needs_lifecycle`]) is in no other build.
     lifecycle: bool,
 }
 
@@ -592,12 +592,15 @@ mod tests {
     use super::{Catalog, CatalogError, Found, StageKind};
     use crate::{
         document::{
-            spec,
-            spec::{PickSpec, ScoreSpec, FILTERS, PICKERS, SCORERS},
+            spec::{self, PickSpec, ScoreSpec, FILTERS, PICKERS, SCORERS},
+            PolicySpec, SpecError,
+        },
+        engine::{
+            Candidate, Constraints, Engine, Filter, Health, Picker, PoolFacts, RequestFacts,
+            Scorer, Scratch, Targets, TieBand, WorkerId,
         },
         stages::builtins::target_of,
-        Candidate, Constraints, Engine, Filter, Health, Lifecycle, Picker, PolicySpec, PoolFacts,
-        RequestFacts, Scorer, Scratch, SpecError, Targets, TieBand, WorkerId,
+        tracking::Lifecycle,
     };
 
     /// Keeps the workers whose id is odd.
@@ -1335,7 +1338,7 @@ profiles:
             .scorer_with("queue-price", |build| {
                 let price: QueuePrice = build.params()?;
                 if price.per_request <= 0 {
-                    return Err(crate::StageError::bad(
+                    return Err(crate::stages::StageError::bad(
                         "per_request",
                         price.per_request,
                         "above zero",
@@ -1348,7 +1351,7 @@ profiles:
     }
 
     fn score_document(score: &str) -> PolicySpec {
-        let version = crate::API_VERSION;
+        let version = crate::document::API_VERSION;
         serde_yaml::from_str(&format!(
             "apiVersion: {version}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n"
         ))
@@ -1507,9 +1510,9 @@ profiles:
 
     #[test]
     fn a_refusal_displays_without_the_stages_path() {
-        let field = crate::StageError::bad("per_request", 0, "above zero");
+        let field = crate::stages::StageError::bad("per_request", 0, "above zero");
         assert_eq!(field.to_string(), "per_request = 0 is not above zero");
-        let other = crate::StageError::other("no price list");
+        let other = crate::stages::StageError::other("no price list");
         assert_eq!(other.to_string(), "no price list");
         let error: &dyn std::error::Error = &other;
         assert!(error.source().is_none());
@@ -1612,7 +1615,7 @@ profiles:
         catalog
             .scorer_with(
                 "high-id",
-                move |_| -> Result<Box<dyn Scorer>, crate::StageError> {
+                move |_| -> Result<Box<dyn Scorer>, crate::stages::StageError> {
                     if called.fetch_add(1, Ordering::Relaxed) == 0 {
                         Ok(Box::new(HighId))
                     } else {
@@ -1675,14 +1678,16 @@ profiles:
                 Ok(Box::new(CountDrop(Arc::clone(&drops))))
             })
             .and_then(|catalog| {
-                catalog.scorer_with("refused", |_| Err(crate::StageError::other("no price")))
+                catalog.scorer_with("refused", |_| {
+                    Err(crate::stages::StageError::other("no price"))
+                })
             })
             .expect("two free names");
         let standing = score_document("[count-drop]")
             .validate_in(&catalog, &[])
             .expect("a valid document");
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
-        let version = crate::API_VERSION;
+        let version = crate::document::API_VERSION;
         let invalid: PolicySpec = serde_yaml::from_str(&format!(
             "apiVersion: {version}
 profiles:
@@ -1748,7 +1753,11 @@ bindings: [{{ profile: before }}]
             .filter_with("min-free", |build| {
                 let rule: MinFree = build.params()?;
                 if rule.slots == 0 {
-                    return Err(crate::StageError::bad("slots", rule.slots, "above zero"));
+                    return Err(crate::stages::StageError::bad(
+                        "slots",
+                        rule.slots,
+                        "above zero",
+                    ));
                 }
                 Ok(Box::new(rule))
             })
@@ -1757,7 +1766,7 @@ bindings: [{{ profile: before }}]
     }
 
     fn filter_document(filter: &str) -> PolicySpec {
-        let version = crate::API_VERSION;
+        let version = crate::document::API_VERSION;
         serde_yaml::from_str(&format!(
             "apiVersion: {version}\nprofiles:\n  default:\n    filter: {filter}\n    pick: random\n"
         ))
@@ -1997,7 +2006,7 @@ bindings: [{{ profile: before }}]
         let called = Arc::new(AtomicUsize::new(0));
         let counted = |called: &Arc<AtomicUsize>| {
             let calls = Arc::clone(called);
-            move |_: &mut crate::StageBuild<'_>| -> Result<Box<dyn Filter>, crate::StageError> {
+            move |_: &mut crate::stages::StageBuild<'_>| -> Result<Box<dyn Filter>, crate::stages::StageError> {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(Box::new(OddIds))
             }
@@ -2064,7 +2073,11 @@ bindings: [{{ profile: before }}]
             .picker_with("nth", |build| {
                 let rule: Nth = build.params()?;
                 if rule.place > 3 {
-                    return Err(crate::StageError::bad("place", rule.place, "at most 3"));
+                    return Err(crate::stages::StageError::bad(
+                        "place",
+                        rule.place,
+                        "at most 3",
+                    ));
                 }
                 Ok(Box::new(rule))
             })
@@ -2073,7 +2086,7 @@ bindings: [{{ profile: before }}]
     }
 
     fn pick_document(pick: &str) -> PolicySpec {
-        let version = crate::API_VERSION;
+        let version = crate::document::API_VERSION;
         serde_yaml::from_str(&format!(
             "apiVersion: {version}\nprofiles:\n  default:\n    filter: [healthy]\n    pick: {pick}\n"
         ))
@@ -2264,7 +2277,7 @@ bindings: [{{ profile: before }}]
         let called = Arc::new(AtomicUsize::new(0));
         let counted = |called: &Arc<AtomicUsize>| {
             let calls = Arc::clone(called);
-            move |_: &mut crate::StageBuild<'_>| -> Result<Box<dyn Picker>, crate::StageError> {
+            move |_: &mut crate::stages::StageBuild<'_>| -> Result<Box<dyn Picker>, crate::stages::StageError> {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(Box::new(Worst))
             }

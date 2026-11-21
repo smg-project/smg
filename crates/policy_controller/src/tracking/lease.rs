@@ -65,7 +65,7 @@ pub struct Lease {
     /// the worker by `target_index` into its pick.
     pub booked: WorkerId,
     pub generation: u64,
-    /// The request's session ([`crate::RequestFacts::session`]: its key
+    /// The request's session ([`crate::engine::RequestFacts::session`]: its key
     /// within its model and phase), which the host fills for every keyed
     /// request, whatever rule governed it, so the commit moves that
     /// session's pins and a sticky in-flight cap counts per session per
@@ -168,7 +168,7 @@ pub enum Membership<'a> {
 
 /// A signal about one worker. The named values a document declares under
 /// `signals` are the other thing of that name: numbers read beside the
-/// rows ([`SignalCells`](crate::SignalCells)).
+/// rows ([`SignalCells`](crate::load::SignalCells)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     /// A load row for one rank of a worker, as the host shows it to its
@@ -371,7 +371,7 @@ pub trait Lifecycle: Send + Sync {
     /// and of its end at the dispatch deadline or where its answer does not
     /// leave, and not yet of the end of a lease whose gateway was let go: it
     /// refuses a document that names such a stage as not in this build
-    /// ([`crate::SpecError::NotInBuild`]). A host that embeds the engine
+    /// ([`crate::document::SpecError::NotInBuild`]). A host that embeds the engine
     /// makes every call. `false` by default: a stage that takes a call to
     /// shed state early decides the same without it.
     fn needs_lifecycle(&self) -> bool {

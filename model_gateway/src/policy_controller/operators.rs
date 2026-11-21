@@ -34,9 +34,9 @@ use smg_policy_controller::{
             snapshot::{self, Asked, Rows},
             Document, DryRun, Format, NeedsRow, SpecDoor, Turn, Unanswered, MAX_DOCUMENT_BYTES,
         },
-        spec::{Digest, Needs},
+        Digest, Needs,
     },
-    engine::view::Phase,
+    engine::Phase,
     store::MemoryStore,
 };
 use tracing::error;

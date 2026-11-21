@@ -850,7 +850,7 @@ impl MemoryStore {
     /// it is told behind the same lock, in its order. One thing does not
     /// start empty: a profile's count of sends, which the engine takes
     /// over from the standing generation's profile of the same name
-    /// before the publication ([`Engine::succeed`](crate::Engine::succeed)).
+    /// before the publication ([`Engine::succeed`](crate::engine::Engine::succeed)).
     ///
     /// The journal is told the generation's number there too, behind the
     /// publication ([`Journal::generation`]).
@@ -1565,7 +1565,7 @@ impl MemoryStore {
     }
 
     /// How long a key that left keeps its session pins: the standing
-    /// engine's time ([`Engine::pins_absence_micros`](crate::Engine::pins_absence_micros)).
+    /// engine's time ([`Engine::pins_absence_micros`](crate::engine::Engine::pins_absence_micros)).
     fn pins_absence(&self) -> Duration {
         Duration::from_micros(self.world.load().spec().engine().pins_absence_micros())
     }
@@ -4075,7 +4075,7 @@ impl Leases {
         mut decode: DecodeSide,
         booked: Option<Slot>,
         now: Instant,
-    ) -> Result<(crate::Lease, DecodeIssue), DecodeRefused> {
+    ) -> Result<(crate::tracking::Lease, DecodeIssue), DecodeRefused> {
         let (held, found) = self.chosen_decode(&key)?;
         #[cfg(feature = "controller")]
         let kept = (held.decode, (found.side, held.record.dispatch_deadline));
@@ -4583,8 +4583,8 @@ impl MemoryStore {
         &self,
         record: LeaseRecord,
         booked: Option<Slot>,
-        issued: impl Fn(&crate::Lease),
-    ) -> Result<crate::Lease, LeaseRefused> {
+        issued: impl Fn(&crate::tracking::Lease),
+    ) -> Result<crate::tracking::Lease, LeaseRefused> {
         self.issue_minted(record, booked, None, false, issued)
     }
 
@@ -4602,8 +4602,8 @@ impl MemoryStore {
         &self,
         record: LeaseRecord,
         booked: Option<Slot>,
-        issued: impl Fn(&crate::Lease),
-    ) -> Result<crate::Lease, LeaseRefused> {
+        issued: impl Fn(&crate::tracking::Lease),
+    ) -> Result<crate::tracking::Lease, LeaseRefused> {
         self.issue_minted(record, booked, None, true, issued)
     }
 
@@ -4622,8 +4622,8 @@ impl MemoryStore {
         record: LeaseRecord,
         side: DecodeSide,
         [booked, decode]: [Option<Slot>; 2],
-        issued: impl Fn(&crate::Lease),
-    ) -> Result<crate::Lease, LeaseRefused> {
+        issued: impl Fn(&crate::tracking::Lease),
+    ) -> Result<crate::tracking::Lease, LeaseRefused> {
         self.issue_minted(record, booked, Some((side, decode)), false, issued)
     }
 
@@ -4637,8 +4637,8 @@ impl MemoryStore {
         lease: LeaseId,
         (decode, booked): (DecodeSide, Option<Slot>),
         now: Instant,
-        issued: impl FnOnce(&crate::Lease),
-    ) -> Result<(crate::Lease, DecodeIssue), DecodeRefused> {
+        issued: impl FnOnce(&crate::tracking::Lease),
+    ) -> Result<(crate::tracking::Lease, DecodeIssue), DecodeRefused> {
         let mut leases = self.turn_of(self.file_of(lease));
         let (lease, issue) = leases.issue_decode((gateway, lease), decode, booked, now)?;
         issued(&lease);
@@ -4747,8 +4747,8 @@ impl MemoryStore {
         booked: Option<Slot>,
         pair: Paired,
         keyed: bool,
-        issued: impl Fn(&crate::Lease),
-    ) -> Result<crate::Lease, LeaseRefused> {
+        issued: impl Fn(&crate::tracking::Lease),
+    ) -> Result<crate::tracking::Lease, LeaseRefused> {
         use std::collections::hash_map::Entry;
 
         // The file of the decider that issues, under its turn: what is

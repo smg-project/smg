@@ -15,8 +15,10 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Engine, PolicySpec, PoolFacts, RequestFacts, Scratch,
-    SignalCell, SignalCells, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, WorkerId},
+    load::{SignalCell, SignalCells},
+    stages::Catalog,
 };
 
 use crate::reads_two::ReadsTwo;

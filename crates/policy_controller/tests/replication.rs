@@ -37,6 +37,7 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
+    engine::{LoadRow, WireModes, WorkerId},
     service::{
         controller::{
             Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
@@ -51,7 +52,6 @@ use smg_policy_controller::{
         HealthPolicy, Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
-    LoadRow, WireModes, WorkerId,
 };
 use tokio::{
     sync::{mpsc, oneshot},

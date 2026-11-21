@@ -354,7 +354,7 @@ impl Controller {
     /// and no lease is taken, so a refusal arrives before a client can
     /// connect. A policy document names the stages `catalog` holds: the
     /// stock build's and the ones the host added. One that needs the
-    /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]) is refused
+    /// lifecycle's calls ([`crate::tracking::Lifecycle::needs_lifecycle`]) is refused
     /// as not in this build: the controller makes the membership call, and a
     /// stage hears a lease's issue, its dispatch, completion and release at
     /// its gateway's word and its end at the dispatch deadline or where its

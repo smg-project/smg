@@ -34,7 +34,8 @@ use criterion::{
 };
 use preset::SIZES;
 use smg_policy_controller::{
-    Constraints, Lease, Lifecycle, Membership, Phase, PoolFacts, RequestFacts, Scratch,
+    engine::{Constraints, Phase, PoolFacts, RequestFacts, Scratch},
+    tracking::{Lease, Lifecycle, Membership},
 };
 
 /// How often the stale rows tell their leave again: well inside the ten

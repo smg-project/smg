@@ -4,8 +4,8 @@
 use super::{facts, member, MODEL};
 use crate::{
     engine::view::{Role, Session, WorkerId},
+    sessions::SessionVerdict,
     store::{MemoryStore, WorkerFacts, WorkersStore},
-    SessionVerdict,
 };
 
 /// The revision `id`'s row stands at.
@@ -72,11 +72,17 @@ mod held {
         revision,
     };
     use crate::{
-        document::spec::{BindingSpec, Needs},
+        document::{
+            spec::{BindingSpec, Needs},
+            AppliedSpec, PolicySpec,
+        },
         engine::{
             framework::{Scorer, TieBand},
             view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
+            Scratch,
         },
+        ring::ConsistentHash,
+        stages::Catalog,
         store::{
             tests::{booking, in_flight},
             world::ViewBuffers,
@@ -84,7 +90,6 @@ mod held {
             WorkerPatch, WorkerStatus, WorkersStore,
         },
         tracking::lease::{Lifecycle, Membership},
-        AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
     };
 
     /// What the store told a stage: each call as it prints, with the epoch

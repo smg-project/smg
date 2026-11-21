@@ -228,13 +228,13 @@ impl Samples {
 mod tests {
     use super::*;
     use crate::{
+        document::{Needs, PolicySpec},
         engine::{
             decision::{Queue, Shed, ShedReason, Trace},
             door::tests::GATEWAY,
             framework::{Binding, Profile, Weighted},
         },
         stages::builtins::{Best, FewestSessions, Healthy, LeastRequests, NotTried},
-        Needs, PolicySpec,
     };
 
     fn naming_engine(generation: u64) -> Engine {

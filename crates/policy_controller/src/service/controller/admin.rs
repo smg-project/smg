@@ -119,7 +119,10 @@ mod tests {
 
     use super::{router, Admin, VERSION};
     use crate::{
-        document::spec::{BindingSpec, OverloadSpec},
+        document::{
+            spec::{BindingSpec, OverloadSpec},
+            AppliedSpec, PolicySpec,
+        },
         engine::view::{LoadRow, Role},
         service::{
             controller::{
@@ -129,7 +132,6 @@ mod tests {
             ingest::loads::Stats,
         },
         store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
-        AppliedSpec, PolicySpec,
     };
 
     async fn get(app: axum::Router, path: &str) -> (StatusCode, String, String) {

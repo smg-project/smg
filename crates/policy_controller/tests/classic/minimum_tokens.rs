@@ -17,13 +17,13 @@ use std::time::{Duration, Instant};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    load::load_report,
+    document::{AppliedSpec, PolicySpec, PowerOfTwoMetric},
+    engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
-    AppliedSpec, Constraints, Engine, Lease, Lifecycle, LoadRow, PolicySpec, PowerOfTwoMetric,
-    RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
+    tracking::{Lease, Lifecycle, Side},
 };
 
 /// What these rows record, as a sheet's head names it: the rank the
@@ -214,7 +214,7 @@ fn load_row(figures: Figures, at: Instant) -> LoadRow {
         }],
         ..WorkerLoadResponse::default()
     };
-    load_report::load_row(&wire, Role::Single, at, at, SignalSource::Poll)
+    smg_policy_controller::load::load_row(&wire, Role::Single, at, at, SignalSource::Poll)
 }
 
 /// The store with the row's worker in it and the engine that decides over

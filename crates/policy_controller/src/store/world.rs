@@ -116,6 +116,7 @@ use crate::{
             fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, NamedHolder,
             OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
         },
+        EncodePool, EncoderFacts,
     },
     load::signals::{SignalCell, SignalCells},
     store::{
@@ -131,7 +132,6 @@ use crate::{
         counts::{Counts, KeptCounts, LentCounts, Slot},
         lease::{Lifecycle, Signal},
     },
-    EncodePool, EncoderFacts,
 };
 
 #[cfg(test)]
@@ -167,11 +167,11 @@ pub struct Ask {
     /// found one.
     pub pinned: Option<WorkerId>,
     /// Whether the profile's stages declared the affinity column
-    /// ([`Needs::affinity`](crate::Needs::affinity)): the build fills it
+    /// ([`Needs::affinity`](crate::document::Needs::affinity)): the build fills it
     /// then, and leaves it empty otherwise.
     pub affinity: bool,
     /// Whether the profile's stages declared the signal cells
-    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)): the build
+    /// ([`Needs::signal_cells`](crate::document::Needs::signal_cells)): the build
     /// hands them then, and none otherwise.
     pub signal_cells: bool,
 }
@@ -192,15 +192,15 @@ pub struct Naming<'a> {
     /// The gateway the decision is for: the view was built for it.
     pub gateway: GatewayId,
     /// The request's block hashes, in order from its first block
-    /// ([`RequestFacts::block_hashes`](crate::RequestFacts::block_hashes)).
+    /// ([`RequestFacts::block_hashes`](crate::engine::RequestFacts::block_hashes)).
     pub block_hashes: &'a [u64],
-    /// The request's cache namespace ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)).
+    /// The request's cache namespace ([`RequestFacts::namespace_seed`](crate::engine::RequestFacts::namespace_seed)).
     pub namespace_seed: u64,
     /// The decision's seed: where a list is cut, the rows kept are drawn
     /// from it, on streams of the naming's own.
     pub seed: u64,
     /// The most rows either list may hold: what the engine names for the
-    /// decision ([`Engine::named_for`](crate::Engine::named_for)), which is
+    /// decision ([`Engine::named_for`](crate::engine::Engine::named_for)), which is
     /// 0 for a profile that keeps its column. A host names no rows there:
     /// a naming under 0 holds every row.
     pub cap: u32,
@@ -567,13 +567,13 @@ pub struct PoolView<'a> {
     pub candidates: &'a [Candidate],
     /// The rows a veto of the asking gateway masks at the decision's
     /// instant, by position, in order: what
-    /// [`Constraints::stalled`](crate::Constraints::stalled) takes. Empty
+    /// [`Constraints::stalled`](crate::engine::Constraints::stalled) takes. Empty
     /// where the rows carry their stalled bits. The rows of it a hold of
     /// that gateway stands on are asked apart ([`World::held`]): a view
     /// under no veto has none, and carries nothing for them.
     pub stalled: &'a [u32],
     /// One more than the position of the pinned worker's row: what
-    /// [`RequestFacts::pinned_at`](crate::RequestFacts::pinned_at) takes.
+    /// [`RequestFacts::pinned_at`](crate::engine::RequestFacts::pinned_at) takes.
     /// Zero where no pinned worker is in the pool and where the rows carry
     /// their session bits.
     pub pinned_at: u32,
@@ -581,7 +581,7 @@ pub struct PoolView<'a> {
     /// it, empty otherwise.
     pub affinity: &'a [AffinityFacts],
     /// What the leases on file book on each row, by position: what
-    /// [`RequestFacts::lent_in_flight`](crate::RequestFacts::lent_in_flight)
+    /// [`RequestFacts::lent_in_flight`](crate::engine::RequestFacts::lent_in_flight)
     /// takes. `None` where the rows carry their counts.
     pub in_flight: Option<LentCounts<'a>>,
     /// The pool's engines ([`Engines`]), where it holds one of several
@@ -589,7 +589,7 @@ pub struct PoolView<'a> {
     /// that holds a host-local row hands none.
     pub engines: Engines<'a>,
     /// The rows' signal cells: what
-    /// [`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)
+    /// [`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)
     /// takes. The publication's own block where the pool was lent, the
     /// decision's written copy otherwise. `None` for an ask that takes
     /// none and under a generation that declares no signal.
@@ -1589,7 +1589,7 @@ impl World {
     /// be lent: in a pool that holds host-local rows, where the asking
     /// gateway's positions are its own, and for a decision that asks for
     /// `written` rows. A profile that shows its rows to a plugin
-    /// ([`Profile::scoped`](crate::Profile::scoped)) asks for them: a
+    /// ([`Profile::scoped`](crate::engine::Profile::scoped)) asks for them: a
     /// plugin's view carries each row's bits and ages as the row's fields.
     ///
     /// What the leases on file book on each row goes into no publication:
@@ -1683,7 +1683,7 @@ impl World {
     /// The rows of a lent view's mask ([`PoolView::stalled`]) a hold of the
     /// asking gateway stands on at the decision's instant, by position, in
     /// order, into `rows`: what
-    /// [`Constraints::held`](crate::Constraints::held) takes beside the
+    /// [`Constraints::held`](crate::engine::Constraints::held) takes beside the
     /// mask. Asked of the publication the view was read from, with the
     /// view's own `ask`. A hold stands no longer than its veto, so a held
     /// row is a row of the mask.
@@ -1822,7 +1822,7 @@ impl World {
     }
 
     /// Name the rows the affinity stages read in the column's place
-    /// ([`NamedAffinity`](crate::NamedAffinity)) for `view`, the rows a
+    /// ([`NamedAffinity`](crate::engine::NamedAffinity)) for `view`, the rows a
     /// decision of `model` in `role` is made over: the pool's as
     /// [`World::view`] lends them, or as [`World::build`] wrote them, which
     /// its caller may have narrowed by its gateway's wires since. `named`

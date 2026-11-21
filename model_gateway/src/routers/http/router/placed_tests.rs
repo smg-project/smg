@@ -13,11 +13,10 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::spec::{KeySourceSpec, RoutingKeySpec},
+    document::{AppliedSpec, KeySourceSpec, PolicySpec, PowerOfTwoMetric, RoutingKeySpec},
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
     },
-    AppliedSpec, PolicySpec, PowerOfTwoMetric,
 };
 use smg_worker::test_support::RefusedAddress;
 use tokio::{net::TcpListener, time::timeout};

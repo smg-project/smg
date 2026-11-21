@@ -24,7 +24,7 @@ use column::build_column;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use placed::page_start_buffer;
-use smg_policy_controller::{AffinityFacts, Constraints, PoolFacts, RequestFacts, Scratch};
+use smg_policy_controller::engine::{AffinityFacts, Constraints, PoolFacts, RequestFacts, Scratch};
 
 const SIZES: [usize; 3] = [8, 64, 512];
 

@@ -25,8 +25,8 @@ use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::RequestDeadline;
 use smg_policy_controller::{
-    engine::view::WorkerId,
-    tracking::lease::{ReleaseReason, TransportClass},
+    engine::WorkerId,
+    tracking::{ReleaseReason, TransportClass},
 };
 use smg_worker::identity::basic::{RuntimeType, Worker, WorkerLoadGuard};
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -2344,8 +2344,8 @@ pub(crate) enum FinalResponse {
 #[cfg(test)]
 pub(super) mod test_support {
     use smg_policy_controller::{
-        document::spec::DecodePick,
-        engine::view::Phase,
+        document::DecodePick,
+        engine::Phase,
         store::{GatewayId, LeasesStore, MemoryStore},
     };
     use smg_worker::identity::basic::ConnectionMode;
@@ -2557,7 +2557,7 @@ mod tests {
     use smg_grpc_client::VllmEngineClient;
     use smg_policy_controller::{
         store::{GatewayId, LeasesStore, MemoryStore, WorkersStore},
-        LeaseId, Side,
+        tracking::{LeaseId, Side},
     };
 
     use super::{
