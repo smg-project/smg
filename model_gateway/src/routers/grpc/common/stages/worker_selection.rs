@@ -2386,7 +2386,8 @@ impl WorkerSelectionStage {
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            Arc::clone(snapshot.pool(RoutingPool::GrpcPipelineRegular)),
+            snapshot,
+            RoutingPool::GrpcPipelineRegular,
             wire,
             PlacementInputs {
                 text,

@@ -892,6 +892,13 @@ impl RowTests {
         }
     }
 
+    /// Whether the set holds both tests of a row's health bits: a profile
+    /// with them tests a worker as the worker tests itself for routing.
+    pub(crate) fn tests_health(self) -> bool {
+        let both = Self::HEALTHY | Self::NOT_OVERLOADED;
+        self.0 & both == both
+    }
+
     /// Whether the set holds a test that reads the row itself and no live
     /// fact: the capacity bit, the room bit, the rows tried.
     pub(crate) fn reads_rows(self) -> bool {

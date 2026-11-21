@@ -1,12 +1,16 @@
 //! One request's routing, head to head, over one fleet of workers a model,
-//! every one ready unless the cell says otherwise. Three paths:
+//! every one ready unless the cell says otherwise. Four paths:
 //!
 //! - `classic`: the classic policies over the worker registry.
-//! - `engine`: the policy engine over that same registry. Everything is
-//!   built as `classic` builds it (the registry, the policies a
-//!   registration leaves, each worker's completion sink, the load feed) and
-//!   the request runs the same function; the one difference is the engine
-//!   set to the placement.
+//! - `engine`: the policy engine over that same registry, asked ahead of
+//!   the classic placement's pass. Everything is built as `classic` builds
+//!   it (the registry, the policies a registration leaves, each worker's
+//!   completion sink, the load feed) and the request runs the same
+//!   function; the one difference is the engine set to the placement.
+//! - `object`: the policy engine asked where the classic placement's pass
+//!   asks its policy. Everything is built as `classic` builds it and the
+//!   request runs the same function, pass and all; the one difference is
+//!   the policy the registry hands the pass, which asks the engine.
 //! - `controller`: the policy controller over its own store in this
 //!   process, registered and reported to as that mode does it.
 //!
@@ -20,8 +24,8 @@
 //! stretches. The binary runs on the gateway's stock allocator, as the
 //! serving binary does.
 //!
-//! `--not-ready N` leaves one worker in `N` not ready, on the `classic` and
-//! `engine` paths: a request is then placed among the others, and a turn or
+//! `--not-ready N` leaves one worker in `N` not ready, on the `classic`,
+//! `engine` and `object` paths: a request is then placed among the others, and a turn or
 //! a draw that lands on a worker that is not ready is part of the cell.
 //! `--ready N` leaves `N` workers of the fleet ready and every other not
 //! ready: with `1`, nearly every request is placed by a pass over the pool.
@@ -31,7 +35,7 @@
 //! thresholds.
 //!
 //! `--models N` serves `N` models, each with a fleet of its own of the
-//! cell's size, on the `classic` and `engine` paths: a caller's requests
+//! cell's size, on the `classic`, `engine` and `object` paths: a caller's requests
 //! name the models in turn, as the requests of a gateway that serves many
 //! models do, so no two requests in a row are for one model.
 //!
@@ -76,7 +80,8 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, route_classic, set_policy_engine_of, ControllerPath, Route,
+                attach_loads, policies_asking_the_engine, route_classic, set_policy_engine_of,
+                ControllerPath, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -289,17 +294,21 @@ type Upkeep = Box<dyn Fn()>;
 
 /// The classic path: a registry with the fleet, the policies a registration
 /// leaves (the model's policy and each worker's completion sink), and the
-/// load feed the monitor would publish. With `engine`, the same, and the
-/// policy engine of the same policy set to the placement.
-fn classic(cell: &Cell, engine: bool) -> (Routing, Option<TestFeed>) {
+/// load feed the monitor would publish. On the `engine` path, the same, and
+/// the policy engine of the same policy set to the placement. On the
+/// `object` path, the same, and the registry's policies ask that engine.
+fn classic(cell: &Cell) -> (Routing, Option<TestFeed>) {
     let registry = Arc::new(WorkerRegistry::new());
-    let policies = Arc::new(PolicyRegistry::new(policy_config(&cell.policy)));
-    if engine {
-        let config = RouterConfig {
-            policy_controller: true,
-            policy: policy_config(&cell.policy),
-            ..RouterConfig::default()
-        };
+    let config = RouterConfig {
+        policy_controller: true,
+        policy: policy_config(&cell.policy),
+        ..RouterConfig::default()
+    };
+    let policies = Arc::new(match cell.path.as_str() {
+        "object" => policies_asking_the_engine(&config).unwrap(),
+        _ => PolicyRegistry::new(policy_config(&cell.policy)),
+    });
+    if cell.path == "engine" {
         set_policy_engine_of(&policies, &config).unwrap();
     }
     let models = model_ids(cell.models);
@@ -372,8 +381,8 @@ fn main() {
         turn_live_draw_from(rows);
     }
     let (routing, upkeep, _feed): (Routing, Upkeep, Option<TestFeed>) = match cell.path.as_str() {
-        "classic" | "engine" => {
-            let (routing, feed) = classic(&cell, cell.path == "engine");
+        "classic" | "engine" | "object" => {
+            let (routing, feed) = classic(&cell);
             (routing, Box::new(|| {}), feed)
         }
         "controller" => {

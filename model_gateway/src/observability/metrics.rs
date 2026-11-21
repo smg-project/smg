@@ -2385,29 +2385,16 @@ impl Metrics {
         });
     }
 
-    /// Count and time one policy decision for `model_id`
-    /// ([`Self::count_policy_decision`], [`Self::time_policy_decision`]):
-    /// one body, the two inlined into it.
+    /// Count and time one policy decision for `model_id`. The counter asks
+    /// `profile_name` only when it needs a handle for a profile. A decision
+    /// no profile made counts under an empty `profile` label and keeps its
+    /// handle under no generation. Where a profile's generation is gone, the
+    /// empty label is used and that handle is discarded after counting.
     pub fn record_policy_decision(
         model_id: &str,
         decision: PolicyDecision,
         profile_name: impl FnOnce() -> Option<Arc<str>>,
         seconds: f64,
-    ) {
-        Self::count_policy_decision(model_id, decision, profile_name);
-        Self::time_policy_decision(decision.mode, decision.outcome, seconds);
-    }
-
-    /// Count one policy decision for `model_id`. The counter asks
-    /// `profile_name` only when it needs a handle for a profile. A decision
-    /// no profile made counts under an empty `profile` label and keeps its
-    /// handle under no generation. Where a profile's generation is gone, the
-    /// empty label is used and that handle is discarded after counting.
-    #[inline]
-    pub fn count_policy_decision(
-        model_id: &str,
-        decision: PolicyDecision,
-        profile_name: impl FnOnce() -> Option<Arc<str>>,
     ) {
         let PolicyDecision {
             generation,
@@ -2416,7 +2403,14 @@ impl Metrics {
             mode,
         } = decision;
         let build = |model: Arc<str>, profile: Option<Arc<str>>| {
-            policy_decisions(model, profile, outcome, mode)
+            let profile = profile.map_or_else(|| "".into(), metrics::SharedString::from);
+            counter!(
+                POLICY_DECISIONS_TOTAL,
+                "model" => model,
+                "profile" => profile,
+                "outcome" => outcome,
+                "mode" => mode
+            )
         };
         if handles::keep_handles() {
             // A decision no profile made names nothing a new document can
@@ -2455,6 +2449,12 @@ impl Metrics {
             let name = profile.and_then(|_| profile_name());
             build(intern_model_label(model_id), name).increment(1);
         }
+        handles::with_static(
+            &handles::POLICY_DECISION_SECONDS,
+            (mode, outcome),
+            || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
+            |time| time.record(seconds),
+        );
     }
 
     /// Count one pick of the policy engine in this process, a worker of
@@ -2463,8 +2463,8 @@ impl Metrics {
     /// a compare of the model id and one atomic step. The first pick under
     /// a model id and a profile builds their handle and keeps it, where
     /// handles are kept at all and the model's label is its own. Any other
-    /// pick counts through the calling thread's handles
-    /// ([`Self::count_policy_decision`]).
+    /// pick counts by a lookup of its series
+    /// ([`Self::count_policy_decision_by_lookup`]).
     ///
     /// Every pick of the engine in this process says one outcome and one
     /// mode, so the kept handle is found by the model id, the document's
@@ -2489,7 +2489,8 @@ impl Metrics {
         let name = profile_name();
         let label = intern_model_label(model_id);
         if name.is_none() || !handles::keep_handles() || handles::is_sentinel(&label) {
-            return Self::count_policy_decision(model_id, pick, || name);
+            let name = pick.profile.and(name);
+            return policy_decisions(label, name, pick.outcome, pick.mode).increment(1);
         }
         let decided = policy_decisions(label, name, pick.outcome, pick.mode);
         decided.increment(1);
@@ -2504,18 +2505,30 @@ impl Metrics {
         }));
     }
 
-    /// Record the `seconds` one policy decision took. A caller that times
-    /// every decision records each; the engine in the gateway's own process
-    /// times one decision in [`POLICY_DECISIONS_PER_TIMED`], so there the
-    /// histogram's count is a sample's and the counter's is the decisions'.
-    #[inline]
+    /// Count one policy decision for `model_id` by a lookup of its series
+    /// (`smg_policy_decisions_total`): no handle is kept for it. For the
+    /// decisions of the engine in this process that place no worker, which
+    /// no pool's kept handle counts ([`Self::count_engine_pick`]).
+    pub fn count_policy_decision_by_lookup(
+        model_id: &str,
+        decision: PolicyDecision,
+        profile_name: impl FnOnce() -> Option<Arc<str>>,
+    ) {
+        let name = decision.profile.and_then(|_| profile_name());
+        let label = intern_model_label(model_id);
+        policy_decisions(label, name, decision.outcome, decision.mode).increment(1);
+    }
+
+    /// Record the `seconds` one policy decision took, by a lookup of its
+    /// series (`smg_policy_decision_seconds`): no handle is kept for it.
+    /// For the engine in the gateway's own process, which times one
+    /// decision in [`POLICY_DECISIONS_PER_TIMED`]: there the histogram's
+    /// count is a sample's and the counter's is the decisions'. A caller
+    /// that times every decision keeps its handle
+    /// ([`Self::record_policy_decision`]), and that record stays the one
+    /// reader of the kept handles.
     pub fn time_policy_decision(mode: &'static str, outcome: &'static str, seconds: f64) {
-        handles::with_static(
-            &handles::POLICY_DECISION_SECONDS,
-            (mode, outcome),
-            || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
-            |time| time.record(seconds),
-        );
+        histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome).record(seconds);
     }
 
     /// The count of the shadow decisions that said `kind` beside a live

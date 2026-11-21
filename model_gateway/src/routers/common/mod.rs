@@ -242,9 +242,9 @@ pub mod bench_support {
     };
     pub use crate::policy_controller::bench_support::{ControllerPath, Route};
     use crate::{
-        config::RouterConfig,
+        config::{RouterConfig, RoutingKeyOverrideConfig},
         observability::cache_trace,
-        policies::PolicyRegistry,
+        policies::{EnginePolicy, PolicyRegistry},
         routers::common::{
             pair_index::{PdPairIndex, PdWire},
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
@@ -269,6 +269,40 @@ pub mod bench_support {
         policies: &PolicyRegistry,
         config: &RouterConfig,
     ) -> Result<(), String> {
+        policies.set_policy_engine(policy_engine_of(config)?);
+        Ok(())
+    }
+
+    /// The classic policy registry of `config`'s policy, its policies
+    /// asking the policy engine of the document in force under `config`:
+    /// [`route_classic`] then runs the classic placement, and the pass asks
+    /// the policy object that asks the engine where it asks a classic
+    /// policy.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_policy_engine_of`], and a policy the engine does not pick
+    /// by itself: the registry would hand out the classic policy, and a
+    /// cell named for the object would time that one.
+    pub fn policies_asking_the_engine(config: &RouterConfig) -> Result<PolicyRegistry, String> {
+        let policies = PolicyRegistry::with_policy_engine(
+            config.policy.clone(),
+            RoutingKeyOverrideConfig::default(),
+            policy_engine_of(config)?,
+        );
+        if policies.get_default_policy().as_any().is::<EnginePolicy>() {
+            Ok(policies)
+        } else {
+            Err(format!(
+                "the policy engine does not pick `{}` by itself: the registry builds the classic policy",
+                config.policy.name()
+            ))
+        }
+    }
+
+    /// The policy engine of the document in force under `config`, validated
+    /// as the gateway's start validates it.
+    fn policy_engine_of(config: &RouterConfig) -> Result<Arc<PolicyEngine>, String> {
         let document = config
             .policy_document_in_force()
             .map_err(|refused| refused.to_string())?;
@@ -278,8 +312,7 @@ pub mod bench_support {
             &config.denied_view_headers(),
         )
         .map_err(|refused| refused.to_string())?;
-        policies.set_policy_engine(Arc::new(PolicyEngine::new(spec)));
-        Ok(())
+        Ok(Arc::new(PolicyEngine::new(spec)))
     }
 
     /// One request's routing under the classic policies on `route`: the

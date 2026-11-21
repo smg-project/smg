@@ -127,7 +127,7 @@ pub(crate) fn single(
 /// request's model and timed where its turn comes. A pick counts through
 /// the handles `picks` keeps for the pool, with no lookup: a gateway that
 /// serves many models pays for none. A request placed on nobody is counted
-/// through the calling thread's handles.
+/// by a lookup of its series.
 fn decide(
     engine: &PolicyEngine,
     request: &PlacementRequest<'_>,
@@ -155,7 +155,7 @@ fn decide(
     };
     match &placed {
         Ok(_) => Metrics::count_engine_pick(picks, request.model, decision, profile_name),
-        Err(_) => Metrics::count_policy_decision(request.model, decision, profile_name),
+        Err(_) => Metrics::count_policy_decision_by_lookup(request.model, decision, profile_name),
     }
     if let Some(seconds) = seconds {
         Metrics::time_policy_decision(EMBEDDED, outcome, seconds);

@@ -189,6 +189,32 @@ impl Engine {
         needs == Needs::default() && !shown && !by_reports && entry.binding.sessions.is_none()
     }
 
+    /// Whether one pick of the profile at `index` over a pool's workers is
+    /// the profile's whole decision, made by its picker alone
+    /// ([`Picker::pick_live`]): the picker says so, the profile holds no
+    /// scorer, its filters are the engine's own and hold both tests of a
+    /// worker's health, and its stages ask nothing else of a decision. A
+    /// caller that holds every other rule of a placement itself (a
+    /// gateway's own placement pass) asks such a profile for its pick and
+    /// reads no row for it. `false` past the profiles.
+    ///
+    /// [`Picker::pick_live`]: super::Picker::pick_live
+    #[must_use]
+    pub fn picks_live(&self, index: u16) -> bool {
+        let at = usize::from(index);
+        let (Some(profile), Some(Some(tests)), Some(marks)) = (
+            self.profiles.get(at),
+            self.row_tests.get(at),
+            self.marks.get(at),
+        ) else {
+            return false;
+        };
+        profile.picker.picks_live()
+            && profile.scorers.is_empty()
+            && tests.tests_health()
+            && marks.0 & !Marks::DRAWS_FIRST == 0
+    }
+
     /// [`Self::decides_live`] of the profile at `index` under `entry`'s
     /// binding.
     fn live_at(&self, entry: &Entry, index: u16) -> bool {

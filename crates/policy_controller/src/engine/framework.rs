@@ -3,7 +3,12 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt::Debug,
+    sync::{atomic::AtomicU64, Arc},
+};
 
 use crate::{
     document::spec::{Assignment, Needs},
@@ -672,6 +677,54 @@ pub trait Picker: Lifecycle + Debug {
     ) -> bool {
         self.draw_first(facts, pool, candidates, keep, kept, draw)
     }
+
+    /// Whether the picker places a request over a pool's workers by itself
+    /// ([`Picker::pick_live`]): its own rule is its whole pick, and it
+    /// reads no row, no score and no count. A caller that keeps a worker's
+    /// health on the worker and holds every other rule of a placement
+    /// itself asks such a picker for one pick and nothing else of a
+    /// decision ([`Engine::picks_live`]). The default is no. The engine
+    /// reads it where such a caller asks for a profile, not at a decision.
+    fn picks_live(&self) -> bool {
+        false
+    }
+
+    /// One pick over `pool` by the picker's own rule alone
+    /// ([`Picker::picks_live`]). `keep` asks the profile's tests of the
+    /// worker at a position of the pool: one read of that worker. `Some`
+    /// is the position picked, which `keep` kept. `None` where the rule's
+    /// own bound ran out before a worker was kept, as a rotation's turns
+    /// past a refused worker do: the caller then reads the pool whole and
+    /// asks [`Picker::pick_among`] of the workers that pass. The default
+    /// picks nobody.
+    fn pick_live(&self, pool: &LivePool<'_>, keep: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
+        let _ = (pool, keep);
+        None
+    }
+
+    /// The pick among the `passed` workers a whole pass left, as a place in
+    /// their list, which stands in the pool's order. `set` names the set
+    /// of them: a picker that keeps a rotation a set turns that set's own.
+    /// Asked with one worker or more. The default takes the first.
+    fn pick_among(&self, set: u64, passed: usize) -> usize {
+        let _ = (set, passed);
+        0
+    }
+}
+
+/// A pool as a picker that places over its workers by itself is handed it
+/// ([`Picker::pick_live`]).
+#[derive(Clone, Copy, Debug)]
+pub struct LivePool<'a> {
+    /// How many workers the pool holds, in an order that stands for as long
+    /// as the pool does.
+    pub rows: usize,
+    /// The pool's own word, kept by the caller beside the pool for as long
+    /// as the pool stands, for the picker that places over it: a rotation
+    /// counts its turns in it, so the pool's rotation is found with the
+    /// pool and no table is looked up. It starts at a position the caller
+    /// drew.
+    pub word: &'a AtomicU64,
 }
 
 /// Per-decision state a stage set keeps across the stages of one profile

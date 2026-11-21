@@ -33,8 +33,8 @@ use super::{
     hash_ring::HashRing,
     kept_rings::KeptRings,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
-    PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, EnginePolicy, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -192,6 +192,13 @@ pub struct PolicyRegistry {
     /// where it stands, and the policies above where it does not.
     policy_engine: Arc<OnceLock<Arc<PolicyEngine>>>,
 
+    /// The policy engine the policies built here ask, where the gateway
+    /// keeps one in its own process ([`Self::with_policy_engine`]): a policy
+    /// whose name is a profile the engine picks by itself is built as the
+    /// object that asks it ([`EnginePolicy`]). `None` builds every policy
+    /// as the classic one.
+    asked_engine: Option<Arc<PolicyEngine>>,
+
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker_for_model`].
@@ -247,7 +254,32 @@ impl PolicyRegistry {
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
     ) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
+        Self::build(default_policy_config, routing_key_override, None)
+    }
+
+    /// [`Self::with_override`] for a gateway that keeps the policy engine
+    /// in its own process. The registry is built as ever and decides as
+    /// ever which policy a request is placed by. A policy it builds under a
+    /// name that `engine`'s document holds as a profile the engine picks by
+    /// itself is the object that asks the engine ([`EnginePolicy`]), under
+    /// the classic policy's name: the default policy, and the policy of a
+    /// model whose label names the default's type. Any other is the classic
+    /// policy of its name.
+    pub fn with_policy_engine(
+        default_policy_config: PolicyConfig,
+        routing_key_override: RoutingKeyOverrideConfig,
+        engine: Arc<PolicyEngine>,
+    ) -> Self {
+        Self::build(default_policy_config, routing_key_override, Some(engine))
+    }
+
+    fn build(
+        default_policy_config: PolicyConfig,
+        routing_key_override: RoutingKeyOverrideConfig,
+        asked_engine: Option<Arc<PolicyEngine>>,
+    ) -> Self {
+        let default_policy =
+            Self::create_policy_from_config(&default_policy_config, asked_engine.as_ref());
         let routing_key_sticky = routing_key_override.enabled.then(|| {
             Arc::new(ManualPolicy::with_config(ManualConfig {
                 eviction_interval_secs: routing_key_override.eviction_interval_secs,
@@ -283,6 +315,7 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             policy_engine: Arc::new(OnceLock::new()),
+            asked_engine,
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
@@ -892,7 +925,7 @@ impl PolicyRegistry {
     /// [`Self::on_worker_added`].
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         if Self::hint_matches_config(policy_type, self.default_policy_config.name()) {
-            Self::create_policy_from_config(&self.default_policy_config)
+            Self::create_policy_from_config(&self.default_policy_config, self.asked_engine.as_ref())
         } else if let Some(policy) = PolicyFactory::create_by_name(policy_type) {
             policy
         } else {
@@ -908,9 +941,19 @@ impl PolicyRegistry {
         hint == config_name || hint == config_name.replace('_', "")
     }
 
-    /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_from_config(config)
+    /// Create a policy from a PolicyConfig: the object that asks `engine`
+    /// where its document holds a profile of the policy's name that the
+    /// engine picks by itself, and the classic policy otherwise (delegates
+    /// to PolicyFactory).
+    fn create_policy_from_config(
+        config: &PolicyConfig,
+        engine: Option<&Arc<PolicyEngine>>,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        let name = config.name();
+        match engine.and_then(|engine| EnginePolicy::of(engine, name, name)) {
+            Some(asking) => Arc::new(asking),
+            None => PolicyFactory::create_from_config(config),
+        }
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)

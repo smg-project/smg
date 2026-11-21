@@ -183,8 +183,10 @@ pub struct ModelWorkerSnapshot {
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
     /// What the policy engine reads of each pool's members (see
-    /// [`Self::pool_members`]).
-    pool_members: [OnceLock<PoolMembers>; RoutingPool::COUNT],
+    /// [`Self::pool_members`]), each in a box of its own: the value stands
+    /// on cache lines of its own, and a snapshot no engine reads holds the
+    /// empty cells alone.
+    pool_members: [OnceLock<Box<PoolMembers>>; RoutingPool::COUNT],
     /// The metric handles each pool's picks by the policy engine count
     /// through (see [`Self::pool_picks`]).
     pool_picks: [KeptPicks; RoutingPool::COUNT],
@@ -378,7 +380,18 @@ impl ModelWorkerSnapshot {
         engine: &PolicyEngine,
     ) -> &PoolMembers {
         self.pool_members[pool.index()]
-            .get_or_init(|| engine.pool_members(model_id, self.pool(pool)))
+            .get_or_init(|| Box::new(engine.pool_members(model_id, self.pool(pool))))
+    }
+
+    /// The cell of [`Self::pool_members`] for `pool`, as the placement hands
+    /// it on beside the pool's name ([`NamedList::members`]): the policy
+    /// object that asks the engine fills it at its first pick over the pool
+    /// and borrows the value at each pick after. Nothing is built for a
+    /// pool no such policy picks over.
+    ///
+    /// [`NamedList::members`]: crate::policies::NamedList::members
+    pub(crate) fn pool_members_cell(&self, pool: RoutingPool) -> &OnceLock<Box<PoolMembers>> {
+        &self.pool_members[pool.index()]
     }
 
     /// The metric handles the picks of `pool` by the policy engine count

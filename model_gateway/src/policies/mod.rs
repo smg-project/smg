@@ -3,10 +3,15 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    any::TypeId,
+    fmt::Debug,
+    sync::{Arc, OnceLock},
+};
 
 use openai_protocol::UNKNOWN_MODEL_ID;
 use rand::RngExt as _;
+use smg_policy_controller::engine::PoolMembers;
 use smg_worker::{identity::basic::Worker, load::state::LoadReceiver, runtime::RoutingState};
 
 use crate::{config::CacheIndexKind, policies::hash_ring::HashRing};
@@ -35,6 +40,7 @@ mod classic_sticky_override_rows;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
+mod engine_policy;
 pub mod expected_wait;
 mod factory;
 pub mod hash_ring;
@@ -60,6 +66,7 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
+pub use engine_policy::EnginePolicy;
 pub use factory::PolicyFactory;
 pub use least_load::LeastLoadPolicy;
 pub use manual::{ManualConfig, ManualPolicy};
@@ -218,15 +225,22 @@ pub(crate) fn as_bucket(policy: &dyn LoadBalancingPolicy) -> Option<&BucketPolic
 
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
+/// The policy object that asks the policy engine is built for a profile
+/// that tests a worker's health itself ([`EnginePolicy::of`]).
+///
+/// The policy says its type once and the types are compared as values, so
+/// a type late in the list costs a compare for each type ahead of it and
+/// no call.
 pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {
-    let policy = policy.as_any();
-    policy.is::<RandomPolicy>()
-        || policy.is::<RoundRobinPolicy>()
-        || policy.is::<LeastLoadPolicy>()
-        || policy.is::<PowerOfTwoPolicy>()
-        || policy.is::<CacheAwarePolicy>()
-        || policy.is::<ManualPolicy>()
-        || policy.is::<PassthroughPolicy>()
+    let policy = policy.as_any().type_id();
+    policy == TypeId::of::<RandomPolicy>()
+        || policy == TypeId::of::<RoundRobinPolicy>()
+        || policy == TypeId::of::<EnginePolicy>()
+        || policy == TypeId::of::<LeastLoadPolicy>()
+        || policy == TypeId::of::<PowerOfTwoPolicy>()
+        || policy == TypeId::of::<CacheAwarePolicy>()
+        || policy == TypeId::of::<ManualPolicy>()
+        || policy == TypeId::of::<PassthroughPolicy>()
 }
 
 /// Whether a built-in policy reads the model's hash ring
@@ -537,6 +551,13 @@ pub struct NamedList<'a> {
     /// Candidate `k` is `list[positions[k]]`, ascending; `None` when the
     /// candidates are the whole list in its order.
     pub positions: Option<&'a [usize]>,
+    /// The routing snapshot's cell for what the policy engine keeps of the
+    /// list, when the caller drew the list from a snapshot's pool: the
+    /// policy object that asks the engine fills it at its first pick over
+    /// the list and finds it there at each pick after, with no lookup
+    /// ([`EnginePolicy`]). `None` for a list no such cell hangs beside. A
+    /// classic policy reads nothing of it.
+    pub members: Option<&'a OnceLock<Box<PoolMembers>>>,
 }
 
 impl NamedList<'_> {
@@ -555,6 +576,7 @@ impl Debug for NamedList<'_> {
         f.debug_struct("NamedList")
             .field("list", &self.list.len())
             .field("positions", &self.positions.map(<[usize]>::len))
+            .field("members", &self.members.map(|cell| cell.get().is_some()))
             .finish()
     }
 }
