@@ -18,6 +18,7 @@ pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
 pub(crate) mod framework;
+pub(crate) mod pair_classes;
 #[cfg(feature = "in-process")]
 pub(crate) mod policy_engine;
 pub(crate) mod prefix_pass;
@@ -42,6 +43,7 @@ pub use framework::{
     PairTable, PairTableError, Picker, Place, Plan, PoolWord, Profile, ScoreFront, ScoreSpread,
     Scorer, Scratch, Shortlist, TieBand, WeightedScorer, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
+pub use pair_classes::PartnerClasses;
 #[cfg(feature = "in-process")]
 pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
