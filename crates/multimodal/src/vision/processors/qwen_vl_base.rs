@@ -841,8 +841,10 @@ impl QwenVLProcessorBase {
         (grid_t * grid_h * grid_w) / (self.config.merge_size * self.config.merge_size)
     }
 
-    /// Patchify tensor directly into an output buffer (avoids intermediate Vec allocation).
     /// Patchify a [C, H, W] tensor and append the patches to `output`.
+    ///
+    /// Test-only reference: the plain tensor form that the RGB-byte fast paths
+    /// (`preprocess`, `patchify_image_rgb_block_band`) are compared with bit for bit.
     ///
     /// Output layout per image:
     ///   `[grid_t, patch_rows, patch_cols, merge_h, merge_w, C, temporal, patch_h, patch_w]`
@@ -967,6 +969,9 @@ impl QwenVLProcessorBase {
     }
 
     /// Patchify a sequence of frame tensors into Qwen's video patch layout.
+    ///
+    /// Test-only reference: the plain tensor form that the RGB-byte video path
+    /// (`preprocess_video`) is compared with bit for bit.
     ///
     /// `tensors` must already be resized and normalized to the same spatial
     /// shape. If the frame count is not divisible by `temporal_patch_size`,
