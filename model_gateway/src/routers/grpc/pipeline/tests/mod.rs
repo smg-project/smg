@@ -45,7 +45,9 @@ use smg_policy_controller::{
 };
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    identity::basic::{ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType},
+    identity::basic::{
+        BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
+    },
     labels::SUPPORTS_VISION_LABEL,
 };
 use tokio::sync::mpsc;
@@ -4312,6 +4314,68 @@ async fn a_non_streamed_request_to_a_silent_worker_is_the_504_at_the_request_tim
     let elapsed = started.elapsed();
     assert_timeout_response(response, elapsed).await;
     assert_aborted_and_released(&scheduler, &worker).await;
+}
+
+/// A non-streamed request cut at the request timeout is one failure for its
+/// worker's circuit breaker, as a streamed one is. So is the decode side of a
+/// prefill and decode pair, for the decode worker.
+#[tokio::test]
+async fn a_non_streamed_request_cut_at_the_request_timeout_counts_against_the_workers_breaker() {
+    let (single, worker, _scheduler, single_components) =
+        silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler {
+        frame_gap: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    })
+    .await;
+    let registry = Arc::new(WorkerRegistry::new());
+    register_worker(&registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&registry, decode_port, WorkerType::Decode);
+    let deps = PipelineDeps::pair(
+        registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_request_timeout(REQUEST_TIMEOUT);
+    let pair = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let pair_components = components(Arc::clone(&registry)).await;
+
+    let mut failures = Vec::new();
+    for (pipeline, components, cut) in [
+        (single, single_components, worker),
+        (pair, pair_components, decode),
+    ] {
+        let response = tokio::time::timeout(
+            CASE_CAP,
+            pipeline.execute_completion(
+                completion(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the request timeout answers");
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        let cut = cut
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .expect("a basic worker");
+        failures.push(cut.circuit_breaker.load().total_failures());
+    }
+    assert_eq!(
+        failures,
+        [1, 1],
+        "the single worker, then the pair's decode worker"
+    );
 }
 
 /// A worker that never answers the call that opens the stream (the
