@@ -19,11 +19,13 @@
 
 use std::{
     borrow::Cow,
+    hash::BuildHasher,
     ops::Range,
     sync::{Arc, LazyLock},
 };
 
 use anyhow::{anyhow, Result};
+use rustc_hash::FxBuildHasher;
 use tokenizers::{decoders::DecoderWrapper, Tokenizer as HfTokenizer};
 
 use crate::{
@@ -424,6 +426,97 @@ impl ByteLevelTable {
             Piece::Bytes(&self.bytes[span])
         };
         Some((piece, kind.special()))
+    }
+}
+
+/// The ids of a [`ByteLevelTable`] by their bytes, the table being the store
+/// of every id's bytes: one array of 32-bit slots, open-addressed, a slot the
+/// id and, in the bits the ids leave free, bits of the hash of its bytes, so
+/// that a probe reads the table only where those bits agree. Six bytes an id,
+/// where a map by text holds every text a second time.
+pub(crate) struct TextIndex {
+    slots: Box<[u32]>,
+    /// Bits of a slot the id takes: enough for the count of ids itself, so
+    /// that the id of all ones is never one of them and [`Self::EMPTY`] is
+    /// no slot's value.
+    id_bits: u32,
+}
+
+impl TextIndex {
+    const EMPTY: u32 = u32::MAX;
+
+    /// The index of every id `table` has bytes for; of two ids with the same
+    /// bytes the lower.
+    pub(crate) fn build(table: &ByteLevelTable) -> Self {
+        let ids = table.kind.len() as u32;
+        // Two thirds full: a miss walks about five slots, a hit two.
+        let room = ids as usize + ids as usize / 2 + 1;
+        let mut index = Self {
+            slots: vec![Self::EMPTY; room].into_boxed_slice(),
+            id_bits: u32::BITS - ids.leading_zeros(),
+        };
+        let mask = index.id_mask();
+        for id in 0..ids {
+            let Some((bytes, _)) = table.token_bytes(id) else {
+                continue;
+            };
+            let (mut at, tag) = index.place(bytes);
+            loop {
+                let slot = index.slots[at];
+                if slot == Self::EMPTY {
+                    index.slots[at] = tag | id;
+                    break;
+                }
+                if slot & !mask == tag && Self::holds(table, slot & mask, bytes) {
+                    break;
+                }
+                at = index.after(at);
+            }
+        }
+        index
+    }
+
+    /// The id whose bytes in `table`, the table of the build, are `bytes`.
+    pub(crate) fn get(&self, table: &ByteLevelTable, bytes: &[u8]) -> Option<TokenIdType> {
+        let (mut at, tag) = self.place(bytes);
+        let mask = self.id_mask();
+        loop {
+            let slot = self.slots[at];
+            if slot == Self::EMPTY {
+                return None;
+            }
+            if slot & !mask == tag && Self::holds(table, slot & mask, bytes) {
+                return Some(slot & mask);
+            }
+            at = self.after(at);
+        }
+    }
+
+    fn holds(table: &ByteLevelTable, id: TokenIdType, bytes: &[u8]) -> bool {
+        table.token_bytes(id).is_some_and(|(held, _)| held == bytes)
+    }
+
+    fn id_mask(&self) -> u32 {
+        u32::MAX.checked_shr(u32::BITS - self.id_bits).unwrap_or(0)
+    }
+
+    fn after(&self, at: usize) -> usize {
+        if at + 1 == self.slots.len() {
+            0
+        } else {
+            at + 1
+        }
+    }
+
+    /// Where the probe of `bytes` starts, and the bits of their hash as a
+    /// slot holds them.
+    fn place(&self, bytes: &[u8]) -> (usize, u32) {
+        let hash = FxBuildHasher
+            .hash_one(bytes)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let at = ((hash >> 32) * self.slots.len() as u64) >> 32;
+        let tag = (hash as u32).checked_shl(self.id_bits).unwrap_or(0);
+        (at as usize, tag)
     }
 }
 

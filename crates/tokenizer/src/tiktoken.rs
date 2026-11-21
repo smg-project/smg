@@ -17,7 +17,8 @@ use tiktoken_rs::{
 
 use crate::{
     byte_level::{
-        cut_start, ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId,
+        cut_start, ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, TextIndex,
+        UnknownId,
     },
     chat_template::{
         load_chat_template_from_file, python_isspace, ChatTemplateContentFormat,
@@ -211,7 +212,12 @@ pub struct TiktokenTokenizer {
     /// every encode in `tokenizer`. Shared as `tokenizer` is.
     native: Option<Arc<NativeEncoder>>,
     special_tokens: SpecialTokens,
+    /// The ids by their text where no `text_index` is; beside one, only the
+    /// added tokens it does not answer (see [`text_id`]).
     vocab: HashMap<String, TokenIdType>,
+    /// The ids by their text over `byte_level`, for a vocabulary file with
+    /// that table.
+    text_index: Option<TextIndex>,
     /// The added tokens' texts by id (`added_tokens_decoder`), read before
     /// the encoder by `id_to_token`: an added token shadows a rank sharing
     /// its id, as `vocab` and the other backend order them. Empty for a
@@ -363,7 +369,8 @@ impl TiktokenTokenizer {
             TiktokenModel::P50kBase | TiktokenModel::P50kEdit => 50281,
             TiktokenModel::R50kBase => 50257,
         };
-        let byte_level = byte_level_table(&tokenizer, vocab_size, &skip_token_ids);
+        let byte_level = byte_level_ids(vocab_size, &skip_token_ids)
+            .map(|ids_end| byte_level_table(&tokenizer, ids_end, &skip_token_ids));
 
         Ok(TiktokenTokenizer {
             tokenizer,
@@ -371,6 +378,7 @@ impl TiktokenTokenizer {
             native: None,
             special_tokens,
             vocab: HashMap::new(),
+            text_index: None,
             added_texts: HashMap::new(),
             vocab_size,
             chat_template: ChatTemplateState::empty(),
@@ -577,13 +585,34 @@ impl TiktokenTokenizer {
             .max()
             .map(|id| id as usize + 1)
             .unwrap_or(0);
-        let vocab = build_vocab_map(&ranks, &specials);
         let added_texts: HashMap<TokenIdType, String> = specials
             .iter()
             .map(|(text, &id)| (id, text.clone()))
             .collect();
         let native = Self::native_encoder(&ranks, &pattern, &by_text);
+        // The decode table holds every id's text already: an index over it
+        // answers a text's id, and a map by text is built only where no
+        // table is (it would hold every text a second time).
+        let ids_end = byte_level_ids(vocab_size, &skip_token_ids);
+        let text_map = ids_end
+            .is_none()
+            .then(|| build_vocab_map(&ranks, &specials));
         let tokenizer = Arc::new(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?);
+        let byte_level =
+            ids_end.map(|ids_end| byte_level_table(&tokenizer, ids_end, &skip_token_ids));
+        let text_index = byte_level.as_deref().map(TextIndex::build);
+        // Beside the index the map keeps only an added token the index does
+        // not answer with its own id (one whose id a rank holds in the
+        // table, or whose text a lower id has): none, as a rule.
+        let vocab = match (text_map, &text_index, &byte_level) {
+            (Some(map), _, _) => map,
+            (None, Some(index), Some(table)) => specials
+                .iter()
+                .filter(|(text, &id)| index.get(table, text.as_bytes()) != Some(id))
+                .map(|(text, &id)| (text.clone(), id))
+                .collect(),
+            _ => HashMap::new(),
+        };
         // Counted and announced once the file's own encoder has loaded too,
         // the point the Hugging Face path counts at as well (before the chat
         // template is read).
@@ -614,15 +643,13 @@ impl TiktokenTokenizer {
         // plus the tokenizer's own eos_token (structured-output grammars end on it).
         let eos_token_ids = with_tokenizer_eos(
             load_eos_token_ids(dir),
-            special_tokens
-                .eos_token
-                .as_deref()
-                .and_then(|token| vocab.get(token).copied()),
+            special_tokens.eos_token.as_deref().and_then(|token| {
+                text_id(&vocab, text_index.as_ref(), byte_level.as_deref(), token)
+            }),
         );
 
         // Detect which chat-template renderer to use based on config.json::architectures
         let renderer = detect_renderer_from_config(dir);
-        let byte_level = byte_level_table(&tokenizer, vocab_size, &skip_token_ids);
 
         // The templates of a vocabulary whose own reader writes control
         // tokens structurally are compiled marked over the special spellings
@@ -650,6 +677,7 @@ impl TiktokenTokenizer {
             native,
             special_tokens,
             vocab,
+            text_index,
             added_texts,
             vocab_size,
             chat_template,
@@ -687,10 +715,10 @@ impl TiktokenTokenizer {
             return;
         }
         let (vocab, added_texts) = (&self.vocab, &self.added_texts);
+        let (index, table) = (self.text_index.as_ref(), self.byte_level.as_deref());
         let is_added = |text: &str| {
-            vocab
-                .get(text)
-                .is_some_and(|id| added_texts.get(id).is_some_and(|added| added == text))
+            text_id(vocab, index, table, text)
+                .is_some_and(|id| added_texts.get(&id).is_some_and(|added| added == text))
         };
         let matcher = OnceCell::new();
         // This file's reader takes an added token as it stands: no flag of
@@ -974,6 +1002,26 @@ fn load_tiktoken_bpe(path: &str) -> Result<FxHashMap<Vec<u8>, Rank>> {
     Ok(encoder)
 }
 
+/// The id of `text`. Without an index, the map's. With one, the map's too
+/// when it holds any (the added tokens the index does not answer), then the
+/// index's over the decode table.
+fn text_id(
+    vocab: &HashMap<String, TokenIdType>,
+    index: Option<&TextIndex>,
+    table: Option<&ByteLevelTable>,
+    text: &str,
+) -> Option<TokenIdType> {
+    let (Some(index), Some(table)) = (index, table) else {
+        return vocab.get(text).copied();
+    };
+    if !vocab.is_empty() {
+        if let Some(&id) = vocab.get(text) {
+            return Some(id);
+        }
+    }
+    index.get(table, text.as_bytes())
+}
+
 /// Build string-level vocab from byte-level encoder + added tokens.
 /// The text tokens by their text (a rank whose bytes are not UTF-8 has no
 /// entry), the added tokens with them. The other direction, an id's text,
@@ -1004,16 +1052,10 @@ fn build_vocab_map(
 /// ids over such a file is bounded the same way.
 pub(crate) const MAX_BYTE_LEVEL_TABLE_IDS: usize = 1 << 22;
 
-/// The bytes every id decodes to, read back from the BPE: a rank's byte
-/// string, a special token's text. Every id up to the largest rank or special
-/// id gets an entry; `skip_token_ids` marks the ones `skip_special_tokens`
-/// strips, as `decode` strips them. `None` when the ids reach past
+/// How many ids the per-id byte table of a vocabulary holds: every id up to
+/// the largest rank, special or skipped id. `None` when the ids reach past
 /// [`MAX_BYTE_LEVEL_TABLE_IDS`].
-fn byte_level_table(
-    bpe: &CoreBPE,
-    vocab_size: usize,
-    skip_token_ids: &HashSet<TokenIdType>,
-) -> Option<Arc<ByteLevelTable>> {
+fn byte_level_ids(vocab_size: usize, skip_token_ids: &HashSet<TokenIdType>) -> Option<usize> {
     let ids_end = skip_token_ids
         .iter()
         .map(|&id| id as usize + 1)
@@ -1027,6 +1069,17 @@ fn byte_level_table(
         );
         return None;
     }
+    Some(ids_end)
+}
+
+/// The bytes every id below `ids_end` decodes to, read back from the BPE: a
+/// rank's byte string, a special token's text. `skip_token_ids` marks the
+/// ones `skip_special_tokens` strips, as `decode` strips them.
+fn byte_level_table(
+    bpe: &CoreBPE,
+    ids_end: usize,
+    skip_token_ids: &HashSet<TokenIdType>,
+) -> Arc<ByteLevelTable> {
     let mut table = ByteLevelTableBuilder::with_capacity(ids_end);
     for id in 0..ids_end {
         let Ok(id) = TokenIdType::try_from(id) else {
@@ -1037,7 +1090,7 @@ fn byte_level_table(
             Err(_) => table.push_absent(),
         }
     }
-    Some(table.finish())
+    table.finish()
 }
 
 /// Find a tiktoken model file in the given directory.
@@ -1501,7 +1554,12 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
-        self.vocab.get(token).copied()
+        text_id(
+            &self.vocab,
+            self.text_index.as_ref(),
+            self.byte_level.as_deref(),
+            token,
+        )
     }
 
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
@@ -2111,7 +2169,8 @@ mod tests {
 
     /// An id that is both a rank and an added token answers the added token,
     /// as the text map did (it inserted the added tokens last) and as the
-    /// other backend orders them; the text-to-id map keeps both texts.
+    /// other backend orders them; both texts answer the id. The table holds
+    /// the ranks' texts already, so the map by text keeps that token alone.
     #[test]
     fn an_added_token_shadows_a_rank_sharing_its_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -2132,6 +2191,7 @@ mod tests {
         assert_eq!(tokenizer.id_to_token(66).as_deref(), Some("B"));
         assert_eq!(tokenizer.token_to_id("<|shadow|>"), Some(65));
         assert_eq!(tokenizer.token_to_id("A"), Some(65));
+        assert_eq!(tokenizer.vocab.keys().collect::<Vec<_>>(), ["<|shadow|>"]);
     }
 
     #[test]
