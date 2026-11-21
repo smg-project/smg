@@ -1000,7 +1000,10 @@ async fn execute_tool_loop_streaming_internal(
         .unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
 
     // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
-    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &response_id);
+    let mut session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &response_id);
+    if let Some(tools) = original_request.tools.as_deref() {
+        openai_bridge::configure_response_tools_approval(&mut session, tools);
+    }
 
     // Create response event emitter
     let created_at = SystemTime::now()
