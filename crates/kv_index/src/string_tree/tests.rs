@@ -2678,3 +2678,383 @@ fn the_block_scan_skips_whole_chunks_and_finds_the_byte_after_them() {
     ];
     assert_scan_is_byte_wise(&text, lengths.into_iter());
 }
+
+/// A bounded pass holds one leaf at a time and walks again: the same LRU
+/// tenants go, the tree ends at the budget, and the maintained counts match
+/// a walk of the tree.
+#[test]
+fn test_bounded_eviction_keeps_the_lru_order_and_the_budget() {
+    let tree = Tree::new();
+    for t in 0..8 {
+        tree.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
+    }
+    tree.evict_tenant_by_size_bounded(40, 1, &|| true);
+
+    assert_eq!(tree.total_char_size(), 40);
+    let sizes = tree.get_used_size_per_tenant();
+    for t in 0..4 {
+        assert_eq!(
+            *sizes.get(&format!("tenant{t}")).unwrap_or(&0),
+            0,
+            "tenant{t} (LRU)"
+        );
+    }
+    for t in 4..8 {
+        assert_eq!(*sizes.get(&format!("tenant{t}")).unwrap(), 10, "tenant{t}");
+    }
+    assert_eq!(get_maintained_counts(&tree), sizes);
+}
+
+/// A leaf's parent becomes a leaf once the leaf goes; a bounded pass that
+/// runs out of entries walks again and finds it.
+#[test]
+fn test_bounded_eviction_reaches_promoted_parents() {
+    let tree = Tree::new();
+    // One tenant, a chain of three nodes: "aaaa" -> "aaaabbbb" -> "aaaabbbbcccc".
+    tree.insert_text("aaaa", "t");
+    tree.insert_text("aaaabbbb", "t");
+    tree.insert_text("aaaabbbbcccc", "t");
+    tree.insert_text("zzzz", "u");
+    tree.evict_tenant_by_size_bounded(4, 1, &|| true);
+    assert!(tree.total_char_size() <= 4);
+    tree.evict_tenant_by_size_bounded(0, 2, &|| true);
+    assert_eq!(tree.total_char_size(), 0);
+}
+
+/// A parent promoted to a leaf in a bounded pass is not evicted ahead of
+/// older leaves the pass left out: it waits for the next pass, and the LRU
+/// order holds across passes.
+#[test]
+fn test_bounded_eviction_defers_parents_newer_than_its_kept_leaves() {
+    let tree = Tree::new();
+    tree.insert_text("aaaabbbb", "t"); // "aaaa" and its leaf "bbbb" for t: oldest
+    tree.insert_text("zzzz", "u"); // u's leaf: next oldest
+    tree.insert_text("aaaa", "t"); // t touches "aaaa" alone: newest
+    assert_eq!(tree.total_char_size(), 12);
+
+    // One entry per pass: the first keeps t's "bbbb"; evicting it promotes
+    // "aaaa", newer than u's "zzzz" which the pass left out.
+    tree.evict_tenant_by_size_bounded(4, 1, &|| true);
+
+    let sizes = tree.get_used_size_per_tenant();
+    assert_eq!(
+        sizes.get("u").copied().unwrap_or(0),
+        0,
+        "u's older leaf goes first"
+    );
+    assert_eq!(sizes.get("t").copied(), Some(4), "t's newer \"aaaa\" stays");
+}
+
+/// A pass whose bound holds every leaf leaves none out, so it sets no
+/// cutoff: the parent it promotes, though newer than every leaf it kept,
+/// goes in the same pass, and one pass empties the tree.
+#[test]
+fn test_bounded_eviction_with_room_for_every_leaf_is_one_pass() {
+    let tree = Tree::new();
+    tree.insert_text("aaaabbbb", "t"); // "aaaa" and its leaf "bbbb" for t: oldest
+    tree.insert_text("zzzz", "u"); // u's leaf: next oldest
+    tree.insert_text("aaaa", "t"); // t touches "aaaa" alone: newest
+    let done = tree.evict_tenant_by_size_bounded(0, 2, &|| true);
+    assert_eq!(tree.total_char_size(), 0);
+    assert_eq!(done.passes, 1);
+}
+
+/// `max_entries` 0 is taken as 1: the eviction ends where one entry a pass
+/// does, without a division by zero.
+#[test]
+fn test_bounded_eviction_takes_no_entries_as_one() {
+    let (bounded, whole) = (Tree::new(), Tree::new());
+    for t in 0..8 {
+        bounded.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
+        whole.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
+    }
+    let done = bounded.evict_tenant_by_size_bounded(40, 0, &|| true);
+    whole.evict_tenant_by_size_bounded(40, 1, &|| true);
+    assert_eq!(
+        get_maintained_counts(&bounded),
+        get_maintained_counts(&whole)
+    );
+    assert!(done.passes > 1, "one entry a pass");
+}
+
+/// `keep_going` is asked before every pass: false stops the eviction before
+/// it starts, and the stats count the passes and the entries evicted.
+#[test]
+fn test_bounded_eviction_stops_when_told_and_counts_its_passes() {
+    let tree = Tree::new();
+    for t in 0..8 {
+        tree.insert_text(&format!("{t}aaaaaaaaa"), &format!("tenant{t}"));
+    }
+    let stopped = tree.evict_tenant_by_size_bounded(40, 1, &|| false);
+    assert!(stopped.cancelled);
+    assert_eq!((stopped.passes, stopped.evicted), (0, 0));
+    assert_eq!(tree.total_char_size(), 80);
+
+    let passes = std::cell::Cell::new(0);
+    let done = tree.evict_tenant_by_size_bounded(40, 1, &|| {
+        passes.set(passes.get() + 1);
+        passes.get() <= 2
+    });
+    assert!(done.cancelled, "stopped after two passes");
+    assert_eq!((done.passes, done.evicted), (2, 2));
+    assert_eq!(tree.total_char_size(), 60);
+}
+
+/// A stop lands inside a pass, not only between passes: `keep_going` is asked
+/// every `CANCEL_CHECK_EVERY` nodes walked, so one pass over a large tree
+/// stops early, evicting nothing, in the bounded and the unbounded eviction.
+#[test]
+fn test_eviction_stops_inside_a_pass() {
+    let tree = Tree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_text(
+            &format!(
+                "{}{t:05}",
+                char::from_u32(0x20000 + t).expect("a CJK ideograph")
+            ),
+            "tenant",
+        );
+    }
+    let full = tree.total_char_size();
+    let asked = std::cell::Cell::new(0usize);
+    let stop_on_second = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    let done = tree.evict_tenant_by_size_bounded(0, usize::MAX, &stop_on_second);
+    assert!(done.cancelled);
+    assert_eq!(
+        (done.passes, done.evicted),
+        (1, 0),
+        "stopped within its one pass"
+    );
+    assert_eq!(tree.total_char_size(), full);
+
+    // The unbounded eviction asks once at entry (true), then stops at the
+    // walk's first check.
+    asked.set(0);
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert_eq!(
+        tree.total_char_size(),
+        full,
+        "the unbounded walk stopped too"
+    );
+    assert!(!tree.evict_tenant_by_size_until(0, &|| true));
+    assert_eq!(tree.total_char_size(), 0);
+}
+
+/// A stop lands while the pass evicts too, not only while it walks:
+/// `keep_going` is asked every `CANCEL_CHECK_EVERY` entries taken off the
+/// heap, so an eviction the walk let through stops within that many entries.
+#[test]
+fn test_eviction_stops_while_it_evicts() {
+    let tree = Tree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_text(
+            &format!(
+                "{}{t:05}",
+                char::from_u32(0x20000 + t).expect("a CJK ideograph")
+            ),
+            "tenant",
+        );
+    }
+    let full = tree.total_char_size();
+    // True at entry and through the walk's checks (3 × CANCEL_CHECK_EVERY
+    // nodes walked, asked 3 times), false from the first check of the
+    // evicting loop.
+    let asked = std::cell::Cell::new(0usize);
+    let walk_only = || {
+        asked.set(asked.get() + 1);
+        asked.get() <= 4
+    };
+    assert!(tree.evict_tenant_by_size_until(0, &walk_only));
+    let left = tree.total_char_size();
+    assert!(left < full, "the walk finished and eviction began");
+    assert!(left > 0, "the stop landed while evicting, not after");
+    let per_leaf = full / (3 * CANCEL_CHECK_EVERY);
+    assert!(
+        full - left <= CANCEL_CHECK_EVERY * per_leaf,
+        "stopped within {CANCEL_CHECK_EVERY} entries: {} of {full} evicted",
+        full - left
+    );
+}
+
+/// A stop is asked for before the eviction starts, so a tree smaller than
+/// one check's worth of nodes stops too, untouched.
+#[test]
+fn test_eviction_stops_before_it_starts() {
+    let tree = Tree::new();
+    tree.insert_text("aaaa", "t");
+    let full = tree.total_char_size();
+    assert!(tree.evict_tenant_by_size_until(0, &|| false));
+    assert_eq!(tree.total_char_size(), full);
+}
+
+/// Bounded eviction ends where the unbounded one does, per tenant: twin
+/// trees from the same seeded inserts (paths of one to four segments over
+/// shared roots and branches, some a prefix of an earlier one, for three
+/// tenants), entry bounds that leave leaves out, budgets down to empty.
+#[test]
+fn test_bounded_eviction_matches_unbounded_on_random_trees() {
+    use rand::{rngs::StdRng, SeedableRng};
+    for seed in 0..6 {
+        for max_entries in [2, 3, 5] {
+            for share in [3, 2, 1, 0] {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let (bounded, whole) = (Tree::new(), Tree::new());
+                for _ in 0..40 {
+                    let root = ["aaaa", "bbbb", "cccc"][rng.random_range(0..3usize)];
+                    let mut text = root.to_string();
+                    for segment in 1..rng.random_range(1..=4usize) {
+                        let branch = rng.random_range(0..3usize);
+                        text.push_str(&format!("{segment}{branch}xy"));
+                    }
+                    let tenant = ["a", "b", "c"][rng.random_range(0..3usize)];
+                    bounded.insert_text(&text, tenant);
+                    whole.insert_text(&text, tenant);
+                }
+                let budget = whole.total_char_size() * share / 4;
+                whole.evict_tenant_by_size(budget);
+                let done = bounded.evict_tenant_by_size_bounded(budget, max_entries, &|| true);
+                assert_eq!(
+                    get_maintained_counts(&bounded),
+                    get_maintained_counts(&whole),
+                    "seed {seed} max_entries {max_entries} budget {budget}"
+                );
+                if share == 0 {
+                    assert!(done.passes > 1, "seed {seed}: one pass held every leaf");
+                }
+            }
+        }
+    }
+}
+
+/// Two bounded evictors alongside an inserter (8,000 inserts over shared
+/// prefixes) end, keep every tenant's count true (what a walk finds it
+/// holding) and summing to the total, and once the inserter stops one more
+/// eviction meets the budget.
+#[test]
+fn test_bounded_eviction_alongside_inserts_keeps_true_counts() {
+    use std::sync::atomic::AtomicBool;
+    let tree = Tree::new();
+    let stop = AtomicBool::new(false);
+    let budget = 64;
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for i in 0..8_000usize {
+                let text = format!("{}{}", ["aa", "bb", "cc"][i % 3], i % 700);
+                tree.insert_text(&text, ["a", "b", "c"][i / 3 % 3]);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                tree.evict_tenant_by_size_bounded(budget, 2, &|| true);
+            }
+        });
+        while !stop.load(Ordering::Relaxed) {
+            tree.evict_tenant_by_size_bounded(budget, 3, &|| true);
+        }
+    });
+    let done = tree.evict_tenant_by_size_bounded(budget, 3, &|| true);
+    assert!(done.cancelled || tree.total_char_size() <= budget);
+    let held = |counts: HashMap<String, usize>| {
+        counts
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .collect::<HashMap<_, _>>()
+    };
+    let maintained = held(get_maintained_counts(&tree));
+    assert_eq!(maintained, held(tree.get_used_size_per_tenant()));
+    assert_eq!(maintained.values().sum::<usize>(), tree.total_char_size());
+}
+
+/// A stopped eviction puts the hash sweep off, one in a row at most: after
+/// a second stop in a row, an entry whose node is gone has left the map.
+#[test]
+fn test_a_second_stop_in_a_row_sweeps_the_hash_map() {
+    let tree = Tree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_text(
+            &format!(
+                "{}{t:05}",
+                char::from_u32(0x20000 + t).expect("a CJK ideograph")
+            ),
+            "tenant",
+        );
+    }
+    // An entry naming no live node, as one that crossed its node's detach.
+    tree.hashed.insert(u64::MAX, Weak::new());
+    let asked = std::cell::Cell::new(0usize);
+    let stop_on_second = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert!(
+        tree.hashed.contains_key(&u64::MAX),
+        "the first stop puts it off"
+    );
+    asked.set(0);
+    assert!(tree.evict_tenant_by_size_until(0, &stop_on_second));
+    assert!(!tree.hashed.contains_key(&u64::MAX), "the second sweeps");
+    assert!(tree.total_char_size() > 0, "both stopped inside the walk");
+}
+
+/// A bounded eviction stopped before its first pass walked nothing, so it
+/// leaves the hash map alone: two such stops in a row sweep nothing.
+#[test]
+fn test_a_bounded_eviction_stopped_before_a_pass_leaves_the_map_alone() {
+    let tree = Tree::new();
+    tree.insert_text("aaaa", "t");
+    tree.hashed.insert(u64::MAX, Weak::new());
+    for _ in 0..2 {
+        let done = tree.evict_tenant_by_size_bounded(0, 1, &|| false);
+        assert!(done.cancelled);
+        assert_eq!(done.passes, 0);
+    }
+    assert!(tree.hashed.contains_key(&u64::MAX));
+}
+
+/// A bounded eviction stopped inside its first pass did walk, so it counts
+/// as a stop for the sweep: two such stops in a row sweep the hash map.
+#[test]
+fn test_two_bounded_stops_inside_the_first_pass_sweep_the_map() {
+    let tree = Tree::new();
+    for t in 0..(3 * CANCEL_CHECK_EVERY) as u32 {
+        tree.insert_text(
+            &format!(
+                "{}{t:05}",
+                char::from_u32(0x20000 + t).expect("a CJK ideograph")
+            ),
+            "tenant",
+        );
+    }
+    tree.hashed.insert(u64::MAX, Weak::new());
+    let full = tree.total_char_size();
+    let asked = std::cell::Cell::new(0usize);
+    // True before the pass, false at the walk's first check.
+    let stop_in_the_walk = || {
+        asked.set(asked.get() + 1);
+        asked.get() < 2
+    };
+    let first = tree.evict_tenant_by_size_bounded(0, 1, &stop_in_the_walk);
+    assert_eq!(
+        (first.cancelled, first.passes, first.evicted),
+        (true, 1, 0),
+        "stopped inside the first pass's walk"
+    );
+    assert!(
+        tree.hashed.contains_key(&u64::MAX),
+        "the first stop puts it off"
+    );
+    asked.set(0);
+    let second = tree.evict_tenant_by_size_bounded(0, 1, &stop_in_the_walk);
+    assert_eq!(
+        (second.cancelled, second.passes, second.evicted),
+        (true, 1, 0),
+        "stopped inside the first pass's walk"
+    );
+    assert!(!tree.hashed.contains_key(&u64::MAX), "the second sweeps");
+    assert_eq!(tree.total_char_size(), full, "both stopped inside the walk");
+}
