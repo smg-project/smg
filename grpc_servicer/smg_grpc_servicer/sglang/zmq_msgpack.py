@@ -767,6 +767,8 @@ class MsgpackSendSocket:
         # consumed (the wire carries each output's new rows).
         self.hidden_rows = HiddenStateRows()
         self.output_adapter = SchedulerOutputAdapter()
+        # Capture the opt-in once for this scheduler sender's lifetime.
+        self._qwenvl_request_diagnostic = os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") == "1"
 
     def attach(
         self,
@@ -874,7 +876,7 @@ class MsgpackSendSocket:
             )
             self._send_slim(slim)
             # A diagnostic failure must never enter the relay-abort handler.
-            if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") == "1":
+            if self._qwenvl_request_diagnostic:
                 try:
                     from smg_grpc_servicer.sglang.zmq_plugin import trace_qwenvl_output
 
