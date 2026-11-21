@@ -152,8 +152,11 @@ pub struct AppContext {
     pub(crate) policy_operators: Option<Arc<Operators>>,
     /// The worker watch, owned by the context until server teardown.
     pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
-    /// The policy engine. Routers ask it for placement wherever
-    /// the policy store is present.
+    /// The gateway's policy engine object. Routers ask it for placement
+    /// wherever it is present: over the policy store where the gateway
+    /// follows a controller, and over the engine of this process where the
+    /// gateway decides there and that engine decides every request of the
+    /// document whole.
     pub(crate) policy_engine: Option<Arc<PolicyEngine>>,
     /// The membership feed over [`Self::policy_store`], present wherever the store is.
     #[cfg_attr(
@@ -167,10 +170,10 @@ pub struct AppContext {
     /// What the start left a gateway that decides in its own process (the
     /// setting on and no controller's address): the policy engine the
     /// policies of [`Self::policy_registry`] ask, and the document it
-    /// decides under as written. Nothing else of the policy controller is
-    /// built there: the store, its door, its feed, the follower and
-    /// [`Self::policy_engine`] are a gateway's that follows a controller.
-    /// `None` with the setting off and under an address.
+    /// decides under as written. Nothing of a followed controller is built
+    /// there: the store, its door, its feed and the follower are a
+    /// gateway's that follows one. `None` with the setting off and under an
+    /// address.
     #[cfg_attr(
         not(test),
         expect(
@@ -987,12 +990,15 @@ impl AppContextBuilder {
     ///
     /// With no controller's address the gateway decides in its own
     /// process: the start builds the policy engine of the document in
-    /// force and nothing else, and the policy registry is built with it
-    /// ([`Self::with_policy_registry`]). The store, its door, its feed, the
-    /// follower and the gateway's own engine object stay unset, so every
-    /// site that asks for one of them takes its classic arm: the worker
-    /// registry, the health checks, the load monitor and the worker
-    /// workflows are the classic ones.
+    /// force, and the policy registry is built with it
+    /// ([`Self::with_policy_registry`]). The store, its door, its feed and
+    /// the follower stay unset, so every site that asks for one of them
+    /// takes its classic arm: the worker registry, the health checks, the
+    /// load monitor and the worker workflows are the classic ones. Where
+    /// the engine decides every request of the document whole, the
+    /// gateway's own engine object is built over it and the registry's
+    /// lists, and the routers ask that object
+    /// ([`InProcess::decides_whole`]).
     ///
     /// Under a controller's address it starts the policy store with its
     /// operators' door, its membership feed, its policy engine with the
@@ -1015,6 +1021,18 @@ impl AppContextBuilder {
                 let operators =
                     Operators::in_process(started.clone(), config, Arc::clone(registry));
                 self.policy_operators = Some(Arc::new(operators));
+                // Where the engine decides every request of the document
+                // whole, the routers ask it through their own arms, over
+                // the registry's lists: the gateway's engine object stands
+                // on the engine of this process, and its timer runs.
+                if started.decides_whole() {
+                    let policy_engine = Arc::new(PolicyEngine::own(
+                        Arc::clone(&started.engine),
+                        Arc::clone(registry),
+                    ));
+                    let _timer = policy_controller::upkeep::start(&policy_engine);
+                    self.policy_engine = Some(policy_engine);
+                }
             }
             return Ok(self);
         }
@@ -1301,10 +1319,12 @@ mod tests {
 
     /// With the setting on and no controller's address the gateway decides
     /// in its own process. The context holds the policy engine and nothing
-    /// else of the policy controller: no store, no door, no feed, no
-    /// follower and no engine object of the gateway's own. Its policy
-    /// registry is the classic one, and the default policy it built is the
-    /// object that asks the engine. With the setting off it holds neither.
+    /// of a controller it would follow: no store, no door, no feed and no
+    /// follower. Under round robin, a document every request of which the
+    /// engine decides whole, it holds the gateway's own engine object over
+    /// that engine, which the routers ask. Its policy registry is the
+    /// classic one, and the default policy it built is the object that
+    /// asks the engine. With the setting off it holds none of them.
     #[tokio::test]
     async fn a_context_in_process_holds_the_policy_engine_and_nothing_else_of_the_controller() {
         for policy_controller in [false, true] {
@@ -1320,7 +1340,7 @@ mod tests {
             assert!(context.policy_store.is_none());
             assert_eq!(context.policy_operators.is_some(), policy_controller);
             assert!(context.policy_feed.is_none());
-            assert!(context.policy_engine.is_none());
+            assert_eq!(context.policy_engine.is_some(), policy_controller);
             assert!(!context.follows_controller());
             assert_eq!(context.in_process.is_some(), policy_controller);
             let default = context.policy_registry.get_default_policy();

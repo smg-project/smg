@@ -886,6 +886,7 @@ impl Router {
             rid: attempt.rid,
             tried: &tried,
             hashes: Some(&hashes),
+            pool: Some(RoutingPool::HttpRegular),
             ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
@@ -1450,6 +1451,7 @@ impl Router {
             streaming,
             headers,
             rid,
+            pool: Some(RoutingPool::HttpRegular),
             ..Ask::of(&id, model_id)
         };
         policy_engine
