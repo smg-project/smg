@@ -31,9 +31,13 @@
 //!   lock no decision holds across its stages.
 
 #[cfg(feature = "in-process")]
+use std::fmt;
+#[cfg(feature = "in-process")]
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "in-process")]
+use kv_index::CacheNamespace;
 #[cfg(feature = "in-process")]
 use smg_worker::load::state::LoadSnapshot;
 
@@ -108,6 +112,21 @@ pub trait RequestMaker {
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         None
     }
+
+    /// The request's prompt as its host holds it, lent to the naming of the
+    /// workers a prefix of it was sent to ([`PromptLent`]): `None` from a
+    /// host that lends none, and from a maker that does not say.
+    ///
+    /// An engine that decides over its host's lists asks this at most once
+    /// a decision, in the whole pass alone, and only where the request's
+    /// place reads the record of sent prefixes
+    /// ([`Needs::sent_prefixes`](crate::document::spec::Needs::sent_prefixes)).
+    /// A place one pick decides never asks it, and an engine that reads its
+    /// own rows never does.
+    #[cfg(feature = "in-process")]
+    fn prompt(&self) -> Option<PromptLent<'_>> {
+        None
+    }
 }
 
 impl RequestMaker for Request<'_> {
@@ -175,6 +194,38 @@ pub enum WorkerLists<'a> {
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.
     Pair(super::policy_engine::pair::PairLists<'a>),
+}
+
+/// A request's prompt as its host lends it to a decision made in the host's
+/// own process ([`RequestMaker::prompt`]): its token ids where the host
+/// tokenized it, else its text, and its cache partition. Nothing is copied.
+///
+/// It is the naming's alone. The engine's record of sent prefixes is read
+/// and written by it, in the walk of a tree, and nothing else reads it. It
+/// is never a field of a request's facts, so no stage, no stage that runs
+/// outside the process, no trace and no kept sample holds a client's tokens
+/// or text. Its `Debug` prints sizes alone.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy, Default)]
+pub struct PromptLent<'a> {
+    /// The prompt's token ids, where the host tokenized it.
+    pub tokens: Option<&'a [u32]>,
+    /// The request's text as the host reads it for routing, where it holds
+    /// no token ids. Token ids win where both are stated.
+    pub text: Option<&'a str>,
+    /// The request's cache partition, where it has one.
+    pub namespace: Option<CacheNamespace>,
+}
+
+#[cfg(feature = "in-process")]
+impl fmt::Debug for PromptLent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptLent")
+            .field("tokens", &self.tokens.map(<[u32]>::len))
+            .field("text_bytes", &self.text.map(str::len))
+            .field("partitioned", &self.namespace.is_some())
+            .finish()
+    }
 }
 
 /// What a guard holds of its decision, lent to its engine for one word
