@@ -1530,7 +1530,8 @@ impl<G: Generation> WorkerMonitor<G> {
                     self.clear_series(&reports, worker, Some(&file.report));
                 }
                 // Its place in the flush's queue goes too, where a held
-                // report waits: the queue keeps no worker that is gone.
+                // report waits. A worker whose file its successor took
+                // over keeps its place until the next flush, which skips it.
                 if report.is_some_and(|file| file.queued) {
                     self.pending_pushed
                         .lock()
