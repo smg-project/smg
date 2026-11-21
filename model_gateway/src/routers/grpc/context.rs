@@ -485,7 +485,8 @@ pub(crate) struct DispatchContext {
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
     /// The attempt's placement, taken when the dispatch creates its load guards.
-    pub placed: Option<Placed>,
+    // Pending placement stays out of the inline dispatch allocation.
+    pub placed: Option<Box<Placed>>,
     pub sticky_key: Option<String>,
     pub clients: Option<ClientSelection>,
     /// Consumed by the first dispatch; a rendezvous retry re-dispatches only the
@@ -509,6 +510,15 @@ pub(crate) struct DispatchContext {
     pub pd_prefill_guard: Option<PrefillLoadGuard>,
     pub response: ResponseState,
 }
+
+// Enforce the same allocator class in a production build, where test trace
+// fields are absent. The original unit test also checks its test-build shape.
+#[cfg(all(not(test), target_pointer_width = "64"))]
+const _: () = {
+    use std::mem::size_of;
+
+    assert!(size_of::<DispatchContext>() <= 2560);
+};
 
 impl DispatchContext {
     /// Cached tokenizer (cheap Arc clone).
@@ -1723,7 +1733,7 @@ impl RequestContext {
             constraint_decided_on: self.state.constraint_decided_on,
             tokenizer: self.state.tokenizer,
             workers: self.state.workers,
-            placed: self.state.placed,
+            placed: self.state.placed.map(Box::new),
             sticky_key: self.state.sticky_key,
             clients: self.state.clients,
             encode_outputs: self.state.encode_outputs,
@@ -2426,7 +2436,13 @@ pub(super) mod test_support {
         let admission = ctx.admit(1).await.expect("no shed");
         let selection = ctx.workers.take().expect("the pair");
         let sent = Instant::now();
-        let guards = LoadGuards::at_dispatch(&selection, Some("pair"), 1, ctx.placed.take(), sent);
+        let guards = LoadGuards::at_dispatch(
+            &selection,
+            Some("pair"),
+            1,
+            ctx.placed.take().map(|placed| *placed),
+            sent,
+        );
         let guards = LoadGuards::admitted(admission, guards);
         // The prefill phase ends ahead of the answer, and its slot goes.
         drop(room);
@@ -2506,7 +2522,7 @@ pub(super) mod test_support {
             workers: Some(WorkerSelection::Single {
                 worker: Arc::clone(placed.worker()),
             }),
-            placed: Some(placed),
+            placed: Some(Box::new(placed)),
             sticky_key: None,
             clients: None,
             encode_outputs: None,
@@ -2760,7 +2776,7 @@ mod tests {
         assert!(admission.is_none(), "no window is reported");
         let selection = ctx.workers.take().expect("the pair");
         let sent = Instant::now();
-        let placed = ctx.placed.take();
+        let placed = ctx.placed.take().map(|placed| *placed);
         let guards = LoadGuards::at_dispatch(&selection, Some("pair"), count, placed, sent);
         // The prefill phase ends ahead of the answer, and its slot goes.
         drop(room);
@@ -2852,7 +2868,13 @@ mod tests {
         let admission = ctx.admit(count).await.expect("no shed");
         assert!(admission.is_none(), "no window is reported");
         let selection = ctx.workers.as_ref().expect("the pair");
-        LoadGuards::at_dispatch(selection, None, count, ctx.placed.take(), sent)
+        LoadGuards::at_dispatch(
+            selection,
+            None,
+            count,
+            ctx.placed.take().map(|placed| *placed),
+            sent,
+        )
     }
 
     /// Whether each side of a pair's lease still stands live in the store,
@@ -3009,7 +3031,7 @@ mod tests {
             &selection,
             None,
             1,
-            ctx.placed.take(),
+            ctx.placed.take().map(|placed| *placed),
             Instant::now(),
         ));
         ctx.release_attempt(&failure, Instant::now());
@@ -3021,7 +3043,7 @@ mod tests {
         // goes, and both rows are named from the context.
         let (placed, _admission, store) = place_pair().await;
         let unsent = [placed.id(), placed.decode_id().expect("the decode's row")];
-        ctx.placed = Some(placed);
+        ctx.placed = Some(Box::new(placed));
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
         ctx.release_attempt(&failure, Instant::now());
         assert!(ctx.placed.is_none());

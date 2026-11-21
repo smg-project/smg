@@ -655,13 +655,13 @@ fn a_stage_built_with_no_context_that_declares_the_signal_cells_is_refused() {
 /// Keeps the rows whose pending tokens stand at or under its limit, and a
 /// row of no value.
 #[derive(Debug)]
-struct AtMost {
+struct UpperBound {
     pending: SignalColumn,
     limit: f64,
     declares: bool,
 }
 
-impl Filter for AtMost {
+impl Filter for UpperBound {
     fn name(&self) -> &'static str {
         "at-most"
     }
@@ -685,7 +685,7 @@ fn a_registered_filter_resolves_a_signal_and_is_held_to_its_need() {
         let mut catalog = Catalog::builtin();
         catalog
             .filter_with("at-most", move |build: &mut StageBuild<'_>| {
-                Ok(Box::new(AtMost {
+                Ok(Box::new(UpperBound {
                     pending: build.signal_column("pending")?,
                     limit: 5.0,
                     declares,

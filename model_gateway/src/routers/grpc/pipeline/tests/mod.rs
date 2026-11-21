@@ -93,7 +93,7 @@ const MODEL: &str = "request-release-test-model";
 async fn a_placed_answer_settles_with_its_tokens() {
     let (placed, store) = place_worker().await;
     let mut ctx = dispatch_context(placed);
-    let guards = dispatched(ctx.placed.take().expect("a placement"), Instant::now());
+    let guards = dispatched(*ctx.placed.take().expect("a placement"), Instant::now());
     let ends = guards.placement().expect("a dispatched placement").ends();
     ctx.load_guards = Some(guards);
     RequestPipeline::settle_success(
@@ -131,7 +131,7 @@ async fn a_failed_attempt_ends_its_lease_before_its_guards_go() {
         let row = placed.id();
         let worker = Arc::clone(placed.worker());
         let mut ctx = dispatch_context(placed);
-        let guards = dispatched(ctx.placed.take().expect("a placement"), Instant::now());
+        let guards = dispatched(*ctx.placed.take().expect("a placement"), Instant::now());
         let ends = guards.placement().expect("a dispatched placement").ends();
         ctx.load_guards = Some(guards);
         let failure = status.to_http_error("stream_failed", String::new());

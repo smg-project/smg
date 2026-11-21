@@ -94,7 +94,7 @@ uuid = { version = "1.23", features = ["v7", "serde"] }
 # list decides for the builds that do not: the policy controller's. A crate that comes to make
 # such a call names the feature on its own dependency line. A wasmtime bump re-reads the
 # `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
-wasmtime = { version = "49.0", default-features = false, features = [
+wasmtime = { version = "49.0.7", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
@@ -120,7 +120,7 @@ wasmtime = { version = "49.0", default-features = false, features = [
     "compile-time-builtins",
     "wit-parser",
 ] }
-wasmtime-wasi = "49.0"
+wasmtime-wasi = "49.0.7"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 webpki-roots = "1.0"

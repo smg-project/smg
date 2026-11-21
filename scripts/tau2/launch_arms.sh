@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# AMD uses ownership-checked sessions. Preserve the existing NVIDIA launcher
+# and its host-locked recovery contract rather than bypassing a refused owner.
+set -euo pipefail
+case "${TAU2_GPU_VENDOR:-nvidia}" in
+  amd) exec python3 "$(dirname "${BASH_SOURCE[0]}")/native_arms.py" "$@" ;;
+  nvidia) ;;
+  *) echo "unsupported TAU2_GPU_VENDOR" >&2; exit 2 ;;
+esac
+
 # Launch one "arm" of the τ²-bench A/B comparison (agent arms only;
 # user-sim is GPT-5.2 via the OpenAI API, handled externally).
 #

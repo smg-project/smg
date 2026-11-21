@@ -185,3 +185,37 @@ def test_two_processes_share_the_last_dollar_slot(tmp_path):
                 worker.terminate()
                 worker.join()
         sent.close()
+
+
+@pytest.mark.parametrize("phase", ["connect", "rollback", "close"])
+def test_parent98_regression_sqlite_failure_stays_budget_error(monkeypatch, tmp_path, phase):
+    primary = budget.sqlite3.OperationalError("primary SQLite failure")
+
+    class BrokenDB:
+        def execute(self, statement):
+            if phase == "rollback":
+                raise primary
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            raise budget.sqlite3.OperationalError("secondary rollback failure")
+
+        def close(self):
+            if phase == "close":
+                raise primary
+
+    def connect(*args, **kwargs):
+        if phase == "connect":
+            raise primary
+        return BrokenDB()
+
+    monkeypatch.setattr(budget.sqlite3, "connect", connect)
+    ledger = object.__new__(budget.Ledger)
+    ledger.path = tmp_path / "ledger.db"
+    ledger.create = True
+    with pytest.raises(budget.BudgetError) as error:
+        with ledger._transaction():
+            pass
+    assert error.value.__cause__ is primary
