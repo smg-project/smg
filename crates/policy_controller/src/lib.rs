@@ -131,8 +131,9 @@
 //! `tracking` and `stages` list their public items themselves, so an item is
 //! at its folder: `engine::WorkerId`. A folder of named things keeps the name
 //! in the path: a policy (`policies::least_load::LeastLoad`), a plugin kind
-//! (`plugins::wasm::Plugin`). `store` and `worker_host` follow neither rule
-//! yet: many of their items have a second path, through their file.
+//! (`plugins::wasm::Plugin`). `store`, `worker_host`, `service` and `plugins`
+//! are not under one path yet: some of their items have a second path,
+//! through their file, such as `plugins::wasm::config::PluginSpec`.
 //!
 //! [`RequestFacts`]: engine::RequestFacts
 //! [`Candidate`]: engine::Candidate
