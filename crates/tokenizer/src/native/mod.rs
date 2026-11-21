@@ -3330,9 +3330,9 @@ impl NativeEncoder {
         cache.unit_ascii = text.is_ascii();
         // One walk per unit. A single-stage encoder hands the unit to
         // `encode_single_stage`, out of line, where the scanner's own loop
-        // probes each piece in place (no recursive walk); the chain hands
-        // its pieces, as offsets into the unit, to the same probe through
-        // its static callback; any other shape walks, a lone `Removed`
+        // probes each piece in place (no recursive walk); the chain's walk
+        // probes its own pieces, offsets into the unit, with the probe
+        // compiled into the walk; any other shape walks, a lone `Removed`
         // stage among them (its matches are no pieces: the scanner loop
         // stays the loop of a stage whose matches are).
         match (&self.chain, self.stages.as_slice(), self.mapped_from) {
@@ -3355,13 +3355,29 @@ impl NativeEncoder {
                 // the head is counted only for a unit with a byte beyond
                 // ASCII.
                 let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
-                chain.pieces(text, words, &mut |start, end| {
-                    if let Err(declined) =
-                        self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
-                });
+                // The probe compiles into the walk where nearly every piece
+                // ends (the template's match, the block pass's cut): out of
+                // line it costs 16.5 to 18.2 of a token's 155 to 177
+                // instructions. Only its hit is compiled in; a miss is a call
+                // (`tokenize_piece_in_place`): with the whole probe there the
+                // walk kept less of its state in registers around a hit.
+                chain.pieces(
+                    text,
+                    words,
+                    #[inline(always)]
+                    |start, end| {
+                        if let Err(declined) = self.tokenize_piece_in_place(
+                            model,
+                            text,
+                            start..end,
+                            mapped,
+                            ids,
+                            cache,
+                        ) {
+                            fallback = Some(declined);
+                        }
+                    },
+                );
             }
             (None, [stage], None)
                 if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
@@ -3866,6 +3882,71 @@ impl NativeEncoder {
             None => None,
         };
         self.tokenize_piece_slow(model, &text.as_bytes()[piece], vacancy, mapped, ids, cache)
+    }
+
+    /// [`Self::tokenize_piece_at`] for a walk that compiles the probe into
+    /// its loop, with only the packed table's answer compiled in there: the
+    /// key by its one read of the text, the probe, an entry's inline ids.
+    /// Every other piece leaves the loop by a call, so the walk keeps its
+    /// registers for the hit: a miss asks the seed, which holds nearly every
+    /// piece a new text misses; a piece longer than a key goes to the slow
+    /// path as it does from [`Self::tokenize_piece_at`] (the wide table or
+    /// the map answers it on a warm encode, so it is no rare piece); the
+    /// rest takes one cold call ([`Self::tokenize_missed_piece`]).
+    #[inline(always)]
+    fn tokenize_piece_in_place(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let bytes = text.as_bytes();
+        match ShortPieceKey::in_window(bytes, piece.start, piece.end) {
+            Some(key) => match cache.packed.lookup_inline(key, ids) {
+                Ok(()) => Ok(()),
+                Err(Some(vacancy)) if self.seeded(vacancy, ids, cache) => Ok(()),
+                Err(missed) => {
+                    let unseeded = missed.is_some();
+                    self.tokenize_missed_piece(model, text, piece, unseeded, mapped, ids, cache)
+                }
+            },
+            None if piece.len() > SHORT_PIECE_MAX_BYTES => {
+                self.tokenize_piece_slow(model, &bytes[piece], None, mapped, ids, cache)
+            }
+            None => self.tokenize_missed_piece(model, text, piece, false, mapped, ids, cache),
+        }
+    }
+
+    /// The rest of [`Self::tokenize_piece_in_place`], for a short piece its
+    /// loop did not answer. `unseeded` is a miss the seed's call did not
+    /// answer either: it goes to the slow path from its vacancy, found by a
+    /// second probe, since a loop that kept the vacancy across the seed's
+    /// call ran more instructions on a hit. A piece the loop did not probe
+    /// to the end (no key by the one read, near the end of the text, or ids
+    /// in the spill) takes [`Self::tokenize_piece_at`] whole.
+    #[cold]
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
+    fn tokenize_missed_piece(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        unseeded: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        if !unseeded {
+            return self.tokenize_piece_at(model, text, piece, mapped, ids, cache);
+        }
+        let bytes = text.as_bytes();
+        let vacancy = ShortPieceKey::at(bytes, piece.start, piece.end)
+            .and_then(|key| cache.packed.probe(key).err());
+        self.tokenize_piece_slow(model, &bytes[piece], vacancy, mapped, ids, cache)
     }
 
     /// [`Self::tokenize_piece_at`] for a gap between two matches of a
