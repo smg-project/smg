@@ -8,6 +8,13 @@
 //!   sink, the load feed) and the request runs the same function, pass and
 //!   all; the one difference is the policy the registry hands the pass,
 //!   which asks the engine.
+//! - `records`: the policy engine's whole decision over records written for
+//!   that one decision from the gateway's own data: the registry's list, the
+//!   worker objects and the load feed. No classic policy is built and no
+//!   classic placement pass runs: the engine of the document the routing
+//!   settings give for the policy decides, and its stages are told the
+//!   request's issue, its dispatch and its end. Every policy the `--policy`
+//!   flag accepts is asked by its name.
 //!
 //! A cell is one path, one route, one policy, one fleet size and one count
 //! of callers. Each caller routes requests back to back: the placement, the
@@ -79,8 +86,8 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, route_pair,
-                set_pair_sides, Route,
+                attach_loads, policies_asking_the_engine, route_classic, route_pair, route_records,
+                set_pair_sides, EngineOverRecords, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -315,12 +322,21 @@ fn reports(fleet: &[Arc<dyn Worker>]) -> Vec<(Arc<dyn Worker>, WorkerLoadRespons
 /// and its turn among its caller's requests, which names its model.
 type Routing = Box<dyn Fn(&[u32], u64) -> bool + Send + Sync>;
 
+/// Who decides a cell's requests: the classic placement over a registry's
+/// policies (the classic ones, or the objects that ask the engine), or the
+/// policy engine's whole decision over records.
+enum Decider {
+    Policies(Arc<PolicyRegistry>),
+    Records(EngineOverRecords),
+}
+
 /// A cell's path, built: a registry with the fleet, the policies a
 /// registration leaves (the model's policy and each worker's completion
 /// sink), and the load feed the monitor would publish. On the `object` path
 /// the registry's policies ask the policy engine of the same policy. A
 /// pair cell's registry holds the two side policies a pair gateway's start
-/// sets, and each model's fleet is its two sides.
+/// sets, and each model's fleet is its two sides. On the `records` path no
+/// policy registry is built: the engine reads the feed itself.
 fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
     let registry = Arc::new(WorkerRegistry::new());
     let mut config = RouterConfig {
@@ -336,17 +352,21 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
             decode_policy: None,
         };
     }
-    let policies = Arc::new(match cell.path.as_str() {
+    let policies = match cell.path.as_str() {
         "classic" => {
             let policies = PolicyRegistry::new(policy_config(&cell.policy));
             if cell.pair {
                 set_pair_sides(&policies, &config);
             }
-            policies
+            Some(Arc::new(policies))
         }
-        "object" => policies_asking_the_engine(&config).unwrap(),
+        "object" => Some(Arc::new(policies_asking_the_engine(&config).unwrap())),
+        "records" => {
+            assert!(!cell.pair, "the records path places single requests");
+            None
+        }
         other => panic!("no path {other}"),
-    });
+    };
     let models = model_ids(cell.models);
     let mut every = Vec::with_capacity(models.len() * cell.workers);
     for model in &models {
@@ -361,8 +381,10 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
         for fleet in fleets {
             for worker in &fleet {
                 registry.register(Arc::clone(worker)).unwrap();
-                policies.on_worker_added(model, None);
-                worker.set_completion_sink(Some(policies.completion_sink()));
+                if let Some(policies) = &policies {
+                    policies.on_worker_added(model, None);
+                    worker.set_completion_sink(Some(policies.completion_sink()));
+                }
             }
             leave_not_ready(&fleet, cell.not_ready);
             leave_ready(&fleet, cell.ready);
@@ -372,8 +394,11 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
             every.extend(fleet);
         }
     }
+    // The feed's receiver goes to whoever decides: the registry's policies,
+    // or the engine.
+    let mut receiver = None;
     let feed = cell.reports.then(|| {
-        let feed = TestFeed::attached_to(|rx| attach_loads(&policies, rx));
+        let feed = TestFeed::attached_to(|rx| receiver = rx);
         let loads: HashMap<String, WorkerLoadResponse> = reports(&every)
             .into_iter()
             .map(|(worker, report)| (worker.url().to_owned(), report))
@@ -381,13 +406,28 @@ fn build(cell: &Cell) -> (Routing, Option<TestFeed>) {
         feed.publish(&loads);
         feed
     });
+    let decider = match policies {
+        Some(policies) => {
+            if cell.reports {
+                attach_loads(&policies, receiver);
+            }
+            Decider::Policies(policies)
+        }
+        None => Decider::Records(EngineOverRecords::of(&config, receiver).unwrap()),
+    };
     let (route, pair) = (cell.route, cell.pair);
     let routing: Routing = Box::new(move |tokens, turn| {
         let model = &models[(turn % models.len() as u64) as usize];
-        if pair {
-            route_pair(&registry, &policies, model, Some(tokens))
-        } else {
-            route_classic(&registry, &policies, model, route, Some(tokens))
+        match &decider {
+            Decider::Policies(policies) if pair => {
+                route_pair(&registry, policies, model, Some(tokens))
+            }
+            Decider::Policies(policies) => {
+                route_classic(&registry, policies, model, route, Some(tokens))
+            }
+            Decider::Records(engine) => {
+                route_records(&registry, engine, model, route, Some(tokens))
+            }
         }
     });
     (routing, feed)

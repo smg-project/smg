@@ -23,6 +23,8 @@ pub(crate) mod pair_classes;
 pub(crate) mod policy_engine;
 pub(crate) mod prefix_pass;
 pub(crate) mod prompt_hashes;
+#[cfg(feature = "in-process")]
+pub(crate) mod records;
 pub(crate) mod sticky_sessions;
 pub(crate) mod store_backed_engine;
 pub(crate) mod view;
@@ -49,6 +51,8 @@ pub use policy_engine::pair::{prefills_full, PairAdmission};
 #[cfg(feature = "in-process")]
 pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
+#[cfg(feature = "in-process")]
+pub use records::{decide, worker_id, DecisionClock, PoolRecords};
 pub use sticky_sessions::{
     SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,

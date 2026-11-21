@@ -24,6 +24,20 @@ pub enum Role {
     Encode,
 }
 
+/// The role of a worker object of this type.
+#[cfg(any(feature = "in-process", feature = "worker-host"))]
+impl From<smg_worker::worker::WorkerType> for Role {
+    fn from(worker_type: smg_worker::worker::WorkerType) -> Self {
+        use smg_worker::worker::WorkerType;
+        match worker_type {
+            WorkerType::Regular => Self::Single,
+            WorkerType::Prefill => Self::Prefill,
+            WorkerType::Decode => Self::Decode,
+            WorkerType::Encode => Self::Encode,
+        }
+    }
+}
+
 /// Which phase of a request a decision is for.
 #[derive(
     Clone,
@@ -149,6 +163,19 @@ impl WireModes {
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+}
+
+/// The one wire a worker object of this connection mode serves.
+#[cfg(any(feature = "in-process", feature = "worker-host"))]
+impl From<smg_worker::worker::ConnectionMode> for WireModes {
+    fn from(mode: smg_worker::worker::ConnectionMode) -> Self {
+        use smg_worker::worker::ConnectionMode;
+        match mode {
+            ConnectionMode::Http => Self::HTTP,
+            ConnectionMode::Grpc => Self::GRPC,
+            ConnectionMode::Zmq => Self::ZMQ,
+        }
     }
 }
 

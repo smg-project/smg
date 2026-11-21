@@ -35,7 +35,7 @@ use std::{
     hash::Hasher,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -44,6 +44,7 @@ use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
 use super::{
     framework::{AloneProfile, NotAlone, Picker, Place, PoolWord},
+    records::{DecisionClock, PoolRecords},
     view::Phase,
 };
 use crate::{document::spec::AppliedSpec, names::intern};
@@ -74,6 +75,10 @@ pub struct PoolMembers {
     /// The pool's own word, for the picker that places over the pool by
     /// itself ([`PolicyEngine::pick`]): a rotation counts its turns here.
     rotation: OwnWord,
+    /// What a decision of a profile that scores reads of the list beside
+    /// its workers' live state ([`Self::records`]): made at the first such
+    /// decision, and by no pick of a profile the engine picks alone.
+    records: OnceLock<PoolRecords>,
 }
 
 /// A word every pick over a pool writes, on cache lines of its own: what
@@ -88,6 +93,17 @@ impl PoolMembers {
     #[must_use]
     pub fn workers(&self) -> &Arc<[Arc<dyn Worker>]> {
         &self.workers
+    }
+
+    /// The list's records under the document `spec`, on `clock`: the half
+    /// of each worker's record that no request changes, the pool's engines
+    /// and its number ([`PoolRecords`]). Made at the first call and kept
+    /// for as long as the list stands; every later call is one read. No
+    /// live value of a worker is kept in them.
+    #[must_use]
+    pub fn records(&self, spec: &AppliedSpec, clock: &DecisionClock) -> &PoolRecords {
+        self.records
+            .get_or_init(|| PoolRecords::new(&self.workers, spec, clock))
     }
 }
 
@@ -121,6 +137,7 @@ impl PolicyEngine {
             // A pool starts its turns at a drawn worker, so a fleet whose
             // membership keeps changing does not lean on its first one.
             rotation: OwnWord(AtomicU64::new(mixed(epoch) >> 32)),
+            records: OnceLock::new(),
         }
     }
 
