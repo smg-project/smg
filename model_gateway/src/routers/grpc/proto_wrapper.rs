@@ -846,8 +846,8 @@ pub struct TrackedStream {
     /// the worker is producing for (see [`Worker::output_silence`]).
     output: Option<OutputTicket>,
     /// Whether the worker's circuit-breaker success for this dispatch is
-    /// still to be sampled, at the stream's first response (a disaggregated
-    /// decode side: see [`ProtoStream::tracked_decode_side`]).
+    /// still to be sampled, at the stream's first response (a single dispatch
+    /// and a disaggregated decode side: see [`ProtoStream::tracked_decode_side`]).
     samples_success: bool,
     /// A response (or the stream's end) pulled ahead of the stream's reader
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
@@ -1347,6 +1347,39 @@ mod tracked_tests {
         );
     }
 
+    /// A single dispatch earns its worker's breaker success at its stream's
+    /// first response, as a decode side does: between two failures it keeps
+    /// a breaker set to two closed.
+    #[tokio::test]
+    async fn a_single_dispatch_earns_its_breaker_success_at_its_first_response() {
+        use smg_worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        // A stream of one response: a tracked layer of its own replays it.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let mut answering =
+            ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(engine, 0, false);
+        if let ProtoStream::Tracked(tracked) = &mut answering {
+            tracked.replay = Some(Some(Ok(ProtoGenerateResponse::Vllm(Box::default()))));
+        }
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://w1:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let booking = DispatchBooking::book(&worker, 16, true);
+        let mut stream = answering.tracked_single_booked(Arc::clone(&worker), booking);
+        worker.record_outcome(504);
+        assert!(stream.next().await.is_some_and(|item| item.is_ok()));
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "a success, at the first response, between the two failures"
+        );
+    }
+
     #[test]
     fn a_prefill_side_booked_at_dispatch_is_pending_before_its_stream_exists() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
@@ -1737,6 +1770,22 @@ impl ProtoStream {
             samples_success: false,
             replay: None,
         }))
+    }
+
+    /// [`Self::tracked_booked`] for a single dispatch: the worker's breaker
+    /// success is sampled at the first response, not when the call returned
+    /// its stream, as a decode side's is (see [`Self::tracked_decode_side`]).
+    #[must_use]
+    pub(crate) fn tracked_single_booked(
+        self,
+        worker: Arc<dyn Worker>,
+        booking: DispatchBooking,
+    ) -> Self {
+        let mut stream = self.tracked_booked(worker, booking);
+        if let Self::Tracked(tracked) = &mut stream {
+            tracked.samples_success = true;
+        }
+        stream
     }
 
     /// Track this stream as the prefill side of a disaggregated dispatch to

@@ -4342,6 +4342,37 @@ async fn a_call_the_worker_never_answers_is_the_504_at_the_request_timeout() {
     assert_eq!(worker.load(), 0, "the slot goes with the answer");
 }
 
+/// A worker that takes every call and answers nothing is taken out at its
+/// breaker's threshold when the requests come one after another: the call
+/// it took is no success for it, so the cut requests are failures in a row.
+#[tokio::test]
+async fn streamed_requests_one_after_another_to_a_silent_worker_open_its_breaker() {
+    let (pipeline, worker, _scheduler, components) =
+        silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+    for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+        let response = pipeline
+            .execute_completion(
+                completion(true),
+                None,
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                None,
+            )
+            .await;
+        // A streamed answer fails inside its body: it is read to its end.
+        tokio::time::timeout(
+            CASE_CAP,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the request timeout ends the body")
+        .expect("drain body");
+    }
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+}
+
 /// A worker that answers within the timeout is not touched by it: the
 /// completion arrives whole, the engine sees no abort.
 #[tokio::test]
