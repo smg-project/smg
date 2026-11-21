@@ -931,6 +931,41 @@ mod tests {
         );
     }
 
+    /// The read with nothing written gives a key's pins as a decision at
+    /// that instant finds them: none for a key the table never read, the
+    /// pins until its idle time ends, and none from that instant. It makes
+    /// no key, renews nothing and forgets nothing.
+    #[test]
+    fn a_keys_pins_are_read_as_they_stand_with_nothing_written() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        assert_eq!(table.pins_at(s(1), 50), [WorkerId(0); 2]);
+        assert!(table.is_empty(), "the read makes no key");
+        table.lookup(s(1), 50, &RULE);
+        table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(7));
+        let held = table.held(s(1));
+        assert_eq!(table.pins_at(s(1), 1_049), [WorkerId(7), WorkerId(0)]);
+        assert_eq!(table.pins_at(s(1), 1_050), [WorkerId(0); 2], "its end");
+        assert_eq!(table.pins_at(s(1), u64::MAX), [WorkerId(0); 2]);
+        assert_eq!(table.held(s(1)), held, "nothing renewed or forgotten");
+        // Under a rule with no idle time the pins stand at every instant
+        // but the clock's last, and a key dispatched to and never read has
+        // none.
+        let for_ever = SessionRule {
+            ttl_micros: None,
+            sweep_micros: 0,
+            ..RULE
+        };
+        table.lookup(s(2), 50, &for_ever);
+        table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(9));
+        assert_eq!(
+            table.pins_at(s(2), u64::MAX - 1),
+            [WorkerId(9), WorkerId(0)]
+        );
+        assert_eq!(table.pins_at(s(2), u64::MAX), [WorkerId(0); 2]);
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(3));
+        assert_eq!(table.pins_at(s(3), 50), [WorkerId(0); 2]);
+    }
+
     /// A key whose TTL passed is forgotten at its next lookup even when no
     /// sweep ran since: the compare is the key's own, the walk only reclaims.
     #[test]

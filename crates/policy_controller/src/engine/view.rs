@@ -1068,9 +1068,12 @@ pub struct RequestFacts<'a> {
     /// one a list ([`PoolRing`]): a stage that places by a ring reads this
     /// one, with no lock, and its own ring learns nothing of the decision.
     /// `None` where the host keeps none: such a stage then places by its
-    /// own ring, which learns its members from the candidates. A ring of
-    /// another length than the candidates is not theirs, and is not read.
-    /// A pair takes none: each side is a list of its own. In-process only.
+    /// own ring, which learns its members from the candidates. A host
+    /// lends the ring of the list it hands as the candidates and never the
+    /// ring of another list: a ring of another length than the candidates
+    /// is its caller's error, which a debug build stops at and any other
+    /// build passes over, placing by the stage's own ring. A pair takes
+    /// none: each side is a list of its own. In-process only.
     pub ring: Option<&'a PoolRing>,
 }
 

@@ -63,8 +63,9 @@ pub trait PoolRows<'p> {
     /// The hash ring of the pool's list, where the host keeps one a list:
     /// asked for a request whose binding places by a ring, and for no
     /// other, so a host builds it at the first call and keeps it with the
-    /// list. `None` where the host keeps none: the ring stage then places
-    /// by its own ring, over every row.
+    /// list. It is the ring of this pool's rows and of no other list
+    /// ([`RequestFacts::ring`]). `None` where the host keeps none: the
+    /// ring stage then places by its own ring, over every row.
     fn ring(&self) -> Option<&'p PoolRing>;
 }
 
