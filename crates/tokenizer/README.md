@@ -50,7 +50,8 @@ as of `tokenizer/src/*`.
 
 ## Backend Implementations
 ### HuggingFaceTokenizer (`huggingface.rs`)
-- Loads `tokenizer.json` (or similar) using `tokenizers::Tokenizer::from_file`.
+- Reads `tokenizer.json` (or similar) into memory and deserializes it there (the two steps of
+  `tokenizers::Tokenizer::from_file`), keeping the text for a second read of its model section.
 - Caches vocab forward and reverse maps for `token_to_id`/`id_to_token` support.
 - Extracts special tokens using common patterns (e.g. `<s>`, `[CLS]`).
 - Adds special tokens on request the way the checkpoint's configuration prescribes: `encode(text, true)`
