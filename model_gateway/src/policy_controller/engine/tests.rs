@@ -59,7 +59,7 @@ use smg_worker::{
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, record_bed, store_blocks, MODEL},
-    transport_class, Ask, End, Hashes, Held, Placed, PolicyEngine, Prompt, Sent, Unplaced, GATEWAY,
+    transport_class, Ask, End, Held, Placed, PolicyEngine, Prompt, Sent, Unplaced, GATEWAY,
     NO_STAGE,
 };
 use crate::{
@@ -816,14 +816,11 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
         store.set_block_size(MODEL, block_size);
         let blocks = compute_request_content_hashes(&tokens, block_size as usize);
         assert_eq!(store_blocks(&store, holder, &blocks), BatchOutcome::Applied);
-        let hashes = Hashes::of(
-            &store,
-            MODEL,
-            &Prompt {
-                tokens: Some(&tokens),
-                ..Prompt::default()
-            },
-        );
+        let hashes = Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::default()
+        }
+        .hashes(&store, MODEL);
         let now = Instant::now();
         // Give plain asks a lower-load choice while affinity can still win.
         for row in store.snapshot().1 {
@@ -888,8 +885,10 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
     };
     for prompt in [as_text, as_tokens] {
         let (policy_engine, store) = record_bed();
-        let hashes = Hashes::of(&store, MODEL, &prompt);
-        assert!(!hashes.blocks.is_empty());
+        let hashes = prompt.hashes(&store, MODEL);
+        let mut written = RequestFacts::default();
+        hashes.write_to(&mut written);
+        assert!(!written.block_hashes.is_empty());
         let now = Instant::now();
         let cold = Ask {
             hashes: Some(&hashes),
@@ -1888,10 +1887,16 @@ async fn a_pair_lands_on_a_prefill_and_its_decode_with_the_ranks_its_targets_nam
 
 #[test]
 fn an_asks_own_token_count_wins_over_its_hashes_count() {
-    let tokens = Hashes {
-        prompt_tokens: 88,
-        ..Hashes::default()
-    };
+    let (_, store) = record_bed();
+    let prompt = [7; 88];
+    let tokens = Prompt {
+        tokens: Some(&prompt),
+        ..Prompt::default()
+    }
+    .hashes(&store, MODEL);
+    let mut counted = RequestFacts::default();
+    tokens.write_to(&mut counted);
+    assert_eq!(counted.prompt_tokens, 88, "the hashes count the prompt");
     let ask = Ask {
         hashes: Some(&tokens),
         ..pair_ask()

@@ -2,6 +2,10 @@
 //! what a decision reads (the view) and what it returns, and the engine that
 //! decides over the policy store.
 //!
+//! [`PromptHashes`] are the block hashes of a request's prompt, made under
+//! its [`HashSeeds`]. A caller writes them into the request facts of the
+//! view.
+//!
 //! The session table that a `sessions` rule reads lives in this folder too.
 
 pub(crate) mod decider;
@@ -9,6 +13,7 @@ pub(crate) mod decision;
 pub(crate) mod demands;
 pub(crate) mod door;
 pub(crate) mod framework;
+pub(crate) mod prompt_hashes;
 pub(crate) mod sticky_sessions;
 pub(crate) mod terms;
 pub(crate) mod view;
@@ -29,6 +34,7 @@ pub use framework::{
     Plan, Profile, Scorer, Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM,
     RANK_FROM,
 };
+pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use sticky_sessions::{
     Forgets, Pins, SessionRule, SessionTable, SessionVerdict, ABSENCE_MICROS,
 };
