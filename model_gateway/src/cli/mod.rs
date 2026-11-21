@@ -1312,8 +1312,9 @@ struct ServingArgs {
     /// streams to the worker verbatim — forfeiting router-level retries. A
     /// streamed request reaches the worker as the client sent it: JSON
     /// validation defers to the worker, and the provider profile's request
-    /// normalization (which the buffered path applies) is skipped. 0 never
-    /// buffers for retries
+    /// normalization (which the buffered path applies) is skipped. This also
+    /// bounds the transcription audio held for one resend after a pre-response
+    /// connection failure; 0 disables both kinds of buffering.
     #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
     max_buffered_request_bytes: u64,
 

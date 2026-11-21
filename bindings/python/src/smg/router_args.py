@@ -519,7 +519,9 @@ class RouterArgs:
     # the foreground)
     max_background_responses: int = 1024
     # Most bytes the router may buffer for a request it holds only to keep
-    # it retryable; larger eligible requests stream and forfeit router retries
+    # it retryable; larger eligible requests stream and forfeit router retries.
+    # Also bounds transcription audio held for one pre-response resend; 0
+    # disables both kinds of buffering
     max_buffered_request_bytes: int = 1048576
     # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
@@ -1574,7 +1576,9 @@ class RouterArgs:
                 " forfeiting router-level retries; a streamed request reaches"
                 " the worker as the client sent it: JSON validation defers to"
                 " the worker, and the provider profile's request normalization"
-                " is skipped. 0 never buffers for retries"
+                " is skipped. This also bounds the transcription audio held"
+                " for one resend after a pre-response connection failure; 0"
+                " disables both kinds of buffering"
             ),
         )
         routing_group.add_argument(

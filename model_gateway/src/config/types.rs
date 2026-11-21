@@ -163,9 +163,10 @@ pub struct RouterConfig {
     pub max_payload_size: usize,
     /// Most bytes the router may hold for a request it buffers only to keep
     /// it retryable; a larger eligible request streams to the worker verbatim
-    /// and forfeits router-level retries. `0` never buffers for retries.
-    /// Requests the router must parse buffer regardless, bounded by
-    /// `max_payload_size`.
+    /// and forfeits router-level retries. Requests the router must parse buffer
+    /// regardless, bounded by `max_payload_size`. This also bounds the
+    /// transcription audio held for one resend after a pre-response connection
+    /// failure; `0` disables both kinds of buffering.
     #[serde(default = "default_max_buffered_request_bytes")]
     pub max_buffered_request_bytes: u64,
     /// Abort a streamed request body once the upstream sender has waited on
