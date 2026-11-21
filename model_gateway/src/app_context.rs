@@ -1024,11 +1024,10 @@ impl AppContextBuilder {
             let registry = self.worker_registry.as_ref().ok_or_else(|| {
                 "worker_registry must be set before the policy controller".to_string()
             })?;
-            let controller = config
-                .policy_controller_address
-                .as_ref()
-                .map(|address| Settings::new(address.clone(), config))
-                .transpose()?;
+            let address = config.policy_controller_address.clone().ok_or_else(|| {
+                "the policy store is started under a controller's address alone".to_string()
+            })?;
+            let controller = Settings::new(address, config)?;
             let connector = Arc::clone(&self.engine_connector);
             let (feed, follower) =
                 policy_controller::feeds(&store, registry, connector, controller);
@@ -1041,7 +1040,7 @@ impl AppContextBuilder {
             let _timer = policy_controller::upkeep::start(&policy_engine);
             self.policy_feed = Some(feed);
             self.policy_engine = Some(policy_engine);
-            self.policy_follower = follower.map(|follower| Arc::new(Mutex::new(Some(follower))));
+            self.policy_follower = Some(Arc::new(Mutex::new(Some(follower))));
             self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
             self.policy_store = Some(store);
         }

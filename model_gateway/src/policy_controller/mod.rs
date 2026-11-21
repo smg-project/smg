@@ -22,9 +22,9 @@
 //! router under its usual id ([`undecided()`]) whenever the store started,
 //! with or without a controller's address. The routes that pick a
 //! worker by no routing policy serve as under the classic policies: a
-//! provider's router, a realtime session and a proxied GET. A local worker's
-//! registration writes its row at the feed's door. With the setting off, the
-//! context holds neither the store, its feed nor its policy engine.
+//! provider's router, a realtime session and a proxied GET. With the
+//! setting off, the context holds neither the store, its feed nor its
+//! policy engine.
 //!
 //! The document in force reaches the store through the policy crate's
 //! operators' door as YAML: the bytes `--print-policy-spec` prints where
@@ -95,8 +95,11 @@ pub(crate) mod follower;
 )]
 pub(crate) mod engine;
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the gateway holds the feed for membership writes")
+    not(any(target_os = "linux", target_os = "macos")),
+    expect(
+        dead_code,
+        reason = "the follower reads the feed, and none runs on this target"
+    )
 )]
 pub(crate) mod feed;
 pub(crate) mod operators;
@@ -537,28 +540,22 @@ pub(crate) fn hosted(
     })
 }
 
-/// The store's membership feed and, under a controller's address, the
-/// follower that writes the store in the door's place.
+/// The store's membership feed, and the follower that writes the store as
+/// the controller at `controller` tells it.
 ///
 /// The two are made together because they are one rule. A gateway that
 /// follows a controller probes no worker, so its holder copies each row's
 /// status onto the row's object ([`feed::following`]), and its follower
-/// settles the feed after each event. Elsewhere the door is the store's
-/// writer, and it settles the feed itself.
+/// settles the feed after each event.
 pub(crate) fn feeds(
     store: &Arc<MemoryStore>,
     registry: &Arc<WorkerRegistry>,
     connector: Arc<dyn EngineConnector>,
-    controller: Option<Settings>,
-) -> (Feed, Option<Follower>) {
-    match controller {
-        Some(settings) => {
-            let feed = feed::following(store, registry, connector);
-            let follower = Follower::start(settings, feed.clone());
-            (feed, Some(follower))
-        }
-        None => (feed::feed(store, registry, connector), None),
-    }
+    controller: Settings,
+) -> (Feed, Follower) {
+    let feed = feed::following(store, registry, connector);
+    let follower = Follower::start(controller, feed.clone());
+    (feed, follower)
 }
 
 /// The refusing router for a family the controller does not decide yet:
