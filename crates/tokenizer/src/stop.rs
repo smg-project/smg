@@ -103,16 +103,13 @@ impl StopSequenceConfig {
 /// more; the automaton's build and the ids' sort are paid once.
 #[derive(Clone, Debug)]
 pub struct StopRules {
-    /// The stop sequences the automaton was built from, hidden then visible; `None` without string
-    /// stops (an empty shared slice would still allocate its header). Shared by every copy of the
-    /// rules, as the automaton's tables are.
-    patterns: Option<Arc<[String]>>,
     /// Index boundary: patterns [0..visible_boundary_idx) are hidden,
     /// patterns [visible_boundary_idx..) are visible
     visible_boundary_idx: usize,
-    /// What the string stops are matched by, behind one shared pointer: held
-    /// inline, the first bytes' bitmap took the gateway's per-request
-    /// context, which holds a decoder, one allocator class up.
+    /// What the string stops are matched by, `None` without them, behind one
+    /// shared pointer: held inline, the first bytes' bitmap took the
+    /// gateway's per-request context, which holds a decoder, one allocator
+    /// class up.
     matcher: Option<Arc<Matcher>>,
     /// True when there are no string stop sequences (only token-level stops).
     /// In this mode the jail buffer is bypassed entirely for lower overhead.
@@ -127,6 +124,8 @@ pub struct StopRules {
 /// The matcher of the string stop sequences.
 #[derive(Debug)]
 struct Matcher {
+    /// The stop sequences the automaton was built from, hidden then visible.
+    patterns: Vec<String>,
     /// Aho-Corasick automaton for O(N) stop sequence matching
     automaton: AhoCorasick,
     /// The bytes a stop sequence begins with, one bit a byte value: text with
@@ -166,11 +165,16 @@ impl StopRules {
             starts[usize::from(first >> 6)] |= 1 << (first & 63);
         }
 
-        let matcher = aho_corasick.map(|automaton| Arc::new(Matcher { automaton, starts }));
+        let matcher = aho_corasick.map(|automaton| {
+            Arc::new(Matcher {
+                patterns,
+                automaton,
+                starts,
+            })
+        });
 
         Self {
             token_only: matcher.is_none(),
-            patterns: (!patterns.is_empty()).then(|| patterns.into()),
             visible_boundary_idx,
             matcher,
             hidden_stop_ids: StopIds::new(&stop_tokens),
@@ -284,9 +288,9 @@ impl StopSequenceDecoder {
         let mut longest = 0;
         for pattern in self
             .rules
-            .patterns
+            .matcher
             .iter()
-            .flat_map(|patterns| patterns.iter())
+            .flat_map(|matcher| matcher.patterns.iter())
         {
             let pat = pattern.as_bytes();
             // Only proper prefixes count, and only ones longer than the best so far.
@@ -443,10 +447,9 @@ impl StopSequenceDecoder {
         let origin = observe_atom(&mut self.decoded_bytes, &buffer[before..], atom);
         if !held {
             let text = &out.as_bytes()[before..];
-            let patterns = self.rules.patterns.as_deref().unwrap_or_default();
-            let bitmap = match &self.rules.matcher {
-                Some(matcher) => &matcher.starts,
-                None => &[0; 4],
+            let (patterns, bitmap) = match &self.rules.matcher {
+                Some(matcher) => (matcher.patterns.as_slice(), &matcher.starts),
+                None => (&[][..], &[0; 4]),
             };
             let starts = |byte: &u8| (bitmap[usize::from(byte >> 6)] >> (byte & 63)) & 1 == 1;
             let may_stop = text.iter().position(starts).is_some_and(|first| {
