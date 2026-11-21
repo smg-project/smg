@@ -75,7 +75,6 @@ impl ModelRegistry {
                 // Nemotron-H Omni matches its own model_type only.
                 LazySpec::new(|| Box::new(NemotronOmniSpec::Packed)),
                 LazySpec::new(|| Box::new(NemotronTranscribeSpec)),
-                // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),
                 LazySpec::new(|| Box::new(Qwen3AsrSpec)),
@@ -365,6 +364,14 @@ mod tests {
             ),
             (
                 "/models/checkpoint",
+                "qwen3_vl",
+                "qwen3_vl",
+                "qwen3-vl",
+                Some("qwen3-vl"),
+            ),
+            // A Qwen3-VL config under a path that names LLaVA.
+            (
+                "/models/llava",
                 "qwen3_vl",
                 "qwen3_vl",
                 "qwen3-vl",
