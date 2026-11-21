@@ -46,8 +46,9 @@ use image::DynamicImage;
 /// tile in bfloat16 (677,376 bytes), sits in the 1 MiB class above this floor.
 pub const SMALLEST: usize = 256 << 10;
 /// The longest buffer the pool serves; a longer one is allocated as before.
-/// Ten 1024x768 images as 130 such tiles write one bfloat16 wire of 88 MB,
-/// which sits in this top class; the bound holds two buffers of it.
+/// Ten 1024x768 images on `llama4`, 130 tiles of 336x336, write one bfloat16
+/// wire of 88 MB, which sits in this top class; the bound holds two buffers
+/// of it.
 pub const LARGEST: usize = 128 << 20;
 /// The capacity the pool holds in all, the idle buffers of every class
 /// together.
