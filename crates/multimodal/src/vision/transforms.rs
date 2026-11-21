@@ -3465,23 +3465,6 @@ fn torch_aa_passes_with_fma(
     Some(unsafe { torch_aa_passes_fma(data, in_w, x, y, sample) })
 }
 
-/// Resize image preserving aspect ratio, fitting within max dimensions.
-pub fn resize_to_fit(
-    image: &DynamicImage,
-    max_width: u32,
-    max_height: u32,
-    filter: FilterType,
-) -> DynamicImage {
-    let (w, h) = image.dimensions();
-    let ratio = (max_width as f64 / w as f64).min(max_height as f64 / h as f64);
-    if ratio >= 1.0 {
-        return image.clone();
-    }
-    let new_w = ((w as f64 * ratio).round() as u32).max(1);
-    let new_h = ((h as f64 * ratio).round() as u32).max(1);
-    resize(image, new_w, new_h, filter)
-}
-
 /// Center crop image to specified dimensions.
 ///
 /// If the crop size is larger than the image, the image is returned unchanged.
@@ -3802,30 +3785,6 @@ pub fn pil_to_filter(resampling: Option<usize>) -> FilterType {
         Some(4) | Some(5) => FilterType::Triangle,
         _ => FilterType::Triangle,
     }
-}
-
-/// Calculate mean color of an image as RGB.
-pub fn calculate_mean_color(image: &DynamicImage) -> Rgb<u8> {
-    let rgb = image.to_rgb8();
-    let (w, h) = (rgb.width() as u64, rgb.height() as u64);
-    let total_pixels = w * h;
-
-    if total_pixels == 0 {
-        return Rgb([128, 128, 128]);
-    }
-
-    let (mut r_sum, mut g_sum, mut b_sum) = (0u64, 0u64, 0u64);
-    for pixel in rgb.pixels() {
-        r_sum += pixel[0] as u64;
-        g_sum += pixel[1] as u64;
-        b_sum += pixel[2] as u64;
-    }
-
-    Rgb([
-        (r_sum / total_pixels) as u8,
-        (g_sum / total_pixels) as u8,
-        (b_sum / total_pixels) as u8,
-    ])
 }
 
 /// Convert normalized mean values [0, 1] to RGB bytes, truncated like the

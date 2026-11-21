@@ -101,17 +101,6 @@ impl Phi4VisionProcessor {
         }
     }
 
-    /// Create a processor with custom dynamic_hd setting.
-    pub fn with_dynamic_hd(dynamic_hd: usize) -> Self {
-        Self {
-            dynamic_hd,
-            base_resolution: BASE_RESOLUTION,
-            mask_resolution: MASK_RESOLUTION,
-            mean: PHI4_MEAN,
-            std: PHI4_STD,
-        }
-    }
-
     /// Create a processor from preprocessor config.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         Self {

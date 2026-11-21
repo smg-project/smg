@@ -498,12 +498,6 @@ impl PreProcessorConfig {
     // Common default values
     pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
     pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
-
-    pub const IMAGENET_MEAN: [f64; 3] = [0.485, 0.456, 0.406];
-    pub const IMAGENET_STD: [f64; 3] = [0.229, 0.224, 0.225];
-
-    pub const SIGLIP_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
-    pub const SIGLIP_STD: [f64; 3] = [0.5, 0.5, 0.5];
 }
 
 #[cfg(test)]
