@@ -3070,6 +3070,59 @@ mod tests {
         }
     }
 
+    /// A closing tag between a block's invokes is held while it is read, up to 128 bytes: a
+    /// longer run that has not closed is no tag's name, and is the stay's text from there,
+    /// released as it arrives. Fed a byte at a time, the bytes no event has accounted for stay
+    /// within that bound, and the output reads the same as in one piece.
+    #[test]
+    fn a_tag_read_between_a_blocks_invokes_is_held_within_a_bound() {
+        let call = "<invoke name=\"get_weather\"><city>Seattle</city></invoke>";
+        for tail in [
+            format!("</{}", "x".repeat(20_000)),
+            format!("</{}>\n</tool_call>", "x".repeat(300)),
+            format!("</{}>\n</tool_call>", "x".repeat(120)),
+        ] {
+            let output = format!("<tool_call>\n{call}\n{tail}");
+            let mut engine = Engine::new(minimax_m3(), weather_and_typed());
+            let mut events = Vec::new();
+            let mut accounted = 0;
+            let mut most = 0;
+            for (fed, c) in output.char_indices() {
+                let mut out = crate::Events::new();
+                crate::Parser::feed(
+                    &mut engine,
+                    crate::Input::Delta {
+                        token_ids: &[],
+                        text: &output[fed..fed + c.len_utf8()],
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("a delta");
+                accounted += out.text().len();
+                most = most.max(fed + c.len_utf8() - accounted);
+                events.extend(out.into_owned().drain());
+            }
+            let mut out = crate::Events::new();
+            crate::Parser::feed(
+                &mut engine,
+                crate::Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("the end");
+            events.extend(out.into_owned().drain());
+            assert!(most <= 128 + SEPARATOR.len(), "{most} bytes held");
+            assert_eq!(bytes(&events), output);
+            let whole = run_with(weather_and_typed(), "", &[&output]);
+            assert_eq!(crate::testing::said(&events), crate::testing::said(&whole));
+            // A tag within the bound is read as one, and ignored; a longer one is text.
+            let ignored = reported(&whole) == [MalformedReason::StrayClosingTag];
+            assert_eq!(ignored, tail.len() < 200 && tail.ends_with("</tool_call>"));
+        }
+    }
+
     /// The end of the output closes nothing for the model. An invoke the output ends inside is
     /// a call the model did not end, whatever it had closed inside it: its end says so (`stop`
     /// at the model's stop, `cut` at a cut), where the same bytes before the invoke's closing

@@ -141,6 +141,10 @@ struct Stay {
     tag: Option<String>,
 }
 
+/// The bytes of a closing tag a wrapping stay holds while it reads one between a block's calls
+/// ([`Engine::wrapping_tags`]): a longer run that has not closed is the stay's text.
+const HELD_TAG: usize = 128;
+
 /// Bytes a stay holds, in the output's order: a trimmed stay's run after its last text that is not
 /// whitespace, a content stay's lead before its first, or a wrapping stay's run after its last.
 #[derive(Debug)]
@@ -986,9 +990,10 @@ impl Engine {
     /// ignored ([`Self::stray_close`]); everything else is text where the template only wraps
     /// ([`Self::wrapping`]), as under any syntax, a closing tag after text of the stay
     /// included: the model is writing prose there, and a tag in it is the prose's. A tag is
-    /// read across pieces: from its `</` the bytes are held while they can still spell one, so
-    /// where the deltas cut it changes nothing, and bytes that spell none after all are the
-    /// stay's text, in the run they stand in.
+    /// read across pieces: from its `</` the bytes are held while they can still spell one, up
+    /// to [`HELD_TAG`] of them, so where the deltas cut it changes nothing, and bytes that
+    /// spell none after all, or run past the bound, are the stay's text, in the run they stand
+    /// in.
     fn wrapping_tags<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let why = MalformedReason::TextBetweenCalls;
         // Where the text of this piece not yet handed on starts, and where the tag being read
@@ -1017,6 +1022,21 @@ impl Engine {
                 }
             };
             if spells {
+                // A run past the bound is no tag's name: its bytes are the stay's text from
+                // here. Begun in this piece they stay in the run they stand in; held from an
+                // earlier one they go on as text.
+                if self
+                    .stay
+                    .tag
+                    .as_ref()
+                    .is_some_and(|tag| tag.len() > HELD_TAG)
+                {
+                    let tag = self.stay.tag.take().unwrap_or_default();
+                    if began.take().is_none() {
+                        self.wrapping(Cow::Owned(format!("<{tag}")), why, out);
+                        plain = at + c.len_utf8();
+                    }
+                }
                 continue;
             }
             let tag = self.stay.tag.take().unwrap_or_default();
