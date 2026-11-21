@@ -219,7 +219,10 @@ pub struct Needs {
     /// send a request on without reading its prompt reads the prompt where
     /// this is declared, and may state zero where it is not: a stage that
     /// read the size undeclared there would place every request as an
-    /// empty one, with no error.
+    /// empty one, with no error. Where a request states its prompt's token
+    /// ids ahead of its body, their count stands for the size, up to the
+    /// host's cap on such a list. A plugin is shown the size where its own
+    /// row declares this, and zero otherwise, whatever the host read.
     #[serde(default)]
     pub prompt_size: bool,
     /// Load reports per worker.

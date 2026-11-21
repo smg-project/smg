@@ -788,8 +788,9 @@ impl PolicyEngine {
     /// declares it, as the bucket stage does). A valid tokens hint states
     /// the ids in a header, and with them their count, so `hinted` lifts
     /// the read: it is asked only where a stage reads the hashes or the
-    /// size. The text itself, which no stage of this build reads, is in the
-    /// body alone.
+    /// size. The hint's count then stands for the size, 512 ids at most,
+    /// as a hint lifts every classic policy's read of the body. The text
+    /// itself, which no stage of this build reads, is in the body alone.
     ///
     /// A key source that is the request's own id reads the body too. The
     /// routing settings name one under the sticky override alone, and the

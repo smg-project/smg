@@ -50,3 +50,19 @@ pub(crate) fn shown_hashes<'a>(facts: &RequestFacts<'a>, needs: Needs) -> &'a [u
     let most = usize::try_from(MAX_BLOCK_HASHES).unwrap_or(usize::MAX);
     facts.block_hashes.get(..most).unwrap_or(facts.block_hashes)
 }
+
+/// The request's size a plugin's view carries, whatever its kind: the
+/// request's where the plugin's row declares it ([`Needs::prompt_size`]),
+/// and zero where it does not, on every path. A host that sends a request
+/// on without reading its prompt states a size of zero where no stage
+/// declares the size. A plugin shown the size undeclared would read the
+/// true size of a request its host read and zero of one it sent on: it
+/// would pass its tests and misplace large bodies in service. Shown zero
+/// always, it reads zero in its first test.
+pub(crate) fn shown_size(facts: &RequestFacts<'_>, needs: Needs) -> u32 {
+    if needs.prompt_size {
+        facts.prompt_tokens
+    } else {
+        0
+    }
+}

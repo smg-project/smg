@@ -937,7 +937,9 @@ pub struct RequestFacts<'a> {
     /// The host's token count or estimate. A stage that reads it declares
     /// [`Needs::prompt_size`](crate::document::Needs::prompt_size): a host
     /// that sends a request on without reading its prompt states zero
-    /// where no stage does.
+    /// where no stage does. Nothing masks the field for a stage of a
+    /// host's own build, which reads it here: undeclared, it reads zero on
+    /// such a request and the true size on every other.
     pub prompt_tokens: u32,
     /// One hash a whole block of the prompt, in order from the first,
     /// capped by the host. A hash is of its own block's content and of
