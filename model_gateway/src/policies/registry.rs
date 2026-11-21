@@ -811,10 +811,23 @@ impl PolicyRegistry {
     /// atomically inside [`super::CacheAwarePolicy::set_mesh_tree_sync`]); every
     /// future cache-aware policy created here inherits both. Pass `None`
     /// to detach.
+    ///
+    /// The mesh shares the classic policy's trees and nothing else. Where
+    /// the policy engine of this process decides, no decision reads those
+    /// trees, so an attach says once, as a warning, that the gateways of the
+    /// mesh do not share which worker holds a prompt's prefix.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
         {
             let mut guard = self.mesh_tree_sync.write();
             guard.clone_from(&adapter);
+        }
+        if adapter.is_some() && self.policy_engine.is_some() {
+            warn!(
+                "A mesh is attached and the policy controller decides in this process: the \
+                 gateways of the mesh do not share which worker holds a prompt's prefix while \
+                 the policy controller is on. Each gateway keeps its own record of the prefixes \
+                 it sent."
+            );
         }
         Self::maybe_inject_mesh_tree_sync(&self.default_policy, adapter.as_ref());
         if let Some(p) = self.prefill_policy.get() {
