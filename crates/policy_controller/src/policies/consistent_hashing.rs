@@ -18,6 +18,10 @@
 //! view, which carries the key. A pruned id is fenced for a while, so a
 //! decision over a stale view does not relearn it.
 //!
+//! A host that keeps its workers in lists of its own can hold the ring of
+//! one list as a value of its own ([`PoolRing`]): the same positions for the
+//! same members, built once and never changed.
+//!
 //! The key is the decision's session key: an encode item's content hash under
 //! the `epd` plan, the request's routing key elsewhere. One ring serves every
 //! pool: a lookup walks past the members that are not candidates of the
@@ -64,6 +68,10 @@ use crate::{
     tracking::{in_flight::with_counts, lease::Membership},
     Draw,
 };
+
+mod pool_ring;
+
+pub use pool_ring::PoolRing;
 
 /// How the `consistent_hashing` policy is composed: its filters, its scorers
 /// and its picker.
