@@ -65,6 +65,16 @@ fn encode_sides() -> Result<PolicySpec, Box<dyn Error>> {
     Ok(document)
 }
 
+/// `document` with the encode pair binding of [`encode_sides`] behind its
+/// own bindings: the engine does not decide the whole of it, so a registry
+/// policy places the requests of a gateway that runs it.
+fn beside_encode(mut document: PolicySpec) -> Result<PolicySpec, Box<dyn Error>> {
+    let encode = encode_sides()?;
+    document.profiles.extend(encode.profiles);
+    document.bindings.extend(encode.bindings);
+    Ok(document)
+}
+
 /// The gateway's own placement runs a binding's overload thresholds, its
 /// key sources and its sessions rule from the routing settings, and runs no
 /// shadow. A supplied document that states one of them otherwise would
@@ -264,14 +274,32 @@ fn a_pair_binding_of_some_models_starts_where_the_engine_decides_whole() -> Case
 
 /// A pair binding plans no single request. One that covers the single
 /// phase, by a list that names no phase or by name, takes its models'
-/// single requests from every binding behind it: the classic policy would
-/// place them and no line would say so. In a gateway that places single
-/// requests the start refuses it by `match.phase`, and takes the binding
-/// that holds its sides' phases alone. A pair mode places no single
-/// request, and starts under either.
+/// single requests from every binding behind it. Where the routers ask the
+/// engine for every request of the document, the engine declines such a
+/// request by its binding, so the document is run as written and starts.
+/// Where a registry policy still places the gateway's requests, the classic
+/// policy would place them and no line would say so: in a gateway that
+/// places single requests the start refuses the binding by `match.phase`,
+/// and takes the one that holds its sides' phases alone. A pair mode places
+/// no single request, and starts under either.
 #[test]
-fn a_pair_binding_holds_its_sides_phases_in_a_gateway_that_places_single_requests() -> Case {
+fn a_pair_binding_holds_its_sides_phases_where_a_registry_policy_places_singles() -> Case {
     let pair = || PolicySpec::pair_presets("round_robin", "round_robin");
+    let many_routers = |document: PolicySpec| RouterConfig {
+        enable_igw: true,
+        ..supplied(document)
+    };
+    // The engine decides a round robin pair's document whole: it starts
+    // in a regular gateway and in a gateway of many routers.
+    let mut named = pair()?;
+    named.bindings[0].matcher.phase = vec![Phase::Single, Phase::Prefill, Phase::Decode];
+    for document in [pair()?, named, pair_sides()?] {
+        assert!(start_in_process(&supplied(document.clone()), None)?.is_some());
+        assert!(start_in_process(&many_routers(document), None)?.is_some());
+    }
+
+    // Beside a plan the engine does not decide whole, a registry policy
+    // places the gateway's requests.
     let words = not_run(
         1,
         "*",
@@ -279,20 +307,8 @@ fn a_pair_binding_holds_its_sides_phases_in_a_gateway_that_places_single_request
         "this gateway places single requests and a pair binding plans none: \
          a pair binding holds its sides' phases alone (`phase: [prefill, decode]`)",
     );
-    // A regular gateway places single requests alone.
-    assert_eq!(refusal(&supplied(pair()?))?, words);
-    let mut named = pair()?;
-    named.bindings[0].matcher.phase = vec![Phase::Single, Phase::Prefill, Phase::Decode];
-    assert_eq!(refusal(&supplied(named))?, words);
-    assert!(start_in_process(&supplied(pair_sides()?), None)?.is_some());
-
-    // A gateway of many routers places them beside its pairs.
-    let many_routers = |document: PolicySpec| RouterConfig {
-        enable_igw: true,
-        ..supplied(document)
-    };
-    assert_eq!(refusal(&many_routers(pair()?))?, words);
-    assert!(start_in_process(&many_routers(pair_sides()?), None)?.is_some());
+    assert_eq!(refusal(&supplied(beside_encode(pair()?)?))?, words);
+    assert_eq!(refusal(&many_routers(beside_encode(pair()?)?))?, words);
 
     // The encode plan's binding names its three sides.
     let encode = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin")?;
@@ -620,12 +636,16 @@ fn the_settings_own_document_always_starts() {
     assert!(said > unrun.len(), "{said} settings start");
 }
 
-/// A side's policy places the pair requests of every model. In a gateway
-/// that places pairs, a binding of some models would be passed by for
-/// those models' pair requests: the start refuses it unless it holds
-/// single requests alone. A gateway that places no pair starts under it.
+/// Where the routers ask the engine for every request of the document, a
+/// binding of some models decides those models' requests at each phase it
+/// covers, and the document starts. Where a registry policy still places a
+/// pair, a side's policy places the pair requests of every model: in a
+/// gateway that places pairs, a binding of some models would be passed by
+/// for those models' pair requests, and the start refuses it unless it
+/// holds single requests alone. A gateway that places no pair starts under
+/// it.
 #[test]
-fn a_binding_of_some_models_holds_single_requests_in_a_gateway_that_places_pairs() -> Case {
+fn a_binding_of_some_models_holds_singles_where_a_registry_policy_places_pairs() -> Case {
     let two_bindings = |phase: Vec<Phase>| -> Result<PolicySpec, Box<dyn Error>> {
         let mut document = PolicySpec::preset("round_robin")?;
         let mut named = document.bindings[0].clone();
@@ -654,11 +674,16 @@ fn a_binding_of_some_models_holds_single_requests_in_a_gateway_that_places_pairs
     assert!(start_in_process(&supplied(two_bindings(vec![])?), None)?.is_some());
     let gateways: [&dyn Fn(PolicySpec) -> RouterConfig; 2] = [&pair_mode, &many_routers];
     for places_pairs in gateways {
+        // The engine decides the whole of two round robin bindings.
+        for phase in [vec![], vec![Phase::Single]] {
+            let whole = places_pairs(two_bindings(phase)?);
+            assert!(start_in_process(&whole, None)?.is_some());
+        }
         assert_eq!(
-            refusal(&places_pairs(two_bindings(vec![])?))?,
+            refusal(&places_pairs(beside_encode(two_bindings(vec![])?)?))?,
             not_run(1, "alpha-*", "match.phase", held)
         );
-        let single = two_bindings(vec![Phase::Single])?;
+        let single = beside_encode(two_bindings(vec![Phase::Single])?)?;
         assert!(start_in_process(&places_pairs(single), None)?.is_some());
     }
     Ok(())

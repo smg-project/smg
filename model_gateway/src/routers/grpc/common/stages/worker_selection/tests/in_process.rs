@@ -557,3 +557,25 @@ async fn a_pair_of_a_model_no_pair_binding_names_is_declined() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"]["code"], "policy_declined", "{body}");
 }
+
+/// A single request whose binding plans a pair alone has no side under it,
+/// and is declined by that binding: the regular stage answers 503
+/// `policy_declined`.
+#[tokio::test]
+async fn a_single_request_under_a_pair_binding_is_declined() {
+    let registry = Arc::new(WorkerRegistry::new());
+    listed(
+        &registry,
+        "grpc://w:8000",
+        RuntimeType::Vllm,
+        None,
+        UNLABELED,
+    );
+    let engine = own_engine(&registry, pair_document());
+    let stage = classic_stage(&registry, PolicyConfig::RoundRobin).with_policy_engine(Some(engine));
+    let declined = stage.execute(&mut prompt_of(&registry, 3)).await;
+    let declined = declined.expect_err("its binding plans a pair alone");
+    let (status, body) = answer_of(declined).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "policy_declined", "{body}");
+}

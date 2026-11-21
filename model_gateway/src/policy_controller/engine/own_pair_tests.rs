@@ -26,7 +26,7 @@ use crate::{
         common::{
             placement::refusal_reason,
             prefill_admission::{PrefillAdmission, PrefillAdmissionRejection},
-            snapshot::WorkerRegistry,
+            snapshot::{RoutingPool, WorkerRegistry},
         },
         grpc::backend_client::BasicWorkerBuilder,
     },
@@ -314,6 +314,47 @@ async fn a_pair_is_decided_under_the_binding_that_names_its_model() {
         refusal_reason(&answer),
         Some("the policy declined at binding")
     );
+}
+
+/// A request whose binding plans no side for its phase is declined by that
+/// binding. A pair binding that names no phase covers the single phase,
+/// where it plans nothing: a single request of its models is declined.
+/// Under a single binding of one model ahead of the pair's, a pair of that
+/// model has no side either, and another model's pair is placed.
+#[tokio::test]
+async fn a_request_with_no_side_under_its_binding_is_declined() {
+    let registry = Arc::new(WorkerRegistry::new());
+    side_of(&registry, MODEL, WorkerType::Regular, 1, None);
+    for model in [MODEL, OTHER] {
+        side_of(&registry, model, WorkerType::Prefill, 1, None);
+        side_of(&registry, model, WorkerType::Decode, 1, None);
+    }
+    let by_binding = |declined: &Unplaced| {
+        let declined_by = ShedReason::PolicyDeclined;
+        matches!(declined, Unplaced::Shed { reason, emptied_by: "binding", .. } if *reason == declined_by)
+    };
+
+    let policy_engine = object_of(&registry, pair_document());
+    let id = mark();
+    let single = Ask {
+        pool: Some(RoutingPool::HttpRegular),
+        ..Ask::of(&id, MODEL)
+    };
+    let declined = policy_engine.place(&single, Instant::now()).await;
+    let declined = declined.expect_err("a pair binding plans no single request");
+    assert!(by_binding(&declined), "{declined:?}");
+
+    let mut document = pair_document();
+    let single = PolicySpec::preset("round_robin").expect("a built-in preset");
+    document.profiles.extend(single.profiles.clone());
+    let mut named = single.bindings[0].clone();
+    named.matcher.model = MODEL.to_owned();
+    document.bindings.insert(0, named);
+    let policy_engine = object_of(&registry, document);
+    let declined = decided_under(&policy_engine, MODEL).await;
+    let declined = declined.expect_err("a single binding plans no pair");
+    assert!(by_binding(&declined), "{declined:?}");
+    assert!(decided_under(&policy_engine, OTHER).await.is_ok());
 }
 
 /// A fleet whose prefills pair with none of its decodes reads the pair

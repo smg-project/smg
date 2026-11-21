@@ -535,9 +535,11 @@ fn hash_index(document: &PolicySpec) -> Result<(), StartError> {
 ///
 /// `whole` says the routers ask the engine for every request of the
 /// document ([`InProcess::decides_whole`]). No registry policy places a
-/// pair then: the engine finds a pair's binding by the request's model, so
-/// a pair binding that names some models and a second pair binding are run
-/// as written, and start.
+/// request then: the engine finds a request's binding by its model and its
+/// phase, and declines one whose binding plans no side for that phase. So
+/// a pair binding that names some models, a second pair binding, a pair
+/// binding that covers the single phase and a binding of some models that
+/// covers a side's phase are run as written, and start.
 fn rule_not_run(
     config: &RouterConfig,
     settings: &PolicySpec,
@@ -601,7 +603,8 @@ fn rule_not_run(
             }
             // A list that names no phase covers every phase.
             let phases = &binding.matcher.phase;
-            if places_singles && (phases.is_empty() || phases.contains(&Phase::Single)) {
+            let singles = phases.is_empty() || phases.contains(&Phase::Single);
+            if !whole && places_singles && singles {
                 let sides = if binding.plan == Some(PlanName::Epd) {
                     EPD_SIDES
                 } else {
@@ -610,7 +613,8 @@ fn rule_not_run(
                 return Err(refused("match.phase", sides));
             }
             pair_planned = true;
-        } else if places_pairs
+        } else if !whole
+            && places_pairs
             && binding.matcher.model != "*"
             && binding.matcher.phase != [Phase::Single]
         {
