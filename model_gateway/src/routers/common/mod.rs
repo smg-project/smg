@@ -224,13 +224,20 @@ pub(crate) fn attach_sized_body(
 /// and whether the process captures every request's cache trace.
 #[cfg(any(test, feature = "test-util"))]
 pub mod bench_support {
-    use std::{sync::Arc, time::Instant};
+    use std::{
+        future::Future,
+        pin::pin,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::Instant,
+    };
 
     use axum::http::{HeaderMap, HeaderValue};
     use rand::RngExt;
     use smg_policy_controller::{
         engine::{
             decide, Constraints, DecisionClock, Identity, Live, Phase, PolicyEngine, RequestFacts,
+            WireModes,
         },
         stages::Lifecycle,
         tracking::{Lease, Outcome, Side as EngineSide, TransportClass},
@@ -249,7 +256,10 @@ pub mod bench_support {
         config::RouterConfig,
         observability::cache_trace,
         policies::{EnginePolicy, PolicyRegistry, Side},
-        policy_controller::start_in_process,
+        policy_controller::{
+            engine::{mark, Ask, End, PolicyEngine as EngineObjectOf, Prompt},
+            start_in_process,
+        },
         routers::common::{
             pair_index::{PdPairIndex, PdWire},
             snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
@@ -360,6 +370,111 @@ pub mod bench_support {
                 config.policy.name()
             ))
         }
+    }
+
+    /// The gateway's own policy engine object, over the engine a gateway's
+    /// start builds for `config`'s policy under the setting, whatever
+    /// `config` says of the setting, and over `registry`'s lists: what the
+    /// routers ask where the engine decides every request of the document
+    /// whole.
+    pub struct EngineObject(EngineObjectOf);
+
+    impl EngineObject {
+        /// The object a gateway's start builds for `config` over `registry`.
+        ///
+        /// # Errors
+        ///
+        /// A configuration no policy document says, a document the engine
+        /// refuses, and a policy the engine does not decide whole yet: the
+        /// routers would keep their classic placement pass, and a cell
+        /// named for the object would time that one.
+        pub fn of(config: &RouterConfig, registry: &Arc<WorkerRegistry>) -> Result<Self, String> {
+            let picked = RouterConfig {
+                policy_controller: true,
+                ..config.clone()
+            };
+            let started = start_in_process(&picked, None)
+                .map_err(|refused| refused.to_string())?
+                .ok_or("this configuration places its requests by no routing policy")?;
+            if !started.decides_whole() {
+                return Err(format!(
+                    "the policy engine does not decide `{}` whole yet: the routers keep their classic placement pass",
+                    config.policy.name()
+                ));
+            }
+            Ok(Self(EngineObjectOf::own(
+                started.engine,
+                Arc::clone(registry),
+            )))
+        }
+    }
+
+    /// One request's routing by the gateway's engine object on `route`, as
+    /// a regular router's arm runs it: the prompt's hashes, the ask over
+    /// the route's pool and the commit of the first target the gateway can
+    /// send to, the dispatch-time read of the chosen worker's overload
+    /// veto, the dispatch's word, the worker's load guard from the send to
+    /// the request's end, and the end's word. `false` where the request had
+    /// no worker.
+    ///
+    /// What [`route_classic`] does under a classic policy, with the engine
+    /// deciding the whole request through the object the routers hold: no
+    /// classic policy and no classic placement pass runs.
+    pub fn route_engine(
+        registry: &WorkerRegistry,
+        object: &EngineObject,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+    ) -> bool {
+        let (pool, wires) = match route {
+            Route::Http => (RoutingPool::HttpRegular, WireModes::NONE),
+            Route::Grpc => (
+                RoutingPool::GrpcPipelineRegular,
+                WireModes::GRPC.union(WireModes::ZMQ),
+            ),
+        };
+        let hashes = object.0.hashes(model, &Prompt::of(tokens, None));
+        let id = mark();
+        let ask = Ask {
+            wires,
+            hashes: Some(&hashes),
+            pool: Some(pool),
+            ..Ask::of(&id, model)
+        };
+        let now = Instant::now();
+        // The engine of this process decides on the calling thread: the
+        // arm's future is ready at its first poll.
+        let placing = pin!(object
+            .0
+            .place_where(&ask, |worker| pool.matches(worker), now));
+        let Poll::Ready(Ok(mut placed)) = placing.poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            return false;
+        };
+        let shed = overload::shed_if_worker_overloaded(
+            placed.worker().as_ref(),
+            model,
+            registry.overload_shed_enabled(),
+        );
+        if shed.is_some() {
+            return false;
+        }
+        placed.dispatched(now);
+        let guard = WorkerLoadGuard::with_key(Arc::clone(placed.worker()), None);
+        drop(guard);
+        placed.completed(
+            End {
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+            now,
+        );
+        true
     }
 
     /// One request's routing under the classic policies on `route`: the
