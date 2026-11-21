@@ -197,7 +197,7 @@ const POOL: &[char] = &[
     '\u{7F}',
 ];
 
-fn pseudo_random(state: &mut u64) -> u64 {
+pub(super) fn pseudo_random(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;
@@ -7079,7 +7079,7 @@ fn fuzz_text(state: &mut u64, fixtures: &[String]) -> String {
 
 /// The pieces of `stages` applied in turn by their match ranges, as byte
 /// ranges: the walk the encoder made before the scanners.
-fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
+pub(super) fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
     fn walk(stages: &[Stage], text: &str, offset: usize, out: &mut Vec<(usize, usize)>) {
         if text.is_empty() {
             return;

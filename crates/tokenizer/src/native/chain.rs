@@ -741,7 +741,11 @@ mod tests {
     };
 
     use super::{
-        super::{pattern::Pattern, Pieces, Stage, Walk},
+        super::{
+            pattern::Pattern,
+            tests::{pseudo_random, staged},
+            Pieces, Stage,
+        },
         *,
     };
 
@@ -782,53 +786,6 @@ mod tests {
             "the word scans and the byte loop cut {text:?} alike"
         );
         pieces
-    }
-
-    /// The pieces of the stage patterns run in turn, each over the pieces
-    /// of the one before (the recursion of `NativeEncoder::pieces`).
-    fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
-        fn walk(stages: &[Stage], text: &str, offset: usize, out: &mut Vec<(usize, usize)>) {
-            if text.is_empty() {
-                return;
-            }
-            let Some((stage, rest)) = stages.split_first() else {
-                out.push((offset, offset + text.len()));
-                return;
-            };
-            let (gaps, matches) = match stage.pieces.walk() {
-                Walk::Merged => {
-                    let mut merged = None;
-                    for (start, _) in stage.pattern.find_iter(text) {
-                        match merged {
-                            Some(from) => walk(rest, &text[from..start], offset + from, out),
-                            None if start > 0 => walk(rest, &text[..start], offset, out),
-                            None => {}
-                        }
-                        merged = Some(start);
-                    }
-                    let from = merged.unwrap_or(0);
-                    walk(rest, &text[from..], offset + from, out);
-                    return;
-                }
-                Walk::Apart { gaps, matches } => (gaps, matches),
-            };
-            let mut cursor = 0;
-            for (start, end) in stage.pattern.find_iter(text) {
-                if gaps && cursor < start {
-                    walk(rest, &text[cursor..start], offset + cursor, out);
-                }
-                if matches {
-                    walk(rest, &text[start..end], offset + start, out);
-                }
-                cursor = end;
-            }
-            if gaps && cursor < text.len() {
-                walk(rest, &text[cursor..], offset + cursor, out);
-            }
-        }
-        let mut out = Vec::new();
-        walk(stages, text, 0, &mut out);
-        out
     }
 
     /// The pieces of the engine: a `Sequence` of `Split`s over the text.
@@ -900,13 +857,6 @@ mod tests {
                 "the stage alone; text {text:?}"
             );
         }
-    }
-
-    fn pseudo_random(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
     }
 
     /// Text shaped for the chain's stages: digit runs of every length up to
