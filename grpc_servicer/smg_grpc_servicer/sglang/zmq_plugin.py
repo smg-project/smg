@@ -42,6 +42,7 @@ import logging
 import os
 import pkgutil
 import re
+import sys
 from array import array
 from typing import Any
 
@@ -161,6 +162,28 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                     result["hash_omitted_over_32768"] = True
                 return result
 
+            def bounded_integer(value):
+                return value if type(value) is int and value.bit_length() <= 128 else None
+
+            def sdk_settings():
+                loaded = sys.modules.get("sglang.srt.environ")
+                sdk_envs = vars(loaded).get("envs") if loaded is not None else None
+                result = {}
+                for name, expected in (
+                    ("SGLANG_MM_BUFFER_SIZE_MB", int),
+                    ("SGLANG_MM_SKIP_COMPUTE_HASH", bool),
+                ):
+                    result[name] = {"status": "UNKNOWN", "value": None}
+                    try:
+                        value = getattr(sdk_envs, name).get()
+                        if type(value) is expected and (
+                            expected is bool or value.bit_length() <= 63
+                        ):
+                            result[name] = {"status": "CAPTURED", "value": value}
+                    except Exception:
+                        pass
+                return result
+
             def tensor_metadata(value, *, integer_values=False):
                 if value is None:
                     return None
@@ -179,6 +202,18 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                     "device_type": device if device in ("cpu", "cuda", "meta") else None,
                     "dtype": str(getattr(value, "dtype", ""))[:32],
                 }
+                # Tensor layout is metadata only: no feature reads, copies or device transfers.
+                for name in ("stride", "storage_offset"):
+                    result[name] = None
+                    try:
+                        metadata = getattr(value, name)()
+                        if name == "stride":
+                            if type(metadata) in (list, tuple) and len(metadata) <= 8:
+                                result[name] = [bounded_integer(v) for v in metadata]
+                        else:
+                            result[name] = bounded_integer(metadata)
+                    except Exception:
+                        pass
                 # Only small CPU integer metadata; never .cpu(), numpy or feature copies.
                 if integer_values:
                     result["values_status"] = "OMITTED_NOT_SMALL_CPU_INTEGER"
@@ -192,10 +227,59 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                         result.update(values_status="CAPTURED", values=summary, first12=values[:12])
                 return result
 
+            observed_origin_ids = getattr(req, "origin_input_ids", None)
+            span_budget = 32768
+
+            def observed_span_matches_pad(pair, pad):
+                nonlocal span_budget
+                if (
+                    type(observed_origin_ids) not in (list, array)
+                    or len(observed_origin_ids) > 32768
+                    or pad is None
+                    or type(pair) not in (list, tuple)
+                    or len(pair) != 2
+                    or any(type(v) is not int for v in pair)
+                ):
+                    return None
+                start, end = pair
+                if not 0 <= start <= end < len(observed_origin_ids):
+                    return None
+                count = end - start + 1
+                if count > span_budget:
+                    return None
+                span_budget -= count
+                matches = True
+                for index in range(start, end + 1):
+                    token = observed_origin_ids[index]
+                    if type(token) is not int:
+                        return None
+                    matches = matches and token == pad
+                return matches
+
             def item_metadata(item):
                 modality = getattr(getattr(item, "modality", None), "name", None)
                 data = getattr(item, "model_specific_data", None)
+                offsets = getattr(item, "offsets", None)
+                offsets = offsets if type(offsets) in (list, tuple) else None
+                pad = bounded_integer(getattr(item, "pad_value", None))
                 return {
+                    "hash": bounded_integer(getattr(item, "hash", None)),
+                    "pad_value": pad,
+                    "offsets": [
+                        [bounded_integer(v) for v in pair]
+                        if type(pair) in (list, tuple) and len(pair) == 2
+                        else None
+                        for pair in offsets[:4]
+                    ]
+                    if offsets is not None
+                    else None,
+                    "observed_origin_span_matches_pad": [
+                        observed_span_matches_pad(pair, pad) for pair in offsets[:4]
+                    ]
+                    if offsets is not None
+                    else None,
+                    "offsets_count": len(offsets) if offsets is not None else None,
+                    "offsets_truncated": len(offsets) > 4 if offsets is not None else None,
                     "modality": modality if modality in ("IMAGE", "VIDEO", "AUDIO") else None,
                     "model_specific_data_is_dict": isinstance(data, dict),
                     "image_grid_thw_present": isinstance(data, dict) and "image_grid_thw" in data,
@@ -207,7 +291,7 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                     "feature": tensor_metadata(getattr(item, "feature", None)),
                 }
 
-            original = ids(getattr(req, "origin_input_ids", None))
+            original = ids(observed_origin_ids)
             unpadded = ids(getattr(req, "origin_input_ids_unpadded", None))
             items = getattr(mm, "mm_items", None)
             rid = getattr(req, "rid", None)
@@ -221,6 +305,10 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
                 if processor is not None
                 else None,
                 mrope_processor_config_commit=revision[:128] if isinstance(revision, str) else None,
+                sdk_effective_settings=sdk_settings(),
+                observed_origin_span_scope=(
+                    "Current event origin_input_ids only; an unpadded MRoPE view need not match pad."
+                ),
                 processor_revision_scope=(
                     "Direct live mrope processor config only; "
                     "None means unavailable, not cached-snapshot proof"

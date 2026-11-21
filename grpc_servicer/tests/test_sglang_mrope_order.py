@@ -1,8 +1,9 @@
 """The child-process plugin supplies original image anchors to the SDK's M-RoPE fallback."""
 
+import json
 import sys
 from array import array
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from smg_grpc_servicer.sglang import mm_broadcast, zmq_plugin
@@ -154,3 +155,182 @@ def test_saved_list_buffer_is_supported_without_changing_caller(monkeypatch):
         req,
     )
     assert observed[0] is saved and req.origin_input_ids is padded
+
+
+class _DiagnosticTensor:
+    dtype = "torch.bfloat16"
+    device = SimpleNamespace(type="cuda")
+
+    def __init__(self, storage_offset=0):
+        self.layout_reads = []
+        self.data_reads = []
+        self._storage_offset = storage_offset
+
+    @property
+    def shape(self):
+        self.layout_reads.append("shape")
+        return (280, 1536)
+
+    def stride(self):
+        self.layout_reads.append("stride")
+        return (1536, 1)
+
+    def storage_offset(self):
+        self.layout_reads.append("storage_offset")
+        return self._storage_offset
+
+    def __getattr__(self, name):
+        self.data_reads.append(name)
+        raise AssertionError(f"Unexpected feature operation: {name}")
+
+
+def _diagnostic_request(monkeypatch):
+    monkeypatch.setenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", "1")
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_TRACE_SLOTS", iter(range(40)))
+    tensors = [_DiagnosticTensor(i * 430080) for i in range(3)]
+    items = [
+        SimpleNamespace(
+            modality=SimpleNamespace(name="IMAGE"),
+            model_specific_data={"image_grid_thw": None},
+            feature=tensor,
+            hash=(2**64 - 1) if i == 0 else 23,
+            pad_value=1000023,
+            offsets=[(start, start + 69)],
+        )
+        for i, (tensor, start) in enumerate(zip(tensors, [2, 75, 148]))
+    ]
+    padded = array("q", [42] * 220)
+    unpadded = padded[:]
+    for item in items:
+        start, end = item.offsets[0]
+        padded[start : end + 1] = array("q", [item.pad_value]) * (end - start + 1)
+        unpadded[start : end + 1] = array("q", [11]) * (end - start + 1)
+    req = SimpleNamespace(
+        rid="smg-qwenvl-" + "a" * 32,
+        origin_input_ids=padded,
+        origin_input_ids_unpadded=unpadded,
+        multimodal_inputs=SimpleNamespace(mm_items=items),
+    )
+    scheduler = SimpleNamespace(server_args=SimpleNamespace(model_path="Qwen/Qwen3-VL-8B-Instruct"))
+    return req, scheduler, tensors
+
+
+@pytest.mark.parametrize("gate", ["disabled", "exhausted"])
+def test_qwenvl_diagnostic_gate_precedes_identity_and_layout_reads(monkeypatch, caplog, gate):
+    req, scheduler, tensors = _diagnostic_request(monkeypatch)
+    if gate == "disabled":
+        monkeypatch.delenv("SMG_QWENVL_REQUEST_DIAGNOSTIC")
+    else:
+        monkeypatch.setattr(zmq_plugin, "_QWENVL_TRACE_SLOTS", iter(()))
+    zmq_plugin._trace_qwenvl("probe", scheduler, req)
+    assert not any(t.layout_reads or t.data_reads for t in tensors)
+    assert not caplog.records
+
+
+def test_qwenvl_diagnostic_records_existing_identity_layout_and_loaded_settings(
+    monkeypatch, caplog
+):
+    req, scheduler, tensors = _diagnostic_request(monkeypatch)
+    reads = []
+
+    def setting(name, value):
+        return SimpleNamespace(get=lambda: (reads.append(name), value)[1])
+
+    loaded = ModuleType("sglang.srt.environ")
+    loaded.envs = SimpleNamespace(
+        SGLANG_MM_BUFFER_SIZE_MB=setting("buffer", 64),
+        SGLANG_MM_SKIP_COMPUTE_HASH=setting("skip", False),
+    )
+    monkeypatch.setitem(sys.modules, loaded.__name__, loaded)
+    before = [
+        (item.hash, item.pad_value, list(item.offsets), item.feature)
+        for item in req.multimodal_inputs.mm_items
+    ]
+    saved = req.origin_input_ids[:]
+    zmq_plugin._trace_qwenvl("probe", scheduler, req)
+    record = caplog.records[-1].getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1]
+    facts = json.loads(record)
+    assert len(record) <= 8192 and facts["slot"] == 0
+    assert facts["sdk_effective_settings"] == {
+        "SGLANG_MM_BUFFER_SIZE_MB": {"status": "CAPTURED", "value": 64},
+        "SGLANG_MM_SKIP_COMPUTE_HASH": {"status": "CAPTURED", "value": False},
+    }
+    assert reads == ["buffer", "skip"]
+    for i, item in enumerate(facts["mm_items"]):
+        assert item["hash"] == before[i][0] and item["pad_value"] == before[i][1]
+        assert item["offsets"] == [list(before[i][2][0])]
+        assert item["offsets_count"] == 1 and item["offsets_truncated"] is False
+        assert item["observed_origin_span_matches_pad"] == [True]
+        assert item["feature"]["stride"] == [1536, 1]
+        assert item["feature"]["storage_offset"] == i * 430080
+    assert req.origin_input_ids == saved
+    assert before == [
+        (item.hash, item.pad_value, list(item.offsets), item.feature)
+        for item in req.multimodal_inputs.mm_items
+    ]
+    assert not any(t.data_reads for t in tensors)
+
+
+@pytest.mark.parametrize("kind", ["not_loaded", "wrong_types", "read_error"])
+def test_qwenvl_diagnostic_unknown_settings_and_bounded_metadata(monkeypatch, caplog, kind):
+    req, scheduler, tensors = _diagnostic_request(monkeypatch)
+    monkeypatch.delitem(sys.modules, "sglang.srt.environ", raising=False)
+    if kind != "not_loaded":
+
+        def read_error():
+            raise RuntimeError("Unavailable SDK setting")
+
+        loaded = ModuleType("sglang.srt.environ")
+        loaded.envs = SimpleNamespace(
+            SGLANG_MM_BUFFER_SIZE_MB=SimpleNamespace(
+                get=read_error if kind == "read_error" else lambda: True
+            ),
+            SGLANG_MM_SKIP_COMPUTE_HASH=SimpleNamespace(
+                get=read_error if kind == "read_error" else lambda: "false"
+            ),
+        )
+        monkeypatch.setitem(sys.modules, loaded.__name__, loaded)
+    first = req.multimodal_inputs.mm_items[0]
+    first.hash = 2**1024
+    first.pad_value = True
+    first.offsets = [(i, i + 1) for i in range(6)]
+    tensors[0]._storage_offset = 2**1024
+    modules_before = {name for name in sys.modules if name.startswith("sglang")}
+    zmq_plugin._trace_qwenvl("probe", scheduler, req)
+    facts = json.loads(
+        caplog.records[-1].getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1]
+    )
+    assert all(
+        value == {"status": "UNKNOWN", "value": None}
+        for value in facts["sdk_effective_settings"].values()
+    )
+    item = facts["mm_items"][0]
+    assert item["hash"] is None and item["pad_value"] is None
+    assert item["offsets"] == [[i, i + 1] for i in range(4)]
+    assert item["offsets_count"] == 6 and item["offsets_truncated"] is True
+    assert item["feature"]["storage_offset"] is None
+    assert modules_before == {name for name in sys.modules if name.startswith("sglang")}
+    assert not any(t.data_reads for t in tensors)
+
+
+def test_qwenvl_span_observation_is_event_local_and_scan_bounded(monkeypatch, caplog):
+    req, scheduler, tensors = _diagnostic_request(monkeypatch)
+    req.origin_input_ids = req.origin_input_ids_unpadded
+    zmq_plugin._trace_qwenvl("mrope_before", scheduler, req)
+    facts = json.loads(
+        caplog.records[-1].getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1]
+    )
+    assert all(item["observed_origin_span_matches_pad"] == [False] for item in facts["mm_items"])
+    assert "unpadded MRoPE view" in facts["observed_origin_span_scope"]
+    first = req.multimodal_inputs.mm_items[0]
+    first.pad_value = 42
+    first.offsets = [(0, 32767)] * 4
+    req.origin_input_ids = [42] * 32768
+    saved = list(req.origin_input_ids)
+    zmq_plugin._trace_qwenvl("probe", scheduler, req)
+    facts = json.loads(
+        caplog.records[-1].getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1]
+    )
+    assert facts["mm_items"][0]["observed_origin_span_matches_pad"] == [True, None, None, None]
+    assert all(item["observed_origin_span_matches_pad"] == [None] for item in facts["mm_items"][1:])
+    assert req.origin_input_ids == saved and not any(t.data_reads for t in tensors)
