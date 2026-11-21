@@ -527,8 +527,9 @@ mod tests {
         );
     }
 
-    /// The reader skips `token_str`: a byte that is not UTF-8 there does not
-    /// stop the load; in a field it reads, the file is refused.
+    /// The reader skips a ranked token's `token_str`: a byte that is not
+    /// UTF-8 there does not stop the load; in a field it reads, the file is
+    /// refused.
     #[test]
     fn a_file_that_is_not_utf8_where_the_reader_skips_still_loads() {
         let text = testing::minimal();
