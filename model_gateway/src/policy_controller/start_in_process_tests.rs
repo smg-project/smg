@@ -7,7 +7,7 @@ use std::{error::Error, sync::Arc};
 use smg_policy_controller::{
     document::{DecodePick, OverloadSpec, Pairing, PlanName, PolicySpec, ShadowSpec},
     engine::Phase,
-    stages::Catalog,
+    stages::StageRegistry,
 };
 
 use super::{start_in_process, would_start};
@@ -134,7 +134,7 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
         policy_controller: true,
         ..RouterConfig::default()
     };
-    let stages = Arc::new(Catalog::builtin());
+    let stages = Arc::new(StageRegistry::builtin());
     let answer = |gateway: &RouterConfig, document: &PolicySpec| {
         would_start(gateway, &stages, document)
             .err()

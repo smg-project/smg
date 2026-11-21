@@ -40,11 +40,13 @@ use smg_policy_controller::{
         AffinityFacts, Candidate, Constraints, Decision, Engine, HashKind, Health, LoadRow, Phase,
         PoolFacts, RequestFacts, Role, Scratch, ShedReason, SignalSource, Target, WorkerId,
     },
+    stages::Lifecycle,
     store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, MemoryStore, Named, Naming,
-        Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        AffinityQuery, AffinityRowsBuffers, BatchFacts, BatchOutcome, GatewayId, KvEvent,
+        KvEventSink, MemoryStore, Signals, StoredBlock, ViewBuffers, ViewQuery, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
-    tracking::{Lease, Lifecycle, Side, TransportClass},
+    tracking::{Lease, Side, TransportClass},
 };
 
 use crate::{same_outcome, Outcome, Recorded, Replayed};
@@ -333,7 +335,7 @@ struct Served {
     /// The number of each worker's last batch.
     sequence: Vec<u64>,
     view: ViewBuffers,
-    named: Named,
+    named: AffinityRowsBuffers,
 }
 
 impl Served {
@@ -371,7 +373,7 @@ impl Served {
             ids,
             sequence: vec![0; workers],
             view: ViewBuffers::default(),
-            named: Named::default(),
+            named: AffinityRowsBuffers::default(),
         }
     }
 
@@ -405,7 +407,7 @@ impl Served {
             .map(|&id| (0, store.indexed_blocks(id, 0) as u32))
             .collect();
         store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GATEWAY,
                 now: Instant::now(),
                 pinned: None,
@@ -415,16 +417,19 @@ impl Served {
             let read = world
                 .view(MODEL, Role::Single, &ask, false, view)
                 .expect("the pool of the row's model");
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GATEWAY,
                 block_hashes: &hashes,
                 namespace_seed: 0,
                 seed,
-                cap: world.spec().engine().named_for(MODEL, Phase::Single),
+                cap: world
+                    .spec()
+                    .engine()
+                    .affinity_rows_cap(MODEL, Phase::Single),
                 wires: None,
                 now_micros: read.built.now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, read.candidates, named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, read.candidates, named);
             for holder in named.affinity().holders {
                 let id = read.candidates[holder.row as usize].id;
                 let place = ids

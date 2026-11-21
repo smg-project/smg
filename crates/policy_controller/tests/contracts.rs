@@ -27,7 +27,7 @@ use prost_types::{
 use smg_policy_controller::{
     document::{PolicySpec, DENIED_HEADERS},
     engine::{
-        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, Lifted,
+        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, LiftedVeto,
         LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
         Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
     },
@@ -1536,8 +1536,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
     let expected: Vec<(String, i32)> = cases!(
-        Lifted,
-        Lifted {
+        LiftedVeto,
+        LiftedVeto {
             None,
             Overload,
             Liveness

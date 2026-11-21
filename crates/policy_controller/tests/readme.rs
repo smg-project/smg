@@ -23,7 +23,7 @@ use std::{
 
 use smg_policy_controller::{
     document::{PolicySpec, PRESETS},
-    stages::Catalog,
+    stages::StageRegistry,
 };
 
 /// The mark on the line before a document the validator refuses.
@@ -172,7 +172,7 @@ fn a_refused_document_is_refused_in_the_words_the_page_shows() {
 #[test]
 fn the_stage_tables_name_the_catalogs_stages_and_no_other() {
     let page = fs::read_to_string(readme()).expect("the README is readable");
-    let catalog = Catalog::builtin();
+    let catalog = StageRegistry::builtin();
     let kinds: [(&str, Vec<&str>); 3] = [
         ("filters", catalog.filters().collect()),
         ("scorers", catalog.scorers().collect()),

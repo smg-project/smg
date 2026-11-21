@@ -6,7 +6,7 @@ use std::time::Instant;
 /// The table of counts the leases on file book and a member's place in
 /// it, named here for the store's files that write it: their home is the
 /// counts' own module.
-pub(super) use crate::tracking::counts::{Counts, Slot};
+pub(super) use crate::tracking::in_flight::{InFlightCounts, WorkerSlot};
 use crate::{
     engine::{
         decision::{Targets, MAX_TARGETS},
@@ -98,7 +98,7 @@ impl LeaseState {
 /// filed inside a decision's clock. The default is a pick of one target at
 /// rank 0.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Picked {
+pub struct PickRecord {
     /// The pick's targets behind its first, in the pick's order;
     /// `WorkerId(0)` is no target.
     rest: [WorkerId; MAX_TARGETS - 1],
@@ -106,7 +106,7 @@ pub struct Picked {
     ranks: [u16; MAX_TARGETS],
 }
 
-impl Picked {
+impl PickRecord {
     /// What a record keeps of the pick `targets`.
     pub fn of(targets: &Targets) -> Self {
         let mut picked = Self::default();
@@ -160,7 +160,7 @@ pub struct DecodeSide {
     pub target: WorkerId,
     /// The decodes of the pick's other targets and every target's decode
     /// rank, for that `Dispatched`.
-    pub picked: Picked,
+    pub picked: PickRecord,
     /// The request's session under the decode phase.
     pub session: Session,
     /// Where the side stands.
@@ -217,7 +217,7 @@ pub struct LeaseRecord {
     /// `Dispatched` names another one ([`LeaseRecord::target_at`]).
     pub target: WorkerId,
     /// The pick's other targets and the ranks, for that `Dispatched`.
-    pub picked: Picked,
+    pub picked: PickRecord,
     /// The mark of a pair's lease. `None` marks a single's lease and no
     /// pair's: a pair is filed with its decode side
     /// ([`LeasesStore::issue_pair`]), and the door that files it sets the

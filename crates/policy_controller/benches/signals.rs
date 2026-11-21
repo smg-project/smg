@@ -18,7 +18,7 @@ use smg_policy_controller::{
     document::{PolicySpec, API_VERSION},
     engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, WorkerId},
     load::{SignalCell, SignalCells},
-    stages::Catalog,
+    stages::StageRegistry,
 };
 
 use crate::reads_two::ReadsTwo;
@@ -27,7 +27,7 @@ use crate::reads_two::ReadsTwo;
 const NOW: u64 = 1_000_000;
 
 fn engine() -> Engine {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("reads-two", |build| {
             let used = build.signal_column("used")?;

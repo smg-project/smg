@@ -43,19 +43,18 @@ use smg_policy_controller::{
     engine::{
         Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
         PairPools, Picker, Plan, PoolFacts, Profile, RequestFacts, Scorer, Scratch, ShedReason,
-        Target, Targets, TieBand, Weighted, WorkerId,
+        Target, Targets, TieBand, WeightedScorer, WorkerId,
     },
     plugins::{
         grpc::{
-            Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
-            GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls,
-            Transport,
+            GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, LoadError, Plugin, PluginBinding,
+            Runtime, Tls, Transport,
         },
-        shared::OpenDecisions,
+        shared::{BreakerSpec, Exposure, Failure, HeaderSet, OpenDecisions, Reveal},
     },
     service::proto,
-    stages::{Best, Healthy, LeastRequests},
-    tracking::{Lease, Lifecycle, Membership, ReleaseReason, Side, Signal},
+    stages::{Best, Healthy, LeastRequests, Lifecycle},
+    tracking::{EventKind, EventSet, Lease, Membership, ReleaseReason, Side, Signal},
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
@@ -145,7 +144,7 @@ fn profile_of(plugin: &Arc<Plugin>, stages: u32, fallbacks: bool) -> Profile {
 }
 
 /// `profile_of` over a bound set the caller took.
-fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
+fn bound_profile(bound: Arc<PluginBinding>, stages: u32, fallbacks: bool) -> Profile {
     let filter: Box<dyn Filter> = if stages & FILTER != 0 {
         let fallback: Option<Box<dyn Filter>> = fallbacks.then(|| Box::new(Healthy) as _);
         Box::new(GrpcFilter::new(Arc::clone(&bound), fallback))
@@ -167,7 +166,7 @@ fn bound_profile(bound: Arc<Bound>, stages: u32, fallbacks: bool) -> Profile {
     Profile {
         name: "plugin".into(),
         filters: vec![filter],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer,
             weight: 1.0,
         }],
@@ -188,7 +187,7 @@ fn filter_then_picker(filter: &Arc<Plugin>, picker: &Arc<Plugin>) -> Profile {
     Profile {
         name: "two-plugins".into(),
         filters: vec![Box::new(GrpcFilter::new(filter.bind(), healthy))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -1195,7 +1194,7 @@ fn a_pair_decision_over_both_kinds_is_one_decision_to_every_plugin() {
         vec![Profile {
             name: "both-kinds".into(),
             filters: vec![Box::new(wasm::WasmFilter::new(guest.bind(), healthy))],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(remote.bind(), least)),
                 weight: 1.0,
             }],
@@ -1983,7 +1982,7 @@ fn filters_of(plugins: &[&Arc<Plugin>]) -> Profile {
                 Box::new(GrpcFilter::new(plugin.bind(), healthy)) as Box<dyn Filter>
             })
             .collect(),
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -2383,7 +2382,7 @@ fn a_frame_past_the_window_is_refused_without_a_fault() {
     let scorers = (0..9)
         .map(|_| {
             let fallback: Option<Box<dyn Scorer>> = Some(Box::new(LeastRequests));
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(GrpcScorer::new(binder.bind(), fallback)) as Box<dyn Scorer>,
                 weight: 1.0,
             }
@@ -3223,7 +3222,7 @@ fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
         single_engine(Profile {
             name: "adapted".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(adapter(fallback)),
                 weight: 1.0,
             }],

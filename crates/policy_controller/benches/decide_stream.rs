@@ -44,31 +44,32 @@
 //!   hands the session its reports sixteen at a time: a hand-over wakes
 //!   the session's thread, and one a request would time the wake.
 //! - `policy_decide_stream/door/64/<callers>`: decisions a second asked in
-//!   process at a host's door (`Door::decide`) by 1, 8 and 64 callers at once
-//!   on one model over 64 members. There is no wire, no controller and no
-//!   deciding thread: each caller is a thread that decides on itself and
-//!   reports the pick's lease released at once (`Door::report`). The store
-//!   lays a file a caller, so each caller decides at a seat of its own, and
-//!   the row reads what callers at once cost each other: the counts they
-//!   share. A row asks the same count of decisions whatever its
-//!   callers, shared among them, and its rate is the callers' measured
-//!   decisions, begun together, over the one interval they share. It prints
-//!   the callers' CPU (`callers_us`) and the switches they asked for a
-//!   decision and, for one caller, its cycles and instructions a decision,
-//!   counted in a pass apart whose rate is not read. A caller sits on a core
-//!   of its own where the process was given as many; a row with more callers
-//!   than cores prints `cores=none`.
+//!   process at a host's door (`StoreBackedEngine::decide`) by 1, 8 and 64
+//!   callers at once on one model over 64 members. There is no wire, no
+//!   controller and no deciding thread: each caller is a thread that decides on
+//!   itself and reports the pick's lease released at once
+//!   (`StoreBackedEngine::report`). The store lays a file a caller, so each
+//!   caller decides at a seat of its own, and the row reads what callers at
+//!   once cost each other: the counts they share. A row asks the same count of
+//!   decisions whatever its callers, shared among them, and its rate is the
+//!   callers' measured decisions, begun together, over the one interval they
+//!   share. It prints the callers' CPU (`callers_us`) and the switches they
+//!   asked for a decision and, for one caller, its cycles and instructions a
+//!   decision, counted in a pass apart whose rate is not read. A caller sits on
+//!   a core of its own where the process was given as many; a row with more
+//!   callers than cores prints `cores=none`.
 //! - `policy_decide_stream/handle/64/<callers>`: the door rows' callers, each
 //!   serving a request through a handle: the decision is held
-//!   (`Handle::decide`), its first target is taken (`Handle::take`), its
-//!   dispatch is said at once (`Handle::dispatched`) and its completion
-//!   behind it (`Handle::completed`), where a door row releases the lease at
-//!   once. The row reads what a host in process pays to say a served
-//!   request's two events at the door, and the completion's health write
+//!   (`DecisionGuard::decide`), its first target is taken
+//!   (`DecisionGuard::take`), its dispatch is said at once
+//!   (`DecisionGuard::dispatched`) and its completion behind it
+//!   (`DecisionGuard::completed`), where a door row releases the lease at once.
+//!   The row reads what a host in process pays to say a served request's two
+//!   events at the door, and the completion's health write
 //!   (`HealthSink::completed`) under the store's workers and health locks,
 //!   which every caller shares. Its callers tell their dispatches, so its
-//!   fleet's bands stand apart as a gateway row's do: its decisions pick
-//!   over the fleet a door row's pick over.
+//!   fleet's bands stand apart as a gateway row's do: its decisions pick over
+//!   the fleet a door row's pick over.
 //! - `policy_decide_stream/count/<mode>/<members>`, one cell a run, named by
 //!   `DECIDE_STREAM_COUNT=<mode>:<members>:<decisions>`: the whole process's
 //!   allocator calls a decision, `in_process` (the store's deciding door, a
@@ -76,29 +77,29 @@
 //!   thread), `commit` (the same with the pick's lease issued at the store's
 //!   leases door and ended there, as a host that embeds the engine commits a
 //!   decision), `door` (a decision asked at a host's door on this thread and
-//!   its lease reported released at once, `Door::decide` and `Door::report`),
-//!   `handle` (a request served through a handle on this thread, from
-//!   `Handle::decide` to `Handle::completed`), `named` (a `door` decision
-//!   under the `cache_aware` preset of a request whose leading blocks three
-//!   members in four hold: the door names its sixteen deepest holders and
-//!   asks the pass's test up to the first that passes), `retry` (the same
-//!   once the deepest holder was tried: another passes and the naming
-//!   stands), `blocked` (the same with the sixteen deepest holders not
-//!   ready, a cap full: the naming looks again once), `refused` (the same
-//!   with the eighty deepest not ready: the naming looks again as often as
-//!   its bound lets it), `stream` (the decision asked
-//!   over one stream, one at a time so every decision wakes the same threads
-//!   whatever its fleet, the client's own calls included) or `pair` (the
-//!   `stream` cell under a pair plan, over that many prefills and as many
-//!   decodes: each request enters at the pair's prefill, and its one answer
-//!   names both workers under two leases of one id). A run's instructions are
-//!   read from outside it (`perf stat -e instructions:u`): two runs of
-//!   different length give a decision's by their difference. A counted run's
-//!   window holds whole exchanges: it opens before the first measured request
-//!   is handed over and closes at the last measured answer, which no request
-//!   follows. A counted run keeps no round trip and sorts none: a sort grows
-//!   faster than its length, and the difference of two runs would keep part of
-//!   it.
+//!   its lease reported released at once, `StoreBackedEngine::decide` and
+//!   `StoreBackedEngine::report`), `handle` (a request served through a handle
+//!   on this thread, from `DecisionGuard::decide` to
+//!   `DecisionGuard::completed`), `named` (a `door` decision under the
+//!   `cache_aware` preset of a request whose leading blocks three members in
+//!   four hold: the door names its sixteen deepest holders and asks the pass's
+//!   test up to the first that passes), `retry` (the same once the deepest
+//!   holder was tried: another passes and the naming stands), `blocked` (the
+//!   same with the sixteen deepest holders not ready, a cap full: the naming
+//!   looks again once), `refused` (the same with the eighty deepest not ready:
+//!   the naming looks again as often as its bound lets it), `stream` (the
+//!   decision asked over one stream, one at a time so every decision wakes the
+//!   same threads whatever its fleet, the client's own calls included) or
+//!   `pair` (the `stream` cell under a pair plan, over that many prefills and
+//!   as many decodes: each request enters at the pair's prefill, and its one
+//!   answer names both workers under two leases of one id). A run's
+//!   instructions are read from outside it (`perf stat -e instructions:u`): two
+//!   runs of different length give a decision's by their difference. A counted
+//!   run's window holds whole exchanges: it opens before the first measured
+//!   request is handed over and closes at the last measured answer, which no
+//!   request follows. A counted run keeps no round trip and sorts none: a sort
+//!   grows faster than its length, and the difference of two runs would keep
+//!   part of it.
 //!
 //! A rate or a gateway row is a bar's cell. It runs `DECIDE_STREAM_PASSES`
 //! passes (one by default), each over a controller of its own, and prints
@@ -237,9 +238,11 @@ use std::{
 use kv_index::{request_prefix_hashes, ContentHash};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
-    engine::{Constraints, Door, LoadRow, PoolFacts, RequestFacts, Role, Scratch, WorkerId},
+    engine::{
+        Constraints, LoadRow, PoolFacts, RequestFacts, Role, Scratch, StoreBackedEngine, WorkerId,
+    },
     service::{
-        controller::{Config, Controller, Election, Listener, Scope, State},
+        controller::{Config, Controller, ElectionConfig, Listener, Scope, State},
         proto::{
             completed::Class, controller_frame, decide_answer::Answer, decision::Outcome,
             gateway_frame::Frame, policy_controller_client::PolicyControllerClient, Completed,
@@ -248,11 +251,11 @@ use smg_policy_controller::{
         },
     },
     store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, Hand, KvEvent, KvEventSink, LeaseRecord,
-        LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, Picked, Said, Signals,
-        StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        BatchFacts, BatchOutcome, GatewayId, Hand, KvEvent, KvEventSink, LeaseRecord, LeaseState,
+        LeasesStore, LoadSink, LoadSource, MemoryStore, PickRecord, Said, Signals, StoredBlock,
+        ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::{Handle, Lease, LeaseId, ReleaseReason, TransportClass},
+    tracking::{DecisionGuard, Lease, LeaseId, ReleaseReason, TransportClass},
 };
 use tokio::{
     runtime,
@@ -1004,7 +1007,7 @@ fn config(deciders: usize) -> Config {
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: deciders,
-        election: Election::default(),
+        election: ElectionConfig::default(),
         discovery: None,
     }
 }
@@ -2152,7 +2155,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
     let gateway = GatewayId(1);
     let term = store.term();
     let mut decide = |seed: u64| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway,
             now: Instant::now(),
             pinned: None,
@@ -2209,7 +2212,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
                 gateway,
                 request: seed,
                 target,
-                picked: Picked::default(),
+                picked: PickRecord::default(),
                 decode: None,
                 term,
                 issued_at: ask.now,
@@ -2251,14 +2254,14 @@ const DOOR_DECISIONS: u64 = 16;
 /// each of its threads that decide, and each then decides at a seat of
 /// its own. No controller is served beside it: a store has one host at
 /// its files.
-fn door_over(members: u32, files: usize, told: bool) -> Door {
+fn door_over(members: u32, files: usize, told: bool) -> StoreBackedEngine {
     assert!(
         !told || least_alone(members),
         "a fleet of {members} members holds more than one row in its least band"
     );
-    let store = MemoryStore::new().with_deciders(files);
+    let store = MemoryStore::new().with_decision_slots(files);
     fill(&store, Shape::bar(members, 1, Fleet::Shared, told, 0, 0));
-    Door::new(Arc::new(store))
+    StoreBackedEngine::new(Arc::new(store))
 }
 
 /// The deepest holders a naming can refuse before its bound: the cap of
@@ -2275,8 +2278,8 @@ const BLOCKED: usize = 16;
 /// ninety-six of them and each to a depth of its own, so a naming under the
 /// preset's cap names the sixteen deepest. The `refused` deepest are not
 /// ready: the pass refuses them.
-fn named_fleet(members: u32, refused: usize) -> (Door, Vec<u64>, Vec<WorkerId>) {
-    let store = MemoryStore::new().with_deciders(1);
+fn named_fleet(members: u32, refused: usize) -> (StoreBackedEngine, Vec<u64>, Vec<WorkerId>) {
+    let store = MemoryStore::new().with_decision_slots(1);
     let document = PolicySpec::preset("cache_aware").expect("a preset of this build");
     let spec = AppliedSpec::validate(&document).expect("a preset validates");
     store.apply(spec).expect("above the unbound start");
@@ -2332,7 +2335,7 @@ fn named_fleet(members: u32, refused: usize) -> (Door, Vec<u64>, Vec<WorkerId>) 
     store.publish_now();
     let hashes = contents.iter().map(|content| content.0).collect();
     let holders = ids.get(..holders).unwrap_or_default().to_vec();
-    (Door::new(Arc::new(store)), hashes, holders)
+    (StoreBackedEngine::new(Arc::new(store)), hashes, holders)
 }
 
 /// How many decisions of a named count's request are asked at `door` under
@@ -2406,7 +2409,7 @@ const MOVED: &str =
 /// behind them: a dispatch told is credited to its member, and credits
 /// that reach the next band would have the callers decide over a pool no
 /// other row holds.
-fn pool_at(door: &Door, probe: u64) -> impl PartialEq + std::fmt::Debug {
+fn pool_at(door: &StoreBackedEngine, probe: u64) -> impl PartialEq + std::fmt::Debug {
     let name = model(0);
     let id = probe.to_le_bytes();
     let request = smg_policy_controller::engine::Request {
@@ -2442,7 +2445,7 @@ fn pool_at(door: &Door, probe: u64) -> impl PartialEq + std::fmt::Debug {
 
 /// Asks one decision at the door for `seed` and reports the pick's lease
 /// released at once, as a host reports one whose client left.
-fn ask_door(door: &Door, name: &str, seed: u64) {
+fn ask_door(door: &StoreBackedEngine, name: &str, seed: u64) {
     let id = seed.to_le_bytes();
     let request = smg_policy_controller::engine::Request {
         id: &id,
@@ -2468,7 +2471,7 @@ fn ask_door(door: &Door, name: &str, seed: u64) {
 /// Serves one request through a handle at the door for `seed`: the
 /// decision held, its first target taken, its dispatch said at once and
 /// its completion behind it, as a host in process says a served request.
-fn ask_handle(door: &Door, name: &str, seed: u64) {
+fn ask_handle(door: &StoreBackedEngine, name: &str, seed: u64) {
     let id = seed.to_le_bytes();
     let request = smg_policy_controller::engine::Request {
         id: &id,
@@ -2481,7 +2484,7 @@ fn ask_handle(door: &Door, name: &str, seed: u64) {
         constraints: Constraints::default(),
     };
     let now = Instant::now();
-    let mut handle = Handle::decide(door, HOST, &request, now).expect("the door decides");
+    let mut handle = DecisionGuard::decide(door, HOST, &request, now).expect("the door decides");
     let target = handle
         .take(0)
         .expect("a pick over the fleet, with its lease");
@@ -2505,7 +2508,7 @@ fn ask_handle(door: &Door, name: &str, seed: u64) {
 /// does stands its fleet's bands apart ([`door_over`]).
 struct Asking {
     kind: &'static str,
-    ask: fn(&Door, &str, u64),
+    ask: fn(&StoreBackedEngine, &str, u64),
     told: bool,
 }
 
@@ -2527,7 +2530,11 @@ const ASKINGS: [Asking; 2] = [
 /// Counts the allocator's calls over `decisions` asked of a door by `ask`
 /// on this thread, as [`in_process`] counts the engine's. The pool is read
 /// before the decisions and behind them ([`pool_at`]), outside the count.
-fn at_door(door: &Door, ask: fn(&Door, &str, u64), decisions: u64) -> u64 {
+fn at_door(
+    door: &StoreBackedEngine,
+    ask: fn(&StoreBackedEngine, &str, u64),
+    decisions: u64,
+) -> u64 {
     let name = model(0);
     let before = pool_at(door, u64::MAX);
     for seed in 0..2_000 {

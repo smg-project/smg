@@ -22,7 +22,7 @@ use std::{
 
 use tokio::sync::watch;
 
-use super::{election::Standing, standby::Lag};
+use super::{election::ElectionObservation, standby::Lag};
 use crate::service::elector::Fence;
 
 /// Where the controller is between its start and its exit.
@@ -87,7 +87,7 @@ pub(crate) enum Phase {
 pub struct Readiness {
     phase: watch::Receiver<Phase>,
     /// The election's steps: a waiter looks again after each.
-    steps: watch::Receiver<Standing>,
+    steps: watch::Receiver<ElectionObservation>,
     fence: Arc<Fence>,
     /// The standby's lag: a follower that runs one is ready while synced.
     lag: Arc<Lag>,
@@ -240,7 +240,7 @@ pub(super) async fn reached(turn: Option<Instant>) {
 /// The writer the run loop holds and the readers it hands out.
 pub(crate) fn channel(
     fence: Arc<Fence>,
-    steps: watch::Receiver<Standing>,
+    steps: watch::Receiver<ElectionObservation>,
     lag: Arc<Lag>,
 ) -> (watch::Sender<Phase>, Readiness) {
     let (sender, phase) = watch::channel(Phase::Starting);
@@ -269,8 +269,8 @@ pub(crate) mod tests {
 
     use super::{channel, Phase, Readiness, Sample, State};
     use crate::service::{
-        controller::{election::Standing, standby::Lag},
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        controller::{election::ElectionObservation, standby::Lag},
+        elector::{ElectionSettings, Elector, MemoryLease, TickOutcome},
     };
 
     /// A candidate alone over a lease of its own and a readiness that reads
@@ -278,7 +278,7 @@ pub(crate) mod tests {
     pub(crate) fn fenced() -> (
         Elector,
         watch::Sender<Phase>,
-        watch::Sender<Standing>,
+        watch::Sender<ElectionObservation>,
         Readiness,
     ) {
         over(
@@ -293,10 +293,10 @@ pub(crate) mod tests {
     ) -> (
         Elector,
         watch::Sender<Phase>,
-        watch::Sender<Standing>,
+        watch::Sender<ElectionObservation>,
         Readiness,
     ) {
-        let (steps, stepped) = watch::channel(Standing::default());
+        let (steps, stepped) = watch::channel(ElectionObservation::default());
         let (phase, readiness) = channel(elector.fence(), stepped, Arc::new(Lag::new(BOUND)));
         (elector, phase, steps, readiness)
     }
@@ -351,7 +351,7 @@ pub(crate) mod tests {
         let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         assert_eq!(readiness.state(), State::Follower);
         let mut renewed = taken;
@@ -359,7 +359,7 @@ pub(crate) mod tests {
             renewed += settings.renew_deadline - Duration::from_millis(10);
             assert_eq!(
                 elector.tick(renewed).expect("the renewal"),
-                Tick::Renewed { term: 1 }
+                TickOutcome::Renewed { term: 1 }
             );
             assert_eq!(readiness.state(), State::Follower);
         }
@@ -388,7 +388,7 @@ pub(crate) mod tests {
         // The next renewal reopens it.
         assert_eq!(
             elector.tick(Instant::now()).expect("the renewal"),
-            Tick::Renewed { term: 1 }
+            TickOutcome::Renewed { term: 1 }
         );
         assert_eq!(readiness.state(), State::Leader);
     }
@@ -419,7 +419,7 @@ pub(crate) mod tests {
         let (waited, ()) = tokio::join!(within(&mut waiter, State::Leader), async {
             tokio::task::yield_now().await;
             elector.lead_at(Instant::now());
-            steps.send_replace(Standing::default());
+            steps.send_replace(ElectionObservation::default());
         });
         assert_eq!(waited, Some(State::Leader));
         assert_eq!(reader.clone().state(), State::Leader);
@@ -512,7 +512,7 @@ pub(crate) mod tests {
         let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         assert_eq!(read(taken), sample(State::Leader, None, false));
 
@@ -558,7 +558,7 @@ pub(crate) mod tests {
         // to wait out: the waiter is at the frame well inside it.
         let short = Arc::new(Lag::new(Duration::from_millis(300)));
         short.follow();
-        let (_standing, stepped) = watch::channel(Standing::default());
+        let (_standing, stepped) = watch::channel(ElectionObservation::default());
         let (phase, mut reader) = channel(elector.fence(), stepped, Arc::clone(&short));
         phase.send_replace(Phase::Serving);
         short.applied(Instant::now());
@@ -610,7 +610,7 @@ pub(crate) mod tests {
         // The count is the replica's since its start: a take keeps it.
         assert_eq!(
             elector.tick(Instant::now()).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         let sample = readiness.sample_at(Instant::now()).0;
         assert_eq!((sample.state, sample.restores), (State::Leader, 2));

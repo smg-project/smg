@@ -22,10 +22,9 @@ use smg_policy_controller::{
     document::{Needs, PolicySpec},
     engine::{Candidate, Phase, RequestFacts, Role, Scorer, TieBand, WireModes, WorkerId},
     load::SignalColumn,
-    stages::{Catalog, CatalogError},
-    store::{HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
-    tracking::Lifecycle,
-    worker_host::{Expect, Membership, Wrote},
+    stages::{Lifecycle, StageRegistry, StageRegistryError},
+    store::{HealthPolicy, LoadSink as StoreLoadSink, MemoryStore, Registrant, WorkerFacts},
+    worker_host::{MembershipWriteOutcome, MembershipWriter, Precondition},
 };
 use smg_worker::{
     identity::basic::Worker,
@@ -136,10 +135,10 @@ impl Scorer for Most {
 
 /// The stock stages and the host's own one, [`MOST`], with what its
 /// decisions read.
-pub(crate) fn stages() -> Result<(Catalog, Read), CatalogError> {
+pub(crate) fn stages() -> Result<(StageRegistry, Read), StageRegistryError> {
     let read = Read::default();
     let kept = Arc::clone(&read);
-    let mut stages = Catalog::builtin();
+    let mut stages = StageRegistry::builtin();
     stages.scorer_with(MOST, move |build| {
         let named: Named = build.params()?;
         Ok(Box::new(Most {
@@ -227,9 +226,11 @@ impl Bed {
             },
             ..WorkerFacts::default()
         };
-        let door: &dyn Membership = &*self.feed.door;
-        let id = match door.found(&Maker::Control, Expect::Nothing, key, &|_| facts.clone()) {
-            Ok(Wrote::Registered(id)) => id,
+        let door: &dyn MembershipWriter = &*self.feed.door;
+        let id = match door.found(&Registrant::Control, Precondition::Absent, key, &|_| {
+            facts.clone()
+        }) {
+            Ok(MembershipWriteOutcome::Registered(id)) => id,
             other => return Err(format!("expected a registration, got {other:?}").into()),
         };
         let object = self
@@ -283,7 +284,7 @@ impl Bed {
     /// dropped one: written, undeclared, wrong unit, out of range, not a
     /// member, older.
     fn taken(&self) -> [u64; 6] {
-        self.store.counts().signal_writes
+        self.store.stats().signal_writes
     }
 
     /// The row a regular request is placed on at `now`, and what its

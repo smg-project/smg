@@ -18,16 +18,14 @@ use smg_policy_controller::{
     document::Needs,
     engine::{
         Binding, Candidate, Constraints, Decision, Engine, Health, Plan, PoolFacts, Profile,
-        RequestFacts, Scratch, ShedReason, Weighted, WorkerId,
+        RequestFacts, Scratch, ShedReason, WeightedScorer, WorkerId,
     },
     plugins::{
-        shared::OpenDecisions,
-        wasm::{
-            EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
-            WasmPicker, WasmScorer, World,
-        },
+        shared::{Failure, OpenDecisions},
+        wasm::{LoadError, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer, World},
     },
-    tracking::{Lease, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
+    stages::Lifecycle,
+    tracking::{EventKind, EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
 };
 
 /// What the example's build line writes.
@@ -90,7 +88,7 @@ fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
     let profile = Profile {
         name: "example".into(),
         filters: vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(Arc::clone(&bound), None)),
             weight: 1.0,
         }],

@@ -8,7 +8,7 @@
 use std::fmt;
 
 use super::{profile_index, Engine, Marks, Profile};
-use crate::{engine::view::Phase, stages::builtins::RowTests};
+use crate::{engine::view::Phase, stages::filters::RowTests};
 
 /// A profile whose whole decision is one pick of its picker
 /// ([`Engine::place_for`]), by its place in the document.

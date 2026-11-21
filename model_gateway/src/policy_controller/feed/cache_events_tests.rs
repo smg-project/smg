@@ -18,10 +18,10 @@ use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{Role, WireModes, WorkerId},
     store::{
-        Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink, Maker, MemoryStore, Named, Naming,
-        Signals, ViewBuffers, WorkerFacts,
+        AffinityQuery, AffinityRowsBuffers, GatewayId, HealthPolicy, LoadSink, MemoryStore,
+        Registrant, Signals, ViewBuffers, ViewQuery as ViewAsk, WorkerFacts,
     },
-    worker_host::{Expect, Wrote},
+    worker_host::{MembershipWriteOutcome, Precondition},
 };
 use tokio::{
     net::TcpListener,
@@ -112,12 +112,13 @@ impl Engine {
     /// Write the engine's row at the feed's door.
     fn register_as(&self, feed: &Feed, events: bool) -> Result<WorkerId, String> {
         let facts = self.row(events);
-        match feed
-            .door
-            .found(&Maker::Control, Expect::Nothing, &self.url, &|_| {
-                facts.clone()
-            }) {
-            Ok(Wrote::Registered(id)) => Ok(id),
+        match feed.door.found(
+            &Registrant::Control,
+            Precondition::Absent,
+            &self.url,
+            &|_| facts.clone(),
+        ) {
+            Ok(MembershipWriteOutcome::Registered(id)) => Ok(id),
             other => Err(format!("expected a registration, got {other:?}")),
         }
     }
@@ -196,7 +197,7 @@ fn holders(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
         let Some(built) = world.build(MODEL, Role::Single, &ask, &mut view) else {
             return Vec::new();
         };
-        let naming = Naming {
+        let naming = AffinityQuery {
             gateway: GatewayId::LOCAL,
             block_hashes: &hashes,
             namespace_seed: 0,
@@ -205,8 +206,8 @@ fn holders(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
             wires: None,
             now_micros: built.now_micros,
         };
-        let mut named = Named::default();
-        world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+        let mut named = AffinityRowsBuffers::default();
+        world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
         named
             .holders
             .iter()

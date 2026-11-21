@@ -171,7 +171,7 @@ mod tests {
     use smg_worker::worker::RuntimeType;
 
     use super::*;
-    use crate::store::{identity, Maker};
+    use crate::store::{identity, Registrant};
 
     const URL: &str = "http://w:8000";
 
@@ -182,7 +182,7 @@ mod tests {
             status: WorkerStatus::Pending,
             revision: 1,
             admitted_at: Instant::now(),
-            maker: Maker::Control,
+            maker: Registrant::Control,
         }
     }
 

@@ -9,8 +9,10 @@ use crate::{
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::{draw_kept, push_drawn, target_of},
-    tracking::lease::Lifecycle,
+    stages::{
+        lifecycle::Lifecycle,
+        pickers::{draw_kept, push_drawn, target_of},
+    },
     Draw,
 };
 
@@ -137,7 +139,7 @@ fn step_over(taken: &mut [usize; MAX_TARGETS], len: usize, j: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::builtins::tests::{candidate, kept};
+    use crate::stages::scorers::tests::{candidate, kept};
 
     #[test]
     fn random_draws_distinct_alternates_and_spreads_across_seeds() {

@@ -15,8 +15,10 @@ use crate::{
         view::{Candidate, ModelFingerprint, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::{pool_turns, push_drawn, target_of},
-    tracking::lease::Lifecycle,
+    stages::{
+        lifecycle::Lifecycle,
+        pickers::{pool_turns, push_drawn, target_of},
+    },
     Draw,
 };
 
@@ -46,7 +48,7 @@ pub(crate) fn profile() -> ProfileSpec {
 /// from each other's rotation.
 #[derive(Debug)]
 pub struct RoundRobin {
-    buckets: Box<[Bucket]>,
+    buckets: Box<[RotationBucket]>,
     /// Claims so far: a claim draws its start from this count and, in a
     /// full bucket, the word it takes.
     claims: AtomicU64,
@@ -56,7 +58,7 @@ pub struct RoundRobin {
 /// bucket holds its tag.
 #[derive(Debug)]
 #[repr(align(64))]
-struct Bucket {
+struct RotationBucket {
     ways: [AtomicU64; WAYS],
 }
 
@@ -84,7 +86,7 @@ const POSITION_BITS: u32 = 32;
 
 const POSITION_MASK: u64 = (1 << POSITION_BITS) - 1;
 
-impl Default for Bucket {
+impl Default for RotationBucket {
     fn default() -> Self {
         Self {
             ways: [const { AtomicU64::new(EMPTY_SLOT) }; WAYS],
@@ -101,7 +103,9 @@ impl Default for RoundRobin {
 impl RoundRobin {
     pub fn new() -> Self {
         Self {
-            buckets: (0..ROTATION_BUCKETS).map(|_| Bucket::default()).collect(),
+            buckets: (0..ROTATION_BUCKETS)
+                .map(|_| RotationBucket::default())
+                .collect(),
             claims: AtomicU64::new(0),
         }
     }
@@ -333,7 +337,7 @@ impl Picker for RoundRobin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::builtins::tests::{candidate, kept};
+    use crate::stages::scorers::tests::{candidate, kept};
 
     fn first_pick(picker: &dyn Picker, facts: &RequestFacts<'_>, pool: &[Candidate]) -> u32 {
         let mut out = Targets::new();

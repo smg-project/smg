@@ -58,10 +58,10 @@ use std::{sync::Arc, time::SystemTime};
 pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
     document::{
-        operator::{Format, SpecDoor, SpecRejected, MAX_DOCUMENT_BYTES},
+        operator::{DocumentManager, Format, SpecRejected, MAX_DOCUMENT_BYTES},
         AppliedSpec, PolicySpec, RoutingSettingsError,
     },
-    stages::Catalog,
+    stages::StageRegistry,
     store::MemoryStore,
 };
 use smg_worker::connection::engine::EngineConnector;
@@ -189,14 +189,14 @@ pub(crate) struct InProcess {
     pub(crate) applied: SystemTime,
     /// The stages the document was validated over, a host's own among
     /// them: a check of another document against this one reads them.
-    pub(crate) stages: Arc<Catalog>,
+    pub(crate) stages: Arc<StageRegistry>,
 }
 
 /// What a start leaves the process: the controller's store, and the
 /// operators' door over it, which holds the start's document as written.
 pub(crate) struct Started {
     pub(crate) store: Arc<MemoryStore>,
-    pub(crate) door: Arc<SpecDoor>,
+    pub(crate) door: Arc<DocumentManager>,
 }
 
 /// [`start_with`] as the stock gateway starts: no stages of a host. The
@@ -232,12 +232,12 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// None of them is served by the classic policies in silence.
 pub(crate) fn start_with(
     config: &RouterConfig,
-    stages: Option<Catalog>,
+    stages: Option<StageRegistry>,
 ) -> Result<Option<Started>, StartError> {
     let Some(document) = document_in_force(config)? else {
         return Ok(None);
     };
-    let stages = stages.unwrap_or_else(Catalog::builtin);
+    let stages = stages.unwrap_or_else(StageRegistry::builtin);
     // A given document may hold what its YAML does not say, a `kind` line.
     // The typed check refuses it by the door's own word before the door
     // reads the YAML, over the same stages and denied headers.
@@ -269,7 +269,7 @@ pub(crate) fn start_with(
 /// adds its one log line.
 pub(crate) fn start_in_process(
     config: &RouterConfig,
-    stages: Option<Catalog>,
+    stages: Option<StageRegistry>,
 ) -> Result<Option<InProcess>, StartError> {
     let started = engine_for(config, stages.map(Arc::new))?;
     if started.is_some() {
@@ -301,7 +301,7 @@ pub(crate) fn start_in_process(
 )]
 pub(crate) fn would_start(
     config: &RouterConfig,
-    stages: &Arc<Catalog>,
+    stages: &Arc<StageRegistry>,
     document: &PolicySpec,
 ) -> Result<(), StartError> {
     let supplied = RouterConfig {
@@ -319,14 +319,14 @@ pub(crate) fn would_start(
 /// it answers for a document the gateway does not run too.
 fn engine_for(
     config: &RouterConfig,
-    stages: Option<Arc<Catalog>>,
+    stages: Option<Arc<StageRegistry>>,
 ) -> Result<Option<InProcess>, StartError> {
     // The document comes under the number a gateway's first document
     // takes: its own, and 1 where it names none (the reader's rule).
     let Some(document) = document_in_force(config)? else {
         return Ok(None);
     };
-    let stages = stages.unwrap_or_else(|| Arc::new(Catalog::builtin()));
+    let stages = stages.unwrap_or_else(|| Arc::new(StageRegistry::builtin()));
     // The bound the operators' door holds a written document to.
     let written = serde_yaml::to_string(&document)?;
     let bytes = u64::try_from(written.len()).unwrap_or(u64::MAX);
@@ -500,13 +500,13 @@ fn document_in_force(config: &RouterConfig) -> Result<Option<PolicySpec>, StartE
 /// print and the start never part.
 pub(crate) fn hosted(
     config: &RouterConfig,
-    stages: Option<Catalog>,
+    stages: Option<StageRegistry>,
     written: &str,
 ) -> Result<Started, SpecRejected> {
     let store = Arc::new(MemoryStore::new());
     let denied = config.denied_view_headers().map(str::to_owned);
-    let stages = stages.unwrap_or_else(Catalog::builtin);
-    let door = SpecDoor::new(Arc::clone(&store), Arc::new(stages), denied.into());
+    let stages = stages.unwrap_or_else(StageRegistry::builtin);
+    let door = DocumentManager::new(Arc::clone(&store), Arc::new(stages), denied.into());
     door.apply(written.as_bytes().to_vec(), Format::Yaml)?;
     Ok(Started {
         store,

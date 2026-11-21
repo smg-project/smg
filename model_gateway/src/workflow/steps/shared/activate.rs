@@ -109,7 +109,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerSpec;
-    use smg_policy_controller::{store::Maker, worker_host::Expect};
+    use smg_policy_controller::{store::Registrant, worker_host::Precondition};
     use smg_worker::{jobs::WorkerJobAsker, registry::event::WorkerEvent};
     use wfaas::WorkflowInstanceId;
 
@@ -176,7 +176,7 @@ mod tests {
         let url = "http://worker:8080";
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
         feed.door
-            .found_built(&Maker::Control, Expect::Anything, &worker, None)
+            .found_built(&Registrant::Control, Precondition::Any, &worker, None)
             .expect("the worker's row");
         let held = hosted.worker_registry.get_by_url(url);
         assert!(held.is_some_and(|held| Arc::ptr_eq(&held, &worker)));
@@ -226,7 +226,7 @@ mod tests {
         let (first, second) = (built(), built());
         for worker in [&first, &second] {
             feed.door
-                .found_built(&Maker::Control, Expect::Anything, worker, None)
+                .found_built(&Registrant::Control, Precondition::Any, worker, None)
                 .expect("the worker's row");
         }
         let held = hosted.worker_registry.get_by_url(url);

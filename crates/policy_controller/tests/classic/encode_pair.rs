@@ -32,7 +32,7 @@ use smg_policy_controller::{
         EncoderFacts, Engine, Health, Identity, MediaCounts, PairPools, PairTable, PoolFacts,
         RequestFacts, Role, Scratch, WorkerId,
     },
-    store::encoding::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
+    store::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
 };
 
 /// The classic policy these rows record, as a sheet's head names it.

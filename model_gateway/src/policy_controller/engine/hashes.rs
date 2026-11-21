@@ -73,7 +73,10 @@ mod tests {
     use smg_policy_controller::{
         document::{AppliedSpec, PolicySpec},
         engine::{HashKind, Identity, PromptHashes, RequestFacts, Role, TEXT_BYTES_PER_TOKEN},
-        store::{Ask as ViewAsk, BatchOutcome, KvEventSink, Named, Naming, ViewBuffers},
+        store::{
+            AffinityQuery, AffinityRowsBuffers, BatchOutcome, KvEventSink, ViewBuffers,
+            ViewQuery as ViewAsk,
+        },
     };
 
     use crate::{
@@ -146,8 +149,8 @@ mod tests {
             let built = world
                 .build(MODEL, Role::Single, &ask, &mut view)
                 .expect("the pool");
-            let mut named = Named::default();
-            let mut naming = Naming {
+            let mut named = AffinityRowsBuffers::default();
+            let mut naming = AffinityQuery {
                 gateway: GATEWAY,
                 block_hashes: facts.block_hashes,
                 namespace_seed: facts.namespace_seed,
@@ -156,12 +159,12 @@ mod tests {
                 wires: None,
                 now_micros: built.now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
             assert_eq!(named.holders.len(), 1);
             assert_eq!(view.candidates[named.holders[0].row as usize].id, holder);
             assert_eq!(named.holders[0].overlap_blocks, 1);
             naming.block_hashes = written(&plain).block_hashes;
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
             assert!(named.holders.is_empty());
         });
         assert_eq!(facts.namespace_seed, namespace.partition_seed());

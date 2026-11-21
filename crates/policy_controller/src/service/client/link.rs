@@ -32,12 +32,12 @@ use crate::service::{
 };
 
 /// About six seconds at ten thousand reports a second.
-const REPORT_QUEUE: usize = 65_536;
+const FRAME_QUEUE: usize = 65_536;
 
 /// The reports that wait for a session at most: half of what a session's
 /// queue holds, so the next session takes the line whole and keeps room
 /// for the reports made while it sends it.
-const LINE: usize = REPORT_QUEUE / 2;
+const LINE: usize = FRAME_QUEUE / 2;
 
 /// A stream's clean end, as the message of the `OK` status the link keeps
 /// of it ([`Link::ended`]).
@@ -50,7 +50,7 @@ const DECIDE_ENDED: &str = "the decide stream ended";
 /// opens in the state its clones share. A request in flight holds a clone,
 /// so what it reports rides the session that stands when it reports,
 /// whichever session its decision came over. A report made while no
-/// session stands waits for the next one ([`Link::report`]).
+/// session stands waits for the next one ([`Link::queue_frame`]).
 ///
 /// A controller can push its policy document over the session
 /// ([`Link::spec_pushes`]). The link's holder applies a push to its own
@@ -64,7 +64,7 @@ pub struct Link {
 /// Why an ask has no usable decision from the controller. The host can
 /// decide the request itself.
 #[derive(Debug)]
-pub enum Unanswered {
+pub enum DecisionUnavailable {
     /// The stream holds no credit. Nothing was sent.
     NoCredit,
     /// The controller's reason for leaving the request to the host and the
@@ -125,7 +125,7 @@ impl Link {
     /// Opens the link's next session at `endpoint`, as [`Self::connect`]
     /// opened its first, in the state the link's clones share. The reports
     /// that waited for a session are sent first, in their order
-    /// ([`Self::report`]).
+    /// ([`Self::queue_frame`]).
     ///
     /// A controller keeps a gateway's leases while it holds the gateway
     /// present: through its sessions, and one grace period past the last
@@ -157,7 +157,7 @@ impl Link {
             .keep_alive_timeout(ANSWER_WAIT)
             .keep_alive_while_idle(true);
         let (mut stub, floor) = dial_leader(endpoint.connect(), gateway_id, ANSWER_WAIT).await?;
-        let (report, reports) = mpsc::channel(REPORT_QUEUE);
+        let (report, reports) = mpsc::channel(FRAME_QUEUE);
         let (request, requests) = mpsc::unbounded_channel();
         // Dropped ahead of the session's start, by an open that failed or
         // by a caller that left, the seat lets its session go.
@@ -202,8 +202,8 @@ impl Link {
     }
 
     /// The reports the line dropped at its bound, each the oldest of a
-    /// full line ([`Self::report`]).
-    pub fn reports_dropped(&self) -> usize {
+    /// full line ([`Self::queue_frame`]).
+    pub fn frames_dropped(&self) -> usize {
         self.shared.state.lock().dropped
     }
 
@@ -278,7 +278,7 @@ impl Link {
     ///
     /// An id stays taken until its ask's answer arrives, also where the
     /// asker left or its budget ended. An ask under it in that time is
-    /// [`Unanswered::InFlight`], so no ask takes an answer made for an
+    /// [`DecisionUnavailable::InFlight`], so no ask takes an answer made for an
     /// earlier one.
     ///
     /// A request the controller's check refuses is refused here, by the
@@ -288,7 +288,7 @@ impl Link {
         &self,
         request: DecideRequest,
         budget: Duration,
-    ) -> Result<Decision, Unanswered> {
+    ) -> Result<Decision, DecisionUnavailable> {
         self.ask_cut(request, 0, budget).await
     }
 
@@ -300,26 +300,26 @@ impl Link {
         mut request: DecideRequest,
         left_out: usize,
         budget: Duration,
-    ) -> Result<Decision, Unanswered> {
+    ) -> Result<Decision, DecisionUnavailable> {
         let cut = match fit(&mut request).and_then(|cut| in_range(&request).map(|()| cut)) {
             Ok(cut) => cut,
-            Err(_) if !self.stands() => return Err(Unanswered::Ended),
-            Err(error) => return Err(Unanswered::Unsent(error)),
+            Err(_) if !self.stands() => return Err(DecisionUnavailable::Ended),
+            Err(error) => return Err(DecisionUnavailable::Unsent(error)),
         };
         let deadline = Instant::now().checked_add(budget);
         let mut pending = self.shared.begin(request, deadline, cut + left_out)?;
         if budget.is_zero() {
-            return Err(Unanswered::Late);
+            return Err(DecisionUnavailable::Late);
         }
         let answer = match deadline {
             Some(at) => timeout_at(at, &mut pending.answer)
                 .await
-                .map_err(|_| Unanswered::Late)?,
+                .map_err(|_| DecisionUnavailable::Late)?,
             None => (&mut pending.answer).await,
         };
-        match answer.map_err(|_| Unanswered::Ended)? {
+        match answer.map_err(|_| DecisionUnavailable::Ended)? {
             Answer::Decision(decision) => Ok(decision),
-            Answer::Busy(busy) => Err(Unanswered::Busy(busy)),
+            Answer::Busy(busy) => Err(DecisionUnavailable::Busy(busy)),
         }
     }
 
@@ -329,7 +329,7 @@ impl Link {
     ///
     /// The line is bounded by its length alone: half of what a session's
     /// queue holds. Past that it drops its oldest report for a new one
-    /// and counts it ([`Self::reports_dropped`]). The link drops no report
+    /// and counts it ([`Self::frames_dropped`]). The link drops no report
     /// by its age. Whether the controller still holds a lease is the
     /// controller's to know, and a report of a lease it let go is no error
     /// there.
@@ -342,7 +342,7 @@ impl Link {
     /// A full queue ends the session: it took no report for as long as its
     /// queue covers. The report that met it waits for the next session,
     /// and the reports the queue held are lost with it.
-    pub fn report(&self, frame: gateway_frame::Frame) {
+    pub fn queue_frame(&self, frame: gateway_frame::Frame) {
         self.shared.report(frame);
     }
 
@@ -457,15 +457,15 @@ struct Open {
     _stop: watch::Sender<()>,
 }
 
-/// A session's seat until its start. Dropped ahead of that, by an open
+/// A session's place until its start. Dropped ahead of that, by an open
 /// that failed or by a caller that left, it lets the session go.
 #[derive(Debug)]
-struct Seat<'a> {
+struct SessionPlace<'a> {
     shared: &'a Shared,
     session: u64,
 }
 
-impl Drop for Seat<'_> {
+impl Drop for SessionPlace<'_> {
     fn drop(&mut self) {
         self.shared.unseat(self.session);
     }
@@ -550,7 +550,7 @@ impl Shared {
         floor: u64,
         reports: mpsc::Sender<gateway_frame::Frame>,
         requests: mpsc::UnboundedSender<DecideRequest>,
-    ) -> (Seat<'_>, u64) {
+    ) -> (SessionPlace<'_>, u64) {
         let (stop, stopped) = watch::channel(());
         let mut state = self.state.lock();
         let before = (state.close(Error::Redialed), state.seated.take());
@@ -568,7 +568,7 @@ impl Shared {
         let (session, floor) = (state.session, state.floor);
         drop(state);
         drop(before);
-        let seat = Seat {
+        let seat = SessionPlace {
             shared: self,
             session,
         };
@@ -716,7 +716,7 @@ impl Shared {
         };
         // A full queue ends the session, as it does under a report.
         if let Err(mpsc::error::TrySendError::Full(_)) = open.reports.try_send(frame) {
-            let full = state.close(Error::ReportsFull);
+            let full = state.close(Error::FrameQueueFull);
             drop(state);
             drop(full);
         }
@@ -733,7 +733,7 @@ impl Shared {
             // The session took no report for as long as its queue covers:
             // it ends, and this report waits for the next one.
             Err(mpsc::error::TrySendError::Full(frame)) => {
-                let full = state.close(Error::ReportsFull);
+                let full = state.close(Error::FrameQueueFull);
                 state.wait(frame);
                 drop(state);
                 drop(full);
@@ -749,18 +749,18 @@ impl Shared {
         request: DecideRequest,
         deadline: Option<Instant>,
         cut: usize,
-    ) -> Result<Pending<'_>, Unanswered> {
+    ) -> Result<Pending<'_>, DecisionUnavailable> {
         let mut state = self.state.lock();
-        let open = state.open.as_mut().ok_or(Unanswered::Ended)?;
+        let open = state.open.as_mut().ok_or(DecisionUnavailable::Ended)?;
         if open.pending.contains_key(request.request_id.as_slice()) {
-            return Err(Unanswered::InFlight);
+            return Err(DecisionUnavailable::InFlight);
         }
         if open.credit == 0 {
-            return Err(Unanswered::NoCredit);
+            return Err(DecisionUnavailable::NoCredit);
         }
         let id = Arc::<[u8]>::from(request.request_id.as_slice());
         if open.requests.send(request).is_err() {
-            return Err(Unanswered::Ended);
+            return Err(DecisionUnavailable::Ended);
         }
         open.credit -= 1;
         // A reader takes this same lock before it can deliver an answer.
@@ -1025,7 +1025,7 @@ pub(super) mod tests {
         /// Opens the next session of `link` as a redial does past its
         /// dial, and holds the controller's ends of it.
         fn session(link: Link, endpoint: Endpoint, told: Welcome) -> Self {
-            let (report, reports) = mpsc::channel(REPORT_QUEUE);
+            let (report, reports) = mpsc::channel(FRAME_QUEUE);
             let (request, requests) = mpsc::unbounded_channel();
             let (controller, session) = mpsc::unbounded_channel();
             let (decide, decisions) = mpsc::unbounded_channel();
@@ -1153,8 +1153,8 @@ pub(super) mod tests {
     }
 
     /// Seats a session on `link` whose welcome has not come.
-    fn seated(link: &Link) -> Seat<'_> {
-        let (report, _) = mpsc::channel(REPORT_QUEUE);
+    fn seated(link: &Link) -> SessionPlace<'_> {
+        let (report, _) = mpsc::channel(FRAME_QUEUE);
         let (request, _) = mpsc::unbounded_channel();
         let endpoint = Endpoint::from_static(NOWHERE);
         let shared = &link.shared;
@@ -1211,7 +1211,7 @@ pub(super) mod tests {
         for id in [7, 3] {
             let link = peer.link.clone();
             std::thread::spawn(move || {
-                link.report(release(id, Side::Single, released::Reason::ClientGone));
+                link.queue_frame(release(id, Side::Single, released::Reason::ClientGone));
             })
             .join()
             .expect("the caller returns");
@@ -1246,19 +1246,22 @@ pub(super) mod tests {
         assert!(poll(asked.as_mut()).is_pending());
         let report = release(7, Side::Single, released::Reason::ClientGone);
         for _ in 0..65_536 {
-            peer.link.report(report.clone());
+            peer.link.queue_frame(report.clone());
         }
         assert!(peer.link.stands());
         closes(&peer.link, || {
-            peer.link.report(report);
+            peer.link.queue_frame(report);
             assert!(!peer.link.stands());
             assert!(matches!(
                 peer.link.ended().as_deref(),
-                Some(Error::ReportsFull)
+                Some(Error::FrameQueueFull)
             ));
         })
         .await;
-        assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+        assert!(matches!(
+            within(asked).await,
+            Err(DecisionUnavailable::Ended)
+        ));
         assert_eq!(within(peer.reports.next()).await, None);
         assert_eq!(within(peer.requests.next()).await, None);
         Peer::readers_end(peer.readers).await;
@@ -1270,7 +1273,7 @@ pub(super) mod tests {
         assert_eq!(peer.link.welcome().decide_window, 1);
         assert!(matches!(
             peer.link.ask(DecideRequest::default(), WAIT).await,
-            Err(Unanswered::Unsent(Error::RequestId(0)))
+            Err(DecisionUnavailable::Unsent(Error::RequestId(0)))
         ));
         let mut too_large = request(4);
         too_large.facts = Some(RequestFacts {
@@ -1279,7 +1282,7 @@ pub(super) mod tests {
         });
         assert!(matches!(
             peer.link.ask(too_large, WAIT).await,
-            Err(Unanswered::Unsent(Error::TooLarge(_)))
+            Err(DecisionUnavailable::Unsent(Error::TooLarge(_)))
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
 
@@ -1288,7 +1291,7 @@ pub(super) mod tests {
         assert_eq!(within(peer.requests.next()).await, Some(request(1)));
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::NoCredit))
+            Poll::Ready(Err(DecisionUnavailable::NoCredit))
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
 
@@ -1297,10 +1300,12 @@ pub(super) mod tests {
             retry_after_micros: 125,
         };
         peer.answer(1, 4, decide_answer::Answer::Busy(busy));
-        assert!(matches!(within(first).await, Err(Unanswered::Busy(told)) if told == busy));
+        assert!(
+            matches!(within(first).await, Err(DecisionUnavailable::Busy(told)) if told == busy)
+        );
         assert!(matches!(
             peer.link.ask(request(2), WAIT).await,
-            Err(Unanswered::NoCredit)
+            Err(DecisionUnavailable::NoCredit)
         ));
         peer.credit(5, 1);
         peer.credit(6, 1);
@@ -1325,7 +1330,7 @@ pub(super) mod tests {
         assert_eq!(within(peer.requests.next()).await, Some(request(3)));
         assert!(matches!(
             peer.link.ask(request(4), WAIT).await,
-            Err(Unanswered::NoCredit)
+            Err(DecisionUnavailable::NoCredit)
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
     }
@@ -1356,7 +1361,7 @@ pub(super) mod tests {
             wrong.facts = Some(facts);
             let refused = peer.link.ask(wrong, WAIT).await;
             assert!(
-                matches!(refused, Err(Unanswered::Unsent(Error::OutOfRange(named))) if named == field),
+                matches!(refused, Err(DecisionUnavailable::Unsent(Error::OutOfRange(named))) if named == field),
                 "{field}: {refused:?}"
             );
         }
@@ -1369,7 +1374,7 @@ pub(super) mod tests {
         assert!(
             matches!(
                 refused,
-                Err(Unanswered::Unsent(Error::OutOfRange("decode_of")))
+                Err(DecisionUnavailable::Unsent(Error::OutOfRange("decode_of")))
             ),
             "{refused:?}"
         );
@@ -1413,7 +1418,7 @@ pub(super) mod tests {
             peer.at_term(u64::from(5 + credit)).await;
             assert!(matches!(
                 poll(Box::pin(peer.link.ask(request(1), WAIT)).as_mut()),
-                Poll::Ready(Err(Unanswered::InFlight))
+                Poll::Ready(Err(DecisionUnavailable::InFlight))
             ));
             assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         }
@@ -1437,13 +1442,16 @@ pub(super) mod tests {
         advance(budget - step).await;
         assert!(poll(first.as_mut()).is_pending());
         advance(2 * step).await;
-        assert!(matches!(within(first).await, Err(Unanswered::Late)));
+        assert!(matches!(
+            within(first).await,
+            Err(DecisionUnavailable::Late)
+        ));
 
         // The first ask's answer is still due. A second ask under its id
         // would take that answer for its own: it is refused, unsent.
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(1), budget)).as_mut()),
-            Poll::Ready(Err(Unanswered::InFlight))
+            Poll::Ready(Err(DecisionUnavailable::InFlight))
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         peer.answer(1, 5, decision(7, &[Side::Single]));
@@ -1462,7 +1470,7 @@ pub(super) mod tests {
 
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), Duration::ZERO)).as_mut()),
-            Poll::Ready(Err(Unanswered::Late))
+            Poll::Ready(Err(DecisionUnavailable::Late))
         ));
         assert_eq!(within(peer.requests.next()).await, Some(request(2)));
     }
@@ -1474,7 +1482,7 @@ pub(super) mod tests {
 
         assert!(matches!(
             peer.link.ask(request(1), Duration::ZERO).await,
-            Err(Unanswered::Late)
+            Err(DecisionUnavailable::Late)
         ));
         assert_eq!(within(peer.requests.next()).await, Some(request(1)));
         // A pair is given back whole, in one frame that names no side.
@@ -1495,7 +1503,7 @@ pub(super) mod tests {
         // The dropped ask's answer is still due: its id stays taken.
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::InFlight))
+            Poll::Ready(Err(DecisionUnavailable::InFlight))
         ));
         peer.answer(2, 4, decision(8, &[Side::Single]));
 
@@ -1543,7 +1551,10 @@ pub(super) mod tests {
                 }
             })
             .await;
-            assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+            assert!(matches!(
+                within(asked).await,
+                Err(DecisionUnavailable::Ended)
+            ));
             assert!(!peer.link.stands());
             assert_eq!(peer.link.term_floor(), 6);
             assert!(matches!(
@@ -1572,13 +1583,13 @@ pub(super) mod tests {
             if session {
                 drop(peer.reports);
                 // The report waits for the link's next session.
-                peer.link.report(gone(7));
+                peer.link.queue_frame(gone(7));
             } else {
                 drop(peer.requests);
                 for _ in 0..2 {
                     assert!(matches!(
                         peer.link.ask(request(2), WAIT).await,
-                        Err(Unanswered::Ended)
+                        Err(DecisionUnavailable::Ended)
                     ));
                 }
             }
@@ -1598,7 +1609,10 @@ pub(super) mod tests {
                     .send(Err(status))
                     .expect("the decide reader takes the status");
             }
-            assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+            assert!(matches!(
+                within(asked).await,
+                Err(DecisionUnavailable::Ended)
+            ));
             Peer::readers_end(peer.readers).await;
             assert!(matches!(
                 peer.link.ended().as_deref(),
@@ -1651,8 +1665,14 @@ pub(super) mod tests {
             ),
         };
         closes(&link, end).await;
-        assert!(matches!(within(first).await, Err(Unanswered::Ended)));
-        assert!(matches!(within(second).await, Err(Unanswered::Ended)));
+        assert!(matches!(
+            within(first).await,
+            Err(DecisionUnavailable::Ended)
+        ));
+        assert!(matches!(
+            within(second).await,
+            Err(DecisionUnavailable::Ended)
+        ));
         Peer::readers_end(peer.readers).await;
         assert!(!peer.link.stands());
         // The link keeps why it ended: a stream's status whole, and the
@@ -1675,15 +1695,15 @@ pub(super) mod tests {
         assert!(said, "session {session}, closed {closed:?}: {ended:?}");
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(3), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::Ended))
+            Poll::Ready(Err(DecisionUnavailable::Ended))
         ));
         assert!(matches!(
             peer.link.ask(DecideRequest::default(), WAIT).await,
-            Err(Unanswered::Ended)
+            Err(DecisionUnavailable::Ended)
         ));
         // A report made now waits for the link's next session.
-        peer.link.report(gone(7));
-        assert_eq!(peer.link.reports_dropped(), 0);
+        peer.link.queue_frame(gone(7));
+        assert_eq!(peer.link.frames_dropped(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1758,10 +1778,10 @@ pub(super) mod tests {
         let link = peer.link.clone();
         drop(peer.link);
         assert!(link.stands());
-        link.report(gone(7));
+        link.queue_frame(gone(7));
         assert!(matches!(
             link.ask(request(1), Duration::ZERO).await,
-            Err(Unanswered::Late)
+            Err(DecisionUnavailable::Late)
         ));
         drop(link);
 
@@ -1780,18 +1800,18 @@ pub(super) mod tests {
         let held = peer.link.clone();
         peer.end_session().await;
         assert!(!held.stands());
-        held.report(gone(7));
-        held.report(gone(3));
+        held.queue_frame(gone(7));
+        held.queue_frame(gone(3));
 
         drop(peer.redial(1));
         assert!(held.stands() && held.ended().is_none());
         peer.read_hello().await;
-        held.report(gone(9));
+        held.queue_frame(gone(9));
         for (seq, lease) in [(2, 7), (3, 3), (4, 9)] {
             let said = within(peer.reports.next()).await.expect("a report");
             assert_eq!((said.seq, said.frame), (seq, Some(gone(lease))));
         }
-        assert_eq!(held.reports_dropped(), 0);
+        assert_eq!(held.frames_dropped(), 0);
     }
 
     /// The link drops no report by its age: a line that waited well past
@@ -1805,10 +1825,10 @@ pub(super) mod tests {
         peer.read_hello().await;
         let link = peer.link.clone();
         peer.end_session().await;
-        link.report(completed(1));
-        link.report(gone(2));
+        link.queue_frame(completed(1));
+        link.queue_frame(gone(2));
         advance(step).await;
-        link.report(completed(3));
+        link.queue_frame(completed(3));
         advance(GRACE - step).await;
 
         drop(peer.redial(1));
@@ -1818,7 +1838,7 @@ pub(super) mod tests {
             let report = within(peer.reports.next()).await.expect("a report");
             assert_eq!(report.frame, Some(said));
         }
-        assert_eq!(link.reports_dropped(), 0);
+        assert_eq!(link.frames_dropped(), 0);
     }
 
     /// A line holds half of a session's queue. Past that it drops its
@@ -1832,18 +1852,18 @@ pub(super) mod tests {
         peer.end_session().await;
         let bound = u64::try_from(LINE).expect("the bound fits");
         for lease in 0..=bound {
-            link.report(gone(lease));
+            link.queue_frame(gone(lease));
         }
-        assert_eq!(link.reports_dropped(), 1);
+        assert_eq!(link.frames_dropped(), 1);
 
         drop(peer.redial(1));
         // No frame is read yet: the session's queue holds the whole line.
-        link.report(gone(bound + 1));
+        link.queue_frame(gone(bound + 1));
         assert!(link.stands());
         peer.read_hello().await;
         let oldest = within(peer.reports.next()).await.expect("a report");
         assert_eq!(oldest.frame, Some(gone(1)));
-        assert_eq!(link.reports_dropped(), 1);
+        assert_eq!(link.frames_dropped(), 1);
     }
 
     /// A full queue ends the session, and the report that met it is the
@@ -1853,17 +1873,20 @@ pub(super) mod tests {
         let mut peer = Peer::patient(1);
         peer.read_hello().await;
         let link = peer.link.clone();
-        for _ in 0..REPORT_QUEUE {
-            link.report(gone(7));
+        for _ in 0..FRAME_QUEUE {
+            link.queue_frame(gone(7));
         }
-        closes(&link, || link.report(gone(8))).await;
-        assert!(matches!(link.ended().as_deref(), Some(Error::ReportsFull)));
+        closes(&link, || link.queue_frame(gone(8))).await;
+        assert!(matches!(
+            link.ended().as_deref(),
+            Some(Error::FrameQueueFull)
+        ));
 
         drop(peer.redial(1));
         peer.read_hello().await;
         let first = within(peer.reports.next()).await.expect("a report");
         assert_eq!(first.frame, Some(gone(8)));
-        assert_eq!(link.reports_dropped(), 0);
+        assert_eq!(link.frames_dropped(), 0);
     }
 
     /// A session whose open fails, or whose dial is dropped, takes no
@@ -1875,16 +1898,16 @@ pub(super) mod tests {
         peer.read_hello().await;
         let link = peer.link.clone();
         peer.end_session().await;
-        link.report(gone(7));
+        link.queue_frame(gone(7));
 
         // The dial reached a leader, and it is dropped ahead of a welcome.
         let failed = seated(&link);
         assert!(!link.stands());
         assert!(poll(pin!(link.closed())).is_pending());
-        link.report(gone(3));
+        link.queue_frame(gone(3));
         drop(failed);
         assert!(poll(pin!(link.closed())).is_ready());
-        link.report(gone(9));
+        link.queue_frame(gone(9));
 
         drop(peer.redial(1));
         peer.read_hello().await;
@@ -1892,7 +1915,7 @@ pub(super) mod tests {
             let said = within(peer.reports.next()).await.expect("a report");
             assert_eq!(said.frame, Some(gone(lease)));
         }
-        assert_eq!(link.reports_dropped(), 0);
+        assert_eq!(link.frames_dropped(), 0);
     }
 
     /// A session can start with its frame stream gone: the call was reset
@@ -1904,8 +1927,8 @@ pub(super) mod tests {
         peer.read_hello().await;
         let link = peer.link.clone();
         peer.end_session().await;
-        link.report(gone(7));
-        link.report(gone(3));
+        link.queue_frame(gone(7));
+        link.queue_frame(gone(3));
 
         // The welcome comes for a session whose report queue has no reader.
         let seat = seated(&link);
@@ -1924,7 +1947,7 @@ pub(super) mod tests {
         drop(seat);
         assert!(link.stands());
         // A report made on that session waits behind them.
-        link.report(gone(9));
+        link.queue_frame(gone(9));
 
         drop(peer.redial(1));
         Peer::readers_end(readers).await;
@@ -1934,7 +1957,7 @@ pub(super) mod tests {
             let said = within(peer.reports.next()).await.expect("a report");
             assert_eq!(said.frame, Some(gone(lease)));
         }
-        assert_eq!(link.reports_dropped(), 0);
+        assert_eq!(link.frames_dropped(), 0);
     }
 
     /// A redial over a session that stands lets it go, as the controller
@@ -1947,13 +1970,16 @@ pub(super) mod tests {
         let link = peer.link.clone();
         let mut asked = Box::pin(link.ask(request(1), WAIT));
         assert!(poll(asked.as_mut()).is_pending());
-        link.report(gone(7));
+        link.queue_frame(gone(7));
 
         let mut closed = pin!(link.closed());
         assert!(poll(closed.as_mut()).is_pending());
         let mut first = peer.redial(1);
         within(closed).await;
-        assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+        assert!(matches!(
+            within(asked).await,
+            Err(DecisionUnavailable::Ended)
+        ));
         assert!(link.stands() && link.ended().is_none());
         // The ask and the report sat in the first session's queues: its
         // streams end ahead of them.
@@ -1961,7 +1987,7 @@ pub(super) mod tests {
         assert_eq!(within(first.requests.next()).await, None);
         Peer::readers_end(first.readers).await;
         peer.read_hello().await;
-        link.report(gone(9));
+        link.queue_frame(gone(9));
         let said = within(peer.reports.next()).await.expect("a report");
         assert_eq!((said.seq, said.frame), (2, Some(gone(9))));
 
@@ -2013,7 +2039,7 @@ pub(super) mod tests {
         assert!(poll(asked.as_mut()).is_pending());
         assert!(matches!(
             poll(Box::pin(link.ask(request(2), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::NoCredit))
+            Poll::Ready(Err(DecisionUnavailable::NoCredit))
         ));
 
         peer.answer(1, WELCOME_TERM, decision(8, &[Side::Single]));
@@ -2134,13 +2160,13 @@ pub(super) mod tests {
         let link = peer.link.clone();
         peer.end_session().await;
         link.spec_ack(7, Ok(()));
-        link.report(gone(3));
+        link.queue_frame(gone(3));
 
         drop(peer.redial(1));
         assert_eq!(stated(&mut peer).await, 7);
         let said = within(peer.reports.next()).await.expect("a report");
         assert_eq!(said.frame, Some(gone(3)));
-        assert_eq!(link.reports_dropped(), 0);
+        assert_eq!(link.frames_dropped(), 0);
     }
 
     /// An answer that meets a full queue ends the session, as a report
@@ -2150,11 +2176,14 @@ pub(super) mod tests {
         let mut peer = Peer::patient(1);
         peer.read_hello().await;
         let link = peer.link.clone();
-        for _ in 0..REPORT_QUEUE {
-            link.report(gone(7));
+        for _ in 0..FRAME_QUEUE {
+            link.queue_frame(gone(7));
         }
         closes(&link, || link.spec_ack(7, Ok(()))).await;
-        assert!(matches!(link.ended().as_deref(), Some(Error::ReportsFull)));
+        assert!(matches!(
+            link.ended().as_deref(),
+            Some(Error::FrameQueueFull)
+        ));
 
         drop(peer.redial(1));
         assert_eq!(stated(&mut peer).await, 7);

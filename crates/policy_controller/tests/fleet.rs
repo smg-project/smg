@@ -140,7 +140,7 @@ use smg_policy_controller::{
     engine::{Role, SignalSource, WireModes, WorkerId},
     policies::{bucket, power_of_two::PowerOfTwoMetric},
     service::{
-        client::{self, blocking, Answer, Client, Link, Unanswered},
+        client::{self, blocking, Answer, Client, DecisionUnavailable, Link},
         controller::{State, PROTOCOL_VERSION},
         proto::{
             self, busy, completed::Class, decision::Outcome, gateway_frame, identity::Form,
@@ -148,7 +148,7 @@ use smg_policy_controller::{
             Hello, Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
             WatchWorkersRequest,
         },
-        watcher::{Ended, Following, Watcher},
+        watcher::{WatchStream, WatchStreamEnd, Watcher},
     },
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
 };
@@ -2611,7 +2611,7 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
         }
         assert_eq!(harness.leases(GATEWAY), count);
         for (lease_id, side) in leases {
-            link.report(gateway_frame::Frame::Released(Released {
+            link.queue_frame(gateway_frame::Frame::Released(Released {
                 what: Some(released::What::LeaseId(lease_id)),
                 reason: released::Reason::ClientGone.into(),
                 side,
@@ -2665,13 +2665,13 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
         let first = linked_pick(&link, ask(b"first"))
             .await
             .expect("a first pick");
-        held.report(sent(first));
+        held.queue_frame(sent(first));
         within("the store reads the first lease dispatched", ROOM, || {
             harness.dispatched(GATEWAY, first.id)
         })
         .await
         .expect("the session said the dispatch");
-        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        link.queue_frame(gateway_frame::Frame::Hello(Hello::default()));
         tokio::time::timeout(ROOM, link.closed())
             .await
             .expect("the session ends");
@@ -2679,7 +2679,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
 
         // The request ends with no session standing. Its report waits, and
         // the link's next session says it.
-        held.report(ended(first));
+        held.queue_frame(ended(first));
         assert_eq!(harness.leases(GATEWAY), 1, "no session said the end");
         Box::pin(link.redial(endpoint.clone(), GATEWAY))
             .await
@@ -2695,7 +2695,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
         let second = linked_pick(&held, ask(b"second"))
             .await
             .expect("a pick on the next session");
-        held.report(sent(second));
+        held.queue_frame(sent(second));
         within("the store reads the second lease dispatched", ROOM, || {
             harness.dispatched(GATEWAY, second.id)
         })
@@ -2709,7 +2709,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
             1,
             "the lease stands through the redial"
         );
-        held.report(ended(second));
+        held.queue_frame(ended(second));
         within(
             "the report on the third session ends the lease",
             ROOM,
@@ -2718,7 +2718,7 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
         .await
         .expect("the third session said the report");
         assert!(held.stands());
-        assert_eq!(held.reports_dropped(), 0);
+        assert_eq!(held.frames_dropped(), 0);
         drop((link, held));
         harness.stop().await.expect("a clean stop");
     };
@@ -2740,7 +2740,7 @@ async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
             .expect("a first pick");
         assert!(matches!(
             link.ask(ask(b"late"), Duration::ZERO).await,
-            Err(Unanswered::Late)
+            Err(DecisionUnavailable::Late)
         ));
         let last = linked_pick(&link, ask(b"last")).await.expect("a last pick");
         // The three asks run on the same decider. The gap proves that the
@@ -2776,7 +2776,7 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
         wrong.facts.as_mut().expect("the ask states facts").phase = 99;
         let refused = link.ask(wrong, ROOM).await;
         assert!(
-            matches!(&refused, Err(Unanswered::Unsent(error))
+            matches!(&refused, Err(DecisionUnavailable::Unsent(error))
                 if error.to_string().contains("facts.phase")),
             "{refused:?}"
         );
@@ -2798,8 +2798,8 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
     use smg_policy_controller::{
-        engine::{Door, Request, RequestFacts},
-        tracking::{Handle, Outcome, Side, TransportClass},
+        engine::{Request, RequestFacts, StoreBackedEngine},
+        tracking::{DecisionGuard, Outcome, Side, TransportClass},
     };
 
     const GATEWAY: &str = "fleet-handle";
@@ -2818,7 +2818,10 @@ async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
                 constraints: Default::default(),
             };
             let started = Instant::now();
-            let held = Box::pin(Handle::<&Door>::asked(&link, &asked, started, ROOM)).await;
+            let held = Box::pin(DecisionGuard::<&StoreBackedEngine>::asked(
+                &link, &asked, started, ROOM,
+            ))
+            .await;
             let mut handle = held.expect("the controller's decision");
             let taken = handle.take(0).expect("a picked worker");
             let alternate = handle.decision().pick().expect("a pick").targets.as_slice()[1];
@@ -2934,7 +2937,7 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
 /// What a watcher's store holds of its controller's workers, by id: each
 /// row's facts, status and revision.
 fn watched(watcher: &Watcher) -> Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)> {
-    let (_, mut rows) = WorkersStore::snapshot(&**watcher.store());
+    let (_, mut rows) = WorkersStore::all_rows(&**watcher.store());
     rows.sort_by_key(|row| row.id.0);
     rows.into_iter()
         .map(|row| (row.id, row.facts, row.status, row.revision))
@@ -2949,7 +2952,7 @@ fn status_of(watcher: &Watcher, id: WorkerId) -> Option<WorkerStatus> {
 /// Follows the stream until `stands` holds of its watcher, each event
 /// inside the room of a wait.
 async fn follows(
-    following: &mut Following<'_>,
+    following: &mut WatchStream<'_>,
     mut stands: impl FnMut(&Watcher) -> bool,
 ) -> Result<(), String> {
     while !stands(following.watcher()) {
@@ -2973,7 +2976,7 @@ async fn follows(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
     use smg_policy_controller::{
-        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, Picked},
+        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, PickRecord},
         tracking::{Lease, LeaseId},
     };
 
@@ -3062,7 +3065,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
                 gateway,
                 request: 1,
                 target: late,
-                picked: Picked::default(),
+                picked: PickRecord::default(),
                 decode: None,
                 term: 0,
                 issued_at: now,
@@ -3136,7 +3139,7 @@ async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
             .open_on(&link)
             .await
             .expect("the link resumes the watch");
-        link.report(gateway_frame::Frame::Hello(Hello::default()));
+        link.queue_frame(gateway_frame::Frame::Hello(Hello::default()));
         tokio::time::timeout(ROOM, link.closed())
             .await
             .expect("the second hello ends the link");
@@ -3197,7 +3200,7 @@ async fn a_watch_ends_when_its_controller_goes_silent() {
         let ended = tokio::time::timeout(bound, stream.next())
             .await
             .expect("a silent controller ends the stream inside its bound");
-        assert!(matches!(ended, Err(Ended::Client(_))), "{ended:?}");
+        assert!(matches!(ended, Err(WatchStreamEnd::Client(_))), "{ended:?}");
 
         relayed.abort_all();
         harness.stop().await.expect("a clean stop");
@@ -3221,8 +3224,7 @@ mod hosted {
             shared::OpenDecisions,
             wasm::{self, PluginSpec, WasmScorer},
         },
-        stages::Catalog,
-        tracking::Lifecycle,
+        stages::{Lifecycle, StageRegistry},
     };
 
     use super::{
@@ -3388,7 +3390,7 @@ mod hosted {
             spec.connect_micros = 5_000_000;
             let served = grpc::Plugin::load(&runtime, spec).expect("the served plugin loads");
 
-            let mut catalog = Catalog::builtin();
+            let mut catalog = StageRegistry::builtin();
             catalog
                 .scorer(NAMESPACED, || Box::new(OfNamespace))
                 .expect("a free name");
@@ -3666,9 +3668,9 @@ mod embedded {
 
     use smg_policy_controller::{
         document::PolicySpec,
-        engine::{fingerprint, Constraints, Door, Request, RequestFacts, WorkerId},
+        engine::{fingerprint, Constraints, Request, RequestFacts, StoreBackedEngine, WorkerId},
         store::{GatewayId, HealthSink, LeaseState, LeasesStore},
-        tracking::{Handle, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
     };
 
     use super::{
@@ -3733,7 +3735,7 @@ mod embedded {
             .await
             .expect("a probe turn reads the fleet ready");
             let store = Arc::clone(fleet.store());
-            let door = Door::new(Arc::clone(&store));
+            let door = StoreBackedEngine::new(Arc::clone(&store));
             let live = || LeasesStore::live(store.as_ref(), gateway);
             let booked = |fleet: &Embedded| -> Vec<u32> {
                 let rows = fleet.read(MODEL, gateway);
@@ -3746,7 +3748,7 @@ mod embedded {
             let ids: [&[u8]; 3] = [b"held-0", b"held-1", b"held-2"];
             let mut held = Vec::new();
             for id in ids {
-                let decided = Handle::decide(&door, gateway, &asked(id), Instant::now());
+                let decided = DecisionGuard::decide(&door, gateway, &asked(id), Instant::now());
                 let mut handle = decided.expect("a decision");
                 let target = handle.take(0).expect("a pick over the fleet");
                 let engine = fleet.engine_of(target.id);
@@ -3773,7 +3775,7 @@ mod embedded {
             assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
 
             // A commit that refuses every target releases the lease.
-            let decided = Handle::decide(&door, gateway, &asked(b"refused"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"refused"), Instant::now());
             let mut handle = decided.expect("a decision");
             assert_eq!(live(), 1, "the issue files the lease");
             handle.released(ReleaseReason::CommitFailed, Instant::now());
@@ -3782,7 +3784,7 @@ mod embedded {
 
             // A client that leaves before the dispatch: a host that knows
             // says so.
-            let decided = Handle::decide(&door, gateway, &asked(b"left"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"left"), Instant::now());
             let mut handle = decided.expect("a decision");
             assert_eq!(live(), 1);
             handle.released(ReleaseReason::ClientGone, Instant::now());
@@ -3791,7 +3793,7 @@ mod embedded {
 
             // A request its host lets go with no word: the lease is given
             // up where the handle is dropped.
-            let decided = Handle::decide(&door, gateway, &asked(b"dropped"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"dropped"), Instant::now());
             assert_eq!((decided.is_ok(), live()), (true, 1));
             drop(decided);
             assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
@@ -3801,7 +3803,7 @@ mod embedded {
             // dispatch: the lease ends as cancelled, no completion of
             // class ok.
             let then = Instant::now();
-            let decided = Handle::decide(&door, gateway, &asked(b"second"), then);
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"second"), then);
             let mut handle = decided.expect("a decision");
             let first = handle.take(0).expect("a pick over the fleet");
             let second = handle.take(1).expect("a rotation offers a second target");
@@ -3838,7 +3840,7 @@ mod embedded {
             // An engine dies under a held decision: the send fails, and
             // the completion its host says with no dispatch ends the
             // lease on the dead engine.
-            let decided = Handle::decide(&door, gateway, &asked(b"dead"), Instant::now());
+            let decided = DecisionGuard::decide(&door, gateway, &asked(b"dead"), Instant::now());
             let mut handle = decided.expect("a decision");
             let target = handle.take(0).expect("a pick over the fleet");
             let engine = fleet.engine_of(target.id).expect("a row of the fleet");

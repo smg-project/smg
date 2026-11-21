@@ -31,7 +31,7 @@ use tracing::warn;
 use crate::{
     service::{
         client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
-        watcher::{Ended, Watcher},
+        watcher::{WatchStreamEnd, Watcher},
     },
     store::MemoryStore,
 };
@@ -288,11 +288,11 @@ async fn follow(
                 // The controller ended the stream with no error: the next
                 // one goes on after the place.
                 Ok(false) => break,
-                Err(Ended::Lost(lost)) => {
+                Err(WatchStreamEnd::Lost(lost)) => {
                     warn!(?lost, "Lost the controller's worker watch position");
                     break;
                 }
-                Err(Ended::Client(error)) => return error,
+                Err(WatchStreamEnd::Client(error)) => return error,
             }
             if following.watcher().at().is_some() {
                 // The store holds the fleet as of a place. The owner brings
@@ -346,9 +346,9 @@ mod tests {
     use crate::{
         document::operator::test_support::Logged,
         engine::view::WorkerId,
+        load::ingest::probe::install_crypto_provider,
         service::{
             controller::{config::tests::valid, Controller, Scope, State, PRINCIPAL_ENTRY},
-            ingest::probe::install_crypto_provider,
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
         },
         store::{MemoryStore, WorkerStatus, WorkersStore},
@@ -413,7 +413,7 @@ mod tests {
     }
 
     fn rows(store: &MemoryStore) -> Vec<(WorkerId, String, WorkerStatus)> {
-        let (_, rows) = store.snapshot();
+        let (_, rows) = store.all_rows();
         let mut rows: Vec<_> = rows
             .into_iter()
             .map(|row| (row.id, row.facts.key, row.status))

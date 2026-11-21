@@ -4,11 +4,11 @@
 
 use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
 
-use super::workers::{Maker, WorkerFacts, WorkerRow, WorkerStatus};
+use super::workers::{Registrant, WorkerFacts, WorkerRow, WorkerStatus};
 
-/// A write of a row by a caller that did not make it.
+/// A write of a row by a caller that did not register it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NotMaker<'a> {
+pub enum NotRegistrant<'a> {
     /// A control call made the row.
     Control,
     /// The caller's own provider made the row, under another key.
@@ -17,7 +17,7 @@ pub enum NotMaker<'a> {
     Provider { provider: &'a str },
 }
 
-impl fmt::Display for NotMaker<'_> {
+impl fmt::Display for NotRegistrant<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control => {
@@ -41,30 +41,30 @@ impl WorkerRow {
     /// registration over a draining row is the URL's next life, whatever
     /// its facts, and a removal that named the draining row then names a
     /// row that left. A patch and a second drain keep a drain. Any other
-    /// row is changed as its facts are ([`WorkerFacts::laid_over`]).
-    pub fn laid(&self, facts: &WorkerFacts) -> Laid {
+    /// row is changed as its facts are ([`WorkerFacts::compare_to_standing`]).
+    pub fn compare_new_facts(&self, facts: &WorkerFacts) -> WorkerFactsChange {
         if self.status == WorkerStatus::Draining {
-            Laid::Another
+            WorkerFactsChange::Another
         } else {
-            facts.laid_over(&self.facts)
+            facts.compare_to_standing(&self.facts)
         }
     }
 
     /// Whether `caller` made the row. Check before writing a standing row.
-    pub fn made_by(&self, caller: &Maker) -> Result<(), NotMaker<'_>> {
+    pub fn made_by(&self, caller: &Registrant) -> Result<(), NotRegistrant<'_>> {
         if self.maker == *caller {
             return Ok(());
         }
         Err(match (&self.maker, caller) {
-            (Maker::Control, _) => NotMaker::Control,
-            (Maker::Provider(found), Maker::Provider(own))
+            (Registrant::Control, _) => NotRegistrant::Control,
+            (Registrant::Provider(found), Registrant::Provider(own))
                 if found.provider() == own.provider() =>
             {
-                NotMaker::AnotherKey {
+                NotRegistrant::AnotherKey {
                     provider: found.provider(),
                 }
             }
-            (Maker::Provider(found), _) => NotMaker::Provider {
+            (Registrant::Provider(found), _) => NotRegistrant::Provider {
                 provider: found.provider(),
             },
         })
@@ -73,7 +73,7 @@ impl WorkerRow {
 
 /// What a registration's facts make of the row that stands under their key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Laid {
+pub enum WorkerFactsChange {
     /// The facts are equal.
     Unmoved,
     /// The facts change within the same life.
@@ -101,25 +101,25 @@ impl WorkerFacts {
     /// A life its vision or its demand facts alone start is handed the
     /// standing life's status: the store hands a status on where role,
     /// models and wires match, and it is the same reachable worker.
-    pub fn laid_over(&self, standing: &Self) -> Laid {
+    pub fn compare_to_standing(&self, standing: &Self) -> WorkerFactsChange {
         if self == standing {
-            Laid::Unmoved
+            WorkerFactsChange::Unmoved
         } else if self.role != standing.role
             || self.wire_modes != standing.wire_modes
             || self.vision != standing.vision
             || self.demand_facts != standing.demand_facts
             || !self.same_models(standing)
         {
-            Laid::Another
+            WorkerFactsChange::Another
         } else {
-            Laid::InPlace
+            WorkerFactsChange::InPlace
         }
     }
 }
 
 /// A fact past its bound, named with the rule it broke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Past {
+pub struct FactPastBound {
     pub fact: &'static str,
     pub why: &'static str,
 }
@@ -134,7 +134,7 @@ impl WorkerFacts {
 
     /// An upper bound on the row's wire size. A row within [`Self::ROW_BYTES`]
     /// fits a controller's frame, including when a host writes it in process.
-    pub fn weight(&self, maker: &Maker) -> usize {
+    pub fn weight(&self, maker: &Registrant) -> usize {
         let text = |value: &str| value.len() + Self::FRAME;
         let mut bytes =
             Self::NUMBERS + 2 * text(&self.key) + text(&self.engine) + text(&self.engine_kind);
@@ -153,15 +153,15 @@ impl WorkerFacts {
                 bytes += text(value);
             }
         }
-        if let Maker::Provider(found) = maker {
+        if let Registrant::Provider(found) = maker {
             bytes += text(found.provider()) + text(found.key());
         }
         bytes
     }
 
     /// Check each fact's own bound, then the size of the row with its maker.
-    pub fn bounded(&self, maker: &Maker) -> Result<(), Past> {
-        let past = |fact, why| Err(Past { fact, why });
+    pub fn bounded(&self, maker: &Registrant) -> Result<(), FactPastBound> {
+        let past = |fact, why| Err(FactPastBound { fact, why });
         if self.key.is_empty() {
             return past("key", "a registration names its worker's URL");
         }
@@ -275,39 +275,40 @@ pub fn base() -> u64 {
 mod tests {
     use std::time::Instant;
 
-    use super::{base, Laid, NotMaker, HALF};
+    use super::{base, NotRegistrant, WorkerFactsChange, HALF};
     use crate::{
         engine::{
             demands::DemandFacts,
             view::{Role, WireModes, WorkerId},
         },
-        store::{Maker, Unmade, WorkerFacts, WorkerRow, WorkerStatus},
+        store::{ProviderKeyError, Registrant, WorkerFacts, WorkerRow, WorkerStatus},
     };
 
     #[test]
-    fn the_rows_maker_passes_and_any_other_caller_is_told_who_made_it() -> Result<(), Unmade> {
+    fn the_rows_maker_passes_and_any_other_caller_is_told_who_made_it(
+    ) -> Result<(), ProviderKeyError> {
         let callers = [
-            Maker::Control,
-            Maker::provider("pool", "first")?,
-            Maker::provider("pool", "second")?,
-            Maker::provider("other", "first")?,
+            Registrant::Control,
+            Registrant::provider("pool", "first")?,
+            Registrant::provider("pool", "second")?,
+            Registrant::provider("other", "first")?,
         ];
         let control = Err((
-            NotMaker::Control,
+            NotRegistrant::Control,
             "the row was made by a control call: its maker alone changes it",
         ));
         let another_key = Err((
-            NotMaker::AnotherKey { provider: "pool" },
+            NotRegistrant::AnotherKey { provider: "pool" },
             "the row is provider pool's under another key: that key's caller changes it",
         ));
         let provider = Err((
-            NotMaker::Provider { provider: "pool" },
+            NotRegistrant::Provider { provider: "pool" },
             "the row is provider pool's: its worker is changed at the provider's source",
         ));
         for (maker, expected) in [
-            (Maker::Control, [Ok(()), control, control, control]),
+            (Registrant::Control, [Ok(()), control, control, control]),
             (
-                Maker::provider("pool", "first")?,
+                Registrant::provider("pool", "first")?,
                 [provider, Ok(()), another_key, provider],
             ),
         ] {
@@ -342,8 +343,14 @@ mod tests {
             incarnation: 0,
             ..standing.clone()
         };
-        assert_eq!(standing.laid_over(&standing), Laid::Unmoved);
-        assert_eq!(fresh.laid_over(&standing), Laid::InPlace);
+        assert_eq!(
+            standing.compare_to_standing(&standing),
+            WorkerFactsChange::Unmoved
+        );
+        assert_eq!(
+            fresh.compare_to_standing(&standing),
+            WorkerFactsChange::InPlace
+        );
     }
 
     #[test]
@@ -355,13 +362,19 @@ mod tests {
             models: vec!["one".to_owned(), "two".to_owned()],
             ..WorkerFacts::default()
         };
-        assert_eq!(standing.clone().laid_over(&standing), Laid::Unmoved);
+        assert_eq!(
+            standing.clone().compare_to_standing(&standing),
+            WorkerFactsChange::Unmoved
+        );
 
         let mut relabelled = standing.clone();
         relabelled
             .labels
             .insert("pool".to_owned(), "blue".to_owned());
-        assert_eq!(relabelled.laid_over(&standing), Laid::InPlace);
+        assert_eq!(
+            relabelled.compare_to_standing(&standing),
+            WorkerFactsChange::InPlace
+        );
 
         for (field, changed) in [
             (
@@ -386,12 +399,19 @@ mod tests {
                 },
             ),
         ] {
-            assert_eq!(changed.laid_over(&standing), Laid::Another, "{field}");
+            assert_eq!(
+                changed.compare_to_standing(&standing),
+                WorkerFactsChange::Another,
+                "{field}"
+            );
         }
 
         let mut reordered = standing.clone();
         reordered.models.reverse();
-        assert_eq!(reordered.laid_over(&standing), Laid::InPlace);
+        assert_eq!(
+            reordered.compare_to_standing(&standing),
+            WorkerFactsChange::InPlace
+        );
     }
 
     /// What a worker states for a request's hard demands says which
@@ -408,12 +428,15 @@ mod tests {
         };
         for (standing, fresh) in [(7, 9), (7, 0), (0, 7)] {
             assert_eq!(
-                stating(fresh).laid_over(&stating(standing)),
-                Laid::Another,
+                stating(fresh).compare_to_standing(&stating(standing)),
+                WorkerFactsChange::Another,
                 "{standing} to {fresh}"
             );
         }
-        assert_eq!(stating(7).laid_over(&stating(7)), Laid::Unmoved);
+        assert_eq!(
+            stating(7).compare_to_standing(&stating(7)),
+            WorkerFactsChange::Unmoved
+        );
     }
 
     /// Whether a worker takes images says which requests it can take at
@@ -428,12 +451,15 @@ mod tests {
         };
         for (standing, fresh) in [(true, false), (false, true)] {
             assert_eq!(
-                seeing(fresh).laid_over(&seeing(standing)),
-                Laid::Another,
+                seeing(fresh).compare_to_standing(&seeing(standing)),
+                WorkerFactsChange::Another,
                 "{standing} to {fresh}"
             );
         }
-        assert_eq!(seeing(true).laid_over(&seeing(true)), Laid::Unmoved);
+        assert_eq!(
+            seeing(true).compare_to_standing(&seeing(true)),
+            WorkerFactsChange::Unmoved
+        );
     }
 
     #[test]
@@ -451,7 +477,7 @@ mod tests {
 
     #[test]
     fn a_fact_past_its_bound_is_refused_by_its_name() {
-        use super::Past;
+        use super::FactPastBound;
 
         type Set = fn(&mut WorkerFacts, usize);
         let limits: [(&str, usize, &str, Set); 8] = [
@@ -495,20 +521,20 @@ mod tests {
                 },
             ),
         ];
-        let maker = Maker::Control;
+        let maker = Registrant::Control;
         for (fact, bound, why, set) in limits {
             let mut facts = stated();
             set(&mut facts, bound);
             assert_eq!(facts.bounded(&maker), Ok(()), "{fact} at {bound}");
             set(&mut facts, bound + 1);
-            assert_eq!(facts.bounded(&maker), Err(Past { fact, why }));
+            assert_eq!(facts.bounded(&maker), Err(FactPastBound { fact, why }));
         }
 
         let mut facts = stated();
         facts.key.clear();
         assert_eq!(
             facts.bounded(&maker),
-            Err(Past {
+            Err(FactPastBound {
                 fact: "key",
                 why: "a registration names its worker's URL"
             })
@@ -523,7 +549,7 @@ mod tests {
             facts.key = bad.to_owned();
             assert_eq!(
                 facts.bounded(&maker),
-                Err(Past {
+                Err(FactPastBound {
                     fact: "key",
                     why: "a URL holds no blank and no control character",
                 })
@@ -532,7 +558,7 @@ mod tests {
         facts.key = stated().key;
         assert_eq!(
             facts.bounded(&maker),
-            Err(Past {
+            Err(FactPastBound {
                 fact: "engine",
                 why: "a URL is at most 2048 bytes",
             })
@@ -541,7 +567,7 @@ mod tests {
             facts.engine = bad.to_owned();
             assert_eq!(
                 facts.bounded(&maker),
-                Err(Past {
+                Err(FactPastBound {
                     fact: "engine",
                     why: "a URL holds no blank and no control character",
                 })
@@ -550,7 +576,7 @@ mod tests {
             facts.engine_kind = bad.to_owned();
             assert_eq!(
                 facts.bounded(&maker),
-                Err(Past {
+                Err(FactPastBound {
                     fact: "engine_kind",
                     why: "a runtime holds no blank and no control character",
                 })
@@ -561,7 +587,7 @@ mod tests {
             facts.models = vec!["m".to_owned(), bad.to_owned()];
             assert_eq!(
                 facts.bounded(&maker),
-                Err(Past {
+                Err(FactPastBound {
                     fact: "models",
                     why: "a model id is not empty and holds no blank and no control character",
                 })
@@ -570,7 +596,7 @@ mod tests {
         facts.models.clear();
         assert_eq!(
             facts.bounded(&maker),
-            Err(Past {
+            Err(FactPastBound {
                 fact: "zone",
                 why: "a zone is at most 256 bytes",
             })
@@ -578,7 +604,7 @@ mod tests {
         facts.zone = None;
         assert_eq!(
             facts.bounded(&maker),
-            Err(Past {
+            Err(FactPastBound {
                 fact: "labels",
                 why: "a label's value is at most 4096 bytes",
             })
@@ -586,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_weighs_its_texts_as_often_as_it_tells_them() -> Result<(), Unmade> {
+    fn a_row_weighs_its_texts_as_often_as_it_tells_them() -> Result<(), ProviderKeyError> {
         let mut facts = WorkerFacts {
             engine: "engine".to_owned(),
             engine_kind: "kind".to_owned(),
@@ -599,19 +625,19 @@ mod tests {
             .into(),
             ..stated()
         };
-        assert_eq!(facts.weight(&Maker::Control), 270);
+        assert_eq!(facts.weight(&Registrant::Control), 270);
         facts.signals.scrape_interval_ms = 1;
-        assert_eq!(facts.weight(&Maker::Control), 279);
-        assert_eq!(facts.weight(&Maker::provider("pool", "work")?), 297);
+        assert_eq!(facts.weight(&Registrant::Control), 279);
+        assert_eq!(facts.weight(&Registrant::provider("pool", "work")?), 297);
         Ok(())
     }
 
     #[test]
     fn a_long_list_of_model_ids_is_bounded_by_the_rows_size_alone() {
-        use super::Past;
+        use super::FactPastBound;
 
         let mut facts = stated();
-        let maker = Maker::Control;
+        let maker = Registrant::Control;
         facts.models = (0..129).map(|id| id.to_string()).collect();
         assert_eq!(facts.bounded(&maker), Ok(()));
 
@@ -623,15 +649,15 @@ mod tests {
         facts.models[62].push('m');
         assert_eq!(
             facts.bounded(&maker),
-            Err(Past {
+            Err(FactPastBound {
                 fact: "row",
                 why: "a row is at most 16384 bytes on the wire",
             })
         );
         facts.models[62].pop();
         assert_eq!(
-            facts.bounded(&Maker::provider("pool", "work").expect("a maker")),
-            Err(Past {
+            facts.bounded(&Registrant::provider("pool", "work").expect("a maker")),
+            Err(FactPastBound {
                 fact: "row",
                 why: "a row is at most 16384 bytes on the wire",
             })

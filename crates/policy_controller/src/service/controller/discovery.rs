@@ -22,7 +22,7 @@ use tracing::error;
 
 use self::flags::{refuse_settings, Credential};
 pub(super) use self::{flags::DiscoveryFlags, host::Host};
-use super::{election::Standing, readiness::reached, ConfigError};
+use super::{election::ElectionObservation, readiness::reached, ConfigError};
 use crate::service::elector::Fence;
 
 /// The selected worker discovery provider and the credential it stamps.
@@ -111,7 +111,7 @@ impl Discovery {
     /// the task still stays until the stop, as the serve's other tasks do.
     pub(crate) async fn run(
         &self,
-        standing: watch::Receiver<Standing>,
+        standing: watch::Receiver<ElectionObservation>,
         stop: watch::Receiver<bool>,
     ) {
         let start = || start_service_discovery(self.settings.clone(), self.host.clone());
@@ -121,7 +121,7 @@ impl Discovery {
     /// [`Discovery::run`] over `start`, the start of the provider.
     async fn run_with<F>(
         &self,
-        mut standing: watch::Receiver<Standing>,
+        mut standing: watch::Receiver<ElectionObservation>,
         mut stop: watch::Receiver<bool>,
         start: impl Fn() -> F + Send + Sync,
     ) where
@@ -230,7 +230,10 @@ impl Discovery {
     /// clock alone turns the fence's answer: a lead the election renews no
     /// more ends there with no word. Returns whether the watch is still
     /// open.
-    async fn turned(turn: Option<Instant>, standing: &mut watch::Receiver<Standing>) -> bool {
+    async fn turned(
+        turn: Option<Instant>,
+        standing: &mut watch::Receiver<ElectionObservation>,
+    ) -> bool {
         tokio::select! {
             changed = standing.changed() => changed.is_ok(),
             () = reached(turn) => true,
@@ -238,7 +241,7 @@ impl Discovery {
     }
 
     /// Waits for a different term, returning whether the watch is still open.
-    async fn left(&self, term: u64, standing: &mut watch::Receiver<Standing>) -> bool {
+    async fn left(&self, term: u64, standing: &mut watch::Receiver<ElectionObservation>) -> bool {
         loop {
             // One read of the fence gives the term and its next turn. No
             // release and no end of the window falls between the two, so a

@@ -36,10 +36,12 @@ mod tests {
             Controller,
         },
         store::{
-            Ask, GatewayId, KvEventSink as _, Maker, MemoryStore, Named, Naming, Signals,
-            ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            AffinityQuery, AffinityRowsBuffers, GatewayId, KvEventSink as _, MemoryStore,
+            Registrant, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
         },
-        worker_host::{Expect, KvFeed, Members, Membership as _, Objects, StoreDoor},
+        worker_host::{
+            KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
+        },
     };
 
     const MODEL: &str = "m";
@@ -221,9 +223,9 @@ mod tests {
         f.store
             .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
             .expect("the first generation");
-        let door = StoreDoor::new(Arc::clone(&f.store));
+        let door = StoreMembershipWriter::new(Arc::clone(&f.store));
         f.check(async {
-            door.found(&Maker::Control, Expect::Nothing, FIRST, &|_| {
+            door.found(&Registrant::Control, Precondition::Absent, FIRST, &|_| {
                 facts(FIRST, WireModes::GRPC, false)
             })
             .expect("registered");
@@ -537,7 +539,7 @@ mod tests {
             let holders = || {
                 store.deciding(|world| {
                     let gateway = GatewayId(0);
-                    let ask = Ask {
+                    let ask = ViewQuery {
                         gateway,
                         now: Instant::now(),
                         pinned: None,
@@ -548,7 +550,7 @@ mod tests {
                     let built = world
                         .build(MODEL, Role::Single, &ask, &mut view)
                         .expect("the worker's pool");
-                    let naming = Naming {
+                    let naming = AffinityQuery {
                         gateway,
                         block_hashes: &hashes,
                         namespace_seed: 0,
@@ -557,8 +559,14 @@ mod tests {
                         wires: None,
                         now_micros: built.now_micros,
                     };
-                    let mut named = Named::default();
-                    world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+                    let mut named = AffinityRowsBuffers::default();
+                    world.fill_affinity_rows(
+                        MODEL,
+                        Role::Single,
+                        &naming,
+                        &view.candidates,
+                        &mut named,
+                    );
                     named
                         .holders
                         .iter()

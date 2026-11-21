@@ -10,11 +10,11 @@ use axum::{
 use serde_json::{json, Value};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
 use smg_policy_controller::{
-    document::{operator::Turn, PolicySpec},
+    document::{operator::SerialTurn, PolicySpec},
     engine::WireModes,
     store::{
-        EncodeOffer, GatewayId, Maker, Overload, PairingDescriptor, Reachability, WorkerFacts,
-        WorkersStore,
+        pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Reachability, Registrant,
+        WorkerFacts, WorkersStore,
     },
 };
 use tower::ServiceExt;
@@ -31,7 +31,7 @@ use crate::{
 type Case = Result<(), Box<dyn Error>>;
 
 /// The turn of one kind of call, read from the operators.
-type TurnOf = fn(&super::Operators) -> &Turn;
+type TurnOf = fn(&super::Operators) -> &SerialTurn;
 
 const SPEC: &str = "/policy/spec";
 const VALIDATE: &str = "/policy/spec:validate";
@@ -558,7 +558,7 @@ async fn a_snapshots_page_is_as_the_openapi_document_gives_it() -> Case {
         },
         ..serving("http://stated.example", &["m"])
     };
-    store.upsert_by(stated, Maker::provider("finder", "http://host/x")?);
+    store.upsert_by(stated, Registrant::provider("finder", "http://host/x")?);
     let (status, _, page) = answered(&app(state)?, snapshot("")?).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page["rows"].as_array().map(Vec::len), Some(2));

@@ -38,18 +38,17 @@ use smg_policy_controller::{
         AppliedSpec, DerivedKey, KeySource, KeySourceSpec, Pairing, PolicySpec, RoutingKeySpec,
     },
     engine::{
-        fingerprint, Candidate, Decision, Identity, LoadRow, MediaCounts, Phase, Picker, Refused,
-        RequestFacts, Role, Shed, ShedReason, Target, Targets, TieBand, Trace, WireModes, WorkerId,
+        fingerprint, Candidate, Decision, DecisionRefused, Identity, LoadRow, MediaCounts, Phase,
+        Picker, RequestFacts, Role, Shed, ShedReason, Target, Targets, TieBand, Trace, WireModes,
+        WorkerId,
     },
-    stages::Catalog,
+    stages::{Lifecycle, StageRegistry},
     store::{
-        Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
-        LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
-        WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+        pairing::PairingDescriptor, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore,
+        LoadSink, LoadSource, MemoryStore, PairBuffers, SessionsStore, ViewQuery as StoreAsk,
+        WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    tracking::{
-        Lease, LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass,
-    },
+    tracking::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 use smg_worker::{
     health::circuit_breaker::CircuitBreakerConfig,
@@ -712,7 +711,7 @@ fn a_refused_ask_is_counted_without_a_profile() {
             .now_or_never()
             .unwrap()
             .err();
-        assert_eq!(refused, Some(Unplaced::Refused(Refused::Unleased)));
+        assert_eq!(refused, Some(Unplaced::Refused(DecisionRefused::Unleased)));
     });
     assert_decisions(&rendered, "", "refused", 1);
 }
@@ -823,7 +822,7 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
         .hashes(&store, MODEL);
         let now = Instant::now();
         // Give plain asks a lower-load choice while affinity can still win.
-        for row in store.snapshot().1 {
+        for row in store.all_rows().1 {
             store.record(
                 row.id,
                 0,
@@ -900,7 +899,7 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
             .expect("a worker")
             .id();
         // Every other row reports less load: the record alone brings it back.
-        for row in store.snapshot().1 {
+        for row in store.all_rows().1 {
             let running = u32::from(row.id == sent);
             let load = LoadRow {
                 running,
@@ -1152,7 +1151,7 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             None,
         ),
         (
-            Unplaced::Refused(Refused::Faulted),
+            Unplaced::Refused(DecisionRefused::Faulted),
             unavailable,
             "policy_controller_unavailable",
             Some("1"),
@@ -1674,7 +1673,7 @@ fn pair_spec(
     for binding in &mut document.bindings {
         binding.routing_key = key.cloned();
     }
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     let prefill = PairPicker {
         name: "ordered-prefill",
         limit: 4,
@@ -1821,7 +1820,7 @@ impl PairBed {
     }
 
     fn counts(&self, ids: &[WorkerId]) -> Option<Vec<u32>> {
-        self.store.with_world(|world| {
+        self.store.with_snapshot(|world| {
             let ask = StoreAsk {
                 gateway: GATEWAY,
                 now: Instant::now(),
@@ -2763,7 +2762,7 @@ async fn a_probe_refuses_a_decode_ask_and_releases_a_pick_before_queuing() {
     tokio::pin!(refused);
     assert!(matches!(
         poll!(refused.as_mut()),
-        Poll::Ready(Err(Unplaced::Refused(Refused::PairSide)))
+        Poll::Ready(Err(Unplaced::Refused(DecisionRefused::PairSide)))
     ));
     assert_eq!(admission.queued_requests(), 1);
 

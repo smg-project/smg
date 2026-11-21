@@ -48,8 +48,8 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use smg_policy_controller::{
     engine::{Role, WireModes},
     store::{
-        encoding::EncodeMember, Ask, EncodeClasses, EncodeHandoff, EncodeOffer, EncodePairBuffers,
-        GatewayId, MemoryStore, PairBuffers, WorkerFacts, WorkersStore,
+        EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer, EncodePairBuffers, GatewayId,
+        MemoryStore, PairBuffers, ViewQuery, WorkerFacts, WorkersStore,
     },
 };
 
@@ -239,7 +239,7 @@ fn doors(c: &mut Criterion) {
     for name in FLEETS {
         for n in SIZES {
             let store = store_of(&fleet(name, n));
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: Instant::now(),
                 pinned: None,

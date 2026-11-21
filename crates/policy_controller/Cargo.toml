@@ -349,7 +349,7 @@ name = "ingest"
 required-features = ["controller"]
 
 [[test]]
-name = "membership_door"
+name = "membership_calls"
 required-features = ["controller", "worker-host"]
 
 [[test]]
@@ -387,7 +387,7 @@ name = "affinity"
 harness = false
 
 [[bench]]
-name = "affinity_named"
+name = "affinity_rows"
 harness = false
 
 [[bench]]
@@ -429,7 +429,7 @@ name = "store_pair"
 harness = false
 
 [[bench]]
-name = "store_lent"
+name = "store_lent_rows"
 harness = false
 
 [[bench]]
@@ -445,7 +445,7 @@ name = "store_journal"
 harness = false
 
 [[bench]]
-name = "store_named"
+name = "store_affinity_rows"
 harness = false
 
 [[bench]]
@@ -497,7 +497,7 @@ name = "predictor"
 harness = false
 
 [[bench]]
-name = "sent"
+name = "dispatch_credit"
 harness = false
 
 [[bench]]
@@ -513,7 +513,7 @@ harness = false
 # A registered scorer's read of a row's report through the view's
 # reading, beside the same scorer reading the row's field.
 [[bench]]
-name = "reports"
+name = "load_report_reader"
 harness = false
 
 [lints]

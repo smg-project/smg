@@ -68,7 +68,8 @@ use smg_policy_controller::{
     service::{
         client::Client,
         controller::{
-            Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
+            State,
         },
         proto::{
             self, completed::Class, policy_controller_client::PolicyControllerClient,
@@ -76,12 +77,12 @@ use smg_policy_controller::{
             Side, Welcome,
         },
     },
-    stages::Catalog,
+    stages::StageRegistry,
     store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, Kinds, KvCursor,
+        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, JournalKinds, KvCursor,
         KvEvent, KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail,
-        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, ViewQuery,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{LeaseId, TransportClass},
 };
@@ -1003,7 +1004,7 @@ impl Replica {
     /// Binds and serves a controller named `id`. Replicas given one `lease`
     /// file elect over it; with none the controller leads itself.
     pub async fn start(id: &str, lease: Option<&Path>) -> Result<Self, String> {
-        Self::start_over(id, lease, Catalog::builtin(), None).await
+        Self::start_over(id, lease, StageRegistry::builtin(), None).await
     }
 
     /// As [`Replica::start`], over the stages `catalog` holds, a host's own
@@ -1014,7 +1015,7 @@ impl Replica {
     pub async fn start_over(
         id: &str,
         lease: Option<&Path>,
-        catalog: Catalog,
+        catalog: StageRegistry,
         spec: Option<&Path>,
     ) -> Result<Self, String> {
         Self::serve(id, lease, loopback().ip(), 0, false, (Some(catalog), spec)).await
@@ -1048,7 +1049,7 @@ impl Replica {
         ip: IpAddr,
         port: u16,
         standbys: bool,
-        (catalog, spec): (Option<Catalog>, Option<&Path>),
+        (catalog, spec): (Option<StageRegistry>, Option<&Path>),
     ) -> Result<Self, String> {
         let listener = |name: &str, scopes: &[Scope], port: u16| Listener {
             name: name.to_owned(),
@@ -1069,11 +1070,11 @@ impl Replica {
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,
             discovery: None,
-            election: Election {
+            election: ElectionConfig {
                 lease: lease.map_or(LeasePlace::Process, |file| {
                     LeasePlace::File(file.to_owned())
                 }),
-                ..Election::default()
+                ..ElectionConfig::default()
             },
         };
         // A pair's first replica draws its replication port from the pairs'
@@ -1092,7 +1093,7 @@ impl Replica {
             } else {
                 port
             };
-            let catalog = host.take().unwrap_or_else(Catalog::builtin);
+            let catalog = host.take().unwrap_or_else(StageRegistry::builtin);
             let bound = bounded(
                 "the controller binds its listeners",
                 ROOM,
@@ -1231,7 +1232,7 @@ impl Harness {
     /// controller reads and applies itself. The case applies no generation
     /// in its own process beside it.
     #[cfg(feature = "wasm")]
-    pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
+    pub async fn start_hosting(catalog: StageRegistry, spec: &Path) -> Result<Self, String> {
         let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
         Self::around(replica).await
     }
@@ -1306,7 +1307,7 @@ impl Harness {
     /// with a load row beside them: what a controller that follows has of
     /// its leader's log. A row no registration made is an error.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
-        let cut = standby.store.cut(Kinds::All);
+        let cut = standby.store.checkpoint(JournalKinds::All);
         let mut held = 0;
         for row in &cut.rows {
             if !self.members.contains_key(&row.id) {
@@ -1662,7 +1663,7 @@ impl Harness {
     /// this instant, each row named by its engine. Until the service
     /// answers decisions this is what a case reads back.
     pub fn view(&mut self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId::LOCAL,
             now: Instant::now(),
             pinned: None,
@@ -2086,7 +2087,7 @@ impl Embedded {
     /// A store of `deciders` files of leases with `document` applied as
     /// its first generation, and no engine yet.
     pub fn start(deciders: usize, mut document: PolicySpec) -> Result<Self, String> {
-        let store = MemoryStore::new().with_deciders(deciders);
+        let store = MemoryStore::new().with_decision_slots(deciders);
         document.generation = 1;
         let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
         store.apply(spec).map_err(|error| error.to_string())?;
@@ -2156,7 +2157,7 @@ impl Embedded {
     /// every rank of it reads healthy, and the requests the leases on
     /// file book on it.
     pub fn read(&self, model: &str, gateway: GatewayId) -> Vec<(bool, u32)> {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway,
             now: Instant::now(),
             pinned: None,

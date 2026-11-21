@@ -10,8 +10,6 @@ pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
 pub mod elector;
-#[cfg(feature = "ingest")]
-pub mod ingest;
 #[cfg(feature = "controller")]
 pub mod proto;
 pub mod replication;

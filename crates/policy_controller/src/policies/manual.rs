@@ -10,7 +10,7 @@ use crate::{
         view::{Candidate, RequestFacts},
     },
     policies::standard_filters,
-    tracking::lease::Lifecycle,
+    stages::lifecycle::Lifecycle,
 };
 
 /// How the `manual` policy is composed: its filters, its scorers and its

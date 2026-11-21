@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use smg_policy_controller::worker_host::{
-    maker_of, Expect, Membership, Objects, Over, Refused, Standing,
+    registrant_of, MembershipWriteRefused, MembershipWriter, Objects, Over, Precondition,
+    RowRevision,
 };
 use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -34,7 +35,7 @@ use crate::{
 /// The update step beside the rows whose objects `rows` holds, writing at
 /// `door`.
 pub(crate) struct UpdateAtDoorStep {
-    door: Arc<dyn Membership>,
+    door: Arc<dyn MembershipWriter>,
     rows: Arc<Objects<ModelWorkerSnapshot>>,
 }
 
@@ -46,7 +47,10 @@ fn step_failed(message: String) -> WorkflowError {
 }
 
 impl UpdateAtDoorStep {
-    pub(crate) fn new(door: Arc<dyn Membership>, rows: Arc<Objects<ModelWorkerSnapshot>>) -> Self {
+    pub(crate) fn new(
+        door: Arc<dyn MembershipWriter>,
+        rows: Arc<Objects<ModelWorkerSnapshot>>,
+    ) -> Self {
         Self { door, rows }
     }
 
@@ -57,7 +61,7 @@ impl UpdateAtDoorStep {
         &self,
         snapshot: Option<&[(WorkerId, u64)]>,
         workers: &[Arc<dyn Worker>],
-    ) -> Vec<Option<Standing>> {
+    ) -> Vec<Option<RowRevision>> {
         workers
             .iter()
             .enumerate()
@@ -78,15 +82,16 @@ impl UpdateAtDoorStep {
     pub(super) fn lay(
         &self,
         asker: &WorkerJobAsker,
-        standing: Standing,
+        standing: RowRevision,
         updated: &Arc<dyn Worker>,
         found: &Arc<dyn Worker>,
     ) -> WorkflowResult<()> {
-        let maker = maker_of(asker, updated.url()).map_err(|why| step_failed(why.to_string()))?;
+        let maker =
+            registrant_of(asker, updated.url()).map_err(|why| step_failed(why.to_string()))?;
         self.door
             .found_built(
                 &maker,
-                Expect::Seen(standing),
+                Precondition::AtRevision(standing),
                 updated,
                 Some(Over::Updated(found)),
             )
@@ -103,31 +108,37 @@ impl UpdateAtDoorStep {
     /// transition into service refreshes again.
     pub(super) fn refresh(
         &self,
-        standing: Standing,
+        standing: RowRevision,
         rebuilt: &Arc<dyn Worker>,
         found: &Arc<dyn Worker>,
     ) -> WorkflowResult<bool> {
         match self.door.refreshed(standing, rebuilt, found) {
             Ok(_) => Ok(true),
-            Err(Refused::Moved | Refused::Absent | Refused::Draining) => Ok(false),
+            Err(
+                MembershipWriteRefused::Moved
+                | MembershipWriteRefused::Absent
+                | MembershipWriteRefused::Draining,
+            ) => Ok(false),
             Err(refusal) => Err(step_failed(dropped(rebuilt.as_ref(), refusal))),
         }
     }
 }
 
 /// Why the door dropped the update of `worker`.
-fn dropped(worker: &dyn Worker, refusal: Refused) -> String {
+fn dropped(worker: &dyn Worker, refusal: MembershipWriteRefused) -> String {
     let url = worker.redacted_url();
     match refusal {
         // The store's sentence, word for word.
-        Refused::NotMaker(why) => why,
-        Refused::Past(past) => format!("{}: {}", past.fact, past.why),
-        Refused::Moved | Refused::Absent => format!(
+        MembershipWriteRefused::NotRegistrant(why) => why,
+        MembershipWriteRefused::Past(past) => format!("{}: {}", past.fact, past.why),
+        MembershipWriteRefused::Moved | MembershipWriteRefused::Absent => format!(
             "worker {url} was replaced or removed since this update found it, so the \
              update was dropped"
         ),
-        Refused::Draining => format!("worker {url} is draining, so the update was dropped"),
-        Refused::NotLabelsAlone => format!(
+        MembershipWriteRefused::Draining => {
+            format!("worker {url} is draining, so the update was dropped")
+        }
+        MembershipWriteRefused::NotLabelsAlone => format!(
             "the label refresh of worker {url} states another fact than its labels, so it \
              was dropped"
         ),
