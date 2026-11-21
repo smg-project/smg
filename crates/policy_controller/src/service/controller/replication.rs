@@ -50,9 +50,9 @@ use crate::{
     service::{
         elector::Fence,
         proto::{self, replica_frame::Frame, replication_event::Event as Sent},
-        replication::{Entry, Event as Written, Log, Unled},
+        replication::{Entry, Event as Written, Log, NotLeading},
     },
-    store::{Cut, Journal, Kinds, LoadSample, MemoryStore, Position},
+    store::{Journal, JournalKinds, LoadSample, MemoryStore, Position, StoreCheckpoint},
 };
 
 /// The watched kinds' ring: the membership and status events a watcher or a
@@ -223,13 +223,13 @@ impl Replication {
         }
         match self.log.leads(term) {
             Ok(()) => Ok(()),
-            Err(Unled::NotYet) => Err(Status::unavailable(format!(
+            Err(NotLeading::NotYet) => Err(Status::unavailable(format!(
                 "this replica has not yet written under term {term}"
             ))),
-            Err(Unled::Follows(followed)) => Err(Status::unavailable(format!(
+            Err(NotLeading::Follows(followed)) => Err(Status::unavailable(format!(
                 "this replica took term {term} and its log followed term {followed}: its writes stand under no term until a later take"
             ))),
-            Err(Unled::Past(stored)) => Err(Status::unavailable(format!(
+            Err(NotLeading::Past(stored)) => Err(Status::unavailable(format!(
                 "this replica's store is under term {stored}, a later take than term {term}"
             ))),
         }
@@ -321,7 +321,7 @@ impl Replication {
     /// stream restored at that place ([`Kept`]). The place is `term`'s own:
     /// where the term moved between the admission and the read, the stream
     /// ends `UNAVAILABLE`.
-    pub(super) fn cut(&self, term: u64) -> Result<Arc<Cut>, Status> {
+    pub(super) fn cut(&self, term: u64) -> Result<Arc<StoreCheckpoint>, Status> {
         self.serves(term)?;
         let cut = self.cuts.at_head(&self.store, &self.log);
         // A take, or another leader's event, can land between the admission
@@ -343,7 +343,11 @@ impl Replication {
     /// streams took no part for [`STALLED`]. The room is counted under the
     /// holds' lock and the cut is made with that lock let go: a cut at a
     /// new head copies the store.
-    fn restore(&self, term: u64, now: Instant) -> Result<Option<(Parts, Arc<Cut>)>, Status> {
+    fn restore(
+        &self,
+        term: u64,
+        now: Instant,
+    ) -> Result<Option<(Parts, Arc<StoreCheckpoint>)>, Status> {
         let parts = {
             let mut holds = self.cuts.holds.lock();
             holds.retain(|hold| hold.keeps(now));
@@ -405,7 +409,7 @@ impl Replication {
 #[derive(Debug, Default)]
 struct Kept {
     /// The cut at the log's head, while a stream still sends it.
-    head: Mutex<Weak<Cut>>,
+    head: Mutex<Weak<StoreCheckpoint>>,
     /// The restores under way: each stream's hold of its cut.
     holds: Mutex<Vec<Arc<Hold>>>,
 }
@@ -434,25 +438,25 @@ struct Hold(Mutex<Held>);
 enum Held {
     #[default]
     Room,
-    Cut(Arc<Cut>, Instant),
+    Cut(Arc<StoreCheckpoint>, Instant),
     Gone,
 }
 
 impl Hold {
     /// A hold of `cut` from `now`, with no room taken first: a case's own.
     #[cfg(test)]
-    fn of(cut: Arc<Cut>, now: Instant) -> Self {
+    fn of(cut: Arc<StoreCheckpoint>, now: Instant) -> Self {
         Self(Mutex::new(Held::Cut(cut, now)))
     }
 
     /// The cut made for the room taken, held from `now`.
-    fn fill(&self, cut: Arc<Cut>, now: Instant) {
+    fn fill(&self, cut: Arc<StoreCheckpoint>, now: Instant) {
         *self.0.lock() = Held::Cut(cut, now);
     }
 
     /// The cut for one more part, taken at `now`; `None` once it was let
     /// go.
-    fn take(&self, now: Instant) -> Option<Arc<Cut>> {
+    fn take(&self, now: Instant) -> Option<Arc<StoreCheckpoint>> {
         match &mut *self.0.lock() {
             Held::Cut(cut, taken) => {
                 *taken = now;
@@ -487,13 +491,13 @@ impl Kept {
         self.holds.lock().retain(|hold| hold.keeps(now));
     }
 
-    fn at_head(&self, store: &MemoryStore, log: &Log) -> Arc<Cut> {
+    fn at_head(&self, store: &MemoryStore, log: &Log) -> Arc<StoreCheckpoint> {
         let mut kept = self.head.lock();
-        let head = log.head(Kinds::All);
+        let head = log.head(JournalKinds::All);
         if let Some(cut) = kept.upgrade().filter(|cut| cut.at == head) {
             return cut;
         }
-        let cut = Arc::new(store.cut(Kinds::All));
+        let cut = Arc::new(store.checkpoint(JournalKinds::All));
         *kept = Arc::downgrade(&cut);
         cut
     }
@@ -524,7 +528,7 @@ impl Drop for Parts {
 impl Parts {
     /// The parts of `cut` from `now`, counted by no leader: a case's own.
     #[cfg(test)]
-    fn of(cut: Arc<Cut>, now: Instant) -> Self {
+    fn of(cut: Arc<StoreCheckpoint>, now: Instant) -> Self {
         Self::held(Arc::new(Hold::of(cut, now)))
     }
 
@@ -598,7 +602,7 @@ fn load_rows(loads: &[(WorkerId, u16, LoadSample)], now: Instant) -> Vec<proto::
 /// Every part of the snapshot of `cut`, as sent at `now`: the cases'
 /// leader.
 #[cfg(test)]
-pub(super) fn parts(cut: Arc<Cut>, now: Instant) -> Vec<proto::ReplicationBatch> {
+pub(super) fn parts(cut: Arc<StoreCheckpoint>, now: Instant) -> Vec<proto::ReplicationBatch> {
     let mut parts = Parts::of(cut, now);
     let mut sent = Vec::new();
     while let Some((batch, ends)) = parts.next(now) {
@@ -734,9 +738,9 @@ impl Feed {
             most => u64::from(most).min(ring),
         };
         let log = &source.log;
-        let (place, held) = match log.first(Kinds::All) {
+        let (place, held) = match log.first(JournalKinds::All) {
             Some(first) if place == Position::default() => (first, true),
-            _ => (place, log.holds(Kinds::All, place)),
+            _ => (place, log.holds(JournalKinds::All, place)),
         };
         let restore = if held {
             Restore::No
@@ -779,7 +783,7 @@ impl Feed {
     /// The log's head as a frame states it: one read of the log, after
     /// whatever events the frame carries were read.
     fn head(&self) -> u64 {
-        self.source.log.head(Kinds::All).seq
+        self.source.log.head(JournalKinds::All).seq
     }
 
     /// The snapshot's cut and its first part at `now`, or the stream's end
@@ -893,7 +897,7 @@ impl Feed {
         if self
             .source
             .log
-            .read(Kinds::All, self.place, most, &mut self.entries)
+            .read(JournalKinds::All, self.place, most, &mut self.entries)
             .is_err()
         {
             return self.resync(Why::Place(self.place), now);
@@ -1088,7 +1092,7 @@ mod tests {
     use crate::{
         engine::view::{LoadRow, WorkerId},
         service::{
-            elector::{ElectionSettings, Elector, Tick},
+            elector::{ElectionSettings, Elector, TickOutcome},
             proto::replication_event::Event as Sent,
             replication,
         },
@@ -1126,7 +1130,7 @@ mod tests {
             let mut elector = Elector::alone(IDENTITY, ElectionSettings::default())
                 .expect("the default settings are in order");
             let at = Instant::now();
-            let Ok(Tick::Acquired { term }) = elector.tick(at) else {
+            let Ok(TickOutcome::Acquired { term }) = elector.tick(at) else {
                 panic!("a free lease is taken at the first tick");
             };
             Self {
@@ -1209,7 +1213,7 @@ mod tests {
     fn resync(feed: &mut Feed, at: Instant) -> Why {
         let word = proto::ReplicationBatch {
             resync_required: true,
-            head_seq: feed.source.log.head(Kinds::All).seq,
+            head_seq: feed.source.log.head(JournalKinds::All).seq,
             ..proto::ReplicationBatch::default()
         };
         match (feed.look(at), &feed.restore) {
@@ -1277,7 +1281,7 @@ mod tests {
             }
         }
         assert_eq!(sizes, [256, 256, 256, 234]);
-        assert_eq!(feed.place, leader.log.head(Kinds::All));
+        assert_eq!(feed.place, leader.log.head(JournalKinds::All));
     }
 
     #[test]
@@ -1324,7 +1328,7 @@ mod tests {
         let mut entries = Vec::new();
         leader
             .log
-            .read(Kinds::All, START, Log::BATCH, &mut entries)
+            .read(JournalKinds::All, START, Log::BATCH, &mut entries)
             .expect("the log holds its start");
         assert!(entries.len() > 2, "{}", entries.len());
         assert!(follows(START, &entries));
@@ -1346,7 +1350,7 @@ mod tests {
         let leader = Leader::leading();
         leader.writes(4);
         let replication = leader.replication();
-        let held = leader.log.head(Kinds::All);
+        let held = leader.log.head(JournalKinds::All);
         let lost = Position {
             seq: held.seq + 1,
             ..held
@@ -1527,10 +1531,12 @@ mod tests {
         // The take, the registration and three load rows: five events.
         leader.writes(3);
         let mut entries = Vec::new();
-        let read = leader.log.read(Kinds::All, START, Log::BATCH, &mut entries);
+        let read = leader
+            .log
+            .read(JournalKinds::All, START, Log::BATCH, &mut entries);
         assert!(read.is_ok());
         let first = entries.first().expect("the take's event").at;
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         let (all, last) = fitting(first, head.seq, &entries, leader.at, usize::MAX, None);
         assert_eq!((all.len(), last), (5, head));
         // What a batch of the first `count` events weighs on the wire.
@@ -1596,7 +1602,7 @@ mod tests {
         let leader = Leader::elected();
         leader.writes(1);
         leader.store.set_term(leader.term);
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         let join = |place| {
             Feed::join(
                 &leader.replication(),
@@ -1644,8 +1650,8 @@ mod tests {
             leader
         };
         let (before, after) = (run(), run());
-        let held = before.log.head(Kinds::All);
-        let head = after.log.head(Kinds::All);
+        let held = before.log.head(JournalKinds::All);
+        let head = after.log.head(JournalKinds::All);
         assert_eq!(held.term, head.term, "one term, two runs");
         let join = |place| {
             Feed::join(
@@ -1664,14 +1670,14 @@ mod tests {
         assert!(matches!(join(head).restore, Restore::No));
         // The log is a watcher's judge as well, and a load row's place is
         // one it holds: this run's head, and no place of the run before.
-        assert!(after.log.holds(Kinds::Watched, head), "{head:?}");
-        assert!(!after.log.holds(Kinds::Watched, held), "{held:?}");
+        assert!(after.log.holds(JournalKinds::Watched, head), "{head:?}");
+        assert!(!after.log.holds(JournalKinds::Watched, held), "{held:?}");
 
         // A standby that applied nothing names no place of either run: it
         // stands at this run's first place and reads its writes from there.
         let first = after
             .log
-            .first(Kinds::All)
+            .first(JournalKinds::All)
             .expect("every write is retained");
         assert_eq!(first.term, 0, "{first:?}");
         let mut feed = join(START);
@@ -1725,7 +1731,7 @@ mod tests {
         let mut feed = leader.feed(START, RING);
         // The lease is given up and taken again: a later term.
         assert!(leader.elector.release().expect("the lease's own store"));
-        let Ok(Tick::Acquired { term }) = leader.elector.tick(leader.at) else {
+        let Ok(TickOutcome::Acquired { term }) = leader.elector.tick(leader.at) else {
             panic!("a released lease is taken at the next tick");
         };
         assert!(term > leader.term);
@@ -1740,7 +1746,7 @@ mod tests {
         let leader = Leader::leading();
         // The take, the registration and 300 load rows: more than a batch.
         leader.writes(300);
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         let ends =
             |batch: &proto::ReplicationBatch| batch.first_seq + batch.events.len() as u64 - 1;
         let mut feed = leader.feed(START, RING);
@@ -1847,7 +1853,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         let part = sent[0].snapshot.as_ref().expect("a part");
         assert!(part.last && part.workers.is_empty() && part.loads.is_empty());
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         assert_eq!((sent[0].first_seq, sent[0].term), (head.seq + 1, head.term));
     }
 
@@ -1865,7 +1871,7 @@ mod tests {
             source: LoadSource::Stream,
         };
         // A cut of load rows alone, a worker each: above two pages of them.
-        let cut = Arc::new(Cut {
+        let cut = Arc::new(StoreCheckpoint {
             at: Position { seq: 7, term: 3 },
             epoch: 2,
             rows: Vec::new(),
@@ -1916,21 +1922,21 @@ mod tests {
         leader.writes(1);
         let later = replication.cut(leader.term).expect("a cut");
         assert!(!Arc::ptr_eq(&first, &later));
-        assert_eq!(later.at, leader.log.head(Kinds::All));
+        assert_eq!(later.at, leader.log.head(JournalKinds::All));
         // Nothing is kept past the last stream that holds a cut: the next
         // at the same place copies the rows again.
         let held = Arc::downgrade(&later);
         drop(later);
         assert!(held.upgrade().is_none(), "the rows are let go");
         let again = replication.cut(leader.term).expect("a cut");
-        assert_eq!(again.at, leader.log.head(Kinds::All));
+        assert_eq!(again.at, leader.log.head(JournalKinds::All));
     }
 
     #[test]
     fn a_place_the_log_does_not_hold_is_told_to_resync() {
         let leader = Leader::leading();
         leader.writes(4);
-        let held = leader.log.head(Kinds::All);
+        let held = leader.log.head(JournalKinds::All);
         for place in [
             Position {
                 term: held.term + 1,
@@ -1952,7 +1958,7 @@ mod tests {
 
     /// A place past the head of `leader`'s log: one its log does not hold.
     fn past_the_head(leader: &Leader) -> Position {
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         Position {
             seq: head.seq + 9,
             ..head
@@ -1963,7 +1969,7 @@ mod tests {
     fn a_standby_the_log_does_not_continue_is_restored_by_the_looks_after_the_word() {
         let leader = Leader::leading();
         let id = leader.writes(3);
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         let lost = past_the_head(&leader);
         let mut feed = leader.feed(lost, RING);
         assert_eq!(resync(&mut feed, leader.at), Why::Place(lost));
@@ -2227,7 +2233,7 @@ mod tests {
             parts += 1;
         }
         assert_eq!(parts, 1, "the rows' part, then the last");
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         assert_eq!((feed.place, feed.acked), (head, head.seq));
         assert!(matches!(feed.look(later), Step::Idle));
     }
@@ -2271,7 +2277,7 @@ mod tests {
         let leader = Leader::leading();
         let id = leader.writes(3);
         let cut = leader.replication().cut(leader.term).expect("a cut");
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         assert_eq!((cut.at, cut.epoch), (head, leader.store.epoch()));
         // The row's part, then the load row's, the last. Each says the
         // place as a heartbeat says the head, and the epoch.
@@ -2336,7 +2342,7 @@ mod tests {
             self.log.carries_loads()
         }
 
-        fn head(&self, kinds: Kinds) -> Position {
+        fn head(&self, kinds: JournalKinds) -> Position {
             // Taken out before it runs: the write reads no head itself.
             let lands = self.lands.lock().take();
             if let Some(lands) = lands {
@@ -2410,7 +2416,7 @@ mod tests {
         leader.writes(1);
         let mut feed = leader.feed(START, RING);
         let sent = batch(feed.look(leader.at));
-        let head = leader.log.head(Kinds::All);
+        let head = leader.log.head(JournalKinds::All);
         assert_eq!(sent.first_seq + sent.events.len() as u64 - 1, head.seq);
         // Silent under a second: nothing. At the second: the heartbeat.
         let second = leader.at + BEAT;

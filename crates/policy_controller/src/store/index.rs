@@ -79,12 +79,12 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     engine::{
-        view::{Candidate, HashKind, NamedAffinity, NamedHolder, Role, WorkerId},
-        warm_up::{WarmRule, Warming},
+        view::{AffinityHolder, AffinityRows, Candidate, HashKind, Role, WorkerId},
+        warm_up::{WarmUpRule, WarmUpState},
     },
     store::{
-        kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
-        snapshot::Naming,
+        kv_events::{BatchAdmission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
+        snapshot::AffinityQuery,
         workers::WorkerRow,
         GatewayId,
     },
@@ -353,20 +353,20 @@ fn admitted<B: Blocks>(
         return Ok(None);
     }
     match cursor.admit(facts.sequence, clears) {
-        Admission::Stale => Err(BatchOutcome::Skipped),
-        Admission::Replay { expected } => Err(BatchOutcome::Gap {
+        BatchAdmission::Stale => Err(BatchOutcome::Skipped),
+        BatchAdmission::Replay { expected } => Err(BatchOutcome::Gap {
             expected,
             received: facts.sequence,
         }),
-        Admission::Restart => {
+        BatchAdmission::Restart => {
             blocks.cleared();
             Ok(Some(ResyncReason::PublisherRestart))
         }
-        Admission::Unrecovered { cleared: true, .. } => {
+        BatchAdmission::Unrecovered { cleared: true, .. } => {
             blocks.cleared();
             Ok(Some(ResyncReason::GapCleared))
         }
-        Admission::Apply | Admission::Unrecovered { cleared: false, .. } => Ok(None),
+        BatchAdmission::Apply | BatchAdmission::Unrecovered { cleared: false, .. } => Ok(None),
     }
 }
 
@@ -488,12 +488,13 @@ fn below(draw: &mut Draw, under: u32) -> u32 {
 }
 
 /// The rows a naming wrote in the affinity column's place
-/// ([`StoreSnapshot::name`](crate::store::StoreSnapshot::name)), with the
-/// naming's own buffers: a host keeps it across decisions beside its view.
+/// ([`StoreSnapshot::fill_affinity_rows`](crate::store::StoreSnapshot::fill_affinity_rows)),
+/// with the naming's own buffers: a host keeps it across decisions beside its
+/// view.
 #[derive(Debug, Default)]
-pub struct Named {
+pub struct AffinityRowsBuffers {
     /// The rows that hold a leading part of the request, ascending by row.
-    pub holders: Vec<NamedHolder>,
+    pub holders: Vec<AffinityHolder>,
     /// The pool's warming rows the decision reads, ascending.
     pub warming: Vec<u32>,
     /// The warming rows are the thin.
@@ -532,11 +533,11 @@ impl Default for RecordRead {
     }
 }
 
-impl Named {
+impl AffinityRowsBuffers {
     /// The lists as a request carries them
     /// ([`RequestFacts::named`](crate::engine::RequestFacts::named)).
-    pub fn affinity(&self) -> NamedAffinity<'_> {
-        NamedAffinity {
+    pub fn affinity(&self) -> AffinityRows<'_> {
+        AffinityRows {
             holders: &self.holders,
             warming: &self.warming,
             thin: self.thin,
@@ -597,7 +598,7 @@ impl Predicted {
     const SLICE: usize = 16;
     const SWEEP: usize = 64;
 
-    fn sent(&self, named: &Named, target: WorkerId, allowed: &AtomicBool) {
+    fn sent(&self, named: &AffinityRowsBuffers, target: WorkerId, allowed: &AtomicBool) {
         if named.sent.whole && named.sent.fresh && named.deepest.contains(&target) {
             // A fresh hit need not wait for a writer to sweep.
             if self.sweeping.load(Ordering::Relaxed) {
@@ -743,7 +744,7 @@ impl Tables {
     /// caller's, written where the pool's own does not serve as it stands.
     fn within<'a>(
         &'a self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         locals: &[(u32, GatewayId)],
         mask: &'a mut [u64; MASK_WORDS],
     ) -> &'a [u64] {
@@ -832,7 +833,7 @@ impl Tables {
     #[inline(never)]
     fn look_again(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         within: &[u64],
         cap: usize,
         whole_at: u64,
@@ -856,7 +857,7 @@ impl Tables {
     #[inline(never)]
     fn again(
         index: &Index,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         within: &[u64],
         cap: usize,
         whole_at: u64,
@@ -903,16 +904,16 @@ impl Tables {
     #[inline(never)]
     fn passing(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         within: &[u64],
         room: usize,
         passes: &dyn Fn(u32) -> bool,
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) -> bool {
         let Some(index) = self.index.as_deref() else {
             return false;
         };
-        let Named { kept, first, .. } = named;
+        let AffinityRowsBuffers { kept, first, .. } = named;
         first.clear();
         first.extend_from_slice(kept);
         let words = within.len().min(MASK_WORDS);
@@ -1017,14 +1018,14 @@ mod seam {
 pub(super) struct PoolIndex {
     tables: Arc<Tables>,
     /// The ruling the warming rows were read under.
-    rule: Option<WarmRule>,
+    rule: Option<WarmUpRule>,
     /// The generation's settings for the sent-prefix record.
     predict: Option<Predict>,
     /// The pool's warming rows, ascending, each with the instant its naming
     /// ends on the store's clock, in microseconds.
     warming: Box<[(u32, u64)]>,
     /// Whether the rows are the thin, and from when they are named.
-    ruled: Warming,
+    ruled: WarmUpState,
     /// The earliest end among the rows: a decision before it names them as
     /// they stand.
     first_end: u64,
@@ -1042,10 +1043,15 @@ impl PoolIndex {
     /// The pool's warming rows at `at` under `rule`, into `reading`, and
     /// how they are read at a later instant: the ruling's own entry over
     /// each row's blocks in the index and its admission.
-    fn warming(tables: &Tables, rule: Option<WarmRule>, at: u64, reading: &mut Reading) -> Warming {
+    fn warming(
+        tables: &Tables,
+        rule: Option<WarmUpRule>,
+        at: u64,
+        reading: &mut Reading,
+    ) -> WarmUpState {
         let Some(rule) = rule else {
             reading.rows.clear();
-            return Warming::default();
+            return WarmUpState::default();
         };
         // The index read once, ahead of the walk: the tables hold a cell (the
         // count they are whole at), so a shared reference to them does not tell
@@ -1059,7 +1065,7 @@ impl PoolIndex {
         };
         reading.sizes.clear();
         reading.sizes.extend(tables.id_of.iter().map(size));
-        rule.name(
+        rule.list_warming_rows(
             &reading.sizes,
             &tables.admitted,
             at,
@@ -1069,7 +1075,7 @@ impl PoolIndex {
     }
 
     /// The ruling the warming rows were read under.
-    pub(super) fn rule(&self) -> Option<WarmRule> {
+    pub(super) fn rule(&self) -> Option<WarmUpRule> {
         self.rule
     }
 
@@ -1112,7 +1118,7 @@ impl PoolIndex {
     /// allocates nothing.
     pub(super) fn again(
         &self,
-        rule: Option<WarmRule>,
+        rule: Option<WarmUpRule>,
         at: u64,
         reading: &mut Reading,
     ) -> Option<Self> {
@@ -1132,9 +1138,9 @@ impl PoolIndex {
     /// A pool's standing from a reading of its warming rows.
     fn read(
         tables: Arc<Tables>,
-        rule: Option<WarmRule>,
+        rule: Option<WarmUpRule>,
         predict: Option<Predict>,
-        ruled: Warming,
+        ruled: WarmUpState,
         rows: &[(u32, u64)],
     ) -> Self {
         let ends = rows.iter().map(|&(_, until)| until);
@@ -1151,7 +1157,11 @@ impl PoolIndex {
     /// The rows of the pool a read for `naming` is kept within, by their
     /// index in the pool, ascending: for the cases.
     #[cfg(test)]
-    pub(super) fn reached(&self, naming: &Naming<'_>, locals: &[(u32, GatewayId)]) -> Vec<u32> {
+    pub(super) fn reached(
+        &self,
+        naming: &AffinityQuery<'_>,
+        locals: &[(u32, GatewayId)],
+    ) -> Vec<u32> {
         let mut mask = [0u64; MASK_WORDS];
         let within = self.tables.within(naming, locals, &mut mask);
         let named = |id: &usize| within[id / 64] & (1 << (id % 64)) != 0;
@@ -1164,7 +1174,7 @@ impl PoolIndex {
     }
 
     /// Name the rows of a decision's view for the affinity stages
-    /// ([`NamedAffinity`]): the request's deepest holders and the pool's
+    /// ([`AffinityRows`]): the request's deepest holders and the pool's
     /// warming rows, each list at most `naming.cap` rows, ascending, by
     /// position in `view`. `pool` is the pool's rows as the publication
     /// holds them, `locals` its host-local rows, and `view` the rows the
@@ -1194,12 +1204,12 @@ impl PoolIndex {
     #[inline]
     pub(super) fn name(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         pool: (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
         hash_kind: HashKind,
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) {
         self.name_in::<false>(naming, pool, locals, view, hash_kind, named);
     }
@@ -1211,12 +1221,12 @@ impl PoolIndex {
     /// record names a row where the view holds it, under either naming.
     pub(super) fn name_cut(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         pool: (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
         hash_kind: HashKind,
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) {
         self.name_in::<true>(naming, pool, locals, view, hash_kind, named);
     }
@@ -1226,12 +1236,12 @@ impl PoolIndex {
     /// caller keeps each caller's lookup in a frame of its own.
     fn name_in<const CUT: bool>(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         (pool_at, pool): (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
         hash_kind: HashKind,
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) {
         named.thin = self.ruled.thin;
         let tables = &*self.tables;
@@ -1267,7 +1277,7 @@ impl PoolIndex {
         let record = tables.predicted.as_ref().filter(|_| hashed);
         let record = record.and_then(|predicted| Some((predicted, tables.unheard()?)));
         // The record's holders, in the room the cap leaves where this runs.
-        let name_record = |named: &mut Named, draw: &mut Draw| {
+        let name_record = |named: &mut AffinityRowsBuffers, draw: &mut Draw| {
             let Some((predicted, unheard)) = &record else {
                 return;
             };
@@ -1351,7 +1361,7 @@ impl PoolIndex {
                     "a holder the read was kept within is in the view"
                 );
                 if let Some(at) = at {
-                    named.holders.push(NamedHolder {
+                    named.holders.push(AffinityHolder {
                         row: at,
                         overlap_blocks: blocks,
                         predicted_blocks: 0,
@@ -1423,11 +1433,11 @@ impl PoolIndex {
     #[inline(never)]
     pub(super) fn name_again(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         pool: &[Candidate],
         view: &[Candidate],
         keeps: &dyn Fn(&Candidate) -> bool,
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) {
         let tables = &*self.tables;
         let whole = view.len() == pool.len();
@@ -1436,7 +1446,7 @@ impl PoolIndex {
             cap => cap as usize,
         };
         // A holder the record of sent prefixes named, not the index.
-        let recorded = |holder: &NamedHolder| holder.predicted_blocks != 0;
+        let recorded = |holder: &AffinityHolder| holder.predicted_blocks != 0;
         // The index's room: the cap less the record's holders. Named
         // ahead, they left the index that room. Named behind, they took
         // what its read left, and a read made again takes no more.
@@ -1478,7 +1488,7 @@ impl PoolIndex {
         named.holders.retain(recorded);
         for &(id, blocks) in &named.kept {
             if let Some(at) = at(id) {
-                named.holders.push(NamedHolder {
+                named.holders.push(AffinityHolder {
                     row: at,
                     overlap_blocks: blocks,
                     predicted_blocks: 0,
@@ -1491,7 +1501,7 @@ impl PoolIndex {
     /// Writes the naming's keys for the leased worker, if it has no lane.
     /// A lane whose cache events are not heard counts as none: the record
     /// speaks for the worker until they are.
-    pub(super) fn sent(&self, rows: &[Candidate], named: &Named, target: WorkerId) {
+    pub(super) fn sent(&self, rows: &[Candidate], named: &AffinityRowsBuffers, target: WorkerId) {
         let Some(predicted) = &self.tables.predicted else {
             return;
         };
@@ -1527,10 +1537,10 @@ impl Predicted {
     /// sorting the rows runs after the guard.
     fn name(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         pool: u32,
         usable: &dyn Fn(WorkerId) -> bool,
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) -> u32 {
         PrefixPredictor::fold_into(&mut named.keys, naming.namespace_seed, naming.block_hashes);
         let tick = (naming.now_micros >> 20) as u16;
@@ -1566,7 +1576,7 @@ fn heard_within(within: &[u64], unheard: &[u64; MASK_WORDS]) -> [u64; MASK_WORDS
 fn name_predicted(
     row_of: impl Fn(WorkerId) -> Option<u32>,
     (blocks, cap): (u32, usize),
-    named: &mut Named,
+    named: &mut AffinityRowsBuffers,
     draw: &mut Draw,
 ) {
     let base = named.holders.len();
@@ -1579,7 +1589,7 @@ fn name_predicted(
         let Some(row) = row_of(id) else {
             continue;
         };
-        let holder = NamedHolder {
+        let holder = AffinityHolder {
             row,
             overlap_blocks: 0,
             predicted_blocks: blocks,
@@ -1743,7 +1753,7 @@ impl Index {
     /// decision would pay a call for the lookup it makes once.
     fn deepest_again(
         &self,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         within: &[u64],
         cap: usize,
         seed: u64,
@@ -1973,7 +1983,7 @@ impl KvTables {
         model: &str,
         rows: &[Candidate],
         admitted: &[u64],
-        rule: Option<WarmRule>,
+        rule: Option<WarmUpRule>,
         predict: Option<Predict>,
         at: u64,
         reading: &mut Reading,

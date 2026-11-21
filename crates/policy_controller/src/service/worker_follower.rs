@@ -31,7 +31,7 @@ use tracing::warn;
 use crate::{
     service::{
         client::{Client, Error, ANSWER_WAIT, KEEPALIVE},
-        watcher::{Ended, Watcher},
+        watcher::{WatchStreamEnd, Watcher},
     },
     store::MemoryStore,
 };
@@ -288,11 +288,11 @@ async fn follow(
                 // The controller ended the stream with no error: the next
                 // one goes on after the place.
                 Ok(false) => break,
-                Err(Ended::Lost(lost)) => {
+                Err(WatchStreamEnd::Lost(lost)) => {
                     warn!(?lost, "Lost the controller's worker watch position");
                     break;
                 }
-                Err(Ended::Client(error)) => return error,
+                Err(WatchStreamEnd::Client(error)) => return error,
             }
             if following.watcher().at().is_some() {
                 // The store holds the fleet as of a place. The owner brings

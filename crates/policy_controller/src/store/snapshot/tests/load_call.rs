@@ -22,7 +22,7 @@ mod held {
             view::{Candidate, RequestFacts, Role, WorkerId},
         },
         stages::{lifecycle::Lifecycle, pickers::target_of, StageRegistry},
-        store::{snapshot::ViewBuffers, Kinds, LoadSink, LoadSource, MemoryStore},
+        store::{snapshot::ViewBuffers, JournalKinds, LoadSink, LoadSource, MemoryStore},
         tracking::{in_flight::WorkerSlot, lease::Signal},
     };
 
@@ -267,7 +267,7 @@ mod held {
         let id = member(&leader, "http://a:8000");
         leader.record(id, 0, load(3, 0), Instant::now(), LoadSource::Stream);
         assert!(told.lock().is_empty(), "nothing of the leader's yet");
-        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
         let restored = shown(&standby, id);
         assert_ne!(restored, 0, "the restore's world shows the report");
         assert_eq!(

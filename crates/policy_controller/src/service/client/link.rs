@@ -64,7 +64,7 @@ pub struct Link {
 /// Why an ask has no usable decision from the controller. The host can
 /// decide the request itself.
 #[derive(Debug)]
-pub enum Unanswered {
+pub enum DecisionUnavailable {
     /// The stream holds no credit. Nothing was sent.
     NoCredit,
     /// The controller's reason for leaving the request to the host and the
@@ -278,7 +278,7 @@ impl Link {
     ///
     /// An id stays taken until its ask's answer arrives, also where the
     /// asker left or its budget ended. An ask under it in that time is
-    /// [`Unanswered::InFlight`], so no ask takes an answer made for an
+    /// [`DecisionUnavailable::InFlight`], so no ask takes an answer made for an
     /// earlier one.
     ///
     /// A request the controller's check refuses is refused here, by the
@@ -288,7 +288,7 @@ impl Link {
         &self,
         request: DecideRequest,
         budget: Duration,
-    ) -> Result<Decision, Unanswered> {
+    ) -> Result<Decision, DecisionUnavailable> {
         self.ask_cut(request, 0, budget).await
     }
 
@@ -300,26 +300,26 @@ impl Link {
         mut request: DecideRequest,
         left_out: usize,
         budget: Duration,
-    ) -> Result<Decision, Unanswered> {
+    ) -> Result<Decision, DecisionUnavailable> {
         let cut = match fit(&mut request).and_then(|cut| in_range(&request).map(|()| cut)) {
             Ok(cut) => cut,
-            Err(_) if !self.stands() => return Err(Unanswered::Ended),
-            Err(error) => return Err(Unanswered::Unsent(error)),
+            Err(_) if !self.stands() => return Err(DecisionUnavailable::Ended),
+            Err(error) => return Err(DecisionUnavailable::Unsent(error)),
         };
         let deadline = Instant::now().checked_add(budget);
         let mut pending = self.shared.begin(request, deadline, cut + left_out)?;
         if budget.is_zero() {
-            return Err(Unanswered::Late);
+            return Err(DecisionUnavailable::Late);
         }
         let answer = match deadline {
             Some(at) => timeout_at(at, &mut pending.answer)
                 .await
-                .map_err(|_| Unanswered::Late)?,
+                .map_err(|_| DecisionUnavailable::Late)?,
             None => (&mut pending.answer).await,
         };
-        match answer.map_err(|_| Unanswered::Ended)? {
+        match answer.map_err(|_| DecisionUnavailable::Ended)? {
             Answer::Decision(decision) => Ok(decision),
-            Answer::Busy(busy) => Err(Unanswered::Busy(busy)),
+            Answer::Busy(busy) => Err(DecisionUnavailable::Busy(busy)),
         }
     }
 
@@ -749,18 +749,18 @@ impl Shared {
         request: DecideRequest,
         deadline: Option<Instant>,
         cut: usize,
-    ) -> Result<Pending<'_>, Unanswered> {
+    ) -> Result<Pending<'_>, DecisionUnavailable> {
         let mut state = self.state.lock();
-        let open = state.open.as_mut().ok_or(Unanswered::Ended)?;
+        let open = state.open.as_mut().ok_or(DecisionUnavailable::Ended)?;
         if open.pending.contains_key(request.request_id.as_slice()) {
-            return Err(Unanswered::InFlight);
+            return Err(DecisionUnavailable::InFlight);
         }
         if open.credit == 0 {
-            return Err(Unanswered::NoCredit);
+            return Err(DecisionUnavailable::NoCredit);
         }
         let id = Arc::<[u8]>::from(request.request_id.as_slice());
         if open.requests.send(request).is_err() {
-            return Err(Unanswered::Ended);
+            return Err(DecisionUnavailable::Ended);
         }
         open.credit -= 1;
         // A reader takes this same lock before it can deliver an answer.
@@ -1258,7 +1258,10 @@ pub(super) mod tests {
             ));
         })
         .await;
-        assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+        assert!(matches!(
+            within(asked).await,
+            Err(DecisionUnavailable::Ended)
+        ));
         assert_eq!(within(peer.reports.next()).await, None);
         assert_eq!(within(peer.requests.next()).await, None);
         Peer::readers_end(peer.readers).await;
@@ -1270,7 +1273,7 @@ pub(super) mod tests {
         assert_eq!(peer.link.welcome().decide_window, 1);
         assert!(matches!(
             peer.link.ask(DecideRequest::default(), WAIT).await,
-            Err(Unanswered::Unsent(Error::RequestId(0)))
+            Err(DecisionUnavailable::Unsent(Error::RequestId(0)))
         ));
         let mut too_large = request(4);
         too_large.facts = Some(RequestFacts {
@@ -1279,7 +1282,7 @@ pub(super) mod tests {
         });
         assert!(matches!(
             peer.link.ask(too_large, WAIT).await,
-            Err(Unanswered::Unsent(Error::TooLarge(_)))
+            Err(DecisionUnavailable::Unsent(Error::TooLarge(_)))
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
 
@@ -1288,7 +1291,7 @@ pub(super) mod tests {
         assert_eq!(within(peer.requests.next()).await, Some(request(1)));
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::NoCredit))
+            Poll::Ready(Err(DecisionUnavailable::NoCredit))
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
 
@@ -1297,10 +1300,12 @@ pub(super) mod tests {
             retry_after_micros: 125,
         };
         peer.answer(1, 4, decide_answer::Answer::Busy(busy));
-        assert!(matches!(within(first).await, Err(Unanswered::Busy(told)) if told == busy));
+        assert!(
+            matches!(within(first).await, Err(DecisionUnavailable::Busy(told)) if told == busy)
+        );
         assert!(matches!(
             peer.link.ask(request(2), WAIT).await,
-            Err(Unanswered::NoCredit)
+            Err(DecisionUnavailable::NoCredit)
         ));
         peer.credit(5, 1);
         peer.credit(6, 1);
@@ -1325,7 +1330,7 @@ pub(super) mod tests {
         assert_eq!(within(peer.requests.next()).await, Some(request(3)));
         assert!(matches!(
             peer.link.ask(request(4), WAIT).await,
-            Err(Unanswered::NoCredit)
+            Err(DecisionUnavailable::NoCredit)
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
     }
@@ -1356,7 +1361,7 @@ pub(super) mod tests {
             wrong.facts = Some(facts);
             let refused = peer.link.ask(wrong, WAIT).await;
             assert!(
-                matches!(refused, Err(Unanswered::Unsent(Error::OutOfRange(named))) if named == field),
+                matches!(refused, Err(DecisionUnavailable::Unsent(Error::OutOfRange(named))) if named == field),
                 "{field}: {refused:?}"
             );
         }
@@ -1369,7 +1374,7 @@ pub(super) mod tests {
         assert!(
             matches!(
                 refused,
-                Err(Unanswered::Unsent(Error::OutOfRange("decode_of")))
+                Err(DecisionUnavailable::Unsent(Error::OutOfRange("decode_of")))
             ),
             "{refused:?}"
         );
@@ -1413,7 +1418,7 @@ pub(super) mod tests {
             peer.at_term(u64::from(5 + credit)).await;
             assert!(matches!(
                 poll(Box::pin(peer.link.ask(request(1), WAIT)).as_mut()),
-                Poll::Ready(Err(Unanswered::InFlight))
+                Poll::Ready(Err(DecisionUnavailable::InFlight))
             ));
             assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         }
@@ -1437,13 +1442,16 @@ pub(super) mod tests {
         advance(budget - step).await;
         assert!(poll(first.as_mut()).is_pending());
         advance(2 * step).await;
-        assert!(matches!(within(first).await, Err(Unanswered::Late)));
+        assert!(matches!(
+            within(first).await,
+            Err(DecisionUnavailable::Late)
+        ));
 
         // The first ask's answer is still due. A second ask under its id
         // would take that answer for its own: it is refused, unsent.
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(1), budget)).as_mut()),
-            Poll::Ready(Err(Unanswered::InFlight))
+            Poll::Ready(Err(DecisionUnavailable::InFlight))
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         peer.answer(1, 5, decision(7, &[Side::Single]));
@@ -1462,7 +1470,7 @@ pub(super) mod tests {
 
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), Duration::ZERO)).as_mut()),
-            Poll::Ready(Err(Unanswered::Late))
+            Poll::Ready(Err(DecisionUnavailable::Late))
         ));
         assert_eq!(within(peer.requests.next()).await, Some(request(2)));
     }
@@ -1474,7 +1482,7 @@ pub(super) mod tests {
 
         assert!(matches!(
             peer.link.ask(request(1), Duration::ZERO).await,
-            Err(Unanswered::Late)
+            Err(DecisionUnavailable::Late)
         ));
         assert_eq!(within(peer.requests.next()).await, Some(request(1)));
         // A pair is given back whole, in one frame that names no side.
@@ -1495,7 +1503,7 @@ pub(super) mod tests {
         // The dropped ask's answer is still due: its id stays taken.
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::InFlight))
+            Poll::Ready(Err(DecisionUnavailable::InFlight))
         ));
         peer.answer(2, 4, decision(8, &[Side::Single]));
 
@@ -1543,7 +1551,10 @@ pub(super) mod tests {
                 }
             })
             .await;
-            assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+            assert!(matches!(
+                within(asked).await,
+                Err(DecisionUnavailable::Ended)
+            ));
             assert!(!peer.link.stands());
             assert_eq!(peer.link.term_floor(), 6);
             assert!(matches!(
@@ -1578,7 +1589,7 @@ pub(super) mod tests {
                 for _ in 0..2 {
                     assert!(matches!(
                         peer.link.ask(request(2), WAIT).await,
-                        Err(Unanswered::Ended)
+                        Err(DecisionUnavailable::Ended)
                     ));
                 }
             }
@@ -1598,7 +1609,10 @@ pub(super) mod tests {
                     .send(Err(status))
                     .expect("the decide reader takes the status");
             }
-            assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+            assert!(matches!(
+                within(asked).await,
+                Err(DecisionUnavailable::Ended)
+            ));
             Peer::readers_end(peer.readers).await;
             assert!(matches!(
                 peer.link.ended().as_deref(),
@@ -1651,8 +1665,14 @@ pub(super) mod tests {
             ),
         };
         closes(&link, end).await;
-        assert!(matches!(within(first).await, Err(Unanswered::Ended)));
-        assert!(matches!(within(second).await, Err(Unanswered::Ended)));
+        assert!(matches!(
+            within(first).await,
+            Err(DecisionUnavailable::Ended)
+        ));
+        assert!(matches!(
+            within(second).await,
+            Err(DecisionUnavailable::Ended)
+        ));
         Peer::readers_end(peer.readers).await;
         assert!(!peer.link.stands());
         // The link keeps why it ended: a stream's status whole, and the
@@ -1675,11 +1695,11 @@ pub(super) mod tests {
         assert!(said, "session {session}, closed {closed:?}: {ended:?}");
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(3), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::Ended))
+            Poll::Ready(Err(DecisionUnavailable::Ended))
         ));
         assert!(matches!(
             peer.link.ask(DecideRequest::default(), WAIT).await,
-            Err(Unanswered::Ended)
+            Err(DecisionUnavailable::Ended)
         ));
         // A report made now waits for the link's next session.
         peer.link.queue_frame(gone(7));
@@ -1761,7 +1781,7 @@ pub(super) mod tests {
         link.queue_frame(gone(7));
         assert!(matches!(
             link.ask(request(1), Duration::ZERO).await,
-            Err(Unanswered::Late)
+            Err(DecisionUnavailable::Late)
         ));
         drop(link);
 
@@ -1956,7 +1976,10 @@ pub(super) mod tests {
         assert!(poll(closed.as_mut()).is_pending());
         let mut first = peer.redial(1);
         within(closed).await;
-        assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+        assert!(matches!(
+            within(asked).await,
+            Err(DecisionUnavailable::Ended)
+        ));
         assert!(link.stands() && link.ended().is_none());
         // The ask and the report sat in the first session's queues: its
         // streams end ahead of them.
@@ -2016,7 +2039,7 @@ pub(super) mod tests {
         assert!(poll(asked.as_mut()).is_pending());
         assert!(matches!(
             poll(Box::pin(link.ask(request(2), WAIT)).as_mut()),
-            Poll::Ready(Err(Unanswered::NoCredit))
+            Poll::Ready(Err(DecisionUnavailable::NoCredit))
         ));
 
         peer.answer(1, WELCOME_TERM, decision(8, &[Side::Single]));

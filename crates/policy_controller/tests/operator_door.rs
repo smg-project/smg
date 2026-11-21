@@ -4,8 +4,8 @@ use std::{error::Error, sync::Arc, time::Instant};
 
 use smg_policy_controller::{
     document::operator::{
-        snapshot::{told, Rows, WorkerRowsQuery},
-        Applied, DocumentManager, Format, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
+        snapshot::{worker_rows_page, Rows, WorkerRowsQuery},
+        ApplyOutcome, DocumentManager, EnforceRefused, Format, SpecRejected, MAX_DOCUMENT_BYTES,
     },
     stages::StageRegistry,
     store::{MemoryStore, StaleGeneration, WorkerFacts, WorkersStore},
@@ -30,7 +30,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert_eq!(door.standing(), (0, None));
     assert_eq!(
         door.apply(START.to_vec(), Format::Json),
-        Ok(Applied::Generation(1))
+        Ok(ApplyOutcome::Generation(1))
     );
 
     let status = door.status().expect("the start's status");
@@ -84,7 +84,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
         limit: 1,
     };
     let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
-    let page = told(&asked, Rows::Told(rows, serving), Instant::now());
+    let page = worker_rows_page(&asked, Rows::Told(rows, serving), Instant::now());
     let [row] = page.rows.as_slice() else {
         panic!("one row fits the limit");
     };
@@ -92,10 +92,10 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert!(page.truncated);
 
     let asked = WorkerRowsQuery { limit: 2, ..asked };
-    let page = told(
+    let page = worker_rows_page(
         &asked,
         Rows::Shared(Arc::new(
-            store.cut(smg_policy_controller::store::Kinds::Watched),
+            store.checkpoint(smg_policy_controller::store::JournalKinds::Watched),
         )),
         Instant::now(),
     );
@@ -134,7 +134,7 @@ fn a_host_reads_a_refusal_as_an_error() {
         words.starts_with("no document is held for generation 2: "),
         "{words}"
     );
-    let unanswered: Box<dyn Error> = Box::new(Unanswered::NotHeld(missing));
+    let unanswered: Box<dyn Error> = Box::new(EnforceRefused::NotHeld(missing));
     assert_eq!(unanswered.to_string(), words);
 }
 

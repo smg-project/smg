@@ -551,9 +551,9 @@ mod tests {
         document::spec::{AcrossRanks, AppliedSpec, PolicySpec, SignalSpec},
         engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
         store::{
-            Ask, GatewayId, LoadSample, LoadSource, MemoryStore, Overload,
-            PollMode as StorePollMode, SignalWriteOutcome, ViewBuffers, WorkerFacts, WorkerPatch,
-            WorkerStatus, WorkersStore,
+            GatewayId, LoadSample, LoadSource, MemoryStore, Overload, PollMode as StorePollMode,
+            SignalWriteOutcome, ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch, WorkerStatus,
+            WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -723,7 +723,7 @@ mod tests {
 
         fn overloaded(&self, id: WorkerId, now: Instant) -> bool {
             let mut out = ViewBuffers::default();
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now,
                 pinned: None,
@@ -1459,7 +1459,7 @@ mod tests {
     fn cells(replica: &Replica) -> FxHashMap<WorkerId, Held> {
         replica.publish();
         replica.store.memory.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: Instant::now(),
                 pinned: None,

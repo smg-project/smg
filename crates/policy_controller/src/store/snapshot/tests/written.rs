@@ -11,8 +11,8 @@ use crate::{
     engine::view::{Role, WireModes, WorkerId},
     store::{
         snapshot::{Classes, Writer, PUBLISH_WINDOW},
-        Kinds, LeaderBits, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch,
-        WorkerRow, WorkerStatus, WorkersStore,
+        JournalKinds, LeaderBits, MembershipChange, MemoryStore, Position, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     tracking::in_flight::WorkerSlot,
 };
@@ -300,7 +300,7 @@ fn a_followed_refresh_asks_the_pair_classes_what_the_leaders_refresh_asks() {
     leader.upsert(offered("grpc://da:9000", Role::Decode, "tx-a"));
     leader.publish_now();
     let standby = MemoryStore::new();
-    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
     // Each store's build asked, then its count of whole derivations.
     let wholes = || {
         leader.publish_now();

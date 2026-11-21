@@ -44,8 +44,8 @@ use smg_policy_controller::{
     document::{PolicySpec, PRESETS},
     engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
     store::{
-        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, VetoWrite,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, VetoWrite,
+        ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -139,8 +139,8 @@ fn pool_of(n: usize, beside: Beside) -> (MemoryStore, Vec<WorkerId>, Instant) {
     (store, ids, opened)
 }
 
-fn ask_at(opened: Instant, pinned: Option<WorkerId>, affinity: bool) -> Ask {
-    Ask {
+fn ask_at(opened: Instant, pinned: Option<WorkerId>, affinity: bool) -> ViewQuery {
+    ViewQuery {
         gateway: ASKER,
         now: opened + Duration::from_secs(1),
         pinned,

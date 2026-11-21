@@ -39,7 +39,8 @@ use crate::{
     document::routing_key::KeySources,
     engine::{
         framework::{
-            Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
+            Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer,
+            WeightedScorer,
         },
         sticky_sessions::SessionRule,
         view::{blocks_within, threshold_permille, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
@@ -241,19 +242,19 @@ pub struct Needs {
     /// asks for the index and the hash fields for the request's hashes, and
     /// neither stands for the column. A host fills the column where this is
     /// declared and may hand an empty column elsewhere. Rows it names in
-    /// the column's place ([`NamedAffinity`](crate::engine::NamedAffinity)) answer
-    /// the crate's own affinity stages and no other reader: a named row
-    /// says its two depths and nothing of its age, growth or index size, so
-    /// a host fills the column for a profile with a stage that reads those,
-    /// a guest's among them. The engine checks the column's shape, never
-    /// its presence: an unfilled column reads as nothing held for every
-    /// candidate and nothing is refused. What holds a host to the need is
-    /// the builder of its view, by a case of its own.
+    /// the column's place ([`AffinityRows`](crate::engine::AffinityRows))
+    /// answer the crate's own affinity stages and no other reader: a named row
+    /// says its two depths and nothing of its age, growth or index size, so a
+    /// host fills the column for a profile with a stage that reads those, a
+    /// guest's among them. The engine checks the column's shape, never its
+    /// presence: an unfilled column reads as nothing held for every candidate
+    /// and nothing is refused. What holds a host to the need is the builder of
+    /// its view, by a case of its own.
     pub affinity: bool,
     /// The sample of a picker that decides a large pool by a draw of this
     /// many rows and the rows the host names; `0` for none. A host that can
     /// name the request's holders and the pool's warming rows
-    /// ([`NamedAffinity`](crate::engine::NamedAffinity)) hands those in the
+    /// ([`AffinityRows`](crate::engine::AffinityRows)) hands those in the
     /// column's place, each list capped at this many rows: the holders by
     /// depth, whole depth groups from the deepest while they fit and the
     /// group at the cap's edge by a uniform draw from the decision's seed;
@@ -3742,7 +3743,7 @@ enum Scored {
     /// defaults.
     Typed(ScoreStage),
     /// A scorer the catalog built, with its weight.
-    Built(Weighted),
+    Built(WeightedScorer),
 }
 
 /// The stage a score entry stands for. The catalog is asked for the name
@@ -3787,14 +3788,16 @@ fn scored(
                 },
             }),
         },
-        (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(Weighted {
+        (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(WeightedScorer {
             scorer,
             weight: 1.0,
         })),
-        (ScoreSpec::Added { written, .. }, Found::Built(scorer)) => Ok(Scored::Built(Weighted {
-            scorer,
-            weight: added_weight(written, &at.sub(name))?,
-        })),
+        (ScoreSpec::Added { written, .. }, Found::Built(scorer)) => {
+            Ok(Scored::Built(WeightedScorer {
+                scorer,
+                weight: added_weight(written, &at.sub(name))?,
+            }))
+        }
         (entry, Found::With(build)) => {
             let at = at.sub(name);
             let mut params = if let ScoreSpec::Added { written, .. } = entry {
@@ -3825,7 +3828,7 @@ fn scored(
                     reason: format!("scorer registered as {name:?} answers the name {answers:?}"),
                 });
             }
-            Ok(Scored::Built(Weighted { scorer, weight }))
+            Ok(Scored::Built(WeightedScorer { scorer, weight }))
         }
         // Only a document built in code: the parser reads a built-in's key
         // into its parameter struct.
@@ -3990,7 +3993,7 @@ fn check_profile(
                     ScoreStage::ConsistentHash(ring)
                         if ring.prefix_tokens.is_none() && ring.bounded_load.is_none()
                 );
-                scorers.push(Weighted {
+                scorers.push(WeightedScorer {
                     scorer,
                     weight: stage.weight(),
                 });
@@ -5520,7 +5523,7 @@ struct LabelSelector {
 
 /// What one worker's registration reads as under a generation's lists.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Listed {
+pub struct ViewListPositions {
     /// The position of the worker's engine family, from 1; `0` when the
     /// list does not name it.
     pub engine_kind: u16,
@@ -5571,16 +5574,16 @@ impl ViewLists {
     /// A worker's three fields under these lists, from the engine family,
     /// the zone and the labels of its registration.
     #[must_use]
-    pub fn listed(
+    pub fn positions(
         &self,
         engine: &str,
         zone: Option<&str>,
         labels: &BTreeMap<String, String>,
-    ) -> Listed {
+    ) -> ViewListPositions {
         let engine_at = self.engines.get(engine).copied();
         let zone = zone.filter(|zone| !zone.is_empty());
         let zone_at = zone.and_then(|zone| self.zones.get(zone).copied());
-        Listed {
+        ViewListPositions {
             engine_kind: engine_at.unwrap_or(0),
             zone: zone_at.unwrap_or(0),
             labels: self.met(labels),
@@ -7282,11 +7285,11 @@ mod tests {
         let lists = applied.lists();
         assert!(!lists.is_empty());
         let held = labels(&[("tier", "gold"), ("note", "a=b")]);
-        let gold = lists.listed("beta", Some("west"), &held);
+        let gold = lists.positions("beta", Some("west"), &held);
         assert_eq!((gold.engine_kind, gold.zone, gold.labels), (2, 2, 0b111));
         assert!(!gold.engine_outside && !gold.zone_outside);
         let held = labels(&[("tier", "silver"), ("note", "a")]);
-        let silver = lists.listed("alpha", Some("east"), &held);
+        let silver = lists.positions("alpha", Some("east"), &held);
         assert_eq!(
             (silver.engine_kind, silver.zone, silver.labels),
             (1, 1, 0b001)
@@ -7296,20 +7299,23 @@ mod tests {
         let mixed = spec_with_view(r#"{"labels":["z","b=1","m","b","a=2","q=x"]}"#);
         let mixed = AppliedSpec::validate(&mixed).expect("the document validates");
         let held = labels(&[("a", "2"), ("b", "1"), ("c", "9"), ("m", ""), ("q", "y")]);
-        assert_eq!(mixed.lists().listed("", None, &held).labels, 0b01_1110);
+        assert_eq!(mixed.lists().positions("", None, &held).labels, 0b01_1110);
         // A name the list does not hold reads 0 and says so. No name reads
         // 0 and is not outside.
-        let stray = lists.listed("gamma", Some("north"), &labels(&[]));
+        let stray = lists.positions("gamma", Some("north"), &labels(&[]));
         assert_eq!((stray.engine_kind, stray.zone, stray.labels), (0, 0, 0));
         assert!(stray.engine_outside && stray.zone_outside);
         for zone in [None, Some("")] {
-            assert_eq!(lists.listed("", zone, &labels(&[])), Listed::default());
+            assert_eq!(
+                lists.positions("", zone, &labels(&[])),
+                ViewListPositions::default()
+            );
         }
         // No list: every worker reads 0 and none is outside.
         let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
         assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
-        let read = none.lists().listed("beta", Some("west"), &held);
-        assert_eq!(read, Listed::default());
+        let read = none.lists().positions("beta", Some("west"), &held);
+        assert_eq!(read, ViewListPositions::default());
     }
 
     #[test]

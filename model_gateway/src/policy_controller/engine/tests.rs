@@ -38,13 +38,14 @@ use smg_policy_controller::{
         AppliedSpec, DerivedKey, KeySource, KeySourceSpec, Pairing, PolicySpec, RoutingKeySpec,
     },
     engine::{
-        fingerprint, Candidate, Decision, Identity, LoadRow, MediaCounts, Phase, Picker, Refused,
-        RequestFacts, Role, Shed, ShedReason, Target, Targets, TieBand, Trace, WireModes, WorkerId,
+        fingerprint, Candidate, Decision, DecisionRefused, Identity, LoadRow, MediaCounts, Phase,
+        Picker, RequestFacts, Role, Shed, ShedReason, Target, Targets, TieBand, Trace, WireModes,
+        WorkerId,
     },
     stages::{Lifecycle, StageRegistry},
     store::{
-        pairing::PairingDescriptor, Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink,
-        LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, PairBuffers, SessionsStore,
+        pairing::PairingDescriptor, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore,
+        LoadSink, LoadSource, MemoryStore, PairBuffers, SessionsStore, ViewQuery as StoreAsk,
         WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
     tracking::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
@@ -710,7 +711,7 @@ fn a_refused_ask_is_counted_without_a_profile() {
             .now_or_never()
             .unwrap()
             .err();
-        assert_eq!(refused, Some(Unplaced::Refused(Refused::Unleased)));
+        assert_eq!(refused, Some(Unplaced::Refused(DecisionRefused::Unleased)));
     });
     assert_decisions(&rendered, "", "refused", 1);
 }
@@ -1150,7 +1151,7 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             None,
         ),
         (
-            Unplaced::Refused(Refused::Faulted),
+            Unplaced::Refused(DecisionRefused::Faulted),
             unavailable,
             "policy_controller_unavailable",
             Some("1"),
@@ -2761,7 +2762,7 @@ async fn a_probe_refuses_a_decode_ask_and_releases_a_pick_before_queuing() {
     tokio::pin!(refused);
     assert!(matches!(
         poll!(refused.as_mut()),
-        Poll::Ready(Err(Unplaced::Refused(Refused::PairSide)))
+        Poll::Ready(Err(Unplaced::Refused(DecisionRefused::PairSide)))
     ));
     assert_eq!(admission.queued_requests(), 1);
 

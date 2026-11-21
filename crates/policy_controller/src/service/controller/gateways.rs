@@ -914,11 +914,11 @@ pub(crate) mod tests {
                 self,
                 tests::{a_completed, worker},
             },
-            elector::{ElectionSettings, Elector, Tick},
+            elector::{ElectionSettings, Elector, TickOutcome},
         },
         store::{
-            Ask, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            SessionsStore, ViewBuffers, WorkersStore,
+            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
+            SessionsStore, ViewBuffers, ViewQuery, WorkersStore,
         },
         tracking::lease::{Lease, LeaseId},
     };
@@ -990,7 +990,7 @@ pub(crate) mod tests {
             gateway,
             request: id,
             target: WorkerId(7),
-            picked: Picked::default(),
+            picked: PickRecord::default(),
             decode: None,
             term: 0,
             issued_at: now,
@@ -1341,7 +1341,7 @@ pub(crate) mod tests {
         let retaken = t0 + 3 * GRACE;
         assert_eq!(
             elector.tick(retaken).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         assert_eq!(gateways.sweep(retaken), 0);
         assert!(gateways.presence(A, retaken + GRACE - MS).is_some());
@@ -1372,7 +1372,7 @@ pub(crate) mod tests {
         let landed = closed + GRACE;
         assert_eq!(
             elector.tick(landed).expect("the renewal"),
-            Tick::Renewed { term: TERM }
+            TickOutcome::Renewed { term: TERM }
         );
         assert_eq!(gateways.sweep(landed), 0);
         assert!(gateways.presence(A, landed + GRACE - MS).is_some());
@@ -1395,7 +1395,7 @@ pub(crate) mod tests {
         let retaken = t0 + 3 * GRACE;
         assert_eq!(
             elector.tick(retaken).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         let seat = welcomed(&gateways, A, "gateway-a", 2, retaken);
         assert_eq!(store.live(A), 1, "its lease stands through the gap");
@@ -1517,7 +1517,7 @@ pub(crate) mod tests {
         let again = t0 + MS;
         assert_eq!(
             elector.tick(again).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         let stands = welcomed(&gateways, A, "gateway-a", 2, again);
 
@@ -1786,7 +1786,7 @@ pub(crate) mod tests {
         worker: WorkerId,
         now: Instant,
     ) -> (bool, bool) {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway,
             now,
             pinned: None,

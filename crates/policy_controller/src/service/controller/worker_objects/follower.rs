@@ -109,7 +109,8 @@ mod tests {
             replication::Log,
         },
         store::{
-            Kinds, LeasesStore, Position, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+            JournalKinds, LeasesStore, Position, WorkerFacts, WorkerPatch, WorkerStatus,
+            WorkersStore,
         },
     };
 
@@ -213,15 +214,15 @@ mod tests {
     fn ship(leader: &Log, follower: &Follower) {
         let now = Instant::now();
         let mut place = match follower.place() {
-            nothing if nothing == Position::default() => {
-                leader.first(Kinds::All).expect("every write is retained")
-            }
+            nothing if nothing == Position::default() => leader
+                .first(JournalKinds::All)
+                .expect("every write is retained"),
             place => place,
         };
         let mut entries = Vec::new();
         loop {
             leader
-                .read(Kinds::All, place, 64, &mut entries)
+                .read(JournalKinds::All, place, 64, &mut entries)
                 .expect("the place is held");
             let Some(last) = entries.last() else {
                 return;
@@ -307,7 +308,7 @@ mod tests {
         standby.caught_up("the standby's start").await;
         assert!(standby.held().is_empty());
         let follower = Follower::new(Arc::clone(&standby.store), Arc::clone(&standby.feed.log));
-        let cut = leader.store.cut(Kinds::All);
+        let cut = leader.store.checkpoint(JournalKinds::All);
         assert_eq!(follower.restore(cut, None), Ok(true));
         standby.caught_up("the restore").await;
         assert_eq!(standby.held(), leader.held());

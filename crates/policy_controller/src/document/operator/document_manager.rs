@@ -84,13 +84,13 @@ use tracing::{info, warn};
 #[cfg(any(test, feature = "controller"))]
 use super::spec_store::StoreRefused;
 #[cfg(feature = "controller")]
-use super::Turn;
+use super::SerialTurn;
 use super::{
     answers::OnFile,
     reader::Refused,
     spec_store::{Persisted, SpecStore},
-    Applied, ApplyCounts, Document, DryRun, Enforced, Format, NeedsRow, NotHeld, SpecRejected,
-    Status, Unanswered, MAX_DOCUMENT_BYTES,
+    ApplyCounts, ApplyOutcome, Document, DryRun, EnforceOutcome, EnforceRefused, Format, NeedsRow,
+    NotHeld, SpecRejected, Status, MAX_DOCUMENT_BYTES,
 };
 use crate::{
     document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
@@ -141,10 +141,10 @@ pub(crate) fn needs_rows(engine: &Engine) -> Vec<NeedsRow> {
 /// The number and the digest of the standing generation `spec`, where
 /// `expected` guards nothing against them: a guard is the digest its caller
 /// read as standing, and an empty one guards nothing.
-fn guard(spec: &AppliedSpec, expected: &str) -> Result<(u64, Option<Digest>), Unanswered> {
+fn guard(spec: &AppliedSpec, expected: &str) -> Result<(u64, Option<Digest>), EnforceRefused> {
     let (standing, digest) = (spec.generation(), spec.digest());
     if !expected.is_empty() && digest.is_none_or(|digest| digest.to_string() != expected) {
-        return Err(Unanswered::Guarded(standing, digest));
+        return Err(EnforceRefused::Guarded(standing, digest));
     }
     Ok((standing, digest))
 }
@@ -380,10 +380,10 @@ pub struct DocumentManager {
     on_file: Mutex<Vec<Retained>>,
     /// One dry run at a time for a host that uses this turn.
     #[cfg(feature = "controller")]
-    pub(crate) dry_turn: Turn,
+    pub(crate) dry_turn: SerialTurn,
     /// Enforce and rollback share one write turn.
     #[cfg(feature = "controller")]
-    pub(crate) write_turn: Turn,
+    pub(crate) write_turn: SerialTurn,
     /// The standing generation's document. An apply swaps it under this
     /// lock with its call of the store's entry, so a reader sees the number
     /// and the document move together and waits on no validation. `None`
@@ -426,9 +426,9 @@ impl DocumentManager {
             dir: OnceLock::new(),
             on_file: Mutex::new(Vec::new()),
             #[cfg(feature = "controller")]
-            dry_turn: Turn::new(DRY_RUNS_WAITING),
+            dry_turn: SerialTurn::new(DRY_RUNS_WAITING),
             #[cfg(feature = "controller")]
-            write_turn: Turn::new(WRITES_WAITING),
+            write_turn: SerialTurn::new(WRITES_WAITING),
             held: Mutex::new(None),
             applied: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -439,7 +439,7 @@ impl DocumentManager {
     /// with one source can apply its start's document here. For an
     /// operator write, use [`DocumentManager::enforce`]. A refusal is counted,
     /// once, and the running generation stays.
-    pub fn apply(&self, document: Vec<u8>, format: Format) -> Result<Applied, SpecRejected> {
+    pub fn apply(&self, document: Vec<u8>, format: Format) -> Result<ApplyOutcome, SpecRejected> {
         self.apply_where(document, format, |_| None, publish_local)
     }
 
@@ -458,9 +458,9 @@ impl DocumentManager {
         &self,
         document: Vec<u8>,
         format: Format,
-        unread: impl Fn(u64) -> Option<Applied>,
+        unread: impl Fn(u64) -> Option<ApplyOutcome>,
         publish: impl FnOnce(&MemoryStore, AppliedSpec) -> Result<bool, StaleGeneration>,
-    ) -> Result<Applied, SpecRejected> {
+    ) -> Result<ApplyOutcome, SpecRejected> {
         self.apply_notifying(document, format, unread, publish, |_| {}, |_, _| {})
             .map_err(|rejected| self.reject(rejected))
     }
@@ -473,11 +473,11 @@ impl DocumentManager {
         &self,
         document: Vec<u8>,
         format: Format,
-        unread: impl Fn(u64) -> Option<Applied>,
+        unread: impl Fn(u64) -> Option<ApplyOutcome>,
         publish: impl FnOnce(&MemoryStore, AppliedSpec) -> Result<bool, StaleGeneration>,
         on_pass: impl FnOnce(Option<(Digest, u64)>),
         on_standing: impl FnOnce(u64, Digest),
-    ) -> Result<Applied, SpecRejected> {
+    ) -> Result<ApplyOutcome, SpecRejected> {
         let applying = self.applying.lock();
         if applying.is_some() {
             return Err(SpecRejected::SecondSource);
@@ -513,14 +513,14 @@ impl DocumentManager {
                 *held = Some(hold(standing));
             }
             on_standing(standing, digest);
-            return Ok(Applied::Unchanged(standing));
+            return Ok(ApplyOutcome::Unchanged(standing));
         };
         let generation = next.generation();
         if !self.enter(next, hold(generation), publish, on_standing)? {
-            return Ok(Applied::Waits(standing));
+            return Ok(ApplyOutcome::Waits(standing));
         }
         drop(applying);
-        Ok(Applied::Generation(generation))
+        Ok(ApplyOutcome::Generation(generation))
     }
 
     /// Publishes `next` and keeps its bytes under the lock a reader takes,
@@ -575,7 +575,7 @@ impl DocumentManager {
     /// The standing number and digest, from one load, where `expected`
     /// guards nothing against them ([`guard`]).
     #[cfg(feature = "controller")]
-    pub(crate) fn guarded(&self, expected: &str) -> Result<(u64, Option<Digest>), Unanswered> {
+    pub(crate) fn guarded(&self, expected: &str) -> Result<(u64, Option<Digest>), EnforceRefused> {
         guard(self.store.snapshot().spec(), expected)
     }
 
@@ -594,7 +594,7 @@ impl DocumentManager {
         expected: &str,
         document: &[u8],
         format: Format,
-    ) -> Result<DryRun, Unanswered> {
+    ) -> Result<DryRun, EnforceRefused> {
         let (world, rule) = {
             let _one_side = self.binding.lock();
             (self.store.snapshot(), self.line())
@@ -728,7 +728,7 @@ impl DocumentManager {
         expected: &str,
         document: Vec<u8>,
         format: Format,
-    ) -> Result<Enforced, Unanswered> {
+    ) -> Result<EnforceOutcome, EnforceRefused> {
         let mut applying = self.applying.lock();
         let world = self.store.snapshot();
         let standing = guard(world.spec(), expected)?;
@@ -751,7 +751,7 @@ impl DocumentManager {
     /// give or take, is refused with the running generation kept, and
     /// counted as rejected. So is every roll back where no spec store is
     /// bound, in the words an enforce is refused by there.
-    pub fn roll_back(&self, wanted: u64) -> Result<Enforced, Unanswered> {
+    pub fn roll_back(&self, wanted: u64) -> Result<EnforceOutcome, EnforceRefused> {
         let mut applying = self.applying.lock();
         let Some(dir) = applying.as_mut() else {
             let standing = self.standing();
@@ -760,7 +760,7 @@ impl DocumentManager {
         };
         let on_file = dir.kept().iter().copied();
         let Some(persisted) = on_file.rev().find(|kept| kept.generation == wanted) else {
-            return Err(Unanswered::NotHeld(self.not_held(wanted)));
+            return Err(EnforceRefused::NotHeld(self.not_held(wanted)));
         };
         let world = self.store.snapshot();
         let standing = (world.spec().generation(), world.spec().digest());
@@ -781,9 +781,9 @@ impl DocumentManager {
         standing: (u64, Option<Digest>),
         before: Vec<NeedsRow>,
         written: Result<Written, SpecRejected>,
-    ) -> Enforced {
+    ) -> EnforceOutcome {
         match written {
-            Ok((generation, digest, after)) => Enforced {
+            Ok((generation, digest, after)) => EnforceOutcome {
                 standing,
                 ran: Ok((generation, digest)),
                 needs: Some(match after {
@@ -791,7 +791,7 @@ impl DocumentManager {
                     None => (before.clone(), before),
                 }),
             },
-            Err(rejected) => Enforced {
+            Err(rejected) => EnforceOutcome {
                 standing,
                 ran: Err(self.reject(rejected)),
                 needs: None,

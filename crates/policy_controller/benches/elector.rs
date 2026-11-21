@@ -28,7 +28,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
     engine::{Constraints, PoolFacts, RequestFacts, Scratch},
     service::elector::{
-        ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord, MemoryLease, Tick, Written,
+        ConditionalWriteOutcome, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
+        MemoryLease, TickOutcome,
     },
 };
 
@@ -45,13 +46,13 @@ fn holder(mut backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
     };
     assert_eq!(
         backend.write(None, &released).expect("the release"),
-        Written::Done
+        ConditionalWriteOutcome::Done
     );
     let mut elector =
         Elector::new(backend, identity, ElectionSettings::default()).expect("valid settings");
     let now = Instant::now();
     let take = elector.tick(now).expect("the take");
-    assert!(matches!(take, Tick::Acquired { .. }), "{take:?}");
+    assert!(matches!(take, TickOutcome::Acquired { .. }), "{take:?}");
     assert!(elector.fence().leader_term(now).is_some());
     elector
 }

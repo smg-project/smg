@@ -156,7 +156,7 @@ pub struct WorkerFacts {
     /// encodes them and a decode attends to them. A request that needs
     /// vision ([`Demands::vision`](crate::engine::demands::Demands::vision)) takes
     /// no other worker, so a registration that changes the bit starts
-    /// another life ([`Self::laid_over`]).
+    /// another life ([`Self::compare_to_standing`]).
     pub vision: bool,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
@@ -242,24 +242,35 @@ impl Registrant {
     /// the provider's own text and may hold an address with a credential:
     /// no refusal, log line or metric label carries it. A key past its bound
     /// is refused and never shortened, since two shortened keys can meet.
-    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Result<Self, Unmade> {
+    pub fn provider(
+        provider: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<Self, ProviderKeyError> {
         let (provider, key) = (provider.into(), key.into());
         if provider.is_empty() {
-            return Err(Unmade::Provider("a provider's row names its provider"));
+            return Err(ProviderKeyError::Provider(
+                "a provider's row names its provider",
+            ));
         }
         if provider.len() > Self::NAME_BYTES {
-            return Err(Unmade::Provider("a provider's name is at most 128 bytes"));
+            return Err(ProviderKeyError::Provider(
+                "a provider's name is at most 128 bytes",
+            ));
         }
         if !token(&provider) {
-            return Err(Unmade::Provider(
+            return Err(ProviderKeyError::Provider(
                 "a provider's name is one token of visible ASCII with no comma",
             ));
         }
         if key.is_empty() {
-            return Err(Unmade::Key("a provider's row names its key for the worker"));
+            return Err(ProviderKeyError::Key(
+                "a provider's row names its key for the worker",
+            ));
         }
         if key.len() > Self::KEY_BYTES {
-            return Err(Unmade::Key("a provider's key is at most 2048 bytes"));
+            return Err(ProviderKeyError::Key(
+                "a provider's key is at most 2048 bytes",
+            ));
         }
         Ok(Self::Provider(Arc::new(ProviderKey { provider, key })))
     }
@@ -281,7 +292,7 @@ pub fn token(name: &str) -> bool {
 /// Why a provider's name and key make no maker: the part that breaks its
 /// rule, with the rule as a refusal says it. The words hold neither text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Unmade {
+pub enum ProviderKeyError {
     /// The provider's name.
     #[error("{0}")]
     Provider(&'static str),

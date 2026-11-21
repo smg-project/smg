@@ -708,7 +708,7 @@ mod tests {
                 .expect("a document of this build");
             (
                 engine.sample_for("m", Phase::Single),
-                engine.named_for("m", Phase::Single),
+                engine.affinity_rows_cap("m", Phase::Single),
             )
         };
         let stock = StageRegistry::builtin();

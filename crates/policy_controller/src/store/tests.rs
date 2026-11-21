@@ -10,13 +10,13 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{InFlightCounts, WorkerSlot, DISPATCH_TTL},
-    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide,
-    Dispatch, GatewayId, Hand, HealthSink, HealthWrite, Journal, Kinds, KvEvent, KvEventSink,
+    AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeRefused, DecodeSide, Dispatch,
+    GatewayId, Hand, HealthSink, HealthWrite, Journal, JournalKinds, KvEvent, KvEventSink,
     LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource,
-    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability,
-    ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Sides,
-    Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite, ViewBuffers, Watch, WorkerFacts,
-    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    LookOutcome, MembershipChange, MembershipTail, MemoryStore, PickRecord, Pin, PollMode,
+    Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash,
+    SessionsStore, Sides, Signals, SnapshotChunk, StoreSnapshot, StoredBlock, VetoWrite,
+    ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     document::spec,
@@ -79,7 +79,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         gateway,
         request: id,
         target: WorkerId(7),
-        picked: Picked::default(),
+        picked: PickRecord::default(),
         decode: None,
         term,
         issued_at: now,
@@ -828,7 +828,7 @@ fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
 
 #[test]
 fn a_providers_maker_is_made_inside_the_rules_of_its_two_parts() {
-    use super::{Registrant, Unmade};
+    use super::{ProviderKeyError, Registrant};
 
     let Ok(Registrant::Provider(found)) = Registrant::provider("cluster", "pods/a") else {
         panic!("a maker of both parts is made");
@@ -845,23 +845,23 @@ fn a_providers_maker_is_made_inside_the_rules_of_its_two_parts() {
     // An empty name is refused in its own words, ahead of the token's.
     assert_eq!(
         unmade("", "pods/a"),
-        Unmade::Provider("a provider's row names its provider")
+        ProviderKeyError::Provider("a provider's row names its provider")
     );
-    assert!(matches!(unmade("", ""), Unmade::Provider(_)));
+    assert!(matches!(unmade("", ""), ProviderKeyError::Provider(_)));
     assert!(matches!(
         unmade(&format!("{name}p"), "pods/a"),
-        Unmade::Provider(_)
+        ProviderKeyError::Provider(_)
     ));
     // A name is one token: a blank, a control character, a comma, a letter
     // outside ASCII and a character of no width each make none.
     for name in ["a b", "a\nb", "a\u{7}b", "a,b", "\u{e9}", "a\u{200b}b"] {
         let refused = unmade(name, "pods/a");
-        assert!(matches!(refused, Unmade::Provider(_)), "{name:?}");
+        assert!(matches!(refused, ProviderKeyError::Provider(_)), "{name:?}");
     }
-    assert!(matches!(unmade("cluster", ""), Unmade::Key(_)));
+    assert!(matches!(unmade("cluster", ""), ProviderKeyError::Key(_)));
     assert!(matches!(
         unmade("cluster", &format!("{key}k")),
-        Unmade::Key(_)
+        ProviderKeyError::Key(_)
     ));
 }
 
@@ -1885,7 +1885,7 @@ fn a_followed_key_registered_again_past_the_absences_time_takes_no_pin() {
     std::thread::sleep(Duration::from_millis(1_100));
     let again = leader.upsert(facts("http://a:8000", 2));
     followed(&leader, &followers[0], again);
-    assert!(followers[1].watch_from(leader.cut(Kinds::Watched)));
+    assert!(followers[1].watch_from(leader.checkpoint(JournalKinds::Watched)));
     for follower in &followers {
         assert_eq!(SessionsStore::lookup(follower, 11), None);
     }
@@ -1918,7 +1918,7 @@ fn a_snapshot_moves_the_pins_of_the_rows_it_drops() {
     for restore in [false, true] {
         let (leader, follower) = (MemoryStore::new(), MemoryStore::new());
         let lay = || {
-            let cut = leader.cut(Kinds::All);
+            let cut = leader.checkpoint(JournalKinds::All);
             if restore {
                 follower.restore_from(cut)
             } else {
@@ -1989,10 +1989,10 @@ fn a_snapshot_returns_a_key_that_had_left_to_its_pins() {
         let change = leader.remove(id, revision).expect("removed");
         followed(&leader, &follower, change);
     }
-    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
     assert_eq!((of(11), of(12)), (Some(a), Some(b)), "both stay on file");
     let again = leader.upsert(facts("http://a:8000", 2)).id();
-    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
     assert_eq!((of(11), of(12)), (Some(again), Some(b)));
     let back = leader.upsert(facts("http://b:8000", 2));
     followed(&leader, &follower, back);
@@ -2008,13 +2008,13 @@ fn a_snapshot_files_no_more_keys_than_the_list_holds() {
     let ids: Vec<WorkerId> = (0..GONE_KEYS + 2)
         .map(|at| leader.upsert(facts(&format!("http://w{at}:8000"), 1)).id())
         .collect();
-    assert!(follower.watch_from(leader.cut(Kinds::Watched)));
+    assert!(follower.watch_from(leader.checkpoint(JournalKinds::Watched)));
     let sessions: &dyn SessionsStore = &follower;
     let now = Instant::now();
     for (key, &id) in (1..).zip(&ids) {
         sessions.pin(key, id, now, None);
     }
-    assert!(follower.watch_from(MemoryStore::new().cut(Kinds::Watched)));
+    assert!(follower.watch_from(MemoryStore::new().checkpoint(JournalKinds::Watched)));
     assert_eq!(sessions.len(), GONE_KEYS);
 }
 
@@ -2214,9 +2214,9 @@ fn pair(
     }
     let mut record = booking(GatewayId(1), id, prefill, now);
     record.lease.side = Side::Prefill;
-    record.picked = Picked::of(&targets);
+    record.picked = PickRecord::of(&targets);
     let decode = DecodeSide {
-        picked: Picked::of_decodes(&targets),
+        picked: PickRecord::of_decodes(&targets),
         ..decode_side(decodes[0])
     };
     (record, decode)
@@ -3151,7 +3151,7 @@ const NONE: [u64; 0] = [];
 /// Each member's requests in flight as a view of the cases' model reads
 /// them for `gateway`, in the view's order: by worker id.
 fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)> {
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway,
         now: Instant::now(),
         pinned: None,
@@ -3194,7 +3194,7 @@ pub(super) fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
 fn decode_side(target: WorkerId) -> DecodeSide {
     DecodeSide {
         target,
-        picked: Picked::default(),
+        picked: PickRecord::default(),
         session: Session::NONE,
         state: LeaseState::ISSUED,
         tokens: 0,
@@ -3282,7 +3282,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     let theirs = (ready(&leader, "http://a:1"), ready(&leader, "http://b:1"));
     assert_eq!(theirs, (a, b));
     drop(told());
-    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
     let leases: &dyn LeasesStore = &store;
     assert_eq!(leases.live(gateway), 0, "a lease stood behind the restore");
     assert!(leases.get(gateway, LeaseId(1)).is_none());
@@ -3301,7 +3301,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     ended.sort_unstable();
     assert_eq!(ended, [1, 2, 3]);
     // The file is empty: a second restore tells no end.
-    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
     assert!(told().is_empty(), "a lease was told twice");
     // The lead taken again: the gateway lists the two leases it still
     // holds, one a worker.
@@ -3339,7 +3339,7 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     // its cut on a thread that names none.
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
     let mut ended: Vec<(u64, Option<DecisionSlot>)> = told()
         .into_iter()
         .map(|(record, _)| record.lease.id.0)
@@ -3376,7 +3376,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     );
     store.probed(id, 2, 0, 0);
 
-    let mut cut = store.cut(Kinds::All);
+    let mut cut = store.checkpoint(JournalKinds::All);
     cut.epoch += 1;
     cut.at.term = 7;
     cut.rows[0].admitted_at += Duration::from_secs(1);
@@ -3403,7 +3403,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
     );
     assert!(store.vetoed(gateway, id, now));
     assert!(store.completed_ok_since(gateway, id, now));
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway,
         now,
         pinned: None,
@@ -3434,7 +3434,7 @@ fn a_watch_snapshot_keeps_a_members_local_tables() {
 /// The count in a one-member world held across a snapshot. Its slot still
 /// reads the live count after the worker leaves the current world.
 fn held_count(world: &StoreSnapshot, gateway: GatewayId, now: Instant) -> u32 {
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway,
         now,
         pinned: None,
@@ -3472,7 +3472,7 @@ fn a_watch_snapshot_evicts_a_leavers_tables_and_its_lease_ends_on_its_own_count(
     let source = MemoryStore::new();
     let joined = ready(&source, "http://b:1");
     LoadSink::record(&source, joined, 0, row(0), now, LoadSource::Stream);
-    assert!(store.watch_from(source.cut(Kinds::All)));
+    assert!(store.watch_from(source.checkpoint(JournalKinds::All)));
     assert_eq!(leases.get(gateway, lease.lease.id), Some(lease));
     assert_eq!(held_count(&before, gateway, now), 1);
     assert_ne!(store.snapshot().booked_of(joined), Some(slot));
@@ -3512,7 +3512,7 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
     let source = MemoryStore::new();
     assert_eq!(ready(&source, key), old);
     let new = source.upsert(facts(key, 2)).id();
-    assert!(store.watch_from(source.cut(Kinds::Watched)));
+    assert!(store.watch_from(source.checkpoint(JournalKinds::Watched)));
     assert_eq!(store.by_key(key).map(|row| row.id), Some(new));
     assert!(WorkersStore::get(&store, old).is_none());
     assert_eq!(in_flight(&store), [(new, 0)]);
@@ -3578,7 +3578,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
         AppliedSpec::validate_digested(&document, digest, &catalog, &[]).expect("a generation");
     store.apply(spec).expect("the generation is applied");
 
-    let mut cut = store.cut(Kinds::Watched);
+    let mut cut = store.checkpoint(JournalKinds::Watched);
     let earlier = cut.epoch;
     // The same revision can name other facts in another history.
     cut.rows[0]
@@ -3601,7 +3601,7 @@ fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     );
     assert_eq!(store.publish_due(), None);
     assert_eq!(store.filed_members(), 0);
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: GatewayId(1),
         now: Instant::now(),
         pinned: None,
@@ -3628,14 +3628,14 @@ fn a_watch_snapshot_the_journal_refuses_changes_nothing() {
     let store = MemoryStore::journaled(Arc::new(Log::new(8, 8)));
     let id = ready(&store, "http://a:1");
     store.set_term(3);
-    let before = store.cut(Kinds::Watched);
+    let before = store.checkpoint(JournalKinds::Watched);
     let world = store.snapshot();
     let source = MemoryStore::new();
     ready(&source, "http://b:1");
-    let mut cut = source.cut(Kinds::Watched);
+    let mut cut = source.checkpoint(JournalKinds::Watched);
     cut.at = Position { seq: 1, term: 2 };
     assert!(!store.watch_from(cut));
-    let after = store.cut(Kinds::Watched);
+    let after = store.checkpoint(JournalKinds::Watched);
     assert_eq!(
         (after.at, after.epoch, after.rows),
         (before.at, before.epoch, before.rows)
@@ -3676,7 +3676,7 @@ impl Journal for WaitsAtRestart {
         false
     }
 
-    fn head(&self, _: Kinds) -> Position {
+    fn head(&self, _: JournalKinds) -> Position {
         Position::default()
     }
 
@@ -3716,7 +3716,7 @@ fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
     // its cut.
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    let cut = leader.cut(Kinds::All);
+    let cut = leader.checkpoint(JournalKinds::All);
     let store = &store;
     let (inside, restored, filed) = std::thread::scope(move |scope| {
         let restore = scope.spawn(move || store.restore_from(cut));
@@ -3801,7 +3801,7 @@ fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
     assert_eq!(seen(2), by_id(vec![(open, 1), (theirs, 2), (last, 4)]));
     assert_eq!(seen(3), by_id(vec![(open, 1), (last, 4)]));
     let mut built = ViewBuffers::default();
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway,
         now,
         pinned: None,
@@ -4009,7 +4009,7 @@ fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
         });
     }
     let record = LeaseRecord {
-        picked: Picked::of(&targets),
+        picked: PickRecord::of(&targets),
         ..booking(gateway, 1, built, now)
     };
     assert_eq!(leases.issue(record), Ok(()));
@@ -4240,7 +4240,7 @@ fn a_lease_books_on_a_standby_behind_a_followed_refresh() {
         .expect("ready");
     leader.publish_now();
     let standby = MemoryStore::new();
-    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
     assert_eq!(standby.filed_members(), 0, "the restore built its world");
     // The leader gives the member its first model and the standby follows.
     let unjournaled = Position::default();
@@ -4349,7 +4349,7 @@ fn a_dispatch_on_another_target_of_the_pick_moves_the_leases_count() {
         });
     }
     let picked = |id: u64| LeaseRecord {
-        picked: Picked::of(&targets),
+        picked: PickRecord::of(&targets),
         ..booking(gateway, id, a, now)
     };
     let leases: &dyn LeasesStore = &store;
@@ -4405,7 +4405,7 @@ fn a_second_dispatch_on_a_third_target_of_the_pick_moves_nothing() {
         });
     }
     let record = LeaseRecord {
-        picked: Picked::of(&targets),
+        picked: PickRecord::of(&targets),
         ..booking(gateway, 1, a, now)
     };
     let leases: &dyn LeasesStore = &store;
@@ -4448,7 +4448,7 @@ fn a_dispatch_on_another_rank_of_the_leases_worker_moves_the_index_alone() {
         });
     }
     let record = LeaseRecord {
-        picked: Picked::of(&targets),
+        picked: PickRecord::of(&targets),
         ..booking(gateway, 1, a, now)
     };
     let leases: &dyn LeasesStore = &store;
@@ -4805,7 +4805,7 @@ fn a_dispatch_on_another_target_of_the_pick_moves_the_keys_count() {
         });
     }
     let picked = LeaseRecord {
-        picked: Picked::of(&targets),
+        picked: PickRecord::of(&targets),
         ..keyed(1, a, key, now)
     };
     leases.issue(picked).expect("filed");
@@ -4961,7 +4961,7 @@ fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     let held = standby.issue_decided(lease(gateway, 0, 3, now), None, |_| ());
     held.expect("minted under the term the standby stood at");
-    let mut cut = MemoryStore::new().cut(Kinds::All);
+    let mut cut = MemoryStore::new().checkpoint(JournalKinds::All);
     cut.at.term = 7;
     assert!(standby.restore_from(cut));
     assert_eq!(term.term(), 7);
@@ -5404,12 +5404,16 @@ fn a_frame_handed_under_a_watch_is_left_to_the_watching_thread() {
     let (store, a, ids) = handed_bed(3, now);
     let hand = Hand::new(GatewayId(1));
     let mut place = store.at_work();
-    assert_eq!(place.look(), Watch::Quiet, "three leases stand on the file");
+    assert_eq!(
+        place.look(),
+        LookOutcome::Quiet,
+        "three leases stand on the file"
+    );
     assert_eq!(store.watches(), 1);
     store.hand(&hand, ids[0], GONE);
     assert_eq!((told_ids(), in_flight(&store)), (vec![], vec![(a, 3)]));
     // The thread's next look applies the frame,
-    assert_eq!(place.look(), Watch::Fed);
+    assert_eq!(place.look(), LookOutcome::Fed);
     assert_eq!(
         (told_ids(), in_flight(&store)),
         (vec![(1, GONE)], vec![(a, 2)])
@@ -5442,7 +5446,11 @@ fn a_watch_starts_at_a_look_and_stands_through_a_job() {
     assert_eq!((told_ids(), store.watches()), (vec![(1, GONE)], 0));
     place.work();
     assert_eq!(store.watches(), 0, "a job starts no watch");
-    assert_eq!(place.look(), Watch::Quiet, "two leases stand on the file");
+    assert_eq!(
+        place.look(),
+        LookOutcome::Quiet,
+        "two leases stand on the file"
+    );
     assert_eq!(store.watches(), 1);
     place.work();
     assert_eq!(store.watches(), 1, "the watch stands through the job");
@@ -5465,17 +5473,17 @@ fn a_look_says_whether_it_applied_a_frame() {
     let (store, a, ids) = handed_bed(3, now);
     let hand = Hand::new(GatewayId(1));
     let mut place = store.at_work();
-    assert_eq!(place.look(), Watch::Quiet, "nothing was handed");
+    assert_eq!(place.look(), LookOutcome::Quiet, "nothing was handed");
     store.hand(&hand, ids[0], GONE);
-    assert_eq!(place.look(), Watch::Fed);
-    assert_eq!(place.look(), Watch::Quiet, "the ring is empty again");
+    assert_eq!(place.look(), LookOutcome::Fed);
+    assert_eq!(place.look(), LookOutcome::Quiet, "the ring is empty again");
     // A second release of the lease that left: a frame all the same.
     store.hand(&hand, ids[0], GONE);
-    assert_eq!(place.look(), Watch::Fed);
+    assert_eq!(place.look(), LookOutcome::Fed);
     // What the thread applies at a job's first step is not its look's.
     store.hand(&hand, ids[1], GONE);
     place.work();
-    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(place.look(), LookOutcome::Quiet);
     assert_eq!(in_flight(&store), [(a, 1)]);
 }
 
@@ -5487,10 +5495,10 @@ fn a_look_that_finds_no_lease_on_file_ends_the_watch() {
     let (store, a, ids) = handed_bed(1, now);
     let hand = Hand::new(GatewayId(1));
     let mut place = store.at_work();
-    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(place.look(), LookOutcome::Quiet);
     store.hand(&hand, ids[0], GONE);
     // The look applies the release of the file's last lease.
-    assert_eq!(place.look(), Watch::Ended);
+    assert_eq!(place.look(), LookOutcome::Ended);
     assert_eq!(store.watches(), 0);
     assert_eq!(
         (told_ids(), in_flight(&store)),
@@ -5504,7 +5512,11 @@ fn a_look_that_finds_no_lease_on_file_ends_the_watch() {
         (told_ids(), in_flight(&store)),
         (vec![(second, GONE)], vec![(a, 0)])
     );
-    assert_eq!(place.look(), Watch::Ended, "no lease stands, and no watch");
+    assert_eq!(
+        place.look(),
+        LookOutcome::Ended,
+        "no lease stands, and no watch"
+    );
 }
 
 /// A watch ends by its word first and one more look behind it. A frame a
@@ -5517,12 +5529,12 @@ fn a_watch_ends_behind_one_more_look() {
     let (store, a, ids) = handed_bed(2, now);
     let hand = Hand::new(GatewayId(1));
     let mut place = store.at_work();
-    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(place.look(), LookOutcome::Quiet);
     store.hand(&hand, ids[0], GONE);
     assert_eq!(told_ids(), []);
     // The end's own look applies the frame and finds the second lease:
     // the watch stands, and the next frame is left to it.
-    assert_eq!(place.end_watch(), Watch::Fed);
+    assert_eq!(place.end_watch(), LookOutcome::Fed);
     assert_eq!(
         (told_ids(), in_flight(&store), store.watches()),
         (vec![(1, GONE)], vec![(a, 1)], 1)
@@ -5531,7 +5543,7 @@ fn a_watch_ends_behind_one_more_look() {
     assert_eq!(told_ids(), [], "left to the watch that stands");
     // With the last lease's release in the ring the end applies it, and
     // the watch ends: the next frame is applied by its hand.
-    assert_eq!(place.end_watch(), Watch::Ended);
+    assert_eq!(place.end_watch(), LookOutcome::Ended);
     assert_eq!(
         (told_ids(), in_flight(&store), store.watches()),
         (vec![(2, GONE)], vec![(a, 0)], 0)
@@ -5549,7 +5561,7 @@ fn a_place_that_rests_or_drops_ends_its_watch() {
     let (store, a, ids) = handed_bed(4, now);
     let hand = Hand::new(GatewayId(1));
     let mut place = store.at_work();
-    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(place.look(), LookOutcome::Quiet);
     store.hand(&hand, ids[0], GONE);
     assert_eq!(told_ids(), []);
     // Its rest applies what was handed, and ends the watch over the three
@@ -5560,7 +5572,7 @@ fn a_place_that_rests_or_drops_ends_its_watch() {
     assert_eq!(told_ids(), [(2, GONE)]);
     // A place dropped on its watch does the same.
     place.work();
-    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(place.look(), LookOutcome::Quiet);
     store.hand(&hand, ids[2], GONE);
     assert_eq!(told_ids(), []);
     drop(place);
@@ -5581,7 +5593,7 @@ fn the_sweep_applies_at_a_watched_file_whose_thread_waits() {
     let (store, a, ids) = handed_bed(2, now);
     let hand = Hand::new(GatewayId(1));
     let mut place = store.at_work();
-    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(place.look(), LookOutcome::Quiet);
     let dispatch = Said::Dispatched(Dispatch::default(), now);
     store.hand(&hand, ids[0], dispatch);
     assert_eq!(told_ids(), []);
@@ -5592,7 +5604,11 @@ fn the_sweep_applies_at_a_watched_file_whose_thread_waits() {
     let abandoned = Said::Released(None, ReleaseReason::Abandoned);
     assert_eq!(told_ids(), [(1, dispatch), (2, abandoned)]);
     assert_eq!(in_flight(&store), [(a, 1)]);
-    assert_eq!(place.look(), Watch::Quiet, "the dispatched lease stands");
+    assert_eq!(
+        place.look(),
+        LookOutcome::Quiet,
+        "the dispatched lease stands"
+    );
 }
 
 /// The sweep applies a release left by a thread that unwound even where
@@ -5610,7 +5626,7 @@ fn the_sweep_applies_a_release_left_before_an_unwind() {
 
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut place = store.at_work();
-        assert_eq!(place.look(), Watch::Quiet);
+        assert_eq!(place.look(), LookOutcome::Quiet);
         store.hand(&hand, ids[0], GONE);
         assert_eq!(told_ids(), []);
         panic!("leave the release for the sweep");
@@ -5634,7 +5650,7 @@ fn a_full_ring_under_a_watch_is_applied_by_its_hand() {
     let (store, a, ids) = handed_bed(room + 2, now);
     let hand = Hand::new(GatewayId(1));
     let mut place = store.at_work();
-    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(place.look(), LookOutcome::Quiet);
     for id in &ids[..MemoryStore::HANDOVER] {
         store.hand(&hand, *id, GONE);
     }
@@ -5645,7 +5661,11 @@ fn a_full_ring_under_a_watch_is_applied_by_its_hand() {
     let applied = told_ids();
     assert_eq!(applied.len(), MemoryStore::HANDOVER);
     assert!(applied.iter().map(|(lease, _)| *lease).eq(1..=room));
-    assert_eq!(place.look(), Watch::Fed, "one lease stands behind the look");
+    assert_eq!(
+        place.look(),
+        LookOutcome::Fed,
+        "one lease stands behind the look"
+    );
     assert_eq!(
         (told_ids(), in_flight(&store)),
         (vec![(room + 1, GONE)], vec![(a, 1)])
@@ -5674,7 +5694,11 @@ fn a_place_applies_what_waits_at_the_other_files_whose_threads_wait() {
             let _acting = DecisionSlot::new(1).enter();
             let ids: Vec<_> = (0..2).map(|_| issued_at(store, a, now).0).collect();
             let mut place = store.at_work();
-            assert_eq!(place.look(), Watch::Quiet, "two leases stand on its file");
+            assert_eq!(
+                place.look(),
+                LookOutcome::Quiet,
+                "two leases stand on its file"
+            );
             let second = ids[1];
             said.send(ids).expect("the case hears the ids");
             word.recv_timeout(PATIENCE).expect("the case's word");
@@ -5764,7 +5788,7 @@ fn a_places_apply_applies_what_was_handed_at_its_own_file() {
 
 /// The rows' counts read once, as a decision reads them.
 fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: GatewayId(1),
         now: Instant::now(),
         pinned: None,
@@ -5840,7 +5864,11 @@ fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
             loop {
                 // At work: the round's lease, then the watch over it.
                 let id = issued_at(store, a, now).0;
-                assert_ne!(place.look(), Watch::Ended, "a lease stands on the file");
+                assert_ne!(
+                    place.look(),
+                    LookOutcome::Ended,
+                    "a lease stands on the file"
+                );
                 lease.store(id, SeqCst);
                 word.store(WATCHES, SeqCst);
                 if !heard(TAKE_UP, std::hint::spin_loop) {
@@ -5922,7 +5950,11 @@ fn a_places_apply_at_the_other_files_measured() {
                 let _acting = DecisionSlot::new(other).enter();
                 let mut place = store.at_work();
                 issued_at(&store, a, now);
-                assert_ne!(place.look(), Watch::Ended, "a lease stands on the file");
+                assert_ne!(
+                    place.look(),
+                    LookOutcome::Ended,
+                    "a lease stands on the file"
+                );
                 place
             })
             .collect();
@@ -6595,7 +6627,7 @@ fn a_restore_leaves_a_working_deciders_leases_to_its_next_take() {
     let (store, a, ids) = handed_bed(2, now);
     let leader = MemoryStore::new();
     assert_eq!(ready(&leader, "http://a:1"), a);
-    let cut = leader.cut(Kinds::All);
+    let cut = leader.checkpoint(JournalKinds::All);
     let (began, working) = mpsc::sync_channel(1);
     let (look, asked) = mpsc::sync_channel::<()>(1);
     let (looked, seen) = mpsc::sync_channel(1);

@@ -206,7 +206,7 @@ use crate::{
     stages::lifecycle::Lifecycle,
     store::{
         leases::DISPATCH_TTL, AtWork, DecodeIssue, DecodeRefused, GatewayId, LeaseRefused,
-        MemoryStore, StoreSnapshot, Watch,
+        LookOutcome, MemoryStore, StoreSnapshot,
     },
     tracking::lease::{Lease, LeaseId, ReleaseReason},
 };
@@ -729,15 +729,15 @@ impl Deciding {
         let mut found = self.look();
         let mut period = LOOK_FLOOR;
         loop {
-            let within = (found != Watch::Ended).then_some(period);
+            let within = (found != LookOutcome::Ended).then_some(period);
             match receive(within) {
                 Ok(job) => return Some(job),
                 Err(RecvTimeoutError::Disconnected) => return None,
                 Err(RecvTimeoutError::Timeout) => {
                     found = self.look();
                     period = match found {
-                        Watch::Fed => LOOK_FLOOR,
-                        Watch::Quiet | Watch::Ended => (2 * period).min(LOOK_CAP),
+                        LookOutcome::Fed => LOOK_FLOOR,
+                        LookOutcome::Quiet | LookOutcome::Ended => (2 * period).min(LOOK_CAP),
                     };
                 }
             }
@@ -751,8 +751,10 @@ impl Deciding {
     /// run with it, outside any decision. A call that panics is held
     /// where it is made ([`lifecycle::tells`]'s word to the engine): it
     /// costs no request and ends no decider.
-    fn look(&mut self) -> Watch {
-        self.working.as_mut().map_or(Watch::Ended, AtWork::look)
+    fn look(&mut self) -> LookOutcome {
+        self.working
+            .as_mut()
+            .map_or(LookOutcome::Ended, AtWork::look)
     }
 
     /// Leaves the decider's work at the leases' file and ends its watch:
@@ -1335,14 +1337,14 @@ pub(crate) mod tests {
                 lifecycle,
                 wire::{self, Checked},
             },
-            elector::{Elector, Tick, TERM_CEILING},
+            elector::{Elector, TickOutcome, TERM_CEILING},
             proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
         },
         stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
-            leases::DISPATCH_TTL, Ask, Built, DecodeIssue, Dispatch, GatewayId, HealthSink,
-            LeaseState, LeasesStore, MemoryStore, Said, StoreSnapshot, ViewBuffers, WorkerFacts,
-            WorkerStatus, WorkersStore,
+            leases::DISPATCH_TTL, DecodeIssue, Dispatch, GatewayId, HealthSink, LeaseState,
+            LeasesStore, MemoryStore, Said, StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
+            WorkerFacts, WorkerStatus, WorkersStore,
         },
         tracking::lease::{Lease, LeaseId, ReleaseReason, Side},
     };
@@ -1371,7 +1373,7 @@ pub(crate) mod tests {
             &Constraints<'_>,
             &mut Scratch,
         ) -> R,
-    ) -> (R, Option<Built>) {
+    ) -> (R, Option<ViewFacts>) {
         store_backed_engine::hand(world, taken, buffers, undialed, decide)
     }
 
@@ -1569,7 +1571,7 @@ pub(crate) mod tests {
         let taken = Instant::now();
         if leads {
             let tick = elector.tick(taken).expect("the take");
-            assert_eq!(tick, Tick::Acquired { term: 1 });
+            assert_eq!(tick, TickOutcome::Acquired { term: 1 });
             // The election's report tells the store the term it took: a
             // lease is minted under the store's own term.
             store.set_term(1);
@@ -1725,7 +1727,7 @@ pub(crate) mod tests {
         fn engines(&self, frame: &proto::DecideRequest, term: u64) -> proto::DecideAnswer {
             let wire = frame.facts.as_ref().expect("the case's frame has facts");
             let decision = self.store.deciding(|world| {
-                let ask = Ask {
+                let ask = ViewQuery {
                     gateway: GATEWAY,
                     now: self.script.taken,
                     pinned: None,
@@ -2342,7 +2344,7 @@ pub(crate) mod tests {
                 let left = bed.elector.step_down(None, taken);
                 assert!(left.expect("a planned hand-over"));
                 let took = bed.elector.tick(taken).expect("the take");
-                assert_eq!(took, Tick::Acquired { term });
+                assert_eq!(took, TickOutcome::Acquired { term });
                 bed.store.set_term(term);
             }
             bed.store.spend_ids(u32::MAX - TERM_MARK + 1);
@@ -2372,7 +2374,7 @@ pub(crate) mod tests {
             let left = bed.elector.step_down(above, taken);
             assert!(left.expect("a term that leaves one to take"));
             let took = bed.elector.tick(taken).expect("the take");
-            assert_eq!(took, Tick::Acquired { term });
+            assert_eq!(took, TickOutcome::Acquired { term });
             bed.store.set_term(term);
             bed.store.spend_ids(u32::MAX - TERM_MARK + 1);
             let at = bed.ask(frame(1, 1)).await;
@@ -3503,15 +3505,15 @@ pub(crate) mod tests {
     /// the watch of that file's place, and the release of the first handed
     /// and left in the file's ring. The place is the case's own, so no
     /// decider's look applies the frame: its next look says whether the
-    /// frame still waited ([`Watch::Fed`]) or was applied meanwhile
-    /// ([`Watch::Quiet`]).
+    /// frame still waited ([`LookOutcome::Fed`]) or was applied meanwhile
+    /// ([`LookOutcome::Quiet`]).
     fn a_frame_under_the_second_files_watch(
         store: &Arc<MemoryStore>,
         member: WorkerId,
     ) -> crate::store::AtWork {
         use crate::{
             engine::decision_slot::DecisionSlot,
-            store::{Hand, Said, Watch},
+            store::{Hand, LookOutcome, Said},
             tracking::lease::ReleaseReason,
         };
 
@@ -3524,7 +3526,7 @@ pub(crate) mod tests {
                 gateway: GATEWAY,
                 request,
                 target: member,
-                picked: crate::store::Picked::default(),
+                picked: crate::store::PickRecord::default(),
                 decode: None,
                 term: 1,
                 issued_at: now,
@@ -3537,7 +3539,11 @@ pub(crate) mod tests {
         };
         let first = issue(1);
         issue(2);
-        assert_eq!(place.look(), Watch::Quiet, "two leases stand on its file");
+        assert_eq!(
+            place.look(),
+            LookOutcome::Quiet,
+            "two leases stand on its file"
+        );
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         store.hand(&Hand::new(GATEWAY), first, gone);
         place
@@ -3549,7 +3555,7 @@ pub(crate) mod tests {
     /// turn at it.
     #[test]
     fn a_decision_whose_stages_refuse_by_no_report_applies_nothing_at_the_other_files() {
-        use crate::{engine::decision_slot::DecisionSlot, store::Watch};
+        use crate::{engine::decision_slot::DecisionSlot, store::LookOutcome};
 
         const SPOKEN: &str = "model-http";
         let store = Arc::new(MemoryStore::new().with_decision_slots(2));
@@ -3581,7 +3587,7 @@ pub(crate) mod tests {
         assert_eq!(handed, 1, "the decision was handed its row");
         assert_eq!(
             watch.look(),
-            Watch::Fed,
+            LookOutcome::Fed,
             "the frame waited for its file's look"
         );
     }
@@ -3593,7 +3599,7 @@ pub(crate) mod tests {
     /// and the frame waits for its file's look.
     #[test]
     fn a_pairs_decision_applies_what_waits_where_a_stage_of_either_side_may_refuse() {
-        use crate::{engine::decision_slot::DecisionSlot, store::Watch};
+        use crate::{engine::decision_slot::DecisionSlot, store::LookOutcome};
 
         let waited = |prefill: &str, decode: &str| {
             let rows = Arc::new(Mutex::new(Vec::new()));
@@ -3642,9 +3648,21 @@ pub(crate) mod tests {
             assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
             watch.look()
         };
-        assert_eq!(waited("random", "random"), Watch::Fed, "no such stage");
-        assert_eq!(waited("random", "seen"), Watch::Quiet, "the decode side's");
-        assert_eq!(waited("seen", "random"), Watch::Quiet, "the prefill side's");
+        assert_eq!(
+            waited("random", "random"),
+            LookOutcome::Fed,
+            "no such stage"
+        );
+        assert_eq!(
+            waited("random", "seen"),
+            LookOutcome::Quiet,
+            "the decode side's"
+        );
+        assert_eq!(
+            waited("seen", "random"),
+            LookOutcome::Quiet,
+            "the prefill side's"
+        );
     }
 
     /// One model a decider, in the deciders' order: the first names of an
@@ -4183,7 +4201,7 @@ pub(crate) mod tests {
         assert!(bed.elector.release().expect("the release"));
         assert_eq!(
             bed.elector.tick(bed.script.taken).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         bed.store.set_term(2);
         let answer = bed.ask(frame(2, 1)).await;
@@ -4205,7 +4223,7 @@ pub(crate) mod tests {
         // up and takes it again: the fence is open, under term 2.
         assert!(bed.elector.release().expect("the release"));
         let tick = bed.elector.tick(bed.script.taken).expect("the take");
-        assert_eq!(tick, Tick::Acquired { term: 2 });
+        assert_eq!(tick, TickOutcome::Acquired { term: 2 });
         // The election's report tells the store the term of each take.
         bed.store.set_term(2);
         release.send(()).expect("the decider waits for the case");
@@ -4602,7 +4620,7 @@ pub(crate) mod tests {
                 gateway: GATEWAY,
                 request: 1,
                 target: member,
-                picked: crate::store::Picked::default(),
+                picked: crate::store::PickRecord::default(),
                 decode: None,
                 term: 1,
                 issued_at: now,
@@ -4650,7 +4668,7 @@ pub(crate) mod tests {
             gateway: GATEWAY,
             request: id,
             target,
-            picked: crate::store::Picked::default(),
+            picked: crate::store::PickRecord::default(),
             decode: None,
             term: 1,
             issued_at: now,
@@ -5115,14 +5133,14 @@ pub(crate) mod tests {
         use std::collections::BTreeSet;
 
         use crate::{
-            engine::view::NamedAffinity,
-            store::{Named, Naming},
+            engine::view::AffinityRows,
+            store::{AffinityQuery, AffinityRowsBuffers},
         };
 
         /// The lists by worker: the holders with their depths, the warming
         /// rows, the bit.
         fn lists(
-            named: &NamedAffinity<'_>,
+            named: &AffinityRows<'_>,
             rows: &[Candidate],
         ) -> (Vec<(WorkerId, u32)>, Vec<WorkerId>, bool) {
             let id = |row: u32| rows[row as usize].id;
@@ -5186,9 +5204,9 @@ pub(crate) mod tests {
         // built and narrowed as the decider narrows it, then named.
         let by_store = |seed: u64, at: Instant| {
             let mut view = ViewBuffers::default();
-            let mut named = Named::default();
+            let mut named = AffinityRowsBuffers::default();
             store.deciding(|world| {
-                let ask = Ask {
+                let ask = ViewQuery {
                     gateway: GATEWAY,
                     now: at,
                     pinned: None,
@@ -5200,7 +5218,7 @@ pub(crate) mod tests {
                     .expect("the pool");
                 view.candidates
                     .retain(|row| row.wire_modes.intersects(WireModes::GRPC));
-                let naming = Naming {
+                let naming = AffinityQuery {
                     gateway: GATEWAY,
                     block_hashes: &[1, 2],
                     namespace_seed: 0,
@@ -5209,7 +5227,13 @@ pub(crate) mod tests {
                     wires: Some(WireModes::GRPC),
                     now_micros: built.now_micros,
                 };
-                world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+                world.fill_affinity_rows(
+                    MODEL,
+                    Role::Single,
+                    &naming,
+                    &view.candidates,
+                    &mut named,
+                );
             });
             lists(&named.affinity(), &view.candidates)
         };
@@ -5274,11 +5298,11 @@ pub(crate) mod tests {
                 let engine = world.spec().engine();
                 assert_eq!(engine.needs_for(MODEL, Phase::Decode).sample, 16);
                 assert_eq!(engine.sample_for(MODEL, Phase::Decode), own);
-                assert_eq!(engine.named_for(MODEL, Phase::Decode), named);
+                assert_eq!(engine.affinity_rows_cap(MODEL, Phase::Decode), named);
                 // No binding of this document covers an encode item: no row
                 // is named for one, whatever its profiles cap.
-                assert_eq!(engine.named_for(MODEL, Phase::Encode), 0);
-                let rule = engine.warm_rule_for(MODEL, Phase::Decode);
+                assert_eq!(engine.affinity_rows_cap(MODEL, Phase::Encode), 0);
+                let rule = engine.warm_up_rule_for(MODEL, Phase::Decode);
                 assert_eq!(rule.is_some(), ruled);
             });
             // Twenty decode members hold the request's one block.
@@ -5850,7 +5874,7 @@ pub(crate) mod tests {
         // read one request on the prefill and one on the decode.
         let mut rows = crate::store::PairBuffers::default();
         bed.store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GATEWAY,
                 now: Instant::now(),
                 pinned: None,

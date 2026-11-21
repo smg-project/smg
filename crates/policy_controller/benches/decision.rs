@@ -38,7 +38,7 @@ use preset::SIZES;
 use smg_policy_controller::{
     document::{PolicySpec, PRESETS},
     engine::{
-        Constraints, Decision, Identity, Lifted, ModelFingerprint, PoolFacts, RequestFacts,
+        Constraints, Decision, Identity, LiftedVeto, ModelFingerprint, PoolFacts, RequestFacts,
         Scratch, Target,
     },
     stages::Lifecycle,
@@ -151,7 +151,7 @@ fn decide(c: &mut Criterion) {
         };
         let steers = matches!(
             engine.decide(&asked, &pool, &view, &cx, &mut scratch),
-            Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload
+            Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload
         );
         if !steers {
             continue;

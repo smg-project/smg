@@ -45,7 +45,7 @@
 //! moved a lease to, and what a stage keeps of a lease's events. A
 //! session's pin of record is read by its own model's decisions alone,
 //! which the file's decider makes behind its apply. A look says whether
-//! it applied a frame ([`Watch`]), and its host sets the time to its next
+//! it applied a frame ([`LookOutcome`]), and its host sets the time to its next
 //! look by that: short while the file's frames flow, longer over a quiet
 //! file. A watch ends where a look finds no lease on file: the decider
 //! takes its word back and looks once more. A frame that look misses was
@@ -474,7 +474,7 @@ impl DerefMut for Turn<'_> {
 /// stands, and whether the look applied a frame. Its host sets the time
 /// to its next look by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Watch {
+pub enum LookOutcome {
     /// The thread keeps no watch: the file holds no lease, and a watch
     /// it kept has ended, by its word first and one more look behind it.
     /// The hands apply in place, and the thread may wait with no bound.
@@ -487,7 +487,7 @@ pub enum Watch {
     /// [`AtWork::look`] or by its next job.
     Quiet,
     /// A lease stands on the file and the look applied a frame: the
-    /// watch stands as under [`Watch::Quiet`], over a file whose frames
+    /// watch stands as under [`LookOutcome::Quiet`], over a file whose frames
     /// flow.
     Fed,
 }
@@ -584,7 +584,7 @@ impl AtWork {
 
     /// The thread has no job at hand: it leaves its work, applies what
     /// was handed behind its last take and says what stands of its watch
-    /// ([`Watch`]). While its file holds a lease the watch stands, and
+    /// ([`LookOutcome`]). While its file holds a lease the watch stands, and
     /// starts here where the thread kept none: the hands leave their
     /// frames in the ring, and the thread owes the file its next look
     /// within its host's period, by this call or by its next job. Where
@@ -592,7 +592,7 @@ impl AtWork {
     /// more look behind it: the hands apply in place, and the thread may
     /// wait with no bound.
     #[must_use = "a thread that keeps its watch owes its file the next look"]
-    pub fn look(&mut self) -> Watch {
+    pub fn look(&mut self) -> LookOutcome {
         if self.working {
             self.working = false;
             self.store.leave(self.file);
@@ -600,8 +600,8 @@ impl AtWork {
         match self.store.looked(self.file) {
             // A watch ends by its word first and one more look. A thread
             // that kept none has no word to take back.
-            Watch::Ended if self.watching => self.end_watch(),
-            Watch::Ended => Watch::Ended,
+            LookOutcome::Ended if self.watching => self.end_watch(),
+            LookOutcome::Ended => LookOutcome::Ended,
             stands => {
                 if !self.watching {
                     // A hand that read no word read who is at work behind
@@ -623,11 +623,11 @@ impl AtWork {
     /// no lease on file and the frame names none. A lease it finds, laid
     /// by another thread since the first look, keeps the watch: its
     /// frames may wait in the ring.
-    pub(crate) fn end_watch(&mut self) -> Watch {
+    pub(crate) fn end_watch(&mut self) -> LookOutcome {
         self.word().store(false, SeqCst);
         fence(SeqCst);
         let found = self.store.looked(self.file);
-        if found == Watch::Ended {
+        if found == LookOutcome::Ended {
             self.watching = false;
         } else {
             self.word().store(true, SeqCst);
@@ -937,23 +937,23 @@ impl MemoryStore {
     /// take's, and it counts no frame. A frame handed while the look
     /// applies is applied all the same and not said: the time to the
     /// next look then grows once where it would have fallen.
-    /// [`Watch::Ended`] too where another thread is at work there: what
+    /// [`LookOutcome::Ended`] too where another thread is at work there: what
     /// waits is that thread's.
-    fn looked(&self, at: usize) -> Watch {
+    fn looked(&self, at: usize) -> LookOutcome {
         if !self.may_act(at) {
-            return Watch::Ended;
+            return LookOutcome::Ended;
         }
         let mut turn = self.files[at].take();
         let fed = turn.behind.ring.waits();
         if !self.applied(at, &mut turn) {
-            return Watch::Ended;
+            return LookOutcome::Ended;
         }
         if turn.records.is_empty() {
-            Watch::Ended
+            LookOutcome::Ended
         } else if fed {
-            Watch::Fed
+            LookOutcome::Fed
         } else {
-            Watch::Quiet
+            LookOutcome::Quiet
         }
     }
 

@@ -106,15 +106,15 @@ use std::{
 use rustc_hash::FxHashMap;
 
 use crate::{
-    document::spec::{AppliedSpec, IndexKind, Listed, Pairing},
+    document::spec::{AppliedSpec, IndexKind, Pairing, ViewListPositions},
     engine::{
         demands::DemandFacts,
         framework::{Engine, OverloadThresholds, PairPools, PairTable},
         view::{
-            fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, NamedHolder,
+            fingerprint, AffinityFacts, AffinityHolder, Candidate, Engines, HashKind, Health,
             OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
         },
-        warm_up::WarmRule,
+        warm_up::WarmUpRule,
         EncodePool, EncoderFacts,
     },
     load::signals::{SignalCell, SignalCells},
@@ -122,7 +122,7 @@ use crate::{
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
         health::LeaderBits,
-        index::{KvTables, Named, PoolIndex, Predict, Reading},
+        index::{AffinityRowsBuffers, KvTables, PoolIndex, Predict, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
@@ -157,7 +157,7 @@ fn age_ms(now_micros: u64, at_micros: u64) -> u32 {
 
 /// What a decision brings to the build of its view.
 #[derive(Clone, Copy, Debug)]
-pub struct Ask {
+pub struct ViewQuery {
     /// The gateway the decision is for: its vetoes mask a worker for it
     /// alone, and a host-local worker of another gateway is not its worker.
     pub gateway: GatewayId,
@@ -176,7 +176,7 @@ pub struct Ask {
     pub signal_cells: bool,
 }
 
-impl Ask {
+impl ViewQuery {
     /// Whether the ask takes a column at all. The two flags are read as
     /// one word: a view or a build makes one test for a profile that asks
     /// for neither column, as most do.
@@ -186,9 +186,10 @@ impl Ask {
     }
 }
 
-/// What a decision brings to the naming of its rows ([`StoreSnapshot::name`]).
+/// What a decision brings to the naming of its rows
+/// ([`StoreSnapshot::fill_affinity_rows`]).
 #[derive(Clone, Copy, Debug)]
-pub struct Naming<'a> {
+pub struct AffinityQuery<'a> {
     /// The gateway the decision is for: the view was built for it.
     pub gateway: GatewayId,
     /// The request's block hashes, in order from its first block
@@ -200,15 +201,16 @@ pub struct Naming<'a> {
     /// from it, on streams of the naming's own.
     pub seed: u64,
     /// The most rows either list may hold: what the engine names for the
-    /// decision ([`Engine::named_for`](crate::engine::Engine::named_for)), which is
-    /// 0 for a profile that keeps its column. A host names no rows there:
-    /// a naming under 0 holds every row.
+    /// decision
+    /// ([`Engine::affinity_rows_cap`](crate::engine::Engine::affinity_rows_cap)),
+    /// which is 0 for a profile that keeps its column. A host names no rows
+    /// there: a naming under 0 holds every row.
     pub cap: u32,
     /// The wires the view was narrowed by since its build, where the
     /// decision's gateway states them.
     pub wires: Option<WireModes>,
     /// The decision's instant on the store's clock, in microseconds, as
-    /// its build read it ([`Built::now_micros`]): a warming row is named
+    /// its build read it ([`ViewFacts::now_micros`]): a warming row is named
     /// until its own end.
     pub now_micros: u64,
 }
@@ -232,7 +234,7 @@ pub struct ViewBuffers {
     /// decision reads one count a row.
     pub kept: InFlightBuffers,
     /// The signal cells of the rows a build wrote here, in the rows' order,
-    /// under an ask that takes them ([`Ask::signal_cells`]); a view names
+    /// under an ask that takes them ([`ViewQuery::signal_cells`]); a view names
     /// the cells a decision reads ([`PoolView::signal_cells`]).
     pub signal_cells: SignalCells,
 }
@@ -401,7 +403,7 @@ impl PairBuffers {
         &mut self,
         wires: Option<WireModes>,
         subset: Option<u32>,
-        built: &(Built, Built),
+        built: &(ViewFacts, ViewFacts),
     ) -> (u64, bool) {
         self.narrow_with_classes(wires, subset, built, None)
     }
@@ -411,7 +413,7 @@ impl PairBuffers {
         &mut self,
         wires: Option<WireModes>,
         subset: Option<u32>,
-        built: &(Built, Built),
+        built: &(ViewFacts, ViewFacts),
         classes: Option<&mut Vec<u32>>,
     ) -> (u64, bool) {
         let prefill = narrow_view(&mut self.prefill, wires, subset, classes);
@@ -419,14 +421,18 @@ impl PairBuffers {
         (prefill + decode, self.emptied(built))
     }
 
-    fn emptied(&self, built: &(Built, Built)) -> bool {
+    fn emptied(&self, built: &(ViewFacts, ViewFacts)) -> bool {
         (built.0.pool_size > 0 && self.prefill.candidates.is_empty())
             || (built.1.pool_size > 0 && self.decode.candidates.is_empty())
     }
 
     /// Reports the pair's narrowing when the wire cut may have included
     /// another view. A subset of zero counts no rows as taken by wires.
-    pub(crate) fn narrowing(&self, built: &(Built, Built), cut_by_wires: bool) -> (u64, bool) {
+    pub(crate) fn narrowing(
+        &self,
+        built: &(ViewFacts, ViewFacts),
+        cut_by_wires: bool,
+    ) -> (u64, bool) {
         let took = if cut_by_wires {
             u64::from(built.0.pool_size) + u64::from(built.1.pool_size)
                 - self.prefill.candidates.len() as u64
@@ -494,7 +500,7 @@ impl EncodePairBuffers {
         &mut self,
         wires: Option<WireModes>,
         subset: Option<u32>,
-        built: &(Built, Built),
+        built: &(ViewFacts, ViewFacts),
     ) -> (u64, bool) {
         let (took, emptied) =
             self.pair
@@ -510,7 +516,7 @@ impl EncodePairBuffers {
 
 /// What a build read beside the rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Built {
+pub struct ViewFacts {
     /// The rows written: the pool as the asking gateway reaches it.
     pub pool_size: u32,
     /// The store's epoch at the membership build the world's pools are of.
@@ -539,7 +545,7 @@ pub struct Built {
     pub unreported: u32,
 }
 
-impl Built {
+impl ViewFacts {
     /// The pool facts of the decision, under the generation the build read
     /// with its rows. No ring, no overload regime and no zone capacity are
     /// derived yet.
@@ -596,11 +602,11 @@ pub struct PoolView<'a> {
     /// none and under a generation that declares no signal.
     pub signal_cells: Option<&'a SignalCells>,
     /// What the view read beside the rows.
-    pub built: Built,
+    pub built: ViewFacts,
 }
 
 impl<'a> PoolView<'a> {
-    /// The pool facts of the decision ([`Built::pool_facts`]) with the
+    /// The pool facts of the decision ([`ViewFacts::pool_facts`]) with the
     /// pool's engines beside them.
     pub fn pool_facts(&self) -> PoolFacts<'a> {
         let mut facts: PoolFacts<'a> = self.built.pool_facts();
@@ -1311,7 +1317,7 @@ impl StoreSnapshot {
     /// `built` read names it beside the worker's row: what the lease of a
     /// decision over that build books. `None` for a worker the pool does
     /// not list. `built` is a build of this world.
-    pub(crate) fn booked(&self, built: &Built, id: WorkerId) -> Option<WorkerSlot> {
+    pub(crate) fn booked(&self, built: &ViewFacts, id: WorkerId) -> Option<WorkerSlot> {
         let pool = built.pool as usize;
         let (rows, shape) = (self.rows.get(pool)?, self.derived.pools.get(pool)?);
         let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
@@ -1362,7 +1368,7 @@ impl StoreSnapshot {
     /// rows the asking gateway reaches. For rows that are written: a
     /// decision over lent rows reads the table beside them
     /// ([`StoreSnapshot::view`]). `built` is a build of this world.
-    pub fn count_in_flight(&self, built: &Built, ask: &Ask, rows: &mut [Candidate]) {
+    pub fn count_in_flight(&self, built: &ViewFacts, ask: &ViewQuery, rows: &mut [Candidate]) {
         let Some(shape) = self.derived.pools.get(built.pool as usize) else {
             return;
         };
@@ -1385,7 +1391,12 @@ impl StoreSnapshot {
     /// left them for `ask`, what the leases on file book on each row's worker:
     /// [`StoreSnapshot::count_in_flight`], a side at a time. `built` is that
     /// build's pair.
-    pub fn count_pair_in_flight(&self, built: &(Built, Built), ask: &Ask, out: &mut PairBuffers) {
+    pub fn count_pair_in_flight(
+        &self,
+        built: &(ViewFacts, ViewFacts),
+        ask: &ViewQuery,
+        out: &mut PairBuffers,
+    ) {
         self.count_in_flight(&built.0, ask, &mut out.prefill.candidates);
         self.count_in_flight(&built.1, ask, &mut out.decode.candidates);
     }
@@ -1395,7 +1406,7 @@ impl StoreSnapshot {
     /// them: a narrowing moves a row from the position the list names.
     /// None for a pool that holds a host-local row, and for a pool no
     /// engine of which holds two rows. `built` is a build of this world.
-    pub fn engines(&self, built: &Built) -> Engines<'_> {
+    pub fn engines(&self, built: &ViewFacts) -> Engines<'_> {
         self.derived
             .pools
             .get(built.pool as usize)
@@ -1445,9 +1456,9 @@ impl StoreSnapshot {
         &self,
         model: &str,
         role: Role,
-        ask: &Ask,
+        ask: &ViewQuery,
         out: &mut ViewBuffers,
-    ) -> Option<Built> {
+    ) -> Option<ViewFacts> {
         let Some(index) = self.index(model, role) else {
             out.candidates.clear();
             out.affinity.clear();
@@ -1463,7 +1474,7 @@ impl StoreSnapshot {
     /// into both doors: a single build stays one call, and a pair build runs
     /// its two sides under its one lookup with no call between them.
     #[inline(always)]
-    fn build_at(&self, index: usize, ask: &Ask, out: &mut ViewBuffers) -> Option<Built> {
+    fn build_at(&self, index: usize, ask: &ViewQuery, out: &mut ViewBuffers) -> Option<ViewFacts> {
         out.candidates.clear();
         out.affinity.clear();
         out.stalled.clear();
@@ -1483,9 +1494,9 @@ impl StoreSnapshot {
         index: usize,
         rows: &[Candidate],
         shape: &PoolShape,
-        ask: &Ask,
+        ask: &ViewQuery,
         out: &mut ViewBuffers,
-    ) -> Built {
+    ) -> ViewFacts {
         let now_micros = micros(self.origin, ask.now);
         for (from, to) in Segments::of(&shape.locals, ask.gateway, rows.len()) {
             out.candidates.extend_from_slice(&rows[from..to]);
@@ -1525,7 +1536,7 @@ impl StoreSnapshot {
         // asked last, so no loop of the build holds the answer.
         let masked =
             own.is_some_and(|run| mask(run, ask.now, shape.locals.is_empty(), &mut out.candidates));
-        Built {
+        ViewFacts {
             pool: index as u32,
             pool_size: out.candidates.len() as u32,
             membership_epoch: self.epoch,
@@ -1551,7 +1562,7 @@ impl StoreSnapshot {
         &self,
         index: usize,
         shape: &PoolShape,
-        ask: &Ask,
+        ask: &ViewQuery,
         rows: usize,
         out: &mut SignalCells,
     ) {
@@ -1604,7 +1615,7 @@ impl StoreSnapshot {
         &'a self,
         model: &str,
         role: Role,
-        ask: &Ask,
+        ask: &ViewQuery,
         written: bool,
         out: &'a mut ViewBuffers,
     ) -> Option<PoolView<'a>> {
@@ -1670,7 +1681,7 @@ impl StoreSnapshot {
             in_flight: Some(self.derived.counts.lend(&shape.booked, &mut out.kept)),
             engines: shape.engines(index as u32),
             signal_cells,
-            built: Built {
+            built: ViewFacts {
                 pool: index as u32,
                 pool_size: rows.len() as u32,
                 membership_epoch: self.epoch,
@@ -1695,7 +1706,12 @@ impl StoreSnapshot {
     /// decision carry the breaker bit beside the stalled one where a hold
     /// stands, and their view's mask is empty.
     #[inline]
-    pub fn held<'a>(&self, view: &PoolView<'_>, ask: &Ask, rows: &'a mut Vec<u32>) -> &'a [u32] {
+    pub fn held<'a>(
+        &self,
+        view: &PoolView<'_>,
+        ask: &ViewQuery,
+        rows: &'a mut Vec<u32>,
+    ) -> &'a [u32] {
         if view.stalled.is_empty() {
             return &[];
         }
@@ -1706,7 +1722,7 @@ impl StoreSnapshot {
     /// run in pool `pool`, and the row of each of its vetoes whose hold
     /// stands at the ask's instant. A run with no hold is one test.
     #[inline(never)]
-    fn held_rows<'a>(&self, pool: u32, ask: &Ask, rows: &'a mut Vec<u32>) -> &'a [u32] {
+    fn held_rows<'a>(&self, pool: u32, ask: &ViewQuery, rows: &'a mut Vec<u32>) -> &'a [u32] {
         rows.clear();
         let own = self
             .vetoes
@@ -1728,9 +1744,9 @@ impl StoreSnapshot {
     pub fn build_pair(
         &self,
         model: &str,
-        ask: &Ask,
+        ask: &ViewQuery,
         out: &mut PairBuffers,
-    ) -> Option<(Built, Built)> {
+    ) -> Option<(ViewFacts, ViewFacts)> {
         // One lookup of the model finds both pools. The classes stand on
         // the prefill pool's shape where both pools hold a member, so
         // neither side is built for a model that has one side alone.
@@ -1766,9 +1782,9 @@ impl StoreSnapshot {
     pub fn build_encode_pair(
         &self,
         model: &str,
-        ask: &Ask,
+        ask: &ViewQuery,
         out: &mut EncodePairBuffers,
-    ) -> Option<(Built, Built)> {
+    ) -> Option<(ViewFacts, ViewFacts)> {
         out.encode.candidates.clear();
         out.encode.affinity.clear();
         out.encode.signal_cells.refill(0);
@@ -1813,7 +1829,7 @@ impl StoreSnapshot {
     /// build read, by a door whose request states a demand: a request that
     /// states none reads no column. Empty where the build's pool is no pool of
     /// this publication.
-    pub fn demand_facts(&self, built: &Built, ask: &Ask, out: &mut Vec<DemandFacts>) {
+    pub fn demand_facts(&self, built: &ViewFacts, ask: &ViewQuery, out: &mut Vec<DemandFacts>) {
         out.clear();
         let Some(shape) = self.derived.pools.get(built.pool as usize) else {
             return;
@@ -1824,7 +1840,7 @@ impl StoreSnapshot {
     }
 
     /// Name the rows the affinity stages read in the column's place
-    /// ([`NamedAffinity`](crate::engine::NamedAffinity)) for `view`, the rows a
+    /// ([`AffinityRows`](crate::engine::AffinityRows)) for `view`, the rows a
     /// decision of `model` in `role` is made over: the pool's as
     /// [`StoreSnapshot::view`] lends them, or as [`StoreSnapshot::build`] wrote
     /// them, which its caller may have narrowed by its gateway's wires since.
@@ -1845,45 +1861,47 @@ impl StoreSnapshot {
     /// The lookup is of this instant: an index is written between two
     /// publications, so a holder may be named a window before its row's
     /// load shows the request that made it one.
-    pub fn name(
+    pub fn fill_affinity_rows(
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         view: &[Candidate],
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) {
         self.name_in::<false>(model, role, naming, view, HashKind::Token, named);
     }
 
-    /// [`StoreSnapshot::name`] for rows its caller cut by more than its
-    /// gateway's wires since their build: the rows a request's hard demands
-    /// took are out of `view`, and nothing else says which. The holders' lookup
-    /// is kept within the view's own rows, so the cap is filled from the rows
-    /// that stay, and a warming row is named where the view holds it.
-    pub fn name_cut(
+    /// [`StoreSnapshot::fill_affinity_rows`] for rows its caller cut by more
+    /// than its gateway's wires since their build: the rows a request's hard
+    /// demands took are out of `view`, and nothing else says which. The
+    /// holders' lookup is kept within the view's own rows, so the cap is filled
+    /// from the rows that stay, and a warming row is named where the view holds
+    /// it.
+    pub fn fill_affinity_rows_narrowed(
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         view: &[Candidate],
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) {
         self.name_in::<true>(model, role, naming, view, HashKind::Token, named);
     }
 
-    /// The one naming behind [`StoreSnapshot::name`] and
-    /// [`StoreSnapshot::name_cut`], built once for each. Those two name a token
-    /// request. The door names a request by the kind it was hashed by: a text
-    /// request is named by the record of sent prefixes alone.
+    /// The one naming behind [`StoreSnapshot::fill_affinity_rows`] and
+    /// [`StoreSnapshot::fill_affinity_rows_narrowed`], built once for each.
+    /// Those two name a token request. The door names a request by the kind it
+    /// was hashed by: a text request is named by the record of sent prefixes
+    /// alone.
     pub(crate) fn name_in<const CUT: bool>(
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         view: &[Candidate],
         hash_kind: HashKind,
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
     ) {
         named.clear();
         // A view with no row (a subset hint of 0, wires no member shares)
@@ -1913,7 +1931,7 @@ impl StoreSnapshot {
     /// naming that sent none ends at this test, in its caller's line: a
     /// decision whose profile keeps no record pays no call for it.
     #[inline(always)]
-    pub(crate) fn sent(&self, named: &Named, target: WorkerId) {
+    pub(crate) fn sent(&self, named: &AffinityRowsBuffers, target: WorkerId) {
         if let Some(pool) = named.sent_pool() {
             self.sent_to(pool, named, target);
         }
@@ -1922,18 +1940,19 @@ impl StoreSnapshot {
     /// [`Self::sent`] for a naming that sent prefixes to the pool at
     /// `pool`. Out of line: both of a single's orders write the record.
     #[inline(never)]
-    fn sent_to(&self, pool: usize, named: &Named, target: WorkerId) {
+    fn sent_to(&self, pool: usize, named: &AffinityRowsBuffers, target: WorkerId) {
         let (Some(rows), Some(Some(held))) = (self.rows.get(pool), self.indexes.get(pool)) else {
             return;
         };
         held.sent(rows, named, target);
     }
 
-    /// Holds the holders just named for `view` ([`StoreSnapshot::name`] or
-    /// [`StoreSnapshot::name_cut`], by the same `naming`, into `named`) to the
-    /// test the decision's pass asks of a row
-    /// ([`Engine::keeps_for`](crate::engine::framework::Engine::keeps_for)), where
-    /// they fill the naming's cap. A naming shorter than its cap holds
+    /// Holds the holders just named for `view`
+    /// ([`StoreSnapshot::fill_affinity_rows`] or
+    /// [`StoreSnapshot::fill_affinity_rows_narrowed`], by the same `naming`,
+    /// into `named`) to the test the decision's pass asks of a row
+    /// ([`Engine::keeps_for`](crate::engine::framework::Engine::keeps_for)),
+    /// where they fill the naming's cap. A naming shorter than its cap holds
     /// every holder the index has, and one under no cap names them all: no
     /// lookup made again reads another, so neither is asked anything and
     /// `keeps`, which makes the test, is not called.
@@ -1953,9 +1972,9 @@ impl StoreSnapshot {
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         view: &[Candidate],
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
         keeps: impl FnOnce() -> Option<K>,
     ) {
         if naming.cap != 0 && named.holders.len() >= naming.cap as usize {
@@ -1971,15 +1990,15 @@ impl StoreSnapshot {
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         view: &[Candidate],
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
         keeps: impl FnOnce() -> Option<K>,
     ) {
         let Some(keeps) = keeps() else {
             return;
         };
-        let passes = |holder: &NamedHolder| view.get(holder.row as usize).is_some_and(&keeps);
+        let passes = |holder: &AffinityHolder| view.get(holder.row as usize).is_some_and(&keeps);
         if !named.holders.iter().any(passes) {
             self.name_again(model, role, naming, view, named, &keeps);
         }
@@ -1993,9 +2012,9 @@ impl StoreSnapshot {
         &self,
         model: &str,
         role: Role,
-        naming: &Naming<'_>,
+        naming: &AffinityQuery<'_>,
         view: &[Candidate],
-        named: &mut Named,
+        named: &mut AffinityRowsBuffers,
         keeps: &dyn Fn(&Candidate) -> bool,
     ) {
         let Some(index) = self.index(model, role) else {
@@ -2028,7 +2047,12 @@ impl StoreSnapshot {
     /// The workers of the pool a naming's read is kept within, by id: for
     /// the cases.
     #[cfg(test)]
-    pub(crate) fn reached(&self, model: &str, role: Role, naming: &Naming<'_>) -> Vec<WorkerId> {
+    pub(crate) fn reached(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &AffinityQuery<'_>,
+    ) -> Vec<WorkerId> {
         let Some(index) = self.index(model, role) else {
             return Vec::new();
         };
@@ -2145,7 +2169,7 @@ struct Held {
     /// The revision of the member's row at the read: a write of the row's
     /// facts moves it.
     revision: u64,
-    listed: Listed,
+    listed: ViewListPositions,
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
@@ -2158,7 +2182,7 @@ fn row_of(
     leader: LeaderBits,
     sample: Option<&LoadSample>,
     origin: Instant,
-    listed: Listed,
+    listed: ViewListPositions,
 ) -> Candidate {
     let facts = &member.facts;
     Candidate {
@@ -3099,7 +3123,7 @@ impl Writer {
         held.clear();
         for (member, ..) in members {
             let facts = &member.facts;
-            let listed = lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
+            let listed = lists.positions(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
             outside.engines += u32::from(listed.engine_outside);
             outside.zones += u32::from(listed.zone_outside);
             if listing {
@@ -3856,7 +3880,7 @@ impl Writer {
                     Some(held) if held.id == member.id && held.revision == member.revision => {
                         held.listed
                     }
-                    _ => lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels),
+                    _ => lists.positions(&facts.engine_kind, facts.zone.as_deref(), &facts.labels),
                 };
                 outside.engines += u32::from(listed.engine_outside);
                 outside.zones += u32::from(listed.zone_outside);
@@ -3867,7 +3891,7 @@ impl Writer {
                 });
                 listed
             } else {
-                Listed::default()
+                ViewListPositions::default()
             };
             let entry = Entry {
                 row: row_of(member, leader, sample.as_ref(), origin, listed),
@@ -4977,7 +5001,7 @@ fn put_read(
 /// hand names rows for such a request alone; a pair's sides read their
 /// columns. `None` where the profile's warm-up stages rule by different
 /// numbers: it is named no rows.
-fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmRule> {
+fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmUpRule> {
     let role = rows.first()?.role;
     spec.engine().pool_rule_for(model, phase_of(role))
 }

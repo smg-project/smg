@@ -135,10 +135,10 @@ mod tests {
     use smg_policy_controller::{
         document::{operator::SpecRejected, PolicySpec, SpecError, OVERLOAD_WAITING_REQUESTS},
         engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scorer, Scratch, WorkerId},
-        service::controller::{Config, Controller, Election, Error, Listener, Scope},
+        service::controller::{Config, Controller, ElectionConfig, Error, Listener, Scope},
         store::{
-            Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers,
-            WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+            GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers,
+            ViewQuery, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
         },
     };
 
@@ -296,8 +296,8 @@ mod tests {
         }
 
         /// What one decision asks of the store, a second into its window.
-        fn ask(&self) -> Ask {
-            Ask {
+        fn ask(&self) -> ViewQuery {
+            ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: self.window + Duration::from_secs(1),
                 pinned: None,
@@ -480,7 +480,7 @@ mod tests {
             shutdown_settle: Config::DEFAULT_SHUTDOWN_SETTLE,
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
-            election: Election::default(),
+            election: ElectionConfig::default(),
             discovery: None,
         }
     }

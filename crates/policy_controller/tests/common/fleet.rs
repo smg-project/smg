@@ -68,7 +68,8 @@ use smg_policy_controller::{
     service::{
         client::Client,
         controller::{
-            Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
+            State,
         },
         proto::{
             self, completed::Class, policy_controller_client::PolicyControllerClient,
@@ -78,10 +79,10 @@ use smg_policy_controller::{
     },
     stages::StageRegistry,
     store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, Kinds, KvCursor,
+        BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, JournalKinds, KvCursor,
         KvEvent, KvEventSink, LaneCounts, LeaseState, MembershipChange, MembershipTail,
-        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        MemoryStore, ResyncReason, SequenceHash, Signals, StoredBlock, ViewBuffers, ViewQuery,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{LeaseId, TransportClass},
 };
@@ -1069,11 +1070,11 @@ impl Replica {
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,
             discovery: None,
-            election: Election {
+            election: ElectionConfig {
                 lease: lease.map_or(LeasePlace::Process, |file| {
                     LeasePlace::File(file.to_owned())
                 }),
-                ..Election::default()
+                ..ElectionConfig::default()
             },
         };
         // A pair's first replica draws its replication port from the pairs'
@@ -1306,7 +1307,7 @@ impl Harness {
     /// with a load row beside them: what a controller that follows has of
     /// its leader's log. A row no registration made is an error.
     pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
-        let cut = standby.store.cut(Kinds::All);
+        let cut = standby.store.checkpoint(JournalKinds::All);
         let mut held = 0;
         for row in &cut.rows {
             if !self.members.contains_key(&row.id) {
@@ -1662,7 +1663,7 @@ impl Harness {
     /// this instant, each row named by its engine. Until the service
     /// answers decisions this is what a case reads back.
     pub fn view(&mut self, model: &str, role: Role) -> Result<Vec<Seen>, String> {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId::LOCAL,
             now: Instant::now(),
             pinned: None,
@@ -2156,7 +2157,7 @@ impl Embedded {
     /// every rank of it reads healthy, and the requests the leases on
     /// file book on it.
     pub fn read(&self, model: &str, gateway: GatewayId) -> Vec<(bool, u32)> {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway,
             now: Instant::now(),
             pinned: None,

@@ -106,7 +106,7 @@ fn key_position(key: u64) -> u64 {
 }
 
 /// What a walk's visitor answers for the member it is shown.
-pub enum Probe<T> {
+pub enum WalkStep<T> {
     /// Take the member: the walk ends with the value.
     Take(T),
     /// Pass the member over.
@@ -517,12 +517,12 @@ impl Ring {
 
     /// Walk clockwise from the key's position, showing `visit` each entry's
     /// member until it takes one or stops; the walk goes once around.
-    pub fn walk<T>(&self, key: u64, mut visit: impl FnMut(u32) -> Probe<T>) -> Option<T> {
+    pub fn walk<T>(&self, key: u64, mut visit: impl FnMut(u32) -> WalkStep<T>) -> Option<T> {
         for member in self.around(key) {
             match visit(member) {
-                Probe::Take(value) => return Some(value),
-                Probe::Skip => {}
-                Probe::Stop => return None,
+                WalkStep::Take(value) => return Some(value),
+                WalkStep::Skip => {}
+                WalkStep::Stop => return None,
             }
         }
         None
@@ -661,10 +661,10 @@ impl ConsistentHash {
         bound: f64,
     ) -> bool {
         ring.walk(key, |member| match slots[member as usize] {
-            FREE => Probe::Skip,
+            FREE => WalkStep::Skip,
             slot => {
                 let owner = &candidates[kept[slot as usize] as usize];
-                Probe::Take(f64::from(facts.in_flight(owner)) > bound)
+                WalkStep::Take(f64::from(facts.in_flight(owner)) > bound)
             }
         })
         .unwrap_or(false)
@@ -725,15 +725,15 @@ impl ConsistentHash {
         ring.walk(key, |member| {
             let slot = slots[member as usize];
             if slot == FREE || slot & TAKEN != 0 {
-                return Probe::Skip;
+                return WalkStep::Skip;
             }
             slots[member as usize] = slot | TAKEN;
             out[slot as usize] = 1.0 - found as f32 / MAX_TARGETS as f32;
             found += 1;
             if found == MAX_TARGETS || found == survivors {
-                Probe::Take(())
+                WalkStep::Take(())
             } else {
-                Probe::Skip
+                WalkStep::Skip
             }
         });
     }
@@ -1047,7 +1047,9 @@ mod tests {
 
     /// The owner of a key: the first member clockwise from its position.
     fn owner_of(ring: &Ring, key: u64) -> Option<WorkerId> {
-        ring.walk(key, |member| Probe::Take(ring.members()[member as usize]))
+        ring.walk(key, |member| {
+            WalkStep::Take(ring.members()[member as usize])
+        })
     }
 
     fn owner(ring: &Ring, key: u64) -> WorkerId {

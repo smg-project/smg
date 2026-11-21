@@ -22,9 +22,9 @@ use crate::{
     document::spec::{CostMargin, Needs, Unreported},
     engine::{
         decision::{Decision, Overlap, Target},
-        framework::{DecisionScope, Front, Scorer, Spread, TieBand},
+        framework::{DecisionScope, ScoreFront, ScoreSpread, Scorer, TieBand},
         view::{Candidate, LoadReportCutoff, LoadRow, PoolFacts, RequestFacts, WorkerId},
-        warm_up::WarmRule,
+        warm_up::WarmUpRule,
     },
     load::signals::{SignalSums, SignalTerm},
     stages::{
@@ -66,10 +66,10 @@ pub(crate) trait ReadsLoad: Scorer {
         asked: &[u32],
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         (
             self.score_with(facts, candidates, asked, out, load),
-            Front::Unsaid,
+            ScoreFront::Unsaid,
         )
     }
 }
@@ -155,7 +155,7 @@ impl<S: ReadsLoad> Scorer for WithLoadReportAgeLimit<S> {
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         let cutoff = LoadReportCutoff::new(facts.now_micros, self.max_age_ms);
         self.stage
             .score_front_with(facts, candidates, kept, asked, out, |row| cutoff.load(row))
@@ -187,7 +187,7 @@ impl<S: ReadsLoad> Scorer for WithLoadReportAgeLimit<S> {
         self.stage.own(facts, pool, candidates, keep, kept)
     }
 
-    fn spread(&self) -> Spread {
+    fn spread(&self) -> ScoreSpread {
         self.stage.spread()
     }
 
@@ -203,8 +203,8 @@ impl<S: ReadsLoad> Scorer for WithLoadReportAgeLimit<S> {
         self.stage.refuses_by_reports()
     }
 
-    fn warm_rule(&self) -> Option<WarmRule> {
-        self.stage.warm_rule()
+    fn warm_up_rule(&self) -> Option<WarmUpRule> {
+        self.stage.warm_up_rule()
     }
 
     fn states_overlap(&self) -> bool {
@@ -2290,7 +2290,7 @@ pub(crate) mod tests {
         document::spec::{LeastCostParams, WarmupSliceParams},
         engine::{
             decision::{Pick, Targets},
-            framework::{Narrowed, Picker},
+            framework::{Picker, Shortlist},
             view::{Health, LoadRow},
         },
         policies::{
@@ -2385,7 +2385,7 @@ pub(crate) mod tests {
                 kept: &[u32],
                 asked: &[u32],
                 out: &mut [f32],
-            ) -> (TieBand, Front) {
+            ) -> (TieBand, ScoreFront) {
                 self.score_front_with(facts, candidates, kept, asked, out, |row| row.load.as_ref())
             }
             fn row_wise(&self) -> bool {
@@ -2413,8 +2413,8 @@ pub(crate) mod tests {
                 );
                 !kept.is_empty()
             }
-            fn spread(&self) -> Spread {
-                Spread::Levels(1.0)
+            fn spread(&self) -> ScoreSpread {
+                ScoreSpread::Levels(1.0)
             }
             fn needs(&self) -> Needs {
                 Needs {
@@ -2428,8 +2428,8 @@ pub(crate) mod tests {
             fn refuses_by_reports(&self) -> bool {
                 false
             }
-            fn warm_rule(&self) -> Option<WarmRule> {
-                WarmupSlice::new(&WarmupSliceParams::default(), Gates::default()).warm_rule()
+            fn warm_up_rule(&self) -> Option<WarmUpRule> {
+                WarmupSlice::new(&WarmupSliceParams::default(), Gates::default()).warm_up_rule()
             }
             fn states_overlap(&self) -> bool {
                 true
@@ -2469,9 +2469,9 @@ pub(crate) mod tests {
                 asked: &[u32],
                 out: &mut [f32],
                 load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
-            ) -> (TieBand, Front) {
+            ) -> (TieBand, ScoreFront) {
                 let band = self.score_with(facts, candidates, asked, out, load);
-                (band, Front::of(self.spread(), out))
+                (band, ScoreFront::of(self.spread(), out))
             }
         }
 
@@ -2519,7 +2519,7 @@ pub(crate) mod tests {
             bare.scope().expect("the scope")
         ));
         assert_eq!(wrapped.refuses_by_reports(), bare.refuses_by_reports());
-        assert_eq!(wrapped.warm_rule(), bare.warm_rule());
+        assert_eq!(wrapped.warm_up_rule(), bare.warm_up_rule());
         assert_eq!(wrapped.states_overlap(), bare.states_overlap());
         assert_eq!(wrapped.said(&facts, &rows, 1), bare.said(&facts, &rows, 1));
         assert_eq!(wrapped.keeps_loads(), bare.keeps_loads());
@@ -2781,7 +2781,7 @@ pub(crate) mod tests {
         band: TieBand,
     ) -> Vec<u32> {
         let mut rows = kept(pool.len() as u32);
-        let Narrowed {
+        let Shortlist {
             compared,
             alternates,
         } = picker.narrow(facts, pool, &mut rows);

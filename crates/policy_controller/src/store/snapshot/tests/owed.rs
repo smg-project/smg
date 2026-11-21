@@ -15,8 +15,8 @@ use super::{
 use crate::{
     engine::view::{Role, WorkerId},
     store::{
-        HealthSink, Kinds, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        HealthSink, JournalKinds, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
 };
 
@@ -268,7 +268,7 @@ fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
     let a = member(&leader, "http://a:8000");
     let b = member(&leader, "http://b:8000");
     let standby = MemoryStore::new();
-    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
     let now = Instant::now();
     let listed = |store: &MemoryStore| -> Vec<WorkerId> {
         let (rows, _, _) = view(store, &ask(now));
@@ -326,7 +326,7 @@ fn a_restore_builds_its_world_at_once_and_leaves_nothing_owed() {
     // A row of the replica's own, its build still owed.
     standby.upsert(worker(9));
     assert!(standby.publish_due().is_some());
-    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
     let (rows, _, _) = view(&standby, &ask(Instant::now()));
     let mut listed: Vec<WorkerId> = rows.iter().map(|row| row.id).collect();
     listed.sort_unstable();

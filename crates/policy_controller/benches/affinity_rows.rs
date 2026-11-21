@@ -23,18 +23,18 @@ use column::build_column;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::engine::{
-    Constraints, NamedAffinity, NamedHolder, Phase, PoolFacts, RequestFacts, Scratch,
+    AffinityHolder, AffinityRows, Constraints, Phase, PoolFacts, RequestFacts, Scratch,
 };
 
 const SIZES: [usize; 5] = [8, 64, 128, 512, 1024];
 
-fn facts(seed: u64, holders: &[NamedHolder]) -> RequestFacts<'_> {
+fn facts(seed: u64, holders: &[AffinityHolder]) -> RequestFacts<'_> {
     RequestFacts {
         model: "m",
         prompt_tokens: 512,
         seed,
         now_micros: 1_000_000,
-        named: Some(NamedAffinity {
+        named: Some(AffinityRows {
             holders,
             warming: &[],
             thin: false,
@@ -55,10 +55,10 @@ fn decide(c: &mut Criterion) {
         build_column(&fleet, &mut held);
         // The holders of the fleet's column as a host names them: the deepest
         // first, at most the sample of the profile that decides.
-        let mut holders: Vec<NamedHolder> = (0u32..)
+        let mut holders: Vec<AffinityHolder> = (0u32..)
             .zip(&held)
             .filter(|(_, entry)| entry.overlap_blocks > 0 || entry.predicted_blocks > 0)
-            .map(|(row, entry)| NamedHolder {
+            .map(|(row, entry)| AffinityHolder {
                 row,
                 overlap_blocks: entry.overlap_blocks,
                 predicted_blocks: entry.predicted_blocks,
@@ -72,7 +72,7 @@ fn decide(c: &mut Criterion) {
                 .iter()
                 .take_while(|holder| holder.overlap_blocks > edge)
                 .count();
-            let group: Vec<NamedHolder> = holders[fit..]
+            let group: Vec<AffinityHolder> = holders[fit..]
                 .iter()
                 .copied()
                 .take_while(|holder| holder.overlap_blocks == edge)

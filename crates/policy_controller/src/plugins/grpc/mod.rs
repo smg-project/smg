@@ -112,7 +112,7 @@
 //! one outage for its life, and a server that ends every call by age past
 //! a minute says one line an age. The process's panic hook writes its own
 //! line to stderr at every panicked turn. Each profile
-//! that binds the plugin holds one [`Bound`] set, taken from its engine
+//! that binds the plugin holds one [`PluginBinding`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
 //! the plugin once per engine. An `Observe` stream's hello names the
 //! version the plugin's `Decide` streams last fixed: none opens before one
@@ -152,18 +152,18 @@ mod unit;
 mod view;
 
 pub use config::{GrpcPluginSpec, Tls, Transport};
-pub use plugin::{Binder, Bound, LoadError, Plugin, Stats};
+pub use plugin::{Binder, LoadError, Plugin, PluginBinding, Stats};
 pub use runtime::Runtime;
 
 use crate::plugins::shared;
 
 /// The plugin's stages over its bound decision: the stage adapters every
-/// plugin kind shares ([`crate::plugins::shared`]), over [`Bound`].
-pub type GrpcFilter = shared::PluginFilter<Bound>;
+/// plugin kind shares ([`crate::plugins::shared`]), over [`PluginBinding`].
+pub type GrpcFilter = shared::PluginFilter<PluginBinding>;
 /// See [`GrpcFilter`].
-pub type GrpcScorer = shared::PluginScorer<Bound>;
+pub type GrpcScorer = shared::PluginScorer<PluginBinding>;
 /// See [`GrpcFilter`].
-pub type GrpcPicker = shared::PluginPicker<Bound>;
+pub type GrpcPicker = shared::PluginPicker<PluginBinding>;
 
 /// The newest protocol version this host speaks. Version 2 added the
 /// membership kind for the models a worker left; a stream that settled on

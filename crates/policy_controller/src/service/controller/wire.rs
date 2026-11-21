@@ -64,8 +64,8 @@ use crate::{
         demands::Demands,
         store_backed_engine::RequestForm,
         view::{
-            fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
-            ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
+            fingerprint, key_of_session, AffinityRows, Constraints, HashKind, Header, Identity,
+            MediaCounts, ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
         },
     },
     service::proto::{
@@ -353,7 +353,7 @@ impl Checked {
         &self,
         lists: &mut Lists,
         view: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let (facts, constraints) = (&self.facts, &self.constraints);
@@ -515,7 +515,7 @@ impl RequestForm for Checked {
         &self,
         lists: &mut Lists,
         viewed: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         Self::read(self, lists, viewed, name, decide)
@@ -946,8 +946,8 @@ mod tests {
         document::spec::MAX_BLOCK_HASHES,
         engine::{
             decision::{
-                Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
-                Trace,
+                Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
+                Targets, Trace,
             },
             store_backed_engine,
             store_backed_engine::unnamed,
@@ -1846,7 +1846,7 @@ mod tests {
     #[test]
     fn the_wire_carries_the_lifted_veto() {
         let steered = Trace {
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
             ..Trace::default()
         };
         assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);

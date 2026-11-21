@@ -40,7 +40,7 @@ pub struct Position {
 /// A kind stands with its slowest reader: watched if a watcher can ask for
 /// it, with the load rows if a standby alone follows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Kinds {
+pub enum JournalKinds {
     /// The watched kinds, those a watcher of the rows can ask for:
     /// membership and status writes, the starts of terms and the
     /// generations applied. A watch is told nothing of a generation yet:
@@ -117,7 +117,7 @@ pub trait Journal: Send + Sync {
     fn carries_loads(&self) -> bool;
 
     /// The last write of `kinds` told, with its term.
-    fn head(&self, kinds: Kinds) -> Position;
+    fn head(&self, kinds: JournalKinds) -> Position;
 
     /// The term the journal followed, `None` while the store leads the
     /// journal's term: from a take that starts the term until the store

@@ -1245,7 +1245,7 @@ impl Plugin {
     /// the stage set that shares one `decision` resource per decision. A
     /// build that binds it to several profiles takes each set from one
     /// [`Plugin::binder`]; taken here, each set would forward the lifecycle.
-    pub fn bind(self: &Arc<Self>) -> Arc<Bound> {
+    pub fn bind(self: &Arc<Self>) -> Arc<PluginBinding> {
         self.binder().bind()
     }
 
@@ -2299,8 +2299,8 @@ pub struct Binder {
 impl Binder {
     /// Binds the plugin to one profile of this build: the stage set that
     /// shares one `decision` resource per decision.
-    pub fn bind(&self) -> Arc<Bound> {
-        Arc::new(Bound {
+    pub fn bind(&self) -> Arc<PluginBinding> {
+        Arc::new(PluginBinding {
             plugin: Arc::clone(&self.plugin),
             opens: ThreadLocal::new(),
             observer_taken: Arc::clone(&self.observer_taken),
@@ -2311,22 +2311,22 @@ impl Binder {
 /// A plugin bound to one profile: the three stage adapters of a profile
 /// share it, so one decision constructs one `decision` resource per phase
 /// whichever stages the profile asks of the plugin.
-pub struct Bound {
+pub struct PluginBinding {
     plugin: Arc<Plugin>,
     opens: ThreadLocal<RefCell<Opens>>,
     /// The build's observer, shared with the build's other bound sets.
     observer_taken: Arc<AtomicBool>,
 }
 
-impl fmt::Debug for Bound {
+impl fmt::Debug for PluginBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Bound")
+        f.debug_struct("PluginBinding")
             .field("plugin", &self.plugin.name)
             .finish_non_exhaustive()
     }
 }
 
-impl Bound {
+impl PluginBinding {
     pub fn plugin(&self) -> &Arc<Plugin> {
         &self.plugin
     }
@@ -2736,7 +2736,7 @@ impl Bound {
     }
 }
 
-impl BoundPlugin for Bound {
+impl BoundPlugin for PluginBinding {
     fn name(&self) -> &'static str {
         self.plugin.name()
     }
@@ -2954,15 +2954,15 @@ impl BoundPlugin for Bound {
 /// This open marks its phase open and counts the decision before its
 /// instance's steps, so it runs under the guard that undoes an open that
 /// stops half-way.
-impl DecisionScope for Bound {
+impl DecisionScope for PluginBinding {
     fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>) {
         let mut half_open = HalfOpen::new(self);
-        Bound::open(self, facts, candidates, pool);
+        PluginBinding::open(self, facts, candidates, pool);
         half_open.returned();
     }
 
     fn close(&self) {
-        Bound::close(self);
+        PluginBinding::close(self);
     }
 }
 

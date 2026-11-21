@@ -379,7 +379,7 @@ name = "affinity"
 harness = false
 
 [[bench]]
-name = "affinity_named"
+name = "affinity_rows"
 harness = false
 
 [[bench]]
@@ -437,7 +437,7 @@ name = "store_journal"
 harness = false
 
 [[bench]]
-name = "store_named"
+name = "store_affinity_rows"
 harness = false
 
 [[bench]]

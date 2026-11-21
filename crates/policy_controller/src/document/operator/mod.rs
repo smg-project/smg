@@ -19,8 +19,8 @@ pub(crate) mod test_support;
 mod turn;
 
 pub use answers::{
-    Applied, ApplyCounts, Document, DryRun, Enforced, NeedsRow, NotHeld, OnFile, SpecRejected,
-    Status, Unanswered,
+    ApplyCounts, ApplyOutcome, Document, DryRun, EnforceOutcome, EnforceRefused, NeedsRow, NotHeld,
+    OnFile, SpecRejected, Status,
 };
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use document_manager::needs_rows;
@@ -32,4 +32,4 @@ pub(crate) use document_manager::{above, over_bound, Checked, Held, Line};
 #[cfg(feature = "controller")]
 pub(crate) use document_manager::{DRY_RUNS_WAITING, WRITES_WAITING};
 pub use reader::{Format, MAX_DOCUMENT_BYTES};
-pub use turn::Turn;
+pub use turn::SerialTurn;

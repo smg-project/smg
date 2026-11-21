@@ -26,8 +26,8 @@ use crate::{
     },
     engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     store::{
-        Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
-        Reachability, Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, JournalKinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
+        Reachability, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
         PUBLISH_WINDOW,
     },
 };
@@ -1035,7 +1035,7 @@ async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
             .build_view(
                 "m",
                 Role::Single,
-                &Ask {
+                &ViewQuery {
                     gateway: GatewayId::LOCAL,
                     now: now(),
                     pinned: None,
@@ -1442,7 +1442,7 @@ fn vetoing_at(waiting: u32) -> AppliedSpec {
 /// Each row of the model's pool: whether it carries the overload verdict.
 fn vetoed(store: &MemoryStore) -> Vec<bool> {
     let mut out = ViewBuffers::default();
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: GatewayId(1),
         now: now(),
         pinned: None,
@@ -1904,7 +1904,7 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
         0,
     );
     assert_eq!(leader.epoch(), store.epoch());
-    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;
     assert_eq!(probe.polls().len(), before, "a follower polled");
@@ -1961,7 +1961,7 @@ async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
         0,
     );
     assert_eq!(leader.epoch(), store.epoch());
-    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert!(store.restore_from(leader.checkpoint(JournalKinds::All)));
     leads.send_replace(Some(2));
     let before = probe.polls().len();
     tokio::time::sleep(TEN + TEN).await;
@@ -1992,7 +1992,7 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     // is no member of the published world.
     let seen = |id: WorkerId| {
         let mut out = ViewBuffers::default();
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId::LOCAL,
             now: now(),
             pinned: None,
@@ -2075,7 +2075,7 @@ fn cells(store: &MemoryStore) -> HashMap<WorkerId, Vec<Option<(f64, u64)>>> {
         store.publish(due);
     }
     store.deciding(|world| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now: now(),
             pinned: None,

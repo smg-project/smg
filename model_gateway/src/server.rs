@@ -4085,7 +4085,7 @@ mod tests {
 
         use smg_policy_controller::{
             engine::{Role, WireModes},
-            store::{Ask, GatewayId, HealthPolicy, Registrant, ViewBuffers, WorkerFacts},
+            store::{GatewayId, HealthPolicy, Registrant, ViewBuffers, ViewQuery, WorkerFacts},
             worker_host::Precondition,
         };
         use smg_worker::runtime::StallReason;
@@ -4142,7 +4142,7 @@ mod tests {
             .expect("the row's object stands");
         // Whether the next decision reads the pool's worker as stalled.
         let stalled = || {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId::LOCAL,
                 now: Instant::now(),
                 pinned: None,

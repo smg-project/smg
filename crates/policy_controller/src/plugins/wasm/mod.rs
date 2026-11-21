@@ -34,13 +34,13 @@
 //! instance new to the feed, or behind more than the 64 changes the feed keeps,
 //! hears the membership as it stands, as one snapshot of ids: the models a
 //! worker left, among the changes it missed, are not told. Each profile that
-//! binds the plugin holds one [`Bound`] set, taken from its engine build's
-//! [`Binder`] (one adapter of a build forwards the lifecycle, so an event
-//! reaches the plugin once per engine); the engine opens it once per decision
-//! over the profile's view (a pair decision opens one per side) and the stages
-//! read one `decision` resource, dropped at the end. The view carries the
-//! request's block hashes only where the plugin's row declares them (`needs`,
-//! either form), the first
+//! binds the plugin holds one [`PluginBinding`] set, taken from its engine
+//! build's [`Binder`] (one adapter of a build forwards the lifecycle, so an
+//! event reaches the plugin once per engine); the engine opens it once per
+//! decision over the profile's view (a pair decision opens one per side) and
+//! the stages read one `decision` resource, dropped at the end. The view
+//! carries the request's block hashes only where the plugin's row declares them
+//! (`needs`, either form), the first
 //! [`MAX_BLOCK_HASHES`](crate::document::spec::MAX_BLOCK_HASHES) of a longer
 //! list, so a prompt's length sizes no view of a module that reads none. Every
 //! call runs under fuel: the plugin's frame budget clamped to the decision's
@@ -190,16 +190,16 @@ mod plugin;
 mod view;
 
 pub use config::{Abi, LogLimit, PluginSpec};
-pub use plugin::{Binder, Bound, LoadError, Plugin, Runtime, Stats, World};
+pub use plugin::{Binder, LoadError, Plugin, PluginBinding, Runtime, Stats, World};
 /// The packed form's layout, as the WIT's table names it.
 pub use view::layout;
 
 use crate::plugins::shared;
 
 /// The plugin's `filter` stage: the adapter every plugin kind shares, over
-/// this kind's [`Bound`].
-pub type WasmFilter = shared::PluginFilter<Bound>;
-/// The plugin's `score` stage, over [`Bound`].
-pub type WasmScorer = shared::PluginScorer<Bound>;
-/// The plugin's `pick` stage, over [`Bound`].
-pub type WasmPicker = shared::PluginPicker<Bound>;
+/// this kind's [`PluginBinding`].
+pub type WasmFilter = shared::PluginFilter<PluginBinding>;
+/// The plugin's `score` stage, over [`PluginBinding`].
+pub type WasmScorer = shared::PluginScorer<PluginBinding>;
+/// The plugin's `pick` stage, over [`PluginBinding`].
+pub type WasmPicker = shared::PluginPicker<PluginBinding>;

@@ -52,16 +52,16 @@ use crate::{
         },
         sticky_sessions::{SessionExpiry, SessionVerdict},
         view::{
-            fingerprint, AffinityFacts, Candidate, Constraints, HashKind, KeyedRow, NamedAffinity,
+            fingerprint, AffinityFacts, AffinityRows, Candidate, Constraints, HashKind, KeyedRow,
             Phase, PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
         },
     },
     stages::lifecycle::Lifecycle,
     store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeIssue, DecodeRefused, DecodeSide, Dispatch,
-        EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
-        LeasesStore, MemoryStore, Named, Naming, PairBuffers, Picked, Pin, Said, SessionsStore,
-        Sides, StoreSnapshot, ViewBuffers,
+        leases::DISPATCH_TTL, AffinityQuery, AffinityRowsBuffers, AtWork, DecodeIssue,
+        DecodeRefused, DecodeSide, Dispatch, EncodePairBuffers, GatewayId, Hand, HealthSink,
+        LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, PairBuffers, PickRecord,
+        Pin, Said, SessionsStore, Sides, StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
     },
     tracking::{
         in_flight::WorkerSlot,
@@ -71,7 +71,7 @@ use crate::{
 
 mod explain;
 
-pub use explain::{DecisionRecord, Explained, Names};
+pub use explain::{DecisionExplanation, DecisionNames, DecisionRecord};
 pub(crate) use explain::{SampleCount, Samples};
 
 /// A request as the store-backed engine reads it: what the rows' narrowing,
@@ -122,13 +122,13 @@ pub(crate) trait RequestForm {
         &self,
         lists: &mut Self::Lists,
         viewed: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R;
 }
 
 /// The naming of a decision that names no row ([`RequestForm::read`]).
-pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<NamedAffinity<'static>> {
+pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<AffinityRows<'static>> {
     None
 }
 
@@ -217,7 +217,8 @@ pub(crate) fn summed(parts: &[Part], count: impl Fn(&Part) -> &AtomicU64) -> u64
 
 /// The stage a decision is shed under when its pool has rows and its
 /// gateway shares a wire with none of them, or its request's runtime is
-/// none of theirs ([`Unmet::Runtime`](crate::engine::demands::Unmet::Runtime)).
+/// none of theirs
+/// ([`UnmetDemand::Runtime`](crate::engine::demands::UnmetDemand::Runtime)).
 pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
@@ -243,7 +244,7 @@ pub(crate) struct Buffers<L> {
     pub(crate) encode: Option<Box<EncodePairBuffers>>,
     pub(crate) scratch: Scratch,
     pub(crate) lists: L,
-    pub(crate) named: Named,
+    pub(crate) named: AffinityRowsBuffers,
     /// What a keyed decision reads of its key in the store, where its
     /// rule has an in-flight cap.
     pub(crate) keyed: Keyed,
@@ -520,7 +521,7 @@ impl<const KEEPS: bool> ByEngine<'_, KEEPS> {
         let booking = decision.pick().and_then(|pick| {
             Some(Booking {
                 target: pick.targets.first()?.id,
-                picked: Picked::of(&pick.targets),
+                picked: PickRecord::of(&pick.targets),
                 verdict: pick.session_verdict,
                 // The scratch holds this decision's rule's TTL where
                 // a rule governed the pick, and an earlier decision's
@@ -747,7 +748,7 @@ struct OwnRows<'a> {
     gateway: GatewayId,
     wires: Option<WireModes>,
     cut: bool,
-    named: &'a mut Named,
+    named: &'a mut AffinityRowsBuffers,
     /// Whether the live profile reads the affinity column by its own
     /// stages: no column is filled for such a shadow's sake.
     column: bool,
@@ -804,7 +805,7 @@ impl<'a> OwnRows<'a> {
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         constraints: &Constraints<'_>,
-    ) -> &'a Named {
+    ) -> &'a AffinityRowsBuffers {
         let Self {
             world,
             gateway,
@@ -815,7 +816,7 @@ impl<'a> OwnRows<'a> {
             ..
         } = self;
         let role = role_of(facts.phase);
-        let naming = Naming {
+        let naming = AffinityQuery {
             gateway,
             block_hashes: facts.block_hashes,
             namespace_seed: facts.namespace_seed,
@@ -982,7 +983,7 @@ pub(crate) fn decide_own_in<A: RequestForm>(
     buffers: &mut Buffers<A::Lists>,
     own: &Part,
     due: (u32, ShadowRows),
-    named: &mut Named,
+    named: &mut AffinityRowsBuffers,
     left: impl FnOnce() -> Duration,
 ) -> ((Decision, Option<Booking>), Shadow) {
     let engine = world.spec().engine();
@@ -1306,10 +1307,10 @@ fn pair_with<const DECODE: bool, A: RequestForm, R, B>(
         &mut R,
         &Engine,
         &str,
-        Ask,
+        ViewQuery,
         Option<WireModes>,
         Option<u32>,
-    ) -> Option<((Built, Built), (u64, bool))>,
+    ) -> Option<((ViewFacts, ViewFacts), (u64, bool))>,
     (decide, book, behind): (
         impl FnOnce(
             &Engine,
@@ -1319,7 +1320,7 @@ fn pair_with<const DECODE: bool, A: RequestForm, R, B>(
             &Constraints<'_>,
             &mut Scratch,
         ) -> Decision,
-        impl FnOnce(&RequestFacts<'_>, &Decision, Option<(Built, Built)>, &Scratch) -> Option<B>,
+        impl FnOnce(&RequestFacts<'_>, &Decision, Option<(ViewFacts, ViewFacts)>, &Scratch) -> Option<B>,
         impl FnOnce(
             &Engine,
             &R,
@@ -1356,7 +1357,7 @@ fn pair_with<const DECODE: bool, A: RequestForm, R, B>(
     if let Some(place) = place.filter(|_| prefill_by_reports || decode_by_reports) {
         place.apply_waiting();
     }
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway,
         now,
         pinned: None,
@@ -1441,7 +1442,7 @@ fn pair_booking(
     world: &StoreSnapshot,
     facts: &RequestFacts<'_>,
     decision: &Decision,
-    built: Option<(Built, Built)>,
+    built: Option<(ViewFacts, ViewFacts)>,
     scratch: &Scratch,
     later: bool,
 ) -> Option<PairBooking> {
@@ -1463,7 +1464,7 @@ fn pair_booking(
     };
     let decode = DecodeSide {
         target: chosen.decode_id,
-        picked: Picked::of_decodes(&pick.targets),
+        picked: PickRecord::of_decodes(&pick.targets),
         session: RequestFacts {
             phase: Phase::Decode,
             ..*facts
@@ -1476,7 +1477,7 @@ fn pair_booking(
     Some(PairBooking {
         prefill: Booking {
             target: first.id,
-            picked: Picked::of(&pick.targets),
+            picked: PickRecord::of(&pick.targets),
             verdict: pick.session_verdict,
             ttl_micros,
             generation: pick.trace.generation,
@@ -1500,7 +1501,7 @@ pub(crate) struct Booking {
     pub(crate) target: WorkerId,
     /// The pick's other targets and the ranks, for a `Dispatched` that
     /// names one by its index.
-    pub(crate) picked: Picked,
+    pub(crate) picked: PickRecord,
     /// What the decision did with the request's session key.
     pub(crate) verdict: SessionVerdict,
     /// The TTL of the rule behind that verdict; none without one.
@@ -1518,7 +1519,7 @@ pub(crate) struct Booking {
     /// The decision's instant in the rows' clock.
     pub(crate) now_micros: u64,
     /// The build the decision read: where its target's count stands.
-    pub(crate) built: Option<Built>,
+    pub(crate) built: Option<ViewFacts>,
 }
 
 /// What a pair's two leases take of its decision's hand-over: the prefill
@@ -1556,7 +1557,7 @@ pub(crate) fn issue<A: RequestForm>(
     taken: &DecisionCall<'_, A>,
     term: u64,
     booking: Booking,
-    named: &Named,
+    named: &AffinityRowsBuffers,
     told: impl Fn(&Lease),
 ) -> Result<Lease, LeaseRefused> {
     let record = record_of(taken, term, &booking, Side::Single);
@@ -1695,7 +1696,7 @@ where
                 let first = pick.targets.first()?.pair?;
                 let side = DecodeSide {
                     target: first.decode_id,
-                    picked: Picked::of_decodes(&pick.targets),
+                    picked: PickRecord::of_decodes(&pick.targets),
                     session: RequestFacts {
                         phase: Phase::Decode,
                         ..*facts
@@ -1905,7 +1906,7 @@ type Read<'a> = (
     &'a [AffinityFacts],
     Option<&'a crate::load::SignalCells>,
     Option<crate::tracking::PoolInFlightCounts<'a>>,
-    Option<Built>,
+    Option<ViewFacts>,
 );
 
 /// Hands `decide` what the engine reads for one request: the request with
@@ -1929,20 +1930,21 @@ type Read<'a> = (
 ///
 /// A request whose profile reads the affinity column by its own stages is
 /// handed no column: the rows the store names for it stand in the column's
-/// place ([`StoreSnapshot::name`]), at most its sample of each list, and every
-/// holder and every warming row where it takes none
-/// ([`Engine::named_for`](crate::engine::framework::Engine::named_for)). Where a
-/// demand took a row, the rows that stay are named within themselves
-/// ([`StoreSnapshot::name_cut`]). The naming is the store's one reader of its
-/// index: the column it builds holds a row's age and no holder. Over the
-/// rows it named the decision is asked in the decider's form for them
-/// ([`Decides::over_named`]).
+/// place ([`StoreSnapshot::fill_affinity_rows`]), at most its sample of each
+/// list, and every holder and every warming row where it takes none
+/// ([`Engine::affinity_rows_cap`](crate::engine::framework::Engine::affinity_rows_cap)).
+/// Where a demand took a row, the rows that stay are named within themselves
+/// ([`StoreSnapshot::fill_affinity_rows_narrowed`]). The naming is the store's
+/// one reader of its index: the column it builds holds a row's age and no
+/// holder. Over the rows it named the decision is asked in the decider's form
+/// for them ([`Decides::over_named`]).
 ///
 /// A pool that has rows of which the request's own narrowing left none is
 /// answered in the decider's form for it ([`Decides::emptied`]), under
 /// the stage that took the last row: the request's hint of 0, the last
-/// demand its rows failed first ([`Unmet`](crate::engine::demands::Unmet)), or its
-/// gateway's wires.
+/// demand its rows failed first
+/// ([`UnmetDemand`](crate::engine::demands::UnmetDemand)), or its gateway's
+/// wires.
 ///
 /// A request whose profile holds a stage that may refuse by a report of
 /// leases ([`Filter::refuses_by_reports`](crate::engine::framework::Filter::refuses_by_reports))
@@ -1954,7 +1956,7 @@ pub(crate) fn hand<A: RequestForm, R>(
     buffers: &mut Buffers<A::Lists>,
     undialed: &AtomicU64,
     decide: impl Decides<R>,
-) -> (R, Option<Built>) {
+) -> (R, Option<ViewFacts>) {
     let DecisionCall {
         request,
         gateway,
@@ -1989,12 +1991,12 @@ pub(crate) fn hand<A: RequestForm, R>(
     // ([`Decides::reads_column`]).
     let column = needs.affinity && decide.reads_column();
     let cap = if column {
-        engine.named_for(model, phase)
+        engine.affinity_rows_cap(model, phase)
     } else {
         0
     };
     let names = cap > 0;
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway,
         now,
         pinned: None,
@@ -2027,7 +2029,7 @@ pub(crate) fn hand<A: RequestForm, R>(
     let by_door = wires.is_none() && request.subset() != Some(0) && request.demands().is_none();
     // The last demand the rows a demand took failed first, where one took
     // a row of the build: the rows left are named within themselves then.
-    let mut unmet: Option<demands::Unmet> = None;
+    let mut unmet: Option<demands::UnmetDemand> = None;
     let (pool, now_micros, candidates, masks, affinity, cells, counts, built): Read<'_> = if by_door
     {
         match world.view(model, role, &ask, shown, view) {
@@ -2130,7 +2132,7 @@ pub(crate) fn hand<A: RequestForm, R>(
         // over: the lent rows, or the built ones after their narrowing.
         let hashes = request.block_hashes();
         let (namespace_seed, hash_kind) = request.cache_namespace();
-        let naming = Naming {
+        let naming = AffinityQuery {
             gateway,
             // The first hashes, as many as the generation reads of them:
             // the engine's request takes the same count.
@@ -2221,12 +2223,12 @@ fn emptied<R>(
     constraints: &Constraints<'_>,
     scratch: &mut Scratch,
     subset: Option<u32>,
-    unmet: Option<demands::Unmet>,
+    unmet: Option<demands::UnmetDemand>,
 ) -> R {
     let stage = if subset == Some(0) {
         SUBSET_HINT
     } else {
-        unmet.map_or(WIRES, demands::Unmet::stage)
+        unmet.map_or(WIRES, demands::UnmetDemand::stage)
     };
     decide.emptied(facts, pool, constraints, scratch, stage)
 }
@@ -2258,10 +2260,11 @@ pub(crate) struct Took {
     /// list: `0` where no demand took a row.
     pub(crate) demanded: u64,
     /// The last of the demands those rows failed first, in the order a
-    /// host answers for them ([`Unmet`](crate::engine::demands::Unmet)): the stage
-    /// a pool the demands left nobody is shed under. `None` where no demand
-    /// took a row.
-    pub(crate) unmet: Option<demands::Unmet>,
+    /// host answers for them
+    /// ([`UnmetDemand`](crate::engine::demands::UnmetDemand)): the stage a pool
+    /// the demands left nobody is shed under. `None` where no demand took a
+    /// row.
+    pub(crate) unmet: Option<demands::UnmetDemand>,
 }
 
 /// [`narrow`] for a request that states hard demands ([`Demands`]): one
@@ -2839,7 +2842,7 @@ impl RequestForm for Request<'_> {
         &self,
         (): &mut (),
         viewed: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let hashes = self.facts.block_hashes;
@@ -2967,7 +2970,7 @@ impl<M: RequestFromSnapshot> Stated for Made<'_, M> {
 
 /// A decision as its host takes it.
 #[derive(Debug)]
-pub struct Decided {
+pub struct DecideOutcome {
     /// The engine's decision.
     pub decision: Decision,
     /// The lease issued for a pick, with the target index it books. For
@@ -2976,7 +2979,7 @@ pub struct Decided {
     pub lease: Option<Leased>,
 }
 
-impl Decided {
+impl DecideOutcome {
     /// Whether the lease is a pair's prefill side. The decode side's
     /// lease shares its id and dispatch span.
     #[must_use]
@@ -2999,7 +3002,7 @@ pub struct Leased {
 
 /// What one pass of a door's clock ended ([`StoreBackedEngine::sweep`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Swept {
+pub struct SweepOutcome {
     /// The leases past their dispatch span, ended as abandoned.
     pub leases: usize,
     /// The pins of record past their end, gone from their table.
@@ -3008,7 +3011,7 @@ pub struct Swept {
 
 /// Why a door has no decision for a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Refused {
+pub enum DecisionRefused {
     /// The request is a decode or encode side sent on its own. A pair is
     /// asked at its prefill, and that one request decides both sides.
     PairSide,
@@ -3118,7 +3121,7 @@ pub struct StoreBackedEngine {
 #[derive(Default)]
 #[repr(align(128))]
 struct OwnNamed {
-    named: Mutex<Named>,
+    named: Mutex<AffinityRowsBuffers>,
 }
 
 /// What the door keeps for one file while its ring is full
@@ -3317,13 +3320,13 @@ impl StoreBackedEngine {
     ///
     /// # Errors
     ///
-    /// [`Refused`]: no decision is made for the request.
+    /// [`DecisionRefused`]: no decision is made for the request.
     pub fn decide(
         &self,
         gateway: GatewayId,
         request: &Request<'_>,
         now: Instant,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         self.deciding(gateway, request, now, Whole(self))
     }
 
@@ -3338,13 +3341,13 @@ impl StoreBackedEngine {
     ///
     /// # Errors
     ///
-    /// [`Refused`]: no decision is made for the request.
+    /// [`DecisionRefused`]: no decision is made for the request.
     pub fn decide_under(
         &self,
         gateway: GatewayId,
         maker: &impl RequestFromSnapshot,
         now: Instant,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let (decided, _) = self.decide_under_stated(gateway, maker, now)?;
         Ok(decided)
     }
@@ -3357,7 +3360,7 @@ impl StoreBackedEngine {
         gateway: GatewayId,
         maker: &impl RequestFromSnapshot,
         now: Instant,
-    ) -> Result<(Decided, bool), Refused> {
+    ) -> Result<(DecideOutcome, bool), DecisionRefused> {
         let made = Made(maker);
         let mut later = false;
         let order = WholeStated {
@@ -3375,7 +3378,7 @@ impl StoreBackedEngine {
     ///
     /// # Errors
     ///
-    /// [`Refused`]: no decision is made for the request. `placed` is cleared.
+    /// [`DecisionRefused`]: no decision is made for the request. `placed` is cleared.
     pub fn decide_encode_pair(
         &self,
         gateway: GatewayId,
@@ -3383,7 +3386,7 @@ impl StoreBackedEngine {
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         now: Instant,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let order = WithEncode {
             door: self,
             items,
@@ -3414,15 +3417,16 @@ impl StoreBackedEngine {
     ///
     /// # Errors
     ///
-    /// [`Refused::Decode`] says why the lease takes no decode side, and
-    /// [`Refused::Faulted`] that the decision panicked. Either files nothing.
+    /// [`DecisionRefused::Decode`] says why the lease takes no decode side, and
+    /// [`DecisionRefused::Faulted`] that the decision panicked. Either files
+    /// nothing.
     pub fn decide_decode(
         &self,
         gateway: GatewayId,
         request: &Request<'_>,
         lease: LeaseId,
         now: Instant,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         self.decode_called(gateway, request, lease, now)
     }
 
@@ -3443,7 +3447,7 @@ impl StoreBackedEngine {
         maker: &impl RequestFromSnapshot,
         lease: LeaseId,
         now: Instant,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         self.decode_called(gateway, &Made(maker), lease, now)
     }
 
@@ -3454,7 +3458,7 @@ impl StoreBackedEngine {
         request: &impl Stated,
         lease: LeaseId,
         now: Instant,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         // The call mints no id: it spends no term and raises none.
         let term = self.term.load(Ordering::Relaxed);
         let called = Called(request, self.store.file_of(lease));
@@ -3483,12 +3487,12 @@ impl StoreBackedEngine {
     /// world. The record is copied and each ring lock released before that
     /// read.
     #[must_use]
-    pub fn explained(&self, gateway: GatewayId, request_id: &[u8]) -> Option<Explained> {
+    pub fn explained(&self, gateway: GatewayId, request_id: &[u8]) -> Option<DecisionExplanation> {
         let record = self.explain(gateway, request_id)?;
         let names = self
             .store
             .deciding(|world| record.names(world.spec().engine()));
-        Some(Explained { record, names })
+        Some(DecisionExplanation { record, names })
     }
 
     /// What `gateway` says of `lease`: a dispatch, a completion or a
@@ -3533,11 +3537,11 @@ impl StoreBackedEngine {
     /// the standing rules is due. A host that never calls keeps such a lease on
     /// file, counted on its worker, until the next issue at its file, and such
     /// a pin for the life of the store.
-    pub fn sweep(&self, now: Instant) -> Swept {
+    pub fn sweep(&self, now: Instant) -> SweepOutcome {
         let store = &*self.store;
         // A kept word counts until its caller has handed it on.
         let settled = |at: usize| self.kept[at].waits.load(Ordering::SeqCst) == 0;
-        Swept {
+        SweepOutcome {
             pins: store.sweep_pins(now),
             leases: store.expire_where(now, settled).len(),
         }
@@ -3551,9 +3555,9 @@ impl StoreBackedEngine {
         request: &impl Stated,
         now: Instant,
         mut order: impl Orders,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         match self.once(gateway, request, now, &mut order) {
-            Err(Refused::Unleased) => self.once(gateway, request, now, order),
+            Err(DecisionRefused::Unleased) => self.once(gateway, request, now, order),
             decided => decided,
         }
     }
@@ -3568,17 +3572,17 @@ impl StoreBackedEngine {
         request: &impl Stated,
         now: Instant,
         order: impl Orders,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let term = self.term.load(Ordering::Relaxed);
         let outcome = self.at_a_seat(term, gateway, request, now, order);
         match &outcome {
             // An id at or past the term's mark: the door raises the term,
             // as an election's hand-over does for a served controller.
-            Ok(Decided {
+            Ok(DecideOutcome {
                 lease: Some(leased),
                 ..
             }) if past_mark(leased.lease.id) => self.rise(term),
-            Err(Refused::Unleased) => self.rise(term),
+            Err(DecisionRefused::Unleased) => self.rise(term),
             _ => {}
         }
         outcome
@@ -3597,7 +3601,7 @@ impl StoreBackedEngine {
         request: &impl Stated,
         now: Instant,
         mut order: impl Orders,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let store = &*self.store;
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
         loop {
@@ -3717,7 +3721,7 @@ impl StoreBackedEngine {
                 release(payload);
                 *buffers = Buffers::default();
                 self.faults.fetch_add(1, Ordering::Relaxed);
-                Err(Refused::Faulted)
+                Err(DecisionRefused::Faulted)
             });
         }
     }
@@ -3758,7 +3762,7 @@ impl StoreBackedEngine {
         at: usize,
         engine: &Engine,
         taken: &DecisionCall<'_, Request<'_>>,
-        decided: &Result<Decided, Refused>,
+        decided: &Result<DecideOutcome, DecisionRefused>,
         said: impl FnOnce() -> (Option<u32>, Option<Shadowed>, [Option<Shadowed>; 2]),
         count: &mut SampleCount,
     ) {
@@ -3887,16 +3891,16 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         entry: Entry,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         match entry {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
                 let lease =
                     self.file::<PLAIN>(world, term, taken, &buffers.named, &decision, booking)?;
-                Ok(Decided { decision, lease })
+                Ok(DecideOutcome { decision, lease })
             }
             Entry::Pair => self.pair(world, at, term, taken, buffers),
-            Entry::Side => Err(Refused::PairSide),
+            Entry::Side => Err(DecisionRefused::PairSide),
         }
     }
 
@@ -3918,10 +3922,10 @@ impl StoreBackedEngine {
         world: &StoreSnapshot,
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
-        named: &Named,
+        named: &AffinityRowsBuffers,
         decision: &Decision,
         booking: Option<Booking>,
-    ) -> Result<Option<Leased>, Refused> {
+    ) -> Result<Option<Leased>, DecisionRefused> {
         let engine = world.spec().engine();
         let told = |lease: &Lease| {
             engine.on_decision_issued(lease, decision);
@@ -3929,7 +3933,7 @@ impl StoreBackedEngine {
         let lease = booking
             .map(|booking| issue(&self.store, world, taken, term, booking, named, told))
             .transpose()
-            .map_err(|_| Refused::Unleased)?;
+            .map_err(|_| DecisionRefused::Unleased)?;
         Ok(lease.map(|lease| Leased {
             lease,
             due: taken.due(),
@@ -3961,7 +3965,7 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         if matches!(
             due.rows,
             ShadowRows::Own | ShadowRows::Apart | ShadowRows::Sides
@@ -3984,7 +3988,7 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         if due.rows == ShadowRows::Sides {
             return self.order_sides(world, at, term, taken, buffers, due);
         }
@@ -4010,7 +4014,7 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let entry = entry(world, taken);
         if !matches!(entry, Entry::Pair) {
             return self.order(world, at, term, taken, buffers, entry);
@@ -4056,7 +4060,7 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let own = &self.parts[at];
         let word = (due.binding, due.rows);
         // The order of a shadow's own rows holds its seat's buffer for
@@ -4085,7 +4089,7 @@ impl StoreBackedEngine {
             count.fetch_add(1, Ordering::Relaxed);
             due.said = Some(shadow);
         }
-        Ok(Decided { decision, lease })
+        Ok(DecideOutcome { decision, lease })
     }
 
     /// A pair's order: decided for both sides and, for a pick, issued a
@@ -4099,7 +4103,7 @@ impl StoreBackedEngine {
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let (decision, booking) = pair_in(world, taken, buffers, &self.parts[at]);
         self.file_pair(world, term, taken, decision, booking)
     }
@@ -4111,15 +4115,15 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         decision: Decision,
         booking: Option<PairBooking>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let lease = booking
             .map(|booking| {
                 issue_pair(&self.store, world, taken, term, &decision, booking)
                     .map(|(prefill, _)| prefill)
             })
             .transpose()
-            .map_err(|_| Refused::Unleased)?;
-        Ok(Decided {
+            .map_err(|_| DecisionRefused::Unleased)?;
+        Ok(DecideOutcome {
             decision,
             lease: lease.map(|lease| Leased {
                 lease,
@@ -4139,7 +4143,7 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         lease: LeaseId,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let (store, own) = (&*self.store, &self.parts[at]);
         let decided = decode_in(world, store, taken, lease, buffers, own);
         self.file_decode(world, taken, lease, decided)
@@ -4164,7 +4168,7 @@ impl StoreBackedEngine {
         buffers: &mut Buffers<()>,
         lease: LeaseId,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let (binding, left) = (due.binding, taken.left);
         let mut said = Shadow::NotDue;
         let (store, own) = (&*self.store, &self.parts[at]);
@@ -4216,15 +4220,15 @@ impl StoreBackedEngine {
         taken: &DecisionCall<'_, Request<'_>>,
         lease: LeaseId,
         decided: Result<(Decision, Option<DecodeBooking>), DecodeRefused>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let store = &*self.store;
-        let (decision, booking) = decided.map_err(Refused::Decode)?;
+        let (decision, booking) = decided.map_err(DecisionRefused::Decode)?;
         let lease = booking
             .map(|booking| issue_decode(store, world, taken, lease, &decision, booking))
             .transpose()
-            .map_err(Refused::Decode)?
+            .map_err(DecisionRefused::Decode)?
             .map(|(lease, _)| lease);
-        Ok(Decided {
+        Ok(DecideOutcome {
             decision,
             lease: lease.map(|lease| Leased {
                 lease,
@@ -4280,7 +4284,7 @@ trait Orders {
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Decided, Refused>;
+    ) -> Result<DecideOutcome, DecisionRefused>;
 
     /// [`Self::plain`] for a request whose binding names a shadow
     /// ([`StoreBackedEngine::order_shadowed`]). What the shadow said is left in
@@ -4294,7 +4298,7 @@ trait Orders {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused>;
+    ) -> Result<DecideOutcome, DecisionRefused>;
 }
 
 /// An order lent to a run. A decision whose lease the store refused runs
@@ -4314,7 +4318,7 @@ impl<O: Orders> Orders for &mut O {
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         (**self).plain(world, at, term, taken, buffers)
     }
 
@@ -4327,7 +4331,7 @@ impl<O: Orders> Orders for &mut O {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         (**self).shadowed(world, at, term, taken, buffers, due)
     }
 }
@@ -4348,7 +4352,7 @@ impl Orders for Whole<'_> {
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         let entry = entry(world, taken);
         self.0.order(world, at, term, taken, buffers, entry)
     }
@@ -4361,7 +4365,7 @@ impl Orders for Whole<'_> {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         self.0.order_shadowed(world, at, term, taken, buffers, due)
     }
 }
@@ -4383,7 +4387,7 @@ impl Orders for WholeStated<'_, '_> {
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         *self.later = taken.request.decode_later();
         Whole(self.door).plain(world, at, term, taken, buffers)
     }
@@ -4396,7 +4400,7 @@ impl Orders for WholeStated<'_, '_> {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         *self.later = taken.request.decode_later();
         Whole(self.door).shadowed(world, at, term, taken, buffers, due)
     }
@@ -4424,7 +4428,7 @@ impl Orders for DecodeCall<'_> {
         _: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         self.0.decode(world, at, taken, buffers, self.1)
     }
 
@@ -4436,7 +4440,7 @@ impl Orders for DecodeCall<'_> {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         // The word is a pair binding's that names a shadow for a side
         // ([`Self::binding`]).
         self.0
@@ -4464,7 +4468,7 @@ impl WithEncode<'_, '_, '_> {
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Result<Decided, Refused>, Entry> {
+    ) -> Result<Result<DecideOutcome, DecisionRefused>, Entry> {
         let (entry, plan) = entry_and_plan(world, taken);
         if !matches!((entry, plan), (Entry::Pair, Plan::Epd { .. })) {
             self.placed.clear();
@@ -4486,7 +4490,7 @@ impl Orders for WithEncode<'_, '_, '_> {
         term: u64,
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         match self.pair(world, at, term, taken, buffers) {
             Ok(decided) => decided,
             Err(entry) => self.door.order(world, at, term, taken, buffers, entry),
@@ -4501,7 +4505,7 @@ impl Orders for WithEncode<'_, '_, '_> {
         taken: &DecisionCall<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
         due: &mut Due,
-    ) -> Result<Decided, Refused> {
+    ) -> Result<DecideOutcome, DecisionRefused> {
         // An `epd` pair is decided with its encode items and asks no
         // shadow of its sides. Any other request is ordered as
         // [`StoreBackedEngine::decide`] orders it, with `placed` cleared: a
@@ -4538,13 +4542,13 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, Refused, Request, RequestFromSnapshot, StoreBackedEngine,
-        StoreSnapshot, Swept, DISPATCH_TTL, LAST_SLOT, ON_SAMPLE_READ, TERM_MARK,
+        decider_of, pinned, DecisionRefused, Request, RequestFromSnapshot, StoreBackedEngine,
+        StoreSnapshot, SweepOutcome, DISPATCH_TTL, LAST_SLOT, ON_SAMPLE_READ, TERM_MARK,
     };
     use crate::{
         document::spec::{AppliedSpec, Needs, PolicySpec},
         engine::{
-            decision::{Decision, Lifted, ShedReason, Target, Targets},
+            decision::{Decision, LiftedVeto, ShedReason, Target, Targets},
             decision_slot::DecisionSlot,
             demands::{DemandFacts, Demands},
             framework::{self, DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
@@ -4553,14 +4557,14 @@ pub(crate) mod tests {
                 Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts,
                 RequestFacts, Role, Session, WireModes, WorkerId,
             },
-            DecisionRecord, References, Unmet,
+            DecisionRecord, References, UnmetDemand,
         },
         policies::random::Random,
         stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
-            Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
-            HealthSink, HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink,
-            LoadSource, MemoryStore, Picked, Said, SessionsStore, VetoWrite, ViewBuffers,
+            DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId, HealthSink,
+            HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
+            MemoryStore, PickRecord, Said, SessionsStore, VetoWrite, ViewBuffers, ViewQuery,
             WorkerFacts, WorkerStatus, WorkersStore,
         },
         tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
@@ -4752,7 +4756,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn release(door: &StoreBackedEngine, decided: &super::Decided) {
+    fn release(door: &StoreBackedEngine, decided: &super::DecideOutcome) {
         if let Some(leased) = decided.lease {
             door.report(
                 GATEWAY,
@@ -4762,7 +4766,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn place_one(door: &StoreBackedEngine, now: Instant) -> Result<EncodePlaced, Refused> {
+    fn place_one(door: &StoreBackedEngine, now: Instant) -> Result<EncodePlaced, DecisionRefused> {
         let mut placed = EncodePlaced::new();
         let items = EncodeItems {
             one: Some(Identity::hashed(99)),
@@ -4849,7 +4853,7 @@ pub(crate) mod tests {
 
     /// What the leases on file book on each member, as a decision reads it.
     fn booked(store: &MemoryStore, role: Role) -> Vec<(WorkerId, u32)> {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GATEWAY,
             now: Instant::now(),
             pinned: None,
@@ -5052,7 +5056,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_door_explains_a_sampled_decision_with_its_names() {
-        use crate::engine::{Explained, Names};
+        use crate::engine::{DecisionExplanation, DecisionNames};
 
         let store = fleet(1);
         sampling(&store, 2, 1);
@@ -5070,9 +5074,9 @@ pub(crate) mod tests {
         assert!(door.explained(GatewayId::LOCAL, id).is_none());
         assert_eq!(
             door.explained(GATEWAY, id),
-            Some(Explained {
+            Some(DecisionExplanation {
                 record,
-                names: Some(Names {
+                names: Some(DecisionNames {
                     plan: "single",
                     profile: "random".into(),
                     picker: "random".into(),
@@ -5089,7 +5093,7 @@ pub(crate) mod tests {
         sampling(&store, 3, 0);
         assert_eq!(
             door.explained(GATEWAY, id),
-            Some(Explained {
+            Some(DecisionExplanation {
                 record,
                 names: None
             })
@@ -5114,9 +5118,9 @@ pub(crate) mod tests {
         assert_eq!(explained.record.binding, Some(0));
         assert_eq!(
             explained.names,
-            Some(crate::engine::Names {
+            Some(crate::engine::DecisionNames {
                 plan: "single",
-                ..crate::engine::Names::default()
+                ..crate::engine::DecisionNames::default()
             }),
         );
         assert_eq!(shed.trace.made_under(), None);
@@ -5494,7 +5498,7 @@ pub(crate) mod tests {
                 call.facts.prompt_tokens = PICK_FAULT;
                 assert_eq!(
                     door.decide_decode(GATEWAY, &call, lease, now).err(),
-                    Some(Refused::Faulted)
+                    Some(DecisionRefused::Faulted)
                 );
                 assert_eq!(store.sides(GATEWAY, lease), before);
                 assert_eq!(door.faults(), 1);
@@ -5803,7 +5807,7 @@ pub(crate) mod tests {
                 request.constraints.subset_hint = subset_hint;
                 assert_eq!(
                     door.decide_decode(gateway, &request, id, now).err(),
-                    Some(Refused::Decode(expected))
+                    Some(DecisionRefused::Decode(expected))
                 );
             }
             assert_eq!(store.sides(GATEWAY, id), sides);
@@ -6281,7 +6285,7 @@ pub(crate) mod tests {
         asked.facts.phase = Phase::Decode;
         assert_eq!(
             door.decide(GATEWAY, &asked, Instant::now()).err(),
-            Some(Refused::PairSide)
+            Some(DecisionRefused::PairSide)
         );
         assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
 
@@ -6290,7 +6294,7 @@ pub(crate) mod tests {
             asked.facts.phase = phase;
             assert_eq!(
                 door.decide(GATEWAY, &asked, Instant::now()).err(),
-                Some(Refused::PairSide)
+                Some(DecisionRefused::PairSide)
             );
             assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
         }
@@ -6665,7 +6669,7 @@ pub(crate) mod tests {
                 donor
                     .decide_encode_pair(GATEWAY, &asked, items(), &mut placed, now)
                     .err(),
-                Some(Refused::PairSide)
+                Some(DecisionRefused::PairSide)
             );
             assert!(!placed.one() && placed.encoders().is_empty());
         }
@@ -7495,7 +7499,7 @@ pub(crate) mod tests {
         );
         assert_eq!(took.undialed, 1);
         assert_ne!(took.demanded, 0);
-        assert_eq!(took.unmet, Some(Unmet::Runtime));
+        assert_eq!(took.unmet, Some(UnmetDemand::Runtime));
         assert_eq!(
             read(&view, &facts),
             (kept.clone(), vec![100, 104], vec![7, 7])
@@ -7606,7 +7610,7 @@ pub(crate) mod tests {
             let pick = decision.pick().expect("two sound members stand");
             let first = pick.targets.first().map(|target| target.id);
             assert_ne!(first, Some(members[0]));
-            assert_eq!(pick.trace.lifted, Lifted::None);
+            assert_eq!(pick.trace.lifted, LiftedVeto::None);
         }
 
         // The pool doubted whole: steered, with the doubt lifted.
@@ -7614,7 +7618,7 @@ pub(crate) mod tests {
         doubt(members[2], true);
         let decision = decide(b"whole", 7);
         let pick = decision.pick().expect("a doubt is not an outage");
-        assert_eq!(pick.trace.lifted, Lifted::Liveness);
+        assert_eq!(pick.trace.lifted, LiftedVeto::Liveness);
 
         // The doubt cleared on one member: it takes the request, and no
         // veto is lifted.
@@ -7623,7 +7627,7 @@ pub(crate) mod tests {
         let pick = decision.pick().expect("a sound member stands");
         let first = pick.targets.first().map(|target| target.id);
         assert_eq!(first, Some(members[1]));
-        assert_eq!(pick.trace.lifted, Lifted::None);
+        assert_eq!(pick.trace.lifted, LiftedVeto::None);
     }
 
     /// In process no election hands a term over: the door starts a store
@@ -7777,7 +7781,7 @@ pub(crate) mod tests {
         let (before, _) = leased(&door, b"r-0", 7);
         picking(&store, 2, "panics", || Box::new(Panics));
         let refused = door.decide(GATEWAY, &request(b"r-1", 7), Instant::now());
-        assert_eq!(refused.err(), Some(Refused::Faulted));
+        assert_eq!(refused.err(), Some(DecisionRefused::Faulted));
         assert_eq!((door.faults(), LeasesStore::live(&*store, GATEWAY)), (1, 1));
         assert_eq!(report(&door, before, gone()), 0, "no thread is at work");
         store
@@ -8143,9 +8147,13 @@ pub(crate) mod tests {
         let leased = decided.expect("a decision").lease;
         let due = leased.expect("a pick's lease").due;
         let inside = due - Duration::from_millis(1);
-        assert_eq!(door.sweep(inside), Swept::default(), "inside its span");
+        assert_eq!(
+            door.sweep(inside),
+            SweepOutcome::default(),
+            "inside its span"
+        );
         assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
-        let ended = Swept { leases: 1, pins: 0 };
+        let ended = SweepOutcome { leases: 1, pins: 0 };
         assert_eq!(door.sweep(due), ended, "at its span's end");
         assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
         assert_eq!(counted(&store), []);
@@ -8170,7 +8178,7 @@ pub(crate) mod tests {
         let at = |seconds: u64| now + Duration::from_secs(seconds);
         let sessions: &dyn SessionsStore = &*store;
         sessions.pin(1, WorkerId(1), now, Some(store.micros(at(60))));
-        let dropped = Swept { leases: 0, pins: 1 };
+        let dropped = SweepOutcome { leases: 0, pins: 1 };
         assert_eq!(door.sweep(at(61)), dropped, "a second past the pin's end");
         assert_eq!(sessions.len(), 0);
     }
@@ -8470,7 +8478,7 @@ pub(crate) mod tests {
         let last = counting(&store, document);
         let named = store.with_snapshot(|world| {
             let engine = world.spec().engine();
-            engine.named_for(MODEL, Phase::Single)
+            engine.affinity_rows_cap(MODEL, Phase::Single)
         });
         assert_ne!(named, 0, "the profile is named its rows");
         let door = StoreBackedEngine::new(Arc::clone(&store));
@@ -8586,9 +8594,10 @@ pub(crate) mod tests {
                 view::{Candidate, Constraints, LoadRow, PoolFacts, RequestFacts, Role, WorkerId},
             },
             store::{
-                Ask, BatchFacts, BatchOutcome, ContentHash, HealthSink, KvEvent, KvEventSink,
-                LoadSink, LoadSource, MemoryStore, Named, Naming, SequenceHash, Signals,
-                StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+                AffinityQuery, AffinityRowsBuffers, BatchFacts, BatchOutcome, ContentHash,
+                HealthSink, KvEvent, KvEventSink, LoadSink, LoadSource, MemoryStore, SequenceHash,
+                Signals, StoredBlock, VetoWrite, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus,
+                WorkersStore,
             },
         };
 
@@ -8683,10 +8692,10 @@ pub(crate) mod tests {
         /// The holders of `named` by their members in `rows`, the deepest
         /// first.
         fn by_depth(
-            named: &[crate::engine::NamedHolder],
+            named: &[crate::engine::AffinityHolder],
             rows: &[Candidate],
         ) -> Vec<(WorkerId, u32)> {
-            let held = |holder: &crate::engine::NamedHolder| {
+            let held = |holder: &crate::engine::AffinityHolder| {
                 (rows[holder.row as usize].id, holder.overlap_blocks)
             };
             let mut holders: Vec<(WorkerId, u32)> = named.iter().map(held).collect();
@@ -8743,9 +8752,9 @@ pub(crate) mod tests {
             cap: u32,
         ) -> Vec<(WorkerId, u32)> {
             let mut view = ViewBuffers::default();
-            let mut named = Named::default();
+            let mut named = AffinityRowsBuffers::default();
             store.deciding(|world| {
-                let ask = Ask {
+                let ask = ViewQuery {
                     gateway: GATEWAY,
                     now: Instant::now(),
                     pinned: None,
@@ -8754,7 +8763,7 @@ pub(crate) mod tests {
                 };
                 let read = world.view(MODEL, Role::Single, &ask, false, &mut view);
                 let read = read.expect("the pool");
-                let naming = Naming {
+                let naming = AffinityQuery {
                     gateway: GATEWAY,
                     block_hashes: facts.block_hashes,
                     namespace_seed: facts.namespace_seed,
@@ -8763,7 +8772,7 @@ pub(crate) mod tests {
                     wires: None,
                     now_micros: read.built.now_micros,
                 };
-                world.name(MODEL, Role::Single, &naming, read.candidates, &mut named);
+                world.fill_affinity_rows(MODEL, Role::Single, &naming, read.candidates, &mut named);
                 by_depth(&named.holders, read.candidates)
             })
         }
@@ -9219,7 +9228,7 @@ pub(crate) mod tests {
                 gateway: GATEWAY,
                 request: id,
                 target: WorkerId(worker),
-                picked: Picked::default(),
+                picked: PickRecord::default(),
                 decode: None,
                 term: 1,
                 issued_at: now,
@@ -9317,7 +9326,7 @@ pub(crate) mod tests {
         let decided = door.decide(GATEWAY, &request(b"r-2", 8), Instant::now());
         let second = decided.expect("a decision").lease;
         let due = second.expect("a pick's lease").due;
-        assert_eq!(door.sweep(due), Swept { leases: 1, pins: 0 });
+        assert_eq!(door.sweep(due), SweepOutcome { leases: 1, pins: 0 });
         let by = Some(DecisionSlot::new(0));
         let calls = ["issued", "dispatched", "completed", "issued", "released"];
         assert_eq!(*heard.lock(), calls.map(|call| (call, by)));
@@ -9342,12 +9351,20 @@ pub(crate) mod tests {
         let kept = &door.kept[0];
         kept.words.lock().push((GATEWAY, id, dispatched()));
         kept.waits.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(door.sweep(leased.due), Swept::default(), "its word waits");
+        assert_eq!(
+            door.sweep(leased.due),
+            SweepOutcome::default(),
+            "its word waits"
+        );
         door.hand_kept(0);
         assert_eq!(kept.waits.load(Ordering::SeqCst), 0);
         let on_file = LeasesStore::get(&*store, GATEWAY, id).expect("the lease is on file");
         assert!(matches!(on_file.state, LeaseState::Dispatched { .. }));
-        assert_eq!(door.sweep(leased.due), Swept::default(), "dispatched");
+        assert_eq!(
+            door.sweep(leased.due),
+            SweepOutcome::default(),
+            "dispatched"
+        );
         assert_eq!(counted(&store).len(), 1);
     }
 
@@ -9372,7 +9389,7 @@ pub(crate) mod tests {
             gateway: GATEWAY,
             request: 1,
             target: WorkerId(7),
-            picked: Picked::default(),
+            picked: PickRecord::default(),
             decode: None,
             term: 0,
             issued_at: t0,
@@ -9840,7 +9857,7 @@ pub(crate) mod tests {
         // seat for the model's. The next reads the door's word.
         for id in [b"r-1", b"r-2"] {
             let refused = door.decide(GATEWAY, &request(id, 7), Instant::now());
-            assert_eq!(refused.err(), Some(Refused::Faulted));
+            assert_eq!(refused.err(), Some(DecisionRefused::Faulted));
         }
         assert_eq!(door.faults(), 2);
         // What is said of the lease on file at the caller's own seat is

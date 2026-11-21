@@ -214,8 +214,8 @@ mod tests {
     use crate::{
         engine::view::Role,
         store::{
-            membership::life, Ask, GatewayId, HealthPolicy, MemoryStore, ViewBuffers, WorkerFacts,
-            WorkerPatch, WorkerStatus as RowStatus, WorkersStore,
+            membership::life, GatewayId, HealthPolicy, MemoryStore, ViewBuffers, ViewQuery,
+            WorkerFacts, WorkerPatch, WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -275,7 +275,7 @@ mod tests {
         /// Whether a decision reads the worker as doubted: the stalled bit
         /// of its row in the model's pool, as any gateway is handed it.
         fn doubted(&self) -> bool {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: Instant::now(),
                 pinned: None,

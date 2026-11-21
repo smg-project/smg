@@ -291,7 +291,7 @@ pub(crate) mod tests {
         stages::{lifecycle::Lifecycle, registry::StageRegistry},
         store::{
             DecodeSide, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
-            MemoryStore, Picked, SessionsStore, WorkerFacts, WorkersStore,
+            MemoryStore, PickRecord, SessionsStore, WorkerFacts, WorkersStore,
         },
         tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     };
@@ -538,7 +538,7 @@ pub(crate) mod tests {
         }
         let side = DecodeSide {
             target: d0,
-            picked: Picked::of_decodes(&targets),
+            picked: PickRecord::of_decodes(&targets),
             session: Session::NONE,
             state: LeaseState::ISSUED,
             tokens: 0,
@@ -554,7 +554,7 @@ pub(crate) mod tests {
             gateway: A,
             request: id,
             target: p,
-            picked: Picked::of(&targets),
+            picked: PickRecord::of(&targets),
             decode: None,
             term: 0,
             issued_at: now,
@@ -673,7 +673,7 @@ pub(crate) mod tests {
     }
 
     /// A pick of the workers 7 and 9, the second at rank 2.
-    fn two_targets() -> Picked {
+    fn two_targets() -> PickRecord {
         let mut targets = Targets::new();
         for (id, dp_rank) in [(7, 0), (9, 2)] {
             targets.push(Target {
@@ -682,7 +682,7 @@ pub(crate) mod tests {
                 ..Target::default()
             });
         }
-        Picked::of(&targets)
+        PickRecord::of(&targets)
     }
 
     #[test]
@@ -790,7 +790,7 @@ pub(crate) mod tests {
         record.lease.tokens = tokens;
         record.lease.issued_micros = 1_000_000;
         record.target = owner;
-        record.picked = Picked::of(&targets);
+        record.picked = PickRecord::of(&targets);
         let issued = record.lease;
         store.with_snapshot(|world| {
             let engine = world.spec().engine();
@@ -1025,7 +1025,7 @@ pub(crate) mod tests {
         let issued = LeaseState::issued(Some(60_000_000));
         let side = DecodeSide {
             target: d,
-            picked: Picked::of_decodes(&targets),
+            picked: PickRecord::of_decodes(&targets),
             session: DECODE_KEY,
             state: issued,
             tokens: 0,
@@ -1044,7 +1044,7 @@ pub(crate) mod tests {
             gateway: A,
             request: 1,
             target: p,
-            picked: Picked::of(&targets),
+            picked: PickRecord::of(&targets),
             decode: None,
             term: 0,
             issued_at: t0,

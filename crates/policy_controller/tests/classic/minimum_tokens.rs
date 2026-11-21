@@ -22,8 +22,8 @@ use smg_policy_controller::{
     policies::power_of_two::PowerOfTwoMetric,
     stages::Lifecycle,
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, ViewQuery, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
     tracking::{Lease, Side},
 };
@@ -326,7 +326,7 @@ impl Bed {
     /// dispatched, as a host commits it: the rank it took, or `None` where
     /// the decision names no row.
     fn pick(&mut self, cost: u32, now: Instant, seed: u64) -> Option<u16> {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now,
             pinned: None,

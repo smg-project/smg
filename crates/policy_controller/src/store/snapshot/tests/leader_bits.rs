@@ -5,15 +5,15 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    admit, ask, doubted, facts, generation_pairing, held, member, stalled, status, view, Ask,
+    admit, ask, doubted, facts, generation_pairing, held, member, stalled, status, view, ViewQuery,
     ASKER, MODEL,
 };
 use crate::{
     document::spec::Pairing,
     engine::view::{Role, WorkerId},
     store::{
-        GatewayId, HealthSink, HealthWrite, Kinds, LeaderBits, MemoryStore, VetoWrite, ViewBuffers,
-        WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+        GatewayId, HealthSink, HealthWrite, JournalKinds, LeaderBits, MemoryStore, VetoWrite,
+        ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
     },
 };
 
@@ -34,7 +34,7 @@ fn says(store: &MemoryStore, id: WorkerId, bits: LeaderBits) -> HealthWrite {
 
 /// The workers of the pool a decision of `gateway` may be handed at `now`.
 fn routable(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
-    let asked = Ask {
+    let asked = ViewQuery {
         gateway,
         ..ask(now)
     };
@@ -252,7 +252,7 @@ fn a_watch_keeps_the_bits_of_a_worker_still_present_and_a_cut_carries_none() {
     let store = MemoryStore::new();
     let id = member(&store, "http://a:8000");
     says(&store, id, DOUBTED);
-    let cut = store.cut(Kinds::All);
+    let cut = store.checkpoint(JournalKinds::All);
     let standby = MemoryStore::new();
     assert!(standby.restore_from(cut.clone()));
     assert!(store.watch_from(cut));

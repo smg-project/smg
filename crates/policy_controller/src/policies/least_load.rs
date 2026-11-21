@@ -20,7 +20,7 @@ use crate::{
     document::spec::{Needs, ProfileSpec},
     engine::{
         decision::Target,
-        framework::{Front, Scorer, TieBand},
+        framework::{ScoreFront, Scorer, TieBand},
         view::{Candidate, LoadRow, RequestFacts, WorkerId},
     },
     policies::standard_filters,
@@ -431,7 +431,7 @@ impl Scorer for LeastLoad {
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
     }
 
@@ -459,7 +459,7 @@ impl ReadsLoad for LeastLoad {
     /// without a report is costed from its reporting peers' baseline, the
     /// least cost among them, which is a pass over every kept row: where
     /// one is asked the stage says that it must be asked whole
-    /// ([`Front::Whole`]), before it costs any. A report without a rate
+    /// ([`ScoreFront::Whole`]), before it costs any. A report without a rate
     /// drains at the kept rows' mean rate: where one is asked that mean is
     /// folded over the kept rows as the plain entry folds it, and where
     /// each row asked reports a rate no other row is read. Either way a
@@ -480,15 +480,15 @@ impl ReadsLoad for LeastLoad {
         asked: &[u32],
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         for &i in asked {
             if load(&candidates[i as usize]).is_none() {
-                return (TieBand::NORMALIZED, Front::Whole);
+                return (TieBand::NORMALIZED, ScoreFront::Whole);
             }
         }
         (
             self.costs(facts, candidates, asked, kept, out, load),
-            Front::Unsaid,
+            ScoreFront::Unsaid,
         )
     }
 }
@@ -824,7 +824,7 @@ mod tests {
         // Asked of every kept row, it answers as the plain entry.
         assert_eq!(
             ll.score_front(&facts, &pool, &kept(3), &kept(3), &mut said),
-            (band, Front::Unsaid)
+            (band, ScoreFront::Unsaid)
         );
         assert_eq!(said, plain);
         // Asked of the first two, it orders them as among the three.
@@ -832,20 +832,20 @@ mod tests {
         let word = ll
             .score_front(&facts, &pool, &kept(3), &[0, 1], &mut said[..2])
             .1;
-        assert_eq!((word, &said[..2]), (Front::Unsaid, &[0.0, 1.0][..]));
+        assert_eq!((word, &said[..2]), (ScoreFront::Unsaid, &[0.0, 1.0][..]));
         // A row without a report is costed from its reporting peers.
         pool[1].load = None;
         let mut untouched = [-1.0f32; 2];
         let word = ll
             .score_front(&facts, &pool, &kept(3), &[0, 1], &mut untouched)
             .1;
-        assert_eq!(word, Front::Whole);
+        assert_eq!(word, ScoreFront::Whole);
         assert_eq!(untouched, [-1.0; 2], "nothing is costed");
         // Asked of the rows that hold a report alone, it answers for them.
         let word = ll
             .score_front(&facts, &pool, &kept(3), &[0, 2], &mut said[..2])
             .1;
-        assert_eq!(word, Front::Unsaid);
+        assert_eq!(word, ScoreFront::Unsaid);
     }
 
     #[test]

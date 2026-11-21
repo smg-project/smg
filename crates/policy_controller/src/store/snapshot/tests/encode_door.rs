@@ -137,7 +137,7 @@ fn the_encode_doors_columns_follow_the_rows_of_the_asking_gateway() {
     ));
     store.publish_now();
     for (gateway, own) in [(ASKER, of_asker), (other, of_other)] {
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway,
             ..ask(now)
         };
@@ -588,7 +588,7 @@ fn the_encode_door_hands_each_pool_the_cells_of_its_own_rows() {
         of_role.sort_by_key(|&(id, _)| id);
         of_role
     };
-    let asked = Ask {
+    let asked = ViewQuery {
         signal_cells: true,
         ..ask(now)
     };

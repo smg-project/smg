@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use smg_policy_controller::worker_host::{
-    registrant_of, MembershipWriter, Objects, Over, Precondition, Refused, RowRevision,
+    registrant_of, MembershipWriteRefused, MembershipWriter, Objects, Over, Precondition,
+    RowRevision,
 };
 use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -113,25 +114,31 @@ impl UpdateAtDoorStep {
     ) -> WorkflowResult<bool> {
         match self.door.refreshed(standing, rebuilt, found) {
             Ok(_) => Ok(true),
-            Err(Refused::Moved | Refused::Absent | Refused::Draining) => Ok(false),
+            Err(
+                MembershipWriteRefused::Moved
+                | MembershipWriteRefused::Absent
+                | MembershipWriteRefused::Draining,
+            ) => Ok(false),
             Err(refusal) => Err(step_failed(dropped(rebuilt.as_ref(), refusal))),
         }
     }
 }
 
 /// Why the door dropped the update of `worker`.
-fn dropped(worker: &dyn Worker, refusal: Refused) -> String {
+fn dropped(worker: &dyn Worker, refusal: MembershipWriteRefused) -> String {
     let url = worker.redacted_url();
     match refusal {
         // The store's sentence, word for word.
-        Refused::NotRegistrant(why) => why,
-        Refused::Past(past) => format!("{}: {}", past.fact, past.why),
-        Refused::Moved | Refused::Absent => format!(
+        MembershipWriteRefused::NotRegistrant(why) => why,
+        MembershipWriteRefused::Past(past) => format!("{}: {}", past.fact, past.why),
+        MembershipWriteRefused::Moved | MembershipWriteRefused::Absent => format!(
             "worker {url} was replaced or removed since this update found it, so the \
              update was dropped"
         ),
-        Refused::Draining => format!("worker {url} is draining, so the update was dropped"),
-        Refused::NotLabelsAlone => format!(
+        MembershipWriteRefused::Draining => {
+            format!("worker {url} is draining, so the update was dropped")
+        }
+        MembershipWriteRefused::NotLabelsAlone => format!(
             "the label refresh of worker {url} states another fact than its labels, so it \
              was dropped"
         ),

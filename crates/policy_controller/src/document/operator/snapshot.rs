@@ -5,8 +5,8 @@
 //! engine addresses, and its provider's key, are told without their
 //! userinfo; the store keeps the originals.
 //!
-//! A page writes itself as JSON ([`Told`]): a host in process serves the
-//! rows an operator reads with no mapping of its own.
+//! A page writes itself as JSON ([`WorkerRowsPage`]): a host in process serves
+//! the rows an operator reads with no mapping of its own.
 
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
@@ -16,8 +16,8 @@ use crate::{
     address::{split, Address, UNPARSABLE},
     engine::view::{Role, WireModes},
     store::{
-        membership::blank, pairing::LAYOUT_FACTS, Cut, EncodeHandoff, Reachability, Registrant,
-        WorkerFacts, WorkerRow, WorkerStatus,
+        membership::blank, pairing::LAYOUT_FACTS, EncodeHandoff, Reachability, Registrant,
+        StoreCheckpoint, WorkerFacts, WorkerRow, WorkerStatus,
     },
 };
 
@@ -82,7 +82,7 @@ pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
 /// The store rows read for a snapshot.
 pub enum Rows {
     /// A shared cut, ordered by registration key, before model filtering.
-    Shared(Arc<Cut>),
+    Shared(Arc<StoreCheckpoint>),
     /// The first serving rows in key order and the total that serve,
     /// as returned by [`crate::store::MemoryStore::rows_serving`].
     Told(Vec<WorkerRow>, usize),
@@ -90,7 +90,7 @@ pub enum Rows {
 
 /// A page of worker rows as an operator reads it.
 #[derive(Debug)]
-pub struct Told {
+pub struct WorkerRowsPage {
     /// The matching rows in registration key order, with addresses redacted.
     pub rows: Vec<WorkerRow>,
     /// Whether the row count or byte bound left a matching row out.
@@ -106,7 +106,7 @@ pub struct Told {
 /// is in milliseconds at the take. A fact the row does not state is `null`,
 /// and `pairing` is `null` for a row that states nothing of a pair or of an
 /// encode handoff.
-impl Serialize for Told {
+impl Serialize for WorkerRowsPage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Page<'a> {
@@ -122,7 +122,7 @@ impl Serialize for Told {
     }
 }
 
-/// One row of a page's JSON ([`Told`]).
+/// One row of a page's JSON ([`WorkerRowsPage`]).
 #[derive(Serialize)]
 struct RowJson<'a> {
     id: String,
@@ -326,12 +326,12 @@ impl<'a> PairingJson<'a> {
 /// Takes a redacted page at `now`, limited by row count and a conservative
 /// measure of the rows' facts. A row admitted after `now` reads as new at
 /// that instant. The first row must fit the byte bound too.
-pub fn told(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> Told {
-    let (rows, truncated) = told_with(asked, read, now, false, |row| {
+pub fn worker_rows_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> WorkerRowsPage {
+    let (rows, truncated) = worker_rows_page_with(asked, read, now, false, |row| {
         let bytes = measure(&row);
         (row.into_owned(), bytes)
     });
-    Told {
+    WorkerRowsPage {
         rows,
         truncated,
         taken: now,
@@ -340,7 +340,7 @@ pub fn told(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> Told {
 
 /// Pages the redacted rows using the host's measure of the answer. A host
 /// that sends an oversized first row alone can keep that rule here.
-pub(crate) fn told_with<T>(
+pub(crate) fn worker_rows_page_with<T>(
     asked: &WorkerRowsQuery,
     read: Rows,
     now: Instant,
@@ -610,14 +610,14 @@ mod tests {
         }
         let read = || store.rows_serving(&asked.models, asked.limit);
         let (rows, serving) = read();
-        let page = told(&asked, Rows::Told(rows, serving), now);
+        let page = worker_rows_page(&asked, Rows::Told(rows, serving), now);
         assert_eq!(page.rows.len(), 1);
         assert!(page.truncated);
 
         let (mut rows, _) = read();
         rows.truncate(1);
         rows[0].facts.key = "x".repeat(2 * 1024 * 1024);
-        let too_large = told(&asked, Rows::Told(rows, 1), now);
+        let too_large = worker_rows_page(&asked, Rows::Told(rows, 1), now);
         assert!(too_large.rows.is_empty() && too_large.truncated);
     }
 
@@ -709,7 +709,7 @@ mod tests {
             models: Vec::new(),
             limit: usize::MAX,
         };
-        let page = told(&asked, Rows::Told(vec![full, least], 2), taken);
+        let page = worker_rows_page(&asked, Rows::Told(vec![full, least], 2), taken);
         let probes = serde_json::json!({
             "failure_threshold": 3,
             "success_threshold": 2,

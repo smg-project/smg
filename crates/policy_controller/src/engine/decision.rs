@@ -8,7 +8,7 @@ use std::fmt;
 
 use crate::engine::{sticky_sessions::SessionVerdict, view::WorkerId};
 #[cfg(feature = "controller")]
-use crate::service::proto::{self, LiftedVeto};
+use crate::service::proto;
 
 /// Targets a decision carries at most: the pick and its alternates.
 pub const MAX_TARGETS: usize = 4;
@@ -233,7 +233,7 @@ impl fmt::Debug for Survivors {
 /// a byte the record had spare: the trace is no larger for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Lifted {
+pub enum LiftedVeto {
     /// No veto was lifted.
     #[default]
     None,
@@ -247,12 +247,12 @@ pub enum Lifted {
 /// The contract's word for the mark: the one mapper, for every writer of a
 /// trace.
 #[cfg(feature = "controller")]
-impl From<Lifted> for LiftedVeto {
-    fn from(mark: Lifted) -> Self {
+impl From<LiftedVeto> for proto::LiftedVeto {
+    fn from(mark: LiftedVeto) -> Self {
         match mark {
-            Lifted::None => Self::None,
-            Lifted::Overload => Self::Overload,
-            Lifted::Liveness => Self::Liveness,
+            LiftedVeto::None => Self::None,
+            LiftedVeto::Overload => Self::Overload,
+            LiftedVeto::Liveness => Self::Liveness,
         }
     }
 }
@@ -284,10 +284,10 @@ pub struct Trace {
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
-    /// The soft veto lifted for this pick ([`Lifted`]): `None` unless that
+    /// The soft veto lifted for this pick ([`LiftedVeto`]): `None` unless that
     /// veto as it stands left the pool nobody, or left a key handed on at
     /// its sessions rule's in-flight cap nobody.
-    pub lifted: Lifted,
+    pub lifted: LiftedVeto,
 }
 
 impl Default for Trace {
@@ -300,7 +300,7 @@ impl Default for Trace {
             top_len: 0,
             seed: 0,
             generation: 0,
-            lifted: Lifted::default(),
+            lifted: LiftedVeto::default(),
         }
     }
 }
@@ -354,7 +354,7 @@ impl Trace {
                 .collect(),
             seed: self.seed,
             generation: self.generation,
-            lifted: LiftedVeto::from(self.lifted) as i32,
+            lifted: proto::LiftedVeto::from(self.lifted) as i32,
             ..proto::Trace::default()
         }
     }
@@ -654,7 +654,7 @@ mod tests {
                 top_len: 0,
                 seed: 0,
                 generation: 0,
-                lifted: Lifted::None,
+                lifted: LiftedVeto::None,
             }
         );
         assert_eq!(trace.made_under(), None);
@@ -669,9 +669,9 @@ mod tests {
     /// record had spare, and a trace no rule wrote reads none.
     #[test]
     fn the_mark_of_a_lifted_veto_costs_the_trace_no_byte() {
-        assert_eq!(size_of::<Lifted>(), 1);
+        assert_eq!(size_of::<LiftedVeto>(), 1);
         assert_eq!(size_of::<Trace>(), 72);
-        assert_eq!(Trace::default().lifted, Lifted::None);
+        assert_eq!(Trace::default().lifted, LiftedVeto::None);
     }
 
     /// The overlap costs the pick no byte: it shares the eight bytes the

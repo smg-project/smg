@@ -79,7 +79,7 @@ impl DecisionSlot {
     /// a guard drops there, its own or another's: with no list no older
     /// guard is known, and the thread then acts as none.
     #[must_use = "the thread acts as the decider only while the guard lives"]
-    pub fn enter(self) -> Acting {
+    pub fn enter(self) -> DecisionSlotGuard {
         // A guard entered once the list is gone joins none: its number is
         // not read again.
         let number = LIVE
@@ -91,7 +91,7 @@ impl DecisionSlot {
             })
             .unwrap_or(0);
         ACTING.set(Some(self));
-        Acting {
+        DecisionSlotGuard {
             number,
             thread: PhantomData,
         }
@@ -120,7 +120,7 @@ impl DecisionSlot {
 /// sent(smg_policy_controller::engine::DecisionSlot::new(0).enter());
 /// ```
 #[derive(Debug)]
-pub struct Acting {
+pub struct DecisionSlotGuard {
     /// The guard's number among its thread's live guards: one more than the
     /// newest one's at its entry, so it grows by one a renewal for as long
     /// as any guard lives. No two guards of the list share a number: a `u64`
@@ -131,7 +131,7 @@ pub struct Acting {
     thread: PhantomData<*const ()>,
 }
 
-impl Drop for Acting {
+impl Drop for DecisionSlotGuard {
     fn drop(&mut self) {
         // The guard leaves the thread's list wherever it stands in it, and
         // the newest one left names the thread. Where the list is gone (a
@@ -153,7 +153,7 @@ impl Drop for Acting {
 mod tests {
     use std::{cell::RefCell, sync::mpsc};
 
-    use super::{Acting, DecisionSlot, LIVE};
+    use super::{DecisionSlot, DecisionSlotGuard, LIVE};
 
     #[test]
     fn a_thread_acts_as_the_decider_it_entered_until_the_guard_drops() {
@@ -264,7 +264,7 @@ mod tests {
     /// A value a thread keeps to its end: it drops the guard it kept, then
     /// enters and drops another, and reports what the thread acted as.
     struct AtEnd {
-        kept: Option<Acting>,
+        kept: Option<DecisionSlotGuard>,
         report: mpsc::Sender<AtEndReport>,
     }
 

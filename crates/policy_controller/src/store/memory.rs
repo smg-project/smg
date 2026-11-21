@@ -33,7 +33,7 @@ use crate::{
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts, LaneWriter},
-        journal::{Journal, Kinds, Position},
+        journal::{Journal, JournalKinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
             DecodeMark, DecodeRefused, DecodeSide, Dispatch, InFlightCounts, LeaseRecord,
@@ -44,9 +44,9 @@ use crate::{
         sessions::{Pin, SessionTables, SessionsStore},
         signals::{SignalSink, SignalWriteOutcome, Writes, VALUE_MAGNITUDE_LIMIT},
         snapshot::{
-            left_models, micros, same_cache, same_offer, Ask, Built, Classes, EncodePairBuffers,
-            OnFile, OutsideLists, PairBuffers, StaleGeneration, StoreSnapshot, ViewBuffers, Writer,
-            PUBLISH_WINDOW,
+            left_models, micros, same_cache, same_offer, Classes, EncodePairBuffers, OnFile,
+            OutsideLists, PairBuffers, StaleGeneration, StoreSnapshot, ViewBuffers, ViewFacts,
+            ViewQuery, Writer, PUBLISH_WINDOW,
         },
         workers::{
             identity, MembershipChange, MembershipTail, Registrant, WorkerFacts, WorkerPatch,
@@ -61,7 +61,7 @@ mod blocks;
 mod turn;
 
 use blocks::{Blocks, Minted};
-pub use turn::{AtWork, Hand, Watch};
+pub use turn::{AtWork, Hand, LookOutcome};
 
 /// Membership changes kept for watchers; a watcher further behind snapshots
 /// again (the registry's broadcast is sized the same today).
@@ -164,9 +164,10 @@ pub struct MemoryStore {
 }
 
 /// The store's replicated tables at one place of its history
-/// ([`MemoryStore::cut`]).
+/// ([`MemoryStore::checkpoint`]). The contract's three snapshot messages are
+/// built from it: the operator's, the watch's and the replication's.
 #[derive(Clone, Debug)]
-pub struct Cut {
+pub struct StoreCheckpoint {
     /// The last journaled write of the kinds asked that the tables hold,
     /// with its term; the default for a store with no journal.
     pub at: Position,
@@ -285,22 +286,22 @@ impl MemoryStore {
     }
 
     /// The tables of `kinds` as one journaled write of those kinds left
-    /// them, with that write's position: the rows, and with [`Kinds::All`]
-    /// the load rows. What a watcher of the rows starts from, and what a
-    /// standby is restored from. Taken under the locks of the kinds asked,
-    /// in the store's order (the membership lock; the load lock for the
-    /// load rows alone): every journaled write holds its table's lock from
-    /// its apply to its telling, so none stands half told here. A writer
-    /// of those tables waits for the copy; a decision reads the published
-    /// world and does not, and a cut of the rows leaves the load writers
-    /// be. Where the journal carries no load row a cut of every kind has
-    /// no tail: that journal is lost to a reader of every kind.
-    pub fn cut(&self, kinds: Kinds) -> Cut {
+    /// them, with that write's position: the rows, and with
+    /// [`JournalKinds::All`] the load rows. What a watcher of the rows starts
+    /// from, and what a standby is restored from. Taken under the locks of the
+    /// kinds asked, in the store's order (the membership lock; the load lock
+    /// for the load rows alone): every journaled write holds its table's lock
+    /// from its apply to its telling, so none stands half told here. A writer
+    /// of those tables waits for the copy; a decision reads the published world
+    /// and does not, and a cut of the rows leaves the load writers be. Where
+    /// the journal carries no load row a cut of every kind has no tail: that
+    /// journal is lost to a reader of every kind.
+    pub fn checkpoint(&self, kinds: JournalKinds) -> StoreCheckpoint {
         // Copied under the locks, sorted after them: a writer waits for the
         // copy alone.
         let (at, epoch, mut rows, mut samples) = {
             let workers = self.workers.lock();
-            let loads = (kinds == Kinds::All).then(|| self.loads.lock());
+            let loads = (kinds == JournalKinds::All).then(|| self.loads.lock());
             let at = self
                 .journal
                 .as_ref()
@@ -320,7 +321,7 @@ impl MemoryStore {
         };
         rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
         samples.sort_by_key(|(id, rank, _)| (*id, *rank));
-        Cut {
+        StoreCheckpoint {
             at,
             epoch,
             rows,
@@ -331,7 +332,7 @@ impl MemoryStore {
     /// The first `limit` rows in key order of the ones that serve one of
     /// `models`, with the count that serve one; no model asked is every
     /// row. What a read that tells a few rows copies, where
-    /// [`MemoryStore::cut`] copies every row. The rows are visited under
+    /// [`MemoryStore::checkpoint`] copies every row. The rows are visited under
     /// the membership lock and the ones told are cloned there, so a writer
     /// waits for those alone: a selection puts the limit's worth in front,
     /// and they are sorted after the lock. The models are put in order
@@ -419,7 +420,7 @@ impl MemoryStore {
     /// file's turn ([`LeasesStore::issue`]): one that read it ahead of the
     /// swap and waited here books a slot the restored world does not
     /// read, until its lease ends.
-    pub fn restore_from(&self, cut: Cut) -> bool {
+    pub fn restore_from(&self, cut: StoreCheckpoint) -> bool {
         // Taken before the first lock, so dropped after the last: the journal
         // restarts inside the locks, and its listener is told behind them.
         let _released = self.released();
@@ -458,7 +459,7 @@ impl MemoryStore {
     /// takes the cut's place: it follows the cut's term and leads no
     /// longer, as at a restore, and the lease files keep their own term.
     /// The two terms are in step after a restore and not after this door.
-    pub fn watch_from(&self, cut: Cut) -> bool {
+    pub fn watch_from(&self, cut: StoreCheckpoint) -> bool {
         let _released = self.released();
         let Some(ended) = self.lay_snapshot(cut, true) else {
             return false;
@@ -474,7 +475,7 @@ impl MemoryStore {
     /// whose pins leave are returned, for the caller to forget behind its
     /// locks ([`Self::forget_gone`]). `None`, with the store as it was,
     /// where the journal refuses the cut's place.
-    fn lay_snapshot(&self, cut: Cut, keep_local: bool) -> Option<Vec<WorkerId>> {
+    fn lay_snapshot(&self, cut: StoreCheckpoint, keep_local: bool) -> Option<Vec<WorkerId>> {
         let mut workers = self.workers.lock();
         // The previous membership. A watch carries its local state for the
         // ids it sees again. A restore carries none of it: it reads the old
@@ -1007,9 +1008,9 @@ impl MemoryStore {
         &self,
         model: &str,
         role: Role,
-        ask: &Ask,
+        ask: &ViewQuery,
         out: &mut ViewBuffers,
-    ) -> Option<Built> {
+    ) -> Option<ViewFacts> {
         self.world.load().build(model, role, ask, out)
     }
 
@@ -1038,9 +1039,9 @@ impl MemoryStore {
     pub fn build_pair(
         &self,
         model: &str,
-        ask: &Ask,
+        ask: &ViewQuery,
         out: &mut PairBuffers,
-    ) -> Option<(Built, Built)> {
+    ) -> Option<(ViewFacts, ViewFacts)> {
         self.world.load().build_pair(model, ask, out)
     }
 
@@ -1056,9 +1057,9 @@ impl MemoryStore {
     pub fn build_encode_pair(
         &self,
         model: &str,
-        ask: &Ask,
+        ask: &ViewQuery,
         out: &mut EncodePairBuffers,
-    ) -> Option<(Built, Built)> {
+    ) -> Option<(ViewFacts, ViewFacts)> {
         self.world.load().build_encode_pair(model, ask, out)
     }
 
@@ -5358,7 +5359,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::{decision_slot::DecisionSlot, view::WorkerId},
-        store::leases::Picked,
+        store::leases::PickRecord,
         tracking::lease::Lease,
     };
 
@@ -5379,7 +5380,7 @@ mod tests {
             gateway: GatewayId(1),
             request: 1,
             target: WorkerId(1),
-            picked: Picked::default(),
+            picked: PickRecord::default(),
             decode: None,
             term: 1,
             issued_at: now,
@@ -5404,7 +5405,7 @@ mod tests {
             gateway: GatewayId(1),
             request,
             target: WorkerId(1),
-            picked: Picked::default(),
+            picked: PickRecord::default(),
             decode: None,
             term: 1,
             issued_at: now,

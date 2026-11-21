@@ -67,7 +67,7 @@ use super::{
 };
 use crate::{
     document::{
-        operator::{DryRun, Enforced, NeedsRow, Turn, Unanswered as ManagerUnanswered},
+        operator::{DryRun, EnforceOutcome, EnforceRefused, NeedsRow, SerialTurn},
         spec::Digest,
     },
     engine::{framework::Engine, store_backed_engine::DecisionRecord},
@@ -77,7 +77,7 @@ use crate::{
             self,
             policy_controller_server::{PolicyController, PolicyControllerServer},
         },
-        replication::Unled,
+        replication::NotLeading,
     },
     stages::registry::StageRegistry,
     store::MemoryStore,
@@ -198,7 +198,7 @@ pub(crate) struct Shared {
     pub(crate) lag: Arc<Lag>,
     /// The turn of the operators' snapshots: one is taken at a time, off
     /// the runtime's workers.
-    pub(crate) snapshots: Turn,
+    pub(crate) snapshots: SerialTurn,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -278,7 +278,7 @@ impl Shared {
             role: watch::channel(None).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
-            snapshots: Turn::new(snapshot::SNAPSHOTS_WAITING),
+            snapshots: SerialTurn::new(snapshot::SNAPSHOTS_WAITING),
         })
     }
 
@@ -601,9 +601,9 @@ impl Service {
         if let Some(term) = self.shared.fence.leader_term(now) {
             return match self.shared.feed.log.leads(term) {
                 Ok(()) => Ok(term),
-                Err(Unled::NotYet) => Err(Status::unavailable(NOT_IN_TERM)),
-                Err(Unled::Follows(_)) => Err(Status::unavailable(NO_TERM_LED)),
-                Err(Unled::Past(_)) => Err(Status::unavailable(TAKE_OVER)),
+                Err(NotLeading::NotYet) => Err(Status::unavailable(NOT_IN_TERM)),
+                Err(NotLeading::Follows(_)) => Err(Status::unavailable(NO_TERM_LED)),
+                Err(NotLeading::Past(_)) => Err(Status::unavailable(TAKE_OVER)),
             };
         }
         let holder = self.leader_info(now).address;
@@ -735,7 +735,7 @@ fn verdict(
 /// end or a file that was not read as internal.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
-        Unanswered::Manager(door @ ManagerUnanswered::Guarded(..)) => {
+        Unanswered::Manager(door @ EnforceRefused::Guarded(..)) => {
             Status::failed_precondition(door.to_string())
         }
         Unanswered::Full => Status::resource_exhausted(format!(
@@ -746,7 +746,7 @@ fn unanswered(unanswered: Unanswered) -> Status {
             "{WRITES_WAITING} applies wait their turn: ask again later"
         )),
         Unanswered::Unwritten(join) => Status::internal(format!("the apply did not end: {join}")),
-        Unanswered::Manager(ManagerUnanswered::NotHeld(not_held)) => {
+        Unanswered::Manager(EnforceRefused::NotHeld(not_held)) => {
             Status::not_found(not_held.to_string())
         }
         Unanswered::Unread { generation, why } => Status::internal(format!(
@@ -855,7 +855,7 @@ impl PolicyController for Service {
     /// field refused by its name, the spec slice of a controller with no
     /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
-    /// ([`Turn`]), and its rows come by one of the roads of
+    /// ([`SerialTurn`]), and its rows come by one of the roads of
     /// [`snapshot::read`]. The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
     /// admitted under. A standby is restored on its `Replicate` stream,
@@ -994,7 +994,7 @@ impl PolicyController for Service {
         // The guard is the door's to read, behind the turn its pass waits.
         let (expected, document) = (apply.expected_digest, apply.document);
         let answer = if enforce {
-            let Enforced {
+            let EnforceOutcome {
                 standing,
                 ran,
                 needs,
@@ -1066,7 +1066,7 @@ impl PolicyController for Service {
                 "generation: a rollback names a generation on file",
             ));
         }
-        let Enforced {
+        let EnforceOutcome {
             standing,
             ran,
             needs,
@@ -1162,13 +1162,13 @@ mod tests {
                 PROTOCOL_VERSION,
             },
             elector::{
-                ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
-                MemoryLease, Tick, Written,
+                ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, FileLease,
+                LeaseBackend, LeaseRecord, MemoryLease, TickOutcome,
             },
             proto::{self, busy::Reason, policy_controller_server::PolicyController},
         },
         stages::registry::StageRegistry,
-        store::{Kinds, LeasesStore, Position, WorkersStore},
+        store::{JournalKinds, LeasesStore, Position, WorkersStore},
         tracking::lease::{LeaseId, ReleaseReason},
     };
 
@@ -2130,7 +2130,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             thread::sleep(self.slow);
             self.lease.write(expected, record)
         }
@@ -2185,11 +2185,11 @@ mod tests {
         // saw it and is published.
         assert_eq!(
             other.tick(Instant::now()).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         assert_eq!(
             elector.tick(Instant::now()).expect("a look"),
-            Tick::Following {
+            TickOutcome::Following {
                 holder: OTHER.to_owned(),
                 term: 1
             }
@@ -2207,7 +2207,7 @@ mod tests {
         thread::sleep(settings.duration + Duration::from_millis(20));
         assert_eq!(
             elector.tick(Instant::now()).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         assert_eq!(
             service.leader_info(Instant::now()),
@@ -2239,14 +2239,14 @@ mod tests {
         let took = Instant::now() + ElectionSettings::default().renew_period;
         assert_eq!(
             elector.tick(took).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         standing.send_replace(saw(IDENTITY, 1));
         assert_eq!(service.leader_info(took), answer("", "", 1, false));
         let taken = took + ElectionSettings::default().renew_deadline;
         assert_eq!(
             elector.tick(taken).expect("the renewal"),
-            Tick::Renewed { term: 1 }
+            TickOutcome::Renewed { term: 1 }
         );
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
 
@@ -3021,7 +3021,7 @@ mod tests {
             refused(service.deregister_worker(removal).await.err(), "a removal");
             let snapshot = from("operator-a", proto::SnapshotRequest::default());
             refused(service.get_snapshot(snapshot).await.err(), "a snapshot");
-            assert_eq!(service.shared.feed.log.head(Kinds::Watched), place);
+            assert_eq!(service.shared.feed.log.head(JournalKinds::Watched), place);
         }
     }
 
@@ -3973,7 +3973,7 @@ mod tests {
         assert!(elector.step_down(None, now).expect("the release"));
         assert_eq!(
             elector.tick(now).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         control.shared.store.set_term(2);
         assert_eq!(control.watched(Instant::now()).ok(), Some(2));

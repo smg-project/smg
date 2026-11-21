@@ -20,8 +20,8 @@ use crate::{
     load::SignalColumn,
     stages::{Lifecycle, StageRegistry},
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, SignalSink,
-        SignalWriteOutcome, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, SignalSink, SignalWriteOutcome,
+        ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
     },
 };
 
@@ -234,7 +234,7 @@ fn foreign(stages: &Stages, name: &str, unit: &str) -> SignalColumn {
 /// `role`, by worker: a cell's value and its sample instant, or none.
 fn lent(store: &MemoryStore, role: Role) -> Vec<(WorkerId, Held)> {
     store.deciding(|world| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GATEWAY,
             now: Instant::now(),
             pinned: None,
@@ -941,7 +941,7 @@ fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_t
     );
     assert!(store.signal_columns().is_empty());
     store.deciding(|world| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GATEWAY,
             now: Instant::now(),
             pinned: None,

@@ -88,8 +88,8 @@ mod held {
         store::{
             snapshot::ViewBuffers,
             tests::{booking, in_flight},
-            Kinds, LeasesStore, LoadSink, MembershipChange, MemoryStore, Position, WorkerFacts,
-            WorkerPatch, WorkerStatus, WorkersStore,
+            JournalKinds, LeasesStore, LoadSink, MembershipChange, MemoryStore, Position,
+            WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
         },
         tracking::lease::Membership,
     };
@@ -412,7 +412,7 @@ mod held {
         decided(&standby, 77, &mut out, &mut scratch);
         assert_eq!(ring.ring().len(), 1);
         told.lock().clear();
-        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
         let snapshot = format!("{:?}", Membership::Snapshot(&members));
         assert_eq!(*told.lock(), [(2, snapshot)]);
         let target = decided(&standby, 77, &mut out, &mut scratch);
@@ -602,7 +602,7 @@ mod held {
         standby
             .apply(generation(1, &standby, &ring, &told))
             .expect("applied");
-        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
         told.lock().clear();
         let at = WorkersStore::epoch(&leader);
         let unjournaled = Position::default();
@@ -651,7 +651,7 @@ mod held {
             })
         };
         let mut ids = vec![write(1, Role::Single, &[MODEL, "second"]).id()];
-        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        assert!(standby.restore_from(leader.checkpoint(JournalKinds::All)));
         for told in &told {
             told.lock().clear();
         }

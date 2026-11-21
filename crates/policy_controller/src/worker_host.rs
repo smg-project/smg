@@ -80,7 +80,7 @@
 //! [`KvHost`] gives each subscription its row in the store. Every replica
 //! runs the adapter over its own streams. The adapter keeps what a row's
 //! stream showed of its cache groups, as the gateway's index does. A row
-//! above rank 0 of a data-parallel worker gets no feed yet ([`NoFeed`]).
+//! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
 //! The module `kv` names the decode's limits.
 //!
 //! # The door
@@ -124,7 +124,7 @@ pub use found::facts;
 #[cfg(feature = "controller")]
 pub(crate) use found::stated;
 pub use health::HealthAdapter;
-pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
+pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
 pub use lead::{Lead, SoleLead};
 pub use loads::LoadAdapter;
@@ -138,14 +138,14 @@ pub(crate) use membership_writer::{
     drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
 };
 pub use membership_writer::{
-    MembershipWriteOutcome, MembershipWriter, Over, Precondition, Refused, Remover,
+    MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
     StoreMembershipWriter,
 };
 pub use object::object;
 pub use objects::{Members, Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,
-    removal_from_store, remover_of, DrainWorkersInStore, NoCredentials, RemoveWorkersFromStore,
-    Unasked, WriteWorkersToStore, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP,
+    removal_from_store, remover_of, DrainWorkersInStore, NoCredentials, RegistrantError,
+    RemoveWorkersFromStore, WriteWorkersToStore, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP,
     REMOVE_WORKERS_FROM_STORE_STEP, WRITE_WORKERS_TO_STORE_STEP,
 };

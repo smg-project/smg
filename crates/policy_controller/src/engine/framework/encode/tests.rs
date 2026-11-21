@@ -1361,15 +1361,15 @@ fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
     }
     let bed = Bed::new();
     let cx = Constraints::default();
-    let holders = [crate::engine::NamedHolder {
+    let holders = [crate::engine::AffinityHolder {
         row: 1,
         overlap_blocks: 8,
         predicted_blocks: 0,
     }];
     let named = RequestFacts {
-        named: Some(crate::engine::NamedAffinity {
+        named: Some(crate::engine::AffinityRows {
             holders: &holders,
-            ..crate::engine::NamedAffinity::default()
+            ..crate::engine::AffinityRows::default()
         }),
         ..bed.asked().0
     };

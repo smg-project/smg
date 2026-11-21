@@ -27,7 +27,7 @@ use tracing::warn;
 use super::{
     credentials::Credentials,
     found::facts,
-    membership_writer::{MembershipWriteOutcome, Refused},
+    membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
     object::{builder, dial_address, status, unchecked},
 };
 use crate::{
@@ -454,8 +454,8 @@ impl<G: Generation> Objects<G> {
         store: &S,
         built: &[Arc<dyn Worker>],
         over: Option<&Arc<dyn Worker>>,
-        write: impl FnOnce() -> Result<Vec<MembershipWriteOutcome>, Refused>,
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+        write: impl FnOnce() -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>,
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         if !self.built_kept {
             return write();
         }
@@ -466,7 +466,7 @@ impl<G: Generation> Objects<G> {
                 _ => None,
             };
             if !stands.is_some_and(|stands| Arc::ptr_eq(&stands, seen)) {
-                return Err(Refused::Moved);
+                return Err(MembershipWriteRefused::Moved);
             }
         }
         let offer = Offer::put(&self.offered, built);
@@ -510,12 +510,12 @@ impl<G: Generation> Objects<G> {
         url: &str,
         over: Option<&Arc<dyn Worker>>,
         write: impl FnOnce() -> T,
-    ) -> Result<T, Refused> {
+    ) -> Result<T, MembershipWriteRefused> {
         let _turn = self.handing.lock();
         if let Some(seen) = over {
             let stands = self.registry.get_by_url(url);
             if !stands.is_some_and(|stands| Arc::ptr_eq(&stands, seen)) {
-                return Err(Refused::Moved);
+                return Err(MembershipWriteRefused::Moved);
             }
         }
         Ok(write())
@@ -528,12 +528,12 @@ impl<G: Generation> Objects<G> {
         store: &S,
         built: &Arc<dyn Worker>,
         over: Option<&Arc<dyn Worker>>,
-        write: impl FnOnce() -> Result<MembershipWriteOutcome, Refused>,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+        write: impl FnOnce() -> Result<MembershipWriteOutcome, MembershipWriteRefused>,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         let wrote = self.handing(store, std::slice::from_ref(built), over, || {
             write().map(|wrote| vec![wrote])
         })?;
-        wrote.first().copied().ok_or(Refused::Moved)
+        wrote.first().copied().ok_or(MembershipWriteRefused::Moved)
     }
 
     /// How many lays found no object handed in, under
@@ -1182,8 +1182,8 @@ mod tests {
             AppliedSpec, PolicySpec,
         },
         store::{
-            GatewayId, HealthSink, Kinds, LoadSink as _, LoadSource, MemoryStore, Registrant,
-            WorkerFacts, WorkerPatch, WorkerStatus,
+            GatewayId, HealthSink, JournalKinds, LoadSink as _, LoadSource, MemoryStore,
+            Registrant, WorkerFacts, WorkerPatch, WorkerStatus,
         },
         worker_host::{
             facts as stated, object, HealthAdapter, KeptCredential, MembershipWriter, Over,
@@ -1269,8 +1269,8 @@ mod tests {
             &self,
             built: &Arc<dyn Worker>,
             over: Option<&Arc<dyn Worker>>,
-            write: impl FnOnce() -> Result<MembershipWriteOutcome, Refused>,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+            write: impl FnOnce() -> Result<MembershipWriteOutcome, MembershipWriteRefused>,
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             let store = self.store.as_ref();
             self.objects.handing_one(store, built, over, write)
         }
@@ -1383,7 +1383,7 @@ mod tests {
         door: &StoreMembershipWriter,
         built: &Arc<dyn Worker>,
         expect: Precondition,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         replica.handing(built, None, || {
             door.found_built(&Registrant::Control, expect, built, None)
         })
@@ -1397,7 +1397,7 @@ mod tests {
         seen: RowRevision,
         rebuilt: &Arc<dyn Worker>,
         over: &Arc<dyn Worker>,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         replica.handing(rebuilt, Some(over), || door.refreshed(seen, rebuilt, over))
     }
 
@@ -1440,7 +1440,7 @@ mod tests {
             assert_eq!(replica.told(), [("replaced", id)], "{name}");
 
             let late = refreshed(&replica, &door, seen, &build(A, KEY_A), &first);
-            assert_eq!(late, Err(Refused::Moved), "{name}");
+            assert_eq!(late, Err(MembershipWriteRefused::Moved), "{name}");
             assert!(Arc::ptr_eq(&replica.at(A), &rebuilt), "{name}");
             assert_eq!(replica.told(), [], "{name}");
             assert_eq!(replica.objects.unhanded(), 0, "{name}");
@@ -1521,7 +1521,7 @@ mod tests {
         replica.told();
         let late = built(A, KEY_B);
         let refused = registered(&replica, &door, &late, Precondition::Absent);
-        assert_eq!(refused, Err(Refused::Stands));
+        assert_eq!(refused, Err(MembershipWriteRefused::Stands));
 
         let facts = replica.row(A).facts;
         let change = replica.store.upsert(facts);
@@ -1704,7 +1704,7 @@ mod tests {
             })
         };
         let stale = built(A, KEY_C);
-        assert_eq!(guarded(&stale, &first), Err(Refused::Moved));
+        assert_eq!(guarded(&stale, &first), Err(MembershipWriteRefused::Moved));
         assert!(Arc::ptr_eq(&replica.at(A), &second));
         let fresh = built(A, KEY_C);
         let wrote = guarded(&fresh, &second);
@@ -2800,7 +2800,9 @@ mod tests {
                 .set_status(row.id, WorkerStatus::Ready, row.revision)
                 .is_some());
         }
-        assert!(replica.store.restore_from(other.cut(Kinds::Watched)));
+        assert!(replica
+            .store
+            .restore_from(other.checkpoint(JournalKinds::Watched)));
         replica.follow();
 
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
@@ -2817,7 +2819,9 @@ mod tests {
         assert!(other
             .set_status(row.id, WorkerStatus::NotReady, row.revision)
             .is_some());
-        assert!(replica.store.restore_from(other.cut(Kinds::Watched)));
+        assert!(replica
+            .store
+            .restore_from(other.checkpoint(JournalKinds::Watched)));
         replica.follow();
         assert!(Arc::ptr_eq(&a, &replica.at(A)));
         assert!(!a.is_available());
@@ -3086,7 +3090,9 @@ mod tests {
                 before_tail(&self.store);
             }
             if let Some((other, row)) = self.turn.lock().take() {
-                assert!(self.store.restore_from(other.cut(Kinds::Watched)));
+                assert!(self
+                    .store
+                    .restore_from(other.checkpoint(JournalKinds::Watched)));
                 let revision = self.store.get(row).expect("the row").revision;
                 assert!(self.store.patch(row, labels("gold"), revision).is_some());
             }
@@ -3251,7 +3257,7 @@ mod tests {
         });
         other.upsert(facts(C, 1));
         other.upsert(facts(D, 1));
-        let cut = other.cut(Kinds::Watched);
+        let cut = other.checkpoint(JournalKinds::Watched);
         let (epoch, theirs) = (cut.epoch, other.by_key(A).expect("a row"));
         assert_eq!(epoch, replica.store.epoch());
         assert_eq!((theirs.id, theirs.revision), (row, replica.row(A).revision));

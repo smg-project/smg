@@ -35,8 +35,9 @@ use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{LoadSink as StoreLoadSink, MemoryStore, Registrant, WorkerFacts},
     worker_host::{
-        HealthAdapter, KvFeed, LoadAdapter, MembershipWriteOutcome, MembershipWriter, Objects,
-        Over, Precondition, Refused, Remover, RowRevision, SoleLead, StoreMembershipWriter,
+        HealthAdapter, KvFeed, LoadAdapter, MembershipWriteOutcome, MembershipWriteRefused,
+        MembershipWriter, Objects, Over, Precondition, Remover, RowRevision, SoleLead,
+        StoreMembershipWriter,
     },
 };
 use smg_worker::{
@@ -408,8 +409,8 @@ struct FeedDoor {
 impl FeedDoor {
     fn write<T>(
         &self,
-        write: impl FnOnce(&StoreMembershipWriter) -> Result<T, Refused>,
-    ) -> Result<T, Refused> {
+        write: impl FnOnce(&StoreMembershipWriter) -> Result<T, MembershipWriteRefused>,
+    ) -> Result<T, MembershipWriteRefused> {
         let _turn = self.turn.lock();
         write(&self.door)
     }
@@ -422,7 +423,7 @@ impl MembershipWriter for FeedDoor {
         expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| door.found(maker, expect, url, state))
     }
 
@@ -432,7 +433,7 @@ impl MembershipWriter for FeedDoor {
         expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         self.write(|door| {
             let seen = over.map(Over::object);
             self.objects.handing(self.store.as_ref(), built, seen, || {
@@ -446,7 +447,7 @@ impl MembershipWriter for FeedDoor {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| door.drained(by, url, seen))
     }
 
@@ -455,7 +456,7 @@ impl MembershipWriter for FeedDoor {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| door.gone(by, url, seen))
     }
 
@@ -464,7 +465,7 @@ impl MembershipWriter for FeedDoor {
         seen: RowRevision,
         built: &Arc<dyn Worker>,
         over: &Arc<dyn Worker>,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.write(|door| {
             self.objects
                 .handing_one(self.store.as_ref(), built, Some(over), || {

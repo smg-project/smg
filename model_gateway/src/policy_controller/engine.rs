@@ -43,9 +43,9 @@ use rand::RngExt;
 use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
     engine::{
-        Constraints, Decision, Identity, Lifted, MediaCounts, Pair, Phase, Refused, Request,
-        RequestFacts, RequestFromSnapshot, ShadowKind, ShedReason, StoreBackedEngine, Swept,
-        Targets, Trace, WireModes, WorkerId, MAX_TARGETS,
+        Constraints, Decision, DecisionRefused, Identity, LiftedVeto, MediaCounts, Pair, Phase,
+        Request, RequestFacts, RequestFromSnapshot, ShadowKind, ShedReason, StoreBackedEngine,
+        SweepOutcome, Targets, Trace, WireModes, WorkerId, MAX_TARGETS,
     },
     store::{GatewayId, MemoryStore, StoreSnapshot},
     tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
@@ -318,7 +318,7 @@ pub(crate) enum Unplaced {
     /// The controller queued the request.
     Queued,
     /// The door made no decision.
-    Refused(Refused),
+    Refused(DecisionRefused),
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
     /// A pair's ask found no endpoint, and by membership no prefill pairs
@@ -513,7 +513,7 @@ impl PolicyEngine {
 
     /// One pass of the door's clock at `now`: the call of the policy engine's
     /// timer ([`upkeep`](super::upkeep)), about once a second.
-    pub(crate) fn sweep(&self, now: Instant) -> Swept {
+    pub(crate) fn sweep(&self, now: Instant) -> SweepOutcome {
         self.door.sweep(now)
     }
 
@@ -661,9 +661,9 @@ impl PolicyEngine {
                     .collect(),
                 seed: trace.seed,
                 lifted: match trace.lifted {
-                    Lifted::None => "none",
-                    Lifted::Overload => "overload",
-                    Lifted::Liveness => "liveness",
+                    LiftedVeto::None => "none",
+                    LiftedVeto::Overload => "overload",
+                    LiftedVeto::Liveness => "liveness",
                 },
                 shed,
                 worker: worker.cloned(),

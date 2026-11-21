@@ -10,8 +10,9 @@ use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, PolicySpec},
     engine::{LoadRow, Role, WireModes, WorkerId},
     store::{
-        Ask as StoreAsk, BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource,
-        MemoryStore, PairBuffers, Signals, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource, MemoryStore,
+        PairBuffers, Signals, ViewQuery as StoreAsk, WorkerFacts, WorkerStatus as RowStatus,
+        WorkersStore,
     },
     tracking::LeaseId,
 };

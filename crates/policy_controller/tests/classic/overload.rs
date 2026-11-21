@@ -23,8 +23,8 @@ use smg_policy_controller::{
     document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
     engine::{permille, LoadRow, Role, SignalSource, WorkerId},
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        GatewayId, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers, ViewQuery,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
 };
 
@@ -322,7 +322,7 @@ impl Bed {
     /// engine's last answer left the rank out.
     fn verdict(&self, now: Instant) -> Option<bool> {
         let mut out = ViewBuffers::default();
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now,
             pinned: None,

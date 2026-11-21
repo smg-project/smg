@@ -118,7 +118,9 @@ pub(crate) mod tests {
     use smg_policy_controller::{
         engine::WorkerId,
         service::{
-            controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
+            controller::{
+                Config, Controller, ElectionConfig, Listener, Scope, State, PRINCIPAL_ENTRY,
+            },
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},
             worker_follower::{PemFile, Tls, WorkerFollowerSettings},
         },
@@ -170,7 +172,7 @@ pub(crate) mod tests {
             shutdown_grace: Duration::from_secs(1),
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 1,
-            election: Election::default(),
+            election: ElectionConfig::default(),
             discovery: None,
         }
     }

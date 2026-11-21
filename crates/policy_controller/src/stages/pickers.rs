@@ -8,7 +8,7 @@ use crate::{
     document::spec::Needs,
     engine::{
         decision::{Target, Targets, MAX_TARGETS},
-        framework::{top_drawn, top_pass, Narrowed, Picker, TieBand, DRAW_BOUND},
+        framework::{top_drawn, top_pass, Picker, Shortlist, TieBand, DRAW_BOUND},
         view::{Candidate, PoolFacts, RequestFacts},
     },
     stages::lifecycle::Lifecycle,
@@ -295,7 +295,7 @@ fn push_ranked<const DRAWN: bool>(
 /// within the band of it stand equal, and one of them is drawn, by one
 /// value of `draw` where they are several. Returns the slots filled.
 ///
-/// For the rows of the engine a picker took ([`Unit::Engine`]): a few rows
+/// For the rows of the engine a picker took ([`DrawUnit::Engine`]): a few rows
 /// in no order of their scores, of which the answer carries fewer than a
 /// ranked push fills. A slot's tie is marked in one word by two passes
 /// over the rows. Where a later slot follows, a third pass notes the rows
@@ -303,7 +303,7 @@ fn push_ranked<const DRAWN: bool>(
 /// one of them is left: the level ranks of one engine are read once. More
 /// rows than a word marks are drawn by [`draw_in_band`] itself.
 ///
-/// [`Unit::Engine`]: crate::engine::framework::Unit::Engine
+/// [`DrawUnit::Engine`]: crate::engine::framework::DrawUnit::Engine
 pub(crate) fn draw_best(mut draw: Draw, scores: &[f32], band: TieBand, out: &mut [usize]) -> usize {
     let slots = out.len().min(scores.len());
     // A bit a row, set while the row is not taken.
@@ -457,7 +457,7 @@ impl Picker for Best {
 
 /// The best of a sample: `best` over the rows it draws first. Where the
 /// host named the request's holders and the pool's warming rows
-/// ([`NamedAffinity`](crate::engine::NamedAffinity)) and the pool holds more than
+/// ([`AffinityRows`](crate::engine::AffinityRows)) and the pool holds more than
 /// twice the sample, and at least the sixteen rows the engine asks a draw
 /// from, it draws `sample` rows the filters keep, uniformly and with
 /// replacement (a repeat or a refused row costs one of its `2 * sample`
@@ -616,11 +616,11 @@ impl Picker for CountFirst {
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &mut [u32],
-    ) -> Narrowed {
+    ) -> Shortlist {
         with_counts!(facts, |counts| {
             let count = |row: u32| counts(&candidates[row as usize]);
             let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
-                return Narrowed::all(0);
+                return Shortlist::all(0);
             };
             let mut compared = 0usize;
             for i in 0..kept.len() {
@@ -658,7 +658,7 @@ impl Picker for CountFirst {
                 }
                 kept.swap(slot, next);
             }
-            Narrowed {
+            Shortlist {
                 compared,
                 alternates,
             }

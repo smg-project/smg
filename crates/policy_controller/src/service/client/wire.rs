@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::{
     engine::{
         decision::{
-            Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
+            Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
             Trace, MAX_TARGETS, TRACE_TOP,
         },
         store_backed_engine::{self, Leased},
@@ -136,7 +136,7 @@ fn narrow<T: TryFrom<u32>>(number: u32, path: &'static str) -> Result<T, Unread>
 pub(crate) fn decided(
     told: &proto::Decision,
     now: Instant,
-) -> Result<store_backed_engine::Decided, Unread> {
+) -> Result<store_backed_engine::DecideOutcome, Unread> {
     let trace = told
         .trace
         .as_ref()
@@ -171,7 +171,7 @@ pub(crate) fn decided(
         None if told.leases.is_empty() => None,
         None => return Err(unread("leases", "only a pick carries a lease")),
     };
-    Ok(store_backed_engine::Decided { decision, lease })
+    Ok(store_backed_engine::DecideOutcome { decision, lease })
 }
 
 fn targets(told: &[proto::Target]) -> Result<Targets, Unread> {
@@ -305,9 +305,9 @@ fn trace(told: &proto::Trace) -> Result<Trace, Unread> {
         None => Survivors::NOT_COUNTED,
     };
     let lifted = match proto::LiftedVeto::try_from(told.lifted) {
-        Ok(proto::LiftedVeto::None) => Lifted::None,
-        Ok(proto::LiftedVeto::Overload) => Lifted::Overload,
-        Ok(proto::LiftedVeto::Liveness) => Lifted::Liveness,
+        Ok(proto::LiftedVeto::None) => LiftedVeto::None,
+        Ok(proto::LiftedVeto::Overload) => LiftedVeto::Overload,
+        Ok(proto::LiftedVeto::Liveness) => LiftedVeto::Liveness,
         Err(_) => return Err(unread("trace.lifted", "unknown veto")),
     };
     // The mark is read first: ahead of every profile the position on the
@@ -367,8 +367,8 @@ mod tests {
         engine::{
             decision,
             decision::{
-                Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
-                Trace,
+                Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
+                Targets, Trace,
             },
             store_backed_engine, view,
             view::{
@@ -612,7 +612,7 @@ mod tests {
             top_len: 3,
             seed: 27,
             generation: 13,
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
         }
     }
 
@@ -708,7 +708,7 @@ mod tests {
         let Decision::Pick(mut pick) = pick(1, false, Survivors::counted(1)) else {
             panic!("a pick");
         };
-        pick.trace.lifted = Lifted::Liveness;
+        pick.trace.lifted = LiftedVeto::Liveness;
         let decision = Decision::Pick(pick);
         let read = decided(&told(decision, None), Instant::now()).expect("a pick");
         assert_eq!(read.decision, decision);
@@ -747,7 +747,7 @@ mod tests {
             ticket: 75,
             max_wait_micros: 15_000,
             trace: Trace {
-                lifted: Lifted::None,
+                lifted: LiftedVeto::None,
                 ..shed.trace
             },
         });

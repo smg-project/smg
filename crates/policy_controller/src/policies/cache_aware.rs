@@ -12,7 +12,7 @@
 //! a candidate beyond its row (the request's blocks it holds, its age in the
 //! pool, its index size) is the affinity column the host fills beside the
 //! rows ([`RequestFacts::affinity`]) or the rows it names in the column's
-//! place ([`NamedAffinity`]), never the row. A stateful part (the
+//! place ([`AffinityRows`]), never the row. A stateful part (the
 //! slice's period, the diversion's window per worker) keeps its state behind
 //! the lifecycle alone, and no stage allocates per decision.
 //!
@@ -35,13 +35,13 @@ use crate::{
     },
     engine::{
         decision::{Overlap, OverlapSource},
-        framework::{Front, Scorer, Spread, TieBand},
+        framework::{ScoreFront, ScoreSpread, Scorer, TieBand},
         prefix_pass::{keep_prefix_pass, take_prefix_pass, withdraw_prefix_pass, PrefixStageId},
         view::{
-            blocks_within, mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow,
-            NamedAffinity, Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
+            blocks_within, mean_in_flight, AffinityFacts, AffinityRows, Candidate, Feed, HashKind,
+            LoadRow, Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
         },
-        warm_up::WarmRule,
+        warm_up::WarmUpRule,
     },
     policies::standard_filters,
     stages::{lifecycle::Lifecycle, scorers::ReadsLoad},
@@ -388,7 +388,7 @@ impl Pass<'_> {
 
 /// The mean in flight the spill gate reads: the drawn rows' where the
 /// engine set it
-/// ([`NamedAffinity::mean_in_flight`]),
+/// ([`AffinityRows::mean_in_flight`]),
 /// else the kept rows'.
 // Forced into the stage's passes with the mean it reads
 // ([`mean_in_flight`]): out of line the mean's walk costs a pass a call.
@@ -557,7 +557,7 @@ impl PrefixAffinity {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        named: NamedAffinity<'_>,
+        named: AffinityRows<'_>,
     ) -> TieBand {
         let request_blocks = self.gates.request_blocks(facts);
         // Nobody holding anything, the deepest match is zero without a
@@ -602,7 +602,7 @@ impl PrefixAffinity {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        named: NamedAffinity<'_>,
+        named: AffinityRows<'_>,
     ) -> TieBand {
         if named.drawn() {
             // Behind a draw the rows stand in the draw's order: each is
@@ -636,8 +636,8 @@ impl Scorer for PrefixAffinity {
     }
 
     /// A holder of the deepest match, a row under the gate, a row over it.
-    fn spread(&self) -> Spread {
-        Spread::Levels(0.5)
+    fn spread(&self) -> ScoreSpread {
+        ScoreSpread::Levels(0.5)
     }
 
     fn states_overlap(&self) -> bool {
@@ -700,7 +700,7 @@ impl Scorer for PrefixAffinity {
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
     }
 
@@ -745,16 +745,16 @@ impl ReadsLoad for PrefixAffinity {
         asked: &[u32],
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         if facts.named_alone().is_some() {
             return (
                 self.score_with(facts, candidates, asked, out, load),
-                Front::Unsaid,
+                ScoreFront::Unsaid,
             );
         }
         if self.gates.kv_imbalanced(candidates, asked, load) {
             self.unjudge();
-            return (neutral(out), Front::Alike);
+            return (neutral(out), ScoreFront::Alike);
         }
         let column = facts.affinity;
         let (band, ceilings) =
@@ -764,9 +764,9 @@ impl ReadsLoad for PrefixAffinity {
         // The values are the ceiling, a half and nothing: every row not
         // counted stands a level or more under the rows that are.
         let said = if ceilings as usize == out.len() {
-            Front::Alike
+            ScoreFront::Alike
         } else {
-            Front::At(ceilings)
+            ScoreFront::At(ceilings)
         };
         (band, said)
     }
@@ -829,8 +829,8 @@ impl Scorer for KvPressure {
 
     /// Every row reads alike: the stage configures the gate and orders
     /// nothing.
-    fn spread(&self) -> Spread {
-        Spread::Alike
+    fn spread(&self) -> ScoreSpread {
+        ScoreSpread::Alike
     }
 
     fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
@@ -904,8 +904,8 @@ impl WarmupSlice {
 
     /// The stage's ruling of who warms, as a host enters it.
     #[inline]
-    fn rule(&self) -> WarmRule {
-        WarmRule {
+    fn rule(&self) -> WarmUpRule {
+        WarmUpRule {
             window_micros: self.secs_micros,
             blocks: self.blocks,
             thin_ratio: self.thin_ratio,
@@ -940,7 +940,7 @@ impl WarmupSlice {
         let mut sizes = self.sizes.lock();
         sizes.clear();
         sizes.extend(column.iter().map(|held| held.indexed_blocks));
-        WarmRule::level(&mut sizes)
+        WarmUpRule::level(&mut sizes)
     }
 
     /// The stage over the rows a host named: it ruled the warming rows
@@ -953,7 +953,7 @@ impl WarmupSlice {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        named: NamedAffinity<'_>,
+        named: AffinityRows<'_>,
     ) -> TieBand {
         if named.warming.is_empty() {
             return neutral(out);
@@ -1200,8 +1200,8 @@ impl Scorer for WarmupSlice {
     }
 
     /// The row that takes the request scores alone, or every row alike.
-    fn spread(&self) -> Spread {
-        Spread::Levels(1.0)
+    fn spread(&self) -> ScoreSpread {
+        ScoreSpread::Levels(1.0)
     }
 
     fn score_front(
@@ -1211,7 +1211,7 @@ impl Scorer for WarmupSlice {
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
     }
 
@@ -1236,7 +1236,7 @@ impl Scorer for WarmupSlice {
         }
     }
 
-    fn warm_rule(&self) -> Option<WarmRule> {
+    fn warm_up_rule(&self) -> Option<WarmUpRule> {
         Some(self.rule())
     }
 }
@@ -1253,16 +1253,23 @@ impl ReadsLoad for WarmupSlice {
         asked: &[u32],
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
-    ) -> (TieBand, Front) {
+    ) -> (TieBand, ScoreFront) {
         let band = self.score_with(facts, candidates, asked, out, load);
         if facts.named_alone().is_some() {
-            return (band, Front::Unsaid);
+            return (band, ScoreFront::Unsaid);
         }
         let alike = match *out {
             [first, second, ..] => first >= 1.0 && second >= 1.0,
             _ => true,
         };
-        (band, if alike { Front::Alike } else { Front::At(1) })
+        (
+            band,
+            if alike {
+                ScoreFront::Alike
+            } else {
+                ScoreFront::At(1)
+            },
+        )
     }
 
     fn score_with(
@@ -1306,7 +1313,7 @@ mod tests {
         document::spec::SpillParams,
         engine::{
             prefix_pass::forget_prefix_pass,
-            view::{Health, LoadRow, NamedHolder},
+            view::{AffinityHolder, Health, LoadRow},
         },
         tracking::in_flight::tests::Lent,
     };
@@ -2058,8 +2065,8 @@ mod tests {
     }
 
     /// `row` named as holding `blocks` by the index.
-    fn holder(row: u32, blocks: u32) -> NamedHolder {
-        NamedHolder {
+    fn holder(row: u32, blocks: u32) -> AffinityHolder {
+        AffinityHolder {
             row,
             overlap_blocks: blocks,
             predicted_blocks: 0,
@@ -2068,8 +2075,12 @@ mod tests {
 
     /// The rows a host names: the `holders`, and the `warming` rows, thin
     /// or young.
-    fn named<'a>(holders: &'a [NamedHolder], warming: &'a [u32], thin: bool) -> NamedAffinity<'a> {
-        NamedAffinity {
+    fn named<'a>(
+        holders: &'a [AffinityHolder],
+        warming: &'a [u32],
+        thin: bool,
+    ) -> AffinityRows<'a> {
+        AffinityRows {
             holders,
             warming,
             thin,
@@ -2082,7 +2093,7 @@ mod tests {
         scorer: &dyn Scorer,
         facts: &RequestFacts<'_>,
         rows: &[Candidate],
-        named: NamedAffinity<'_>,
+        named: AffinityRows<'_>,
     ) -> Vec<f32> {
         // The rows' counts are lent beside them, as [`scores_beside`] lends
         // them.
@@ -2116,7 +2127,7 @@ mod tests {
                 _ => sized(row, row % 3, 0, 64),
             })
             .collect();
-        let each: Vec<NamedHolder> = pool
+        let each: Vec<AffinityHolder> = pool
             .iter()
             .filter(|(_, held)| held.overlap_blocks > 0)
             .map(|(row, held)| holder(row.position, held.overlap_blocks))
@@ -2217,12 +2228,12 @@ mod tests {
             candidate(2, 0, 1),
         ];
         let each = [
-            NamedHolder {
+            AffinityHolder {
                 row: 0,
                 overlap_blocks: 0,
                 predicted_blocks: 4,
             },
-            NamedHolder {
+            AffinityHolder {
                 row: 1,
                 overlap_blocks: 0,
                 predicted_blocks: 9,
@@ -2432,7 +2443,7 @@ mod tests {
             scores_named(&stage, &facts(16), &pool, held),
             vec![1.0, 0.5, 0.5]
         );
-        let behind_a_draw = NamedAffinity {
+        let behind_a_draw = AffinityRows {
             mean_in_flight: Some(2.0),
             ..held
         };
@@ -2448,7 +2459,7 @@ mod tests {
             scores_named(&warmup(1.0, 0), &facts(16), &pool, warming),
             vec![1.0, 0.0, 0.0]
         );
-        let behind_a_draw = NamedAffinity {
+        let behind_a_draw = AffinityRows {
             mean_in_flight: Some(2.0),
             ..warming
         };
@@ -2475,7 +2486,7 @@ mod tests {
         let holders = [holder(1, 4), holder(4, 4), holder(5, 3)];
         let whole = named(&holders, &[0, 3], true);
         // The mean of the rows handed, so both reads judge by one mean.
-        let drawn = NamedAffinity {
+        let drawn = AffinityRows {
             mean_in_flight: Some(2.0),
             ..whole
         };
@@ -2748,7 +2759,7 @@ mod tests {
             let kept = kept(lent_rows.len() as u32);
             let mut out = vec![0.0; lent_rows.len()];
             let (_, said) = stage.score_front(&facts, &lent_rows, &kept, &kept, &mut out);
-            (out, matches!(said, Front::Alike))
+            (out, matches!(said, ScoreFront::Alike))
         };
         let held = || {
             let column = column(&calm);
@@ -2811,7 +2822,7 @@ mod tests {
                 order.swap(i, next(i as u64 + 1) as usize);
             }
             let whole = named(&holders, &[], false);
-            let drawn = NamedAffinity {
+            let drawn = AffinityRows {
                 mean_in_flight: Some(mean_in_flight(&RequestFacts::default(), &pool, &order)),
                 ..whole
             };
@@ -2895,7 +2906,7 @@ mod tests {
                 order.swap(i, next(i as u64 + 1) as usize);
             }
             let whole = named(&holders, &[], false);
-            let drawn = NamedAffinity {
+            let drawn = AffinityRows {
                 mean_in_flight: Some(mean_in_flight(&RequestFacts::default(), &pool, &order)),
                 ..whole
             };
@@ -2946,7 +2957,7 @@ mod tests {
         let order = [4u32, 1, 5, 3, 0, 2];
         let holders = [holder(1, 12), holder(4, 12)];
         let whole = named(&holders, &[0, 2, 3], true);
-        let drawn = NamedAffinity {
+        let drawn = AffinityRows {
             mean_in_flight: Some(4.0),
             ..whole
         };
@@ -2977,7 +2988,7 @@ mod tests {
     fn a_host_that_names_warming_rows_enters_the_stages_own_ruling() {
         const NOW: u64 = 600_000_000;
         let stage = warmup(0.25, 8);
-        let rule = stage.warm_rule().expect("the stage rules who warms");
+        let rule = stage.warm_up_rule().expect("the stage rules who warms");
         // A row: its index size and how many seconds ago it was admitted.
         let fleets: [&[(u32, u64)]; 8] = [
             &[(40, 500), (40, 500), (4, 500), (40, 500)],
@@ -2990,11 +3001,11 @@ mod tests {
             &[(9, 10), (3, 10), (6, 500), (7, 500)],
         ];
         // The rows a host names at `now` from the ruling's entry at `read`.
-        let read_at = |rule: &WarmRule, fleet: &[(u32, u64)], read: u64, now: u64| {
+        let read_at = |rule: &WarmUpRule, fleet: &[(u32, u64)], read: u64, now: u64| {
             let sizes: Vec<u32> = fleet.iter().map(|row| row.0).collect();
             let admitted: Vec<u64> = fleet.iter().map(|row| NOW - row.1 * 1_000_000).collect();
             let (mut scratch, mut rows) = (Vec::new(), vec![(99, 0)]);
-            let warming = rule.name(&sizes, &admitted, read, &mut scratch, &mut rows);
+            let warming = rule.list_warming_rows(&sizes, &admitted, read, &mut scratch, &mut rows);
             let named = rows
                 .iter()
                 .filter(|&&(_, until)| warming.from <= now && now < until);
@@ -3004,7 +3015,7 @@ mod tests {
             )
         };
         let named_by =
-            |rule: &WarmRule, fleet: &[(u32, u64)], now: u64| read_at(rule, fleet, now, now);
+            |rule: &WarmUpRule, fleet: &[(u32, u64)], now: u64| read_at(rule, fleet, now, now);
         let mut seen = Vec::new();
         for fleet in fleets {
             let column: Vec<AffinityFacts> = fleet
@@ -3063,7 +3074,7 @@ mod tests {
             ..WarmupSliceParams::default()
         };
         let narrow = WarmupSlice::new(&narrow, Gates::of(None, None, Some(16)));
-        let narrow = narrow.warm_rule().expect("the stage rules who warms");
+        let narrow = narrow.warm_up_rule().expect("the stage rules who warms");
         assert_eq!(named_by(&narrow, &fleet, NOW).0, Vec::<u32>::new());
     }
 
@@ -3086,12 +3097,12 @@ mod tests {
         assert!(KvPressure.row_wise());
     }
 
-    /// The two ranks say the word their scores read as ([`Front::of`]), and
-    /// score a row alike by either entry. Seeded pools of one to forty
-    /// rows, a part of them kept: nobody, some or every row holds the
-    /// request, rows stand over and under the spill gate, and some rows
-    /// warm. Two builds of each stage are asked side by side, one by each
-    /// entry, so the slice's counters turn alike.
+    /// The two ranks say the word their scores read as ([`ScoreFront::of`]),
+    /// and score a row alike by either entry. Seeded pools of one to forty
+    /// rows, a part of them kept: nobody, some or every row holds the request,
+    /// rows stand over and under the spill gate, and some rows warm. Two builds
+    /// of each stage are asked side by side, one by each entry, so the slice's
+    /// counters turn alike.
     #[test]
     fn the_ranks_say_the_word_their_scores_read_as() {
         let spill = || {
@@ -3138,13 +3149,13 @@ mod tests {
                 assert_eq!(front_band, band, "{name}, round {round}");
                 assert_eq!(
                     word,
-                    Front::of(plain.spread(), &by_score),
+                    ScoreFront::of(plain.spread(), &by_score),
                     "{name}, round {round}: {by_score:?}"
                 );
                 let which = match word {
-                    Front::Alike => 0,
-                    Front::At(0) => 1,
-                    Front::At(1) => 2,
+                    ScoreFront::Alike => 0,
+                    ScoreFront::At(0) => 1,
+                    ScoreFront::At(1) => 2,
                     _ => 3,
                 };
                 words[stage][which] += 1;
@@ -3165,16 +3176,16 @@ mod tests {
         };
         let mut lone = [0.0];
         let (_, word) = warmup(0.25, 0).score_front(&fed, &three, &[2], &[2], &mut lone);
-        assert_eq!((lone, word), ([1.0], Front::Alike));
+        assert_eq!((lone, word), ([1.0], ScoreFront::Alike));
         // A decision fed no column: the slice stands alike, and no row
         // holds the request.
         let unfed = facts(16);
         let (mut slices, mut holds) = ([0.0; 3], [0.0; 3]);
         let (_, word) =
             warmup(0.25, 0).score_front(&unfed, &three, &kept(3), &kept(3), &mut slices);
-        assert_eq!((slices, word), ([1.0; 3], Front::Alike));
+        assert_eq!((slices, word), ([1.0; 3], ScoreFront::Alike));
         let (_, word) = affinity(None).score_front(&unfed, &three, &kept(3), &kept(3), &mut holds);
-        assert_eq!((holds, word), ([0.5; 3], Front::At(0)));
+        assert_eq!((holds, word), ([0.5; 3], ScoreFront::At(0)));
         // The rows a host named say nothing, and score as by the plain
         // entry: the second row holds the request and the third warms.
         let holders = [holder(1, 8)];
@@ -3191,7 +3202,7 @@ mod tests {
             let band = plain.score(&naming, &three, &kept(3), &mut by_score);
             assert_eq!(
                 said.score_front(&naming, &three, &kept(3), &kept(3), &mut by_front),
-                (band, Front::Unsaid),
+                (band, ScoreFront::Unsaid),
                 "{}",
                 plain.name()
             );
@@ -3222,7 +3233,12 @@ mod tests {
         for stage in &gated {
             let mut out = [0.0; 2];
             let (_, word) = stage.score_front(&pressed, &two, &kept(2), &kept(2), &mut out);
-            assert_eq!((out, word), ([1.0, 1.0], Front::Alike), "{}", stage.name());
+            assert_eq!(
+                (out, word),
+                ([1.0, 1.0], ScoreFront::Alike),
+                "{}",
+                stage.name()
+            );
         }
     }
 }

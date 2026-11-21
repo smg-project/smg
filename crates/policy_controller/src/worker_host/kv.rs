@@ -468,8 +468,8 @@ where
     }
 
     /// A feed's own row begins. An error, with nothing done, says why it
-    /// does not. [`NoFeed::NoRow`]: `stands` says the feed's object stands
-    /// for the row no longer. [`NoFeed::UpperRank`]: the holder stands the
+    /// does not. [`SkipReason::NoRow`]: `stands` says the feed's object stands
+    /// for the row no longer. [`SkipReason::UpperRank`]: the holder stands the
     /// row above rank 0. An object kept through such a move still stands
     /// for the row, which is its engine's stream's now. Both are asked in
     /// the hold that writes the row's entry: a row laid again behind the
@@ -483,13 +483,13 @@ where
     /// its engine, begins from nothing too. One a leaving stream still
     /// clears is left to it, and this feed's batches are passed over until
     /// that ends.
-    fn begin(&self, row: WorkerId, stands: impl FnOnce() -> bool) -> Result<(), NoFeed> {
+    fn begin(&self, row: WorkerId, stands: impl FnOnce() -> bool) -> Result<(), SkipReason> {
         let mut rows = self.rows.lock();
         if !stands() {
-            return Err(NoFeed::NoRow);
+            return Err(SkipReason::NoRow);
         }
         if !self.stands_lowest(row) {
-            return Err(NoFeed::UpperRank);
+            return Err(SkipReason::UpperRank);
         }
         let own = rows
             .written
@@ -769,7 +769,7 @@ where
 
 /// Why a subscription got no feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoFeed {
+pub enum SkipReason {
     /// The holder keeps no row for the worker's object: it laid none, or it
     /// has laid another object in its place.
     NoRow,
@@ -779,7 +779,7 @@ pub enum NoFeed {
 
 /// How many subscriptions a host gave no feed, by the reason.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Unfed {
+pub struct SkippedSubscriptions {
     /// The holder kept no row for the worker's object.
     pub no_row: u64,
     /// The worker's row was a rank above 0.
@@ -820,8 +820,8 @@ impl<G: Generation, S: ?Sized> KvHost<G, S> {
 
 impl<G, S: ?Sized> KvHost<G, S> {
     /// How many subscriptions got no feed so far, by the reason.
-    pub fn unfed(&self) -> Unfed {
-        Unfed {
+    pub fn skipped_subscriptions(&self) -> SkippedSubscriptions {
+        SkippedSubscriptions {
             no_row: self.no_row.load(Ordering::Relaxed),
             upper_rank: self.upper_rank.load(Ordering::Relaxed),
         }
@@ -834,7 +834,7 @@ where
     S: store::KvEventSink<Batch = [KvEvent]> + ?Sized + 'static,
 {
     type Sink = KvAdapter<S>;
-    type Ticket = Result<WorkerId, NoFeed>;
+    type Ticket = Result<WorkerId, SkipReason>;
 
     fn enroll(&self, worker: &Arc<dyn Worker>, model: &str) -> Self::Ticket {
         // A size the store's width cannot hold is not a size of record.
@@ -850,11 +850,11 @@ where
         // A stream is its engine's and resumes by rank 0: a row above it
         // opens no feed, and its engine's rank 0 stream feeds it.
         if worker.dp_rank().is_some_and(|rank| rank > 0) {
-            return Err(NoFeed::UpperRank);
+            return Err(SkipReason::UpperRank);
         }
         // The row this very object stands for: one the holder has laid
         // another object in the place of has none.
-        self.row_of(worker).ok_or(NoFeed::NoRow)
+        self.row_of(worker).ok_or(SkipReason::NoRow)
     }
 
     /// The feed names the worker's row. A subscription with no feed is
@@ -885,7 +885,7 @@ where
                 self.sink.urls.lock().insert(row, url);
                 Some((Arc::clone(&self.sink), row))
             }
-            Err(NoFeed::NoRow) => {
+            Err(SkipReason::NoRow) => {
                 self.no_row.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     worker_url = %worker.redacted_url(),
@@ -893,7 +893,7 @@ where
                 );
                 None
             }
-            Err(NoFeed::UpperRank) => {
+            Err(SkipReason::UpperRank) => {
                 self.upper_rank.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     worker_url = %worker.redacted_url(),
@@ -932,8 +932,8 @@ mod tests {
     use crate::{
         engine::view::Role,
         store::{
-            Ask, GatewayId, KvEventSink as _, MemoryStore, Named, Naming, Signals, ViewBuffers,
-            WorkerFacts, WorkersStore,
+            AffinityQuery, AffinityRowsBuffers, GatewayId, KvEventSink as _, MemoryStore, Signals,
+            ViewBuffers, ViewQuery, WorkerFacts, WorkersStore,
         },
         worker_host::Members,
     };
@@ -1143,7 +1143,7 @@ mod tests {
 
         f.store.publish_now();
         let gateway = GatewayId(0);
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway,
             now: Instant::now(),
             pinned: None,
@@ -1155,7 +1155,7 @@ mod tests {
             let built = world
                 .build(MODEL, Role::Single, &ask, &mut view)
                 .expect("the pool");
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway,
                 block_hashes: &hashes,
                 namespace_seed: seed,
@@ -1164,8 +1164,8 @@ mod tests {
                 wires: None,
                 now_micros: built.now_micros,
             };
-            let mut named = Named::default();
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            let mut named = AffinityRowsBuffers::default();
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, &view.candidates, &mut named);
             assert_eq!(named.holders.len(), 1);
             let holder = &named.holders[0];
             assert_eq!(view.candidates[holder.row as usize].id, f.row);
@@ -2231,7 +2231,10 @@ mod tests {
         let (sink, row) = host.open(ticket, &worker, MODEL).expect("the row's feed");
         assert_eq!(row, f.row);
         assert!(Arc::ptr_eq(&sink, &host.sink));
-        assert_eq!(host.unfed(), Unfed::default());
+        assert_eq!(
+            host.skipped_subscriptions(),
+            SkippedSubscriptions::default()
+        );
     }
 
     #[test]
@@ -2315,7 +2318,7 @@ mod tests {
             Some(7)
         );
         assert_eq!(f.blocks(), 1);
-        let unfed = host.unfed();
+        let unfed = host.skipped_subscriptions();
         assert_eq!((unfed.no_row, unfed.upper_rank), (0, 1));
     }
 
@@ -2329,15 +2332,15 @@ mod tests {
             .get_by_url(URL)
             .expect("the worker's object");
         let ticket = host.enroll(&worker, MODEL);
-        assert_eq!(ticket, Err(NoFeed::UpperRank));
+        assert_eq!(ticket, Err(SkipReason::UpperRank));
         // The model's size is seeded all the same.
         assert_eq!(f.store.block_size(MODEL), Some(BLOCK_SIZE));
         assert!(host.open(ticket, &worker, MODEL).is_none());
-        let unfed = Unfed {
+        let unfed = SkippedSubscriptions {
             no_row: 0,
             upper_rank: 1,
         };
-        assert_eq!(host.unfed(), unfed);
+        assert_eq!(host.skipped_subscriptions(), unfed);
     }
 
     #[test]
@@ -2365,7 +2368,7 @@ mod tests {
         host.objects.follow(f.store.as_ref());
         let new = registry.get_by_url(URL).expect("the row's new object");
         assert!(!Arc::ptr_eq(&old, &new));
-        assert_eq!(host.enroll(&old, MODEL), Err(NoFeed::NoRow));
+        assert_eq!(host.enroll(&old, MODEL), Err(SkipReason::NoRow));
         assert_eq!(host.enroll(&new, MODEL), Ok(f.row));
     }
 
@@ -2380,13 +2383,13 @@ mod tests {
             .register(Arc::clone(&worker))
             .is_some());
         let ticket = host.enroll(&worker, MODEL);
-        assert_eq!(ticket, Err(NoFeed::NoRow));
+        assert_eq!(ticket, Err(SkipReason::NoRow));
         assert!(host.open(ticket, &worker, MODEL).is_none());
-        let unfed = Unfed {
+        let unfed = SkippedSubscriptions {
             no_row: 1,
             upper_rank: 0,
         };
-        assert_eq!(host.unfed(), unfed);
+        assert_eq!(host.skipped_subscriptions(), unfed);
     }
 
     #[test]
@@ -2989,7 +2992,7 @@ mod tests {
 
         assert!(f.host.open(ticket, &worker, MODEL).is_none());
         assert_eq!(f.store.indexed_blocks(row, 1), 1);
-        assert_eq!(f.host.unfed().no_row, 1);
+        assert_eq!(f.host.skipped_subscriptions().no_row, 1);
     }
 
     /// No stream takes a row its leaving stream still clears: a batch
@@ -3076,7 +3079,7 @@ mod tests {
         }
         // A row its object stands for no longer begins nothing.
         sink.removed(f.row);
-        assert_eq!(sink.begin(f.row, || false), Err(NoFeed::NoRow));
+        assert_eq!(sink.begin(f.row, || false), Err(SkipReason::NoRow));
         assert!(sink.rows.lock().written.is_empty());
     }
 

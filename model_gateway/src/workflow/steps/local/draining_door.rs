@@ -16,8 +16,8 @@ use smg_policy_controller::{
     engine::WorkerId,
     store::{Registrant, WorkerFacts},
     worker_host::{
-        MembershipWriteOutcome, MembershipWriter, Objects, Over, Precondition, Refused, Remover,
-        RowRevision,
+        MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
+        Precondition, Remover, RowRevision,
     },
 };
 use smg_worker::identity::basic::Worker;
@@ -66,7 +66,7 @@ impl MembershipWriter for DrainingDoor {
         expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.door.found(maker, expect, url, state)
     }
 
@@ -78,7 +78,7 @@ impl MembershipWriter for DrainingDoor {
         expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         self.door.found_rows(maker, expect, built, over)
     }
 
@@ -87,7 +87,7 @@ impl MembershipWriter for DrainingDoor {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         let wrote = self.door.drained(by, url, seen)?;
         // `Unmoved` is a row that was draining already: the removal that
         // marked it may have ended before its mark reached the worker.
@@ -103,7 +103,7 @@ impl MembershipWriter for DrainingDoor {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.door.gone(by, url, seen)
     }
 
@@ -113,7 +113,7 @@ impl MembershipWriter for DrainingDoor {
         seen: RowRevision,
         built: &Arc<dyn Worker>,
         over: &Arc<dyn Worker>,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.door.refreshed(seen, built, over)
     }
 }

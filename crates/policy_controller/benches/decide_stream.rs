@@ -242,7 +242,7 @@ use smg_policy_controller::{
         Constraints, LoadRow, PoolFacts, RequestFacts, Role, Scratch, StoreBackedEngine, WorkerId,
     },
     service::{
-        controller::{Config, Controller, Election, Listener, Scope, State},
+        controller::{Config, Controller, ElectionConfig, Listener, Scope, State},
         proto::{
             completed::Class, controller_frame, decide_answer::Answer, decision::Outcome,
             gateway_frame::Frame, policy_controller_client::PolicyControllerClient, Completed,
@@ -251,9 +251,9 @@ use smg_policy_controller::{
         },
     },
     store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, Hand, KvEvent, KvEventSink, LeaseRecord,
-        LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, Picked, Said, Signals,
-        StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        BatchFacts, BatchOutcome, GatewayId, Hand, KvEvent, KvEventSink, LeaseRecord, LeaseState,
+        LeasesStore, LoadSink, LoadSource, MemoryStore, PickRecord, Said, Signals, StoredBlock,
+        ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{DecisionGuard, Lease, LeaseId, ReleaseReason, TransportClass},
 };
@@ -1007,7 +1007,7 @@ fn config(deciders: usize) -> Config {
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: deciders,
-        election: Election::default(),
+        election: ElectionConfig::default(),
         discovery: None,
     }
 }
@@ -2155,7 +2155,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
     let gateway = GatewayId(1);
     let term = store.term();
     let mut decide = |seed: u64| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway,
             now: Instant::now(),
             pinned: None,
@@ -2212,7 +2212,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
                 gateway,
                 request: seed,
                 target,
-                picked: Picked::default(),
+                picked: PickRecord::default(),
                 decode: None,
                 term,
                 issued_at: ask.now,

@@ -27,14 +27,15 @@ use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, PRESETS},
     engine::{
-        AffinityFacts, Candidate, Constraints, Engine, Health, LoadRow, NamedAffinity, NamedHolder,
-        PairPools, PoolFacts, Request, RequestFacts, Role, Scratch, SignalSource,
+        AffinityFacts, AffinityHolder, AffinityRows, Candidate, Constraints, Engine, Health,
+        LoadRow, PairPools, PoolFacts, Request, RequestFacts, Role, Scratch, SignalSource,
         StoreBackedEngine, Target, WireModes, WorkerId,
     },
     stages::Lifecycle,
     store::{
-        pairing::PairingDescriptor, Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore,
-        PairBuffers, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        pairing::PairingDescriptor, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore,
+        PairBuffers, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
+        PUBLISH_WINDOW,
     },
     tracking::{DecisionGuard, Lease, Outcome, Side, TransportClass},
 };
@@ -270,7 +271,7 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
                 .collect()
         };
         let (cold, held) = (column(0), column(4));
-        let names = [NamedHolder {
+        let names = [AffinityHolder {
             row: 0,
             overlap_blocks: 4,
             predicted_blocks: 0,
@@ -286,9 +287,9 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
             ),
             (
                 RequestFacts {
-                    named: Some(NamedAffinity {
+                    named: Some(AffinityRows {
                         holders: &names,
-                        ..NamedAffinity::default()
+                        ..AffinityRows::default()
                     }),
                     ..facts(1)
                 },
@@ -621,7 +622,7 @@ fn a_build_from_the_store_after_the_first_allocates_nothing() {
         let (store, _, opened) = store_of(n);
         let mut out = ViewBuffers::default();
         for affinity in [false, true] {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: opened + Duration::from_secs(1),
                 pinned: None,
@@ -679,7 +680,7 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
         let transport = [Some("tx-a"), Some("tx-b"), Some("tx-a"), None][index % 4];
         register(format!("grpc://d{index}:9000"), Role::Decode, transport);
     }
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: GatewayId(1),
         now: Instant::now(),
         pinned: None,
@@ -844,7 +845,7 @@ fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
         store.gateway_veto(asker, ids[1], Some(opened + Duration::from_secs(3_600)));
         let mut out = ViewBuffers::default();
         for affinity in [false, true] {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: asker,
                 now: opened + Duration::from_secs(1),
                 pinned: Some(ids[0]),

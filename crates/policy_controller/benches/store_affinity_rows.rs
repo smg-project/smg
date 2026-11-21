@@ -44,9 +44,9 @@ use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{Constraints, LoadRow, Phase, RequestFacts, Role, Scratch, WorkerId},
     store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, LoadSink, LoadSource,
-        MemoryStore, Named, Naming, Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore, PUBLISH_WINDOW,
+        AffinityQuery, AffinityRowsBuffers, BatchFacts, BatchOutcome, GatewayId, KvEvent,
+        KvEventSink, LoadSink, LoadSource, MemoryStore, Signals, StoredBlock, ViewBuffers,
+        ViewQuery, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -146,7 +146,7 @@ fn fleet_picking(n: usize, pick: Option<&str>) -> (MemoryStore, Vec<WorkerId>) {
 struct Host {
     hashes: Vec<u64>,
     view: ViewBuffers,
-    named: Named,
+    named: AffinityRowsBuffers,
     scratch: Scratch,
 }
 
@@ -173,7 +173,7 @@ fn decide(
     );
     store.deciding(|world| {
         let engine = world.spec().engine();
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GATEWAY,
             now,
             pinned: None,
@@ -185,16 +185,16 @@ fn decide(
         let read = world.view(MODEL, Role::Single, &ask, false, &mut host.view)?;
         let built = read.built;
         if named {
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GATEWAY,
                 block_hashes: &host.hashes,
                 namespace_seed: 0,
                 seed,
-                cap: engine.named_for(MODEL, Phase::Single),
+                cap: engine.affinity_rows_cap(MODEL, Phase::Single),
                 wires: None,
                 now_micros: built.now_micros,
             };
-            world.name(
+            world.fill_affinity_rows(
                 MODEL,
                 Role::Single,
                 &naming,
@@ -242,7 +242,7 @@ fn decisions(c: &mut Criterion) {
         let mut host = Host {
             hashes: Vec::new(),
             view: ViewBuffers::default(),
-            named: Named::default(),
+            named: AffinityRowsBuffers::default(),
             scratch: Scratch::new(),
         };
         // A hit is its one holder's, whatever the seed.

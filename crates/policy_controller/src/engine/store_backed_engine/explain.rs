@@ -44,7 +44,7 @@ pub struct DecisionRecord {
 
 /// The names of a sampled decision, from the generation that decided.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Names {
+pub struct DecisionNames {
     /// The binding's plan, spelled as in the policy document.
     pub plan: &'static str,
     /// The profile named by the trace. This and the stage names are empty
@@ -61,17 +61,17 @@ pub struct Names {
 
 /// A sampled decision with the names that can still be read for it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Explained {
+pub struct DecisionExplanation {
     /// The sampled decision.
     pub record: DecisionRecord,
     /// `None` when the decision's generation or binding is unavailable.
-    pub names: Option<Names>,
+    pub names: Option<DecisionNames>,
 }
 
 impl DecisionRecord {
     /// Reads names if `engine` has the recorded generation number and binding.
     #[must_use]
-    pub fn names(&self, engine: &Engine) -> Option<Names> {
+    pub fn names(&self, engine: &Engine) -> Option<DecisionNames> {
         let trace = self.decision.trace();
         if trace.generation != engine.generation() {
             return None;
@@ -82,9 +82,9 @@ impl DecisionRecord {
             Plan::PdPair => PlanName::PdPair,
             Plan::Epd { .. } => PlanName::Epd,
         };
-        let mut names = Names {
+        let mut names = DecisionNames {
             plan: plan.name(),
-            ..Names::default()
+            ..DecisionNames::default()
         };
         let Some(at) = trace.made_under() else {
             return Some(names);
@@ -231,7 +231,7 @@ mod tests {
         document::{Needs, PolicySpec},
         engine::{
             decision::{Queue, Shed, ShedReason, Trace},
-            framework::{Binding, Profile, Weighted},
+            framework::{Binding, Profile, WeightedScorer},
             store_backed_engine::tests::GATEWAY,
         },
         stages::{
@@ -246,11 +246,11 @@ mod tests {
             name: name.into(),
             filters: vec![Box::new(NotTried), Box::new(Healthy)],
             scorers: vec![
-                Weighted {
+                WeightedScorer {
                     scorer: Box::new(LeastRequests),
                     weight: 1.0,
                 },
-                Weighted {
+                WeightedScorer {
                     scorer: Box::new(FewestSessions),
                     weight: 1.0,
                 },

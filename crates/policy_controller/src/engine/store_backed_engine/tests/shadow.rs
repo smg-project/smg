@@ -30,7 +30,7 @@ use crate::{
         decision::{Decision, ShadowKind, Targets},
         framework::{EncodePlaced, PairSide, Picker, TieBand},
         sticky_sessions::SessionVerdict,
-        store_backed_engine::{Decided, StoreBackedEngine, ON_SHADOW, SHADOW_FLOOR},
+        store_backed_engine::{DecideOutcome, StoreBackedEngine, ON_SHADOW, SHADOW_FLOOR},
         view::{Candidate, LoadRow, Phase, RequestFacts, Role, WorkerId},
     },
     stages::{lifecycle::Lifecycle, pickers::target_of, registry::StageRegistry},
@@ -223,7 +223,7 @@ fn a_shadow_of_another_outcome_changes_nothing_of_the_live_answer() {
 /// shadow is counted.
 #[test]
 fn a_pool_a_demand_emptied_is_shed_under_the_demand_and_is_not_shadowed() {
-    use crate::engine::{decision::ShedReason, Demands, Unmet};
+    use crate::engine::{decision::ShedReason, Demands, UnmetDemand};
 
     let (door, asked) = bed(Rule::Place(0), Rule::Place(1));
     let mut order = request(b"r-1", 7);
@@ -236,7 +236,10 @@ fn a_pool_a_demand_emptied_is_shed_under_the_demand_and_is_not_shadowed() {
         Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
         decision => Err(decision.pick().is_some()),
     };
-    assert_eq!(shed, Ok((ShedReason::NoEndpoints, Unmet::Vision.stage())));
+    assert_eq!(
+        shed,
+        Ok((ShedReason::NoEndpoints, UnmetDemand::Vision.stage()))
+    );
     assert_eq!(asked.load(Ordering::Relaxed), 0);
     assert_eq!(kinds(&door), [0, 0, 0, 0]);
 }
@@ -875,7 +878,7 @@ fn paired(
     door: &StoreBackedEngine,
     id: &'static [u8],
     now: Instant,
-) -> (Decided, (WorkerId, WorkerId)) {
+) -> (DecideOutcome, (WorkerId, WorkerId)) {
     let decided = door.decide(GATEWAY, &pair_request(id), now);
     let decided = decided.expect("a decision");
     let pair = pair_of(&decided);
@@ -883,7 +886,7 @@ fn paired(
 }
 
 /// The prefill and the decode a pair's decision names first.
-fn pair_of(decided: &Decided) -> (WorkerId, WorkerId) {
+fn pair_of(decided: &DecideOutcome) -> (WorkerId, WorkerId) {
     let pick = decided.decision.pick();
     let first = pick.and_then(|pick| pick.targets.first());
     let first = *first.expect("a pair");

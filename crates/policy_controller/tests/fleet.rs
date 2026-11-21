@@ -140,7 +140,7 @@ use smg_policy_controller::{
     engine::{Role, SignalSource, WireModes, WorkerId},
     policies::{bucket, power_of_two::PowerOfTwoMetric},
     service::{
-        client::{self, blocking, Answer, Client, Link, Unanswered},
+        client::{self, blocking, Answer, Client, DecisionUnavailable, Link},
         controller::{State, PROTOCOL_VERSION},
         proto::{
             self, busy, completed::Class, decision::Outcome, gateway_frame, identity::Form,
@@ -148,7 +148,7 @@ use smg_policy_controller::{
             Hello, Identity, Lease, OverloadThresholds, Released, RequestFacts, ShedReason, Side,
             WatchWorkersRequest,
         },
-        watcher::{Ended, Following, Watcher},
+        watcher::{WatchStream, WatchStreamEnd, Watcher},
     },
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
 };
@@ -2740,7 +2740,7 @@ async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
             .expect("a first pick");
         assert!(matches!(
             link.ask(ask(b"late"), Duration::ZERO).await,
-            Err(Unanswered::Late)
+            Err(DecisionUnavailable::Late)
         ));
         let last = linked_pick(&link, ask(b"last")).await.expect("a last pick");
         // The three asks run on the same decider. The gap proves that the
@@ -2776,7 +2776,7 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
         wrong.facts.as_mut().expect("the ask states facts").phase = 99;
         let refused = link.ask(wrong, ROOM).await;
         assert!(
-            matches!(&refused, Err(Unanswered::Unsent(error))
+            matches!(&refused, Err(DecisionUnavailable::Unsent(error))
                 if error.to_string().contains("facts.phase")),
             "{refused:?}"
         );
@@ -2952,7 +2952,7 @@ fn status_of(watcher: &Watcher, id: WorkerId) -> Option<WorkerStatus> {
 /// Follows the stream until `stands` holds of its watcher, each event
 /// inside the room of a wait.
 async fn follows(
-    following: &mut Following<'_>,
+    following: &mut WatchStream<'_>,
     mut stands: impl FnMut(&Watcher) -> bool,
 ) -> Result<(), String> {
     while !stands(following.watcher()) {
@@ -2976,7 +2976,7 @@ async fn follows(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
     use smg_policy_controller::{
-        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, Picked},
+        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, PickRecord},
         tracking::{Lease, LeaseId},
     };
 
@@ -3065,7 +3065,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
                 gateway,
                 request: 1,
                 target: late,
-                picked: Picked::default(),
+                picked: PickRecord::default(),
                 decode: None,
                 term: 0,
                 issued_at: now,
@@ -3200,7 +3200,7 @@ async fn a_watch_ends_when_its_controller_goes_silent() {
         let ended = tokio::time::timeout(bound, stream.next())
             .await
             .expect("a silent controller ends the stream inside its bound");
-        assert!(matches!(ended, Err(Ended::Client(_))), "{ended:?}");
+        assert!(matches!(ended, Err(WatchStreamEnd::Client(_))), "{ended:?}");
 
         relayed.abort_all();
         harness.stop().await.expect("a clean stop");

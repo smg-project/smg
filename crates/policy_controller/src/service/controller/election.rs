@@ -46,7 +46,7 @@ use super::config::ConfigError;
 use crate::service::elector::KubernetesLease;
 use crate::{
     service::elector::{
-        term_said, ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, Tick,
+        term_said, ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, TickOutcome,
     },
     store::{LeasesStore, MemoryStore},
 };
@@ -98,7 +98,7 @@ impl fmt::Display for LeasePlace {
 
 /// The election's configuration (design 5.3).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Election {
+pub struct ElectionConfig {
     /// Where the lease lives.
     pub lease: LeasePlace,
     /// The timing: duration 3 s, renew period 1 s, renew deadline 2 s by
@@ -114,7 +114,7 @@ pub struct Election {
     pub advertise: Option<String>,
 }
 
-impl Election {
+impl ElectionConfig {
     /// Refuses what no bind could cure: settings out of order, a lease with
     /// no name or an empty namespace, and an advertised address that is
     /// malformed, that is the wildcard in any spelling (a client that dials
@@ -303,7 +303,10 @@ pub enum LeaseError {
 /// The elector of `election` under `identity`. The lease's place is opened
 /// here, on the runtime the election thread will block on, so a place that
 /// is not there refuses the start before a listener serves.
-pub(crate) async fn elector(election: &Election, identity: String) -> Result<Elector, LeaseError> {
+pub(crate) async fn elector(
+    election: &ElectionConfig,
+    identity: String,
+) -> Result<Elector, LeaseError> {
     let backend: Box<dyn LeaseBackend> = match &election.lease {
         // The elector makes this place's store itself and hands it to
         // nobody: no other holder can be, and its take leads at once.
@@ -590,11 +593,11 @@ fn run_loop(
                 failing = false;
                 seen.looked = true;
                 match &tick {
-                    Tick::Acquired { .. } => {
+                    TickOutcome::Acquired { .. } => {
                         stamped = Some(began);
                         late = false;
                     }
-                    Tick::Renewed { .. } => {
+                    TickOutcome::Renewed { .. } => {
                         // One line a streak: the margin went to the store or
                         // to steps that failed, and nobody leads from the
                         // deadline until a renewal lands under it. The field
@@ -622,11 +625,11 @@ fn run_loop(
                 // under this holder: the next step says which. The standing
                 // reads either as no record.
                 let nobody = match &tick {
-                    Tick::Gone { .. } => true,
-                    Tick::Lost { holder, .. } => holder.is_empty(),
+                    TickOutcome::Gone { .. } => true,
+                    TickOutcome::Lost { holder, .. } => holder.is_empty(),
                     // A replica that waits its turn follows nobody,
                     // whatever record stands.
-                    Tick::Waiting { .. } => true,
+                    TickOutcome::Waiting { .. } => true,
                     _ => false,
                 };
                 let named = if nobody { None } else { elector.observed() };
@@ -782,20 +785,20 @@ enum Streak {
 /// store's log.
 fn report(
     elector: &Elector,
-    tick: &Tick,
+    tick: &TickOutcome,
     store: &MemoryStore,
     following: &mut String,
     streak: &mut Streak,
     leading: &mut bool,
 ) {
     let now = match tick {
-        Tick::Gone { .. } => Streak::Gone,
-        Tick::Waiting { .. } => Streak::Waiting,
+        TickOutcome::Gone { .. } => Streak::Gone,
+        TickOutcome::Waiting { .. } => Streak::Waiting,
         _ => Streak::None,
     };
     let was = std::mem::replace(streak, now);
     match tick {
-        Tick::Acquired { term } => {
+        TickOutcome::Acquired { term } => {
             following.clear();
             store.set_term(*term);
             // The take started no term in the store's log.
@@ -808,7 +811,7 @@ fn report(
                 );
             }
         }
-        Tick::Lost { term, holder } => {
+        TickOutcome::Lost { term, holder } => {
             warn!(
                 identity = elector.identity(),
                 term,
@@ -816,7 +819,7 @@ fn report(
                 "the lease moved; the fence is closed"
             );
         }
-        Tick::Following { holder, term } => {
+        TickOutcome::Following { holder, term } => {
             if following != holder {
                 following.clone_from(holder);
                 info!(
@@ -827,7 +830,7 @@ fn report(
                 );
             }
         }
-        Tick::Gone { term } => {
+        TickOutcome::Gone { term } => {
             // One line a streak; a holder followed after it is named anew.
             following.clear();
             if was != Streak::Gone {
@@ -838,7 +841,7 @@ fn report(
                 );
             }
         }
-        Tick::Waiting { term } => {
+        TickOutcome::Waiting { term } => {
             // One line a streak, at info: a turn waited out is no anomaly.
             following.clear();
             if was != Streak::Waiting {
@@ -849,7 +852,7 @@ fn report(
                 );
             }
         }
-        Tick::Renewed { .. } | Tick::Raced => {
+        TickOutcome::Renewed { .. } | TickOutcome::Raced => {
             debug!(identity = elector.identity(), ?tick, "election step");
         }
     }
@@ -859,12 +862,12 @@ fn report(
     // take it made: after a slow step the fence reads closed here as well,
     // with no wait to name, and the next renewal leads.
     match tick {
-        Tick::Acquired { term } | Tick::Renewed { term } => {
+        TickOutcome::Acquired { term } | TickOutcome::Renewed { term } => {
             if !*leading {
                 *leading = elector.fence().leader_term(Instant::now()).is_some();
                 if *leading {
                     info!(identity = elector.identity(), term, "leading");
-                } else if matches!(tick, Tick::Acquired { .. }) && elector.waits_to_lead() {
+                } else if matches!(tick, TickOutcome::Acquired { .. }) && elector.waits_to_lead() {
                     info!(
                         identity = elector.identity(),
                         term,
@@ -1005,15 +1008,15 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        dialable, elector, identity, run, split_identity, start, Election, ElectionObservation,
-        LeaseError, LeasePlace, Running, Said, Word,
+        dialable, elector, identity, run, split_identity, start, ElectionConfig,
+        ElectionObservation, LeaseError, LeasePlace, Running, Said, Word,
     };
     use crate::{
         service::{
             controller::{config::ConfigError, replication::journaled_from},
             elector::{
-                ElectError, ElectionSettings, Elector, Fence, LeaseBackend, LeaseRecord,
-                MemoryLease, Tick, Written, TERM_CEILING,
+                ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, Fence,
+                LeaseBackend, LeaseRecord, MemoryLease, TickOutcome, TERM_CEILING,
             },
         },
         store::{LeasesStore, MemoryStore, Position},
@@ -1152,7 +1155,7 @@ mod tests {
     #[test]
     fn the_address_defaults_to_a_listener_that_binds_one() {
         let bound = |ip: std::net::IpAddr| SocketAddr::new(ip, 40123);
-        let mut election = Election::default();
+        let mut election = ElectionConfig::default();
         assert_eq!(
             election.address(bound(Ipv4Addr::LOCALHOST.into())),
             Ok(Some("127.0.0.1:40123".to_owned()))
@@ -1223,9 +1226,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_process_place_makes_an_elector_alone_that_leads_at_its_take() {
-        let mut alone = elector(&Election::default(), "controller-0@127.0.0.1:1".to_owned())
-            .await
-            .expect("the process place needs nothing");
+        let mut alone = elector(
+            &ElectionConfig::default(),
+            "controller-0@127.0.0.1:1".to_owned(),
+        )
+        .await
+        .expect("the process place needs nothing");
         let now = Instant::now();
         alone.tick(now).expect("the take");
         assert_eq!(alone.fence().leader_term(now), Some(1));
@@ -1234,9 +1240,9 @@ mod tests {
     #[tokio::test]
     async fn a_lease_file_needs_its_directory_and_writes_nothing_before_the_first_step() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let at = |path: PathBuf| Election {
+        let at = |path: PathBuf| ElectionConfig {
             lease: LeasePlace::File(path),
-            ..Election::default()
+            ..ElectionConfig::default()
         };
         let candidate = "controller-0@127.0.0.1:1".to_owned();
 
@@ -1319,9 +1325,9 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             let written = self.lease.write(expected, record)?;
-            if written == Written::Done && !record.holder.is_empty() {
+            if written == ConditionalWriteOutcome::Done && !record.holder.is_empty() {
                 self.took = true;
             }
             Ok(written)
@@ -1342,7 +1348,7 @@ mod tests {
         };
         assert_eq!(
             lease.write(None, &released).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
@@ -1577,7 +1583,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             self.lease.write(expected, record)
         }
 
@@ -1688,7 +1694,10 @@ mod tests {
         let mut lease = MemoryLease::new();
         let first = held("x@127.0.0.1:8", 5);
         let (fallen, back) = (held("y@127.0.0.1:9", 3), held("y@127.0.0.1:9", 5));
-        assert_eq!(lease.write(None, &first).expect("a write"), Written::Done);
+        assert_eq!(
+            lease.write(None, &first).expect("a write"),
+            ConditionalWriteOutcome::Done
+        );
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
             renew_period: Duration::from_millis(20),
@@ -1703,7 +1712,7 @@ mod tests {
 
         assert_eq!(
             lease.write(Some(&first), &fallen).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the look at the fallen term", || {
             stood.borrow().holder.is_empty()
@@ -1713,7 +1722,7 @@ mod tests {
         // A holder again at the first look that reads a term at the highest.
         assert_eq!(
             lease.write(Some(&fallen), &back).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the look at the term come back", || {
             stood.borrow().holder == back.holder
@@ -1741,7 +1750,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             if !record.holder.is_empty() {
                 return self.lease.write(expected, record);
             }
@@ -1817,7 +1826,10 @@ mod tests {
         let fallen = held("y@127.0.0.1:9", 3);
         let back = held("y@127.0.0.1:9", 5);
         let again = held("y@127.0.0.1:9", 4);
-        assert_eq!(lease.write(None, &first).expect("a write"), Written::Done);
+        assert_eq!(
+            lease.write(None, &first).expect("a write"),
+            ConditionalWriteOutcome::Done
+        );
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
             renew_period: Duration::from_millis(20),
@@ -1848,7 +1860,7 @@ mod tests {
         // A streak of looks under the fallen term: one line.
         assert_eq!(
             lease.write(Some(&first), &fallen).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the look at the fallen term", || {
             stood.borrow().holder.is_empty()
@@ -1857,14 +1869,14 @@ mod tests {
         // The term comes back and falls again: one line more.
         assert_eq!(
             lease.write(Some(&fallen), &back).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the look at the term come back", || {
             stood.borrow().holder == back.holder
         });
         assert_eq!(
             lease.write(Some(&back), &again).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the look at the second fall", || {
             stood.borrow().holder.is_empty()
@@ -1955,7 +1967,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             self.began.lock().push(Instant::now());
             if self.slow.load(Ordering::SeqCst) {
                 thread::sleep(self.takes);
@@ -2377,7 +2389,8 @@ mod tests {
             let mut lease = self.lease.clone();
             until("a record stored over the one there", || {
                 let stored = lease.read().expect("a read");
-                lease.write(stored.as_ref(), record).expect("a write") == Written::Done
+                lease.write(stored.as_ref(), record).expect("a write")
+                    == ConditionalWriteOutcome::Done
             });
         }
 
@@ -2423,7 +2436,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             let next = {
                 let mut ahead = self.ahead.lock();
                 match ahead.front() {
@@ -2442,7 +2455,7 @@ mod tests {
                 });
             }
             let written = self.lease.write(expected, record)?;
-            if written == Written::Done {
+            if written == ConditionalWriteOutcome::Done {
                 self.landed.fetch_add(1, Ordering::SeqCst);
             }
             Ok(written)
@@ -2518,7 +2531,7 @@ mod tests {
         };
         assert_eq!(
             lease.write(None, &released).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         let mut taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
@@ -2526,7 +2539,7 @@ mod tests {
             .checked_sub(Duration::from_secs(1))
             .expect("the clock is past its first second");
         let tick = taker.tick(began).expect("the take");
-        assert_eq!(tick, Tick::Acquired { term: 2 });
+        assert_eq!(tick, TickOutcome::Acquired { term: 2 });
         assert_eq!(taker.fence().leader_term(Instant::now()), None);
         let lines = Logged(Arc::new(Mutex::new(Vec::new())));
         let writer = lines.clone();
@@ -2602,7 +2615,7 @@ mod tests {
         };
         until("the other holder's take", || {
             let current = lease.read().expect("a read");
-            lease.write(current.as_ref(), &other).expect("a write") == Written::Done
+            lease.write(current.as_ref(), &other).expect("a write") == ConditionalWriteOutcome::Done
         });
         until("the take above", || {
             fence.leader_term(Instant::now()) == Some(3)
@@ -3535,7 +3548,7 @@ mod tests {
         };
         assert_eq!(
             lease.write(Some(&released), &ran_out).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the record that ran out names nobody", || {
             *stood.borrow()
@@ -3584,7 +3597,7 @@ mod tests {
         };
         assert_eq!(
             lease.write(Some(&released), &later).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the term read in the release is counted", || {
             *stood.borrow()
@@ -3603,7 +3616,7 @@ mod tests {
         };
         assert_eq!(
             lease.write(Some(&later), &restored).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the line of the fallen term", || {
             looping.said("the lease's term is under the highest")
@@ -3631,7 +3644,10 @@ mod tests {
             ..LeaseRecord::default()
         };
         let mut lease = MemoryLease::new();
-        assert_eq!(lease.write(None, &free).expect("a write"), Written::Done);
+        assert_eq!(
+            lease.write(None, &free).expect("a write"),
+            ConditionalWriteOutcome::Done
+        );
         let follower = Elector::new(Box::new(lease.clone()), "b@127.0.0.1:2", brisk())
             .expect("the settings are in order");
         let (standing, mut stood) = watch::channel(ElectionObservation::default());
@@ -3721,7 +3737,10 @@ mod tests {
             ..LeaseRecord::default()
         };
         let mut lease = MemoryLease::new();
-        assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
+        assert_eq!(
+            lease.write(None, &held).expect("a write"),
+            ConditionalWriteOutcome::Done
+        );
         let follower = Elector::new(Box::new(lease.clone()), "b@127.0.0.1:2", brisk())
             .expect("the settings are in order");
         let fence = follower.fence();
@@ -3758,7 +3777,7 @@ mod tests {
         };
         assert_eq!(
             lease.write(Some(&held), &released).expect("a write"),
-            Written::Done
+            ConditionalWriteOutcome::Done
         );
         until("the take", || fence.leader_term(Instant::now()) == Some(10));
         let (under, text) = looping
@@ -3781,7 +3800,10 @@ mod tests {
             ..LeaseRecord::default()
         };
         let mut lease = MemoryLease::new();
-        assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
+        assert_eq!(
+            lease.write(None, &held).expect("a write"),
+            ConditionalWriteOutcome::Done
+        );
         let follower = Elector::new(Box::new(lease), "b@127.0.0.1:2", unhurried())
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(ElectionObservation::default());

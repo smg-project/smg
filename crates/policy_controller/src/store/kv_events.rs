@@ -214,7 +214,7 @@ pub const GAP_CLEAR_THRESHOLD: u64 = 1_024;
 
 /// What the cursor decided about one batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admission {
+pub enum BatchAdmission {
     /// Apply the batch; the cursor advanced to it.
     Apply,
     /// A duplicate of something already applied; drop it.
@@ -229,7 +229,7 @@ pub enum Admission {
     Unrecovered { missed: u64, cleared: bool },
 }
 
-impl Admission {
+impl BatchAdmission {
     /// The batch is applied after this decision.
     pub const fn applies(self) -> bool {
         matches!(self, Self::Apply | Self::Restart | Self::Unrecovered { .. })
@@ -265,17 +265,17 @@ pub struct RankCursor {
 impl RankCursor {
     /// Decide what to do with a batch carrying `seq`; `clears` says whether
     /// it carries the engine's own cache clear.
-    pub fn admit(&mut self, seq: u64, clears: bool) -> Admission {
+    pub fn admit(&mut self, seq: u64, clears: bool) -> BatchAdmission {
         let fresh = std::mem::replace(&mut self.fresh, false);
         let Some(last) = self.applied else {
             self.applied = Some(seq);
             self.replay = None;
-            return Admission::Apply;
+            return BatchAdmission::Apply;
         };
         if seq == last + 1 {
             self.applied = Some(seq);
             self.replay = None;
-            return Admission::Apply;
+            return BatchAdmission::Apply;
         }
         if seq <= last {
             // A counter at its start is a new publisher too: replays never
@@ -286,24 +286,24 @@ impl RankCursor {
                 || (seq <= 1 && seq < last)
                 || seq + RESTART_WINDOW <= last;
             if !restarted {
-                return Admission::Stale;
+                return BatchAdmission::Stale;
             }
             self.applied = Some(seq);
             self.replay = None;
             self.degraded = false;
-            return Admission::Restart;
+            return BatchAdmission::Restart;
         }
         let expected = last + 1;
         if self.replay.is_none() {
             self.replay = Some((expected, seq));
-            return Admission::Replay { expected };
+            return BatchAdmission::Replay { expected };
         }
         let missed = seq - expected;
         let cleared = missed > GAP_CLEAR_THRESHOLD;
         self.replay = None;
         self.degraded = !cleared;
         self.applied = Some(seq);
-        Admission::Unrecovered { missed, cleared }
+        BatchAdmission::Unrecovered { missed, cleared }
     }
 
     /// A snapshot chunk stamped `seq` was applied: the cursor stands there,

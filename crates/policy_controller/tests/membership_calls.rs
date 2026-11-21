@@ -42,7 +42,7 @@ use openai_protocol::worker::RuntimeType;
 use replicas::{Lease, Record, Replica};
 use smg_policy_controller::{
     service::{
-        controller::{Config, Controller, Election, Listener, Scope, State, SERVICE_NAME},
+        controller::{Config, Controller, ElectionConfig, Listener, Scope, State, SERVICE_NAME},
         elector::ElectionSettings,
         proto::{
             self, policy_controller_client::PolicyControllerClient, register_worker_request::Mode,
@@ -556,7 +556,7 @@ fn config() -> Config {
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: 2,
-        election: Election::default(),
+        election: ElectionConfig::default(),
         discovery: None,
     }
 }

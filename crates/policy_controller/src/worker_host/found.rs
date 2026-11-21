@@ -205,9 +205,9 @@ mod tests {
         store::{
             encoding::{EncodeHandoff, EncodeOffer},
             pairing::{mismatch, Member, PairingDescriptor, LAYOUT_FACTS},
-            Ask, GatewayId, HealthPolicy, LoadSink as _, LoadSource, MemoryStore, Overload,
-            Reachability, Registrant, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkerStatus,
-            WorkersStore as _,
+            GatewayId, HealthPolicy, LoadSink as _, LoadSource, MemoryStore, Overload,
+            Reachability, Registrant, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerRow,
+            WorkerStatus, WorkersStore as _,
         },
         worker_host::object,
     };
@@ -547,7 +547,7 @@ mod tests {
         store.publish_now();
         store.record(id, 0, LoadRow::default(), now, LoadSource::Stream);
         store.publish_now();
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now,
             pinned: None,

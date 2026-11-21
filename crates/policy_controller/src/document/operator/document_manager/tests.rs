@@ -79,7 +79,7 @@ fn bind(generations: &DocumentManager, dir: &Path) {
 fn yaml(
     generations: &DocumentManager,
     document: impl Into<Vec<u8>>,
-) -> Result<Applied, SpecRejected> {
+) -> Result<ApplyOutcome, SpecRejected> {
     generations.apply(document.into(), Format::Yaml)
 }
 
@@ -131,10 +131,13 @@ fn a_document_applied_through_the_door_lists_the_member_that_joins() {
 fn a_document_with_no_line_starts_as_generation_one_and_a_changed_one_is_the_next() {
     let (store, generations) = generations();
     assert!(!generations.bound());
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
     assert!(generations.bound());
     assert_eq!(standing(&store).0, 1);
-    assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Generation(2)));
+    assert_eq!(yaml(&generations, RANDOM), Ok(ApplyOutcome::Generation(2)));
     assert_eq!((standing(&store).0, generations.generation()), (2, 2));
 }
 
@@ -146,9 +149,9 @@ fn a_document_with_no_line_starts_as_generation_one_and_a_changed_one_is_the_nex
 fn a_written_line_is_a_claim_the_entry_checks() {
     let (store, generations) = generations();
     let first = yaml(&generations, with_line(LEAST_LOAD, 5));
-    assert_eq!(first, Ok(Applied::Generation(5)));
+    assert_eq!(first, Ok(ApplyOutcome::Generation(5)));
     let second = yaml(&generations, with_line(RANDOM, 9));
-    assert_eq!(second, Ok(Applied::Generation(9)));
+    assert_eq!(second, Ok(ApplyOutcome::Generation(9)));
     let random = standing(&store);
 
     let lower = yaml(&generations, with_line(LEAST_LOAD, 4)).expect_err("a number under 9");
@@ -164,7 +167,7 @@ fn a_written_line_is_a_claim_the_entry_checks() {
     assert_eq!(standing(&store), random, "the running generation stays");
 
     let again = yaml(&generations, with_line(RANDOM, 12));
-    assert_eq!(again, Ok(Applied::Generation(12)));
+    assert_eq!(again, Ok(ApplyOutcome::Generation(12)));
     assert_eq!(
         standing(&store),
         (12, random.1),
@@ -181,7 +184,7 @@ fn a_changed_document_under_the_standing_line_is_refused_by_name_and_the_running
     let first = with_line(LEAST_LOAD, 3);
     assert_eq!(
         yaml(&generations, first.clone()),
-        Ok(Applied::Generation(3))
+        Ok(ApplyOutcome::Generation(3))
     );
     let running = standing(&store);
     let (_, Some(running_digest)) = running else {
@@ -217,7 +220,10 @@ fn a_changed_document_under_the_standing_line_is_refused_by_name_and_the_running
 #[test]
 fn a_document_that_only_changed_its_form_is_no_change() {
     let (store, generations) = generations();
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
     let running = standing(&store);
 
     let json = br#"{"profiles":{"default":{"pick":"best","score":["least-load"],"filter":["healthy"]}},"apiVersion":"smg.policy/v1"}"#;
@@ -228,7 +234,7 @@ fn a_document_that_only_changed_its_form_is_no_change() {
         (with_line(LEAST_LOAD, 1), Format::Yaml),
     ] {
         let outcome = generations.apply(document, format);
-        assert_eq!(outcome, Ok(Applied::Unchanged(1)));
+        assert_eq!(outcome, Ok(ApplyOutcome::Unchanged(1)));
     }
     assert_eq!(standing(&store), running);
     let answer = generations.document(0).expect("the standing document");
@@ -243,8 +249,14 @@ fn the_counts_follow_the_outcomes() {
     let (_store, generations) = generations();
     let counts = |applied, rejected| ApplyCounts { applied, rejected };
     assert_eq!(generations.apply_counts(), counts(0, 0));
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Unchanged(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Unchanged(1))
+    );
     assert_eq!(generations.apply_counts(), counts(1, 0));
 
     let refused = yaml(&generations, with_line(RANDOM, 1));
@@ -253,7 +265,7 @@ fn the_counts_follow_the_outcomes() {
         Err(SpecRejected::ChangedUnderItsLine { .. })
     ));
     assert_eq!(generations.apply_counts(), counts(1, 1));
-    assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Generation(2)));
+    assert_eq!(yaml(&generations, RANDOM), Ok(ApplyOutcome::Generation(2)));
     assert_eq!(generations.apply_counts(), counts(2, 1));
 }
 
@@ -270,7 +282,10 @@ fn a_source_that_finds_its_document_running_holds_its_bytes() {
         .expect("above the unbound start");
     assert!(!generations.bound());
 
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Unchanged(5)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Unchanged(5))
+    );
     assert!(generations.bound());
     let answer = generations.document(0).expect("the standing document");
     assert_eq!((answer.generation, answer.document), (5, LEAST_LOAD.into()));
@@ -283,7 +298,7 @@ fn a_source_that_finds_its_document_running_holds_its_bytes() {
     store
         .apply(AppliedSpec::validate(&next).expect("a valid document"))
         .expect("above the standing one");
-    assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Unchanged(6)));
+    assert_eq!(yaml(&generations, RANDOM), Ok(ApplyOutcome::Unchanged(6)));
     let answer = generations.document(0).expect("the standing document");
     assert_eq!((answer.generation, answer.document), (6, RANDOM.into()));
 }
@@ -297,7 +312,7 @@ fn a_mint_at_the_last_number_is_refused_by_name_and_the_held_bytes_stay() {
     let last = with_line(LEAST_LOAD, u64::MAX);
     assert_eq!(
         yaml(&generations, last.clone()),
-        Ok(Applied::Generation(u64::MAX))
+        Ok(ApplyOutcome::Generation(u64::MAX))
     );
     for (document, offered) in [
         (RANDOM.as_bytes().to_vec(), u64::MAX),
@@ -323,7 +338,10 @@ fn a_mint_at_the_last_number_is_refused_by_name_and_the_held_bytes_stay() {
 #[test]
 fn a_held_document_is_answered_only_while_its_generation_stands() {
     let (store, generations) = generations();
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
     let mut next: PolicySpec = serde_yaml::from_str(RANDOM).expect("a document");
     next.generation = 2;
     store
@@ -350,7 +368,10 @@ fn a_document_that_faults_its_pass_is_refused_by_name() {
     let store = Arc::new(MemoryStore::new());
     let generations =
         DocumentManager::validating(Arc::clone(&store), stock(), Vec::new(), faulting);
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
     let running = standing(&store);
 
     assert_eq!(
@@ -362,7 +383,7 @@ fn a_document_that_faults_its_pass_is_refused_by_name() {
     assert_eq!(answer.document, LEAST_LOAD.as_bytes());
     assert_eq!(
         yaml(&generations, with_line(LEAST_LOAD, 4)),
-        Ok(Applied::Generation(4))
+        Ok(ApplyOutcome::Generation(4))
     );
 }
 
@@ -396,7 +417,10 @@ fn a_fault_whose_payload_faults_at_its_drop_is_held() {
     let store = Arc::new(MemoryStore::new());
     let generations =
         DocumentManager::validating(Arc::clone(&store), stock(), Vec::new(), dropping);
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
 
     assert_eq!(
         yaml(&generations, RANDOM),
@@ -405,7 +429,7 @@ fn a_fault_whose_payload_faults_at_its_drop_is_held() {
     assert_eq!(standing(&store).0, 1);
     assert_eq!(
         yaml(&generations, with_line(LEAST_LOAD, 4)),
-        Ok(Applied::Generation(4))
+        Ok(ApplyOutcome::Generation(4))
     );
 }
 
@@ -458,7 +482,10 @@ fn a_read_during_an_apply_waits_on_no_validation() {
         Vec::new(),
         stalling,
     ));
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
     let applying = {
         let generations = Arc::clone(&generations);
         thread::spawn(move || yaml(&generations, RANDOM))
@@ -470,7 +497,7 @@ fn a_read_during_an_apply_waits_on_no_validation() {
     RELEASED.store(true, Ordering::SeqCst);
     assert_eq!(
         applying.join().expect("the apply's thread"),
-        Ok(Applied::Generation(2))
+        Ok(ApplyOutcome::Generation(2))
     );
 }
 
@@ -531,7 +558,7 @@ fn the_stores_entry_is_called_under_the_documents_lock() {
         );
         assert_eq!(
             yaml(&generations, document),
-            Ok(Applied::Generation(number))
+            Ok(ApplyOutcome::Generation(number))
         );
     }
     assert_eq!(*found.lock(), [true], "the first generation's end");
@@ -548,7 +575,10 @@ fn a_document_the_validator_refuses_is_refused_though_its_digest_stands() {
 
     {
         let (store, generations) = generations();
-        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        assert_eq!(
+            yaml(&generations, LEAST_LOAD),
+            Ok(ApplyOutcome::Generation(1))
+        );
         let running = standing(&store);
         assert_eq!(yaml(&generations, with_kind.as_str()), Err(kind()));
         assert_eq!(yaml(&generations, with_line(&with_kind, 1)), Err(kind()));
@@ -574,7 +604,10 @@ fn a_document_the_validator_refuses_is_refused_though_its_digest_stands() {
 #[test]
 fn an_invalid_document_is_rejected_whole_and_the_running_generation_stays() {
     let (store, generations) = generations();
-    assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(
+        yaml(&generations, LEAST_LOAD),
+        Ok(ApplyOutcome::Generation(1))
+    );
     let running = standing(&store);
 
     let unknown_filter = SpecError::UnknownFilter {
@@ -697,7 +730,7 @@ fn a_small_file_that_shares_a_profile_by_alias_runs_as_written_out() {
             let (_store, generations) = generations();
             assert_eq!(
                 yaml(&generations, document),
-                Ok(Applied::Generation(1)),
+                Ok(ApplyOutcome::Generation(1)),
                 "{names} names {written}"
             );
         }
@@ -727,7 +760,7 @@ fn a_field_the_reader_refuses_is_named_by_its_path() {
             &generations,
             LEAST_LOAD.replace("[healthy]", "[\"healthy\"]")
         ),
-        Ok(Applied::Generation(1))
+        Ok(ApplyOutcome::Generation(1))
     );
 }
 
@@ -837,7 +870,7 @@ fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
     let (_store, generations) = generations();
     assert_eq!(
         yaml(&generations, with_line(LEAST_LOAD, 5)),
-        Ok(Applied::Generation(5))
+        Ok(ApplyOutcome::Generation(5))
     );
     let over = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits") + 1;
     let rows = [
@@ -903,7 +936,7 @@ fn a_document_over_the_bound_is_refused_by_its_size() {
     let bound = over - 1;
     assert_eq!(
         generations.apply(padded(LEAST_LOAD, bound), Format::Yaml),
-        Ok(Applied::Generation(1))
+        Ok(ApplyOutcome::Generation(1))
     );
 }
 
@@ -921,7 +954,7 @@ fn applies_from_several_threads_each_mint_a_number_of_their_own() {
                 scope.spawn(move || {
                     let document = LEAST_LOAD.replace("default", &format!("profile-{writer}"));
                     match yaml(generations, document) {
-                        Ok(Applied::Generation(generation)) => generation,
+                        Ok(ApplyOutcome::Generation(generation)) => generation,
                         other => panic!("writer {writer}: {other:?}"),
                     }
                 })
@@ -968,7 +1001,7 @@ fn an_enforce_is_refused_where_another_apply_landed_first() {
     // The same guard again: the digest it names stands no longer.
     let late = generations.enforce(&read, bound_to(1).into(), Format::Yaml);
     assert!(
-        matches!(late, Err(Unanswered::Guarded(2, Some(stands))) if stands == digest),
+        matches!(late, Err(EnforceRefused::Guarded(2, Some(stands))) if stands == digest),
         "{late:?}"
     );
     assert_eq!(standing(&store), (2, Some(digest)));
@@ -978,7 +1011,7 @@ fn an_enforce_is_refused_where_another_apply_landed_first() {
     let (_dir, _store, empty) = stored();
     let guarded = empty.enforce(&read, LEAST_LOAD.into(), Format::Yaml);
     assert!(
-        matches!(guarded, Err(Unanswered::Guarded(0, None))),
+        matches!(guarded, Err(EnforceRefused::Guarded(0, None))),
         "{guarded:?}"
     );
 }
@@ -1090,7 +1123,7 @@ fn a_start_takes_the_files_number_for_a_document_the_store_runs_under_a_lower_on
     let dir = tempfile::tempdir().expect("a temp dir");
     std::fs::write(dir.path().join(name_of(2, "yaml")), LEAST_LOAD).expect("the file");
     let (store, first) = generations();
-    assert_eq!(yaml(&first, LEAST_LOAD), Ok(Applied::Generation(1)));
+    assert_eq!(yaml(&first, LEAST_LOAD), Ok(ApplyOutcome::Generation(1)));
     let (_, runs) = standing(&store);
 
     let bound = DocumentManager::new(Arc::clone(&store), stock(), Vec::new());
@@ -1307,7 +1340,7 @@ fn a_refused_generation_that_stays_on_file_is_told_and_goes_at_the_next_write() 
         }
         let behind = DocumentManager::new(Arc::clone(&store), stock(), Vec::new());
         let entered = yaml(&behind, with_line(&bound_to(0), 2));
-        assert_eq!(entered, Ok(Applied::Generation(2)));
+        assert_eq!(entered, Ok(ApplyOutcome::Generation(2)));
         std::fs::remove_file(&name).expect("the persisted file");
         std::fs::create_dir(&name).expect("a directory in its place");
         drop(documents);
@@ -1328,7 +1361,7 @@ fn a_refused_generation_that_stays_on_file_is_told_and_goes_at_the_next_write() 
     );
     assert!(matches!(
         generations.roll_back(2),
-        Err(Unanswered::NotHeld(_))
+        Err(EnforceRefused::NotHeld(_))
     ));
 
     std::fs::remove_dir(&name).expect("the directory goes");
@@ -1362,7 +1395,7 @@ fn enforces_under_one_guard_land_once() {
                             enforced.ran.expect("the one the guard admits runs");
                             true
                         }
-                        Err(Unanswered::Guarded(..)) => false,
+                        Err(EnforceRefused::Guarded(..)) => false,
                         Err(other) => panic!("{other:?}"),
                     }
                 })
@@ -1534,7 +1567,7 @@ fn a_rollback_to_a_generation_not_on_file_is_not_held() {
         enforce(&generations, bound_to(number)).expect("it runs");
     }
     for gone in [1, last + 1] {
-        let Err(Unanswered::NotHeld(not_held)) = generations.roll_back(gone) else {
+        let Err(EnforceRefused::NotHeld(not_held)) = generations.roll_back(gone) else {
             panic!("generation {gone} is not on file");
         };
         let expected = NotHeld {
@@ -1596,8 +1629,8 @@ fn publication_runs_once_for_a_change_and_skips_the_standing_document() {
             },
         )
     };
-    assert_eq!(apply(), Ok(Applied::Generation(1)));
-    assert_eq!(apply(), Ok(Applied::Unchanged(1)));
+    assert_eq!(apply(), Ok(ApplyOutcome::Generation(1)));
+    assert_eq!(apply(), Ok(ApplyOutcome::Unchanged(1)));
     assert_eq!(calls.get(), 1);
 }
 
@@ -1624,7 +1657,7 @@ fn a_publication_that_waits_keeps_the_document_counts_and_log_as_they_were() {
             Ok(false)
         },
     );
-    assert_eq!(waited, Ok(Applied::Waits(1)));
+    assert_eq!(waited, Ok(ApplyOutcome::Waits(1)));
     assert_eq!(standing(&store), (1, Some(stood.digest)));
     assert_eq!(door.document(0), Ok(stood));
     assert_eq!(door.apply_counts(), applied(1, 0));
@@ -1649,7 +1682,7 @@ fn the_same_document_is_refused_only_by_a_host_that_denies_its_header() {
     assert_eq!(denied.standing(), (0, None));
     assert_eq!(
         yaml(&make(Vec::new()), document),
-        Ok(Applied::Generation(1))
+        Ok(ApplyOutcome::Generation(1))
     );
 }
 
@@ -1689,7 +1722,7 @@ fn an_applys_time_by_the_documents_size() {
             let began = Instant::now();
             let applied = yaml(&generations, document);
             micros.push(began.elapsed().as_micros());
-            assert_eq!(applied, Ok(Applied::Generation(1)));
+            assert_eq!(applied, Ok(ApplyOutcome::Generation(1)));
         }
         micros.sort_unstable();
         writeln!(

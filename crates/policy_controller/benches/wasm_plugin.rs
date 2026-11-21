@@ -47,7 +47,7 @@ use smg_policy_controller::{
     document::{Needs, MAX_BLOCK_HASHES},
     engine::{
         Binding, Constraints, DecisionSlot, Engine, Plan, PoolFacts, Profile, RequestFacts,
-        Scratch, Target, Weighted, WorkerId,
+        Scratch, Target, WeightedScorer, WorkerId,
     },
     plugins::{
         shared::OpenDecisions,
@@ -93,7 +93,7 @@ fn plugin_engine(plugin: &Arc<Plugin>) -> Engine {
     let profile = Profile {
         name: "plugin".into(),
         filters: vec![Box::new(WasmFilter::new(Arc::clone(&bound), None))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(Arc::clone(&bound), None)),
             weight: 1.0,
         }],
@@ -107,7 +107,7 @@ fn native_engine() -> Engine {
     engine_of(Profile {
         name: "native".into(),
         filters: vec![Box::new(Healthy)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],

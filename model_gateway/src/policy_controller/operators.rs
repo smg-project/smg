@@ -32,7 +32,7 @@ use smg_policy_controller::{
     document::{
         operator::{
             snapshot::{self, Rows, WorkerRowsQuery},
-            Document, DocumentManager, DryRun, Format, NeedsRow, Turn, Unanswered,
+            Document, DocumentManager, DryRun, EnforceRefused, Format, NeedsRow, SerialTurn,
             MAX_DOCUMENT_BYTES,
         },
         Digest, Needs,
@@ -65,8 +65,8 @@ const SNAPSHOT_ROWS: usize = 1_024;
 pub(crate) struct Operators {
     door: Arc<DocumentManager>,
     store: Arc<MemoryStore>,
-    dry_runs: Turn,
-    snapshots: Turn,
+    dry_runs: SerialTurn,
+    snapshots: SerialTurn,
 }
 
 impl Operators {
@@ -74,8 +74,8 @@ impl Operators {
         Self {
             door,
             store,
-            dry_runs: Turn::new(DRY_RUNS_WAITING),
-            snapshots: Turn::new(SNAPSHOTS_WAITING),
+            dry_runs: SerialTurn::new(DRY_RUNS_WAITING),
+            snapshots: SerialTurn::new(SNAPSHOTS_WAITING),
         }
     }
 }
@@ -308,7 +308,7 @@ pub(crate) async fn validate(
             };
             (StatusCode::UNPROCESSABLE_ENTITY, Json(refused)).into_response()
         }
-        Ok(Err(Unanswered::Guarded(generation, digest))) => {
+        Ok(Err(EnforceRefused::Guarded(generation, digest))) => {
             let refused = Refused {
                 error: format!("If-Match names another digest; generation {generation} stands"),
                 code: "PRECONDITION_FAILED",
@@ -318,7 +318,7 @@ pub(crate) async fn validate(
             (StatusCode::PRECONDITION_FAILED, Json(refused)).into_response()
         }
         // A dry run names no generation on file.
-        Ok(Err(unanswered @ Unanswered::NotHeld(_))) => {
+        Ok(Err(unanswered @ EnforceRefused::NotHeld(_))) => {
             error!(%unanswered, "the policy dry run gave no verdict");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -356,7 +356,7 @@ pub(crate) struct SnapshotQuery {
 struct Snapshot {
     generation: u64,
     #[serde(flatten)]
-    page: snapshot::Told,
+    page: snapshot::WorkerRowsPage,
 }
 
 /// `GET /policy/snapshot`: the worker rows the controller's store holds,
@@ -398,7 +398,7 @@ pub(crate) async fn snapshot(
         let now = Instant::now();
         let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
         serde_json::to_vec(&Snapshot {
-            page: snapshot::told(&asked, Rows::Told(rows, serving), now),
+            page: snapshot::worker_rows_page(&asked, Rows::Told(rows, serving), now),
             generation: store.snapshot().spec().generation(),
         })
     })

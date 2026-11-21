@@ -69,13 +69,14 @@ use std::{
 };
 
 #[cfg(feature = "client")]
-use crate::service::client::{wire, Error, Link, Unanswered};
+use crate::service::client::{wire, DecisionUnavailable, Error, Link};
 use crate::{
     engine::{
         decision::{Decision, Target},
         framework::{EncodeItems, EncodePlaced},
         store_backed_engine::{
-            self, Decided, Leased, Refused, Request, RequestFromSnapshot, StoreBackedEngine,
+            self, DecideOutcome, DecisionRefused, Leased, Request, RequestFromSnapshot,
+            StoreBackedEngine,
         },
         view::WorkerId,
     },
@@ -152,7 +153,7 @@ fn micros(span: Duration) -> u32 {
 /// for its reports and for its drop.
 pub struct DecisionGuard<D: Deref<Target = StoreBackedEngine>> {
     arm: Arm<D>,
-    decided: Decided,
+    decided: DecideOutcome,
     /// The index to name at dispatch: the first until the host takes
     /// another. After the prefill dispatch it can move for the decode.
     index: u8,
@@ -170,13 +171,13 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     ///
     /// # Errors
     ///
-    /// [`Refused`]: the door made no decision for the request.
+    /// [`DecisionRefused`]: the door made no decision for the request.
     pub fn decide(
         door: D,
         gateway: GatewayId,
         request: &Request<'_>,
         now: Instant,
-    ) -> Result<Self, Refused> {
+    ) -> Result<Self, DecisionRefused> {
         let decided = door.decide(gateway, request, now)?;
         let later = request.constraints.decode_later;
         Ok(Self::hold(
@@ -192,13 +193,13 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     ///
     /// # Errors
     ///
-    /// [`Refused`]: the door made no decision for the request.
+    /// [`DecisionRefused`]: the door made no decision for the request.
     pub fn decide_under(
         door: D,
         gateway: GatewayId,
         maker: &impl RequestFromSnapshot,
         now: Instant,
-    ) -> Result<Self, Refused> {
+    ) -> Result<Self, DecisionRefused> {
         let (decided, later) = door.decide_under_stated(gateway, maker, now)?;
         Ok(Self::hold(
             Arm::Engine { door, gateway },
@@ -214,7 +215,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     ///
     /// # Errors
     ///
-    /// [`Refused`]: the door made no decision for the request.
+    /// [`DecisionRefused`]: the door made no decision for the request.
     pub fn decide_encode_pair(
         door: D,
         gateway: GatewayId,
@@ -222,7 +223,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
         items: EncodeItems<'_>,
         placed: &mut EncodePlaced,
         now: Instant,
-    ) -> Result<Self, Refused> {
+    ) -> Result<Self, DecisionRefused> {
         let decided = door.decide_encode_pair(gateway, request, items, placed, now)?;
         let later = request.constraints.decode_later;
         Ok(Self::hold(
@@ -233,7 +234,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
         ))
     }
 
-    fn hold(arm: Arm<D>, decided: Decided, later: bool, now: Instant) -> Self {
+    fn hold(arm: Arm<D>, decided: DecideOutcome, later: bool, now: Instant) -> Self {
         let first = decided
             .decision
             .pick()
@@ -292,17 +293,17 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     ///
     /// # Errors
     ///
-    /// [`Refused`] gives the reason the call made no decision. The handle
-    /// keeps its current pick. A single's lease, and a pair's decode side
-    /// that ended or that the host gave up ([`Self::released_decode`]),
-    /// are refused here by name, and no door is asked. A pair whose two
-    /// sides are owed nothing is refused as a lease that is gone. A handle
-    /// over a link is refused as not chosen: no link asks a decode later.
+    /// [`DecisionRefused`] gives the reason the call made no decision. The
+    /// handle keeps its current pick. A single's lease, and a pair's decode
+    /// side that ended or that the host gave up ([`Self::released_decode`]),
+    /// are refused here by name, and no door is asked. A pair whose two sides
+    /// are owed nothing is refused as a lease that is gone. A handle over a
+    /// link is refused as not chosen: no link asks a decode later.
     pub fn decide_decode(
         &mut self,
         request: &Request<'_>,
         now: Instant,
-    ) -> Result<&Decision, Refused> {
+    ) -> Result<&Decision, DecisionRefused> {
         self.decode_decided(|door, gateway, lease| door.decide_decode(gateway, request, lease, now))
     }
 
@@ -316,7 +317,7 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
         &mut self,
         maker: &impl RequestFromSnapshot,
         now: Instant,
-    ) -> Result<&Decision, Refused> {
+    ) -> Result<&Decision, DecisionRefused> {
         self.decode_decided(|door, gateway, lease| {
             door.decide_decode_under(gateway, maker, lease, now)
         })
@@ -326,11 +327,15 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     /// side of its pair's lease.
     fn decode_decided(
         &mut self,
-        call: impl FnOnce(&StoreBackedEngine, GatewayId, LeaseId) -> Result<Decided, Refused>,
-    ) -> Result<&Decision, Refused> {
+        call: impl FnOnce(
+            &StoreBackedEngine,
+            GatewayId,
+            LeaseId,
+        ) -> Result<DecideOutcome, DecisionRefused>,
+    ) -> Result<&Decision, DecisionRefused> {
         let lease = self
             .lease()
-            .ok_or(Refused::Decode(DecodeRefused::NoLease))?
+            .ok_or(DecisionRefused::Decode(DecodeRefused::NoLease))?
             .lease
             .id;
         // The handle's own word comes first, where it knows the answer. A
@@ -341,18 +346,20 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
         // no report, so the store still holds it chosen and would issue
         // it, a booking nobody reports again.
         match (self.decided.pair(), self.owed, self.decode) {
-            (false, ..) => return Err(Refused::Decode(DecodeRefused::NotChosen)),
+            (false, ..) => return Err(DecisionRefused::Decode(DecodeRefused::NotChosen)),
             (true, Owed::Nothing, Owed::Nothing) => {
-                return Err(Refused::Decode(DecodeRefused::NoLease));
+                return Err(DecisionRefused::Decode(DecodeRefused::NoLease));
             }
-            (true, _, Owed::Nothing) => return Err(Refused::Decode(DecodeRefused::DecodeStands)),
+            (true, _, Owed::Nothing) => {
+                return Err(DecisionRefused::Decode(DecodeRefused::DecodeStands))
+            }
             _ => {}
         }
         let answer = match &self.arm {
             Arm::Engine { door, gateway } => call(door, *gateway, lease)?,
             // A controller over a link issued both sides at the first ask.
             #[cfg(feature = "client")]
-            Arm::Link(_) => return Err(Refused::Decode(DecodeRefused::NotChosen)),
+            Arm::Link(_) => return Err(DecisionRefused::Decode(DecodeRefused::NotChosen)),
         };
         let first = answer.decision.pick().and_then(|pick| pick.targets.first());
         if let Some((leased, target)) = answer.lease.zip(first) {
@@ -633,31 +640,34 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
     ///
     /// # Errors
     ///
-    /// [`Unanswered`] if the link has no answer or the handle cannot read it.
-    /// The link releases the leases of an unread answer as late decisions.
+    /// [`DecisionUnavailable`] if the link has no answer or the handle cannot
+    /// read it. The link releases the leases of an unread answer as late
+    /// decisions.
     ///
     /// A request whose `budget_micros` is 0 is answered
-    /// [`Unanswered::Late`] before anything is sent. Over a link that
+    /// [`DecisionUnavailable::Late`] before anything is sent. Over a link that
     /// budget says the request's time is spent, and the controller would
     /// answer busy at its receipt. A request built for the door in process
     /// carries that budget unless its host states one.
     ///
     /// A request that states a hard demand is answered
-    /// [`Unanswered::Unsent`] with [`Error::OutOfRange`] before anything is
-    /// sent. This protocol version states no demand, and a controller that
-    /// reads none would pick among workers the demand rules out. Its host
-    /// decides such a request itself.
+    /// [`DecisionUnavailable::Unsent`] with [`Error::OutOfRange`] before
+    /// anything is sent. This protocol version states no demand, and a
+    /// controller that reads none would pick among workers the demand rules
+    /// out. Its host decides such a request itself.
     pub async fn asked(
         link: &Link,
         request: &Request<'_>,
         now: Instant,
         budget: Duration,
-    ) -> Result<Self, Unanswered> {
+    ) -> Result<Self, DecisionUnavailable> {
         if request.facts.budget_micros == 0 {
-            return Err(Unanswered::Late);
+            return Err(DecisionUnavailable::Late);
         }
         if !request.constraints.demands.is_none() {
-            return Err(Unanswered::Unsent(Error::OutOfRange("constraints.demands")));
+            return Err(DecisionUnavailable::Unsent(Error::OutOfRange(
+                "constraints.demands",
+            )));
         }
         let (asked, left_out) = wire::request(request);
         let told = link.ask_cut(asked, left_out, budget).await?;
@@ -671,7 +681,9 @@ impl<D: Deref<Target = StoreBackedEngine>> DecisionGuard<D> {
             )),
             Err(unread) => {
                 link.release_late(told);
-                Err(Unanswered::Unsent(Error::NoDecision(unread.to_string())))
+                Err(DecisionUnavailable::Unsent(Error::NoDecision(
+                    unread.to_string(),
+                )))
             }
         }
     }
@@ -727,7 +739,7 @@ mod tests {
                     pair_fleet, pair_request, picking, push_fleet, request, Ends, GATEWAY,
                     PATIENCE,
                 },
-                Refused, Request, RequestFromSnapshot, StoreBackedEngine,
+                DecisionRefused, Request, RequestFromSnapshot, StoreBackedEngine,
             },
             view::{Candidate, Identity, RequestFacts, WorkerId},
         },
@@ -1271,7 +1283,7 @@ mod tests {
     fn paired(
         door: &StoreBackedEngine,
         now: Instant,
-    ) -> Result<DecisionGuard<&StoreBackedEngine>, Refused> {
+    ) -> Result<DecisionGuard<&StoreBackedEngine>, DecisionRefused> {
         DecisionGuard::decide(door, GATEWAY, &pair_request(b"pair"), now)
     }
 
@@ -1426,7 +1438,7 @@ mod tests {
         let original = *handle.decision();
         assert_eq!(
             handle.decide_decode(&asked, now).err(),
-            Some(Refused::Decode(DecodeRefused::PrefillNotHeld))
+            Some(DecisionRefused::Decode(DecodeRefused::PrefillNotHeld))
         );
         assert_eq!(*handle.decision(), original);
         assert_eq!(handle.index, 1);
@@ -1461,7 +1473,7 @@ mod tests {
         assert_eq!(pair_counts(store, workers), [1, 0, 1]);
         assert_eq!(
             handle.decide_decode(&asked, call).err(),
-            Some(Refused::Decode(DecodeRefused::DecodeStands))
+            Some(DecisionRefused::Decode(DecodeRefused::DecodeStands))
         );
         assert_eq!(handle.take_decode(1), Some(first));
         assert_eq!(states(store, lease), Some([prefill, LeaseState::ISSUED]));
@@ -1578,7 +1590,7 @@ mod tests {
         // An issued side takes no second call.
         assert_eq!(
             handle.decide_decode_under(&Later, now).err(),
-            Some(Refused::Decode(DecodeRefused::DecodeStands))
+            Some(DecisionRefused::Decode(DecodeRefused::DecodeStands))
         );
         drop(handle);
         let _ = words();
@@ -1653,7 +1665,7 @@ mod tests {
         assert_eq!(chosen, Some(LeaseState::Chosen));
         assert_eq!(
             handle.decide_decode(&asked, now).err(),
-            Some(Refused::Decode(DecodeRefused::DecodeStands))
+            Some(DecisionRefused::Decode(DecodeRefused::DecodeStands))
         );
         assert_eq!(store.sides(GATEWAY, lease), before);
         assert_eq!(pair_counts(store, [first.id, decode]), [1, 0]);
@@ -1668,7 +1680,7 @@ mod tests {
         let mut alone = held(&single, b"r-1", now);
         assert_eq!(
             alone.decide_decode(&request(b"r-1", 7), now).err(),
-            Some(Refused::Decode(DecodeRefused::NotChosen))
+            Some(DecisionRefused::Decode(DecodeRefused::NotChosen))
         );
     }
 
@@ -1690,7 +1702,7 @@ mod tests {
         assert_eq!(store.sides(GATEWAY, lease), None);
         assert_eq!(
             handle.decide_decode(&asked, now).err(),
-            Some(Refused::Decode(DecodeRefused::NoLease))
+            Some(DecisionRefused::Decode(DecodeRefused::NoLease))
         );
         assert_eq!(store.sides(GATEWAY, lease), None);
     }
@@ -2086,13 +2098,13 @@ mod tests {
         use tokio_stream::StreamExt as _;
 
         use super::{
-            outcome, request, DecisionGuard, DecodeRefused, Duration, Instant, Refused, Request,
-            Side, StoreBackedEngine, TransportClass, WorkerId, PATIENCE,
+            outcome, request, DecisionGuard, DecisionRefused, DecodeRefused, Duration, Instant,
+            Request, Side, StoreBackedEngine, TransportClass, WorkerId, PATIENCE,
         };
         use crate::{
             engine::Demands,
             service::{
-                client::{poll, Error, Peer, Unanswered},
+                client::{poll, DecisionUnavailable, Error, Peer},
                 proto::{
                     self,
                     completed::Class,
@@ -2133,7 +2145,7 @@ mod tests {
             peer: &mut Peer,
             told: proto::Decision,
             now: Instant,
-        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, Unanswered> {
+        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, DecisionUnavailable> {
             let mut ask = request(&[1], 7);
             ask.facts.budget_micros = 200_000;
             answered_to(peer, &ask, told, now).await
@@ -2145,7 +2157,7 @@ mod tests {
             ask: &Request<'_>,
             told: proto::Decision,
             now: Instant,
-        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, Unanswered> {
+        ) -> Result<DecisionGuard<&'static StoreBackedEngine>, DecisionUnavailable> {
             peer.read_hello().await;
             let link = peer.link.clone();
             let exchange = async {
@@ -2418,7 +2430,7 @@ mod tests {
                 let mut peer = Peer::new(1);
                 let answer = answered(&mut peer, told, Instant::now()).await;
                 assert!(
-                    matches!(&answer, Err(Unanswered::Unsent(Error::NoDecision(why))) if why.starts_with(path)),
+                    matches!(&answer, Err(DecisionUnavailable::Unsent(Error::NoDecision(why))) if why.starts_with(path)),
                     "{answer:?}"
                 );
                 reports(&mut peer, [released(side, Reason::LateDecision)]).await;
@@ -2568,7 +2580,7 @@ mod tests {
             handle.dispatched(now);
             assert_eq!(
                 handle.decide_decode(&ask, now).err(),
-                Some(Refused::Decode(DecodeRefused::NotChosen))
+                Some(DecisionRefused::Decode(DecodeRefused::NotChosen))
             );
             handle.completed(&outcome(WorkerId(28), TransportClass::Ok), now);
             drop(handle);
@@ -2596,7 +2608,7 @@ mod tests {
                 let mut peer = Peer::new(1);
                 let answer = answered(&mut peer, told, Instant::now()).await;
                 assert!(
-                    matches!(&answer, Err(Unanswered::Unsent(Error::NoDecision(why))) if why.starts_with(path)),
+                    matches!(&answer, Err(DecisionUnavailable::Unsent(Error::NoDecision(why))) if why.starts_with(path)),
                     "{answer:?}"
                 );
                 reports(
@@ -2647,7 +2659,10 @@ mod tests {
             )
             .await
             .expect("the ask returns");
-            assert!(matches!(answer, Err(Unanswered::Late)), "{answer:?}");
+            assert!(
+                matches!(answer, Err(DecisionUnavailable::Late)),
+                "{answer:?}"
+            );
             assert_eq!(tokio::time::Instant::now(), before);
         }
 
@@ -2672,7 +2687,10 @@ mod tests {
             )
             .await
             .expect("the ask returns");
-            assert!(matches!(answer, Err(Unanswered::Late)), "{answer:?}");
+            assert!(
+                matches!(answer, Err(DecisionUnavailable::Late)),
+                "{answer:?}"
+            );
             assert_eq!(tokio::time::Instant::now(), before);
             assert!(
                 poll(pin!(peer.requests.next())).is_pending(),
@@ -2708,7 +2726,9 @@ mod tests {
             assert!(
                 matches!(
                     answer,
-                    Err(Unanswered::Unsent(Error::OutOfRange("constraints.demands")))
+                    Err(DecisionUnavailable::Unsent(Error::OutOfRange(
+                        "constraints.demands"
+                    )))
                 ),
                 "{answer:?}"
             );

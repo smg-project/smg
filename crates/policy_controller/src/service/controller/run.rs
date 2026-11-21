@@ -26,7 +26,8 @@ use tracing_subscriber::EnvFilter;
 #[cfg(feature = "discovery")]
 use super::discovery::DiscoveryFlags;
 use super::{
-    Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
+    Config, ConfigError, Controller, ElectionConfig, Error, LeasePlace, Listener, Scope, Tls,
+    VERSION,
 };
 use crate::{service::elector::ElectionSettings, stages::registry::StageRegistry};
 
@@ -411,7 +412,7 @@ impl Cli {
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
             load_poll_interval: Duration::from_secs(self.load_monitor_interval),
             decide_shards: usize::from(self.decide_shards),
-            election: Election {
+            election: ElectionConfig {
                 lease: self.lease(),
                 settings: ElectionSettings {
                     duration: Duration::from_millis(self.lease_duration_ms),
@@ -688,7 +689,7 @@ mod tests {
         service::{
             controller::{
                 membership::tests::Logged, spec_store::SpecStore, Config, ConfigError, Controller,
-                Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
+                ElectionConfig, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
             },
             elector::ElectionSettings,
         },
@@ -1065,7 +1066,7 @@ mod tests {
     #[test]
     fn with_no_lease_flag_one_replica_leads_itself_on_the_designs_settings() {
         let alone = config(&[]).expect("parsed");
-        assert_eq!(alone.election, Election::default());
+        assert_eq!(alone.election, ElectionConfig::default());
         assert_eq!(alone.election.lease, LeasePlace::Process);
         assert_eq!(alone.election.settings, ElectionSettings::default());
         assert_eq!(

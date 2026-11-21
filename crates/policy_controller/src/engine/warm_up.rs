@@ -2,12 +2,12 @@
 //!
 //! The `warmup-slice` stage of the `cache_aware` policy applies it to a
 //! decision's rows. A host that names a pool's warming rows asks the same
-//! ruling ([`WarmRule::name`]), so the two never differ.
+//! ruling ([`WarmUpRule::list_warming_rows`]), so the two never differ.
 
-/// How a host reads the rows a ruling named ([`WarmRule::name`]) at an
-/// instant of the ruling's clock.
+/// How a host reads the rows a ruling named ([`WarmUpRule::list_warming_rows`])
+/// at an instant of the ruling's clock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Warming {
+pub struct WarmUpState {
     /// The rows named are the thin.
     pub thin: bool,
     /// The instant from which the rows are named: `0`, unless every row
@@ -18,10 +18,11 @@ pub struct Warming {
 
 /// The warm-up stage's ruling of who warms, as its three numbers: what the
 /// stage rules a host's column by, and what a host that names a pool's
-/// warming rows enters ([`WarmRule::name`]). The ruling has this one home: a
-/// host hands it the pool's sizes and admissions and never restates it.
+/// warming rows enters ([`WarmUpRule::list_warming_rows`]). The ruling has this
+/// one home: a host hands it the pool's sizes and admissions and never restates
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WarmRule {
+pub struct WarmUpRule {
     /// How long after its admission a worker is young, in microseconds; `0`
     /// keeps nobody young.
     pub(crate) window_micros: u64,
@@ -33,7 +34,7 @@ pub struct WarmRule {
     pub(crate) thin_ratio: f32,
 }
 
-impl WarmRule {
+impl WarmUpRule {
     /// Whether an index of `indexed` blocks is thin against the fleet's
     /// `level`: empty, or below the ratio of the level, once the fleet holds
     /// a cache worth catching up to.
@@ -65,7 +66,7 @@ impl WarmRule {
     }
 
     /// The pool's warming rows by this ruling, for a host that names them
-    /// ([`NamedAffinity::warming`]). `sizes` holds each row's index size
+    /// ([`AffinityRows::warming`]). `sizes` holds each row's index size
     /// and `admitted` each row's admission, on the clock `now` is read on,
     /// in microseconds; `scratch` is the host's, for the level. The rows go
     /// to `out`, emptied first, ascending, each with the instant its naming
@@ -76,18 +77,18 @@ impl WarmRule {
     ///
     /// The rows stand for every later instant of that clock while the sizes
     /// do: at an instant a host names the rows whose end is past it, and
-    /// nobody before [`Warming::from`]. So a host that reads the sizes at
+    /// nobody before [`WarmUpState::from`]. So a host that reads the sizes at
     /// its own pace still ends a young row's naming on time.
     ///
-    /// [`NamedAffinity::warming`]: crate::engine::view::NamedAffinity::warming
-    pub fn name(
+    /// [`AffinityRows::warming`]: crate::engine::view::AffinityRows::warming
+    pub fn list_warming_rows(
         &self,
         sizes: &[u32],
         admitted: &[u64],
         now: u64,
         scratch: &mut Vec<u32>,
         out: &mut Vec<(u32, u64)>,
-    ) -> Warming {
+    ) -> WarmUpState {
         out.clear();
         let young = |size: u32, admitted: u64| self.is_young(now.saturating_sub(admitted), size);
         let any_indexed = sizes.iter().any(|&size| size > 0);
@@ -97,7 +98,7 @@ impl WarmRule {
             .filter(|&(&size, &admitted)| young(size, admitted))
             .count();
         if !any_indexed && youngs == 0 {
-            return Warming::default();
+            return WarmUpState::default();
         }
         let level = if any_indexed {
             scratch.clear();
@@ -113,7 +114,7 @@ impl WarmRule {
                 .map(|(row, _)| (row, u64::MAX)),
         );
         if !out.is_empty() {
-            return Warming {
+            return WarmUpState {
                 thin: true,
                 from: 0,
             };
@@ -127,6 +128,6 @@ impl WarmRule {
         // first of its rows is young no more.
         let first_end = out.iter().map(|&(_, until)| until).min();
         let from = first_end.filter(|_| youngs == sizes.len()).unwrap_or(0);
-        Warming { thin: false, from }
+        WarmUpState { thin: false, from }
     }
 }

@@ -88,7 +88,7 @@ pub(crate) use self::wire::{MAX_FRAME, MAX_REQUEST_ID};
 pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, DiscoverySettings, Listener, Scope, Tls},
-    election::{Election, LeaseError, LeasePlace},
+    election::{ElectionConfig, LeaseError, LeasePlace},
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     run::run,
@@ -1388,10 +1388,10 @@ mod tests {
             probe::unbuildable,
         },
         service::elector::{
-            ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
-            Written,
+            ConditionalWriteOutcome, ElectError, ElectionSettings, Elector, LeaseBackend,
+            LeaseRecord, MemoryLease, TickOutcome,
         },
-        store::Kinds,
+        store::JournalKinds,
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -1410,7 +1410,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             assert!(self.writes > 0, "the lease gave way");
             self.writes -= 1;
             self.lease.write(expected, record)
@@ -1516,7 +1516,7 @@ mod tests {
         let mut starts = Vec::new();
         for _ in 0..2 {
             let controller = Controller::bind(valid()).await.expect("the listeners bind");
-            starts.push(controller.shared.feed.log.head(Kinds::Watched));
+            starts.push(controller.shared.feed.log.head(JournalKinds::Watched));
         }
         assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
         assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
@@ -1781,7 +1781,7 @@ mod tests {
             &mut self,
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
-        ) -> Result<Written, ElectError> {
+        ) -> Result<ConditionalWriteOutcome, ElectError> {
             if record.holder.is_empty() {
                 thread::sleep(self.slow);
             }
@@ -1942,7 +1942,7 @@ mod tests {
         phase.send_replace(Phase::Serving);
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
         steps.send_replace(ElectionObservation::default());
         told_as(true).await;
@@ -1953,7 +1953,7 @@ mod tests {
         // Taken again, then the stop: the replica left, and the teller ends.
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
         steps.send_replace(ElectionObservation::default());
         told_as(true).await;
@@ -2003,11 +2003,17 @@ mod tests {
         // narrow window.
         phase.send_replace(Phase::Serving);
         let taken = Instant::now();
-        assert!(matches!(elector.tick(taken), Ok(Tick::Acquired { .. })));
+        assert!(matches!(
+            elector.tick(taken),
+            Ok(TickOutcome::Acquired { .. })
+        ));
         let mut renewed = taken;
         for _ in 0..2 {
             renewed += settings.renew_deadline - Duration::from_millis(10);
-            assert!(matches!(elector.tick(renewed), Ok(Tick::Renewed { .. })));
+            assert!(matches!(
+                elector.tick(renewed),
+                Ok(TickOutcome::Renewed { .. })
+            ));
         }
         steps.send_replace(ElectionObservation::default());
         told_as(true).await;
@@ -2046,7 +2052,7 @@ mod tests {
         phase.send_replace(Phase::Serving);
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
         steps.send_replace(ElectionObservation::default());
         told_as(&mut role, true).await;
@@ -2092,7 +2098,7 @@ mod tests {
         phase.send_replace(Phase::Serving);
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
         steps.send_replace(ElectionObservation::default());
         let first = elector.fence().term();
@@ -2102,7 +2108,7 @@ mod tests {
         assert!(elector.release().expect("a release"));
         assert!(matches!(
             elector.tick(Instant::now()),
-            Ok(Tick::Acquired { .. })
+            Ok(TickOutcome::Acquired { .. })
         ));
         let second = elector.fence().term();
         assert_ne!(second, first, "a take is another term");
@@ -2156,14 +2162,14 @@ mod tests {
             let taken = Instant::now();
             assert_eq!(
                 elector.tick(taken).expect("the take"),
-                Tick::Acquired { term: 1 }
+                TickOutcome::Acquired { term: 1 }
             );
             let mut renewed = taken;
             for _ in 0..10 {
                 renewed += settings.renew_deadline - Duration::from_millis(10);
                 assert_eq!(
                     elector.tick(renewed).expect("the renewal"),
-                    Tick::Renewed { term: 1 }
+                    TickOutcome::Renewed { term: 1 }
                 );
             }
             steps.send_replace(ElectionObservation::default());

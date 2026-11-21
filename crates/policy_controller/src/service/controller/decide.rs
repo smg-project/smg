@@ -591,7 +591,7 @@ mod tests {
                 watch_workers::tests::Woken,
                 wire::{Checked, Decided, MAX_FRAME},
             },
-            elector::{Elector, Tick},
+            elector::{Elector, TickOutcome},
             proto::{self, busy::Reason, decide_answer::Answer, identity::Form},
         },
         store::{leases::DISPATCH_TTL, HealthSink, LeasesStore},
@@ -665,7 +665,7 @@ mod tests {
         let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         // The election's report tells the store the term of each take: a
         // lease is minted under the store's own term.
@@ -772,7 +772,7 @@ mod tests {
         /// the term.
         fn takes(&mut self, term: u64) {
             let tick = self.elector.tick(self.now()).expect("the take");
-            assert_eq!(tick, Tick::Acquired { term });
+            assert_eq!(tick, TickOutcome::Acquired { term });
             self.shared.store.set_term(term);
             self.standing.send_replace(ElectionObservation {
                 holder: IDENTITY.to_owned(),

@@ -10,7 +10,7 @@ use axum::{
 use serde_json::{json, Value};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
 use smg_policy_controller::{
-    document::{operator::Turn, PolicySpec},
+    document::{operator::SerialTurn, PolicySpec},
     engine::WireModes,
     store::{
         pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Reachability, Registrant,
@@ -31,7 +31,7 @@ use crate::{
 type Case = Result<(), Box<dyn Error>>;
 
 /// The turn of one kind of call, read from the operators.
-type TurnOf = fn(&super::Operators) -> &Turn;
+type TurnOf = fn(&super::Operators) -> &SerialTurn;
 
 const SPEC: &str = "/policy/spec";
 const VALIDATE: &str = "/policy/spec:validate";

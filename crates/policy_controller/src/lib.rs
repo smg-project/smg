@@ -68,8 +68,8 @@
 //!   [`store::Journal`], the watched kinds kept apart from the load
 //!   rows; the rejoin rule and the bounded read a standby or a watcher of
 //!   the rows is served by, and the store's cut at one position
-//!   ([`store::MemoryStore::cut`]). The stream, the standby and the watch
-//!   are later steps.
+//!   ([`store::MemoryStore::checkpoint`]). The stream, the standby and the
+//!   watch are later steps.
 //!
 //! - Section 9, the WebAssembly plugin host (the `plugins::wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`

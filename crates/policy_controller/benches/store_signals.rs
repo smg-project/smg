@@ -34,8 +34,8 @@ use smg_policy_controller::{
     engine::{Constraints, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
     stages::StageRegistry,
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, SignalSink, SignalWriteOutcome,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, LoadSink, LoadSource, MemoryStore, SignalSink, SignalWriteOutcome, ViewBuffers,
+        ViewQuery, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -139,7 +139,7 @@ fn decide_cells(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_signals/decide");
     for n in SIZES {
         let (store, _, opened) = pool_of(n);
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: ASKER,
             now: opened + Duration::from_secs(1),
             pinned: None,

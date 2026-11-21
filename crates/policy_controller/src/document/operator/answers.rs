@@ -9,9 +9,11 @@ use crate::{
     store::StaleGeneration,
 };
 
-/// What an apply did with a document.
+/// What `DocumentManager::apply` did with a document. The contract's
+/// `ApplyResult` is another thing: it answers the operator's apply call,
+/// which is `EnforceOutcome` here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Applied {
+pub enum ApplyOutcome {
     /// It runs, as this generation.
     Generation(u64),
     /// It is the document of this generation, which stands: nothing was
@@ -241,9 +243,10 @@ pub struct DryRun {
     pub needs: Option<(Vec<NeedsRow>, Vec<NeedsRow>)>,
 }
 
-/// What an enforce of a document answers.
+/// What `DocumentManager::enforce` and `roll_back` answer for a document.
+/// The contract's `ApplyResult` is built from it.
 #[derive(Debug)]
-pub struct Enforced {
+pub struct EnforceOutcome {
     /// The number and the digest that stood when the document was checked.
     pub standing: (u64, Option<Digest>),
     /// The number the document runs under from this apply on, with its
@@ -257,7 +260,7 @@ pub struct Enforced {
 
 /// Why a dry run or write gave no verdict.
 #[derive(Debug)]
-pub enum Unanswered {
+pub enum EnforceRefused {
     /// The caller's guard names another digest than the standing one's.
     /// The refusal names the standing number and digest.
     Guarded(u64, Option<Digest>),
@@ -265,7 +268,7 @@ pub enum Unanswered {
     NotHeld(NotHeld),
 }
 
-impl fmt::Display for Unanswered {
+impl fmt::Display for EnforceRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Guarded(standing, Some(digest)) => write!(
@@ -278,4 +281,4 @@ impl fmt::Display for Unanswered {
     }
 }
 
-impl std::error::Error for Unanswered {}
+impl std::error::Error for EnforceRefused {}

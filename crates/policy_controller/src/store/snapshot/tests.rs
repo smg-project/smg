@@ -10,9 +10,9 @@ use std::{
 };
 
 use super::{
-    run_of, seek, side_of, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto,
-    PoolVetoes, StaleGeneration, StoreSnapshot, VetoEnds, ViewBuffers, Writer, PUBLISH_WINDOW,
-    WALKED_RUNS,
+    run_of, seek, side_of, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto, PoolVetoes,
+    StaleGeneration, StoreSnapshot, VetoEnds, ViewBuffers, ViewFacts, ViewQuery, Writer,
+    PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
     document::{
@@ -197,8 +197,8 @@ fn load(running: u32, age_ms: u32) -> LoadRow {
     }
 }
 
-fn ask(now: Instant) -> Ask {
-    Ask {
+fn ask(now: Instant) -> ViewQuery {
+    ViewQuery {
         gateway: ASKER,
         now,
         pinned: None,
@@ -208,7 +208,7 @@ fn ask(now: Instant) -> Ask {
 }
 
 /// One decision's view of the model's single pool.
-fn view(store: &MemoryStore, ask: &Ask) -> (Vec<Candidate>, Vec<AffinityFacts>, Built) {
+fn view(store: &MemoryStore, ask: &ViewQuery) -> (Vec<Candidate>, Vec<AffinityFacts>, ViewFacts) {
     let mut out = ViewBuffers::default();
     let built = store
         .build_view(MODEL, Role::Single, ask, &mut out)
@@ -221,7 +221,7 @@ fn view(store: &MemoryStore, ask: &Ask) -> (Vec<Candidate>, Vec<AffinityFacts>, 
 /// rows [`StoreSnapshot::view`] hands, with what it hands beside them written
 /// in, are the rows [`StoreSnapshot::build`] writes, field for field. Every
 /// case that builds its view through [`view`] holds the lent one to it here.
-fn lent_agrees(store: &MemoryStore, ask: &Ask) {
+fn lent_agrees(store: &MemoryStore, ask: &ViewQuery) {
     let (mut built, mut lent) = (ViewBuffers::default(), ViewBuffers::default());
     store.with_snapshot(|world| {
         let read = world
@@ -279,7 +279,7 @@ fn running(store: &MemoryStore, now: Instant) -> Option<u32> {
 /// build writes a veto's row the stalled bit, and the breaker bit beside
 /// it while its hold stands.
 fn stalled(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
-    let asked = Ask {
+    let asked = ViewQuery {
         gateway,
         ..ask(now)
     };
@@ -294,7 +294,7 @@ fn stalled(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerI
 /// The workers of the pool `gateway` doubts at `now`, by id: the rows a
 /// build writes the stalled bit alone on.
 fn doubted(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
-    let asked = Ask {
+    let asked = ViewQuery {
         gateway,
         ..ask(now)
     };
@@ -310,7 +310,7 @@ fn doubted(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerI
 /// the rows a build writes the breaker bit on, each beside the stalled
 /// bit.
 fn held(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
-    let asked = Ask {
+    let asked = ViewQuery {
         gateway,
         ..ask(now)
     };
@@ -399,7 +399,7 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
             .build_view(
                 MODEL,
                 Role::Single,
-                &Ask {
+                &ViewQuery {
                     gateway: GatewayId(gateway),
                     affinity: true,
                     ..ask(now)
@@ -432,7 +432,7 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
     for pinned in [open, ours, last] {
         let (rows, _, _) = view(
             &store,
-            &Ask {
+            &ViewQuery {
                 pinned: Some(pinned),
                 ..ask(now)
             },
@@ -445,7 +445,7 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
     // A pin on a row this gateway does not reach marks no row.
     let (rows, _, _) = view(
         &store,
-        &Ask {
+        &ViewQuery {
             pinned: Some(theirs),
             ..ask(now)
         },
@@ -480,7 +480,7 @@ fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
     let ours = stating("unix:///c", 9, Reachability::Gateway(GatewayId(1)));
     let last = stating("http://d:8000", 0, Reachability::Any);
     let stated_to = |gateway: u64| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(gateway),
             ..ask(now)
         };
@@ -512,7 +512,7 @@ fn a_build_names_the_asking_gateways_list_where_the_pool_holds_a_host_local_row(
     let now = Instant::now();
     let open = member(&store, "http://a:8000");
     let built = |gateway: u64| {
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway: GatewayId(gateway),
             ..ask(now)
         };
@@ -547,7 +547,7 @@ fn a_build_names_the_asking_gateways_list_where_its_veto_masks_a_row() {
     let now = Instant::now();
     let vetoed = member(&store, "http://a:8000");
     let reach = |gateway: u64, at: Instant| {
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway: GatewayId(gateway),
             ..ask(at)
         };
@@ -599,7 +599,7 @@ fn two_gateways_lists_of_one_size_each_turn_their_own_rotation() {
     let mut drawn = [Vec::new(), Vec::new()];
     // Their asks alternate through one engine, as a controller's do.
     for turn in 0..32u64 {
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway: GatewayId(1 + turn % 2),
             ..ask(now)
         };
@@ -663,7 +663,7 @@ fn two_gateways_in_strict_turn_leave_each_others_vetoed_rows_their_share() {
     let (mut out, mut scratch) = (ViewBuffers::default(), Scratch::new());
     let mut picked = [0u32; 16];
     for turn in 0..224u64 {
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway: GatewayId(1 + turn % 2),
             ..ask(now)
         };
@@ -1669,7 +1669,7 @@ fn the_column_is_filled_for_a_profile_that_declares_it_and_for_no_other() {
     assert!(needs("cache_aware").affinity);
     let (rows, column, _) = view(
         &store,
-        &Ask {
+        &ViewQuery {
             affinity: needs("cache_aware").affinity,
             ..ask(now)
         },
@@ -1693,7 +1693,7 @@ fn the_column_is_filled_for_a_profile_that_declares_it_and_for_no_other() {
     assert!(!needs("round_robin").affinity);
     let (rows, column, _) = view(
         &store,
-        &Ask {
+        &ViewQuery {
             affinity: needs("round_robin").affinity,
             ..ask(now)
         },
@@ -1879,7 +1879,7 @@ fn a_pool_of_many_members_is_sorted_by_worker_id_and_each_is_found_by_it() {
     for &pinned in &ids {
         let (rows, _, _) = view(
             &store,
-            &Ask {
+            &ViewQuery {
                 pinned: Some(pinned),
                 ..ask(now)
             },
@@ -2054,7 +2054,7 @@ fn the_pair_door_builds_both_sides_of_one_publication() {
     // view: not the side that has members, not the last pair's; neither
     // its rows, nor its table, nor, under an ask that declares it, its
     // column.
-    let with_column = Ask {
+    let with_column = ViewQuery {
         affinity: true,
         ..ask(t0)
     };
@@ -2915,7 +2915,11 @@ fn the_pair_door_builds_no_decode_side_beside_an_empty_prefill_pool() {
 }
 
 /// One decision's view of one side of the model's pair.
-fn side(store: &MemoryStore, role: Role, ask: &Ask) -> (Vec<Candidate>, Vec<AffinityFacts>, Built) {
+fn side(
+    store: &MemoryStore,
+    role: Role,
+    ask: &ViewQuery,
+) -> (Vec<Candidate>, Vec<AffinityFacts>, ViewFacts) {
     let mut out = ViewBuffers::default();
     let built = store
         .build_view(MODEL, role, ask, &mut out)
@@ -3003,7 +3007,7 @@ enum Pairs {
 /// again, or nobody.
 fn partners_drawn(
     store: &MemoryStore,
-    ask: &Ask,
+    ask: &ViewQuery,
     prefill: WorkerId,
     pairs: Pairs,
 ) -> Vec<WorkerId> {
@@ -3137,7 +3141,7 @@ fn a_worker_has_one_row_of_one_class_and_the_world_holds_which_classes_pair() {
     // prefills and is still one row, with one position and one column entry.
     let (prefills, _, built) = side(&store, Role::Prefill, &ask(now));
     assert_eq!(built.pool_size, 2);
-    let with_column = Ask {
+    let with_column = ViewQuery {
         affinity: true,
         ..ask(now)
     };
@@ -3212,7 +3216,7 @@ fn a_pool_less_another_gateways_host_local_rows_pairs_by_the_same_table() {
             .collect()
     };
     for (gateway, own) in [(ASKER, &of_asker), (other, &of_other)] {
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway,
             ..ask(now)
         };
@@ -4887,7 +4891,7 @@ fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
     assert_eq!(next, (2, Some(2)));
 }
 
-/// How many rows of a pool hold no report ([`Built::unreported`]), kept by
+/// How many rows of a pool hold no report ([`ViewFacts::unreported`]), kept by
 /// the writes and shown where the rows are published: a member before its
 /// first report and a member whose report was dropped each count, and a
 /// report without a rate does not. The build and the lent view read one
@@ -5039,7 +5043,7 @@ fn a_pool_every_gateway_reaches_whole_is_lent_where_it_stands_and_copied_when_as
     let first = member(&store, "http://a:8000");
     let second = member(&store, "http://b:8000");
     store.gateway_veto(ASKER, second, Some(now + Duration::from_secs(1)));
-    let asked = Ask {
+    let asked = ViewQuery {
         pinned: Some(first),
         ..ask(now)
     };
@@ -5115,7 +5119,7 @@ fn a_pin_that_names_no_member_of_the_pool_pins_no_lent_row() {
     );
     let mut out = ViewBuffers::default();
     for outsider in others {
-        let asked = Ask {
+        let asked = ViewQuery {
             pinned: Some(outsider),
             ..ask(now)
         };
@@ -5148,7 +5152,7 @@ fn a_pool_that_holds_a_host_local_row_is_copied_for_every_gateway() {
     );
     let mut out = ViewBuffers::default();
     for (gateway, rows) in [(ASKER, 1), (GatewayId(2), 2)] {
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway,
             ..ask(now)
         };
@@ -5184,7 +5188,7 @@ fn a_lent_view_hands_its_own_gateways_standing_vetoes_in_the_rows_order() {
     store.gateway_veto(GatewayId(2), ids[0], Some(end));
     let masked = |gateway: GatewayId, now: Instant| {
         let mut out = ViewBuffers::default();
-        let asked = Ask {
+        let asked = ViewQuery {
             gateway,
             ..ask(now)
         };

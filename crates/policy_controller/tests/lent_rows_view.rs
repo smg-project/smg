@@ -25,8 +25,8 @@ use smg_policy_controller::{
     engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
     stages::StageRegistry,
     store::{
-        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
-        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, ViewQuery,
+        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
 };
 
@@ -205,7 +205,7 @@ fn lent_agrees(
 ) {
     let (store, ids, opened) = store_of(n, refused, vetoed, aged);
     let (written, lent) = (make(), make());
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: ASKER,
         now: opened + Duration::from_secs(1),
         pinned: pin.then(|| ids[n / 2]),
@@ -329,7 +329,7 @@ fn generation(number: u64) -> AppliedSpec {
 #[test]
 fn a_decision_that_straddles_a_write_frees_nothing() {
     let (store, ids, opened) = store_of(64, false, true, false);
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: ASKER,
         now: opened + Duration::from_secs(1),
         pinned: None,
@@ -471,7 +471,7 @@ fn a_period_told_before_any_window_shows_its_judgment_and_frees_nothing() {
     assert_eq!(named, (cool, hot));
     // The build those registrations left owed, asked: no window opens.
     store.publish_now();
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: ASKER,
         now: late,
         pinned: None,

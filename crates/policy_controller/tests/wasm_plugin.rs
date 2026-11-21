@@ -28,13 +28,13 @@ use smg_policy_controller::{
     engine::{
         Binding, Candidate, Constraints, Decision, DecisionSlot, Engine, Health, Identity,
         PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch, ShedReason,
-        Target, Weighted, WorkerId,
+        Target, WeightedScorer, WorkerId,
     },
     plugins::{
         shared::{BreakerSpec, Failure, OpenDecisions, Reveal},
         wasm::{
-            Abi, Bound, LoadError, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer,
-            World,
+            Abi, LoadError, Plugin, PluginBinding, PluginSpec, Runtime, WasmFilter, WasmPicker,
+            WasmScorer, World,
         },
     },
     policies::power_of_two::PowerOfTwo,
@@ -284,7 +284,7 @@ fn plugin_profile(
 
 /// A profile whose three stages share `bound`, each with the given fallback.
 fn bound_profile(
-    bound: Arc<Bound>,
+    bound: Arc<PluginBinding>,
     filter_fallback: Option<Box<dyn smg_policy_controller::engine::Filter>>,
     scorer_fallback: Option<Box<dyn smg_policy_controller::engine::Scorer>>,
     picker_fallback: Option<Box<dyn smg_policy_controller::engine::Picker>>,
@@ -295,7 +295,7 @@ fn bound_profile(
             Arc::clone(&bound),
             filter_fallback,
         ))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(Arc::clone(&bound), scorer_fallback)),
             weight: 1.0,
         }],
@@ -631,7 +631,7 @@ fn band_engine(
     single_engine(Profile {
         name: "band".into(),
         filters: vec![],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(plugin.bind(), fallback)),
             weight: 1.0,
         }],
@@ -838,7 +838,7 @@ fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
         let engine = single_engine(Profile {
             name: "two-draw".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
                 weight: 1.0,
             }],
@@ -1756,7 +1756,7 @@ fn a_profile_of_built_ins_holds_no_scope_and_a_plugin_profile_does() {
     let native = Profile {
         name: "native".into(),
         filters: vec![Box::new(Healthy)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -2450,7 +2450,7 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
         profile
             .filters
             .push(Box::new(SaysWhenAsked(Arc::clone(&asked))));
-        profile.scorers.push(Weighted {
+        profile.scorers.push(WeightedScorer {
             scorer: Box::new(ReadsTheClockWhenAsked(Arc::clone(&scored))),
             weight: 1.0,
         });
@@ -2699,7 +2699,7 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_
     let profile = Profile {
         name: "two".into(),
         filters: vec![],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
             weight: 1.0,
         }],
@@ -2903,7 +2903,7 @@ fn runtimes_built_over_the_same_open_decisions_draw_one_remainder_and_apart_draw
         let engine = single_engine(Profile {
             name: "two".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
                 weight: 1.0,
             }],
@@ -3196,7 +3196,7 @@ fn a_scope_is_closed_only_after_its_open_returned() {
     let engine = single_engine(Profile {
         name: "host-scopes".into(),
         filters,
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -3291,7 +3291,7 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
     let engine = single_engine(Profile {
         name: "host-scopes".into(),
         filters,
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -3346,7 +3346,7 @@ fn host_profile(filters: Vec<Box<dyn smg_policy_controller::engine::Filter>>) ->
     Profile {
         name: "host-scopes".into(),
         filters,
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -4026,7 +4026,7 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
         let engine = single_engine(Profile {
             name: "one-stage".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
                 weight: 1.0,
             }],
@@ -4114,7 +4114,7 @@ impl LeftLent {
         let engine = single_engine(Profile {
             name: "one-stage".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
                 weight: 1.0,
             }],
@@ -5397,7 +5397,7 @@ fn a_scorer_held_short_of_late_through_half_a_window_before_a_spinner_stays_shut
         guest::record_guest(),
         mode::SPIN_IN_SCORE,
     );
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -6163,7 +6163,7 @@ fn a_spinner_behind_an_honest_scorer_opens_its_breaker_at_the_window_in_either_o
             guest::record_guest(),
             mode::SPIN_IN_SCORE,
         );
-        let scorer = |plugin: &Arc<Plugin>| Weighted {
+        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
             scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
             weight: 1.0,
         };
@@ -6270,7 +6270,7 @@ fn three_honest_quarters_and_a_spinner_charge_nobody_in_a_try(made: u32) -> bool
         &mut Scratch::new(),
     );
     let burn = (burners[0].stats().fuel_used - before) / 3;
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -6379,11 +6379,11 @@ fn an_init_the_remainder_clamps_is_the_decisions_budget_spent_and_the_close_rebu
         name: "clamped-init".into(),
         filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
         scorers: vec![
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(bound.clone(), None)),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
                 weight: 1.0,
             },
@@ -6493,11 +6493,11 @@ fn decide_on_a_cold_slot(
         name: "cold-init".into(),
         filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
         scorers: vec![
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(bound.clone(), None)),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
                 weight: 1.0,
             },
@@ -7705,11 +7705,11 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged_in_a_
     let engine = single_engine(Profile {
         name: "clamped".into(),
         filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: std::iter::once(Weighted {
+        scorers: std::iter::once(WeightedScorer {
             scorer: Box::new(WasmScorer::new(bound.clone(), None)),
             weight: 1.0,
         })
-        .chain(neighbours.iter().map(|neighbour| Weighted {
+        .chain(neighbours.iter().map(|neighbour| WeightedScorer {
             scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
             weight: 1.0,
         }))
@@ -7791,7 +7791,7 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     let spinner = loaded(&runtime, slow_calibration);
     // What one `init` of the spinner costs: the load made one instance.
     let init_fuel = spinner.stats().fuel_used;
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -7888,7 +7888,7 @@ fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_
             guest::record_guest(),
             mode::SPIN_IN_CONSTRUCTOR,
         );
-        let scorer = |plugin: &Arc<Plugin>| Weighted {
+        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
             scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
             weight: 1.0,
         };
@@ -8015,7 +8015,7 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
     hog.fuel_per_micro = SLOW_CALIBRATION;
     hog.budget_micros = SLOW_FRAME_MICROS;
     let hog = loaded(&runtime, hog);
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -8075,11 +8075,11 @@ fn a_third_stage_spinner_behind_its_own_cheap_stages_opens_at_the_window() {
             mode::SPIN_IN_PICK,
         );
         let bound = spinner.bind();
-        let own = Weighted {
+        let own = WeightedScorer {
             scorer: Box::new(WasmScorer::new(bound.clone(), None)),
             weight: 1.0,
         };
-        let other = Weighted {
+        let other = WeightedScorer {
             scorer: Box::new(WasmScorer::new(honest.bind(), None)),
             weight: 1.0,
         };
@@ -8249,7 +8249,7 @@ fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
     reading.needs.affinity = true;
     let plugin = loaded(&runtime, reading);
     let scorers = || {
-        vec![Weighted {
+        vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }]
@@ -8943,7 +8943,7 @@ enum Inside {
 
 thread_local! {
     /// The name a case's thread holds, where a scope of the host can end it.
-    static HELD_NAME: std::cell::RefCell<Option<smg_policy_controller::engine::Acting>> =
+    static HELD_NAME: std::cell::RefCell<Option<smg_policy_controller::engine::DecisionSlotGuard>> =
         const { std::cell::RefCell::new(None) };
 }
 

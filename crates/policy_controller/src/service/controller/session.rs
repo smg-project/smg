@@ -650,7 +650,7 @@ mod tests {
                 service::{Service, Shared},
                 PROTOCOL_VERSION,
             },
-            elector::{ElectionSettings, Elector, Tick},
+            elector::{ElectionSettings, Elector, TickOutcome},
             proto::{
                 self, controller_frame, gateway_frame::Frame,
                 policy_controller_client::PolicyControllerClient,
@@ -740,7 +740,7 @@ mod tests {
             if self.elector.is_holder() || self.elector.observed().is_some() {
                 let tick = self.elector.tick(now).expect("a step");
                 assert!(
-                    tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
+                    tick == TickOutcome::Acquired { term } || tick == TickOutcome::Renewed { term },
                     "{tick:?}"
                 );
             } else {

@@ -1040,7 +1040,7 @@ mod tests {
     use super::{layout::*, *};
     use crate::{
         document::spec::MAX_BLOCK_HASHES,
-        engine::view::{Header, MediaCounts, NamedAffinity, NamedHolder, WorkerId},
+        engine::view::{AffinityHolder, AffinityRows, Header, MediaCounts, WorkerId},
         plugins::shared::config::HeaderSet,
     };
 
@@ -1183,13 +1183,13 @@ mod tests {
     #[test]
     fn both_fills_give_a_named_holder_its_depth_and_every_other_row_nothing() {
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
-                holders: &[NamedHolder {
+            named: Some(AffinityRows {
+                holders: &[AffinityHolder {
                     row: 1,
                     overlap_blocks: 17,
                     predicted_blocks: 0,
                 }],
-                ..NamedAffinity::default()
+                ..AffinityRows::default()
             }),
             ..RequestFacts::default()
         };

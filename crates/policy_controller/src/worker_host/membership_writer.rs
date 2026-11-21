@@ -12,7 +12,7 @@ use super::{found::paired, kv_feed::asks_events, RowRevision};
 use crate::{
     engine::view::WorkerId,
     store::{
-        membership::{self, Laid, NotRegistrant, Past},
+        membership::{self, FactPastBound, NotRegistrant, WorkerFactsChange},
         pairing::PairingDescriptor,
         HealthSink, MembershipChange, MemoryStore, Registrant, WorkerFacts, WorkerPatch, WorkerRow,
         WorkerStatus, WorkersStore,
@@ -37,18 +37,18 @@ impl MembershipWriteOutcome {
 }
 
 /// A write the door refused. Nothing was written, with one exception: a
-/// registration's rows refused as [`Refused::NotLeading`] behind their first
-/// write keep the rows written before the lead was lost.
+/// registration's rows refused as [`MembershipWriteRefused::NotLeading`] behind
+/// their first write keep the rows written before the lead was lost.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Refused {
+pub enum MembershipWriteRefused {
     /// Another registrant's row, named by its registrant.
     NotRegistrant(String),
     /// A fact the door does not take, or the row past its size. A fact is
     /// refused past its bound, under a key that is not the call's URL, or,
     /// at the controller's door, when its log does not carry it to a standby
     /// or when it states a host-local wire and names no gateway.
-    Past(Past),
+    Past(FactPastBound),
     /// No row stands under the URL.
     Absent,
     /// The host does not lead now, with its reason.
@@ -69,7 +69,7 @@ pub enum Refused {
     NotLabelsAlone,
 }
 
-impl Refused {
+impl MembershipWriteRefused {
     pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
     pub(crate) const NOT_LABELS_ALONE: &str =
         "a refresh writes a row's labels and the pairing they derive, and states no other fact";
@@ -94,8 +94,8 @@ pub enum Remover<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precondition {
     /// Nothing: an add. A row standing under a URL it states, or one the
-    /// registration would retire, refuses it whole ([`Refused::Stands`]),
-    /// whoever made the row.
+    /// registration would retire, refuses it whole
+    /// ([`MembershipWriteRefused::Stands`]), whoever made the row.
     ///
     /// One standing is the add's own. A lead lost between two rows leaves
     /// the rows written before it, and the same add tried again lays the
@@ -106,9 +106,10 @@ pub enum Precondition {
     /// differs or is another maker's.
     Absent,
     /// The row its asker saw, at the revision it saw: a replacement by id,
-    /// which states that one row. No row refuses it ([`Refused::Absent`]),
-    /// and so does another row or revision ([`Refused::Moved`]). A draining
-    /// row refuses it too ([`Refused::Draining`]): its removal wins.
+    /// which states that one row. No row refuses it
+    /// ([`MembershipWriteRefused::Absent`]), and so does another row or
+    /// revision ([`MembershipWriteRefused::Moved`]). A draining row refuses it
+    /// too ([`MembershipWriteRefused::Draining`]): its removal wins.
     AtRevision(RowRevision),
     /// Anything: an upsert.
     Any,
@@ -167,7 +168,7 @@ pub trait MembershipWriter: Send + Sync + 'static {
         expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<MembershipWriteOutcome, Refused>;
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused>;
 
     /// Lays the rows one registration states of one engine, each with the
     /// worker its registration built, over what it expects to stand. A
@@ -188,9 +189,9 @@ pub trait MembershipWriter: Send + Sync + 'static {
     /// the first write, so a refusal of a row or of the group writes
     /// nothing. At a door whose lead can move, the term is asked ahead of
     /// each row's write and each removal: a lead lost between two of them
-    /// refuses there ([`Refused::NotLeading`]), and what was written before
-    /// it stands. An upsert lays the rest, and so does the same add tried
-    /// again ([`Precondition::Absent`]). A guarded write
+    /// refuses there ([`MembershipWriteRefused::NotLeading`]), and what was
+    /// written before it stands. An upsert lays the rest, and so does the same
+    /// add tried again ([`Precondition::Absent`]). A guarded write
     /// ([`Precondition::AtRevision`]) states the one row its asker saw and
     /// changes it where it stands, by that row's own rule.
     ///
@@ -213,7 +214,7 @@ pub trait MembershipWriter: Send + Sync + 'static {
         expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused>;
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>;
 
     /// Lay the registration of one built worker:
     /// [`found_rows`](Self::found_rows) with one row.
@@ -223,9 +224,9 @@ pub trait MembershipWriter: Send + Sync + 'static {
         expect: Precondition,
         built: &Arc<dyn Worker>,
         over: Option<Over<'_>>,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         let wrote = self.found_rows(maker, expect, slice::from_ref(built), over)?;
-        wrote.first().copied().ok_or(Refused::Moved)
+        wrote.first().copied().ok_or(MembershipWriteRefused::Moved)
     }
 
     /// Mark the row the asker saw as draining. Its revision stays the same.
@@ -234,7 +235,7 @@ pub trait MembershipWriter: Send + Sync + 'static {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused>;
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused>;
 
     /// Remove the row the asker saw under the registered URL.
     fn gone(
@@ -242,7 +243,7 @@ pub trait MembershipWriter: Send + Sync + 'static {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused>;
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused>;
 
     /// Write the labels of the worker the health loop's refresh rebuilt,
     /// and the pairing descriptor they derive, over the row the asker saw
@@ -252,13 +253,14 @@ pub trait MembershipWriter: Send + Sync + 'static {
     ///
     /// The facts `built` states over the standing row ([`facts`]) may
     /// differ from the row's in the labels and the descriptor alone. Any
-    /// other difference is refused ([`Refused::NotLabelsAlone`]), so a
-    /// refresh starts no life. No row, another row or revision, and a
-    /// draining row refuse it too. The stated facts' room is tested as a
-    /// registration's is: the controller's door, whose log carries no
-    /// descriptor, refuses a refresh that states one as it refuses such a
-    /// registration. Equal labels and an equal descriptor write nothing
-    /// and answer [`MembershipWriteOutcome::Unmoved`].
+    /// other difference is refused
+    /// ([`MembershipWriteRefused::NotLabelsAlone`]), so a refresh starts no
+    /// life. No row, another row or revision, and a draining row refuse it too.
+    /// The stated facts' room is tested as a registration's is: the
+    /// controller's door, whose log carries no descriptor, refuses a refresh
+    /// that states one as it refuses such a registration. Equal labels and an
+    /// equal descriptor write nothing and answer
+    /// [`MembershipWriteOutcome::Unmoved`].
     ///
     /// Each door says what it does with the object, as for
     /// [`Self::found_built`]. A door whose host keeps built objects hands
@@ -280,7 +282,7 @@ pub trait MembershipWriter: Send + Sync + 'static {
         seen: RowRevision,
         built: &Arc<dyn Worker>,
         over: &Arc<dyn Worker>,
-    ) -> Result<MembershipWriteOutcome, Refused>;
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused>;
 }
 
 /// What a door owns of a write, beside the rules every door shares.
@@ -289,17 +291,17 @@ pub(crate) trait Turn {
 
     /// Check the term ahead of a write. A registration asks before each
     /// row it writes and each row it removes.
-    fn check_term(&self) -> Result<(), Refused> {
+    fn check_term(&self) -> Result<(), MembershipWriteRefused> {
         Ok(())
     }
 
     /// The number of the life a registration makes now, or a refusal where
     /// the turn may make none: under a term its log no longer leads.
-    fn life(&self) -> Result<u64, Refused>;
+    fn life(&self) -> Result<u64, MembershipWriteRefused>;
 
     /// The door's own rules of the facts it is about to write, behind the
     /// store's measure.
-    fn room(&self, facts: &WorkerFacts, maker: &Registrant) -> Result<(), Refused>;
+    fn room(&self, facts: &WorkerFacts, maker: &Registrant) -> Result<(), MembershipWriteRefused>;
 
     /// Hear a row as its write left it, ahead of the connect signal of a
     /// row whose checks are off.
@@ -309,22 +311,26 @@ pub(crate) trait Turn {
     fn told(&self, _: MembershipWriteOutcome) {}
 }
 
-fn made_by(row: &WorkerRow, maker: &Registrant) -> Result<(), Refused> {
+fn made_by(row: &WorkerRow, maker: &Registrant) -> Result<(), MembershipWriteRefused> {
     row.made_by(maker)
-        .map_err(|not| Refused::NotRegistrant(not.to_string()))
+        .map_err(|not| MembershipWriteRefused::NotRegistrant(not.to_string()))
 }
 
 /// The row an asker saw, where it still stands under the URL at the
 /// revision the asker saw.
-fn seen_row(store: &MemoryStore, url: &str, seen: RowRevision) -> Result<WorkerRow, Refused> {
-    let row = store.by_key(url).ok_or(Refused::Absent)?;
+fn seen_row(
+    store: &MemoryStore,
+    url: &str,
+    seen: RowRevision,
+) -> Result<WorkerRow, MembershipWriteRefused> {
+    let row = store.by_key(url).ok_or(MembershipWriteRefused::Absent)?;
     if (row.id, row.revision) != (seen.row, seen.revision) {
-        return Err(Refused::Moved);
+        return Err(MembershipWriteRefused::Moved);
     }
     Ok(row)
 }
 
-const RANKS: Refused = Refused::Past(Past {
+const RANKS: MembershipWriteRefused = MembershipWriteRefused::Past(FactPastBound {
     fact: "dp_rank",
     why: "a registration states every rank of one engine under its own URL",
 });
@@ -361,7 +367,7 @@ pub(crate) fn stating<T>(
 
 /// What a stated row leaves to write: its facts, and what laying them makes
 /// of the row that stands under its URL.
-pub(crate) type Ready = (WorkerFacts, Option<(WorkerId, Laid)>);
+pub(crate) type Ready = (WorkerFacts, Option<(WorkerId, WorkerFactsChange)>);
 
 /// Whether a registration states its engine as one row: the row stands
 /// under the engine's own URL and states no rank. Such a row is the engine
@@ -378,7 +384,7 @@ fn standing_under(
     store: &MemoryStore,
     expect: Precondition,
     url: &str,
-) -> Result<Option<WorkerRow>, Refused> {
+) -> Result<Option<WorkerRow>, MembershipWriteRefused> {
     Ok(match expect {
         Precondition::AtRevision(seen) => Some(seen_row(store, url, seen)?),
         Precondition::Absent | Precondition::Any => store.by_key(url),
@@ -395,7 +401,7 @@ fn ready_row(
     expect: Precondition,
     Stated { url, state }: &Stated<'_>,
     standing: Option<WorkerRow>,
-) -> Result<Ready, Refused> {
+) -> Result<Ready, MembershipWriteRefused> {
     let store = turn.store();
     if let Some(row) = &standing {
         // An add of several rows asks no maker here. What it meets is
@@ -408,12 +414,12 @@ fn ready_row(
         // URL's next life and its removal would leave the worker: the
         // removal wins over a replacement.
         if matches!(expect, Precondition::AtRevision(_)) && row.status == WorkerStatus::Draining {
-            return Err(Refused::Draining);
+            return Err(MembershipWriteRefused::Draining);
         }
     }
     let mut facts = state(standing.as_ref().map(|row| &row.facts));
     if facts.key != *url {
-        return Err(Refused::Past(Past {
+        return Err(MembershipWriteRefused::Past(FactPastBound {
             fact: "key",
             why: "the facts name the URL of the call",
         }));
@@ -425,9 +431,9 @@ fn ready_row(
     if let Some(row) = &standing {
         facts.incarnation = row.facts.incarnation;
     }
-    facts.bounded(maker).map_err(Refused::Past)?;
+    facts.bounded(maker).map_err(MembershipWriteRefused::Past)?;
     turn.room(&facts, maker)?;
-    let laid = standing.map(|row| (row.id, row.laid(&facts)));
+    let laid = standing.map(|row| (row.id, row.compare_new_facts(&facts)));
     Ok((facts, laid))
 }
 
@@ -441,7 +447,11 @@ fn ready_row(
 ///
 /// The rule reads what stands and nothing of a first attempt, so it holds
 /// at the next leader's door too.
-fn same_add(store: &MemoryStore, maker: &Registrant, ready: &[Ready]) -> Result<(), Refused> {
+fn same_add(
+    store: &MemoryStore,
+    maker: &Registrant,
+    ready: &[Ready],
+) -> Result<(), MembershipWriteRefused> {
     let mut writes = false;
     for (_, laid) in ready {
         let Some((id, laid)) = laid else {
@@ -449,14 +459,14 @@ fn same_add(store: &MemoryStore, maker: &Registrant, ready: &[Ready]) -> Result<
             continue;
         };
         let own = store.get(*id).is_some_and(|row| row.made_by(maker).is_ok());
-        if !own || *laid != Laid::Unmoved {
-            return Err(Refused::Stands);
+        if !own || *laid != WorkerFactsChange::Unmoved {
+            return Err(MembershipWriteRefused::Stands);
         }
     }
     if writes {
         Ok(())
     } else {
-        Err(Refused::Stands)
+        Err(MembershipWriteRefused::Stands)
     }
 }
 
@@ -470,10 +480,10 @@ pub(crate) fn lay_one(
     expect: Precondition,
     url: &str,
     state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-) -> Result<MembershipWriteOutcome, Refused> {
+) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     let standing = standing_under(turn.store(), expect, url)?;
     if expect == Precondition::Absent && standing.is_some() {
-        return Err(Refused::Stands);
+        return Err(MembershipWriteRefused::Stands);
     }
     let (facts, laid) = ready_row(turn, maker, expect, &Stated { url, state }, standing)?;
     turn.check_term()?;
@@ -488,9 +498,9 @@ pub(crate) fn lay(
     maker: &Registrant,
     expect: Precondition,
     rows: &[Stated<'_>],
-) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
     if rows.is_empty() {
-        return Err(Refused::Past(Past {
+        return Err(MembershipWriteRefused::Past(FactPastBound {
             fact: "rows",
             why: "a registration states at least one row",
         }));
@@ -500,7 +510,7 @@ pub(crate) fn lay(
     // registration's.
     if matches!(expect, Precondition::AtRevision(_)) {
         let [row] = rows else {
-            return Err(Refused::Past(Past {
+            return Err(MembershipWriteRefused::Past(FactPastBound {
                 fact: "rows",
                 why: "a replacement states the one row its asker saw",
             }));
@@ -515,7 +525,7 @@ pub(crate) fn lay(
     // An add with no row left to write is refused before a fact is stated,
     // whoever made the rows that stand.
     if expect == Precondition::Absent && standing.iter().all(Option::is_some) {
-        return Err(Refused::Stands);
+        return Err(MembershipWriteRefused::Stands);
     }
     let mut ready = Vec::with_capacity(rows.len());
     for (row, standing) in rows.iter().zip(standing) {
@@ -535,10 +545,10 @@ pub(crate) fn lay_ready(
     maker: &Registrant,
     adds: bool,
     ready: Vec<Ready>,
-) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
     let store = turn.store();
     let Some((first, _)) = ready.first() else {
-        return Err(Refused::Past(Past {
+        return Err(MembershipWriteRefused::Past(FactPastBound {
             fact: "rows",
             why: "a registration states at least one row",
         }));
@@ -584,7 +594,7 @@ pub(crate) fn lay_ready(
     for row in &left {
         // An add retires no row: the engine stands in another form.
         if adds {
-            return Err(Refused::Stands);
+            return Err(MembershipWriteRefused::Stands);
         }
         made_by(row, maker)?;
     }
@@ -613,16 +623,16 @@ fn write_row(
     turn: &impl Turn,
     maker: &Registrant,
     mut facts: WorkerFacts,
-    laid: Option<(WorkerId, Laid)>,
-) -> Result<MembershipWriteOutcome, Refused> {
+    laid: Option<(WorkerId, WorkerFactsChange)>,
+) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     match laid {
-        None | Some((_, Laid::Another)) => facts.incarnation = turn.life()?,
-        Some((id, Laid::Unmoved)) => {
+        None | Some((_, WorkerFactsChange::Another)) => facts.incarnation = turn.life()?,
+        Some((id, WorkerFactsChange::Unmoved)) => {
             let wrote = MembershipWriteOutcome::Unmoved(id);
             turn.told(wrote);
             return Ok(wrote);
         }
-        Some((_, Laid::InPlace)) => {}
+        Some((_, WorkerFactsChange::InPlace)) => {}
     }
     let store = turn.store();
     let probes = facts.health.probes;
@@ -634,7 +644,7 @@ fn write_row(
         }
         MembershipChange::Replaced { old, new } => MembershipWriteOutcome::Another { old, new },
         MembershipChange::Removed { .. } | MembershipChange::StatusChanged { .. } => {
-            return Err(Refused::Moved);
+            return Err(MembershipWriteRefused::Moved);
         }
     };
     // The row as its write left it: a connect signal moves it next.
@@ -651,10 +661,10 @@ fn write_row(
 fn changed(
     change: Option<MembershipChange>,
     wrote: fn(WorkerId) -> MembershipWriteOutcome,
-) -> Result<MembershipWriteOutcome, Refused> {
+) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     change
         .map(|change| wrote(change.id()))
-        .ok_or(Refused::Moved)
+        .ok_or(MembershipWriteRefused::Moved)
 }
 
 fn removal_row(
@@ -662,14 +672,14 @@ fn removal_row(
     by: Remover<'_>,
     url: &str,
     seen: RowRevision,
-) -> Result<WorkerRow, Refused> {
+) -> Result<WorkerRow, MembershipWriteRefused> {
     let row = seen_row(store, url, seen)?;
     match by {
         Remover::Registrant(maker) => made_by(&row, maker)?,
         Remover::Provider(name) => match &row.maker {
             Registrant::Provider(provider) if provider.provider() == name => {}
             Registrant::Provider(provider) => {
-                return Err(Refused::NotRegistrant(
+                return Err(MembershipWriteRefused::NotRegistrant(
                     NotRegistrant::Provider {
                         provider: provider.provider(),
                     }
@@ -677,7 +687,9 @@ fn removal_row(
                 ));
             }
             Registrant::Control => {
-                return Err(Refused::NotRegistrant(NotRegistrant::Control.to_string()))
+                return Err(MembershipWriteRefused::NotRegistrant(
+                    NotRegistrant::Control.to_string(),
+                ))
             }
         },
         Remover::Health(scope) => {
@@ -689,7 +701,7 @@ fn removal_row(
                 UnhealthyRemovalScope::AllLocal => true,
             };
             if !allowed {
-                return Err(Refused::OutOfScope);
+                return Err(MembershipWriteRefused::OutOfScope);
             }
         }
     }
@@ -702,7 +714,7 @@ pub(crate) fn drain(
     by: Remover<'_>,
     url: &str,
     seen: RowRevision,
-) -> Result<MembershipWriteOutcome, Refused> {
+) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     let row = removal_row(store, by, url, seen)?;
     if row.status == WorkerStatus::Draining {
         return Ok(MembershipWriteOutcome::Unmoved(row.id));
@@ -719,7 +731,7 @@ pub(crate) fn take(
     by: Remover<'_>,
     url: &str,
     seen: RowRevision,
-) -> Result<MembershipWriteOutcome, Refused> {
+) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     let row = removal_row(store, by, url, seen)?;
     changed(
         store.remove(row.id, row.revision),
@@ -739,7 +751,7 @@ pub(crate) fn refresh(
     seen: RowRevision,
     built: &dyn Worker,
     read: Reading,
-) -> Result<MembershipWriteOutcome, Refused> {
+) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     refresh_stated(turn, seen, built.url(), &|standing| {
         read(built, Some(standing), None)
     })
@@ -757,19 +769,19 @@ fn refresh_stated(
     seen: RowRevision,
     url: &str,
     state: &dyn Fn(&WorkerFacts) -> WorkerFacts,
-) -> Result<MembershipWriteOutcome, Refused> {
+) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
     let store = turn.store();
     let row = seen_row(store, url, seen)?;
     // A draining row is leaving: its removal wins over a refresh, as over
     // a replacement.
     if row.status == WorkerStatus::Draining {
-        return Err(Refused::Draining);
+        return Err(MembershipWriteRefused::Draining);
     }
     let mut stated = state(&row.facts);
     let labels = mem::replace(&mut stated.labels, row.facts.labels.clone());
     let mut pairing = mem::replace(&mut stated.pairing, row.facts.pairing.clone());
     if stated != row.facts {
-        return Err(Refused::NotLabelsAlone);
+        return Err(MembershipWriteRefused::NotLabelsAlone);
     }
     // The row holds its descriptor as the pairing rule reads it. A stated
     // one that differs is read the same way before it counts as moved: its
@@ -787,7 +799,9 @@ fn refresh_stated(
     }
     stated.labels = labels;
     stated.pairing = pairing;
-    stated.bounded(&row.maker).map_err(Refused::Past)?;
+    stated
+        .bounded(&row.maker)
+        .map_err(MembershipWriteRefused::Past)?;
     turn.room(&stated, &row.maker)?;
     // The write, in place or by the patch, is a write of the turn: the term
     // is asked ahead of it.
@@ -800,7 +814,7 @@ fn refresh_stated(
             MembershipChange::Registered { .. }
             | MembershipChange::Replaced { .. }
             | MembershipChange::Removed { .. }
-            | MembershipChange::StatusChanged { .. } => Err(Refused::Moved),
+            | MembershipChange::StatusChanged { .. } => Err(MembershipWriteRefused::Moved),
         };
     }
     let patch = WorkerPatch {
@@ -847,9 +861,9 @@ impl StoreMembershipWriter {
 
     fn call<T>(
         &self,
-        write: impl FnOnce() -> Result<T, Refused>,
+        write: impl FnOnce() -> Result<T, MembershipWriteRefused>,
         changed: impl FnOnce(&T) -> bool,
-    ) -> Result<T, Refused> {
+    ) -> Result<T, MembershipWriteRefused> {
         let turn = self.turn.lock();
         let answer = write();
         drop(turn);
@@ -868,7 +882,7 @@ impl StoreMembershipWriter {
         maker: &Registrant,
         expect: Precondition,
         rows: &[Stated<'_>],
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         self.call(
             || lay(self, maker, expect, rows),
             |answer| answer.iter().any(MembershipWriteOutcome::changed),
@@ -881,11 +895,11 @@ impl Turn for StoreMembershipWriter {
         &self.store
     }
 
-    fn life(&self) -> Result<u64, Refused> {
+    fn life(&self) -> Result<u64, MembershipWriteRefused> {
         Ok(membership::life(Self::TERM, self.base, self.store.epoch()))
     }
 
-    fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), Refused> {
+    fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
         Ok(())
     }
 }
@@ -897,7 +911,7 @@ impl MembershipWriter for StoreMembershipWriter {
         expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.call(
             || lay_one(self, maker, expect, url, state),
             MembershipWriteOutcome::changed,
@@ -912,7 +926,7 @@ impl MembershipWriter for StoreMembershipWriter {
         expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         stating(built, over, paired, |rows| self.rows(maker, expect, rows))
     }
 
@@ -921,7 +935,7 @@ impl MembershipWriter for StoreMembershipWriter {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.call(
             || drain(&self.store, by, url, seen),
             MembershipWriteOutcome::changed,
@@ -933,7 +947,7 @@ impl MembershipWriter for StoreMembershipWriter {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.call(
             || take(&self.store, by, url, seen),
             MembershipWriteOutcome::changed,
@@ -946,7 +960,7 @@ impl MembershipWriter for StoreMembershipWriter {
         seen: RowRevision,
         built: &Arc<dyn Worker>,
         _: &Arc<dyn Worker>,
-    ) -> Result<MembershipWriteOutcome, Refused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.call(
             || refresh(self, seen, built.as_ref(), paired),
             MembershipWriteOutcome::changed,
@@ -973,8 +987,8 @@ pub(super) mod tests {
     };
 
     use super::{
-        changed, lay, lay_one, refresh_stated, MembershipWriteOutcome, MembershipWriter,
-        Precondition, Refused, Remover, RowRevision, Stated, StoreMembershipWriter, Turn,
+        changed, lay, lay_one, refresh_stated, MembershipWriteOutcome, MembershipWriteRefused,
+        MembershipWriter, Precondition, Remover, RowRevision, Stated, StoreMembershipWriter, Turn,
     };
     use crate::{
         document::spec::{AppliedSpec, Pairing, PolicySpec},
@@ -988,7 +1002,7 @@ pub(super) mod tests {
         },
         store::{
             index::indexed_under,
-            membership::{self, Past},
+            membership::{self, FactPastBound},
             pairing::PairingDescriptor,
             MembershipChange, MembershipTail, MemoryStore, Registrant, Signals, WorkerFacts,
             WorkerRow, WorkerStatus, WorkersStore,
@@ -1024,7 +1038,7 @@ pub(super) mod tests {
             maker: &Registrant,
             expect: Precondition,
             rows: &[Stated<'_>],
-        ) -> Result<Vec<MembershipWriteOutcome>, Refused>;
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused>;
     }
 
     impl Rows for StoreMembershipWriter {
@@ -1033,7 +1047,7 @@ pub(super) mod tests {
             maker: &Registrant,
             expect: Precondition,
             rows: &[Stated<'_>],
-        ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
             StoreMembershipWriter::rows(self, maker, expect, rows)
         }
     }
@@ -1045,7 +1059,7 @@ pub(super) mod tests {
             maker: &Registrant,
             url: &str,
             state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             self.found_one_over(maker, Precondition::Any, url, state)
         }
 
@@ -1056,7 +1070,7 @@ pub(super) mod tests {
             expect: Precondition,
             url: &str,
             state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             let answer = self.rows(maker, expect, &[Stated { url, state }])?;
             assert_eq!(answer.len(), 1);
             Ok(answer[0])
@@ -1097,7 +1111,7 @@ pub(super) mod tests {
         door: &dyn Rows,
         maker: &Registrant,
         facts: &[WorkerFacts],
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         find_rows_over(door, maker, Precondition::Any, facts)
     }
 
@@ -1106,7 +1120,7 @@ pub(super) mod tests {
         maker: &Registrant,
         expect: Precondition,
         facts: &[WorkerFacts],
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         let states: Vec<_> = facts
             .iter()
             .map(|facts| move |_: Option<&WorkerFacts>| facts.clone())
@@ -1173,7 +1187,7 @@ pub(super) mod tests {
         let epoch = store.epoch();
         assert_eq!(
             find_rows(&*door, &Registrant::Control, &ranks),
-            Err(Refused::Past(Past {
+            Err(MembershipWriteRefused::Past(FactPastBound {
                 fact: "labels",
                 why: "a label's value is at most 4096 bytes",
             }))
@@ -1264,7 +1278,7 @@ pub(super) mod tests {
         let two = ranked(2);
         assert_eq!(
             find_rows_over(&*door, &maker, Precondition::Absent, &two),
-            Err(Refused::Stands)
+            Err(MembershipWriteRefused::Stands)
         );
         assert_eq!(store.epoch(), epoch);
 
@@ -1375,7 +1389,7 @@ pub(super) mod tests {
         let before = store.all_rows();
         assert_eq!(
             find_rows(&*door, &provider, &ranked(4)),
-            Err(Refused::NotRegistrant(
+            Err(MembershipWriteRefused::NotRegistrant(
                 "the row was made by a control call: its maker alone changes it".to_owned()
             ))
         );
@@ -1427,7 +1441,7 @@ pub(super) mod tests {
             assert!(
                 matches!(
                     find_rows(&*door, &Registrant::Control, &ranks),
-                    Err(Refused::Past(Past {
+                    Err(MembershipWriteRefused::Past(FactPastBound {
                         fact: "dp_rank",
                         ..
                     }))
@@ -1444,7 +1458,10 @@ pub(super) mod tests {
         };
         assert!(matches!(
             door.rows(&Registrant::Control, Precondition::Any, &[row]),
-            Err(Refused::Past(Past { fact: "key", .. }))
+            Err(MembershipWriteRefused::Past(FactPastBound {
+                fact: "key",
+                ..
+            }))
         ));
         assert_eq!(store.all_rows(), (0, Vec::new()));
     }
@@ -1503,14 +1520,14 @@ pub(super) mod tests {
         for maker in [&Registrant::Control, &pool] {
             assert_eq!(
                 door.found(maker, Precondition::Absent, &ranks[0].key, &unstated),
-                Err(Refused::Stands)
+                Err(MembershipWriteRefused::Stands)
             );
         }
         // The rows write holds the engine to its width where one rank stands.
         let epoch = store.epoch();
         assert!(matches!(
             find_rows(&*door, &Registrant::Control, &ranks[1..]),
-            Err(Refused::Past(Past {
+            Err(MembershipWriteRefused::Past(FactPastBound {
                 fact: "dp_rank",
                 ..
             }))
@@ -1573,7 +1590,7 @@ pub(super) mod tests {
         assert_eq!(first, MembershipWriteOutcome::Registered(*stood));
         assert_eq!(store.all_rows().1.len(), 3);
         let epoch = store.epoch();
-        assert_eq!(add(), Err(Refused::Stands));
+        assert_eq!(add(), Err(MembershipWriteRefused::Stands));
         assert_eq!(store.epoch(), epoch);
         Ok(())
     }
@@ -1600,7 +1617,7 @@ pub(super) mod tests {
         let before = store.all_rows();
         let refused = |maker: &Registrant, facts: &[WorkerFacts]| {
             let add = find_rows_over(&*door, maker, Precondition::Absent, facts);
-            assert_eq!(add, Err(Refused::Stands));
+            assert_eq!(add, Err(MembershipWriteRefused::Stands));
             assert_eq!(store.all_rows(), before);
         };
 
@@ -1627,7 +1644,10 @@ pub(super) mod tests {
         let (store, door) = open();
         assert!(matches!(
             door.rows(&Registrant::Control, Precondition::Any, &[]),
-            Err(Refused::Past(Past { fact: "rows", .. }))
+            Err(MembershipWriteRefused::Past(FactPastBound {
+                fact: "rows",
+                ..
+            }))
         ));
         assert_eq!(store.all_rows(), (0, Vec::new()));
     }
@@ -1756,7 +1776,7 @@ pub(super) mod tests {
         for maker in [&control, &pool] {
             assert_eq!(
                 door.found_one_over(maker, Precondition::Absent, URL, &unstated),
-                Err(Refused::Stands)
+                Err(MembershipWriteRefused::Stands)
             );
         }
 
@@ -1767,7 +1787,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             door.found_one_over(&pool, seen, URL, &unstated),
-            Err(Refused::NotRegistrant(
+            Err(MembershipWriteRefused::NotRegistrant(
                 "the row was made by a control call: its maker alone changes it".to_owned()
             ))
         );
@@ -1784,7 +1804,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             door.found_one_over(&control, seen, URL, &unstated),
-            Err(Refused::Moved)
+            Err(MembershipWriteRefused::Moved)
         );
 
         // Other models are the URL's next life, as under an upsert.
@@ -1817,11 +1837,11 @@ pub(super) mod tests {
         );
         assert_eq!(
             door.found_one_over(&control, Precondition::AtRevision(seen), URL, &unstated),
-            Err(Refused::Draining)
+            Err(MembershipWriteRefused::Draining)
         );
         assert!(matches!(
             door.found_one_over(&pool, Precondition::AtRevision(seen), URL, &unstated),
-            Err(Refused::NotRegistrant(_))
+            Err(MembershipWriteRefused::NotRegistrant(_))
         ));
         assert_eq!(
             store.by_key(URL).map(|row| (row.id, row.status)),
@@ -1835,7 +1855,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             door.found_one_over(&control, Precondition::AtRevision(seen), URL, &unstated),
-            Err(Refused::Absent)
+            Err(MembershipWriteRefused::Absent)
         );
         assert_eq!(store.by_key(URL), None);
 
@@ -1850,7 +1870,7 @@ pub(super) mod tests {
         let epoch = store.epoch();
         assert_eq!(
             find_rows_over(&*door, &control, Precondition::Absent, &two),
-            Err(Refused::Stands)
+            Err(MembershipWriteRefused::Stands)
         );
         assert_eq!(store.epoch(), epoch);
 
@@ -1868,7 +1888,7 @@ pub(super) mod tests {
             ]
         ));
         let epoch = store.epoch();
-        assert_eq!(add(&[stated()]), Err(Refused::Stands));
+        assert_eq!(add(&[stated()]), Err(MembershipWriteRefused::Stands));
         let rank = store.by_key(&two[0].key).expect("rank zero");
         assert!(matches!(
             find_rows_over(
@@ -1877,12 +1897,15 @@ pub(super) mod tests {
                 Precondition::AtRevision(standing(&rank)),
                 &two
             ),
-            Err(Refused::Past(Past { fact: "rows", .. }))
+            Err(MembershipWriteRefused::Past(FactPastBound {
+                fact: "rows",
+                ..
+            }))
         ));
         assert_eq!(store.epoch(), epoch);
         find_rows(&*door, &control, &[stated()]).expect("plain again");
         let epoch = store.epoch();
-        assert_eq!(add(&two), Err(Refused::Stands));
+        assert_eq!(add(&two), Err(MembershipWriteRefused::Stands));
         assert_eq!(store.epoch(), epoch);
     }
 
@@ -1914,11 +1937,14 @@ pub(super) mod tests {
             ..standing(&replacement)
         };
         for seen in [wrong_revision, standing(&first)] {
-            assert_eq!(door.drained(by, URL, seen), Err(Refused::Moved));
-            assert_eq!(door.gone(by, URL, seen), Err(Refused::Moved));
+            assert_eq!(
+                door.drained(by, URL, seen),
+                Err(MembershipWriteRefused::Moved)
+            );
+            assert_eq!(door.gone(by, URL, seen), Err(MembershipWriteRefused::Moved));
             assert_eq!(
                 door.gone(Remover::Provider("other"), URL, seen),
-                Err(Refused::Moved)
+                Err(MembershipWriteRefused::Moved)
             );
         }
         assert_eq!(store.by_key(URL), Some(replacement));
@@ -1954,7 +1980,7 @@ pub(super) mod tests {
             let by = Remover::Provider("pool");
             let seen = standing(&row);
             if let Some(refusal) = refusal {
-                let expected = Err(Refused::NotRegistrant(refusal.to_owned()));
+                let expected = Err(MembershipWriteRefused::NotRegistrant(refusal.to_owned()));
                 assert_eq!(door.drained(by, URL, seen), expected);
                 assert_eq!(door.gone(by, URL, seen), expected);
                 assert_eq!(store.by_key(URL), Some(row));
@@ -2005,8 +2031,14 @@ pub(super) mod tests {
                     );
                     assert_eq!(store.by_key(URL), None);
                 } else {
-                    assert_eq!(door.drained(by, URL, seen), Err(Refused::OutOfScope));
-                    assert_eq!(door.gone(by, URL, seen), Err(Refused::OutOfScope));
+                    assert_eq!(
+                        door.drained(by, URL, seen),
+                        Err(MembershipWriteRefused::OutOfScope)
+                    );
+                    assert_eq!(
+                        door.gone(by, URL, seen),
+                        Err(MembershipWriteRefused::OutOfScope)
+                    );
                     assert_eq!(store.by_key(URL), Some(row));
                 }
             }
@@ -2091,12 +2123,18 @@ pub(super) mod tests {
             ];
             for stray in strays {
                 let refused = door.refreshed(seen, &worker(stray), &first);
-                assert_eq!(refused, Err(Refused::NotLabelsAlone));
+                assert_eq!(refused, Err(MembershipWriteRefused::NotLabelsAlone));
             }
             let wide = "x".repeat(WorkerFacts::LABEL_VALUE_BYTES + 1);
             let refused = door.refreshed(seen, &worker(built(&wide)), &first);
             assert!(
-                matches!(refused, Err(Refused::Past(Past { fact: "labels", .. }))),
+                matches!(
+                    refused,
+                    Err(MembershipWriteRefused::Past(FactPastBound {
+                        fact: "labels",
+                        ..
+                    }))
+                ),
                 "{refused:?}"
             );
             assert_eq!(store.by_key(URL).as_ref(), Some(&row));
@@ -2117,19 +2155,28 @@ pub(super) mod tests {
 
             // The asker's row moved under it, then drains, then is gone.
             let late = worker(built("bronze"));
-            assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Moved));
+            assert_eq!(
+                door.refreshed(seen, &late, &first),
+                Err(MembershipWriteRefused::Moved)
+            );
             let seen = standing(&moved);
             let by = Remover::Registrant(maker);
             assert_eq!(
                 door.drained(by, URL, seen),
                 Ok(MembershipWriteOutcome::Draining(moved.id))
             );
-            assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Draining));
+            assert_eq!(
+                door.refreshed(seen, &late, &first),
+                Err(MembershipWriteRefused::Draining)
+            );
             assert_eq!(
                 door.gone(by, URL, seen),
                 Ok(MembershipWriteOutcome::Removed(moved.id))
             );
-            assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Absent));
+            assert_eq!(
+                door.refreshed(seen, &late, &first),
+                Err(MembershipWriteRefused::Absent)
+            );
         }
         Ok(())
     }
@@ -2217,7 +2264,7 @@ pub(super) mod tests {
             facts.priority += 1;
             facts
         });
-        assert_eq!(stray, Err(Refused::NotLabelsAlone));
+        assert_eq!(stray, Err(MembershipWriteRefused::NotLabelsAlone));
         assert_eq!(store.by_key(URL).as_ref(), Some(&bare));
 
         // A row may hold one that reports nothing, as a registration states
@@ -2389,7 +2436,7 @@ pub(super) mod tests {
 
         assert!(matches!(
             door.gone(Remover::Registrant(&Registrant::Control), URL, seen),
-            Err(Refused::NotRegistrant(_))
+            Err(MembershipWriteRefused::NotRegistrant(_))
         ));
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
@@ -2596,7 +2643,7 @@ pub(super) mod tests {
             door.found_one(&maker, URL, &|_| stated())
                 .expect("registered");
             let row = store.by_key(URL).expect("the registered row");
-            let expected = Err(Refused::NotRegistrant(why.to_owned()));
+            let expected = Err(MembershipWriteRefused::NotRegistrant(why.to_owned()));
             assert_eq!(
                 door.found_one(&caller, URL, &|_| panic!("only the maker states facts")),
                 expected
@@ -2625,14 +2672,16 @@ pub(super) mod tests {
                 self.0
             }
 
-            fn life(&self) -> Result<u64, Refused> {
+            fn life(&self) -> Result<u64, MembershipWriteRefused> {
                 if self.1.replace(true) {
-                    return Err(Refused::NotLeading("the term moved".to_owned()));
+                    return Err(MembershipWriteRefused::NotLeading(
+                        "the term moved".to_owned(),
+                    ));
                 }
                 Ok(7)
             }
 
-            fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), Refused> {
+            fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
                 Ok(())
             }
         }
@@ -2654,7 +2703,9 @@ pub(super) mod tests {
         let turn = OneLife(&store, std::cell::Cell::new(false));
         assert_eq!(
             lay(&turn, &Registrant::Control, Precondition::Any, &rows),
-            Err(Refused::NotLeading("the term moved".to_owned()))
+            Err(MembershipWriteRefused::NotLeading(
+                "the term moved".to_owned()
+            ))
         );
         assert!(store.by_key(&two[0].key).is_some());
         assert!(store.by_key(&two[1].key).is_none());
@@ -2668,19 +2719,21 @@ pub(super) mod tests {
             self.0
         }
 
-        fn check_term(&self) -> Result<(), Refused> {
+        fn check_term(&self) -> Result<(), MembershipWriteRefused> {
             let Some(left) = self.1.get().checked_sub(1) else {
-                return Err(Refused::NotLeading("the term moved".to_owned()));
+                return Err(MembershipWriteRefused::NotLeading(
+                    "the term moved".to_owned(),
+                ));
             };
             self.1.set(left);
             Ok(())
         }
 
-        fn life(&self) -> Result<u64, Refused> {
+        fn life(&self) -> Result<u64, MembershipWriteRefused> {
             Ok(7)
         }
 
-        fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), Refused> {
+        fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
             Ok(())
         }
     }
@@ -2688,7 +2741,7 @@ pub(super) mod tests {
     fn lay_under(
         turn: &TermFor<'_>,
         facts: &[WorkerFacts],
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         lay_as(turn, Precondition::Any, facts)
     }
 
@@ -2696,7 +2749,7 @@ pub(super) mod tests {
         turn: &TermFor<'_>,
         expect: Precondition,
         facts: &[WorkerFacts],
-    ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         let states: Vec<_> = facts
             .iter()
             .map(|facts| move |_: Option<&WorkerFacts>| facts.clone())
@@ -2720,7 +2773,9 @@ pub(super) mod tests {
         let (store, door) = door();
         let three = ranked(3);
         find_rows(&door, &Registrant::Control, &three).expect("three ranks registered");
-        let lost = Err(Refused::NotLeading("the term moved".to_owned()));
+        let lost = Err(MembershipWriteRefused::NotLeading(
+            "the term moved".to_owned(),
+        ));
         let term = |checks| TermFor(&store, std::cell::Cell::new(checks));
 
         // Every rank's label changes. The term holds for the first row.
@@ -2754,7 +2809,9 @@ pub(super) mod tests {
             lay_one(&turn, &Registrant::Control, Precondition::Any, URL, &|_| {
                 stated()
             }),
-            Err(Refused::NotLeading("the term moved".to_owned()))
+            Err(MembershipWriteRefused::NotLeading(
+                "the term moved".to_owned()
+            ))
         );
         assert_eq!(store.all_rows(), (0, Vec::new()));
     }
@@ -2772,7 +2829,9 @@ pub(super) mod tests {
         };
         assert_eq!(
             add(1),
-            Err(Refused::NotLeading("the term moved".to_owned()))
+            Err(MembershipWriteRefused::NotLeading(
+                "the term moved".to_owned()
+            ))
         );
         assert_eq!(store.all_rows().1.len(), 1);
         let wrote = add(3);
@@ -2799,12 +2858,12 @@ pub(super) mod tests {
                 self.0
             }
 
-            fn life(&self) -> Result<u64, Refused> {
+            fn life(&self) -> Result<u64, MembershipWriteRefused> {
                 Ok(0)
             }
 
-            fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), Refused> {
-                Err(Refused::Past(Past {
+            fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
+                Err(MembershipWriteRefused::Past(FactPastBound {
                     fact: "row",
                     why: "no room",
                 }))
@@ -2817,7 +2876,7 @@ pub(super) mod tests {
             models: vec!["m".repeat(257)],
             ..stated()
         };
-        let no = Refused::Past(Past {
+        let no = MembershipWriteRefused::Past(FactPastBound {
             fact: "models",
             why: "a model id is at most 256 bytes",
         });
@@ -2847,7 +2906,7 @@ pub(super) mod tests {
                     state: &|_| stated()
                 }]
             ),
-            Err(Refused::Past(Past {
+            Err(MembershipWriteRefused::Past(FactPastBound {
                 fact: "row",
                 why: "no room"
             }))
@@ -2875,11 +2934,11 @@ pub(super) mod tests {
                 store.set_status(row.id, WorkerStatus::Draining, stale),
                 MembershipWriteOutcome::Draining
             ),
-            Err(Refused::Moved)
+            Err(MembershipWriteRefused::Moved)
         );
         assert_eq!(
             changed(store.remove(row.id, stale), MembershipWriteOutcome::Removed),
-            Err(Refused::Moved)
+            Err(MembershipWriteRefused::Moved)
         );
         assert_eq!(
             door.drained(Remover::Registrant(&maker), URL, standing(&row)),
@@ -2912,11 +2971,11 @@ pub(super) mod tests {
         let maker = Registrant::provider("pool", "first").expect("a maker");
         assert_eq!(
             door.drained(Remover::Registrant(&maker), URL, ABSENT),
-            Err(Refused::Absent)
+            Err(MembershipWriteRefused::Absent)
         );
         assert_eq!(
             door.gone(Remover::Registrant(&maker), URL, ABSENT),
-            Err(Refused::Absent)
+            Err(MembershipWriteRefused::Absent)
         );
         assert_eq!(store.epoch(), 0);
     }
@@ -2937,7 +2996,7 @@ pub(super) mod tests {
                         "http://absent",
                         ABSENT
                     ),
-                    Err(Refused::Absent)
+                    Err(MembershipWriteRefused::Absent)
                 );
                 heard.fetch_add(1, Ordering::Relaxed);
             })
@@ -3062,7 +3121,7 @@ pub(super) mod tests {
             key: "http://another".to_owned(),
             ..stated()
         });
-        let refused = Refused::Past(Past {
+        let refused = MembershipWriteRefused::Past(FactPastBound {
             fact: "key",
             why: "the facts name the URL of the call",
         });

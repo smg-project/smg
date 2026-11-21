@@ -22,16 +22,16 @@ pub(crate) mod view;
 pub(crate) mod warm_up;
 
 pub use decision::{
-    Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, ShadowKind, Shed, ShedReason,
+    Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, Queue, ShadowKind, Shed, ShedReason,
     Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-pub use decision_slot::{Acting, DecisionSlot};
-pub use demands::{DemandFacts, Demands, References, Unmet};
+pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
+pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{
-    Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
-    Front, Narrowed, OverloadThresholds, PairPools, PairSide, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM,
-    RANK_FROM,
+    Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine,
+    Filter, OverloadThresholds, PairPools, PairSide, PairTable, PairTableError, Picker, Plan,
+    Profile, ScoreFront, ScoreSpread, Scorer, Scratch, Shortlist, TieBand, WeightedScorer,
+    DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use sticky_sessions::{
@@ -39,13 +39,13 @@ pub use sticky_sessions::{
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
 pub use store_backed_engine::{
-    Decided, DecisionRecord, Explained, Leased, Names, Refused, Request, RequestFromSnapshot,
-    StoreBackedEngine, Swept, SHADOW_ROWS,
+    DecideOutcome, DecisionExplanation, DecisionNames, DecisionRecord, DecisionRefused, Leased,
+    Request, RequestFromSnapshot, StoreBackedEngine, SweepOutcome, SHADOW_ROWS,
 };
 pub use view::{
-    fingerprint, key_of_session, permille, AffinityFacts, Candidate, Constraints, Engines,
-    HashKind, Header, Health, Identity, KeyedRow, LoadRow, MediaCounts, ModelFingerprint,
-    NamedAffinity, NamedHolder, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role,
-    Session, SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
+    fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
+    Constraints, Engines, HashKind, Header, Health, Identity, KeyedRow, LoadRow, MediaCounts,
+    ModelFingerprint, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session,
+    SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
 };
-pub use warm_up::{WarmRule, Warming};
+pub use warm_up::{WarmUpRule, WarmUpState};

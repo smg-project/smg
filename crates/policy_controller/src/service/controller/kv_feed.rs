@@ -36,8 +36,8 @@ mod tests {
             Controller,
         },
         store::{
-            Ask, GatewayId, KvEventSink as _, MemoryStore, Named, Naming, Registrant, Signals,
-            ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            AffinityQuery, AffinityRowsBuffers, GatewayId, KvEventSink as _, MemoryStore,
+            Registrant, Signals, ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
         },
         worker_host::{
             KvFeed, Members, MembershipWriter as _, Objects, Precondition, StoreMembershipWriter,
@@ -539,7 +539,7 @@ mod tests {
             let holders = || {
                 store.deciding(|world| {
                     let gateway = GatewayId(0);
-                    let ask = Ask {
+                    let ask = ViewQuery {
                         gateway,
                         now: Instant::now(),
                         pinned: None,
@@ -550,7 +550,7 @@ mod tests {
                     let built = world
                         .build(MODEL, Role::Single, &ask, &mut view)
                         .expect("the worker's pool");
-                    let naming = Naming {
+                    let naming = AffinityQuery {
                         gateway,
                         block_hashes: &hashes,
                         namespace_seed: 0,
@@ -559,8 +559,14 @@ mod tests {
                         wires: None,
                         now_micros: built.now_micros,
                     };
-                    let mut named = Named::default();
-                    world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+                    let mut named = AffinityRowsBuffers::default();
+                    world.fill_affinity_rows(
+                        MODEL,
+                        Role::Single,
+                        &naming,
+                        &view.candidates,
+                        &mut named,
+                    );
                     named
                         .holders
                         .iter()

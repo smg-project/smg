@@ -22,12 +22,12 @@ use wfaas::{
 };
 
 use super::{
-    facts, found::engine_of, Credentials, KeptCredential, MembershipWriteOutcome, MembershipWriter,
-    Objects, Over, Precondition, Refused, Remover, RowRevision,
+    facts, found::engine_of, Credentials, KeptCredential, MembershipWriteOutcome,
+    MembershipWriteRefused, MembershipWriter, Objects, Over, Precondition, Remover, RowRevision,
 };
 use crate::{
     engine::view::WorkerId,
-    store::{Registrant, Unmade, WorkersStore},
+    store::{ProviderKeyError, Registrant, WorkersStore},
 };
 
 /// The provider name used by the host's own discovery source.
@@ -35,21 +35,21 @@ pub const DISCOVERY: &str = "discovery";
 
 /// Why a job's asker cannot make a registration.
 #[derive(Debug, thiserror::Error)]
-pub enum Unasked {
+pub enum RegistrantError {
     /// Health checks ask for removals.
     #[error("health checks do not register workers")]
     Health,
     /// The store refused the maker's name or key.
     #[error(transparent)]
-    Unmade(#[from] Unmade),
+    Unmade(#[from] ProviderKeyError),
 }
 
 /// Who a job registers its workers as, using the address written in its spec.
-pub fn registrant_of(asker: &WorkerJobAsker, address: &str) -> Result<Registrant, Unasked> {
+pub fn registrant_of(asker: &WorkerJobAsker, address: &str) -> Result<Registrant, RegistrantError> {
     match asker {
         WorkerJobAsker::Api | WorkerJobAsker::Startup => Ok(Registrant::Control),
         WorkerJobAsker::Discovery => Ok(Registrant::provider(DISCOVERY, address)?),
-        WorkerJobAsker::Health => Err(Unasked::Health),
+        WorkerJobAsker::Health => Err(RegistrantError::Health),
     }
 }
 
@@ -271,20 +271,24 @@ fn failed(step: &str, message: impl Into<String>) -> WorkflowError {
     }
 }
 
-fn registration_refusal(engine: &str, refusal: Refused) -> WorkflowError {
+fn registration_refusal(engine: &str, refusal: MembershipWriteRefused) -> WorkflowError {
     let message = match refusal {
-        Refused::NotRegistrant(why) => why,
-        Refused::Past(past) => format!("{}: {}", past.fact, past.why),
-        Refused::Absent => ABSENT.to_owned(),
-        Refused::NotLeading(_) => NOT_LEADING.to_owned(),
-        Refused::Moved => MOVED.to_owned(),
-        Refused::Stands => format!("Worker {} already exists", Endpoint::redacted_str(engine)),
-        Refused::Draining => format!(
+        MembershipWriteRefused::NotRegistrant(why) => why,
+        MembershipWriteRefused::Past(past) => format!("{}: {}", past.fact, past.why),
+        MembershipWriteRefused::Absent => ABSENT.to_owned(),
+        MembershipWriteRefused::NotLeading(_) => NOT_LEADING.to_owned(),
+        MembershipWriteRefused::Moved => MOVED.to_owned(),
+        MembershipWriteRefused::Stands => {
+            format!("Worker {} already exists", Endpoint::redacted_str(engine))
+        }
+        MembershipWriteRefused::Draining => format!(
             "Worker {} is draining, so the replacement was dropped",
             Endpoint::redacted_str(engine)
         ),
-        Refused::OutOfScope => Refused::OUT_OF_SCOPE.to_owned(),
-        Refused::NotLabelsAlone => Refused::NOT_LABELS_ALONE.to_owned(),
+        MembershipWriteRefused::OutOfScope => MembershipWriteRefused::OUT_OF_SCOPE.to_owned(),
+        MembershipWriteRefused::NotLabelsAlone => {
+            MembershipWriteRefused::NOT_LABELS_ALONE.to_owned()
+        }
     };
     failed(WRITE_WORKERS_TO_STORE_STEP, message)
 }
@@ -522,7 +526,7 @@ enum Left {
 fn removal_answer(
     step: &str,
     url: &str,
-    answer: Result<MembershipWriteOutcome, Refused>,
+    answer: Result<MembershipWriteOutcome, MembershipWriteRefused>,
 ) -> WorkflowResult<Left> {
     let refused = |why: String| {
         warn!(worker_url = %Endpoint::redacted_str(url), why, "Worker left alone");
@@ -530,25 +534,29 @@ fn removal_answer(
     };
     Ok(match answer {
         Ok(wrote) => Left::Wrote(wrote),
-        Err(Refused::Moved) => {
+        Err(MembershipWriteRefused::Moved) => {
             skipped(url, MOVED);
             Left::Standing
         }
-        Err(Refused::Absent) => {
+        Err(MembershipWriteRefused::Absent) => {
             skipped(url, ABSENT);
             Left::Gone
         }
-        Err(Refused::NotRegistrant(why)) => refused(why),
-        Err(Refused::OutOfScope) => refused(Refused::OUT_OF_SCOPE.to_owned()),
-        Err(Refused::NotLeading(_)) => return Err(failed(step, NOT_LEADING)),
-        Err(Refused::Stands) => return Err(failed(step, "the door answered a removal as an add")),
-        Err(Refused::Draining) => {
+        Err(MembershipWriteRefused::NotRegistrant(why)) => refused(why),
+        Err(MembershipWriteRefused::OutOfScope) => {
+            refused(MembershipWriteRefused::OUT_OF_SCOPE.to_owned())
+        }
+        Err(MembershipWriteRefused::NotLeading(_)) => return Err(failed(step, NOT_LEADING)),
+        Err(MembershipWriteRefused::Stands) => {
+            return Err(failed(step, "the door answered a removal as an add"))
+        }
+        Err(MembershipWriteRefused::Draining) => {
             return Err(failed(step, "the door answered a removal as a replacement"))
         }
-        Err(Refused::NotLabelsAlone) => {
+        Err(MembershipWriteRefused::NotLabelsAlone) => {
             return Err(failed(step, "the door answered a removal as a refresh"))
         }
-        Err(Refused::Past(past)) => {
+        Err(MembershipWriteRefused::Past(past)) => {
             return Err(failed(step, format!("{}: {}", past.fact, past.why)))
         }
     })
@@ -768,11 +776,12 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            MemoryStore, Overload, Registrant, Unmade, WorkerFacts, WorkerStatus, WorkersStore,
+            MemoryStore, Overload, ProviderKeyError, Registrant, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
         worker_host::{
-            facts, Members, MembershipWriteOutcome, MembershipWriter, Objects, Over, Precondition,
-            Refused, Remover, RowRevision, StoreMembershipWriter,
+            facts, Members, MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter,
+            Objects, Over, Precondition, Remover, RowRevision, StoreMembershipWriter,
         },
     };
 
@@ -923,7 +932,7 @@ mod tests {
             &self,
             maker: &Registrant,
             worker: &dyn Worker,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             let answer = self
                 .door
                 .found(maker, Precondition::Any, worker.url(), &|old| {
@@ -1131,10 +1140,13 @@ mod tests {
             remover_of(&Discovery, SCOPE),
             Remover::Provider("discovery")
         ));
-        assert!(matches!(registrant_of(&Health, URL), Err(Unasked::Health)));
+        assert!(matches!(
+            registrant_of(&Health, URL),
+            Err(RegistrantError::Health)
+        ));
         assert!(matches!(
             registrant_of(&Discovery, ""),
-            Err(Unasked::Unmade(Unmade::Key(_)))
+            Err(RegistrantError::Unmade(ProviderKeyError::Key(_)))
         ));
         for scope in [
             UnhealthyRemovalScope::Disabled,
@@ -1340,7 +1352,7 @@ mod tests {
         assert_eq!(f.store.epoch(), 0);
     }
 
-    struct Shut(Refused);
+    struct Shut(MembershipWriteRefused);
 
     impl MembershipWriter for Shut {
         fn found(
@@ -1349,7 +1361,7 @@ mod tests {
             _: Precondition,
             _: &str,
             _: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             Err(self.0.clone())
         }
 
@@ -1359,7 +1371,7 @@ mod tests {
             _: Precondition,
             _: &[Arc<dyn Worker>],
             _: Option<Over<'_>>,
-        ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
             Err(self.0.clone())
         }
 
@@ -1368,7 +1380,7 @@ mod tests {
             _: Remover<'_>,
             _: &str,
             _: RowRevision,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             Err(self.0.clone())
         }
 
@@ -1377,7 +1389,7 @@ mod tests {
             _: Remover<'_>,
             _: &str,
             _: RowRevision,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             Err(self.0.clone())
         }
 
@@ -1386,7 +1398,7 @@ mod tests {
             _: RowRevision,
             _: &Arc<dyn Worker>,
             _: &Arc<dyn Worker>,
-        ) -> Result<MembershipWriteOutcome, Refused> {
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
             Err(self.0.clone())
         }
     }
@@ -1400,8 +1412,9 @@ mod tests {
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
 
-        let door: Arc<dyn MembershipWriter> =
-            Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
+        let door: Arc<dyn MembershipWriter> = Arc::new(Shut(MembershipWriteRefused::NotLeading(
+            "follower".to_owned(),
+        )));
         let drain = DrainWorkersInStore {
             door: Arc::clone(&door),
             ..f.drain()
@@ -1420,10 +1433,13 @@ mod tests {
     #[tokio::test]
     async fn a_registration_retries_only_when_the_door_or_row_moved() {
         for (refusal, retryable) in [
-            (Refused::NotLeading("follower".to_owned()), true),
-            (Refused::Moved, true),
-            (Refused::Absent, false),
-            (Refused::OutOfScope, false),
+            (
+                MembershipWriteRefused::NotLeading("follower".to_owned()),
+                true,
+            ),
+            (MembershipWriteRefused::Moved, true),
+            (MembershipWriteRefused::Absent, false),
+            (MembershipWriteRefused::OutOfScope, false),
         ] {
             let f = Fixture::new();
             let mut cx = f.registration(WorkerJobAsker::Api, vec![worker(URL, "model")]);
@@ -1595,8 +1611,8 @@ mod tests {
             _: Precondition,
             _: &str,
             _: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-        ) -> Result<MembershipWriteOutcome, Refused> {
-            Err(Refused::Moved)
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            Err(MembershipWriteRefused::Moved)
         }
 
         fn found_rows(
@@ -1605,7 +1621,7 @@ mod tests {
             _: Precondition,
             built: &[Arc<dyn Worker>],
             _: Option<Over<'_>>,
-        ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
             for built in built {
                 self.door
                     .found(maker, Precondition::Any, built.url(), &|standing| {
@@ -1615,7 +1631,7 @@ mod tests {
                     })?;
             }
             self.objects.follow(&*self.store);
-            Err(Refused::Moved)
+            Err(MembershipWriteRefused::Moved)
         }
 
         fn drained(
@@ -1623,8 +1639,8 @@ mod tests {
             _: Remover<'_>,
             _: &str,
             _: RowRevision,
-        ) -> Result<MembershipWriteOutcome, Refused> {
-            Err(Refused::Moved)
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            Err(MembershipWriteRefused::Moved)
         }
 
         fn gone(
@@ -1632,8 +1648,8 @@ mod tests {
             _: Remover<'_>,
             _: &str,
             _: RowRevision,
-        ) -> Result<MembershipWriteOutcome, Refused> {
-            Err(Refused::Moved)
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            Err(MembershipWriteRefused::Moved)
         }
 
         fn refreshed(
@@ -1641,8 +1657,8 @@ mod tests {
             _: RowRevision,
             _: &Arc<dyn Worker>,
             _: &Arc<dyn Worker>,
-        ) -> Result<MembershipWriteOutcome, Refused> {
-            Err(Refused::Moved)
+        ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
+            Err(MembershipWriteRefused::Moved)
         }
     }
 
@@ -2174,8 +2190,9 @@ mod tests {
             .registry
             .register(Arc::clone(&live))
             .expect("an object without a row");
-        let door: Arc<dyn MembershipWriter> =
-            Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
+        let door: Arc<dyn MembershipWriter> = Arc::new(Shut(MembershipWriteRefused::NotLeading(
+            "follower".to_owned(),
+        )));
         let drain = DrainWorkersInStore {
             door: Arc::clone(&door),
             ..f.drain()
@@ -2230,25 +2247,25 @@ mod tests {
         let url = "http://user:secret@worker:8000/p?token=hidden";
         let answers = [
             (
-                Refused::Moved,
+                MembershipWriteRefused::Moved,
                 "DEBUG",
                 "the membership row moved",
                 Left::Standing,
             ),
             (
-                Refused::Absent,
+                MembershipWriteRefused::Absent,
                 "DEBUG",
                 "no row is registered under the URL",
                 Left::Gone,
             ),
             (
-                Refused::NotRegistrant("another maker's row".to_owned()),
+                MembershipWriteRefused::NotRegistrant("another maker's row".to_owned()),
                 "WARN",
                 "another maker's row",
                 Left::Refused("another maker's row".to_owned()),
             ),
             (
-                Refused::OutOfScope,
+                MembershipWriteRefused::OutOfScope,
                 "WARN",
                 "the row's maker is outside the health removal scope",
                 Left::Refused("the row's maker is outside the health removal scope".to_owned()),

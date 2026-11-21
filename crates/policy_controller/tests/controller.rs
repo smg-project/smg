@@ -25,8 +25,8 @@ use smg_policy_controller::{
     engine::{fingerprint, LoadRow, Role, WorkerId},
     service::{
         controller::{
-            Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, State,
-            Tls, TlsError, SERVICE_NAME,
+            Config, ConfigError, Controller, ElectionConfig, Error, LeasePlace, Listener, Scope,
+            State, Tls, TlsError, SERVICE_NAME,
         },
         elector::{ElectionSettings, FileLease, LeaseBackend},
         proto::{
@@ -37,8 +37,8 @@ use smg_policy_controller::{
         },
     },
     store::{
-        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, Picked, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, PickRecord,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
     tracking::{Lease, LeaseId},
 };
@@ -81,7 +81,7 @@ fn config() -> Config {
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: 2,
-        election: Election::default(),
+        election: ElectionConfig::default(),
         discovery: None,
     }
 }
@@ -374,7 +374,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 gateway,
                 request: 1,
                 target: WorkerId(7),
-                picked: Picked::default(),
+                picked: PickRecord::default(),
                 decode: None,
                 term: 1,
                 issued_at: now,
@@ -1140,7 +1140,7 @@ async fn a_controller_that_cannot_read_its_lease_is_not_ready_until_it_can() {
     let mut config = config();
     // No settle window: the stop's release is all the serve waits for.
     config.shutdown_settle = Duration::ZERO;
-    config.election = Election {
+    config.election = ElectionConfig {
         lease: LeasePlace::File(lease.clone()),
         settings: ElectionSettings {
             duration: Duration::from_millis(600),

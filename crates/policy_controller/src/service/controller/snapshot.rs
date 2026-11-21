@@ -27,7 +27,7 @@
 //! hold that lock once a write, as watches do. A call with no limit and no
 //! models takes that road too, alone or not: it would copy every row
 //! anyway, and a call let in while it runs shares the copy. The last call
-//! out lets the copy go where no watch is open to share it ([`Turn`],
+//! out lets the copy go where no watch is open to share it ([`SerialTurn`],
 //! [`Watchers::unshared`](super::watch_workers::Watchers::unshared)): a
 //! copy of every row is held only while a reader can share it. Any other
 //! call that is alone with no watch open copies the rows it may tell and
@@ -45,7 +45,7 @@
 //! open where it copies, a standby's base, and a polling load driver's
 //! tick.
 //! **One snapshot is taken at a time, off the runtime's workers**
-//! ([`Turn`]): one operator's copy is made at a time, and the take itself
+//! ([`SerialTurn`]): one operator's copy is made at a time, and the take itself
 //! holds no thread a stream of the listener runs on. A watch's open and a
 //! standby's base copy by themselves, in no turn.
 //!
@@ -61,7 +61,7 @@ use super::{generations::Generations, watch_workers, wire};
 use crate::{
     document::operator::{
         snapshot::{self, Rows, WorkerRowsQuery},
-        Turn,
+        SerialTurn,
     },
     service::proto::{self, snapshot_request::Slice},
     store::MemoryStore,
@@ -118,7 +118,7 @@ fn names(keep: impl Fn(Slice) -> bool) -> String {
 /// the take ends. `out` runs when the last place goes back, including
 /// where a caller leaves while it waits.
 pub(super) async fn in_turn<T: Send + 'static>(
-    turn: &Turn,
+    turn: &SerialTurn,
     take: impl FnOnce() -> T + Send + 'static,
     out: impl FnOnce() + Send + 'static,
 ) -> Result<T, Status> {
@@ -219,7 +219,7 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<SnapshotQuery, St
 /// with no watch open reads the rows it may tell and keeps nothing.
 pub(crate) fn read(
     asked: &SnapshotQuery,
-    turn: &Turn,
+    turn: &SerialTurn,
     feed: &watch_workers::Feed,
     watchers: &watch_workers::Watchers,
     store: &MemoryStore,
@@ -279,7 +279,7 @@ pub(crate) fn taken(
 
 /// A controller page keeps its bound on the encoded rows' bytes.
 fn rows(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> (Vec<proto::WorkerRow>, bool) {
-    snapshot::told_with(asked, read, now, true, |row| {
+    snapshot::worker_rows_page_with(asked, read, now, true, |row| {
         let told = wire::snapshot_row(&row, now);
         let framed = message::encoded_len(1, &told);
         (told, framed)
@@ -302,7 +302,7 @@ mod tests {
     use tonic::Code;
 
     use super::{
-        asked, in_turn, served, taken, Rows, SnapshotQuery, Turn, WorkerRowsQuery, SLICES,
+        asked, in_turn, served, taken, Rows, SerialTurn, SnapshotQuery, WorkerRowsQuery, SLICES,
         SNAPSHOTS_WAITING,
     };
     use crate::{
@@ -317,7 +317,7 @@ mod tests {
             proto::{self, snapshot_request::Slice},
         },
         stages::registry::StageRegistry,
-        store::{Cut, Kinds, MemoryStore, WorkerFacts, WorkerRow, WorkersStore},
+        store::{JournalKinds, MemoryStore, StoreCheckpoint, WorkerFacts, WorkerRow, WorkersStore},
     };
 
     /// The rows slice alone: every model, no limit.
@@ -335,7 +335,7 @@ mod tests {
         asked: &SnapshotQuery,
         now: Instant,
     ) -> (Vec<proto::WorkerRow>, bool) {
-        let cut = Arc::new(Cut {
+        let cut = Arc::new(StoreCheckpoint {
             rows: cut.to_vec(),
             at: Default::default(),
             epoch: 0,
@@ -556,7 +556,7 @@ mod tests {
         let store = MemoryStore::new();
         let key = "grpc://operator-name:s3cret-word@10.0.0.5:8000";
         let id = register(&store, key, "model-a");
-        let cut = store.cut(Kinds::Watched);
+        let cut = store.checkpoint(JournalKinds::Watched);
         let later = cut.rows[0].admitted_at + Duration::from_millis(1_500);
         let (told, truncated) = rows(&cut.rows, &ROWS, later);
         let [row] = told.as_slice() else {
@@ -599,7 +599,7 @@ mod tests {
 
         let store = MemoryStore::new();
         register(&store, &url(1), "model-a");
-        let mut row = store.cut(Kinds::Watched).rows[0].clone();
+        let mut row = store.checkpoint(JournalKinds::Watched).rows[0].clone();
         let page = |row: &WorkerRow| {
             let (mut told, _) = rows(std::slice::from_ref(row), &ROWS, Instant::now());
             told.pop().expect("one row")
@@ -649,7 +649,7 @@ mod tests {
         for n in 0..5 {
             register(&store, &url(n), "model-a");
         }
-        let cut = store.cut(Kinds::Watched);
+        let cut = store.checkpoint(JournalKinds::Watched);
         let now = Instant::now();
         let told = |limit| {
             let (page, truncated) = rows(
@@ -681,7 +681,7 @@ mod tests {
             let wide = format!("grpc://{n}.{}:8000", "u".repeat(PAGE_BYTES / 2));
             register(&store, &wide, "model-a");
         }
-        let cut = store.cut(Kinds::Watched);
+        let cut = store.checkpoint(JournalKinds::Watched);
         let (page, truncated) = rows(&cut.rows, &ROWS, Instant::now());
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
@@ -705,7 +705,7 @@ mod tests {
             let key = format!("grpc://10.0.{}.{}:8000", n / 100, n % 100);
             register(&store, &key, "model-a");
         }
-        let cut = store.cut(Kinds::Watched);
+        let cut = store.checkpoint(JournalKinds::Watched);
         let (page, truncated) = rows(&cut.rows, &ROWS, Instant::now());
         assert_eq!((page.len(), truncated), (200, false));
     }
@@ -719,7 +719,7 @@ mod tests {
         for (n, model) in models.into_iter().enumerate() {
             register(&store, &url(n), model);
         }
-        let cut = store.cut(Kinds::Watched);
+        let cut = store.checkpoint(JournalKinds::Watched);
         let told = |limit| {
             let asked = SnapshotQuery {
                 rows: WorkerRowsQuery {
@@ -750,7 +750,7 @@ mod tests {
         for (n, model) in models.into_iter().enumerate() {
             register(&store, &url(n), model);
         }
-        let cut = store.cut(Kinds::Watched);
+        let cut = store.checkpoint(JournalKinds::Watched);
         let filters = [
             Vec::new(),
             vec!["model-b".to_owned()],
@@ -795,7 +795,7 @@ mod tests {
                 asked,
                 3,
                 "controller-0",
-                || Rows::Shared(Arc::new(store.cut(Kinds::Watched))),
+                || Rows::Shared(Arc::new(store.checkpoint(JournalKinds::Watched))),
                 &generations,
                 Instant::now(),
             )
@@ -884,7 +884,7 @@ mod tests {
     /// waits for the case's word: a take on that thread could not be told.
     #[tokio::test]
     async fn one_snapshot_is_taken_at_a_time_and_a_call_past_the_wait_is_told_to_ask_again() {
-        let turn = Arc::new(Turn::new(SNAPSHOTS_WAITING));
+        let turn = Arc::new(SerialTurn::new(SNAPSHOTS_WAITING));
         let runtime = thread::current().id();
         let (release, word) = mpsc::channel::<()>();
         let word = Arc::new(std::sync::Mutex::new(word));
@@ -957,7 +957,7 @@ mod tests {
     /// the word comes.
     #[tokio::test]
     async fn a_caller_that_leaves_frees_the_turn_no_earlier_than_its_take_ends() {
-        let turn = Arc::new(Turn::new(SNAPSHOTS_WAITING));
+        let turn = Arc::new(SerialTurn::new(SNAPSHOTS_WAITING));
         let (release, word) = mpsc::channel::<()>();
         let (started, at_work) = mpsc::channel::<()>();
         let mut calls = JoinSet::new();
@@ -1030,7 +1030,7 @@ mod tests {
     /// waited. A call that leaves another let in is not the last.
     #[tokio::test]
     async fn the_last_call_out_is_the_one_that_leaves_no_call_let_in() {
-        let turn = Arc::new(Turn::new(SNAPSHOTS_WAITING));
+        let turn = Arc::new(SerialTurn::new(SNAPSHOTS_WAITING));
         let outs = Arc::new(AtomicUsize::new(0));
         let counted = || {
             let outs = Arc::clone(&outs);
@@ -1090,7 +1090,9 @@ mod tests {
 
     #[test]
     fn plain_snapshot_rows_map_to_the_previous_wire_rows() {
-        use crate::document::operator::snapshot::{told, Rows as ReadRows, WorkerRowsQuery};
+        use crate::document::operator::snapshot::{
+            worker_rows_page, Rows as ReadRows, WorkerRowsQuery,
+        };
 
         let store = MemoryStore::new();
         for (key, model) in [
@@ -1101,7 +1103,7 @@ mod tests {
         ] {
             register(&store, key, model);
         }
-        let cut = Arc::new(store.cut(Kinds::Watched));
+        let cut = Arc::new(store.checkpoint(JournalKinds::Watched));
         let now = Instant::now() + Duration::from_secs(1);
         for models in [Vec::new(), vec!["a".to_owned()], vec!["none".to_owned()]] {
             for limit in [0, 1, 2, 3, usize::MAX] {
@@ -1116,7 +1118,7 @@ mod tests {
                     ReadRows::Shared(Arc::clone(&cut)),
                     ReadRows::Told(rows, serving),
                 ] {
-                    let found = told(&asked, read, now);
+                    let found = worker_rows_page(&asked, read, now);
                     let mapped: Vec<_> = found
                         .rows
                         .iter()

@@ -5,7 +5,7 @@ use crate::{
     document::spec::{PolicySpec, ProfileSpec, ResidentWorkParams, ScoreStage, SpecError},
     engine::{
         decision::Targets,
-        framework::{Narrowed, Picker, TieBand, Unit},
+        framework::{DrawUnit, Picker, Shortlist, TieBand},
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
@@ -214,8 +214,8 @@ impl Picker for PowerOfTwo {
 
     /// Two engines, where the host lists them: the two rows that stand for
     /// them are compared as two rows drawn are.
-    fn unit(&self) -> Unit {
-        Unit::Engine
+    fn unit(&self) -> DrawUnit {
+        DrawUnit::Engine
     }
 
     fn draw_first(
@@ -230,8 +230,8 @@ impl Picker for PowerOfTwo {
         draw_two_kept(draw, candidates, keep, kept)
     }
 
-    fn narrow(&self, facts: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Narrowed {
-        Narrowed {
+    fn narrow(&self, facts: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Shortlist {
+        Shortlist {
             compared: draw_two(facts.seed, kept),
             alternates: 0,
         }
@@ -287,8 +287,8 @@ impl Picker for PowerOfTwoCountFirst {
         draw_two_kept(draw, candidates, keep, kept)
     }
 
-    fn narrow(&self, facts: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Narrowed {
-        Narrowed {
+    fn narrow(&self, facts: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Shortlist {
+        Shortlist {
             compared: draw_two(facts.seed, kept),
             alternates: 0,
         }

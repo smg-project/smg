@@ -54,7 +54,7 @@ use std::{
 use tokio::{sync::watch, task::JoinError, time::sleep};
 use tracing::debug;
 
-use super::generations::{Applied, Format, Generations, SpecRejected, MAX_DOCUMENT_BYTES};
+use super::generations::{ApplyOutcome, Format, Generations, SpecRejected, MAX_DOCUMENT_BYTES};
 use crate::document::operator::spec_store::NOT_A_FILE;
 
 /// Between two looks at the file.
@@ -224,12 +224,12 @@ enum Look {
     Shown,
     /// The file was read and the door read nothing of it: its replica
     /// stopped leading under the look, or leads under another term by now,
-    /// and the number is the standing one ([`Applied::Waits`]). The state
+    /// and the number is the standing one ([`ApplyOutcome::Waits`]). The state
     /// stays unread.
     Waits(u64),
     /// The file was read and its document handed to the door, with this
     /// outcome.
-    Read(Result<Applied, SpecRejected>),
+    Read(Result<ApplyOutcome, SpecRejected>),
 }
 
 /// The file source: the path, and where its watch stands.
@@ -444,7 +444,7 @@ impl SpecFile {
         // The door read nothing: this replica stopped leading while the
         // look was in flight, or leads under another term by now. The state
         // stays unread, so the next look reads it.
-        if let Ok(Applied::Waits(standing)) = outcome {
+        if let Ok(ApplyOutcome::Waits(standing)) = outcome {
             return Look::Waits(standing);
         }
         self.read = now;
@@ -500,7 +500,7 @@ impl SpecFile {
     /// holds, passed and by its digest and its own line
     /// ([`Generations::shown`]). The door holds who
     /// writes, and a look that was in flight when the replica stopped
-    /// leading applies nothing there ([`Applied::Waits`]). So two replicas
+    /// leading applies nothing there ([`ApplyOutcome::Waits`]). So two replicas
     /// that read one file never apply it twice under two numbers. The
     /// first looks after a take read the file as a start does, though it
     /// never moved, while its document has not stood on this replica since
@@ -569,7 +569,7 @@ pub(crate) mod tests {
                 },
                 Validate,
             },
-            elector::{Elector, Tick},
+            elector::{Elector, TickOutcome},
         },
         stages::StageRegistry,
         store::MemoryStore,
@@ -644,7 +644,7 @@ pub(crate) mod tests {
 
     /// The two looks a moved file takes: the one that sees it moved, and the
     /// one that finds it standing and reads it.
-    fn settle(file: &mut SpecFile) -> Result<Applied, SpecRejected> {
+    fn settle(file: &mut SpecFile) -> Result<ApplyOutcome, SpecRejected> {
         assert_eq!(
             file.poll(),
             Look::Settling,
@@ -662,7 +662,7 @@ pub(crate) mod tests {
     /// file moved and takes the two looks of [`settle`]. Where it does not,
     /// the watch finds the file as it last saw it, and the next look reads
     /// it.
-    fn returned(file: &mut SpecFile, before: &Seen) -> Result<Applied, SpecRejected> {
+    fn returned(file: &mut SpecFile, before: &Seen) -> Result<ApplyOutcome, SpecRejected> {
         if look(&file.path) != *before {
             return settle(file);
         }
@@ -1108,7 +1108,7 @@ pub(crate) mod tests {
         assert_eq!(looks, 1, "the missing open ends this read");
         assert_eq!(failed, Look::Settling, "the missing open is retried");
         assert_eq!((bed.rejected(), bed.generation()), (0, 1));
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
 
         // The same impossible lost version at every look: its missing open
         // still contradicts the injected look.
@@ -1178,7 +1178,10 @@ pub(crate) mod tests {
         if saved.exists() {
             fs::rename(&saved, &bed.path).expect("the file returns after the missing open");
         }
-        assert_eq!(returned(&mut file, &standing), Ok(Applied::Generation(2)));
+        assert_eq!(
+            returned(&mut file, &standing),
+            Ok(ApplyOutcome::Generation(2))
+        );
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
     }
 
@@ -1239,7 +1242,7 @@ pub(crate) mod tests {
         });
         assert_eq!(moving, Look::Settling, "the bytes read while it moved");
         assert_eq!(watched.generation(), 1);
-        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(9))));
+        assert_eq!(file.poll(), Look::Read(Ok(ApplyOutcome::Generation(9))));
     }
 
     /// A start does not accept bytes from a replacement that appears only
@@ -1316,7 +1319,10 @@ pub(crate) mod tests {
         if saved.exists() {
             fs::rename(&saved, &bed.path).expect("the settled file is restored");
         }
-        assert_eq!(returned(&mut file, &settled), Ok(Applied::Generation(2)));
+        assert_eq!(
+            returned(&mut file, &settled),
+            Ok(ApplyOutcome::Generation(2))
+        );
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
     }
 
@@ -1388,7 +1394,7 @@ pub(crate) mod tests {
         replace(&bed.path, RANDOM.as_bytes());
         assert_eq!(file.poll(), Look::Settling);
         assert_eq!(bed.generation(), 1, "not read at the look that saw it move");
-        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(2))));
+        assert_eq!(file.poll(), Look::Read(Ok(ApplyOutcome::Generation(2))));
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
         assert_eq!(file.poll(), Look::Same);
 
@@ -1398,7 +1404,7 @@ pub(crate) mod tests {
         fs::write(&bed.path, with_line(RANDOM, 11)).expect("the second write");
         assert_eq!(file.poll(), Look::Settling, "it moved since the last look");
         assert_eq!(bed.generation(), 2);
-        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(11))));
+        assert_eq!(file.poll(), Look::Read(Ok(ApplyOutcome::Generation(11))));
         assert_eq!(file.poll(), Look::Same);
     }
 
@@ -1433,7 +1439,7 @@ pub(crate) mod tests {
         turn("..v2");
         assert_eq!(file.poll(), Look::Settling, "it waits its poll again");
         assert_eq!(bed.generation(), 1);
-        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(2))));
+        assert_eq!(file.poll(), Look::Read(Ok(ApplyOutcome::Generation(2))));
     }
 
     /// A mounted ConfigMap's update: the file is a link through `..data`,
@@ -1464,7 +1470,7 @@ pub(crate) mod tests {
 
         publish("..version_2", RANDOM);
         fs::remove_dir_all(mount.join("..version_1")).expect("the old version goes");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
         assert_eq!(file.poll(), Look::Same);
     }
@@ -1494,7 +1500,7 @@ pub(crate) mod tests {
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
 
         replace(&bed.path, RANDOM.as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
         assert_eq!(bed.rejected(), 1);
     }
 
@@ -1525,7 +1531,7 @@ pub(crate) mod tests {
         assert_eq!((bed.rejected(), bed.generation()), (2, 1));
 
         replace(&bed.path, RANDOM.as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
         assert_eq!(bed.rejected(), 2);
     }
 
@@ -1578,7 +1584,7 @@ pub(crate) mod tests {
         assert_eq!((bed.rejected(), bed.generation()), (1, 1));
 
         replace(&bed.path, &with_line(LEAST_LOAD, 3));
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(3)));
         assert_eq!(bed.rejected(), 1);
     }
 
@@ -1611,7 +1617,7 @@ pub(crate) mod tests {
         assert_eq!((bed.rejected(), bed.generation()), (1, 1));
 
         // It rests: the next look finds it standing and reads it.
-        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(2))));
+        assert_eq!(file.poll(), Look::Read(Ok(ApplyOutcome::Generation(2))));
         assert_eq!(file.poll(), Look::Same);
         for _ in 1..RESTLESS_LOOKS {
             assert_eq!(restless(&mut file), Look::Settling);
@@ -1670,7 +1676,7 @@ pub(crate) mod tests {
             assert_eq!(restless(&mut file), Look::Settling);
         }
         // It rests one look short of being told, and is read.
-        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(2))));
+        assert_eq!(file.poll(), Look::Read(Ok(ApplyOutcome::Generation(2))));
         for _ in 1..RESTLESS_LOOKS {
             assert_eq!(restless(&mut file), Look::Settling, "the run began again");
         }
@@ -1920,14 +1926,14 @@ pub(crate) mod tests {
         bed.generations.at_take();
         assert_eq!(bed.generation(), 1, "the leader's, and none of the start's");
         assert_eq!(bed.answered().2, RANDOM.as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
         // Behind its next take the file's document stands: no read.
         bed.generations.at_take();
         assert_eq!(file.poll(), Look::Same);
         // A file that moved is read at any look.
         replace(&bed.path, bound_to(1).as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(3)));
 
         // A mount that lags: a standby's file holds the document it was
         // told at its join, and its leader applied another since. The take
@@ -1941,7 +1947,7 @@ pub(crate) mod tests {
         assert_eq!(file.poll(), Look::Same, "an older document of its leader's");
         assert_eq!((bed.generation(), bed.answered().2), (2, RANDOM.into()));
         replace(&bed.path, RANDOM.as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Unchanged(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Unchanged(2)));
 
         let unrun = self::bed(LEAST_LOAD.replace("healthy", "no-such-stage").as_bytes());
         let refused = SpecFile::start_deferred(unrun.path.clone(), Arc::clone(&unrun.generations));
@@ -2016,7 +2022,7 @@ pub(crate) mod tests {
         assert_eq!(door.apply_counts().rejected, 1);
         assert!(awaits(), "the mark stays");
         assert!(door.bound(), "the door keeps its source");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(1)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(1)));
         assert!(!awaits(), "the mark went with the unbound start");
     }
 
@@ -2053,7 +2059,7 @@ pub(crate) mod tests {
         // not stood here.
         elector.tick(Instant::now()).expect("a take");
         assert!(bed.generations.source_writes(), "it leads again");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(3)));
         assert_eq!(bed.answered().2, bound_to(1).as_bytes());
 
         // A lead comes back with no take as well: a fence closes by itself
@@ -2087,11 +2093,14 @@ pub(crate) mod tests {
         // finds the file as it was shown.
         let read = (0..8).find_map(|_| {
             let renewed = elector.tick(Instant::now());
-            assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "a renewal");
+            assert!(
+                matches!(renewed, Ok(TickOutcome::Renewed { .. })),
+                "a renewal"
+            );
             assert!(matches!(file.poll(), Look::Settling | Look::Same));
             Some(file.poll()).filter(|look| matches!(look, Look::Read(_)))
         });
-        assert_eq!(read, Some(Look::Read(Ok(Applied::Generation(2)))));
+        assert_eq!(read, Some(Look::Read(Ok(ApplyOutcome::Generation(2)))));
         assert_eq!(bed.answered().2, bound_to(1).as_bytes());
         assert_eq!(bed.generations.takes(), 1, "no take since the first");
     }
@@ -2115,7 +2124,7 @@ pub(crate) mod tests {
         // A leader's look reads behind the take: no later look reads for
         // the take's sake.
         replace(&bed.path, bound_to(1).as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
         // A renewal whose write returns two deadlines late stamps a window
         // that has ended: the replica holds its lease and shows no term.
         // The file moves, and the look is a follower's.
@@ -2123,16 +2132,22 @@ pub(crate) mod tests {
             .checked_sub(2 * deadline)
             .expect("a host that is up for a minute");
         let renewed = elector.tick(late);
-        assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "a renewal");
+        assert!(
+            matches!(renewed, Ok(TickOutcome::Renewed { .. })),
+            "a renewal"
+        );
         assert!(!bed.generations.source_writes(), "past its deadline");
         shown(&bed, &mut file, bound_to(2).as_bytes());
         // The next renewal opens the fence under the same term, and the
         // look reads the state it was shown: its document has not stood
         // here.
         let renewed = elector.tick(Instant::now());
-        assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "a renewal");
+        assert!(
+            matches!(renewed, Ok(TickOutcome::Renewed { .. })),
+            "a renewal"
+        );
         assert!(bed.generations.source_writes(), "it leads again");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(3)));
         assert_eq!(bed.answered().2, bound_to(2).as_bytes());
         assert_eq!(bed.generations.takes(), 1, "no take since the first");
         assert_eq!(file.poll(), Look::Same, "read once");
@@ -2227,7 +2242,7 @@ pub(crate) mod tests {
         assert_eq!(bed.generation(), 1);
         assert!(bed.generations.source_writes(), "it leads again");
         // Read again under the term that shows now, the file is applied.
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
         assert_eq!(bed.answered().2, bound_to(1).as_bytes());
         assert_eq!(bed.rejected(), 0);
     }
@@ -2269,7 +2284,7 @@ pub(crate) mod tests {
         follow(&bed, &[LEAST_LOAD, RANDOM]);
         assert_eq!(bed.generation(), 2);
         elector.tick(Instant::now()).expect("a take");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(10)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(10)));
         assert_eq!(bed.answered().2, numbered);
         assert_eq!(bed.rejected(), 0);
     }
@@ -2346,7 +2361,7 @@ pub(crate) mod tests {
         let numbered = with_line(LEAST_LOAD, 10);
         shown(&bed, &mut file, &numbered);
         elector.tick(Instant::now()).expect("a take");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(10)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(10)));
         assert_eq!(bed.answered().2, numbered);
     }
 
@@ -2376,7 +2391,7 @@ pub(crate) mod tests {
         // The mount's sync is a move: it is read, the standing document
         // again.
         replace(&bed.path, bound_to(1).as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Unchanged(3)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Unchanged(3)));
 
         // The same where the leader's word came first: the file takes the
         // document that stands, and its leader replaces it.
@@ -2410,7 +2425,7 @@ pub(crate) mod tests {
         // generation that replaced it.
         shown(&bed, &mut file, LEAST_LOAD.as_bytes());
         elector.tick(Instant::now()).expect("a take");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(3)));
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
         assert_eq!(file.poll(), Look::Same);
     }
@@ -2464,7 +2479,7 @@ pub(crate) mod tests {
         // The file moves again, and no look sees it ahead of the take.
         replace(&bed.path, bound_to(2).as_bytes());
         elector.tick(Instant::now()).expect("a take");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(2)));
         assert_eq!(bed.answered().2, bound_to(2).as_bytes());
     }
 
@@ -2481,7 +2496,7 @@ pub(crate) mod tests {
         let (mut file, mut elector) = standby(&bed);
         follow(&bed, &[RANDOM, &bound_to(1)]);
         elector.tick(Instant::now()).expect("a take");
-        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+        assert_eq!(settle(&mut file), Ok(ApplyOutcome::Generation(3)));
         assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
 
         // Numbered 1 under its leader's generation 2: refused, told once.

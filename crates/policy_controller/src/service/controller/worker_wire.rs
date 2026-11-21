@@ -26,8 +26,8 @@ use crate::{
     },
     store::{
         membership::blank, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange,
-        Overload, Position, Reachability, Registrant, Signals, Unmade, WorkerFacts, WorkerPatch,
-        WorkerRow, WorkerStatus,
+        Overload, Position, ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus,
     },
 };
 
@@ -728,8 +728,8 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         None => Registrant::Control,
         Some(by) => match Registrant::provider(by.provider.clone(), by.key.clone()) {
             Ok(maker) => maker,
-            Err(Unmade::Provider(why)) => return Err(refused("row.maker.provider", why)),
-            Err(Unmade::Key(why)) => return Err(refused("row.maker.key", why)),
+            Err(ProviderKeyError::Provider(why)) => return Err(refused("row.maker.provider", why)),
+            Err(ProviderKeyError::Key(why)) => return Err(refused("row.maker.key", why)),
         },
     };
     let age = Duration::from_millis(told.admitted_age_ms);
@@ -2846,7 +2846,7 @@ mod tests {
     #[test]
     fn a_row_crosses_with_its_maker() {
         use super::{maker_weight, room};
-        use crate::store::{Registrant, Unmade};
+        use crate::store::{ProviderKeyError, Registrant};
 
         let now = Instant::now();
         // A control call's row says no maker, and a row that says none
@@ -2925,7 +2925,7 @@ mod tests {
                 ..told.clone()
             };
             let refusal = told_row(&broken, now).expect_err("refused");
-            let (Unmade::Provider(why) | Unmade::Key(why)) =
+            let (ProviderKeyError::Provider(why) | ProviderKeyError::Key(why)) =
                 Registrant::provider(provider, key).expect_err("no maker");
             assert_eq!((refusal.path, refusal.why), (path, why));
         }

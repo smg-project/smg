@@ -87,32 +87,32 @@ mod tests;
 pub use encoding::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
 pub use health::{HealthSink, HealthWrite, LeaderBits, VetoWrite};
 pub use index::{
-    ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter, Named, SequenceHash,
-    StoredBlock, WorkerGroups, INDEX_WORKERS,
+    AffinityRowsBuffers, ApplyError, ChainBlockMap, ContentHash, KvEvent, LaneCounts, LaneWriter,
+    SequenceHash, StoredBlock, WorkerGroups, INDEX_WORKERS,
 };
-pub use journal::{Journal, Kinds, Position};
+pub use journal::{Journal, JournalKinds, Position};
 pub use kv_events::{
-    Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
+    BatchAdmission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,
 };
 pub use leases::{
     DecodeMark, DecodeRefused, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState,
-    LeasesStore, Picked, Said, Sides,
+    LeasesStore, PickRecord, Said, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub(crate) use memory::DecodeIssue;
-pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreStats, Watch};
+pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use signals::{SignalSink, SignalWriteOutcome};
 pub use snapshot::{
-    Ask, Built, EncodePairBuffers, Naming, OutsideLists, PairBuffers, PoolView, StaleGeneration,
-    StoreSnapshot, ViewBuffers, PUBLISH_WINDOW,
+    AffinityQuery, EncodePairBuffers, OutsideLists, PairBuffers, PoolView, StaleGeneration,
+    StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery, PUBLISH_WINDOW,
 };
 pub use workers::{
     identity, identity_of, token, HealthPolicy, MembershipChange, MembershipTail, Overload,
-    ProviderKey, Reachability, Registrant, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow,
-    WorkerStatus, WorkersStore,
+    ProviderKey, ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch,
+    WorkerRow, WorkerStatus, WorkersStore,
 };
 
 /// The verified identity of a gateway: the fingerprint of the subject its

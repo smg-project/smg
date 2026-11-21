@@ -18,13 +18,13 @@ use parking_lot::Mutex;
 use smg_policy_controller::{
     engine::{Role, WireModes, WorkerId},
     store::{
-        Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink as StoreLoadSink, MemoryStore, Overload,
-        Registrant, ViewBuffers, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        GatewayId, HealthPolicy, LoadSink as StoreLoadSink, MemoryStore, Overload, Registrant,
+        ViewBuffers, ViewQuery as ViewAsk, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
         PUBLISH_WINDOW,
     },
     worker_host::{
-        MembershipWriteOutcome, MembershipWriter, Objects, Over, Precondition, Refused, Remover,
-        RowRevision, StoreMembershipWriter,
+        MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Objects, Over,
+        Precondition, Remover, RowRevision, StoreMembershipWriter,
     },
 };
 use smg_worker::{
@@ -555,7 +555,7 @@ fn a_built_worker_is_the_rows_object_when_its_write_returns() {
             Some(Over::Updated(over)),
         )
     };
-    assert_eq!(guarded(&first), Err(Refused::Moved));
+    assert_eq!(guarded(&first), Err(MembershipWriteRefused::Moved));
     assert!(held(&second));
     assert!(matches!(
         guarded(&second),
@@ -607,7 +607,7 @@ fn a_refreshed_worker_is_the_rows_object_when_its_write_returns() {
     assert!(held(&equal));
 
     let late = feed.door.refreshed(seen(), &built("silver"), &first);
-    assert_eq!(late, Err(Refused::Moved));
+    assert_eq!(late, Err(MembershipWriteRefused::Moved));
     assert!(held(&equal));
 
     let moved = built("silver");
@@ -680,7 +680,10 @@ fn three_ranks_registered_in_one_turn_leave_three_handed_objects() {
     let refused = feed
         .door
         .found_rows(&Registrant::Control, Precondition::Any, &alone[1..2], None);
-    assert!(matches!(refused, Err(Refused::Past(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(MembershipWriteRefused::Past(_))),
+        "{refused:?}"
+    );
     assert_eq!(stand(&registry, &built), [true; 3]);
     assert_eq!(stand(&registry, &alone), [false; 3]);
     assert_eq!(feed.objects.unhanded(), 0);
@@ -816,7 +819,7 @@ fn a_refused_write_tells_nobody() {
     assert!(matches!(
         feed.door
             .found(&another, Precondition::Any, URL, &|_| stated()),
-        Err(Refused::NotRegistrant(_))
+        Err(MembershipWriteRefused::NotRegistrant(_))
     ));
     let after = registry.get_by_url(URL).expect("the worker still stands");
     assert!(Arc::ptr_eq(&before, &after));

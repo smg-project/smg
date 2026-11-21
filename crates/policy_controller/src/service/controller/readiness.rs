@@ -270,7 +270,7 @@ pub(crate) mod tests {
     use super::{channel, Phase, Readiness, Sample, State};
     use crate::service::{
         controller::{election::ElectionObservation, standby::Lag},
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        elector::{ElectionSettings, Elector, MemoryLease, TickOutcome},
     };
 
     /// A candidate alone over a lease of its own and a readiness that reads
@@ -351,7 +351,7 @@ pub(crate) mod tests {
         let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         assert_eq!(readiness.state(), State::Follower);
         let mut renewed = taken;
@@ -359,7 +359,7 @@ pub(crate) mod tests {
             renewed += settings.renew_deadline - Duration::from_millis(10);
             assert_eq!(
                 elector.tick(renewed).expect("the renewal"),
-                Tick::Renewed { term: 1 }
+                TickOutcome::Renewed { term: 1 }
             );
             assert_eq!(readiness.state(), State::Follower);
         }
@@ -388,7 +388,7 @@ pub(crate) mod tests {
         // The next renewal reopens it.
         assert_eq!(
             elector.tick(Instant::now()).expect("the renewal"),
-            Tick::Renewed { term: 1 }
+            TickOutcome::Renewed { term: 1 }
         );
         assert_eq!(readiness.state(), State::Leader);
     }
@@ -512,7 +512,7 @@ pub(crate) mod tests {
         let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         assert_eq!(read(taken), sample(State::Leader, None, false));
 
@@ -610,7 +610,7 @@ pub(crate) mod tests {
         // The count is the replica's since its start: a take keeps it.
         assert_eq!(
             elector.tick(Instant::now()).expect("the take"),
-            Tick::Acquired { term: 1 }
+            TickOutcome::Acquired { term: 1 }
         );
         let sample = readiness.sample_at(Instant::now()).0;
         assert_eq!((sample.state, sample.restores), (State::Leader, 2));

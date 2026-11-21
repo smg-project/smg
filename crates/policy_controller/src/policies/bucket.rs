@@ -2364,7 +2364,7 @@ mod tests {
                 }),
             });
         }
-        let picked = crate::store::Picked::of_decodes(&targets);
+        let picked = crate::store::PickRecord::of_decodes(&targets);
         let decision = Decision::Pick(Pick {
             targets,
             ..Pick::default()

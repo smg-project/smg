@@ -1183,9 +1183,9 @@ mod tests {
     /// lifted, and none for a pick no rule made.
     #[test]
     fn the_views_trace_carries_the_lifted_veto() {
-        use crate::engine::decision::{Lifted, Trace};
+        use crate::engine::decision::{LiftedVeto, Trace};
         let steered = Trace {
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
             ..Trace::default()
         };
         assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);

@@ -83,18 +83,18 @@ use crate::{
         replication::Log,
     },
     store::{
-        membership::{self, life, Laid},
-        HealthSink, Kinds, MemoryStore, Position, Registrant, WorkerRow, WorkerStatus,
+        membership::{self, life, WorkerFactsChange},
+        HealthSink, JournalKinds, MemoryStore, Position, Registrant, WorkerRow, WorkerStatus,
         WorkersStore,
     },
 };
 #[cfg(feature = "worker-host")]
 use crate::{
-    store::{membership::Past, WorkerFacts},
+    store::{membership::FactPastBound, WorkerFacts},
     worker_host::{
         drain, lay, lay_one, lay_ready, refresh, stated, stating, take, MembershipWriteOutcome,
-        MembershipWriter, Over, Precondition, Ready, Refused as WriterRefused, Remover,
-        RowRevision, Stated, Turn,
+        MembershipWriteRefused, MembershipWriter, Over, Precondition, Ready, Remover, RowRevision,
+        Stated, Turn,
     },
 };
 
@@ -170,7 +170,7 @@ impl MembershipCalls {
     /// The log's place: read after a call's write, that write's own or one
     /// past it.
     fn place(&self) -> Position {
-        self.log.head(Kinds::Watched)
+        self.log.head(JournalKinds::Watched)
     }
 
     /// The number of the life a registration makes now, under `admitted`,
@@ -324,19 +324,19 @@ impl MembershipCalls {
                 // make the row is told so, and never that it stands unmoved.
                 made_by(&row, maker)?;
                 let laid = if mode == Mode::Replace {
-                    Laid::Another
+                    WorkerFactsChange::Another
                 } else {
-                    row.laid(&facts)
+                    row.compare_new_facts(&facts)
                 };
                 match laid {
-                    Laid::Unmoved => {
+                    WorkerFactsChange::Unmoved => {
                         let epoch = self.store.epoch();
                         let at = self.place();
                         let unmoved = worker_wire::relabelled(&row);
                         return Ok(told(REGISTER, by, unmoved, false, epoch, at));
                     }
-                    Laid::InPlace => {}
-                    Laid::Another => facts.incarnation = self.next_life(admitted)?,
+                    WorkerFactsChange::InPlace => {}
+                    WorkerFactsChange::Another => facts.incarnation = self.next_life(admitted)?,
                 }
                 Some(row)
             }
@@ -500,19 +500,25 @@ const AS_RANKS: &str =
 
 /// The host door's refusal as a call's answer and an audit line's words.
 #[cfg(feature = "worker-host")]
-fn refused(refusal: &WriterRefused) -> Status {
+fn refused(refusal: &MembershipWriteRefused) -> Status {
     match refusal {
-        WriterRefused::NotRegistrant(why) => Status::permission_denied(why.as_str()),
-        WriterRefused::Past(past) => {
+        MembershipWriteRefused::NotRegistrant(why) => Status::permission_denied(why.as_str()),
+        MembershipWriteRefused::Past(past) => {
             Status::invalid_argument(format!("{}: {}", past.fact, past.why))
         }
-        WriterRefused::Absent => absent(),
-        WriterRefused::NotLeading(why) => Status::unavailable(why.as_str()),
-        WriterRefused::Moved => moved(),
-        WriterRefused::Stands => Status::already_exists("a worker is registered under the URL"),
-        WriterRefused::Draining => Status::failed_precondition(DRAINING),
-        WriterRefused::OutOfScope => Status::permission_denied(WriterRefused::OUT_OF_SCOPE),
-        WriterRefused::NotLabelsAlone => Status::permission_denied(WriterRefused::NOT_LABELS_ALONE),
+        MembershipWriteRefused::Absent => absent(),
+        MembershipWriteRefused::NotLeading(why) => Status::unavailable(why.as_str()),
+        MembershipWriteRefused::Moved => moved(),
+        MembershipWriteRefused::Stands => {
+            Status::already_exists("a worker is registered under the URL")
+        }
+        MembershipWriteRefused::Draining => Status::failed_precondition(DRAINING),
+        MembershipWriteRefused::OutOfScope => {
+            Status::permission_denied(MembershipWriteRefused::OUT_OF_SCOPE)
+        }
+        MembershipWriteRefused::NotLabelsAlone => {
+            Status::permission_denied(MembershipWriteRefused::NOT_LABELS_ALONE)
+        }
     }
 }
 
@@ -547,20 +553,20 @@ impl Turn for CallTurn<'_> {
         &self.door.store
     }
 
-    fn check_term(&self) -> Result<(), WriterRefused> {
+    fn check_term(&self) -> Result<(), MembershipWriteRefused> {
         self.door
             .check_term(self.term)
-            .map_err(|status| WriterRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
-    fn life(&self) -> Result<u64, WriterRefused> {
+    fn life(&self) -> Result<u64, MembershipWriteRefused> {
         self.door
             .next_life(self.term)
-            .map_err(|status| WriterRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
     /// The call's own rules spoke where each rank's facts were read.
-    fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), WriterRefused> {
+    fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
         Ok(())
     }
 
@@ -617,13 +623,13 @@ impl MembershipCalls {
                 (_, None) => None,
                 // An add asks its maker of no row: the group's rule says
                 // which standing ranks are the same add's.
-                (Mode::Add, Some(row)) => Some((row.id, row.laid(&facts))),
+                (Mode::Add, Some(row)) => Some((row.id, row.compare_new_facts(&facts))),
                 (mode, Some(row)) => {
                     made_by(row, maker)?;
                     let laid = if mode == Mode::Replace {
-                        Laid::Another
+                        WorkerFactsChange::Another
                     } else {
-                        row.laid(&facts)
+                        row.compare_new_facts(&facts)
                     };
                     Some((row.id, laid))
                 }
@@ -645,7 +651,7 @@ impl MembershipCalls {
             // An add refused where a rank it states stands names that row,
             // as a call of one row does.
             match (&refusal, stood.iter().flatten().next()) {
-                (WriterRefused::Stands, Some(row)) => stands(row),
+                (MembershipWriteRefused::Stands, Some(row)) => stands(row),
                 _ => refused(&refusal),
             }
         })?;
@@ -742,15 +748,17 @@ impl ReplicaMembershipWriter {
         &self,
         call: &'static str,
         asker: Option<&str>,
-        write: impl FnOnce(u64) -> Result<T, WriterRefused>,
-    ) -> Result<T, WriterRefused> {
+        write: impl FnOnce(u64) -> Result<T, MembershipWriteRefused>,
+    ) -> Result<T, MembershipWriteRefused> {
         let turn = self.door.turn.lock();
         let term = match (self.leading)() {
             Ok(term) => term,
             Err(status) => {
                 drop(turn);
                 audit_refusal(call, &self.by, status.code(), status.message(), asker);
-                return Err(WriterRefused::NotLeading(status.message().to_owned()));
+                return Err(MembershipWriteRefused::NotLeading(
+                    status.message().to_owned(),
+                ));
             }
         };
         match write(term) {
@@ -771,7 +779,7 @@ impl ReplicaMembershipWriter {
         maker: &Registrant,
         expect: Precondition,
         rows: &[Stated<'_>],
-    ) -> Result<Vec<MembershipWriteOutcome>, WriterRefused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         self.call(Self::REGISTRATION, None, |term| {
             lay(&ReplicaTurn { host: self, term }, maker, expect, rows)
         })
@@ -794,8 +802,8 @@ impl ReplicaMembershipWriter {
         &self,
         call: &'static str,
         by: Remover<'_>,
-        write: impl FnOnce() -> Result<MembershipWriteOutcome, WriterRefused>,
-    ) -> Result<MembershipWriteOutcome, WriterRefused> {
+        write: impl FnOnce() -> Result<MembershipWriteOutcome, MembershipWriteRefused>,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         let asker = Some(match by {
             Remover::Registrant(Registrant::Control) => "control call",
             Remover::Registrant(Registrant::Provider(provider)) => provider.provider(),
@@ -824,26 +832,26 @@ impl Turn for ReplicaTurn<'_> {
         &self.host.door.store
     }
 
-    fn check_term(&self) -> Result<(), WriterRefused> {
+    fn check_term(&self) -> Result<(), MembershipWriteRefused> {
         self.host
             .door
             .check_term(self.term)
-            .map_err(|status| WriterRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
-    fn life(&self) -> Result<u64, WriterRefused> {
+    fn life(&self) -> Result<u64, MembershipWriteRefused> {
         self.host
             .door
             .next_life(self.term)
-            .map_err(|status| WriterRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
-    fn room(&self, facts: &WorkerFacts, maker: &Registrant) -> Result<(), WriterRefused> {
+    fn room(&self, facts: &WorkerFacts, maker: &Registrant) -> Result<(), MembershipWriteRefused> {
         worker_wire::wire_reach(facts.wire_modes, facts.reachable_from, "row.wire")
             .and_then(|()| worker_wire::carried(facts))
             .and_then(|()| worker_wire::room(facts, &facts.labels, maker, "row"))
             .map_err(|refusal| {
-                WriterRefused::Past(Past {
+                MembershipWriteRefused::Past(FactPastBound {
                     fact: refusal.path,
                     why: refusal.why,
                 })
@@ -864,7 +872,7 @@ impl MembershipWriter for ReplicaMembershipWriter {
         expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<MembershipWriteOutcome, WriterRefused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.call(Self::REGISTRATION, None, |term| {
             lay_one(&ReplicaTurn { host: self, term }, maker, expect, url, state)
         })
@@ -877,7 +885,7 @@ impl MembershipWriter for ReplicaMembershipWriter {
         expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<MembershipWriteOutcome>, WriterRefused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         stating(built, over, stated, |rows| self.rows(maker, expect, rows))
     }
 
@@ -886,7 +894,7 @@ impl MembershipWriter for ReplicaMembershipWriter {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, WriterRefused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.removal("worker drain", by, || {
             drain(&self.door.store, by, url, seen)
         })
@@ -897,7 +905,7 @@ impl MembershipWriter for ReplicaMembershipWriter {
         by: Remover<'_>,
         url: &str,
         seen: RowRevision,
-    ) -> Result<MembershipWriteOutcome, WriterRefused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.removal("worker removal", by, || {
             take(&self.door.store, by, url, seen)
         })
@@ -911,7 +919,7 @@ impl MembershipWriter for ReplicaMembershipWriter {
         seen: RowRevision,
         built: &Arc<dyn Worker>,
         _: &Arc<dyn Worker>,
-    ) -> Result<MembershipWriteOutcome, WriterRefused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         const CALL: &str = "worker label refresh";
         self.call(CALL, None, |term| {
             refresh(
@@ -1022,8 +1030,8 @@ pub(crate) mod tests {
         worker_host::{
             check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
             check_one_row, check_provider, check_rank_rows, check_refresh, FindOne,
-            MembershipWriteOutcome, MembershipWriter, Precondition, Refused, Remover, RowRevision,
-            Rows, Stated, StoreMembershipWriter,
+            MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Precondition,
+            Remover, RowRevision, Rows, Stated, StoreMembershipWriter,
         },
     };
 
@@ -1848,7 +1856,7 @@ pub(crate) mod tests {
             self.log.carries_loads()
         }
 
-        fn head(&self, kinds: store::Kinds) -> Position {
+        fn head(&self, kinds: store::JournalKinds) -> Position {
             self.log.head(kinds)
         }
 
@@ -2111,7 +2119,7 @@ pub(crate) mod tests {
         let watched = |after: Position| {
             let mut entries = Vec::new();
             door.log
-                .read(store::Kinds::Watched, after, 64, &mut entries)
+                .read(store::JournalKinds::Watched, after, 64, &mut entries)
                 .expect("the log holds the call's writes");
             entries
                 .iter()
@@ -2500,7 +2508,7 @@ pub(crate) mod tests {
                 state(&mut facts);
                 facts
             });
-            let Err(Refused::Past(past)) = answer else {
+            let Err(MembershipWriteRefused::Past(past)) = answer else {
                 panic!("{fact}: wrong answer: {answer:?}")
             };
             assert_eq!(past.fact, fact);
@@ -2535,7 +2543,7 @@ pub(crate) mod tests {
         let epoch = store.epoch();
         for wire in [WireModes::ZMQ, WireModes::GRPC.union(WireModes::ZMQ)] {
             let answer = hosted.found_one(&maker, URL, &stated(wire, Reachability::Any));
-            let Err(Refused::Past(past)) = answer else {
+            let Err(MembershipWriteRefused::Past(past)) = answer else {
                 panic!("{wire:?}: wrong answer: {answer:?}")
             };
             assert_eq!(past.fact, "row.wire");
@@ -2576,7 +2584,7 @@ pub(crate) mod tests {
             maker: &Registrant,
             expect: Precondition,
             rows: &[Stated<'_>],
-        ) -> Result<Vec<MembershipWriteOutcome>, Refused> {
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
             ReplicaMembershipWriter::rows(self, maker, expect, rows)
         }
     }
@@ -2663,8 +2671,9 @@ pub(crate) mod tests {
         door.register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
             .expect("registered");
         let epoch = store.epoch();
-        let denied = |answer: Result<MembershipWriteOutcome, Refused>, whose: &str| {
-            let Err(Refused::NotRegistrant(why)) = answer else {
+        let denied = |answer: Result<MembershipWriteOutcome, MembershipWriteRefused>,
+                      whose: &str| {
+            let Err(MembershipWriteRefused::NotRegistrant(why)) = answer else {
                 panic!("wrong refusal: {answer:?}")
             };
             assert!(why.contains(whose), "{why}");
@@ -2692,7 +2701,7 @@ pub(crate) mod tests {
         // lead refuses by name. None of the five wrote.
         assert_eq!(
             hosted.gone(by, "grpc://10.0.0.9:8000", seen),
-            Err(Refused::Absent)
+            Err(MembershipWriteRefused::Absent)
         );
         let follower = || -> Result<u64, Status> {
             Err(Status::failed_precondition("this replica does not lead"))
@@ -2700,7 +2709,9 @@ pub(crate) mod tests {
         let follower = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), follower);
         assert_eq!(
             follower.gone(by, URL, seen),
-            Err(Refused::NotLeading("this replica does not lead".to_owned()))
+            Err(MembershipWriteRefused::NotLeading(
+                "this replica does not lead".to_owned()
+            ))
         );
         assert_eq!(store.epoch(), epoch);
         // The maker's own call takes the row away and answers it removed.
@@ -2716,7 +2727,10 @@ pub(crate) mod tests {
             .expect("found again");
         let again = store.by_key(URL).expect("the new row");
         assert_ne!(again.id, made.id);
-        assert_eq!(hosted.gone(by, URL, seen), Err(Refused::Moved));
+        assert_eq!(
+            hosted.gone(by, URL, seen),
+            Err(MembershipWriteRefused::Moved)
+        );
         assert_eq!(store.by_key(URL), Some(again));
     }
 
@@ -2743,7 +2757,9 @@ pub(crate) mod tests {
             fence_reads.fetch_add(1, Ordering::Relaxed);
             Err(Status::failed_precondition("this replica does not lead"))
         });
-        let refused = Err(Refused::NotLeading("this replica does not lead".to_owned()));
+        let refused = Err(MembershipWriteRefused::NotLeading(
+            "this replica does not lead".to_owned(),
+        ));
         assert_eq!(
             hosted.found_one(&maker, URL, &|_| panic!(
                 "a follower does not ask for facts"
@@ -2762,13 +2778,15 @@ pub(crate) mod tests {
     #[test]
     fn a_providers_registration_numbers_its_life_under_the_term_the_log_leads() {
         use super::{ReplicaTurn, Turn};
-        use crate::store::membership::Past;
+        use crate::store::membership::FactPastBound;
 
         let (store, door) = door_in(TERM + 1);
         let door = Arc::new(door);
         let maker = found("pods/a");
         let stale = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
-        let refusal = Err(Refused::NotLeading(super::LEADS_NO_TERM.to_owned()));
+        let refusal = Err(MembershipWriteRefused::NotLeading(
+            super::LEADS_NO_TERM.to_owned(),
+        ));
         assert_eq!(stale.found_one(&maker, URL, &|_| found_facts()), refusal);
         assert_eq!(store.epoch(), 0);
 
@@ -2813,7 +2831,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             turn.room(&heavy, &maker),
-            Err(Refused::Past(Past {
+            Err(MembershipWriteRefused::Past(FactPastBound {
                 fact: "row",
                 why: "a row is at most 16384 bytes on the wire",
             }))
@@ -2835,7 +2853,9 @@ pub(crate) mod tests {
         };
         assert_eq!(
             turn.life(),
-            Err(Refused::NotLeading(super::LEADS_NO_TERM.to_owned()))
+            Err(MembershipWriteRefused::NotLeading(
+                super::LEADS_NO_TERM.to_owned()
+            ))
         );
     }
 
@@ -2858,7 +2878,7 @@ pub(crate) mod tests {
                         revision: 0
                     }
                 ),
-                Err(Refused::Absent)
+                Err(MembershipWriteRefused::Absent)
             );
             let registered = door
                 .found_one(&maker, URL, &|_| found_facts())
@@ -3515,7 +3535,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             door.drained(Remover::Health(UnhealthyRemovalScope::Disabled), URL, seen),
-            Err(Refused::OutOfScope)
+            Err(MembershipWriteRefused::OutOfScope)
         );
         let by = Remover::Health(UnhealthyRemovalScope::DiscoveryOwned);
         assert_eq!(
@@ -3567,7 +3587,7 @@ pub(crate) mod tests {
         let row = store.by_key(HTTP).expect("the registered row");
         let seen = standing(&row);
         let stray = door.refreshed(seen, &built("other", "gold"), &first);
-        assert_eq!(stray, Err(Refused::NotLabelsAlone));
+        assert_eq!(stray, Err(MembershipWriteRefused::NotLabelsAlone));
         let wrote = door.refreshed(seen, &built("m", "silver"), &first);
         assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
 
@@ -3581,7 +3601,10 @@ pub(crate) mod tests {
             "{logged}"
         );
         assert!(calls[0].contains("code=PermissionDenied"), "{logged}");
-        assert!(calls[0].contains(Refused::NOT_LABELS_ALONE), "{logged}");
+        assert!(
+            calls[0].contains(MembershipWriteRefused::NOT_LABELS_ALONE),
+            "{logged}"
+        );
         assert!(calls[1].contains("made=\"relabelled\""), "{logged}");
         assert!(!logged.contains(HTTP), "{logged}");
     }

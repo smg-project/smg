@@ -12,8 +12,8 @@ use std::{
 };
 
 use super::{
-    gone, request, Candidate, Lifecycle, Needs, Refused, Request, RequestFacts, StoreBackedEngine,
-    TieBand, GATEWAY, MODEL,
+    gone, request, Candidate, DecisionRefused, Lifecycle, Needs, Request, RequestFacts,
+    StoreBackedEngine, TieBand, GATEWAY, MODEL,
 };
 use crate::{
     document::{
@@ -26,7 +26,9 @@ use crate::{
     engine::{
         decision::ShadowKind,
         framework::Scorer,
-        store_backed_engine::{decide_in, entry, Buffers, Decided, DecisionCall, SHADOW_FLOOR},
+        store_backed_engine::{
+            decide_in, entry, Buffers, DecideOutcome, DecisionCall, SHADOW_FLOOR,
+        },
         view::{HashKind, LoadRow, Phase, Role, WorkerId},
     },
     stages::registry::StageRegistry,
@@ -137,7 +139,7 @@ fn order(
     asked: &Request<'_>,
     now: Instant,
     buffers: &mut Buffers<()>,
-) -> Result<Decided, Refused> {
+) -> Result<DecideOutcome, DecisionRefused> {
     let store = &**door.store();
     let term = store.term();
     store.deciding(|world| {
@@ -731,7 +733,7 @@ fn a_refused_lease_writes_nothing() -> Case {
         let entry = entry(world, &taken);
         door.order(world, 0, term, &taken, &mut buffers, entry)
     });
-    assert!(matches!(refused, Err(Refused::Unleased)));
+    assert!(matches!(refused, Err(DecisionRefused::Unleased)));
     assert_eq!(slices(&store, Role::Single), Some(0));
     decide_only(&door, &asked, now, &mut buffers);
     assert!(buffers.named.holders.is_empty());
@@ -884,7 +886,7 @@ fn a_profile_named_no_row_keeps_no_record_of_sent_prefixes() -> Case {
         );
     }
     let spec = applied(&document)?;
-    assert_eq!(spec.engine().named_for(MODEL, Phase::Single), 0);
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 0);
     assert!(!spec.engine().reads_sent_for(MODEL, Phase::Single));
     store.apply(spec)?;
     assert_eq!(slices(&store, Role::Single), None);
