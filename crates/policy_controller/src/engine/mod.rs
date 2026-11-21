@@ -9,6 +9,7 @@ pub(crate) mod decision;
 pub(crate) mod demands;
 pub(crate) mod door;
 pub(crate) mod framework;
+pub(crate) mod prompt_hashes;
 pub(crate) mod sticky_sessions;
 pub(crate) mod terms;
 pub(crate) mod view;
@@ -29,6 +30,7 @@ pub use framework::{
     Plan, Profile, Scorer, Scratch, Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM,
     RANK_FROM,
 };
+pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use sticky_sessions::{
     Forgets, Pins, SessionRule, SessionTable, SessionVerdict, ABSENCE_MICROS,
 };
