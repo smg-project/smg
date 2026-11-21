@@ -213,6 +213,10 @@ mod tests {
         let policies = asking_under(&document, "round_robin", DocumentOrigin::Settings);
         policies.set_side_policy(Side::Prefill, &PolicyConfig::RoundRobin);
         policies.set_side_policy(Side::Decode, &PolicyConfig::RoundRobin);
+        // Every case over this registry is a case of the engine's object.
+        for side in [policies.get_prefill_policy(), policies.get_decode_policy()] {
+            assert!(side.as_any().is::<EnginePolicy>(), "{}", side.name());
+        }
         policies
     }
 

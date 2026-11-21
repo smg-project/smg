@@ -1394,10 +1394,15 @@ mod tests {
     /// profile, the stage of it that asks more, the binding and the phase.
     #[tokio::test]
     async fn a_supplied_document_starts_where_the_engine_picks_each_of_its_places() {
-        let supplied = |name: &str| RouterConfig {
-            policy_controller: true,
-            policy_spec: Some(PolicySpec::preset(name).expect("a built-in preset")),
-            ..Default::default()
+        // A document that names no number: the first of its gateway.
+        let supplied = |name: &str| {
+            let mut document = PolicySpec::preset(name).expect("a built-in preset");
+            document.generation = 0;
+            RouterConfig {
+                policy_controller: true,
+                policy_spec: Some(document),
+                ..Default::default()
+            }
         };
         let context = AppContext::from_config(supplied("round_robin"), 10, None, None)
             .await
@@ -1405,7 +1410,7 @@ mod tests {
         assert!(context.policy_store.is_none());
         let default = context.policy_registry.get_default_policy();
         assert!(default.as_any().is::<EnginePolicy>());
-        // A supplied document that names no number takes 1, as at the door.
+        // It takes the number 1, as at the operators' door.
         let started = context
             .in_process
             .as_ref()

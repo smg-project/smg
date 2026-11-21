@@ -127,7 +127,7 @@ impl PolicyEngine {
     /// matches names the place's profile. The answer is that profile where
     /// one pick of its picker is its whole decision ([`Place::Alone`]),
     /// the stage of it that asks more where it is not
-    /// ([`Place::NotYet`]), and [`Place::Unbound`] where no binding names
+    /// ([`Place::NotAlone`]), and [`Place::Unbound`] where no binding names
     /// the model for the phase. A policy that serves every model is asked
     /// for with the empty model id, which the bindings of every model
     /// alone match.
@@ -406,7 +406,7 @@ mod tests {
             "bucket",
         ] {
             let engine = preset(name);
-            let Place::NotYet { profile, stage } = engine.place(MODEL, Phase::Single) else {
+            let Place::NotAlone { profile, stage } = engine.place(MODEL, Phase::Single) else {
                 panic!("{name} is picked alone");
             };
             assert_eq!(profile, name);
@@ -414,14 +414,14 @@ mod tests {
         }
         assert_eq!(
             preset("random").place(MODEL, Phase::Single),
-            Place::NotYet {
+            Place::NotAlone {
                 profile: "random",
                 stage: InTheWay::Picker("random"),
             }
         );
         assert!(matches!(
             preset("least_load").place(MODEL, Phase::Single),
-            Place::NotYet {
+            Place::NotAlone {
                 stage: InTheWay::Scorer(_),
                 ..
             }
@@ -462,7 +462,7 @@ mod tests {
                 } else {
                     let stage = InTheWay::Filter(filter);
                     let profile = "round_robin";
-                    assert_eq!(place, Place::NotYet { profile, stage }, "{phase:?}");
+                    assert_eq!(place, Place::NotAlone { profile, stage }, "{phase:?}");
                 }
             }
         }
@@ -485,7 +485,7 @@ mod tests {
             let profile = "round_robin";
             assert_eq!(
                 engine_of(&document).place(MODEL, Phase::Single),
-                Place::NotYet { profile, stage }
+                Place::NotAlone { profile, stage }
             );
         }
     }

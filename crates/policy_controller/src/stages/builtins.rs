@@ -831,6 +831,10 @@ impl RowTests {
     /// window's at a prefill place and the decode rooms' at a decode
     /// place. The two windows are bits a host supplies, and such a pass
     /// is the host: it narrows a side's candidates by them before it asks.
+    /// At an encode place no pass narrows by the workers a retry tried,
+    /// and none has to: a retry's list names the prefill and the decode it
+    /// tried and never an encoder, so that test passes every candidate
+    /// there.
     pub(crate) const fn held_by_a_pass(phase: Phase) -> Self {
         let side = match phase {
             Phase::Prefill => Self::HAS_CAPACITY,

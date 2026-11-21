@@ -46,6 +46,19 @@ pub enum Phase {
     Encode,
 }
 
+impl Phase {
+    /// The phase's name, as a document writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Encode => "encode",
+        }
+    }
+}
+
 /// What the request's block hashes were computed over.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HashKind {

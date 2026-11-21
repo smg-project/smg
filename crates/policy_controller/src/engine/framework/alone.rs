@@ -25,7 +25,7 @@ pub enum Place<'a> {
     /// workers the caller hands: the caller asks that pick and nothing else.
     Alone(AloneProfile),
     /// The place's profile asks more of a decision than that pick gives.
-    NotYet {
+    NotAlone {
         /// The profile's name.
         profile: &'a str,
         /// The first of its stages that asks more.
@@ -103,7 +103,7 @@ impl Engine {
         };
         match self.in_the_way(index, profile, phase) {
             None => Place::Alone(AloneProfile(index)),
-            Some(stage) => Place::NotYet {
+            Some(stage) => Place::NotAlone {
                 profile: &profile.name,
                 stage,
             },

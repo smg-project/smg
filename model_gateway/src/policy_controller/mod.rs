@@ -132,11 +132,11 @@ pub(crate) enum StartError {
         "the policy document's profile `{profile}` is not decided in this process yet: \
          it holds {stage} (binding `{model}`, phase {phase})"
     )]
-    NotInProcess {
+    NotAlone {
         profile: String,
         stage: String,
         model: String,
-        phase: String,
+        phase: &'static str,
     },
 }
 
@@ -236,12 +236,14 @@ pub(crate) fn start_with(
 /// picks the place's profile by itself, and by the classic policy of the
 /// setting elsewhere. A document its operator supplied has no setting
 /// behind a place, so a place of it the engine does not pick by itself
-/// is refused here ([`StartError::NotInProcess`]).
+/// is refused here ([`StartError::NotAlone`]).
 pub(crate) fn start_in_process(
     config: &RouterConfig,
     stages: Option<Catalog>,
 ) -> Result<Option<InProcess>, StartError> {
-    let Some((mut document, stages)) = document_in_force(config, stages)? else {
+    // The document comes under the number a gateway's first document
+    // takes: its own, and 1 where it names none (the reader's rule).
+    let Some((document, stages)) = document_in_force(config, stages)? else {
         return Ok(None);
     };
     // The bound the operators' door holds a written document to.
@@ -249,11 +251,6 @@ pub(crate) fn start_in_process(
     let bytes = u64::try_from(written.len()).unwrap_or(u64::MAX);
     if bytes > MAX_DOCUMENT_BYTES {
         return Err(SpecRejected::TooLarge(bytes).into());
-    }
-    // The number the door gives a gateway's first document: its own, and
-    // 1 where it names none.
-    if document.generation == 0 {
-        document.generation = 1;
     }
     let spec = AppliedSpec::validate_in(&document, &stages, &config.denied_view_headers())
         .map_err(SpecRejected::Invalid)?;
@@ -265,11 +262,11 @@ pub(crate) fn start_in_process(
     };
     if origin == DocumentOrigin::Supplied {
         if let Some(place) = engine.not_alone() {
-            return Err(StartError::NotInProcess {
+            return Err(StartError::NotAlone {
                 profile: place.profile.to_owned(),
                 stage: place.stage.to_string(),
                 model: place.model.to_owned(),
-                phase: format!("{:?}", place.phase).to_lowercase(),
+                phase: place.phase.name(),
             });
         }
     }

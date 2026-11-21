@@ -96,12 +96,7 @@ struct Placed<'a> {
 
 impl std::fmt::Display for Placed<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let phase = match self.phase {
-            Phase::Single => "single",
-            Phase::Prefill => "prefill",
-            Phase::Decode => "decode",
-            Phase::Encode => "encode",
-        };
+        let phase = self.phase.name();
         if self.model == EVERY_MODEL {
             write!(f, "every model ({phase} requests)")
         } else {
@@ -320,10 +315,10 @@ impl PolicyRegistry {
     /// policies it ever held: the default one, one a model, one a side of a
     /// pair. Each is the policy of a place, a model and a phase, and the
     /// engine finds the place's profile by its document's bindings where
-    /// the policy is built ([`Self::policy_at`]). `origin` says how that
-    /// document came to be: under one made from the routing settings a
-    /// worker's `policy` label chooses a model's policy as ever, and under
-    /// a supplied one the binding that names the model does.
+    /// the policy is built. `origin` says how that document came to be:
+    /// under one made from the routing settings a worker's `policy` label
+    /// chooses a model's policy as ever, and under a supplied one the
+    /// binding that names the model does.
     pub fn with_policy_engine(
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
@@ -1000,7 +995,7 @@ impl PolicyRegistry {
                     "Model {model_id}: no binding of the policy document names it, \
                      the classic policies place it"
                 ),
-                (Place::Unbound | Place::NotYet { .. }, _) => {}
+                (Place::Unbound | Place::NotAlone { .. }, _) => {}
             }
         }
 
@@ -1074,7 +1069,7 @@ impl PolicyRegistry {
                 info!("Policy `{name}` of {place}: the policy engine decides it");
                 Arc::new(EnginePolicy::of(&asked.engine, profile, name))
             }
-            Place::NotYet { profile, stage } => {
+            Place::NotAlone { profile, stage } => {
                 info!(
                     "Policy `{name}` of {place}: the classic policy decides it, \
                      the policy engine does not pick the profile `{profile}` by itself yet ({stage})"
@@ -1194,8 +1189,8 @@ impl PolicyRegistry {
 
     /// Get the encode policy for EPD mode. Falls back to consistent_hashing so
     /// repeated multimodal items keep stable affinity even when the main policy is
-    /// load-oriented or random. The fallback is built as every policy is
-    /// ([`Self::policy_at`]); a gateway's start sets the encode policy of a
+    /// load-oriented or random. The fallback is built as every policy of
+    /// this registry is; a gateway's start sets the encode policy of a
     /// deployment that has an encode side, so no request of it comes here.
     pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         self.encode_policy.get().map(Arc::clone).unwrap_or_else(|| {
