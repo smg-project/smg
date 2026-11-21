@@ -1909,10 +1909,23 @@ mod tests {
             );
             let format = serde_json::from_str::<Value>(&tag).expect("JSON");
             let format = &format["format"];
-            assert_eq!(format["type"], "triggered_tags");
+            // One call opens by its trigger in free text; a required turn of more than one holds
+            // its calls one after another, with no trigger and no text between them.
+            assert_eq!(
+                format["type"],
+                if one_call {
+                    "triggered_tags"
+                } else {
+                    "tags_with_separator"
+                }
+            );
             assert_eq!(
                 format["triggers"],
-                json!(["<|tool_calls_section_begin|>", "</think>"])
+                if one_call {
+                    json!(["<|tool_calls_section_begin|>", "</think>"])
+                } else {
+                    Value::Null
+                }
             );
             assert_eq!(format["at_least_one"], true);
             assert_eq!(

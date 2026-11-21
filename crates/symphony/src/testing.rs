@@ -596,14 +596,12 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
         // With the thought closed, where the engine does not say: the calls at once.
         let calls = tag(false, GrammarStart::Unknown);
         let calls = &calls["format"];
-        assert_eq!(calls["type"], "triggered_tags", "{choice}: {calls}");
-        assert_eq!(calls["at_least_one"], true, "{choice}: {calls}");
+        let tags = call_tags(format, one_call, calls);
         assert_eq!(
             calls["stop_after_first"],
             if one_call { value!(true) } else { Value::Null },
             "{choice}: {calls}"
         );
-        let tags = calls["tags"].as_array().expect("tags");
         assert!(!tags.is_empty(), "{choice}: {calls}");
         for tag in tags {
             let begin = tag["begin"].as_str().expect("a begin");
@@ -715,11 +713,7 @@ pub(crate) fn a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
             .unwrap_or_else(|| panic!("{name}: no tag"))
             .payload();
         let calls = &tag["format"];
-        assert_eq!(
-            calls["type"], "triggered_tags",
-            "{name}: {start:?}: {calls}"
-        );
-        for tag in calls["tags"].as_array().expect("tags") {
+        for tag in call_tags(format, false, calls) {
             let begin = tag["begin"].as_str().expect("a begin");
             assert!(
                 begin.starts_with(marker),
@@ -727,6 +721,24 @@ pub(crate) fn a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
             );
         }
     }
+}
+
+/// The tags of a forced tag's calls on `format`: where the table says what it writes between
+/// calls and more than one call may come, the calls repeat with that text allowed after each;
+/// triggered tags otherwise.
+fn call_tags<'a>(format: &Format, one_call: bool, calls: &'a Value) -> &'a [Value] {
+    let says = format
+        .layout()
+        .is_some_and(|layout| layout.between_calls.is_some());
+    let tags = if says && !one_call {
+        assert_eq!(calls["type"], "plus", "{calls}");
+        &calls["content"]["elements"][0]["elements"]
+    } else {
+        assert_eq!(calls["type"], "triggered_tags", "{calls}");
+        assert_eq!(calls["at_least_one"], true, "{calls}");
+        &calls["tags"]
+    };
+    tags.as_array().expect("tags")
 }
 
 /// A function tool named `name` with `parameters` as its schema.

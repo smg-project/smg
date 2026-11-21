@@ -564,6 +564,11 @@ fn block_of(ways_in: &[WayIn<'_>], content: Grammar, close: &str, count: Count<'
             triggers.push(trigger.to_string());
         }
     }
+    // The text between two calls is written inside the block: none stands between two blocks.
+    let count = Count {
+        between: count.between.map(|_| ""),
+        ..count
+    };
     count.triggered(triggers, tags)
 }
 
@@ -624,6 +629,8 @@ pub enum GrammarStart {
 struct Count<'a> {
     at_least_one: bool,
     one: bool,
+    /// What the table's layout says its template writes between two calls, where it says.
+    between: Option<&'a str>,
     /// The terminal that ends the turn wherever the model stands (Kimi K3's message close), or
     /// nothing for a table whose turn a stop token ends.
     last: &'a str,
@@ -661,6 +668,24 @@ impl Count<'_> {
     /// Tags `triggers` open in free text, as many as the count lets the model write; with one
     /// call, each tag's end carries the end of the turn.
     fn triggered(&self, triggers: Vec<String>, tags: Vec<Tag>) -> Grammar {
+        // Free text after a required call is read as content beside it, so several required
+        // calls take none; only a table that says what its template writes between calls.
+        if let (true, false, Some(between)) = (self.at_least_one, self.one, self.between) {
+            let calls = if between.is_empty() {
+                self.separated(tags)
+            } else {
+                // That text may follow each call: between two calls and before the turn ends.
+                Grammar::Plus(Box::new(Grammar::Sequence(vec![
+                    Grammar::Or(tags.into_iter().map(Grammar::Tag).collect()),
+                    Grammar::Optional(Box::new(Grammar::ConstString(between.to_string()))),
+                ])))
+            };
+            return if self.last.is_empty() {
+                calls
+            } else {
+                Grammar::Sequence(vec![calls, Grammar::ConstString(self.last.to_string())])
+            };
+        }
         let tags = tags
             .into_iter()
             .map(|tag| Tag {
@@ -798,6 +823,9 @@ impl Format {
         let count = Count {
             at_least_one: options.at_least_one,
             one: options.one_call,
+            between: self
+                .layout()
+                .and_then(|layout| layout.between_calls.as_deref()),
             last: self.turn_end(),
         };
         // The markers are the syntaxes' with a region of calls; xLAM's list has none.
@@ -2538,14 +2566,16 @@ mod tests {
         for format in [formats::qwen3(CallSyntax::Json), formats::qwen2_5()] {
             let grammar = format.grammar(&tools, true, false).expect("a grammar");
             let payload = grammar.payload();
-            assert_eq!(
-                payload["format"]["type"],
-                "triggered_tags",
-                "{}",
-                format.name()
-            );
-            assert_eq!(payload["format"]["triggers"], value!(["<tool_call>"]));
-            let tags = payload["format"]["tags"].as_array().expect("tags");
+            // Qwen3 says the newline between calls: its calls repeat, the newline allowed after each.
+            let tags = if format.layout().is_some() {
+                assert_eq!(payload["format"]["type"], "plus");
+                &payload["format"]["content"]["elements"][0]["elements"]
+            } else {
+                assert_eq!(payload["format"]["type"], "triggered_tags");
+                assert_eq!(payload["format"]["triggers"], value!(["<tool_call>"]));
+                &payload["format"]["tags"]
+            };
+            let tags = tags.as_array().expect("tags");
             assert_eq!(tags.len(), 3, "a nameless tool has no tag");
             assert_eq!(
                 tags[0]["begin"],

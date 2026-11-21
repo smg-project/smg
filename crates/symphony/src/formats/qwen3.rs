@@ -8,7 +8,7 @@
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
 //! [`Placement`] says.
 //!
-//! The table carries the one part of its chat template's layout the tags write: after the
+//! The table carries the parts of its chat template's layout the tags write: after the
 //! thought's close the Qwen3 and Qwen 3.5 templates write two newlines before the content or the
 //! first call (`</think>\n\n<tool_call>`), so a forced call written where the close left the
 //! engine begins with them, as the template writes it, and the call's marker is not the grammar's
@@ -16,7 +16,8 @@
 //! close, so the table under the direct placement carries none; the NVIDIA Nemotron 3 groups and
 //! Step 3.5 Flash, which read with the tagged table, write one newline there, which their entries
 //! in `groups.json` carry in the table's place (`after`). The thought the model opens and closes
-//! itself: a `<tool_call>` inside it is thought text, as the template reads it.
+//! itself: a `<tool_call>` inside it is thought text, as the template reads it. Between two calls
+//! the templates write one newline, which the table carries too.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -49,7 +50,9 @@ pub fn qwen3(syntax: CallSyntax) -> Format {
     if matches!(syntax, CallSyntax::Tagged(_, Placement::Direct)) {
         return format;
     }
-    format.with_layout(super::thought_layout("</think>", "\n\n"))
+    let mut layout = super::thought_layout("</think>", "\n\n");
+    layout.between_calls = Some("\n".into());
+    format.with_layout(layout)
 }
 
 #[cfg(test)]
