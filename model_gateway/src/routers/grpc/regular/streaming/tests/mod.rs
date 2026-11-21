@@ -671,6 +671,112 @@ fn serialized_messages_event(event: &MessageStreamEvent) -> Vec<u8> {
     bytes
 }
 
+/// A burst of deltas, several blocks' worth written with nothing read from
+/// the engine in between, leaves block by block through either writer (the
+/// borrowed text's and the event's): the frames ahead go to the channel
+/// before the write their block has no room for, so the block is never grown
+/// under them (a growth copies every frame it holds), a frame is a block
+/// short of less than one event's room, and the bytes are the frames' own in
+/// their order.
+#[tokio::test]
+async fn a_burst_of_deltas_leaves_block_by_block_and_never_grows_the_block() {
+    for as_event in [false, true] {
+        let (tx, mut rx) = driven_channel();
+        let mut buffer = BytesMut::with_capacity(MESSAGES_FIRST_BLOCK);
+        let mut expected = Vec::new();
+        let mut frames = Vec::new();
+        for step in 0..600 {
+            let text = format!("word {step} ");
+            let mut alone = BytesMut::new();
+            StreamingProcessor::format_string_delta_frame_into(
+                &mut alone,
+                0,
+                StreamingProcessor::TEXT_DELTA_HEAD,
+                &text,
+            )
+            .expect("the frame writes");
+            expected.extend_from_slice(&alone);
+            if as_event {
+                let event = MessageStreamEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: ContentBlockDelta::TextDelta { text },
+                };
+                StreamingProcessor::write_messages_event(&tx, &mut buffer, &event)
+                    .await
+                    .expect("the event writes");
+            } else {
+                StreamingProcessor::write_text_delta(&tx, &mut buffer, 0, &text)
+                    .await
+                    .expect("the delta writes");
+            }
+            assert!(
+                buffer.capacity() <= MESSAGES_FIRST_BLOCK,
+                "step {step}, as an event {as_event}: the block grew to {} bytes",
+                buffer.capacity()
+            );
+            // The frames stay held, as a connection that has not written them
+            // yet holds them: the stream's next block is a new one.
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame.expect("a frame"));
+            }
+        }
+        assert!(
+            frames.len() >= 3,
+            "as an event {as_event}: {} frames left",
+            frames.len()
+        );
+        for frame in &frames {
+            assert!(
+                frame.len() <= MESSAGES_FIRST_BLOCK
+                    && frame.len() + MESSAGES_EVENT_ROOM > MESSAGES_FIRST_BLOCK,
+                "as an event {as_event}: a frame of {} bytes",
+                frame.len()
+            );
+        }
+        let mut bytes: Vec<u8> = frames
+            .iter()
+            .flat_map(|frame| frame.iter().copied())
+            .collect();
+        bytes.extend_from_slice(&buffer);
+        assert_eq!(bytes, expected, "as an event {as_event}");
+    }
+}
+
+/// A text written plain between its quotes is the string serde writes: every
+/// byte under 0x80 alone, inside a text and doubled (the ones JSON escapes go
+/// through serde, the rest are written as they are), and text past ASCII.
+#[test]
+fn a_json_string_written_plain_is_the_string_serde_writes() {
+    let mut texts: Vec<String> = (0u8..0x80)
+        .flat_map(|byte| {
+            let character = char::from(byte);
+            [
+                character.to_string(),
+                format!("a{character}b"),
+                format!("{character}{character}"),
+            ]
+        })
+        .collect();
+    texts.extend(
+        [
+            "",
+            "plain words",
+            "caf\u{e9}",
+            "\u{80}",
+            "\u{2028}\u{2029}",
+            "\u{1f600} ok",
+            "tab\there \"quoted\" back\\slash",
+        ]
+        .map(String::from),
+    );
+    for text in &texts {
+        let mut written = BytesMut::new();
+        push_json_str(&mut written, text);
+        let expected = serde_json::to_vec(text).expect("a string serializes");
+        assert_eq!(written.to_vec(), expected, "{text:?}");
+    }
+}
+
 /// The one-pass `content_block_delta` frames write exactly the bytes of the
 /// serialized event, so the literal head can never drift from serde's walk of
 /// the two tagged enums: every string delta variant, several block indices and
@@ -694,7 +800,7 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
         "caf\u{e9} \u{1f600} \u{2028}",
         "{\"partial\": [1, 2",
     ];
-    for index in [0u32, 1, 7, 1234, u32::MAX] {
+    for index in [0u32, 1, 7, 9, 10, 1234, u32::MAX] {
         for text in texts {
             let deltas = [
                 ContentBlockDelta::TextDelta {
