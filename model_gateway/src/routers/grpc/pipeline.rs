@@ -709,11 +709,7 @@ impl RequestPipeline {
             .process(dctx, attempt_spec)
             .await
             .inspect_err(|response| {
-                error!(
-                    "Stage {} failed with status {}",
-                    self.stages.response_processing.name(),
-                    response.status()
-                );
+                log_response_stage_failure(self.stages.response_processing.name(), response);
             })
     }
 
@@ -1859,6 +1855,24 @@ fn generate_response_body(
         return GenerateBody::One(Box::new(responses.remove(0)));
     }
     GenerateBody::Many(responses)
+}
+
+/// A failure of the response stage, in the log: one ERROR line with the stage
+/// and the status. An answer whose line the stage wrote itself
+/// ([`ReportedRefusal`]: a request the wire's contract fails on the model's own
+/// output has its one WARN from there) gets a DEBUG line here, as an ingress
+/// stage's reported refusal does, so an outcome that is no failure of the
+/// gateway's is not logged as one.
+fn log_response_stage_failure(stage: &str, response: &Response) {
+    if response.extensions().get::<ReportedRefusal>().is_some() {
+        debug!(
+            "Stage {} answered with status {}; reported by the stage",
+            stage,
+            response.status()
+        );
+    } else {
+        error!("Stage {} failed with status {}", stage, response.status());
+    }
 }
 
 #[cfg(test)]

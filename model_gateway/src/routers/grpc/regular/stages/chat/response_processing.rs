@@ -116,15 +116,21 @@ impl ChatResponseProcessingStage {
             Err(failure) => {
                 // A failure that carries the engine's counters ends a request
                 // whose answer the engine completed (a tool call the reader
-                // could not read): the reservation is settled with them here,
-                // as the stream settles them, so the close of an unsettled
-                // reservation that follows a failed answer finds it settled
-                // and keeps no estimate in their place.
-                if let (Some(counts), Some(cell)) = (
-                    TokenCounts::carried_by(&failure),
-                    ctx.rate_limit_cell.as_deref(),
-                ) {
-                    cell.settle(counts.settlement()).await;
+                // could not read), as the stream that fails the same way
+                // ends. The dispatch is told the answer ended whole, with its
+                // counts: the lease takes its first end, so the failed
+                // attempt's release that follows charges the worker no
+                // failure and gives up no pair. And the reservation is
+                // settled with the counts here, so its close after a failed
+                // answer finds it settled and keeps no estimate in their
+                // place.
+                if let Some(counts) = TokenCounts::carried_by(&failure) {
+                    if let Some(placement) = ctx.placement() {
+                        placement.completed(counts.prompt, counts.completion);
+                    }
+                    if let Some(cell) = ctx.rate_limit_cell.as_deref() {
+                        cell.settle(counts.settlement()).await;
+                    }
                 }
                 return Err(failure);
             }

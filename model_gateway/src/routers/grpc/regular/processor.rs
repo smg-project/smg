@@ -23,6 +23,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
 use crate::{
+    middleware::ReportedRefusal,
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     routers::{
         common::retry::mark_non_retryable,
@@ -523,10 +524,14 @@ impl ResponseProcessor {
                 // answers it: one such choice fails the whole request. The
                 // engine completed the answer, so the failure carries the
                 // engine's counters for the request's settlement, as the
-                // stream settles them on the same failure.
+                // stream settles them on the same failure. Its one line is
+                // written here, and the answer says so, so the layers above
+                // write no second one at ERROR for an outcome that is the
+                // model's.
                 Ok(Err(ChoiceFailure::ToolCallFormat(failure))) => {
                     failure.warn(&dispatch.request_id, model);
                     let mut response = failure.response();
+                    response.extensions_mut().insert(ReportedRefusal);
                     response_formatting::TokenCounts::of_collected(
                         &all_responses,
                         chat_request.expected_choices,

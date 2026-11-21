@@ -449,3 +449,30 @@ async fn a_failure_in_the_server_class_keeps_the_pipelines_error_line() {
         "{lines:?}"
     );
 }
+
+/// A failure the response stage wrote the line for itself (a request the wire's contract fails
+/// on the model's own output, with its one WARN) is not the pipeline's ERROR: marked, its stage
+/// line stays at DEBUG, as an ingress stage's reported refusal does. An unmarked failure of the
+/// stage keeps its ERROR line.
+#[test]
+fn a_failure_the_response_stage_reported_is_not_the_pipelines_error_line() {
+    let lines = LinesAtWarnOrAbove::default();
+    let _subscriber = test_subscriber(lines.clone());
+
+    let mut reported = error::bad_request("invalid_tool_call_format", "the model's own");
+    reported.extensions_mut().insert(ReportedRefusal);
+    log_response_stage_failure("response_processing", &reported);
+    assert!(lines.lines().is_empty(), "{:?}", lines.lines());
+
+    let unreported = error::internal_error("process_choice_failed", "the gateway's own");
+    log_response_stage_failure("response_processing", &unreported);
+    let written = lines.lines();
+    assert_eq!(written.len(), 1, "{written:?}");
+    assert_eq!(written[0].0, Level::ERROR);
+    assert!(
+        written[0]
+            .1
+            .contains("Stage response_processing failed with status 500"),
+        "{written:?}"
+    );
+}
