@@ -112,9 +112,9 @@ pub(crate) async fn prepare_chat_like(
 
         // The media-part order and, for a request with media, the plan and
         // the placeholder tokens, resolved from the registries as the
-        // Messages stage resolves them (`utils::resolve_media`).
+        // Messages stage resolves them (`multimodal::resolve_media`).
         let model_id = ctx.input.model_id.as_str();
-        let media = utils::resolve_media(
+        let media = multimodal::resolve_media(
             &ctx.components,
             model_id,
             &*tokenizer,

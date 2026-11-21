@@ -244,7 +244,7 @@ impl MessagePreparationStage {
 mod tests {
     use axum::http::StatusCode;
 
-    use crate::routers::grpc::utils::message_utils::invalid_multimodal_request;
+    use crate::routers::grpc::multimodal::invalid_multimodal_request;
 
     #[test]
     fn invalid_multimodal_input_maps_to_bad_request() {

@@ -5,6 +5,8 @@
 //!
 //! - [`detect`]: find modalities and extract content parts from chat/messages.
 //! - [`config`]: model config-file registry and per-router component bundle.
+//! - [`resolve`]: what a request's media needs before the template renders:
+//!   the placeholder tokens for its plan and the model's media-part order.
 //! - [`process`]: fetch media → preprocess → expand placeholder tokens →
 //!   build the lightweight [`MultimodalIntermediate`].
 //! - [`assemble`]: turn the intermediate into backend-specific `MultimodalData`
@@ -15,20 +17,18 @@
 //! - [`refs`]: router-vs-worker processing resolution and the media-reference
 //!   payload for workers that process media themselves.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{
     hub::HubFetchError, AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame,
-    MediaConnectorError, MediaFault, Modality, MultiModalError, PlaceholderRange,
+    MediaConnectorError, MediaErrorCode, MediaFault, Modality, MultiModalError, PlaceholderRange,
     PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
 use crate::routers::{
-    common::retry::mark_non_retryable,
-    error,
-    grpc::{proto_wrapper::VLLM_MROPE_GRID_KEYS, utils::message_utils::invalid_multimodal_request},
+    common::retry::mark_non_retryable, error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS,
 };
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
@@ -65,6 +65,7 @@ mod pixel_cache;
 mod plan;
 mod process;
 mod refs;
+mod resolve;
 mod serialize;
 mod settings;
 mod transparency;
@@ -107,6 +108,7 @@ pub(crate) use refs::{
     worker_runs_gateway_pipeline, worker_supports_ec_transfer, MmProcessing, MmRefsError,
     GATEWAY_PIPELINE_PROCESSOR,
 };
+pub(crate) use resolve::{resolve_media, MediaContext, ResolvedMedia};
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transparency::engine_transparency_policy;
@@ -274,6 +276,16 @@ pub(crate) fn preparation_fault_response() -> Response {
         PIPELINE_CODE,
         "The gateway could not prepare media processing for this model; \
          the request is not at fault",
+    )
+}
+
+/// The 400 for media the request carries that cannot be prepared, under the
+/// media stage's code (`MediaErrorCode::InvalidRequest`, the one the media
+/// pipeline answers media refused as the request sent it under).
+pub(crate) fn invalid_multimodal_request(error: impl Display) -> Response {
+    error::bad_request(
+        MediaErrorCode::InvalidRequest.as_str(),
+        format!("Invalid multimodal request: {error}"),
     )
 }
 
