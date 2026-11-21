@@ -3,7 +3,7 @@ use std::{
     collections::{BinaryHeap, HashMap},
     hash::{BuildHasherDefault, Hasher},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Weak,
     },
 };
@@ -14,7 +14,7 @@ use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
+    common::{intern_tenant, MatchResult, TenantId, CANCEL_CHECK_EVERY, MATCHED_TENANTS_CAP},
     RadixTree,
 };
 use crate::snapshot::{SnapshotNode, TreeSnapshot};
@@ -349,6 +349,10 @@ pub struct Tree {
     /// named: the empty text ends there, every tenant holds it, and a
     /// repair page carries it as its first entry.
     hashed: DashMap<u64, Weak<Node>, FxBuildHasher>,
+    /// Whether the last eviction to end stopped before its hash sweep:
+    /// the next one sweeps, whether it finishes or stops too, so a sweep is
+    /// put off for one eviction in a row at most.
+    sweep_owed: AtomicBool,
 }
 
 // For the heap
@@ -515,6 +519,7 @@ impl Tree {
             ),
             total_char_count: AtomicUsize::new(0),
             hashed: DashMap::with_hasher(FxBuildHasher),
+            sweep_owed: AtomicBool::new(false),
         }
     }
 
@@ -1376,15 +1381,80 @@ impl Tree {
     /// on the tree-wide total (no single tenant has to exceed anything) and
     /// removes leaves in LRU order across tenants, least recently used first.
     pub fn evict_tenant_by_size(&self, max_size: usize) {
+        self.evict_tenant_by_size_until(max_size, &|| true);
+    }
+
+    /// [`Self::evict_tenant_by_size`] that stops early once `keep_going`
+    /// says so, asked once before it starts and every [`CANCEL_CHECK_EVERY`]
+    /// nodes walked or entries taken off its heap; whether it was stopped.
+    ///
+    /// `keep_going` must not insert into or evict from this tree. This walk
+    /// holds no node guard when it asks, but the token tree's does, and the
+    /// two share one contract. Reads are fine.
+    pub fn evict_tenant_by_size_until(
+        &self,
+        max_size: usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> bool {
         if self.total_char_size() <= max_size {
-            return;
+            return false;
+        }
+        if !keep_going() {
+            return true;
+        }
+        self.before_eviction();
+        let cancelled = self.evict_pass(max_size, keep_going);
+        self.after_eviction(cancelled);
+        cancelled
+    }
+
+    /// Once per eviction, before its passes.
+    fn before_eviction(&self) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!("Before eviction - Used size per tenant:");
+            for entry in &self.tenant_char_count {
+                debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
+            }
+        }
+    }
+
+    /// Once per eviction, after its passes (and their holds on the nodes)
+    /// are gone; `cancelled` when `keep_going` stopped it.
+    fn after_eviction(&self, cancelled: bool) {
+        // An entry whose node left without passing `forget_hash` (a record
+        // that crossed the node's detach) leaves here. A stopped eviction
+        // puts the sweep (a pass over the whole map) off so the stop lands at
+        // once, but one in a row at most: the next eviction sweeps whether it
+        // finishes or stops too, so the map outgrows the tree's hashed nodes
+        // by two evictions at most. Concurrency: the swap hands the owed sweep
+        // to exactly one of two stopped evictions, and a sweep clears it, so
+        // no two stopped evictions in a row both put it off.
+        if !cancelled || self.sweep_owed.swap(true, Ordering::Relaxed) {
+            self.sweep_owed.store(false, Ordering::Relaxed);
+            self.hashed.retain(|_, node| node.strong_count() > 0);
         }
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!("After eviction - Used size per tenant:");
+            for entry in &self.tenant_char_count {
+                debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
+            }
+        }
+    }
+
+    /// One eviction pass; whether `keep_going` stopped it (asked every
+    /// [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off the heap).
+    fn evict_pass(&self, max_size: usize, keep_going: &dyn Fn() -> bool) -> bool {
         // Collect leaves across all tenants
         let mut stack = vec![Arc::clone(&self.root)];
+        let mut walked = 0usize;
         let mut pq = BinaryHeap::new();
 
         while let Some(curr) = stack.pop() {
+            walked += 1;
+            if walked.is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
+                return true;
+            }
             for child in &curr.children {
                 stack.push(Arc::clone(child.value()));
             }
@@ -1406,16 +1476,16 @@ impl Tree {
             }
         }
 
-        debug!("Before eviction - Used size per tenant:");
-        for entry in &self.tenant_char_count {
-            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
-        }
-
         // Process eviction until the tree-wide total obeys the budget
+        let mut popped = 0usize;
         while self.total_char_size() > max_size {
             let Some(Reverse(entry)) = pq.pop() else {
                 break;
             };
+            popped += 1;
+            if popped.is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
+                return true;
+            }
             let EvictionEntry { tenant, node, .. } = entry;
 
             // Root is never eligible for eviction (re-enters via promotion)
@@ -1481,15 +1551,7 @@ impl Tree {
             }
         }
 
-        // An entry whose node left without passing `forget_hash` (a record
-        // that crossed the node's detach) leaves here, so the map never
-        // outgrows the tree's hashed nodes by more than one eviction pass.
-        self.hashed.retain(|_, node| node.strong_count() > 0);
-
-        debug!("After eviction - Used size per tenant:");
-        for entry in &self.tenant_char_count {
-            debug!("Tenant: {}, Size: {}", entry.key(), entry.value());
-        }
+        false
     }
 
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {

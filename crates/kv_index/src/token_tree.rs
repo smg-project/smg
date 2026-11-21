@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     sync::{
-        atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
         Arc, Weak,
     },
 };
@@ -27,7 +27,7 @@ use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
+    common::{intern_tenant, MatchResult, TenantId, CANCEL_CHECK_EVERY, MATCHED_TENANTS_CAP},
     RadixTree,
 };
 
@@ -431,6 +431,10 @@ pub struct TokenTree {
     /// second copy of the tokens; an entry leaves with its node, under the
     /// same eviction (see [`TokenTree::cleanup_empty_ancestors_with_parent`]).
     hashed: DashMap<u64, Weak<Node>, FxBuildHasher>,
+    /// Whether the last eviction to end stopped before its hash sweep:
+    /// the next one sweeps, whether it finishes or stops too, so a sweep is
+    /// put off for one eviction in a row at most.
+    sweep_owed: AtomicBool,
 }
 
 impl std::fmt::Debug for TokenTree {
@@ -487,6 +491,7 @@ impl TokenTree {
             eviction_policy: policy,
             page_size,
             hashed: DashMap::with_hasher(FxBuildHasher),
+            sweep_owed: AtomicBool::new(false),
         }
     }
 
@@ -1872,31 +1877,90 @@ impl TokenTree {
     /// first under LRU — using the same leaf-first machinery as
     /// [`Self::evict_tenant`].
     pub fn evict_tenant_by_size(&self, max_size: usize) {
-        use std::{cmp::Reverse, collections::BinaryHeap};
+        self.evict_tenant_by_size_until(max_size, &|| true);
+    }
 
+    /// [`Self::evict_tenant_by_size`] that stops early once `keep_going`
+    /// says so, asked once before it starts and every [`CANCEL_CHECK_EVERY`]
+    /// nodes walked or entries taken off its heap; whether it was stopped.
+    ///
+    /// `keep_going` must not insert into or evict from this tree: the walk
+    /// asks it while holding read guards on its ancestors' children, so such
+    /// a write waits on its own thread and never returns. Reads are fine.
+    pub fn evict_tenant_by_size_until(
+        &self,
+        max_size: usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> bool {
         let initial_total = self.total_token_size();
         if initial_total <= max_size {
-            return;
+            return false;
+        }
+        if !keep_going() {
+            return true;
+        }
+        let cancelled = self.evict_pass(max_size, keep_going);
+        self.after_eviction(initial_total, max_size, cancelled);
+        cancelled
+    }
+
+    /// Once per eviction, after its passes (and their holds on the nodes)
+    /// are gone; `cancelled` when `keep_going` stopped it.
+    fn after_eviction(&self, initial_total: usize, max_size: usize, cancelled: bool) {
+        // An entry whose node left without passing `forget_hash` (a record
+        // that crossed the node's detach) leaves here. A stopped eviction
+        // puts the sweep (a pass over the whole map) off so the stop lands at
+        // once, but one in a row at most: the next eviction sweeps whether it
+        // finishes or stops too, so the map outgrows the tree's hashed nodes
+        // by two evictions at most. Concurrency: the swap hands the owed sweep
+        // to exactly one of two stopped evictions, and a sweep clears it, so
+        // no two stopped evictions in a row both put it off.
+        if !cancelled || self.sweep_owed.swap(true, Ordering::Relaxed) {
+            self.sweep_owed.store(false, Ordering::Relaxed);
+            self.hashed.retain(|_, node| node.strong_count() > 0);
         }
 
-        let mut leaves: Vec<(NodeRef, TenantId, u64)> = Vec::new();
-        self.collect_all_tenant_leaves(&self.root, &mut leaves);
+        debug!(
+            evicted = initial_total.saturating_sub(self.total_token_size()),
+            remaining = self.total_token_size(),
+            max_size = max_size,
+            policy = ?self.eviction_policy,
+            "Evicted tokens to tree-wide budget (leaf-first)"
+        );
+    }
+
+    /// One eviction pass; whether `keep_going` stopped it (asked every
+    /// [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off the heap).
+    fn evict_pass(&self, max_size: usize, keep_going: &dyn Fn() -> bool) -> bool {
+        use std::{cmp::Reverse, collections::BinaryHeap};
 
         // Min-heap by eviction priority (policy-dependent), across all tenants
         let mut heap: BinaryHeap<Reverse<((i64, u64), usize)>> = BinaryHeap::new();
-        let mut leaf_data: Vec<(NodeRef, TenantId)> = Vec::with_capacity(leaves.len());
-
+        let mut leaf_data: Vec<(NodeRef, TenantId)> = Vec::new();
+        // Every leaf, its priority computed as it enters the heap.
+        let mut leaves: Vec<(NodeRef, TenantId, u64)> = Vec::new();
+        let mut walked = 0usize;
+        if !self.collect_all_tenant_leaves(&self.root, &mut leaves, &mut walked, keep_going) {
+            return true;
+        }
+        leaf_data.reserve(leaves.len());
         for (node, tenant, ts) in leaves.drain(..) {
             let priority = self.compute_eviction_priority(&node, ts);
-            let idx = leaf_data.len();
+            heap.push(Reverse((priority, leaf_data.len())));
             leaf_data.push((node, tenant));
-            heap.push(Reverse((priority, idx)));
         }
 
+        let mut cancelled = false;
+        let mut popped = 0usize;
         while self.total_token_size() > max_size {
             let Some(Reverse((_, idx))) = heap.pop() else {
                 break;
             };
+            popped += 1;
+            if popped.is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
+                cancelled = true;
+                break;
+            }
 
             let (node, tenant) = {
                 let (node, tenant) = &leaf_data[idx];
@@ -1925,33 +1989,32 @@ impl TokenTree {
         // first, so a node this pass detached counts as gone below.
         drop(heap);
         drop(leaf_data);
-        // An entry whose node left without passing `forget_hash` (a record
-        // that crossed the node's detach) leaves here, so the map never
-        // outgrows the tree's hashed nodes by more than one eviction pass.
-        self.hashed.retain(|_, node| node.strong_count() > 0);
-
-        debug!(
-            evicted = initial_total.saturating_sub(self.total_token_size()),
-            remaining = self.total_token_size(),
-            max_size = max_size,
-            policy = ?self.eviction_policy,
-            "Evicted tokens to tree-wide budget (leaf-first)"
-        );
+        cancelled
     }
 
-    /// Collect `(node, tenant, ts)` for every tenant-leaf of every tenant.
+    /// Collect `(node, tenant, ts)` for every tenant-leaf of every tenant;
+    /// `false` when `keep_going` stopped the walk (asked every
+    /// [`CANCEL_CHECK_EVERY`] nodes, counted in `walked`).
     fn collect_all_tenant_leaves(
         &self,
         node: &NodeRef,
         result: &mut Vec<(NodeRef, TenantId, u64)>,
-    ) {
+        walked: &mut usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> bool {
+        *walked += 1;
+        if (*walked).is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
+            return false;
+        }
         for child_entry in &node.children {
-            self.collect_all_tenant_leaves(child_entry.value(), result);
+            if !self.collect_all_tenant_leaves(child_entry.value(), result, walked, keep_going) {
+                return false;
+            }
         }
 
         // Root is never eligible for eviction
         if Arc::ptr_eq(node, &self.root) {
-            return;
+            return true;
         }
         for entry in &node.tenant_last_access_time {
             let tenant = entry.key();
@@ -1965,6 +2028,7 @@ impl TokenTree {
                 result.push((Arc::clone(node), Arc::clone(tenant), *entry.value()));
             }
         }
+        true
     }
 
     /// Lazily walk the tree in pre-order, yielding each node's
