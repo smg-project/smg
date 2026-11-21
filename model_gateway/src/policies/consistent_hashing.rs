@@ -235,6 +235,10 @@ impl LoadBalancingPolicy for ConsistentHashingPolicy {
         "consistent_hashing"
     }
 
+    fn honors_routing_key(&self) -> bool {
+        true
+    }
+
     /// A session key places the request on its ring owner. An explicit
     /// target worker outranks it, and the implicit client key
     /// (`x-forwarded-for`, `cookie`) identifies a client rather than a

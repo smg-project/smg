@@ -171,6 +171,18 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false
     }
 
+    /// Whether this policy places a request that carries a routing key by
+    /// that key itself, reading the header ahead of the key derived from
+    /// the request id as the sticky routing-key override does (`manual`,
+    /// `consistent_hashing`). The override leaves such a policy its own
+    /// handling and places a keyed request of every other policy. The
+    /// registry asks the policy, and never reads its name for it: a name is
+    /// a label, and a profile of a policy document may be called anything.
+    /// A constant for the policy's lifetime.
+    fn honors_routing_key(&self) -> bool {
+        false
+    }
+
     /// Drop the state this policy keeps on a removed worker (a load-aware
     /// policy's dispatch tally), so it does not accumulate under worker
     /// churn (autoscaling, rolling updates). Default is a no-op for

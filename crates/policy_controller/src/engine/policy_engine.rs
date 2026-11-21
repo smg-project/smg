@@ -44,7 +44,7 @@ use super::{
     framework::{AloneProfile, NotAlone, Picker, Place, PoolWord},
     view::Phase,
 };
-use crate::document::spec::AppliedSpec;
+use crate::{document::spec::AppliedSpec, names::intern};
 
 /// The engine of one policy document, for a gateway that decides in its own
 /// process.
@@ -140,6 +140,18 @@ impl PolicyEngine {
     #[must_use]
     pub fn place(&self, model: &str, phase: Phase) -> Place<'_> {
         self.spec.engine().place_for(model, phase)
+    }
+
+    /// The name of `profile` as the document writes it, as a label that
+    /// lives as long as the process: a caller that counts its picks under
+    /// the profile's name hands it to a metric. One allocation a distinct
+    /// name.
+    #[must_use]
+    pub fn profile_label(&self, profile: AloneProfile) -> &'static str {
+        let profiles = self.spec.engine().profiles();
+        profiles
+            .get(usize::from(profile.0))
+            .map_or("", |profile| intern(&profile.name))
     }
 
     /// The first place a binding of the document names whose profile the

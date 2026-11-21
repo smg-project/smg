@@ -558,11 +558,11 @@ mod tests {
         let default = policies.get_default_policy();
         assert_eq!(default.name(), "least_load");
         assert!(!default.as_any().is::<EnginePolicy>());
-        // A model the first binding names: the object, under the default's
-        // label, and its own object.
+        // A model the first binding names: its own object, labelled by its
+        // profile's name as the supplied document writes it.
         let alpha = policies.on_worker_added("alpha-1", None);
         assert!(alpha.as_any().is::<EnginePolicy>());
-        assert_eq!(alpha.name(), "least_load");
+        assert_eq!(alpha.name(), "by-turns");
         // Any other model: the default policy itself.
         let beta = policies.on_worker_added("beta-1", None);
         assert!(Arc::ptr_eq(&beta, &default));
@@ -585,9 +585,56 @@ mod tests {
         let labelled = settings.on_worker_added("alpha-1", Some("random"));
         assert_eq!(labelled.name(), "random");
         assert!(!labelled.as_any().is::<EnginePolicy>());
-        // No label: the model's own place, under either origin.
+        // No label: the model's own place, under either origin. Under the
+        // document the settings make the object keeps the classic policy's
+        // name.
         let plain = settings.on_worker_added("alpha-2", None);
         assert!(plain.as_any().is::<EnginePolicy>());
+        assert_eq!(plain.name(), "least_load");
+    }
+
+    /// A profile's name is a label and nothing reads it as a classic
+    /// policy's. The sticky routing-key override leaves the classic
+    /// `manual` policy its own handling of a key, and asks the policy for
+    /// that. An object whose profile a supplied document calls `manual`
+    /// turns a rotation, so the override places its keyed requests: one
+    /// key stays on one worker.
+    #[test]
+    fn a_profile_named_for_a_classic_policy_is_not_read_as_that_policy() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let profile = document
+            .profiles
+            .remove("round_robin")
+            .expect("the preset's profile");
+        document.profiles.insert("manual".to_string(), profile);
+        document.bindings[0].profile = Some("manual".to_string());
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let policies = PolicyRegistry::with_policy_engine(
+            config("round_robin"),
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..RoutingKeyOverrideConfig::default()
+            },
+            Arc::new(PolicyEngine::new(spec)),
+            DocumentOrigin::Supplied,
+        );
+        let policy = policies.get_default_policy();
+        assert!(policy.as_any().is::<EnginePolicy>());
+        assert_eq!(policy.name(), "manual");
+        assert!(!policy.honors_routing_key());
+
+        let (_registry, fleet) = fleet(4);
+        let keyed = SelectWorkerInfo {
+            routing_key: Some("one-conversation"),
+            ..SelectWorkerInfo::default()
+        };
+        let first = policies
+            .select_worker_for_model(&policy, MODEL, &fleet, &keyed)
+            .expect("a worker");
+        for _ in 0..4 {
+            let again = policies.select_worker_for_model(&policy, MODEL, &fleet, &keyed);
+            assert_eq!(again, Some(first), "the key's worker");
+        }
     }
 
     /// A model no binding of a supplied document names is placed by the

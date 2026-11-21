@@ -87,6 +87,21 @@ struct AskedEngine {
     origin: DocumentOrigin,
 }
 
+impl AskedEngine {
+    /// The label of the object that decides by `profile`, which the
+    /// selection counter counts under and the log names. Under a supplied
+    /// document it is the profile's name as the document writes it: the
+    /// settings' policy names nothing of that document. Under the document
+    /// the routing settings mean it is `classic`, the name of the classic
+    /// policy of the place, as ever.
+    fn label(&self, profile: AloneProfile, classic: &'static str) -> &'static str {
+        match self.origin {
+            DocumentOrigin::Settings => classic,
+            DocumentOrigin::Supplied => self.engine.profile_label(profile),
+        }
+    }
+}
+
 /// A place as the start log names it: the model, or every model, and the
 /// phase.
 struct Placed<'a> {
@@ -151,7 +166,7 @@ impl TextNeeds {
         Self::from_answers(
             policy.needs_request_text(),
             policy.needs_request_text_with_tokens(),
-            !PolicyRegistry::routing_key_override_applies(policy.name()),
+            policy.honors_routing_key(),
         )
     }
 
@@ -532,18 +547,19 @@ impl PolicyRegistry {
 
     /// The sticky routing-key override's selector, with the request's key and
     /// its source, when the override places this request: it is enabled,
-    /// `policy` does not honor the key itself (`manual` and
+    /// `policy` does not honor the key itself
+    /// ([`LoadBalancingPolicy::honors_routing_key`]: `manual` and
     /// `consistent_hashing` read `rid_key` and the header themselves with the
     /// same header-first precedence), and the request carries a key from a
     /// configured source. The one predicate the keyed path is entered by; the
-    /// policy's name is read only when the override is enabled.
+    /// policy is asked only when the override is enabled.
     fn sticky_for<'a>(
         &self,
         policy: &dyn LoadBalancingPolicy,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&Arc<ManualPolicy>, &'a str, &'static str)> {
         let sticky = self.routing_key_sticky.as_ref()?;
-        if !Self::routing_key_override_applies(policy.name()) {
+        if policy.honors_routing_key() {
             return None;
         }
         let (key, source) = self.effective_sticky_key(info)?;
@@ -684,13 +700,6 @@ impl PolicyRegistry {
 
         let (idx, branch) = sticky.assign_pin(workers, key, &healthy);
         finish(Some(idx), branch)
-    }
-
-    /// Policies that already honor the routing key keep their own handling
-    /// (they consult the header before `rid_key`, like the override does); all
-    /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
-    fn routing_key_override_applies(name: &str) -> bool {
-        !matches!(name, "manual" | "consistent_hashing")
     }
 
     /// Set KV event monitor (thread-safe, can be called after initialization).
@@ -1113,16 +1122,19 @@ impl PolicyRegistry {
     }
 
     /// The object that asks the engine under `profile`, which the engine
-    /// found for `place`, labelled `name`: the one site that builds it, and
-    /// the one line that says the engine decides a policy.
+    /// found for `place`: the one site that builds it, and the one line
+    /// that says the engine decides a policy. `name` is the classic policy
+    /// of the place, which labels the object under the document the
+    /// routing settings mean ([`AskedEngine::label`]).
     fn engine_object(
         asked: &AskedEngine,
         profile: AloneProfile,
         name: &'static str,
         place: &Placed<'_>,
     ) -> Arc<dyn LoadBalancingPolicy> {
-        info!("Policy `{name}` of {place}: the policy engine decides it");
-        Arc::new(EnginePolicy::of(&asked.engine, profile, name))
+        let label = asked.label(profile, name);
+        info!("Policy `{label}` of {place}: the policy engine decides it");
+        Arc::new(EnginePolicy::of(&asked.engine, profile, label))
     }
 
     /// Builds the policy of a pair's `side` from the side's own `config`
@@ -1549,13 +1561,16 @@ mod tests {
     fn override_eligibility_skips_key_native_policies() {
         // Policies that already honor X-SMG-Routing-Key are skipped; others (incl.
         // prefix_hash, which routes by tokens) get the sticky override.
-        assert!(PolicyRegistry::routing_key_override_applies("cache_aware"));
-        assert!(PolicyRegistry::routing_key_override_applies("prefix_hash"));
-        assert!(PolicyRegistry::routing_key_override_applies("least_load"));
-        assert!(!PolicyRegistry::routing_key_override_applies("manual"));
-        assert!(!PolicyRegistry::routing_key_override_applies(
-            "consistent_hashing"
-        ));
+        let honors = |name: &str| {
+            PolicyFactory::create_by_name(name)
+                .expect("a policy's name")
+                .honors_routing_key()
+        };
+        assert!(!honors("cache_aware"));
+        assert!(!honors("prefix_hash"));
+        assert!(!honors("least_load"));
+        assert!(honors("manual"));
+        assert!(honors("consistent_hashing"));
     }
 
     #[test]
@@ -1645,7 +1660,7 @@ mod tests {
             );
             let policy = reg.get_default_policy();
             let name = policy.name();
-            assert!(!PolicyRegistry::routing_key_override_applies(name));
+            assert!(policy.honors_routing_key(), "{name}");
             let workers = vec![
                 worker_of("http://w1", WorkerType::Regular),
                 worker_of("http://w2", WorkerType::Regular),
@@ -1792,11 +1807,11 @@ mod tests {
 
     /// The override's exemption is per policy: a sticky-exempt text policy
     /// (`consistent_hashing` honours the key itself and reads no text, so the
-    /// stand-in here is a test policy by that name) keeps the requirement
-    /// under a valid key where `cache_aware` loses it, as a per-model policy
-    /// beside the default; the requirement leaves with it. (No hint names
-    /// the stand-in, so it goes into the map directly and the test refreshes
-    /// what registration and removal refresh.)
+    /// stand-in here is a test policy that says the same of itself) keeps the
+    /// requirement under a valid key where `cache_aware` loses it, as a
+    /// per-model policy beside the default; the requirement leaves with it.
+    /// (No hint names the stand-in, so it goes into the map directly and the
+    /// test refreshes what registration and removal refresh.)
     #[test]
     fn text_requirement_under_a_key_counts_the_exempt_policies_only() {
         let reg = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
@@ -1836,7 +1851,8 @@ mod tests {
         );
     }
 
-    /// A text policy the routing-key override leaves alone (by name).
+    /// A text policy the routing-key override leaves alone: it says it
+    /// places a keyed request by the key itself.
     #[derive(Debug)]
     struct TextBesideIdsExempt;
 
@@ -1850,7 +1866,11 @@ mod tests {
         }
 
         fn name(&self) -> &'static str {
-            "consistent_hashing"
+            "text_by_its_own_key"
+        }
+
+        fn honors_routing_key(&self) -> bool {
+            true
         }
 
         fn needs_request_text(&self) -> bool {
