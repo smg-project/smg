@@ -728,9 +728,9 @@ fn a_single_generate_stream_records_its_dispatch_wait_with_its_ttft() {
     );
 }
 
-/// A stream whose entry point runs outside a request's entry stamp, as a turn
-/// of a Responses tool loop does (a spawned task dispatches it), has no entry
-/// to count from: it records its TTFT and no dispatch wait.
+/// A stream whose entry point runs outside any entry stamp, as a pipeline run
+/// bare does, has no entry to count from: it records its TTFT and no dispatch
+/// wait.
 #[test]
 fn a_stream_outside_an_entry_stamp_records_its_ttft_and_no_dispatch_wait() {
     let rendered = render_after(|| async {

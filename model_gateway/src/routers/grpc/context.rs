@@ -2282,7 +2282,7 @@ impl ExecutionResult {
 }
 
 /// A request's wait ahead of the dispatch its answer's clocks start at, as
-/// [`dispatch_wait`] reads it; `None` outside a request's entry stamp.
+/// [`dispatch_wait`] reads it; `None` when no entry stamp is in scope.
 pub(crate) type DispatchWait = Option<std::time::Duration>;
 
 /// The wait of the request whose answering attempt was dispatched at
@@ -2296,9 +2296,18 @@ pub(crate) type DispatchWait = Option<std::time::Duration>;
 /// run inside it, so they read the wait there, against the dispatch instant
 /// their stream's clocks start at, and hand it to the reading they build:
 /// the response body drives that reading once the request's future has
-/// returned, outside the scope. `None` outside a request's stamp: a turn of
-/// a Responses tool loop, which a spawned task dispatches, and a pipeline a
-/// test runs bare.
+/// returned, outside the scope.
+///
+/// A streamed Responses tool loop dispatches its generations from a task of
+/// its own and puts each of them under a stamp there: the first turn's under
+/// the request's own, a later turn's under one taken where that turn starts.
+/// A later turn's wait is therefore the gateway's time from the turn's start
+/// to its dispatch, with none of the generations and tool calls before it.
+///
+/// `None` when no stamp is in scope. Behind the edge every entry point that
+/// reads the wait runs under one. A pipeline a test runs bare has none, on
+/// any turn of a tool loop either, and its stream records its time to first
+/// token alone.
 pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
     let entered = RequestStarted::current()?;
     Some(dispatched.saturating_duration_since(entered))
