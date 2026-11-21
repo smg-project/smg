@@ -10,9 +10,12 @@
 //!
 //! The thought is the `analysis` message, the answer the `final` message, and a call a message
 //! whose header holds `to=functions.NAME`, on any channel, its body one JSON value. A
-//! `commentary` message with no recipient, and a message to a tool of the model's own
-//! (`to=python`, `to=browser`, `to=container`), read as the thought. Everything between two
-//! messages is framing.
+//! `commentary` message with no recipient, an `analysis` or `commentary` message to any other
+//! recipient, and a message to a tool of the model's own (`to=python`, `to=browser`,
+//! `to=container`) on any channel read as the thought. Everything between two messages is
+//! framing.
+//!
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -28,6 +31,8 @@ pub fn gpt_oss() -> Format {
         .terminal("analysis", "<|channel|>analysis<|message|>")
         .terminal("final", "<|channel|>final<|message|>")
         .terminal("preamble", "<|channel|>commentary<|message|>")
+        .terminal("analysis_to", "<|channel|>analysis")
+        .terminal("commentary_to", "<|channel|>commentary")
         .terminal("to_python", "to=python")
         .terminal("to_browser", "to=browser")
         .terminal("to_container", "to=container")
@@ -40,15 +45,29 @@ pub fn gpt_oss() -> Format {
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
         .state("call", Emits::Arguments)
+        .state("thought_header", Emits::Content)
         .state("aside", Emits::Content)
         .transition("message", "analysis", "reasoning")
         .transition("message", "final", "content")
         .transition("message", "preamble", "reasoning")
         .transition("message", "body", "content")
+        .transition("message", "analysis_to", "thought_header")
+        .transition("message", "commentary_to", "thought_header")
+        .transition("thought_header", "body", "reasoning")
+        .transition("thought_header", "call_open", "call")
+        .transition("thought_header", "analysis", "reasoning")
+        .transition("thought_header", "final", "content")
+        .transition("thought_header", "preamble", "reasoning")
         .transition("message", "to_python", "aside")
         .transition("message", "to_browser", "aside")
         .transition("message", "to_container", "aside")
+        .transition("thought_header", "to_python", "aside")
+        .transition("thought_header", "to_browser", "aside")
+        .transition("thought_header", "to_container", "aside")
         .transition("aside", "body", "reasoning")
+        .transition("aside", "analysis", "reasoning")
+        .transition("aside", "final", "reasoning")
+        .transition("aside", "preamble", "reasoning")
         .transition("reasoning", "end", "message")
         .transition("reasoning", "call_close", "message")
         .transition("content", "end", "message")
@@ -58,6 +77,7 @@ pub fn gpt_oss() -> Format {
         .transition("call", "start", "message")
         .calls(CallSyntax::Shaped(shape::intern(call_shape())))
         .framing("message")
+        .framing("thought_header")
         .framing("aside")
         .closes_at_stop("call")
         .turn_anchor("<|start|>assistant")
@@ -102,41 +122,107 @@ mod tests {
     use super::*;
     use crate::{adapt, engine::Engine, testing::drive, Declared};
 
-    /// Each turn reads as the Harmony token parser reads it: the thought, the answer, and a
-    /// call under either order of its header, the stop token hidden as the stop decoder hides it.
+    /// Each turn reads as the Harmony token parser reads it: the thought, the answer, a call
+    /// under either order of its header, and every header whose body is a thought, the stop
+    /// token hidden as the stop decoder hides it. The one turn it reads otherwise says so.
     #[test]
     fn a_turn_reads_as_the_harmony_parser_reads_it() {
         let call = ("get_weather", r#"{"city": "Paris"}"#);
-        let turns = [
+        let mut turns = vec![
             (
                 "<|channel|>analysis<|message|>Need the weather.<|end|><|start|>assistant\
                  <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
-                 {\"city\": \"Paris\"}",
+                 {\"city\": \"Paris\"}"
+                    .into(),
                 Some("Need the weather."),
                 None,
-                &[call][..],
+                vec![call],
             ),
             (
-                " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}",
+                " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}"
+                    .into(),
                 None,
                 None,
-                &[call][..],
+                vec![call],
+            ),
+            (
+                "<|channel|>analysis to=functions.get_weather <|constrain|>json<|message|>\
+                 {\"city\": \"Paris\"}"
+                    .into(),
+                None,
+                None,
+                vec![call],
+            ),
+            (
+                "<|channel|>commentary to=functions.get-weather.v2 json<|message|>{}".into(),
+                None,
+                None,
+                vec![("get-weather.v2", "{}")],
             ),
             (
                 "<|channel|>analysis<|message|>Think.<|end|><|start|>assistant<|channel|>final\
-                 <|message|>The answer.",
+                 <|message|>The answer."
+                    .into(),
                 Some("Think."),
                 Some("The answer."),
-                &[][..],
+                vec![],
+            ),
+            // Not the token parser's read: it takes a start marker in a call's body for the
+            // arguments' text. The table ends the call there, with no arguments.
+            (
+                "<|channel|>commentary to=functions.get_weather json<|message|><|start|>assistant"
+                    .into(),
+                None,
+                None,
+                vec![("get_weather", "")],
+            ),
+            // A preamble, then the call it announces.
+            (
+                "<|channel|>commentary<|message|>Looking it up.<|end|><|start|>assistant\
+                 <|channel|>commentary to=functions.get_weather json<|message|>\
+                 {\"city\": \"Paris\"}"
+                    .into(),
+                Some("Looking it up."),
+                None,
+                vec![call],
+            ),
+            // A recipient that is no function and no tool of the model's own: the channel decides.
+            (
+                "<|channel|>commentary to=repo_browser.print_tree <|constrain|>json<|message|>\
+                 {\"path\": \".\"}"
+                    .into(),
+                Some(r#"{"path": "."}"#),
+                None,
+                vec![],
             ),
             (
-                "<|channel|>commentary to=functions.get_weather json<|message|><|start|>assistant",
+                "<|channel|>analysis to=foo<|message|>Let me think.".into(),
+                Some("Let me think."),
                 None,
-                None,
-                &[("get_weather", "")][..],
+                vec![],
             ),
+            // A header that names no channel.
+            ("<|message|>Plain.".into(), None, Some("Plain."), vec![]),
         ];
+        // The model's own tools, under either order of the header and on either channel.
+        for tool in ["python", "browser", "container"] {
+            for header in [
+                format!(" to={tool}<|channel|>analysis<|message|>"),
+                format!("<|channel|>analysis to={tool} code<|message|>"),
+                format!(" to={tool}<|channel|>commentary code<|message|>"),
+            ] {
+                turns.push((
+                    format!(
+                        "{header}print(1)<|end|><|start|>assistant<|channel|>final<|message|>Done."
+                    ),
+                    Some("print(1)"),
+                    Some("Done."),
+                    vec![],
+                ));
+            }
+        }
         for (output, reasoning, content, calls) in turns {
+            let output = output.as_str();
             let mut engine = Engine::new(gpt_oss(), Declared::default());
             let events = drive(
                 &mut engine,

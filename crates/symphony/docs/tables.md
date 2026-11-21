@@ -1064,8 +1064,9 @@ call, the recipient `to=functions.NAME`, before the channel or after it, then an
   or marker, so a name with a dash or a dot is read whole.
 - **Everything between two messages is framing.** The headers, `<|start|>assistant` and a channel
   the table does not name are dropped; the body of an unnamed channel is content.
-- **A preamble and the model's own tools are the thought.** A commentary message with no recipient
-  and a message to `python`, `browser` or `container` read as reasoning, as the gateway's Harmony
+- **A preamble and the model's own tools are the thought.** A commentary message with no recipient,
+  a message to `python`, `browser` or `container` on any channel, and an analysis or commentary
+  message to any other recipient that is no function read as reasoning, as the gateway's Harmony
   pipeline reads them; every thought of a turn is kept, in order.
 - **The stop closes the last call.** `<|call|>` and `<|return|>` are stop tokens the stop decoder
   hides; a `<|start|>` inside a call's body ends the call where it stands.
