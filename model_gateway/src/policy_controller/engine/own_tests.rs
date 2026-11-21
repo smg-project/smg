@@ -62,9 +62,8 @@ fn own_dialed(name: &str, modes: &[ConnectionMode]) -> (PolicyEngine, Vec<Arc<dy
     (PolicyEngine::own(engine, registry), listed)
 }
 
-/// A ready worker of [`MODEL`] dialed on `mode`, the `at`-th, registered in
-/// `registry`.
-fn joined(registry: &WorkerRegistry, at: usize, mode: ConnectionMode) -> Arc<dyn Worker> {
+/// A ready worker of [`MODEL`] dialed on `mode`, the `at`-th.
+fn ready(at: usize, mode: ConnectionMode) -> Arc<dyn Worker> {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://worker-{at}:8000"))
             .model(ModelCard::new(MODEL))
@@ -73,6 +72,12 @@ fn joined(registry: &WorkerRegistry, at: usize, mode: ConnectionMode) -> Arc<dyn
             .build(),
     );
     worker.set_status(WorkerStatus::Ready);
+    worker
+}
+
+/// [`ready`], registered in `registry`.
+fn joined(registry: &WorkerRegistry, at: usize, mode: ConnectionMode) -> Arc<dyn Worker> {
+    let worker = ready(at, mode);
     assert!(registry.register(Arc::clone(&worker)).is_some());
     worker
 }
@@ -631,18 +636,18 @@ fn registry_of(policy_engine: &PolicyEngine) -> &WorkerRegistry {
     }
 }
 
-/// The places in `workers` of the workers that `asks` requests of one
-/// routing key are placed on, each place once. Every request is placed.
-async fn places_of_one_key(
+/// The places in `workers` of the workers that `asks` requests of the
+/// routing key `key` are placed on, each place once. Every request is
+/// placed.
+async fn places_of(
     policy_engine: &PolicyEngine,
     workers: &[Arc<dyn Worker>],
+    key: &str,
     asks: usize,
 ) -> Vec<usize> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-smg-routing-key",
-        HeaderValue::from_static("conversation"),
-    );
+    let key = HeaderValue::from_str(key).expect("a header value");
+    headers.insert("x-smg-routing-key", key);
     let mut places = Vec::new();
     for _ in 0..asks {
         let id = mark();
@@ -666,19 +671,18 @@ async fn places_of_one_key(
     places
 }
 
+const KEY: &str = "conversation";
+
 /// No request builds a list's hash ring and none waits for one: here
 /// nothing fills a ring but the case's own call, so a request that waited
-/// would never return. A keyed request ahead of its list's ring is placed,
-/// not refused, as one that carries no key: one key is handed more workers
-/// than one. Once the ring stands the key keeps one worker. A worker that
-/// joins makes another list, whose ring is owed again: the key's requests
-/// are placed meanwhile, and behind the fill the key keeps the worker it
-/// had, or the one that joined.
+/// would never return. A keyed request ahead of its model's first ring is
+/// placed, not refused, as one that carries no key: one key is handed more
+/// workers than one. Once the ring stands the key keeps one worker.
 #[tokio::test]
-async fn a_keyed_request_ahead_of_its_lists_ring_is_placed_and_keeps_one_worker_behind_it() {
-    let (policy_engine, mut workers) = own("consistent_hashing", 8);
+async fn a_keyed_request_ahead_of_its_models_first_ring_is_placed_and_keeps_one_worker_behind_it() {
+    let (policy_engine, workers) = own("consistent_hashing", 8);
     assert!(!policy_engine.rings_stand(MODEL));
-    let ahead = places_of_one_key(&policy_engine, &workers, 24).await;
+    let ahead = places_of(&policy_engine, &workers, KEY, 24).await;
     assert!(ahead.len() > 1, "one key, one worker: a ring placed it");
     assert!(
         !policy_engine.rings_stand(MODEL),
@@ -687,17 +691,81 @@ async fn a_keyed_request_ahead_of_its_lists_ring_is_placed_and_keeps_one_worker_
 
     assert!(policy_engine.fill_rings(MODEL));
     assert!(policy_engine.rings_stand(MODEL));
-    let kept = places_of_one_key(&policy_engine, &workers, 24).await;
+    let kept = places_of(&policy_engine, &workers, KEY, 24).await;
     assert_eq!(kept.len(), 1, "the key moved: {kept:?}");
+}
 
-    workers.push(joined(registry_of(&policy_engine), 8, ConnectionMode::Http));
-    assert!(!policy_engine.rings_stand(MODEL), "another list");
-    let ahead = places_of_one_key(&policy_engine, &workers, 24).await;
-    assert!(ahead.len() > 1, "one key, one worker: a ring placed it");
+/// A membership change publishes another list, whose ring is built off the
+/// path of a request. Until it stands, here for as long as the case holds
+/// the fill back, a keyed request is decided over the last membership whose
+/// ring stands and takes only a worker the list in force holds. A key keeps
+/// its worker across a join, across another worker's leave, and where its
+/// worker is replaced at its address. A worker that joined takes no keyed
+/// request. A key whose worker left goes to the next member of the ring:
+/// the one that takes the key while its worker is not ready. Once the ring
+/// of the list in force stands, the worker that joined takes its keys.
+#[tokio::test]
+async fn behind_a_membership_change_a_key_is_placed_by_the_ring_that_stands() {
+    let (policy_engine, mut workers) = own("consistent_hashing", 8);
+    let registry = registry_of(&policy_engine);
     assert!(policy_engine.fill_rings(MODEL));
-    let behind = places_of_one_key(&policy_engine, &workers, 24).await;
+    let kept = places_of(&policy_engine, &workers, KEY, 8).await;
+    let [owner] = kept[..] else {
+        panic!("the key moved: {kept:?}");
+    };
+    let keys: Vec<String> = (0..96).map(|key| format!("key-{key}")).collect();
+
+    // A worker joins: the ring of the list in force is owed from here on.
+    workers.push(joined(registry, 8, ConnectionMode::Http));
+    assert!(!policy_engine.rings_stand(MODEL));
+    let across_the_join = places_of(&policy_engine, &workers, KEY, 24).await;
+    assert_eq!(across_the_join, [owner]);
+    for key in &keys {
+        let placed = places_of(&policy_engine, &workers, key, 2).await;
+        assert_eq!(placed.len(), 1, "{key} moved: {placed:?}");
+        assert_ne!(placed, [8], "{key}: the worker that joined took it");
+    }
+
+    // Another worker leaves.
+    let other = (owner + 1) % 8;
+    assert!(registry.remove_by_url(workers[other].url()).is_some());
+    let across_the_leave = places_of(&policy_engine, &workers, KEY, 24).await;
+    assert_eq!(across_the_leave, [owner]);
+
+    // The key's worker is replaced at its address: the engine knows a
+    // worker by its address, and the key stays there.
+    let id = registry.get_id_by_url(workers[owner].url());
+    let replacing = ready(owner, ConnectionMode::Http);
+    assert!(registry.replace(&id.expect("the key's worker"), Arc::clone(&replacing)));
+    workers[owner] = replacing;
+    let across_the_replacement = places_of(&policy_engine, &workers, KEY, 24).await;
+    assert_eq!(across_the_replacement, [owner]);
+
+    // The key's worker leaves: the key goes to the next member of the ring.
+    workers[owner].set_status(WorkerStatus::NotReady);
+    let behind = places_of(&policy_engine, &workers, KEY, 8).await;
+    let [next] = behind[..] else {
+        panic!("the key spread: {behind:?}");
+    };
+    assert!(next != owner && next != other && next != 8);
+    workers[owner].set_status(WorkerStatus::Ready);
+    assert_eq!(places_of(&policy_engine, &workers, KEY, 8).await, [owner]);
+    assert!(registry.remove_by_url(workers[owner].url()).is_some());
+    let moved = places_of(&policy_engine, &workers, KEY, 24).await;
+    assert_eq!(moved, [next]);
+
+    // The ring of the list in force stands: the worker that joined takes
+    // its share of the keys.
+    assert!(policy_engine.fill_rings(MODEL));
+    assert!(policy_engine.rings_stand(MODEL));
+    let mut taken_by_the_joined = 0;
+    for key in &keys {
+        let placed = places_of(&policy_engine, &workers, key, 2).await;
+        assert_eq!(placed.len(), 1, "{key} moved: {placed:?}");
+        taken_by_the_joined += usize::from(placed == [8]);
+    }
     assert!(
-        behind == kept || behind == [8],
-        "the key had {kept:?} and has {behind:?}"
+        taken_by_the_joined > 0,
+        "the worker that joined took no key"
     );
 }

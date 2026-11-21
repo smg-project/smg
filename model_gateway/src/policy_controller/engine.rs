@@ -44,12 +44,14 @@ use std::{
     time::Instant,
 };
 
+use arc_swap::ArcSwap;
 use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 use parking_lot::Mutex;
 use rand::RngExt;
+use rustc_hash::FxHashMap;
 use smg_policy_controller::{
     document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
     engine::{
@@ -713,6 +715,56 @@ pub(crate) struct PolicyEngine {
     /// under a document that reads load reports
     /// ([`Self::read_loads`]).
     loads: loads::Loads,
+    /// The memberships whose hash rings stand, where the engine of this
+    /// process places by a ring.
+    standing: Standing,
+}
+
+/// The memberships whose hash rings stand, by model: for each model the
+/// engine of this process places by a ring, the registry's value of the
+/// last membership whose rings the fill built ([`PolicyEngine::fill_rings`]).
+///
+/// A membership change publishes another list, and that list's ring is
+/// built off the path of a request. An attempt that comes ahead of it is
+/// decided over the membership kept here, by its ring, and takes a worker
+/// of the list in force ([`stood_before`]): a key keeps its worker across
+/// the change, a key whose worker left goes to the next member of the ring,
+/// and a worker that joined takes no keyed request until its list's ring
+/// stands.
+///
+/// The fill alone writes, a whole map a time. A request reads with no lock,
+/// and only where the list in force has no ring yet.
+struct Standing {
+    /// Whether the document places a single request of some model by a
+    /// ring, read once where the object is made. `false` under a followed
+    /// controller and under a document with no ring: nothing is kept and no
+    /// request reads the map.
+    kept: bool,
+    memberships: ArcSwap<FxHashMap<Box<str>, Arc<ModelWorkerSnapshot>>>,
+}
+
+impl Standing {
+    fn new(kept: bool) -> Self {
+        Self {
+            kept,
+            memberships: ArcSwap::default(),
+        }
+    }
+
+    /// Keeps `membership`, whose rings the fill has built, as `model`'s. A
+    /// membership with no worker keeps none: the model's next list waits
+    /// for a ring of its own.
+    fn keep(&self, model: &str, membership: &Arc<ModelWorkerSnapshot>) {
+        self.memberships.rcu(|memberships| {
+            let mut memberships = FxHashMap::clone(memberships);
+            if membership.is_empty() {
+                memberships.remove(model);
+            } else {
+                memberships.insert(model.into(), Arc::clone(membership));
+            }
+            memberships
+        });
+    }
 }
 
 /// Where the policy engine finds the worker of a target.
@@ -737,6 +789,7 @@ impl PolicyEngine {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::Held(objects),
             loads: loads::Loads::default(),
+            standing: Standing::new(false),
         }
     }
 
@@ -744,10 +797,12 @@ impl PolicyEngine {
     /// `engine` decides over the lists `registry` publishes, and no store
     /// stands between them.
     pub(crate) fn own(engine: Arc<OwnEngine>, registry: Arc<WorkerRegistry>) -> Self {
+        let rings = engine.spec().engine().needs_for_phase(Phase::Single).ring;
         Self {
             door: Arc::new(Decider::Own(engine)),
             workers: Workers::Listed(registry),
             loads: loads::Loads::default(),
+            standing: Standing::new(rings),
         }
     }
 
@@ -853,6 +908,10 @@ impl PolicyEngine {
     /// engine keeps of it in the snapshot's cell, as a request finds it.
     /// A list that holds no worker takes no ring. Under a document that
     /// places the model by no ring nothing is made of its lists here.
+    ///
+    /// The membership whose rings were built is kept as the model's
+    /// ([`Standing`]): the attempts that come ahead of the next
+    /// membership's rings are decided over it.
     pub(crate) fn fill_rings(&self, model: &str) -> bool {
         let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) else {
             return false;
@@ -864,6 +923,7 @@ impl PolicyEngine {
                     engine.fill_ring(model, members_of(engine, &snapshot, pool));
                 }
             }
+            self.standing.keep(model, &snapshot);
         }
         true
     }
@@ -897,6 +957,7 @@ impl PolicyEngine {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::AtKey(registry),
             loads: loads::Loads::default(),
+            standing: Standing::new(false),
         }
     }
 
@@ -1523,6 +1584,15 @@ impl PolicyEngine {
     /// its candidates ahead of its policy. Such a list is a part of its
     /// pool ([`PoolMembers::part`]): nothing is kept of it, and the
     /// requests narrowed to one part take its workers in turn.
+    ///
+    /// Under a document that places by a hash ring, an attempt's first ask
+    /// can come ahead of the ring of the list in force, which is built off
+    /// the path of a request. It is then decided over the last membership
+    /// whose rings stand, and a target's worker is the one the list in
+    /// force holds at that worker's address ([`stood_before`]). Where no
+    /// target holds, the next ask is decided over the list in force. An ask
+    /// over a part of a pool, or over the workers on its wires, is decided
+    /// over that list as it is.
     fn place_listed(
         &self,
         registry: &WorkerRegistry,
@@ -1580,6 +1650,22 @@ impl PolicyEngine {
             // load reports: lent once, and every record of the decision is
             // read in it. The ask's instant was read before it.
             let lent = self.loads.lend();
+            // The first ask over the registry's own list is decided over
+            // the membership before it, where this list's ring is not
+            // built yet.
+            let stood = match (kept, &snapshot) {
+                (Some(in_force), Some((_, pool))) if first && dialed.is_none() => {
+                    stood_before(&self.standing, ask.model, *pool, in_force)
+                }
+                _ => None,
+            };
+            let members = stood.as_ref().and_then(Stood::members).or(members);
+            // The worker at a place of the list the ask is decided over,
+            // as the list in force holds it.
+            let at = |place: u32| match &stood {
+                Some(stood) => stood.worker(place),
+                None => list?.get(place as usize),
+            };
             let made = Made {
                 ask,
                 missed: &missed,
@@ -1615,7 +1701,7 @@ impl PolicyEngine {
                     // The engine picked the place in this list, on the
                     // read of the worker that found it eligible: the
                     // worker is read no second time.
-                    let Some(worker) = list.and_then(|list| list.get(pick.place as usize)) else {
+                    let Some(worker) = at(pick.place) else {
                         continue;
                     };
                     if holds(worker.as_ref()) {
@@ -1676,7 +1762,7 @@ impl PolicyEngine {
             let taken = match decision {
                 Decision::Pick(pick) => {
                     let taken = pick.targets.iter().enumerate().find_map(|(index, target)| {
-                        let worker = list?.get(target.position as usize)?;
+                        let worker = at(target.position)?;
                         // Ready and let through by its circuit breaker, as
                         // a commit over a store's rows asks
                         // (`routable_but_for_veto`), on one read.
@@ -1770,6 +1856,66 @@ fn members_of<'s>(
     snapshot
         .pool_members_cell(pool)
         .get_or_init(|| Box::new(engine.pool_members(list)))
+}
+
+/// The membership an attempt's first ask is decided over in the place of
+/// `in_force`, what the engine keeps of `pool`'s list of `model` as the
+/// registry publishes it: the last one whose rings the fill built
+/// ([`Standing`]). `None` where the ask is decided over the list in force:
+/// the document places by no ring, the list's own ring stands, or no ring
+/// of the model stands yet, as at its first requests.
+///
+/// One load of the kept map and one handle of the membership, and only for
+/// an ask that finds its list's ring not built.
+fn stood_before<'f>(
+    standing: &Standing,
+    model: &str,
+    pool: RoutingPool,
+    in_force: &'f PoolMembers,
+) -> Option<Stood<'f>> {
+    if !standing.kept || in_force.ring().get().is_some() {
+        return None;
+    }
+    let membership = Arc::clone(standing.memberships.load().get(model)?);
+    let stood = Stood {
+        membership,
+        pool,
+        in_force: in_force.workers(),
+    };
+    // A membership whose list of this pool took no ring decides nothing.
+    stood.members()?.ring().get()?;
+    Some(stood)
+}
+
+/// A membership whose rings stand, and the list in force that came after
+/// it: what an ask ahead of that list's ring is decided over
+/// ([`stood_before`]).
+struct Stood<'f> {
+    membership: Arc<ModelWorkerSnapshot>,
+    pool: RoutingPool,
+    in_force: &'f [Arc<dyn Worker>],
+}
+
+impl<'f> Stood<'f> {
+    /// What the engine keeps of the membership's list: the members the ask
+    /// is decided over, by their ring and their records.
+    fn members(&self) -> Option<&PoolMembers> {
+        let members = self.membership.pool_members_cell(self.pool).get()?;
+        Some(members)
+    }
+
+    /// The worker of the list in force at the address of the membership's
+    /// worker at `place`: that worker where it stayed, the one registered
+    /// at its address where it was replaced, and `None` where it left. A
+    /// worker's id is its address, so the engine knows the two by one id.
+    ///
+    /// One pass over the list in force by the object, and a second by the
+    /// address where the object is not on it.
+    fn worker(&self, place: u32) -> Option<&'f Arc<dyn Worker>> {
+        let stood = self.members()?.workers().get(place as usize)?;
+        let held = self.in_force.iter().find(|held| Arc::ptr_eq(held, stood));
+        held.or_else(|| self.in_force.iter().find(|held| held.url() == stood.url()))
+    }
 }
 
 /// A request's end, as its router read it.
