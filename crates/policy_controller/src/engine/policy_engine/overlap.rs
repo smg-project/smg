@@ -7,17 +7,19 @@
 //! in the gateway's index of its workers' cache events ([`CacheIndex`]) and
 //! on the worker objects. [`decide`] names a request's rows from them, hands
 //! them to the decision and, where the decision picked, writes the engine's
-//! record of the prefixes it sent.
+//! record of the prefixes it sent. A pair decision reads a column a side in
+//! the rows' place ([`AffinityFacts`]): [`column`] fills one from the same
+//! data, and [`sent`] writes the record behind the pair's pick.
 //!
 //! What is kept, and what guards it:
 //!
 //! - **Once a list of workers** ([`PoolAffinity`]): each worker's number in
-//!   the model's index and the list's warming rows by the profile's own
-//!   ruling ([`WarmUpRule`]). It is a ruling read from the index and the
-//!   worker objects, never a copy of a worker's health or load. One
-//!   decision reads it again at most once a second, behind one atomic flag,
-//!   and swaps it in by pointer. A decision loads the pointer and writes no
-//!   shared word.
+//!   the model's index, what the index held for it and when it was
+//!   admitted, and the list's warming rows by the profile's own ruling
+//!   ([`WarmUpRule`]). It is a ruling read from the index and the worker
+//!   objects, never a copy of a worker's health or load. One decision reads
+//!   it again at most once a second, behind one atomic flag, and swaps it in
+//!   by pointer. A decision loads the pointer and writes no shared word.
 //! - **Once a model** ([`Affinity`]): the record of the prefixes sent to the
 //!   workers the index does not speak for ([`PrefixPredictor`]), behind one
 //!   reader-writer lock. A naming takes it as a reader, and only where the
@@ -34,7 +36,7 @@
 
 use std::{
     cell::RefCell,
-    fmt,
+    fmt, mem,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -52,7 +54,9 @@ use crate::{
     document::spec::{AppliedSpec, IndexKind},
     engine::{
         decision::Decision,
-        view::{AffinityHolder, AffinityRows, HashKind, Phase, RequestFacts, WorkerId},
+        view::{
+            AffinityFacts, AffinityHolder, AffinityRows, HashKind, Phase, RequestFacts, WorkerId,
+        },
         warm_up::WarmUpState,
     },
     tracking::prefix_predictor::PrefixPredictor,
@@ -208,6 +212,16 @@ impl Affinity {
         }
     }
 
+    /// How many picks' prefixes the records left out, every model's
+    /// together: a write that met a held record at its first turn waits for
+    /// nobody and records nothing. For a host's own count beside its count
+    /// of decisions, never for a decision.
+    pub fn left_out(&self) -> u64 {
+        let records = self.sent.lock();
+        let left_out = |sent: &Arc<Sent>| sent.left_out.load(Ordering::Relaxed);
+        records.values().map(left_out).sum()
+    }
+
     /// The record of `model`, made at its first asking and held to `bound`
     /// placements.
     fn sent_of(&self, model: &str, bound: usize) -> Arc<Sent> {
@@ -239,6 +253,10 @@ struct Sent {
     /// How many workers were told gone. Written under the record's write
     /// guard: a write in parts stops where it moved since its naming.
     left: AtomicU64,
+    /// How many writes were left out whole, their first turn having met a
+    /// held lock. Written by such a write alone, so a pick that records
+    /// writes no shared word for it.
+    left_out: AtomicU64,
 }
 
 /// What a naming read of the record its pick may write.
@@ -253,6 +271,29 @@ struct RecordRead {
     left: u64,
 }
 
+/// What the fill of a column read of the record of sent prefixes
+/// ([`column`]). The write behind the pick made over that column stands on
+/// it ([`sent`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SentRead {
+    read: RecordRead,
+    /// The rows sent the record's deepest block of the request, the first
+    /// of them, as many as fit: a pick of one of them may be a repeat that
+    /// writes nothing.
+    deepest: [u32; Self::KEPT],
+}
+
+impl SentRead {
+    /// The deepest rows a read keeps. A pick of a row past them is written
+    /// again, which costs a write and moves nothing a reader can see.
+    const KEPT: usize = 8;
+}
+
+/// The record's tick at an instant of the decision clock: about a second.
+const fn tick_of(now_micros: u64) -> u16 {
+    (now_micros >> 20) as u16
+}
+
 impl Sent {
     /// A write gives the lock back after this many blocks.
     const SLICE: usize = 16;
@@ -265,6 +306,7 @@ impl Sent {
             bound: AtomicUsize::new(bound),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(0),
+            left_out: AtomicU64::new(0),
         }
     }
 
@@ -294,28 +336,35 @@ impl Sent {
         }
     }
 
-    /// Records the request of `keys` as sent to `target`, behind the naming
-    /// that read `read` and found `deepest` at the request's deepest block.
-    ///
-    /// A request the record already holds whole for the target, its end
-    /// used at this tick, writes nothing: the write would move nothing a
-    /// reader can see. Any other is written sixteen blocks a turn of the
-    /// lock. An entry is a prediction, so a write that meets a held lock at
-    /// its first turn is left out whole and waits for no thread; its later
-    /// turns wait, so a prompt begun is recorded to its end. A worker that
-    /// left since the naming stops the write: the record gives no place to
-    /// a worker told gone.
-    fn write(&self, keys: &[u64], deepest: &[WorkerId], read: RecordRead, target: WorkerId) {
-        if keys.is_empty() {
-            return;
+    /// Whether a pick behind `read` is a repeat that writes nothing: the
+    /// record already holds the whole request for the picked worker, its
+    /// end used at this tick, so a write would move nothing a reader can
+    /// see. `held` says the naming found the picked worker among those
+    /// sent the request's deepest block.
+    fn repeats(&self, read: RecordRead, held: bool) -> bool {
+        if !(read.whole && read.fresh && held) {
+            return false;
         }
-        if read.whole && read.fresh && deepest.contains(&target) {
-            // A fresh repeat need not wait for a writer to sweep.
-            if self.sweeping.load(Ordering::Relaxed) {
-                if let Some(mut record) = self.record.try_write() {
-                    self.sweep(&mut record);
-                }
+        // A fresh repeat need not wait for a writer to sweep.
+        if self.sweeping.load(Ordering::Relaxed) {
+            if let Some(mut record) = self.record.try_write() {
+                self.sweep(&mut record);
             }
+        }
+        true
+    }
+
+    /// Records the request of `keys` as sent to `target`, behind the naming
+    /// that read `read`. Not for a repeat ([`Self::repeats`]).
+    ///
+    /// The request is written sixteen blocks a turn of the lock. An entry
+    /// is a prediction, so a write that meets a held lock at its first turn
+    /// is left out whole and waits for no thread; its later turns wait, so
+    /// a prompt begun is recorded to its end. A worker that left since the
+    /// naming stops the write: the record gives no place to a worker told
+    /// gone.
+    fn write(&self, keys: &[u64], read: RecordRead, target: WorkerId) {
+        if keys.is_empty() {
             return;
         }
         let ends = (Self::SLICE..keys.len())
@@ -327,6 +376,7 @@ impl Sent {
             } else if let Some(record) = self.record.try_write() {
                 record
             } else {
+                self.left_out.fetch_add(1, Ordering::Relaxed);
                 return;
             };
             if self.left.load(Ordering::Relaxed) != read.left {
@@ -382,6 +432,18 @@ struct Table {
     /// The most rows of each list a decision is named: the profile's
     /// sample. `0` where the profile is named no row.
     cap: usize,
+    /// The place's stages read affinity. Where they do and the profile is
+    /// named no row, a single decision is handed the column whole.
+    reads: bool,
+    /// One entry a worker of the list, in the list's order: its age at the
+    /// read, the blocks the index held for it and what they gained since
+    /// its admission, and nothing held. A decision that takes a column
+    /// copies it, brings the ages to its own instant and writes its
+    /// request's holders over it. A decision reads these here, and not from
+    /// the index and the worker objects, because that costs a lookup a
+    /// worker where this costs one copy of the list. Empty where the stages
+    /// read no affinity.
+    column: Box<[AffinityFacts]>,
     /// The model's index of cache events, where it has one.
     index: Option<Arc<dyn CacheIndex>>,
     /// Index number -> row of the list.
@@ -418,6 +480,11 @@ fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Microseconds as a column's whole milliseconds, saturating.
+fn millis(micros: u64) -> u32 {
+    u32::try_from(micros / 1_000).unwrap_or(u32::MAX)
+}
+
 /// A count as a row's 32 bits, saturating.
 fn count(blocks: usize) -> u32 {
     u32::try_from(blocks).unwrap_or(u32::MAX)
@@ -431,29 +498,35 @@ fn set(mask: &mut [u64], at: usize) {
 }
 
 impl Table {
-    /// The table of `workers` for the decisions of `model` at `phase`, read
-    /// at `now`: one pass over the list. For each worker, its number in the
-    /// model's index (one lookup by address), the blocks the index holds
-    /// for it, what its index gained since its admission and its admission
-    /// instant. Then the profile's ruling of who warms, over those columns.
-    fn read(asked: &Asked<'_>, model: &str, phase: Phase, now: u64) -> Self {
+    /// The table of the list asked, for the decisions of its place, read at
+    /// the decision's instant: one pass over the list. For each worker, its
+    /// number in the model's index (one lookup by address), the blocks the
+    /// index holds for it, what its index gained since its admission and
+    /// its admission instant. Then the profile's ruling of who warms, over
+    /// those columns.
+    fn read(asked: &Asked<'_>) -> Self {
         let Asked {
             affinity,
             spec,
             workers,
             ids,
-            ..
+            model,
+            phase,
+            now,
         } = *asked;
         let engine = spec.engine();
         let cap = match engine.affinity_rows_cap(model, phase) {
             u32::MAX => usize::MAX,
             cap => cap as usize,
         };
+        let reads = cap != 0 || engine.needs_for(model, phase).affinity;
         let mut table = Self {
             model: model.into(),
             phase,
             read_at: now,
             cap,
+            reads,
+            column: Box::default(),
             index: None,
             row_of: Box::default(),
             within: Box::default(),
@@ -467,7 +540,7 @@ impl Table {
             ruled: WarmUpState::default(),
             first_end: u64::MAX,
         };
-        if cap == 0 {
+        if !reads {
             return table;
         }
         // The index is its workers' model's, by the id they registered
@@ -482,9 +555,12 @@ impl Table {
         let mut sizes = vec![0u32; rows];
         let mut growth = vec![0u32; rows];
         let mut admitted = vec![0u64; rows];
+        let mut column = vec![AffinityFacts::default(); rows];
         let mut numbered = 0usize;
         for (row, worker) in workers.iter().enumerate() {
-            admitted[row] = now.saturating_sub(micros(worker.admitted_age()));
+            let age = micros(worker.admitted_age());
+            admitted[row] = now.saturating_sub(age);
+            column[row].admitted_age_ms = millis(age);
             let Some(index) = &index else {
                 continue;
             };
@@ -498,8 +574,11 @@ impl Table {
             // The worker keeps its own baseline: what its index held when
             // this admission was first read.
             growth[row] = count(worker.warmup_growth(blocks));
+            column[row].indexed_blocks = sizes[row];
+            column[row].indexed_growth = growth[row];
             numbered = numbered.max(number as usize + 1);
         }
+        table.column = column.into();
         let mut row_of = vec![NONE; numbered];
         let mut within = vec![0u64; numbered.div_ceil(64)];
         let mut heard = vec![0u64; rows.div_ceil(64)];
@@ -549,9 +628,9 @@ impl Table {
         table
     }
 
-    /// Whether the table answers for the request's place.
-    fn is_of(&self, facts: &RequestFacts<'_>) -> bool {
-        self.phase == facts.phase && *self.model == *facts.model
+    /// Whether the table answers for the decisions of `model` at `phase`.
+    fn is_of(&self, model: &str, phase: Phase) -> bool {
+        self.phase == phase && *self.model == *model
     }
 
     /// Whether the index speaks for `row`.
@@ -591,6 +670,7 @@ impl Table {
             deepest,
             picked,
             live,
+            ..
         } = buffers;
         holders.clear();
         warming.clear();
@@ -638,12 +718,38 @@ impl Table {
         read
     }
 
+    /// Reads the record of sent prefixes for the request: the deepest block
+    /// of it that a worker the record speaks for was sent, as a count of
+    /// blocks, and the workers sent it, into `deepest`. The request's keys
+    /// are folded into `keys`. The record's lock is held as a reader for
+    /// the one read and given back before a row is chosen.
+    fn read_sent(
+        &self,
+        sent: &Sent,
+        facts: &RequestFacts<'_>,
+        keys: &mut Vec<u64>,
+        deepest: &mut Vec<WorkerId>,
+    ) -> (u32, RecordRead) {
+        PrefixPredictor::fold_into(keys, facts.namespace_seed, facts.block_hashes);
+        let tick = tick_of(facts.now_micros);
+        let usable = |id: WorkerId| self.spoken_row(id).is_some();
+        let record = sent.record.read();
+        let found = record.deepest_among(keys, &usable);
+        deepest.clear();
+        deepest.extend(found.holders());
+        let read = RecordRead {
+            tick,
+            whole: found.blocks() as usize == keys.len(),
+            fresh: found.fresh(tick),
+            left: sent.left.load(Ordering::Relaxed),
+        };
+        (found.blocks(), read)
+    }
+
     /// The record's holders of the request, behind the holders already
     /// named and in the room the cap leaves: the workers sent the deepest
     /// block of it that a worker the record speaks for was sent, a draw of
-    /// them where they would fill more than the room. The record's lock is
-    /// held as a reader for the one read and given back before the rows are
-    /// chosen.
+    /// them where they would fill more than the room.
     fn name_sent(
         &self,
         sent: &Sent,
@@ -653,23 +759,7 @@ impl Table {
         holders: &mut Vec<AffinityHolder>,
         draw: &mut Draw,
     ) -> RecordRead {
-        PrefixPredictor::fold_into(keys, facts.namespace_seed, facts.block_hashes);
-        // A tick is about a second of the decision clock.
-        let tick = (facts.now_micros >> 20) as u16;
-        let usable = |id: WorkerId| self.spoken_row(id).is_some();
-        let (blocks, read) = {
-            let record = sent.record.read();
-            let found = record.deepest_among(keys, &usable);
-            deepest.clear();
-            deepest.extend(found.holders());
-            let read = RecordRead {
-                tick,
-                whole: found.blocks() as usize == keys.len(),
-                fresh: found.fresh(tick),
-                left: sent.left.load(Ordering::Relaxed),
-            };
-            (found.blocks(), read)
-        };
+        let (blocks, read) = self.read_sent(sent, facts, keys, deepest);
         let base = holders.len();
         let room = self.cap.saturating_sub(base);
         if room == 0 {
@@ -736,6 +826,85 @@ impl Table {
         warming.extend(drawn.map(|&(row, _)| row));
         warming.sort_unstable();
     }
+
+    /// Fills `column`, one entry a worker of the list in the list's order:
+    /// what the table read of each worker, its age brought to the request's
+    /// instant, and over it what the request's holders hold.
+    ///
+    /// The index says what the rows it speaks for hold, every holder with
+    /// its own depth, in one lookup. The record of sent prefixes says it
+    /// for the others: the workers sent the deepest block of the request
+    /// that such a worker was sent. A column has an entry a row, so nothing
+    /// is capped and nothing drawn. As for the rows a decision is named,
+    /// the index is asked for a request hashed by token blocks alone and
+    /// the record for a request of either kind.
+    ///
+    /// Returns what was read of the record, where it was read: the pick's
+    /// write stands on it.
+    fn fill(
+        &self,
+        facts: &RequestFacts<'_>,
+        buffers: &mut Buffers,
+        column: &mut Vec<AffinityFacts>,
+    ) -> Option<SentRead> {
+        let Buffers {
+            kept,
+            keys,
+            deepest,
+            ..
+        } = buffers;
+        column.clear();
+        column.extend_from_slice(&self.column);
+        let later = millis(facts.now_micros.saturating_sub(self.read_at));
+        if later > 0 {
+            for entry in column.iter_mut() {
+                entry.admitted_age_ms = entry.admitted_age_ms.saturating_add(later);
+            }
+        }
+        if facts.block_hashes.is_empty() {
+            return None;
+        }
+        let tokens = facts.hash_kind == HashKind::Token;
+        let index = self.index.as_deref();
+        if let Some(index) = index.filter(|_| tokens && self.heard_any) {
+            // Every holder fits: the lookup cuts nothing and draws nothing.
+            index.deepest_into(
+                facts.block_hashes,
+                facts.block_size,
+                &self.within,
+                column.len(),
+                &mut |_| 0,
+                kept,
+            );
+            for &(number, blocks) in kept.iter() {
+                let row = self.row_of.get(number as usize).copied().unwrap_or(NONE);
+                if let Some(entry) = column.get_mut(row as usize) {
+                    entry.overlap_blocks = blocks;
+                }
+            }
+        }
+        // The record is read where it speaks for a row of the list.
+        let sent = self.sent.as_deref().filter(|_| self.unheard_any)?;
+        let (blocks, record) = self.read_sent(sent, facts, keys, deepest);
+        let mut read = SentRead {
+            read: record,
+            deepest: [NONE; SentRead::KEPT],
+        };
+        let mut named = 0usize;
+        for &id in deepest.iter() {
+            let Some(row) = self.spoken_row(id) else {
+                continue;
+            };
+            if let Some(entry) = column.get_mut(row as usize) {
+                entry.predicted_blocks = blocks;
+            }
+            if let Some(slot) = read.deepest.get_mut(named) {
+                *slot = row;
+            }
+            named += 1;
+        }
+        Some(read)
+    }
 }
 
 /// Whether the bit of `at` is set. A place past the mask's end is not.
@@ -759,6 +928,9 @@ struct Buffers {
     deepest: Vec<WorkerId>,
     picked: Vec<u32>,
     live: Vec<(u32, u64)>,
+    /// The column a single decision is handed where its profile is named
+    /// no row.
+    column: Vec<AffinityFacts>,
 }
 
 impl Buffers {
@@ -771,8 +943,19 @@ impl Buffers {
             deepest: Vec::new(),
             picked: Vec::new(),
             live: Vec::new(),
+            column: Vec::new(),
         }
     }
+}
+
+/// Runs `with` over the calling thread's buffers.
+fn with_buffers<T>(with: impl FnOnce(&mut Buffers) -> T) -> T {
+    BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
+        Ok(mut buffers) => with(&mut buffers),
+        // A stage asked for a decision from inside this one, on this
+        // thread: that decision takes buffers of its own.
+        Err(_) => with(&mut Buffers::new()),
+    })
 }
 
 thread_local! {
@@ -781,14 +964,19 @@ thread_local! {
     static BUFFERS: RefCell<Buffers> = const { RefCell::new(Buffers::new()) };
 }
 
-/// What one decision is asked over.
+/// The list one decision is made over and the place it is decided for.
 #[derive(Clone, Copy)]
 struct Asked<'a> {
     affinity: &'a Affinity,
     spec: &'a AppliedSpec,
     workers: &'a [Arc<dyn Worker>],
     ids: &'a [WorkerId],
-    facts: &'a RequestFacts<'a>,
+    /// The model as the request names it, and the phase the list is decided
+    /// at: a pair's request carries one phase for its two lists.
+    model: &'a str,
+    phase: Phase,
+    /// The decision's instant.
+    now: u64,
 }
 
 /// One single decision of a profile whose stages read affinity.
@@ -806,8 +994,11 @@ struct Asked<'a> {
 /// decision's instant ([`RequestFacts::now_micros`]) on the one clock of the
 /// engine's decisions.
 ///
-/// A profile that is named no row, and a request whose host filled a column
-/// or named rows itself, pass straight to `decide`.
+/// A profile whose stages read no affinity, and a request whose host filled
+/// a column or named rows itself, pass straight to `decide`. A profile that
+/// reads affinity and is named no row (it shows its rows to a plugin, whose
+/// stage reads the column whole) is handed the column [`column`] fills, in
+/// [`RequestFacts::affinity`].
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
@@ -831,52 +1022,124 @@ pub fn decide(
         spec,
         workers,
         ids,
-        facts,
+        model: facts.model,
+        phase: facts.phase,
+        now: facts.now_micros,
     };
-    BUFFERS.with(|buffers| match buffers.try_borrow_mut() {
-        Ok(mut buffers) => pool.decide(&asked, &mut buffers, decide),
-        // A stage asked for a decision from inside this one, on this
-        // thread: that decision takes buffers of its own.
-        Err(_) => pool.decide(&asked, &mut Buffers::new(), decide),
-    })
+    with_buffers(|buffers| pool.with_table(&asked, |table| table.decide(facts, buffers, decide)))
+}
+
+/// One list's column for a decision that reads a column in the rows' place:
+/// each side of a pair decision, by the side's own list and `phase`.
+///
+/// `column` is emptied and filled with one entry a worker of `workers`, in
+/// the list's order: the worker's age, what the model's index holds for it
+/// and what that gained since its admission, and what the worker holds of
+/// the request, by the index where the index speaks for the worker and by
+/// the record of sent prefixes where it does not. The caller hands the
+/// column to the side it was filled for and to no other.
+///
+/// The parameters are [`decide`]'s, and `phase` is the phase the list is
+/// decided at, which a pair's request does not carry for both its lists.
+/// Returns what was read of the record of sent prefixes, where the record
+/// speaks for a worker of the list: the caller hands it to [`sent`] behind
+/// the pick. Nothing is allocated once `column` and the calling thread's
+/// buffers have grown, but where a table is read.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the list as `decide` takes it, the phase a pair's request does not carry, and the column"
+)]
+pub fn column(
+    affinity: &Affinity,
+    pool: &PoolAffinity,
+    spec: &AppliedSpec,
+    workers: &[Arc<dyn Worker>],
+    ids: &[WorkerId],
+    phase: Phase,
+    facts: &RequestFacts<'_>,
+    column: &mut Vec<AffinityFacts>,
+) -> Option<SentRead> {
+    debug_assert_eq!(workers.len(), ids.len(), "one id a worker of the list");
+    let asked = Asked {
+        affinity,
+        spec,
+        workers,
+        ids,
+        model: facts.model,
+        phase,
+        now: facts.now_micros,
+    };
+    let read =
+        with_buffers(|buffers| pool.with_table(&asked, |table| table.fill(facts, buffers, column)));
+    // A place whose stages read no affinity keeps no table: every worker
+    // reads as holding nothing, just admitted.
+    column.resize(workers.len(), AffinityFacts::default());
+    read
+}
+
+/// Behind a pick made over a column ([`column`]): records the request's
+/// prefix as sent to the picked worker `id`, where the record of sent
+/// prefixes speaks for that worker. The record says where a prefix was
+/// decided to go.
+///
+/// `pool`, `phase` and `facts` are the ones the column was filled with, and
+/// `read` is what that fill returned. A worker the index speaks for, a
+/// worker that is not of the list, and a list whose table was since read
+/// for another place write nothing.
+pub fn sent(
+    pool: &PoolAffinity,
+    phase: Phase,
+    facts: &RequestFacts<'_>,
+    read: SentRead,
+    id: WorkerId,
+) {
+    let standing = pool.table.load();
+    let table = standing.as_deref();
+    let Some(table) = table.filter(|table| table.is_of(facts.model, phase)) else {
+        return;
+    };
+    let (Some(sent), Some(row)) = (table.sent.as_deref(), table.spoken_row(id)) else {
+        return;
+    };
+    if sent.repeats(read.read, read.deepest.contains(&row)) {
+        return;
+    }
+    with_buffers(|buffers| {
+        // The keys are the request's own, whichever list was filled last.
+        PrefixPredictor::fold_into(&mut buffers.keys, facts.namespace_seed, facts.block_hashes);
+        sent.write(&buffers.keys, read.read, id);
+    });
 }
 
 impl PoolAffinity {
-    /// [`decide`] over the list's table: the one that stands, or the one
-    /// this decision reads.
-    fn decide(
-        &self,
-        asked: &Asked<'_>,
-        buffers: &mut Buffers,
-        decide: impl FnOnce(&RequestFacts<'_>) -> Decision,
-    ) -> Decision {
-        let facts = asked.facts;
-        let now = facts.now_micros;
+    /// Runs `with` over the list's table for the place asked: the one that
+    /// stands, or the one this decision reads.
+    fn with_table<T>(&self, asked: &Asked<'_>, with: impl FnOnce(&Table) -> T) -> T {
         // The pointer is loaded with no shared write, and the table it
         // names stands while this decision reads it.
         let standing = self.table.load();
-        if let Some(table) = standing.as_deref().filter(|table| table.is_of(facts)) {
-            let stands = now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS;
+        let table = standing.as_deref();
+        if let Some(table) = table.filter(|table| table.is_of(asked.model, asked.phase)) {
+            let stands = asked.now.saturating_sub(table.read_at) < TABLE_STANDS_MICROS;
             // One decision reads a table again; the others decide by the
             // one that stands.
             if stands || self.reading.swap(true, Ordering::AcqRel) {
-                return table.decide(facts, buffers, decide);
+                return with(table);
             }
             let table = {
                 let _reading = Reading(&self.reading);
-                self.read(asked, now)
+                self.read(asked)
             };
-            return table.decide(facts, buffers, decide);
+            return with(&table);
         }
         // A list with no table of this place: each decision that meets it
         // reads one, and the last one swapped in stands.
-        self.read(asked, now).decide(facts, buffers, decide)
+        with(&self.read(asked))
     }
 
-    /// Reads the list's table at `now` and swaps it in.
-    fn read(&self, asked: &Asked<'_>, now: u64) -> Arc<Table> {
-        let facts = asked.facts;
-        let table = Arc::new(Table::read(asked, facts.model, facts.phase, now));
+    /// Reads the list's table at the decision's instant and swaps it in.
+    fn read(&self, asked: &Asked<'_>) -> Arc<Table> {
+        let table = Arc::new(Table::read(asked));
         self.table.store(Some(Arc::clone(&table)));
         table
     }
@@ -891,8 +1154,11 @@ impl Table {
         buffers: &mut Buffers,
         decide: impl FnOnce(&RequestFacts<'_>) -> Decision,
     ) -> Decision {
-        if self.cap == 0 {
+        if !self.reads {
             return decide(facts);
+        }
+        if self.cap == 0 {
+            return self.decide_by_column(facts, buffers, decide);
         }
         let read = self.name(facts, buffers);
         let decision = decide(&RequestFacts {
@@ -910,8 +1176,40 @@ impl Table {
         let target = decision.pick().and_then(|pick| pick.targets.first());
         // The index speaks for a worker whose cache events are heard: the
         // record takes no entry for it.
-        if let Some(target) = target.filter(|target| !self.heard(target.position)) {
-            sent.write(&buffers.keys, &buffers.deepest, read, target.id);
+        let Some(target) = target.filter(|target| !self.heard(target.position)) else {
+            return decision;
+        };
+        if !sent.repeats(read, buffers.deepest.contains(&target.id)) {
+            sent.write(&buffers.keys, read, target.id);
+        }
+        decision
+    }
+
+    /// One decision of a profile that reads the column whole: the fill, the
+    /// decision over the column, and the record's write behind a pick.
+    fn decide_by_column(
+        &self,
+        facts: &RequestFacts<'_>,
+        buffers: &mut Buffers,
+        decide: impl FnOnce(&RequestFacts<'_>) -> Decision,
+    ) -> Decision {
+        // The column leaves the buffers while the fill writes the others.
+        let mut column = mem::take(&mut buffers.column);
+        let read = self.fill(facts, buffers, &mut column);
+        let decision = decide(&RequestFacts {
+            affinity: &column,
+            ..*facts
+        });
+        buffers.column = column;
+        let (Some(read), Some(sent)) = (read, self.sent.as_deref()) else {
+            return decision;
+        };
+        let target = decision.pick().and_then(|pick| pick.targets.first());
+        let Some(target) = target.filter(|target| !self.heard(target.position)) else {
+            return decision;
+        };
+        if !sent.repeats(read.read, read.deepest.contains(&target.position)) {
+            sent.write(&buffers.keys, read.read, target.id);
         }
         decision
     }

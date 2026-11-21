@@ -228,6 +228,44 @@ impl Bed {
         let named = self.decide(&request(prompt, 7, now), None);
         named.expect("rows named").holders
     }
+
+    /// The list's column for `facts` at `phase`, and what its fill read of
+    /// the record of sent prefixes.
+    fn column(
+        &self,
+        facts: &RequestFacts<'_>,
+        phase: Phase,
+    ) -> (Vec<AffinityFacts>, Option<SentRead>) {
+        let mut filled = vec![AffinityFacts {
+            overlap_blocks: 99,
+            ..AffinityFacts::default()
+        }];
+        let read = column(
+            &self.affinity,
+            &self.pool,
+            &self.spec,
+            &self.workers,
+            &self.ids,
+            phase,
+            facts,
+            &mut filled,
+        );
+        (filled, read)
+    }
+}
+
+/// The cache-aware preset on both sides of the pair plan.
+fn paired() -> AppliedSpec {
+    let mut document =
+        PolicySpec::pair_presets("cache_aware", "cache_aware").expect("the pair presets");
+    document.generation = 1;
+    AppliedSpec::validate(&document).expect("the pair document validates")
+}
+
+/// What each row of a column holds: by the index, then by the record.
+fn held(column: &[AffinityFacts]) -> Vec<(u32, u32)> {
+    let held = |row: &AffinityFacts| (row.overlap_blocks, row.predicted_blocks);
+    column.iter().map(held).collect()
 }
 
 /// The request's token blocks hash as an engine's stored blocks do: the
@@ -500,4 +538,152 @@ fn the_engine_decides_by_the_rows_named() {
             assert_eq!(place(seed), first, "indexed: {indexed}, seed {seed}");
         }
     }
+}
+
+/// A pair side's column holds one entry a worker of the side's list, in the
+/// list's order: the leading blocks of the request the worker holds by the
+/// index, what the index holds for the worker and what that gained since
+/// its admission, and the worker's age at the request's instant.
+#[test]
+fn a_sides_column_holds_each_workers_facts_and_what_it_holds_of_the_request() {
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    let hashes = hashes_of(&asked);
+    store(&index, 0, &hashes[..2]);
+    store(&index, 2, &hashes);
+    store(&index, 2, &hashes_of(&prompt(9_000, 3)));
+    let bed = Bed::new(affinity, paired(), 4);
+    let indexed = |column: &[AffinityFacts]| -> Vec<(u32, u32)> {
+        let indexed = |row: &AffinityFacts| (row.indexed_blocks, row.indexed_growth);
+        column.iter().map(indexed).collect()
+    };
+    let (first, _) = bed.column(&request(&asked, 7, NOW), Phase::Prefill);
+    assert_eq!(held(&first), [(2, 0), (0, 0), (4, 0), (0, 0)]);
+    assert_eq!(indexed(&first), [(2, 0), (0, 0), (7, 0), (0, 0)]);
+    // Half a second on, by the table that stands, each worker is half a
+    // second older.
+    let (second, _) = bed.column(&request(&asked, 7, NOW + SECOND / 2), Phase::Prefill);
+    for (then, later) in first.iter().zip(&second) {
+        assert_eq!(later.admitted_age_ms, then.admitted_age_ms + 500);
+    }
+    // The table read a second on holds what the index gained since.
+    store(&index, 0, &hashes_of(&prompt(5_000, 5)));
+    let (third, _) = bed.column(&request(&asked, 7, NOW + SECOND), Phase::Prefill);
+    assert_eq!(indexed(&third), [(7, 5), (0, 0), (7, 0), (0, 0)]);
+    assert_eq!(held(&third), held(&first));
+    // A request hashed by nothing is held by nobody, and its column is whole.
+    let bare = RequestFacts {
+        model: MODEL,
+        now_micros: NOW + SECOND,
+        ..RequestFacts::default()
+    };
+    assert_eq!(held(&bed.column(&bare, Phase::Prefill).0), [(0, 0); 4]);
+}
+
+/// With no index the record of sent prefixes speaks for a pair side's
+/// workers: a pick written behind a column is what the side's next column
+/// holds for its worker, and the two lists of a pair keep their workers
+/// apart in the model's one record.
+#[test]
+fn a_sides_pick_is_recorded_and_its_next_column_holds_it() {
+    let (affinity, _, _) = hosted(false);
+    let prefills = Bed::new(affinity, paired(), 4);
+    let asked = prompt(1_000, 4);
+    let facts = request(&asked, 7, NOW);
+    let (column_of, read) = prefills.column(&facts, Phase::Prefill);
+    assert_eq!(held(&column_of), [(0, 0); 4]);
+    let read = read.expect("the record speaks for the prefills");
+    sent(
+        &prefills.pool,
+        Phase::Prefill,
+        &facts,
+        read,
+        prefills.ids[1],
+    );
+    let sent_to_one = [(0, 0), (0, 4), (0, 0), (0, 0)];
+    let (column_of, read) = prefills.column(&facts, Phase::Prefill);
+    assert_eq!(held(&column_of), sent_to_one);
+    // A worker that is not of the list writes nothing, and neither does a
+    // write for another place than the list's table stands for.
+    let read = read.expect("the record speaks for the prefills");
+    sent(&prefills.pool, Phase::Prefill, &facts, read, WorkerId(999));
+    sent(&prefills.pool, Phase::Decode, &facts, read, prefills.ids[2]);
+    assert_eq!(
+        held(&prefills.column(&facts, Phase::Prefill).0),
+        sent_to_one
+    );
+    // The decodes are another list of the model, with workers of their own.
+    let decode_pool = PoolAffinity::default();
+    let (decodes, _) = pool(3);
+    let decode_ids: Vec<WorkerId> = (100..103).map(WorkerId).collect();
+    let mut filled = Vec::new();
+    let mut decode_column = || {
+        let read = column(
+            &prefills.affinity,
+            &decode_pool,
+            &prefills.spec,
+            &decodes,
+            &decode_ids,
+            Phase::Decode,
+            &facts,
+            &mut filled,
+        );
+        (held(&filled), read)
+    };
+    let (holds, read) = decode_column();
+    assert_eq!(holds, [(0, 0); 3]);
+    let read = read.expect("the record speaks for the decodes");
+    sent(&decode_pool, Phase::Decode, &facts, read, decode_ids[2]);
+    assert_eq!(decode_column().0, [(0, 0), (0, 0), (0, 4)]);
+    assert_eq!(
+        held(&prefills.column(&facts, Phase::Prefill).0),
+        sent_to_one
+    );
+    assert_eq!(prefills.affinity.left_out(), 0);
+}
+
+/// A profile that reads affinity and is named no row is handed the column
+/// whole: here its two warm-up stages rule by different windows, so no one
+/// ruling names its warming rows.
+#[test]
+fn a_profile_named_no_row_is_handed_the_column() {
+    let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .get_mut("cache_aware")
+        .expect("the preset's profile");
+    profile.score.push(
+        ScoreStage::WarmupSlice(WarmupSliceParams {
+            weight: 1.0,
+            secs: Some(7),
+            ..WarmupSliceParams::default()
+        })
+        .into(),
+    );
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    assert_eq!(spec.engine().affinity_rows_cap(MODEL, Phase::Single), 0);
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 2, &hashes_of(&asked));
+    let bed = Bed::new(affinity, spec, 4);
+    let mut seen = None;
+    let decision = decide(
+        &bed.affinity,
+        &bed.pool,
+        &bed.spec,
+        &bed.workers,
+        &bed.ids,
+        &request(&asked, 7, NOW),
+        |facts| {
+            assert!(facts.named.is_none());
+            seen = Some(held(facts.affinity));
+            shed()
+        },
+    );
+    assert!(decision.pick().is_none());
+    let seen = seen.expect("a decision");
+    assert_eq!(seen, [(0, 0), (0, 0), (4, 0), (0, 0)]);
 }
