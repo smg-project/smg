@@ -427,8 +427,9 @@ const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// A thread's first text at least this long has the merge table read before
 /// it (`NativeEncoder::piece_cache_for_text`): the read is half the time of
 /// a first 9 KiB text and a small part of a first 150 KiB one, which runs
-/// as before (measured).
-const READ_AT_ONCE_BYTES: usize = 64 << 10;
+/// as before (measured). It is `PARALLEL_MIN_BYTES`: the pool takes only a
+/// text that long, so a thread of the pool reads before its first unit.
+const READ_AT_ONCE_BYTES: usize = PARALLEL_MIN_BYTES;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
@@ -627,7 +628,7 @@ struct PieceCache {
     /// rests asks again; zero for a thread that does not rest.
     asks_from: usize,
     /// The calls up to the one that reads the merge table through
-    /// (`NativeEncoder::piece_cache_for_call`): two in a new cache, zero
+    /// (`NativeEncoder::piece_cache_for_text`): two in a new cache, zero
     /// once the table is read.
     calls_to_read: u8,
 }
@@ -4626,21 +4627,9 @@ impl NativeEncoder {
     /// compares per call at the most. A call that ended on
     /// a declined piece or unwound left its waiting pieces behind
     /// (`Self::waits`): they are dropped here, their holes stood in ids
-    /// that are gone. The thread's second call reads the merge table
-    /// through once (`MergeTable::read_through`), so the first-sight pieces
-    /// of the calls after it find the table's lines in the caches; its
-    /// first call does not, the read is most of the time of a short first
-    /// encode and only the encodes after it pay it back.
+    /// that are gone.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
-        if cache.calls_to_read > 0 {
-            cache.calls_to_read -= 1;
-            if cache.calls_to_read == 0 {
-                if let Some(merges) = &self.merges {
-                    merges.read_through();
-                }
-            }
-        }
         let share = self.piece_cache_share();
         cache.shares =
             cache.clears > 0 && self.enough_callers() && cache.short_entries() >= cache.asks_from;
@@ -4662,14 +4651,26 @@ impl NativeEncoder {
     }
 
     /// [`Self::piece_cache_for_call`] for a call that encodes a text of
-    /// `bytes` bytes, or a unit of one: a text of [`READ_AT_ONCE_BYTES`] or
-    /// more has the merge table read before it at the thread's first call
-    /// too.
+    /// `bytes` bytes, or a unit of one. The thread's second call reads the
+    /// merge table through once (`MergeTable::read_through`), so the
+    /// first-sight pieces of the calls after it find the table's lines in
+    /// the caches; its first call does not, the read is most of the time of
+    /// a short first encode and only the encodes after it pay it back. A
+    /// first text of [`READ_AT_ONCE_BYTES`] or more has the read before it.
+    /// A call is one call of the encoder, not one prompt: a prompt encoded
+    /// by segments is several, and has the read before its second.
     fn piece_cache_for_text(&self, bytes: usize) -> RefMut<'_, PieceCache> {
         let mut cache = self.piece_cache_for_call();
-        if bytes >= READ_AT_ONCE_BYTES && std::mem::take(&mut cache.calls_to_read) > 0 {
-            if let Some(merges) = &self.merges {
-                merges.read_through();
+        if cache.calls_to_read > 0 {
+            cache.calls_to_read = if bytes >= READ_AT_ONCE_BYTES {
+                0
+            } else {
+                cache.calls_to_read - 1
+            };
+            if cache.calls_to_read == 0 {
+                if let Some(merges) = &self.merges {
+                    merges.read_through();
+                }
             }
         }
         cache
