@@ -17,7 +17,7 @@ use crate::{
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Engines, PoolFacts, RequestFacts},
     },
-    stages::builtins::{draw_best, target_of},
+    stages::pickers::{draw_best, target_of},
     Draw,
 };
 

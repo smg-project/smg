@@ -8,7 +8,7 @@ use crate::{
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::target_of,
+    stages::pickers::target_of,
     tracking::lease::Lifecycle,
     Draw,
 };
@@ -93,7 +93,7 @@ impl Picker for Passthrough {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::builtins::tests::candidate;
+    use crate::stages::scorers::tests::candidate;
 
     #[test]
     fn passthrough_keeps_the_hosts_order() {

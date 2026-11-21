@@ -23,7 +23,7 @@
 //! today. A share-weighted sum cannot hold a deeper holder ahead of a lighter
 //! one, which is the rule the preset keeps.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -36,13 +36,15 @@ use crate::{
     engine::{
         decision::{Overlap, OverlapSource},
         framework::{Front, Scorer, Spread, TieBand},
+        prefix_pass::{keep_prefix_pass, take_prefix_pass, withdraw_prefix_pass, PrefixStageId},
         view::{
-            mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow, NamedAffinity,
-            Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
+            blocks_within, mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow,
+            NamedAffinity, Phase, RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
         },
+        warm_up::WarmRule,
     },
     policies::standard_filters,
-    stages::builtins::ReadsLoad,
+    stages::scorers::ReadsLoad,
     tracking::{
         counts::with_counts,
         lease::{Lifecycle, Membership},
@@ -165,18 +167,6 @@ impl Default for Gates {
             block_size: DEFAULT_BLOCK_SIZE,
         }
     }
-}
-
-/// How many whole blocks of `block_size` lie within the first `tokens`
-/// tokens of a request hashed in `kind`: the tokens over the block size,
-/// under the text kind their bytes over the window's size in bytes. A
-/// block size is one at least.
-pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
-    let units = match kind {
-        HashKind::Token => tokens,
-        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
-    };
-    units / block_size
 }
 
 impl Gates {
@@ -421,54 +411,6 @@ fn neutral(out: &mut [f32]) -> TieBand {
     TieBand(0.0)
 }
 
-/// What a pass of a prefix stage judged its rows by, kept for the word the
-/// stage says of a pick behind its decision ([`Scorer::said`]). A scorer's
-/// call is handed no scratch of its decision's, and the pick is made
-/// behind it, so the two numbers wait in a slot of the thread. That rests
-/// on a decision that runs on one thread from its priced pass to its word,
-/// which holds while the engine's decision never waits.
-///
-/// The engine clears the slot ahead of a decision whose overlap it states
-/// ([`forget_judged`]). A pass writes it only where it prices the held
-/// prefix. The first stage of a decision to write it keeps it: the engine
-/// asks a profile's first prefix stage, and a later stage's pass is no
-/// word of that one. A later pass of the same stage writes over its own
-/// word, and one that orders nothing under the fleet's KV gate takes it
-/// back, so the word left is of the stage's last pass.
-#[derive(Clone, Copy)]
-struct Judged {
-    /// The stage that judged ([`PrefixAffinity::id`]): a profile may hold
-    /// two, and one's pass is no word of the other's.
-    by: u32,
-    /// The deepest match of the rows judged, in blocks.
-    best: u32,
-    /// The mean in flight the spill gate read.
-    mean: f32,
-}
-
-impl Judged {
-    /// No pass judged: no stage's number, and a match no row holds.
-    const NONE: Self = Self {
-        by: 0,
-        best: 0,
-        mean: 0.0,
-    };
-}
-
-thread_local! {
-    static JUDGED: std::cell::Cell<Judged> = const { std::cell::Cell::new(Judged::NONE) };
-}
-
-/// Forgets what a pass on this thread judged by: a decision no pass
-/// judged for then says that no margin held.
-pub(crate) fn forget_judged() {
-    JUDGED.set(Judged::NONE);
-}
-
-/// The number the next prefix stage takes ([`PrefixAffinity::id`]): none
-/// takes `0`, which reads as no stage.
-static NEXT_STAGE: AtomicU32 = AtomicU32::new(1);
-
 // ---------------------------------------------------------------- prefix affinity
 
 /// The holders of the request's prefix first. A candidate's match is its
@@ -483,9 +425,9 @@ pub struct PrefixAffinity {
     threshold: f32,
     source: AffinitySource,
     gates: Gates,
-    /// The stage's own number, by which a pass's word is told from another
-    /// stage's ([`Judged`]).
-    id: u32,
+    /// The stage's own number, by which what its pass measured is told from
+    /// another stage's.
+    id: PrefixStageId,
 }
 
 impl PrefixAffinity {
@@ -495,7 +437,7 @@ impl PrefixAffinity {
             threshold: params.threshold.unwrap_or(DEFAULT_THRESHOLD),
             source: params.source.unwrap_or_default(),
             gates,
-            id: NEXT_STAGE.fetch_add(1, Ordering::Relaxed),
+            id: PrefixStageId::next(),
         }
     }
 
@@ -506,25 +448,16 @@ impl PrefixAffinity {
     }
 
     /// Leaves what this pass judges by for the word of the pick
-    /// ([`Judged`]). The first stage of a decision to judge keeps the slot,
-    /// and a later pass of its own writes over it.
+    /// ([`keep_prefix_pass`]). The first stage of a decision to judge keeps
+    /// the slot, and a later pass of its own writes over it.
     fn judge(&self, best: u32, mean: f32) {
-        let stands = JUDGED.get().by;
-        if stands == 0 || stands == self.id {
-            JUDGED.set(Judged {
-                by: self.id,
-                best,
-                mean,
-            });
-        }
+        keep_prefix_pass(self.id, best, mean);
     }
 
     /// This pass orders nothing: what an earlier pass of this stage left
     /// is no word of the pick.
     fn unjudge(&self) {
-        if JUDGED.get().by == self.id {
-            JUDGED.set(Judged::NONE);
-        }
+        withdraw_prefix_pass(self.id);
     }
 
     /// The blocks of the request a candidate holds by this stage's source.
@@ -742,15 +675,15 @@ impl Scorer for PrefixAffinity {
         };
         // The pass's word is taken whichever row is asked about: it is
         // the word of one decision.
-        let judged = JUDGED.replace(Judged::NONE);
+        let judged = take_prefix_pass(self.id);
         let margin_held = blocks > 0
-            && judged.by == self.id
-            && judged.best == blocks
-            && candidates.get(row as usize).is_some_and(|candidate| {
-                let load = facts.in_flight(candidate) as f32;
-                let price = self.gates.tokens_of(blocks, facts);
-                self.gates.over(load, judged.mean, 0.0)
-                    && !self.gates.over(load, judged.mean, price)
+            && judged.is_some_and(|(best, mean)| {
+                best == blocks
+                    && candidates.get(row as usize).is_some_and(|candidate| {
+                        let load = facts.in_flight(candidate) as f32;
+                        let price = self.gates.tokens_of(blocks, facts);
+                        self.gates.over(load, mean, 0.0) && !self.gates.over(load, mean, price)
+                    })
             });
         // Both counts by one shift: the share they say holds for a
         // request past sixteen bits.
@@ -916,131 +849,6 @@ impl Scorer for KvPressure {
 }
 
 // ---------------------------------------------------------------- warm-up slice
-
-/// How a host reads the rows a ruling named ([`WarmRule::name`]) at an
-/// instant of the ruling's clock.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Warming {
-    /// The rows named are the thin.
-    pub thin: bool,
-    /// The instant from which the rows are named: `0`, unless every row
-    /// was young. Such a fleet has nobody to catch up to until the first
-    /// of its rows is young no more.
-    pub from: u64,
-}
-
-/// The warm-up stage's ruling of who warms, as its three numbers: what the
-/// stage rules a host's column by, and what a host that names a pool's
-/// warming rows enters ([`WarmRule::name`]). The ruling has this one home: a
-/// host hands it the pool's sizes and admissions and never restates it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WarmRule {
-    /// How long after its admission a worker is young, in microseconds; `0`
-    /// keeps nobody young.
-    window_micros: u64,
-    /// The level from which a fleet holds a cache worth catching up to, and
-    /// the growth a young worker is short of, in blocks.
-    blocks: u32,
-    /// The share of the fleet's level under which an index is thin; `0`
-    /// keeps nobody thin.
-    thin_ratio: f32,
-}
-
-impl WarmRule {
-    /// Whether an index of `indexed` blocks is thin against the fleet's
-    /// `level`: empty, or below the ratio of the level, once the fleet holds
-    /// a cache worth catching up to.
-    #[inline]
-    fn is_thin(&self, indexed: u32, level: u32) -> bool {
-        self.thin_ratio > 0.0
-            && level >= self.blocks
-            && (indexed == 0 || f64::from(indexed) < f64::from(level) * f64::from(self.thin_ratio))
-    }
-
-    /// Whether a worker admitted `age_micros` ago whose index grew by
-    /// `growth` blocks since is young: within the window and short of its
-    /// first blocks.
-    #[inline]
-    fn is_young(&self, age_micros: u64, growth: u32) -> bool {
-        age_micros < self.window_micros && growth < self.blocks
-    }
-
-    /// The fleet's index level: the upper median of the rows' index sizes,
-    /// so one emptied worker does not drag it down. Reorders `sizes`.
-    #[inline]
-    fn level(sizes: &mut [u32]) -> u32 {
-        if sizes.is_empty() {
-            return 0;
-        }
-        let mid = sizes.len() / 2;
-        let (_, level, _) = sizes.select_nth_unstable(mid);
-        *level
-    }
-
-    /// The pool's warming rows by this ruling, for a host that names them
-    /// ([`NamedAffinity::warming`]). `sizes` holds each row's index size
-    /// and `admitted` each row's admission, on the clock `now` is read on,
-    /// in microseconds; `scratch` is the host's, for the level. The rows go
-    /// to `out`, emptied first, ascending, each with the instant its naming
-    /// ends: the thin whatever the fleet's age, with no end (`u64::MAX`),
-    /// else the young, each until its window is over, as the stage rules a
-    /// column of the same sizes and ages. A row is admitted with nothing
-    /// indexed, so its growth since admission is its size.
-    ///
-    /// The rows stand for every later instant of that clock while the sizes
-    /// do: at an instant a host names the rows whose end is past it, and
-    /// nobody before [`Warming::from`]. So a host that reads the sizes at
-    /// its own pace still ends a young row's naming on time.
-    pub fn name(
-        &self,
-        sizes: &[u32],
-        admitted: &[u64],
-        now: u64,
-        scratch: &mut Vec<u32>,
-        out: &mut Vec<(u32, u64)>,
-    ) -> Warming {
-        out.clear();
-        let young = |size: u32, admitted: u64| self.is_young(now.saturating_sub(admitted), size);
-        let any_indexed = sizes.iter().any(|&size| size > 0);
-        let youngs = sizes
-            .iter()
-            .zip(admitted)
-            .filter(|&(&size, &admitted)| young(size, admitted))
-            .count();
-        if !any_indexed && youngs == 0 {
-            return Warming::default();
-        }
-        let level = if any_indexed {
-            scratch.clear();
-            scratch.extend_from_slice(sizes);
-            Self::level(scratch)
-        } else {
-            0
-        };
-        let rows = (0u32..).zip(sizes.iter().zip(admitted));
-        out.extend(
-            rows.clone()
-                .filter(|&(_, (&size, _))| self.is_thin(size, level))
-                .map(|(row, _)| (row, u64::MAX)),
-        );
-        if !out.is_empty() {
-            return Warming {
-                thin: true,
-                from: 0,
-            };
-        }
-        let window = self.window_micros;
-        out.extend(
-            rows.filter(|&(_, (&size, &admitted))| young(size, admitted))
-                .map(|(row, (_, &admitted))| (row, admitted.saturating_add(window))),
-        );
-        // A fleet that is all young has nobody to catch up to, until the
-        // first of its rows is young no more.
-        let first_end = out.iter().map(|&(_, until)| until).min();
-        let from = first_end.filter(|_| youngs == sizes.len()).unwrap_or(0);
-        Warming { thin: false, from }
-    }
-}
 
 /// The warm-up slice. One miss in `1 / share` goes to the least-loaded
 /// warming worker (one with a thin index against the fleet's level, or a
@@ -1499,7 +1307,10 @@ mod tests {
     use super::*;
     use crate::{
         document::spec::SpillParams,
-        engine::view::{Health, LoadRow, NamedHolder},
+        engine::{
+            prefix_pass::forget_prefix_pass,
+            view::{Health, LoadRow, NamedHolder},
+        },
         tracking::counts::tests::Lent,
     };
 
@@ -2766,7 +2577,7 @@ mod tests {
 
     /// One holder over the swing's margin and under the priced one: the
     /// stage says the margin held. It says so once, of its own pass, of a
-    /// deepest holder, and not behind [`forget_judged`].
+    /// deepest holder, and not behind [`forget_prefix_pass`].
     #[test]
     fn the_word_of_a_pass_is_one_decisions_and_one_stages() {
         let gate = || {
@@ -2816,7 +2627,7 @@ mod tests {
         assert!(!stage.said(&facts, &rows, 0).margin_held);
         // A decision whose overlap the engine states begins with no word.
         pass(&stage);
-        forget_judged();
+        forget_prefix_pass();
         assert!(!stage.said(&facts, &rows, 0).margin_held);
     }
 
@@ -2848,7 +2659,7 @@ mod tests {
             };
             stage.said(&facts, &rows(pool), 0).margin_held
         };
-        forget_judged();
+        forget_prefix_pass();
         assert_eq!(pass(&busy), vec![1.0, 0.5, 0.5, 0.5]);
         assert!(held(&busy));
         assert_eq!(pass(&busy), vec![1.0, 0.5, 0.5, 0.5]);
@@ -2892,7 +2703,7 @@ mod tests {
             };
             stage.said(&facts, &rows(&calm), 0).margin_held
         };
-        forget_judged();
+        forget_prefix_pass();
         assert_eq!(pass(&calm), vec![1.0, 0.5, 0.5, 0.5]);
         assert!(held());
         assert_eq!(pass(&calm), vec![1.0, 0.5, 0.5, 0.5]);
@@ -2950,7 +2761,7 @@ mod tests {
             };
             stage.said(&facts, &rows(&calm), 0).margin_held
         };
-        forget_judged();
+        forget_prefix_pass();
         assert!(!front(&calm).1);
         assert!(held());
         assert!(!front(&calm).1);

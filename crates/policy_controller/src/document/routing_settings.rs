@@ -23,7 +23,7 @@ use crate::{
         },
         power_of_two::PowerOfTwoMetric,
     },
-    stages::builtins::{
+    stages::scorers::{
         DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
 };

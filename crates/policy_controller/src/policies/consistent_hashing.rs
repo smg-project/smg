@@ -43,13 +43,7 @@
 //! request to the owner at the next boundary down, so a prompt that grew
 //! past a loaded worker still lands where its head is held.
 
-use std::{
-    cell::RefCell,
-    cmp::Ordering,
-    collections::VecDeque,
-    mem,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, cmp::Ordering, mem, time::Instant};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -66,6 +60,7 @@ use crate::{
         prefix_hash::{prefix_key, Prefix},
         standard_filters,
     },
+    stages::fence::Fence,
     tracking::{
         counts::with_counts,
         lease::{Lifecycle, Membership},
@@ -108,14 +103,6 @@ fn position(key: u32, vnode: u32) -> u64 {
     Draw::new(u64::from(key) ^ u64::from(vnode).wrapping_mul(0x9e37_79b9_7f4a_7c15)).next_u64()
 }
 
-/// How long a pruned id stays fenced against relearning from a view older
-/// than the pruning: longer than any gap between a request's capture of the
-/// pool and its decision (the stage holds no await between the two), shorter
-/// than a worker's re-registration, after which a new handle at a reused
-/// address may carry the same id and joins from its view as any other. The
-/// feed naming the id (added, replacing, in a snapshot) lifts it at once.
-pub const FENCE: Duration = Duration::from_secs(10);
-
 /// The position a key hashes to.
 fn key_position(key: u64) -> u64 {
     Draw::new(key).next_u64()
@@ -131,78 +118,11 @@ pub enum Probe<T> {
     Stop,
 }
 
-/// The ids a lifecycle pruned within [`FENCE`], fenced against relearning
-/// from a view older than the pruning. A stage that learns its members from
-/// a decision's view holds one. It keeps pruned workers out of a listing
-/// and is no kin of [`crate::service::elector::Fence`], which holds the term a
-/// process leads under.
-#[derive(Debug, Default)]
-pub(crate) struct Fence {
-    /// The retirements within [`FENCE`], oldest first. Those of an id the
-    /// feed named since stay until they lapse and lift nothing.
-    retired: VecDeque<(WorkerId, Instant)>,
-    /// Each fenced id with its last retirement, the one whose lapse lifts
-    /// the fence.
-    fenced: FxHashMap<WorkerId, Instant>,
-}
-
-impl Fence {
-    /// Whether no id holds a fence.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.fenced.is_empty()
-    }
-
-    /// Whether `id` holds a fence the last [`Fence::expire`] left standing.
-    pub(crate) fn holds(&self, id: WorkerId) -> bool {
-        self.fenced.contains_key(&id)
-    }
-
-    /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
-    /// against relearning.
-    pub(crate) fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
-        self.fenced
-            .get(&id)
-            .is_some_and(|&at| now.saturating_duration_since(at) < FENCE)
-    }
-
-    /// Lift the fence on `id`: the feed named it as a member again.
-    pub(crate) fn admit(&mut self, id: WorkerId) {
-        // Its retirements stay in the list: none is its last any more, so
-        // their lapses lift nothing.
-        self.fenced.remove(&id);
-    }
-
-    /// Forget the retirements older than [`FENCE`] at `now`.
-    pub(crate) fn expire(&mut self, now: Instant) {
-        while let Some(&(old, at)) = self.retired.front() {
-            if now.saturating_duration_since(at) < FENCE {
-                break;
-            }
-            self.retired.pop_front();
-            // The fence lifts with the id's last retirement. The map says
-            // whether this entry is it: no pass over the list for a lapse.
-            if self.fenced.get(&old) == Some(&at) {
-                self.fenced.remove(&old);
-            }
-        }
-    }
-
-    /// Fence `id` for [`FENCE`] from `now`: a lifecycle pruned it.
-    pub(crate) fn retire(&mut self, id: WorkerId, now: Instant) {
-        self.expire(now);
-        let last = self.fenced.entry(id).or_insert(now);
-        *last = (*last).max(now);
-        // Two callers can read their clocks in one order and get here in
-        // the other. The list stays oldest first all the same, so a
-        // retirement that lapsed never waits behind a later one.
-        let behind = self.retired.partition_point(|&(_, at)| at <= now);
-        self.retired.insert(behind, (id, now));
-    }
-}
-
 /// The ring: its members, each at [`VIRTUAL_NODES`] sorted positions hashed
 /// from the member's stable key and indexed by the handle id; the ids pruned
 /// within [`FENCE`], fenced against relearning from a stale view.
+///
+/// [`FENCE`]: crate::stages::FENCE
 #[derive(Debug, Default)]
 pub struct Ring {
     /// The members in the order of their ids, by the index the entries
@@ -214,6 +134,8 @@ pub struct Ring {
     /// `(position, member index)`, sorted by position.
     entries: Vec<(u64, u32)>,
     /// The ids pruned within [`FENCE`].
+    ///
+    /// [`FENCE`]: crate::stages::FENCE
     fence: Fence,
     /// The pools shown whole ([`Ring::show`]) under `shown_epoch`, by their
     /// host's number in rising order, each with whether it may be walked:
@@ -354,6 +276,8 @@ impl Ring {
     /// [`Ring::add_many`] for the members a decision's view carries at `now`:
     /// an id the lifecycle pruned within [`FENCE`] is left out, since the
     /// view may be older than the pruning. Returns how many joined.
+    ///
+    /// [`FENCE`]: crate::stages::FENCE
     pub fn learn(
         &mut self,
         members: impl IntoIterator<Item = (WorkerId, u32)>,
@@ -461,6 +385,8 @@ impl Ring {
 
     /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
     /// against relearning.
+    ///
+    /// [`FENCE`]: crate::stages::FENCE
     pub fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
         self.fence.is_retired(id, now)
     }
@@ -473,6 +399,8 @@ impl Ring {
 
     /// Remove a member at `now`, fencing its id for [`FENCE`]; `false` when
     /// it was none.
+    ///
+    /// [`FENCE`]: crate::stages::FENCE
     pub fn remove(&mut self, id: WorkerId, now: Instant) -> bool {
         self.fence.retire(id, now);
         self.forget_shown();
@@ -1093,9 +1021,12 @@ impl Scorer for ConsistentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{
-        view,
-        view::{fold_block, Health, Identity},
+    use crate::{
+        engine::{
+            view,
+            view::{fold_block, Health, Identity},
+        },
+        stages::fence::FENCE,
     };
 
     fn ids(n: u64) -> Vec<WorkerId> {

@@ -42,7 +42,7 @@
 //! keeps its own place and takes its predecessor's load and bookings, and
 //! the predecessor's place leaves as a removed worker's does. A pruned
 //! worker is fenced for a while
-//! ([`FENCE`](crate::policies::consistent_hashing::FENCE)): a view
+//! ([`FENCE`](crate::stages::fence::FENCE)): a view
 //! captured before its leave still shows it, and a decision over such a
 //! view lists it nowhere, seats it nowhere and places the others. The feed
 //! naming the worker again lifts the fence at once. A worker that left a
@@ -79,7 +79,8 @@ use crate::{
         framework::{Scorer, TieBand},
         view::{Candidate, Phase, RequestFacts, WorkerId},
     },
-    policies::{consistent_hashing::Fence, standard_filters},
+    policies::standard_filters,
+    stages::fence::Fence,
     tracking::lease::{Lease, Lifecycle, Membership, Side},
 };
 
@@ -1021,8 +1022,7 @@ mod tests {
             view::{self, Health},
             Constraints, PoolFacts, Scratch,
         },
-        policies::consistent_hashing::FENCE,
-        stages::Catalog,
+        stages::{fence::FENCE, Catalog},
     };
 
     const SECOND: u64 = 1_000_000;

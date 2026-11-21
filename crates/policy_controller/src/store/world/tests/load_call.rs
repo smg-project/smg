@@ -21,7 +21,7 @@ mod held {
             framework::{Picker, Scorer, TieBand},
             view::{Candidate, RequestFacts, Role, WorkerId},
         },
-        stages::{builtins::target_of, Catalog},
+        stages::{pickers::target_of, Catalog},
         store::{world::ViewBuffers, Kinds, LoadSink, LoadSource, MemoryStore},
         tracking::{
             counts::Slot,

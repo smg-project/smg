@@ -43,7 +43,7 @@ use crate::{
         },
         sticky_sessions::SessionRule,
         terms::{signal_named, Term, SIGNAL_FAMILY},
-        view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
+        view::{blocks_within, threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
     },
     load::{
         reports::Reports,
@@ -52,18 +52,19 @@ use crate::{
     policies::{
         self,
         bucket::Bucket,
-        cache_aware::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
+        cache_aware::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
         consistent_hashing::ConsistentHash,
         least_load::LeastLoad,
     },
     stages::{
-        builtins::{
-            has_room_rule, with_report_age, FewestSessions, HasRoomRule, HasRoomSignals, LeastCost,
-            LeastCostSent, LeastCostSignals, LeastRequests, ResidentWork, SampledBest,
-            SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
-            DEFAULT_THROUGHPUT,
-        },
         catalog::{profile_sent, Catalog, FilterFactory, Found, PickerFactory, StageBuild},
+        filters::{has_room_rule, HasRoomRule, HasRoomSignals},
+        pickers::SampledBest,
+        scorers::{
+            with_report_age, FewestSessions, LeastCost, LeastCostSent, LeastCostSignals,
+            LeastRequests, ResidentWork, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT,
+            DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        },
     },
     tracking::sent::SentCredit,
 };

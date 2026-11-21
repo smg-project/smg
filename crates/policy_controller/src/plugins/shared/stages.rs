@@ -23,7 +23,7 @@ use crate::{
         framework::{DecisionScope, Filter, Picker, Scorer, TieBand},
         view::{Candidate, Constraints, RequestFacts},
     },
-    stages::builtins::Best,
+    stages::pickers::Best,
     tracking::lease::{
         EventKind, EventSet, Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
     },

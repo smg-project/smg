@@ -11,7 +11,7 @@ use crate::{
         framework, Candidate, Constraints, Engine, Filter, LoadRow, Pair, PoolFacts, RequestFacts,
         Scorer, Scratch, Target, TieBand, WorkerId,
     },
-    stages::{builtins, Catalog},
+    stages::{pickers, Catalog},
     store::{
         Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
         WorkerFacts, WorkerStatus, WorkersStore,
@@ -1104,7 +1104,7 @@ impl framework::Picker for LeastSent {
     ) {
         let sent = |row: &&u32| self.sent.read(facts, &candidates[**row as usize]).requests;
         if let Some(&row) = kept.iter().min_by_key(sent) {
-            out.push(builtins::target_of(&candidates[row as usize]));
+            out.push(pickers::target_of(&candidates[row as usize]));
         }
     }
 }

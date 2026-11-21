@@ -234,7 +234,11 @@ mod tests {
             door::tests::GATEWAY,
             framework::{Binding, Profile, Weighted},
         },
-        stages::builtins::{Best, FewestSessions, Healthy, LeastRequests, NotTried},
+        stages::{
+            filters::{Healthy, NotTried},
+            pickers::Best,
+            scorers::{FewestSessions, LeastRequests},
+        },
     };
 
     fn naming_engine(generation: u64) -> Engine {

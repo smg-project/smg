@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     engine::{Candidate, RequestFacts, Target, WorkerId},
-    stages::builtins::{Credits, SinceReport},
+    stages::scorers::{Credits, SinceReport},
     tracking::{Lease, Membership, Side},
 };
 

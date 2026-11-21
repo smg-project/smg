@@ -36,7 +36,11 @@ use crate::{
         sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
     },
-    stages::builtins::{Best, Healthy, LeastRequests, NotOverloaded},
+    stages::{
+        filters::{Healthy, NotOverloaded},
+        pickers::Best,
+        scorers::LeastRequests,
+    },
 };
 
 /// What a binding does with a pool whose every usable worker the overload
@@ -583,7 +587,10 @@ mod tests {
             },
         },
         policies::{consistent_hashing::ConsistentHash, manual::Manual},
-        stages::builtins::{Best, Healthy, NotOverloaded},
+        stages::{
+            filters::{Healthy, NotOverloaded},
+            pickers::Best,
+        },
         tracking::{
             counts::tests::Lent,
             lease::{Lease, Lifecycle, Side},

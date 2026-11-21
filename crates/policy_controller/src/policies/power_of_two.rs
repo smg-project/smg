@@ -9,7 +9,7 @@ use crate::{
         view::{Candidate, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::{below_band, draw_kept, target_of},
+    stages::pickers::{below_band, draw_kept, target_of},
     tracking::lease::Lifecycle,
     Draw,
 };
@@ -317,9 +317,12 @@ mod tests {
     use crate::{
         document::spec::ScoreSpec,
         engine::framework::Scorer,
-        stages::builtins::{
-            tests::{candidate, kept, picked, picked_within},
-            CountFirst, LeastRequests,
+        stages::{
+            pickers::CountFirst,
+            scorers::{
+                tests::{candidate, kept, picked, picked_within},
+                LeastRequests,
+            },
         },
     };
 

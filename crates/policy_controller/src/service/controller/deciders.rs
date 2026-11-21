@@ -1337,7 +1337,7 @@ pub(crate) mod tests {
             elector::{Elector, Tick, TERM_CEILING},
             proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
         },
-        stages::{builtins::Best, catalog::Catalog},
+        stages::{catalog::Catalog, pickers::Best},
         store::{
             leases::DISPATCH_TTL, Ask, Built, DecodeIssue, Dispatch, GatewayId, HealthSink,
             LeaseState, LeasesStore, MemoryStore, Said, ViewBuffers, WorkerFacts, WorkerStatus,

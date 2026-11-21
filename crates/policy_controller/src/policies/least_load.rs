@@ -13,9 +13,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[cfg(test)]
-use crate::stages::builtins::HeldCredit;
+use crate::stages::scorers::HeldCredit;
 #[cfg(test)]
-use crate::stages::builtins::SinceReport;
+use crate::stages::scorers::SinceReport;
 use crate::{
     document::spec::{Needs, ProfileSpec},
     engine::{
@@ -24,7 +24,7 @@ use crate::{
         view::{Candidate, LoadRow, RequestFacts, WorkerId},
     },
     policies::standard_filters,
-    stages::builtins::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
+    stages::scorers::{normalize_costs, ReadsLoad, PENDING, TIE_EPSILON_SECS},
     tracking::{
         counts::with_counts,
         lease::{Lease, Lifecycle, Membership, Side},
@@ -498,10 +498,13 @@ mod tests {
             decision::{Pair, Targets},
             framework::Picker,
         },
-        stages::builtins::{
-            take_lane, target_of,
-            tests::{candidate, kept, report, RETIRE_WAITS},
-            Best, SessionAffinity, RETIRE_BATCH, SINCE_REPORT_KEPT,
+        stages::{
+            pickers::{target_of, Best},
+            scorers::{
+                take_lane,
+                tests::{candidate, kept, report, RETIRE_WAITS},
+                SessionAffinity, RETIRE_BATCH, SINCE_REPORT_KEPT,
+            },
         },
     };
 

@@ -7,16 +7,20 @@
 //! view.
 //!
 //! The session table that a `sessions` rule reads lives in this folder too.
+//! So does the warm-up ruling: a stage applies it, and a host names a pool's
+//! warming rows by it.
 
 pub(crate) mod decider;
 pub(crate) mod decision;
 pub(crate) mod demands;
 pub(crate) mod door;
 pub(crate) mod framework;
+pub(crate) mod prefix_pass;
 pub(crate) mod prompt_hashes;
 pub(crate) mod sticky_sessions;
 pub(crate) mod terms;
 pub(crate) mod view;
+pub(crate) mod warm_up;
 
 pub use decider::{Acting, Decider};
 pub use decision::{
@@ -44,3 +48,4 @@ pub use view::{
     NamedAffinity, NamedHolder, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role,
     Session, SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
 };
+pub use warm_up::{WarmRule, Warming};

@@ -19,7 +19,10 @@ use crate::{
         cache_aware::Gates, consistent_hashing::ConsistentHash, power_of_two::PowerOfTwo,
         random::Random,
     },
-    stages::builtins::{Best, CountFirst, NotOverloaded, SampledBest},
+    stages::{
+        filters::NotOverloaded,
+        pickers::{Best, CountFirst, SampledBest},
+    },
     tracking::lease::{Lifecycle, Membership},
     Draw,
 };

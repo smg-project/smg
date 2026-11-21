@@ -4530,7 +4530,7 @@ pub(crate) mod tests {
             DecisionRecord, References, Unmet,
         },
         policies::random::Random,
-        stages::{builtins::Best, catalog::Catalog},
+        stages::{catalog::Catalog, pickers::Best},
         store::{
             Ask, DecodeMark, DecodeRefused, Dispatch, EncodeHandoff, EncodeOffer, GatewayId,
             HealthSink, HealthWrite, LeaderBits, LeaseRecord, LeaseState, LeasesStore, LoadSink,

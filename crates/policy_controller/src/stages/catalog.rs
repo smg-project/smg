@@ -34,7 +34,10 @@ use crate::{
         random::Random,
         round_robin::RoundRobin,
     },
-    stages::builtins::{Best, CountFirst, HasCapacity, HasRoom, Healthy, NotOverloaded, NotTried},
+    stages::{
+        filters::{HasCapacity, HasRoom, Healthy, NotOverloaded, NotTried},
+        pickers::{Best, CountFirst},
+    },
     tracking::sent::SentCredit,
 };
 
@@ -603,7 +606,7 @@ mod tests {
             Candidate, Constraints, Engine, Filter, Health, Picker, PoolFacts, RequestFacts,
             Scorer, Scratch, Targets, TieBand, WorkerId,
         },
-        stages::builtins::target_of,
+        stages::pickers::target_of,
         tracking::Lifecycle,
     };
 

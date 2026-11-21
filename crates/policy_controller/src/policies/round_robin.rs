@@ -15,7 +15,7 @@ use crate::{
         view::{Candidate, ModelFingerprint, PoolFacts, RequestFacts},
     },
     policies::standard_filters,
-    stages::builtins::{push_drawn, target_of},
+    stages::pickers::{push_drawn, target_of},
     tracking::lease::Lifecycle,
     Draw,
 };
@@ -299,7 +299,7 @@ impl Picker for RoundRobin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stages::builtins::tests::{candidate, kept};
+    use crate::stages::scorers::tests::{candidate, kept};
 
     fn first_pick(picker: &dyn Picker, facts: &RequestFacts<'_>, pool: &[Candidate]) -> u32 {
         let mut out = Targets::new();

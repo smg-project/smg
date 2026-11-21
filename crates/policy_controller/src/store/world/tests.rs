@@ -25,7 +25,7 @@ use crate::{
         },
         PairPools, PairTable, Scorer, Scratch, Target,
     },
-    stages::builtins::ResidentWork,
+    stages::scorers::ResidentWork,
     store::{
         loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeaderBits, LeasesStore,
         LoadSink, LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor,

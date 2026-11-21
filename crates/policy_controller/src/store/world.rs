@@ -115,10 +115,10 @@ use crate::{
             fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, NamedHolder,
             OverloadRegime, Phase, PoolFacts, Role, WireModes, WorkerId,
         },
+        warm_up::WarmRule,
         EncodePool, EncoderFacts,
     },
     load::signals::{SignalCell, SignalCells},
-    policies::cache_aware::WarmRule,
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
         health::LeaderBits,

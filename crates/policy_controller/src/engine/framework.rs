@@ -12,18 +12,21 @@ use crate::{
             Decision, Lifted, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
             MAX_TARGETS, TRACE_TOP,
         },
+        prefix_pass::forget_prefix_pass,
         sticky_sessions::{self, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
             ReportCutoff, RequestFacts, WorkerId,
         },
+        warm_up::WarmRule,
     },
     load::signals::SignalCells,
-    policies::{
-        cache_aware::{forget_judged, WarmRule},
-        random::Random,
+    policies::random::Random,
+    stages::{
+        filters::RowTests,
+        pickers::{target_of, Best},
+        scorers::{FewestSessions, LeastRequests},
     },
-    stages::builtins::{target_of, Best, FewestSessions, LeastRequests, RowTests},
     tracking::{
         lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
         sent::SentCredit,
@@ -5011,7 +5014,7 @@ impl Engine {
     ) -> Decision {
         // What a pass of an earlier decision judged by is no word of this
         // one's pick.
-        forget_judged();
+        forget_prefix_pass();
         let mut decision = self.decide(facts, pool, candidates, cx, scratch);
         if let Decision::Pick(pick) = &mut decision {
             let overlap = self.overlap_of(facts, candidates, pick);
@@ -5031,7 +5034,7 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        forget_judged();
+        forget_prefix_pass();
         let mut decision = self.decide_keeping(facts, pool, candidates, cx, scratch);
         if let Decision::Pick(pick) = &mut decision {
             let overlap = self.overlap_of(facts, candidates, pick);
@@ -6484,8 +6487,10 @@ mod tests {
             random::Random,
             round_robin::RoundRobin,
         },
-        stages::builtins::{
-            self, Best, CountFirst, Healthy, LeastRequests, NotOverloaded, NotTried,
+        stages::{
+            filters::{Healthy, NotOverloaded, NotTried},
+            pickers::{self, Best, CountFirst},
+            scorers::{self, LeastRequests},
         },
         tracking::counts::tests::Lent,
     };
@@ -15171,7 +15176,7 @@ mod tests {
 
     #[test]
     fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         // A request names one row tried, and the host one excluded.
         let (pool, mask) = tested_rows();
         let (mut drew, mut masked) = (0u32, 0u32);
@@ -15240,7 +15245,7 @@ mod tests {
     /// lifted.
     #[test]
     fn the_namings_test_is_the_draws_own() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         let (pool, mask) = tested_rows();
         let mut refused = 0u32;
         for set in 0..32u8 {
@@ -15285,7 +15290,7 @@ mod tests {
     /// mark, whatever the request carries.
     #[test]
     fn the_namings_test_is_none_where_the_pass_alone_can_say() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         /// A filter that is shown the whole view: the default word.
         #[derive(Debug)]
         struct Whole;
@@ -15358,7 +15363,7 @@ mod tests {
 
     #[test]
     fn a_whole_pass_by_the_folded_test_decides_as_one_asked_a_stage_at_a_time() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         // A row's shape: ready, or refused by one of four bits.
         fn shaped(rows: u32, shape: impl Fn(u32) -> u32) -> Vec<Candidate> {
             (0..rows)
@@ -15493,7 +15498,7 @@ mod tests {
     /// the fold holds none of them.
     #[test]
     fn a_whole_pass_over_an_encode_items_set_is_asked_a_stage_at_a_time() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         let engine = engine_of(filters_of(0b11111), Box::new(Passthrough));
         assert!(engine.row_tests[0].is_some(), "the profile folds");
         // Two rows every filter keeps. The item's rule refuses the first.
@@ -15613,7 +15618,7 @@ mod tests {
     /// decision. The all-vetoed rule's pick is the fold's often.
     #[test]
     fn a_folded_engine_decides_as_a_staged_one_on_scratches_that_are_kept() {
-        use crate::stages::builtins::filters_of;
+        use crate::stages::filters::filters_of;
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = |n: u64| {
             state ^= state << 13;
@@ -16142,10 +16147,10 @@ mod tests {
                 name: "sampled".into(),
                 filters: vec![Box::new(Healthy)],
                 scorers: vec![Weighted {
-                    scorer: Box::new(builtins::ResidentWork::new(0)),
+                    scorer: Box::new(scorers::ResidentWork::new(0)),
                     weight: 1.0,
                 }],
-                picker: Box::new(builtins::SampledBest::new(4)),
+                picker: Box::new(pickers::SampledBest::new(4)),
             }],
             vec![Binding {
                 model: "m".into(),
@@ -16256,7 +16261,7 @@ mod tests {
                 name: "whole".into(),
                 filters: vec![Box::new(Healthy), Box::new(Whole)],
                 scorers: Vec::new(),
-                picker: Box::new(builtins::SampledBest::new(16)),
+                picker: Box::new(pickers::SampledBest::new(16)),
             }],
             vec![single_binding()],
             1,
@@ -16375,7 +16380,7 @@ mod tests {
             name: name.into(),
             filters: vec![Box::new(Healthy)],
             scorers: Vec::new(),
-            picker: Box::new(builtins::SampledBest::new(sample)),
+            picker: Box::new(pickers::SampledBest::new(sample)),
         };
         Engine::new(
             vec![sampled("narrow", 4), sampled("wide", 16)],
@@ -17212,7 +17217,7 @@ mod tests {
         // Under the built-in picker of that kind the profile holds the
         // three marks. A request that names none is asked by rank: the
         // stage behind the rank of the four rows in front.
-        let sampled = builtins::SampledBest::new(2);
+        let sampled = pickers::SampledBest::new(2);
         let engine = staged(stages(), Box::new(sampled));
         assert_eq!(
             engine.marks[0].ahead(),

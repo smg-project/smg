@@ -33,7 +33,7 @@ use crate::{
         sticky_sessions::SessionVerdict,
         view::{Candidate, LoadRow, Phase, RequestFacts, Role, WorkerId},
     },
-    stages::{builtins::target_of, catalog::Catalog},
+    stages::{catalog::Catalog, pickers::target_of},
     store::{
         BatchFacts, BatchOutcome, ContentHash, Dispatch, KvEvent, KvEventSink, LeasesStore,
         LoadSink, LoadSource, MemoryStore, Said, SequenceHash, Signals, StoredBlock, WorkerFacts,
