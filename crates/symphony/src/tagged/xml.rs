@@ -43,6 +43,16 @@ use crate::{
 /// element the tool declares a container at the bound ([`Assembler::close_element`]).
 const DEEPEST: usize = PartialJson::DEFAULT_MAX_DEPTH;
 
+/// The whitespace a closing tag held undecided inside a value may have behind it, in bytes
+/// ([`Assembler::close_tag`]): past it the run is the value's text, and the tag was beside
+/// text.
+const HELD_SPACE: usize = 64;
+
+/// The declared properties a call keeps a bit for ([`Assembler::given`]): the width of the
+/// mask. A property the tool declares past it is never taken for the next parameter where a
+/// string's close is missing; a tag that names it stays the string's text.
+const PLACES: usize = u64::BITS as usize;
+
 /// The invoke's closing tag: the one terminal a started call's end carries. The next invoke's
 /// opening and the block's close end a call too, but they belong to the region, and the engine
 /// drops them.
@@ -73,6 +83,30 @@ pub struct Assembler {
     /// own inside the value, and their closing tags are the value's text as they are
     /// ([`Self::close_tag`]).
     nested: u32,
+    /// How many of them carry the open leaf's own name: the leaf's closing tag pairs with the
+    /// innermost of those first.
+    own_nested: u32,
+    /// Whether the open leaf took a tag behind a separator as its text: from there every tag
+    /// behind a separator inside it is its text, and only its own closing tag behind one closes
+    /// it.
+    marked: bool,
+    /// A closing tag behind the separator that names nothing open, inside an element that holds
+    /// text, with the whitespace after it: held until the next byte says how it reads
+    /// ([`Self::settle_stray_close`]).
+    stray: Option<Stray>,
+    /// An opening tag that may end a string whose close is missing, when the parameter it
+    /// names has a type that constrains its text: held, with the whitespace and the first bytes
+    /// behind it, until they say whether a value of that type begins there
+    /// ([`Self::weigh_candidate`]).
+    candidate: Option<Candidate>,
+    /// The parameters the call has given, one bit per place among the tool's declared
+    /// properties ([`Declared::place`]), up to [`PLACES`].
+    given: u64,
+    /// Of those, the strings ended at the next parameter's opening tag
+    /// ([`Self::ends_a_string`]): a reading the rest of the call has to bear out.
+    ended_early: u64,
+    /// Whether such a reading did not hold, said once ([`Self::not_borne_out`]).
+    unconfirmed: bool,
     /// Whether the last bytes taken were the table's ignored terminal: the separator the
     /// template writes before every tag, and never inside a value.
     after_separator: bool,
@@ -116,9 +150,72 @@ struct Element {
     key: String,
     /// What the tools declare at the element's path, asked once, when its tag opened it.
     kind: Option<Kind>,
+    /// For a parameter of the call itself: its place among the tool's declared properties,
+    /// within [`PLACES`], and whether the tool types it `string` and nothing else.
+    place: Option<u8>,
+    plain_string: bool,
     shape: Shape,
     /// Children written so far, once the element is a container.
     written: u32,
+}
+
+/// An opening tag held undecided inside a string: the parameter it names, its bytes, the
+/// whitespace behind it and the first bytes of what follows.
+#[derive(Clone, Debug)]
+struct Candidate {
+    key: String,
+    tag: String,
+    space: String,
+    seen: String,
+}
+
+/// Whether `seen`, the first bytes behind a parameter's opening tag and its whitespace, begin a
+/// value of the type `schema` declares, for a type that constrains its text: a number begins
+/// with a digit, or a sign and a digit; a boolean and a null are one of the words the template
+/// writes for them; an enumerated value begins as one of its values does. `Some(true)` once the
+/// bytes do, `Some(false)` once they cannot, `None` while more bytes would say, which is at
+/// most [`LONGEST_WORD`] bytes. A type that leaves its text free (a string, an object, a list,
+/// none declared) is `Some(true)` with no byte seen.
+fn begins(schema: &serde_json::Value, seen: &str) -> Option<bool> {
+    fn one_of(words: &[&str], seen: &str) -> Option<bool> {
+        if seen.is_empty() {
+            None
+        } else if words.contains(&seen) {
+            Some(true)
+        } else if words.iter().any(|word| word.starts_with(seen)) {
+            None
+        } else {
+            Some(false)
+        }
+    }
+    if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) {
+        let first = seen.chars().next()?;
+        return Some(values.iter().any(|value| match value {
+            serde_json::Value::String(text) => text.starts_with(first),
+            other => other.to_string().starts_with(first),
+        }));
+    }
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("integer" | "number") => match seen.as_bytes() {
+            [] | [b'-' | b'+'] => None,
+            [b'0'..=b'9', ..] | [b'-' | b'+', b'0'..=b'9', ..] => Some(true),
+            _ => Some(false),
+        },
+        Some("boolean") => one_of(&["true", "false", "True", "False"], seen),
+        Some("null") => one_of(&["null", "None"], seen),
+        _ => Some(true),
+    }
+}
+
+/// The bytes [`begins`] reads at most before it answers: the longest word a type is written as.
+const LONGEST_WORD: usize = "false".len();
+
+/// A closing tag held undecided inside a value: its bytes, then the whitespace after it.
+#[derive(Clone, Debug)]
+struct Stray {
+    held: String,
+    /// Where the tag's bytes end in `held`.
+    tag: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -169,6 +266,13 @@ impl Assembler {
             written: 0,
             tag: None,
             nested: 0,
+            own_nested: 0,
+            marked: false,
+            stray: None,
+            candidate: None,
+            given: 0,
+            ended_early: 0,
+            unconfirmed: false,
             after_separator: false,
             released: false,
             too_deep: false,
@@ -201,6 +305,9 @@ impl Assembler {
         if self.done {
             return;
         }
+        // A separator behind a tag held undecided: a tag follows, not a value's text.
+        self.candidate_is_text(out);
+        self.settle_stray_close(true, out);
         self.release_tag(out);
         self.after_separator = true;
     }
@@ -245,7 +352,16 @@ impl Assembler {
             self.report_unnamed(MalformedReason::CallWithoutName, out);
             return;
         }
-        self.close_open_string(MalformedReason::OpenAtTheMarker, out);
+        self.candidate_is_text(out);
+        self.settle_stray_close(true, out);
+        // A string ended at the next parameter's tag is borne out by the call's own closing
+        // tag alone: any other end leaves the reading open.
+        if self.ended_early != 0 && (at_stop || terminal != INVOKE_CLOSE) {
+            self.not_borne_out(out);
+        }
+        if self.close_open_string(MalformedReason::OpenAtTheMarker, out) && !at_stop {
+            self.slipped(out);
+        }
         if !self.too_deep && self.between_elements() {
             // A tag the end cut short between elements (`<cou`): the model had begun a member the
             // client will not get. Refused, so the call gets no close; the whitespace before it is
@@ -264,6 +380,7 @@ impl Assembler {
             self.report(MalformedReason::InvalidArguments, out);
         }
         if whole && !self.between_elements() && self.holds_text_alone() {
+            self.slipped(out);
             self.close_left_open(MalformedReason::OpenAtTheParentsClose, "", out);
             if self.too_deep {
                 // The value would nest past the bound: refused, as at the element's own close.
@@ -321,6 +438,13 @@ impl Assembler {
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
+        }
+        if let Some(stray) = self.stray.take() {
+            self.carried.push_str(&stray.held);
+        }
+        if let Some(candidate) = self.candidate.take() {
+            self.carried
+                .extend([candidate.tag, candidate.space, candidate.seen]);
         }
         self.hold_tag();
         if self.started() {
@@ -465,7 +589,33 @@ impl Assembler {
 
     /// The elements: a tag being read takes its bytes up to `>`, or stops being a tag at the first
     /// byte a name cannot hold; text runs to the next `<`.
-    fn body<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> &'d str {
+    fn body<'d>(
+        &mut self,
+        mut text: &'d str,
+        declared: &Declared,
+        out: &mut Events<'d>,
+    ) -> &'d str {
+        if self.candidate.is_some() {
+            match self.weigh_candidate(&mut text, declared) {
+                Some(true) => self.candidate_is_the_parameter(declared, out),
+                Some(false) => self.candidate_is_text(out),
+                None => return "",
+            }
+        }
+        if let Some(stray) = &mut self.stray {
+            // Whitespace joins the tag held undecided, up to the bound; the first other byte
+            // says the tag stood beside text.
+            let space = text.len() - text.trim_start().len();
+            let room = HELD_SPACE.saturating_sub(stray.held.len() - stray.tag);
+            if space <= room {
+                stray.held.push_str(&text[..space]);
+                text = &text[space..];
+                if text.is_empty() {
+                    return "";
+                }
+            }
+            self.settle_stray_close(false, out);
+        }
         if let Some(tag) = &mut self.tag {
             let Some((at, byte)) = text.char_indices().find(|(_, c)| !is_tag_byte(*c)) else {
                 tag.push_str(text);
@@ -478,7 +628,16 @@ impl Assembler {
                 return &text[at + 1..];
             }
             // Not a tag after all: the `<` and what followed it are text, and this byte is read
-            // again as text or as the start of a tag.
+            // again as text or as the start of a tag. A name behind a separator that whitespace
+            // ends is an opening tag with attributes, which a value takes as its text as it
+            // takes one without; it may close itself (`/>`), so it is never counted as one of
+            // the leaf's own name, whose closing tag would then pair with it.
+            if byte.is_whitespace() && self.after_separator && !self.between_elements() {
+                let name = self.tag.as_deref().unwrap_or_default();
+                if !name.is_empty() && !name.starts_with('/') {
+                    self.took_a_tag(false);
+                }
+            }
             self.release_tag(out);
             return &text[at..];
         }
@@ -495,6 +654,14 @@ impl Assembler {
                 ""
             }
         }
+    }
+
+    /// The open leaf took an opening tag behind a separator as its text, one of its `own` name
+    /// or another: counted, so that the closing tag that pairs with it is its text too.
+    fn took_a_tag(&mut self, own: bool) {
+        self.nested = self.nested.saturating_add(1);
+        self.own_nested = self.own_nested.saturating_add(u32::from(own));
+        self.marked = true;
     }
 
     /// A `<` and the bytes after it were not a tag: they are text where they stand.
@@ -528,7 +695,7 @@ impl Assembler {
             return;
         }
         if closing {
-            self.close_tag(name, bytes, out);
+            self.close_tag(name, bytes, declared, out);
         } else {
             self.open_tag(name, bytes, declared, out);
         }
@@ -551,14 +718,35 @@ impl Assembler {
     /// model is writing tags of its own inside the value, and the closing tag that pairs with
     /// it is the value's text too ([`Self::close_tag`]).
     fn open_tag(&mut self, key: &str, bytes: String, declared: &Declared, out: &mut Events) {
+        // The tag's bytes, until a fragment has taken them as its source.
+        let mut bytes = bytes;
+        if self.ends_a_string(key, declared) {
+            let free = self
+                .function
+                .as_deref()
+                .and_then(|function| declared.parameter(function, key))
+                .is_none_or(|(_, schema)| begins(schema, "").is_some());
+            if !free {
+                // The parameter's type constrains its text: what follows the tag says whether
+                // a value of it begins there, or the tag is the string's text.
+                self.candidate = Some(Candidate {
+                    key: key.to_string(),
+                    tag: bytes,
+                    space: String::new(),
+                    seen: String::new(),
+                });
+                return;
+            }
+            self.end_the_string(&bytes, out);
+            bytes.clear();
+        }
         match self
             .open
             .last()
             .map(|element| (element.shape, element.kind))
         {
             Some((Shape::Leaf(_), _)) => {
-                self.nested = self.nested.saturating_add(u32::from(self.after_separator));
-                self.leaf_text(Cow::Owned(bytes), out);
+                self.tag_is_text(key, bytes, out);
                 return;
             }
             Some((Shape::Open, kind)) => {
@@ -568,9 +756,7 @@ impl Assembler {
                     None => !self.after_separator,
                 };
                 if leaf {
-                    self.become_leaf(out);
-                    self.nested = self.nested.saturating_add(u32::from(self.after_separator));
-                    self.leaf_text(Cow::Owned(bytes), out);
+                    self.tag_is_text(key, bytes, out);
                     return;
                 }
                 if self.open.len() >= DEEPEST {
@@ -583,17 +769,228 @@ impl Assembler {
             }
             Some((Shape::Object | Shape::List, _)) | None => {}
         }
+        self.open_element(key, &bytes, declared, out);
+    }
+
+    /// An opening tag the innermost element takes as its text: the element is a leaf from here,
+    /// and a tag behind the separator is counted, so that the closing tag that pairs with it
+    /// is the leaf's text too ([`Self::took_a_tag`]).
+    fn tag_is_text(&mut self, key: &str, bytes: String, out: &mut Events) {
+        if matches!(
+            self.open.last(),
+            Some(Element {
+                shape: Shape::Open,
+                ..
+            })
+        ) {
+            self.become_leaf(out);
+        }
+        if self.after_separator {
+            let own = self.open.last().is_some_and(|leaf| leaf.key == key);
+            self.took_a_tag(own);
+        }
+        self.leaf_text(Cow::Owned(bytes), out);
+    }
+
+    /// The string whose close is missing ends here, behind the one word
+    /// (`OpenAtTheNextParameter`), and the tag that ended it, `bytes`, stands behind its
+    /// closing quote.
+    fn end_the_string(&mut self, bytes: &str, out: &mut Events) {
+        let place = self.open.last().and_then(|string| string.place);
+        self.close_left_open(MalformedReason::OpenAtTheNextParameter, bytes, out);
+        if let Some(place) = place {
+            self.ended_early |= 1 << place;
+        }
+    }
+
+    /// Opens the element `key`, with `bytes` of its tag still to account for, and asks the
+    /// tools once what they declare at its path.
+    fn open_element(&mut self, key: &str, bytes: &str, declared: &Declared, out: &mut Events) {
         let kind = self.kind_of(key, declared);
-        self.carried.push_str(&bytes);
+        // A parameter of the call itself takes its bit, so that a string whose close is missing
+        // can tell the next parameter's tag from a tag that names one the call gave already.
+        let (place, plain_string) = if self.open.is_empty() {
+            let declared = self
+                .function
+                .as_deref()
+                .and_then(|function| declared.place(function, key));
+            let place = declared
+                .map(|(place, _)| place)
+                .filter(|place| *place < PLACES);
+            let again = place.is_some_and(|place| self.given & (1 << place) != 0);
+            if self.ended_early != 0 && (declared.is_none() || again) {
+                // A parameter the tool does not declare, or one given twice, after a string
+                // that ended at a tag: the reading is not borne out.
+                self.not_borne_out(out);
+            }
+            if let Some(place) = place {
+                self.given |= 1 << place;
+            }
+            (
+                place.and_then(|place| u8::try_from(place).ok()),
+                declared.is_some_and(|(_, plain_string)| plain_string),
+            )
+        } else {
+            (None, false)
+        };
+        self.carried.push_str(bytes);
         self.value.clear();
         self.nested = 0;
+        self.own_nested = 0;
+        self.marked = false;
         self.open.push(Element {
             key: key.to_string(),
             kind,
+            place,
+            plain_string,
             shape: Shape::Open,
             written: 0,
         });
         self.released = false;
+    }
+
+    /// Reads `text` into the opening tag held undecided ([`Candidate`]) until the bytes behind
+    /// it say whether a value of the named parameter's type begins there: whitespace joins the
+    /// held run, up to [`HELD_SPACE`] bytes, and the bytes after it are weighed by the type
+    /// ([`begins`]). `text` is left at the first byte not taken. A longer run of whitespace, or
+    /// a tag where the value should begin, is no value. `None` while more bytes would say.
+    fn weigh_candidate(&mut self, text: &mut &str, declared: &Declared) -> Option<bool> {
+        let function = self.function.as_deref()?;
+        let candidate = self.candidate.as_mut()?;
+        let (_, schema) = declared.parameter(function, &candidate.key)?;
+        while let Some(next) = text.chars().next() {
+            if candidate.seen.is_empty() && next.is_whitespace() {
+                if candidate.space.len() + next.len_utf8() > HELD_SPACE {
+                    return Some(false);
+                }
+                candidate.space.push(next);
+            } else if next == '<' {
+                return Some(false);
+            } else {
+                candidate.seen.push(next);
+            }
+            *text = &text[next.len_utf8()..];
+            if let Some(value) = begins(schema, &candidate.seen) {
+                return Some(value);
+            }
+            debug_assert!(candidate.seen.len() < LONGEST_WORD);
+        }
+        None
+    }
+
+    /// The opening tag held undecided is the next parameter's: a value of its type begins
+    /// behind it. The string ends at the tag ([`Self::end_the_string`]), the parameter opens,
+    /// and the bytes held behind the tag are its first text.
+    fn candidate_is_the_parameter(&mut self, declared: &Declared, out: &mut Events) {
+        let Some(candidate) = self.candidate.take() else {
+            return;
+        };
+        self.end_the_string(&candidate.tag, out);
+        self.open_element(&candidate.key, "", declared, out);
+        let mut held = candidate.space;
+        held.push_str(&candidate.seen);
+        self.text(Cow::Owned(held), out);
+    }
+
+    /// The opening tag held undecided is the string's text, if one is held: no value of the
+    /// named parameter's type begins behind it (or a tag does, or the call's end), so the
+    /// string goes on with the tag and the bytes held behind it, as with any tag behind a
+    /// separator that is no parameter's.
+    fn candidate_is_text(&mut self, out: &mut Events) {
+        let Some(candidate) = self.candidate.take() else {
+            return;
+        };
+        let after_separator = std::mem::replace(&mut self.after_separator, true);
+        self.tag_is_text(&candidate.key, candidate.tag, out);
+        self.after_separator = after_separator;
+        let mut held = candidate.space;
+        held.push_str(&candidate.seen);
+        if !held.is_empty() {
+            self.text(Cow::Owned(held), out);
+        }
+    }
+
+    /// Whether the opening tag `key`, where it stands, ends a string whose own close is
+    /// missing: the innermost element is a parameter of the call itself that the tool types
+    /// `string` and nothing else, still a string (its text streamed, or none yet), with no tag
+    /// of its own text open in it; the tag stands right behind the template's separator; and
+    /// it names a parameter the tool declares that the call has not given (within [`PLACES`]).
+    /// A string has no child element, so such a tag is the next parameter, and what streamed
+    /// so far is the string whole: nothing of it is held and nothing is taken back. Any other
+    /// tag behind a separator stays the string's text. A candidate whose type constrains its
+    /// text is weighed by the bytes behind the tag first ([`Self::weigh_candidate`]).
+    fn ends_a_string(&self, key: &str, declared: &Declared) -> bool {
+        if !self.after_separator || self.nested != 0 {
+            return false;
+        }
+        let [string] = self.open.as_slice() else {
+            return false;
+        };
+        let streams = matches!(
+            string.shape,
+            Shape::Open
+                | Shape::Leaf(Leaf {
+                    mode: Mode::Streaming,
+                    ..
+                })
+        );
+        if !string.plain_string || !streams {
+            return false;
+        }
+        self.function
+            .as_deref()
+            .and_then(|function| declared.place(function, key))
+            .is_some_and(|(place, _)| place < PLACES && self.given & (1 << place) == 0)
+    }
+
+    /// A string ended at the next parameter's opening tag ([`Self::ends_a_string`]) and the
+    /// call did not bear the reading out. Said once, by a `Malformed { UnconfirmedStringEnd }`
+    /// event of no bytes: what the client holds of the call may be wrong, so the call gets no
+    /// close and is no whole call.
+    fn not_borne_out(&mut self, out: &mut Events) {
+        if !self.unconfirmed {
+            self.unconfirmed = true;
+            super::left_open(MalformedReason::UnconfirmedStringEnd, out);
+        }
+        self.refused = true;
+    }
+
+    /// The call needed a repair: after a string that ended at the next parameter's tag, the
+    /// reading is not borne out ([`Self::not_borne_out`]).
+    fn slipped(&mut self, out: &mut Events) {
+        if self.ended_early != 0 {
+            self.not_borne_out(out);
+        }
+    }
+
+    /// Reads the closing tag held undecided inside a value ([`Self::close_tag`]), if one is,
+    /// by what came behind it and its whitespace. A tag (`closes`: the template's separator
+    /// came, or the call's end): the held tag stands for the element's own close, misnamed,
+    /// and closes it ([`Self::close_left_open`]); the whitespace is the template's, between two
+    /// tags. Text: the held tag stood in the middle of the value, so it is ignored, counted by
+    /// a `Malformed { StrayClosingTag }` event of no bytes, and the value goes on with the
+    /// whitespace as its text. A streamed string's ignored tag leaves as a malformed call's
+    /// bytes; a value held for its close keeps the tag's bytes with its own, in their order.
+    fn settle_stray_close(&mut self, closes: bool, out: &mut Events) {
+        let Some(Stray { mut held, tag }) = self.stray.take() else {
+            return;
+        };
+        let space = held.split_off(tag);
+        self.slipped(out);
+        if closes {
+            self.close_left_open(MalformedReason::MisnamedClosingTag, &held, out);
+            self.carried.push_str(&space);
+            return;
+        }
+        if self.carried.is_empty() {
+            super::refuse(held, MalformedReason::StrayClosingTag, out);
+        } else {
+            super::left_open(MalformedReason::StrayClosingTag, out);
+            self.carried.push_str(&held);
+        }
+        if !space.is_empty() {
+            self.text(Cow::Owned(space), out);
+        }
     }
 
     /// A closing tag. It closes the innermost element when it names it. Any other closing tag
@@ -622,10 +1019,26 @@ impl Assembler {
     /// model left the element's own close out, and the element is written empty (`[]` or `{}`)
     /// as the tag closes through it. Where the empty container would nest past [`DEEPEST`],
     /// that tag stays text.
-    fn close_tag(&mut self, name: &str, bytes: String, out: &mut Events) {
+    fn close_tag(&mut self, name: &str, bytes: String, declared: &Declared, out: &mut Events) {
         if self.open.last().is_some_and(|element| element.key == name) {
-            self.close_element(&bytes, out);
+            // The innermost element's own closing tag, unless it pairs with a tag of that
+            // name the value took as its text, or stands without the separator in a value
+            // that took tags behind one: then it is the value's text.
+            if self.after_separator && self.own_nested > 0 {
+                self.own_nested -= 1;
+                self.nested = self.nested.saturating_sub(1);
+                self.text(Cow::Owned(bytes), out);
+            } else if self.marked && !self.after_separator {
+                self.text(Cow::Owned(bytes), out);
+            } else {
+                self.close_element(&bytes, out);
+            }
             return;
+        }
+        if self.ended_early != 0 && self.names_a_string_ended_early(name, declared) {
+            // The string's own closing tag, after the next parameter's tag ended it: that
+            // tag was the string's text.
+            self.not_borne_out(out);
         }
         let around = self.open.iter().rposition(|element| element.key == name);
         if !self.between_elements() {
@@ -638,16 +1051,33 @@ impl Assembler {
                 self.text(Cow::Owned(bytes), out);
                 return;
             }
-            if !self.holds_text_alone() {
+            if !self.holds_text_alone() || (around.is_none() && self.marked) {
                 self.text(Cow::Owned(bytes), out);
                 return;
             }
         }
         match around {
-            Some(at) => self.close_through(at, &bytes, out),
+            Some(at) => {
+                self.slipped(out);
+                self.close_through(at, &bytes, out);
+            }
             None if self.between_elements() => self.refuse_stray_close(&bytes, out),
-            None => self.close_left_open(MalformedReason::MisnamedClosingTag, &bytes, out),
+            None => {
+                // Whether it closes the value or stands in the middle of it is said by what
+                // follows it: held, with the whitespace behind it, for the next other byte.
+                let tag = bytes.len();
+                self.stray = Some(Stray { held: bytes, tag });
+            }
         }
+    }
+
+    /// Whether `name` is a parameter whose string the next parameter's tag ended
+    /// ([`Self::ends_a_string`]).
+    fn names_a_string_ended_early(&self, name: &str, declared: &Declared) -> bool {
+        self.function
+            .as_deref()
+            .and_then(|function| declared.place(function, name))
+            .is_some_and(|(place, _)| place < PLACES && self.ended_early & (1 << place) != 0)
     }
 
     /// Whether the text the innermost element holds for its close has no start of a tag in it:
@@ -961,6 +1391,8 @@ impl Assembler {
         self.open.pop();
         self.value.clear();
         self.nested = 0;
+        self.own_nested = 0;
+        self.marked = false;
         let mut source = std::mem::take(&mut self.carried);
         source.push_str(bytes);
         self.push_fragment(fragment, Text::uncounted(source), out);
@@ -1072,6 +1504,7 @@ impl Assembler {
     /// costs the call nothing, since such a tag carries no member the client could lose; the
     /// call is as whole after it as before.
     fn refuse_stray_close(&mut self, bytes: &str, out: &mut Events) {
+        self.slipped(out);
         let whole = !self.refused;
         self.refuse_between(bytes, MalformedReason::StrayClosingTag, out);
         self.refused = !whole;

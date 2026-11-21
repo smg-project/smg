@@ -2166,83 +2166,479 @@ mod tests {
         );
     }
 
-    /// The reading has a cost, written down here. The table takes a closing tag behind the
-    /// separator for structure, because the template writes the separator before every tag it
-    /// writes and never inside a value. A model that writes the separator before a closing tag
-    /// inside a value, as the value's own text, has the value end there. Where text follows,
-    /// it is text between elements: refused, and the call gets no close, so a driver that asks
-    /// is told a call was lost. Where only closing tags follow, they are ignored and the call
-    /// closes whole with the shorter value, under `MisnamedClosingTag` alone: the one shape
-    /// this reading delivers changed. Without the separator the same tags are the value's
-    /// text, and so is a pair of tags the value opened and closed behind separators.
+    /// One function for the tests of where a string ends: two strings, an integer, an object,
+    /// a string that may be null, a number, a boolean and an enumerated value.
+    fn save() -> Declared {
+        declared(
+            "save",
+            value!({"type": "object", "properties": {
+                "file": {"type": "string"},
+                "text": {"type": "string"},
+                "lines": {"type": "integer"},
+                "info": {"type": "object", "properties": {"note": {"type": "string"}}},
+                "label": {"type": ["string", "null"]},
+                "ratio": {"type": "number"},
+                "last": {"type": "boolean"},
+                "speed": {"enum": ["fast", "slow"]},
+            }}),
+        )
+    }
+
+    /// One block with one `save` invoke whose elements are `body`, as the model writes them.
+    fn save_call(body: &str) -> String {
+        format!(
+            "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"save\">{body}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        )
+    }
+
+    /// The events of `output` read whole, after checking that it reads the same in pieces of
+    /// one to nine characters: the same calls, content and finish, every byte accounted for.
+    fn read_in_any_pieces(declared: &Declared, output: &str) -> Vec<Event<'static>> {
+        let read = |pieces: &[&str]| run_with(declared.clone(), "", pieces);
+        let whole = read(&[output]);
+        assert_eq!(bytes(&whole), output);
+        let starts: Vec<usize> = output.char_indices().map(|(at, _)| at).collect();
+        for size in 1..=9 {
+            let pieces: Vec<&str> = starts
+                .chunks(size)
+                .map(|chunk| {
+                    let end = starts
+                        .get(starts.partition_point(|at| *at <= chunk[chunk.len() - 1]))
+                        .copied()
+                        .unwrap_or(output.len());
+                    &output[chunk[0]..end]
+                })
+                .collect();
+            let events = read(&pieces);
+            assert_eq!(bytes(&events), output, "{size}-character pieces");
+            assert_eq!(
+                crate::testing::said(&events),
+                crate::testing::said(&whole),
+                "{size}-character pieces of {output}"
+            );
+        }
+        whole
+    }
+
+    /// A string whose closing tag the model left out ends at the next parameter's opening tag:
+    /// inside a parameter of the call itself that the tool types `string` and nothing else, a
+    /// tag behind the separator that names a parameter the tool declares and the call has not
+    /// given is that parameter, and what streamed before it is the string whole. One
+    /// `Malformed { OpenAtTheNextParameter }` event of no bytes stands before the closing
+    /// quote, whose source is the tag; nothing is refused, and the call closes whole at its own
+    /// closing tag.
     #[test]
-    fn a_closing_tag_behind_the_separator_inside_a_value_ends_the_value_there() {
-        let edit = || {
-            declared(
-                "edit",
-                value!({"type": "object", "properties": {
-                    "content": {"type": "string"}, "old_string": {"type": "string"}}}),
-            )
+    fn a_string_without_its_close_ends_at_the_next_parameters_tag() {
+        let ended = MalformedReason::OpenAtTheNextParameter;
+        for (body, written, words) in [
+            (
+                "]<]minimax[>[<file>/tmp/a.py]<]minimax[>[<text>x]<]minimax[>[</text>",
+                value!({"file": "/tmp/a.py", "text": "x"}),
+                1,
+            ),
+            (
+                "]<]minimax[>[<file>notes\n]<]minimax[>[<lines>3]<]minimax[>[</lines>",
+                value!({"file": "notes\n", "lines": 3}),
+                1,
+            ),
+            (
+                "]<]minimax[>[<file>a]<]minimax[>[<text>x]<]minimax[>[<lines>7]<]minimax[>[</lines>",
+                value!({"file": "a", "text": "x", "lines": 7}),
+                2,
+            ),
+            (
+                "]<]minimax[>[<file>a]<]minimax[>[<info>]<]minimax[>[<note>n]<]minimax[>[</note>]<]minimax[>[</info>",
+                value!({"file": "a", "info": {"note": "n"}}),
+                1,
+            ),
+            (
+                "]<]minimax[>[<file>]<]minimax[>[<text>x]<]minimax[>[</text>",
+                value!({"file": "", "text": "x"}),
+                1,
+            ),
+            (
+                "]<]minimax[>[<info>]<]minimax[>[<file>n]<]minimax[>[</file>]<]minimax[>[</info>]<]minimax[>[<text>a]<]minimax[>[<file>p]<]minimax[>[</file>",
+                value!({"info": {"file": "n"}, "text": "a", "file": "p"}),
+                1,
+            ),
+        ] {
+            let events = read_in_any_pieces(&save(), &save_call(body));
+            assert_eq!(arguments(&events), written, "{body}");
+            assert_eq!(reported(&events), vec![ended; words], "{body}");
+            assert!(losses(&events).is_empty(), "{body}");
+            assert_eq!(refused(&events), "", "{body}");
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)], "{body}");
+        }
+        let events = read_in_any_pieces(
+            &save(),
+            &save_call("]<]minimax[>[<file>/tmp/a.py]<]minimax[>[<text>x]<]minimax[>[</text>"),
+        );
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the reading is counted");
+        assert!(
+            matches!(
+                &events[at..at + 2],
+                [
+                    Event::Malformed { text, why: MalformedReason::OpenAtTheNextParameter },
+                    Event::ToolCallArguments { json, source, .. }
+                ] if text.text.is_empty() && json == "\"" && source.text == "<text>"
+            ),
+            "{events:#?}"
+        );
+    }
+
+    /// Every other tag behind the separator inside a string is the string's text, as before:
+    /// one that names no parameter of the tool, one that names a parameter the call gave
+    /// already, and any tag in a parameter the tool does not type `string` and nothing else.
+    /// A pair of tags the value opened and closed behind separators is its text, a pair of the
+    /// value's own name included, and once a value took a tag behind a separator as its text
+    /// every later one is its text too, until its own closing tag behind a separator. No
+    /// reason is given: a well-formed call reads as it did.
+    #[test]
+    fn any_other_tag_behind_the_separator_stays_the_strings_text() {
+        for (body, written) in [
+            (
+                "]<]minimax[>[<text>]<]minimax[>[<div>hi]<]minimax[>[</div>]<]minimax[>[</text>",
+                value!({"text": "<div>hi</div>"}),
+            ),
+            (
+                "]<]minimax[>[<file>p]<]minimax[>[</file>]<]minimax[>[<text>see ]<]minimax[>[<file>]<]minimax[>[</text>",
+                value!({"file": "p", "text": "see <file>"}),
+            ),
+            (
+                "]<]minimax[>[<label>a]<]minimax[>[<lines>3]<]minimax[>[</lines>]<]minimax[>[</label>",
+                value!({"label": "a<lines>3</lines>"}),
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<text>b]<]minimax[>[</text>c]<]minimax[>[</text>",
+                value!({"text": "a<text>b</text>c"}),
+            ),
+            (
+                "]<]minimax[>[<text>]<]minimax[>[<i>x]<]minimax[>[</i><td>a]<]minimax[>[</td>b]<]minimax[>[<br>c]<]minimax[>[</text>",
+                value!({"text": "<i>x</i><td>a</td>b<br>c"}),
+            ),
+            (
+                "]<]minimax[>[<text><ul>]<]minimax[>[<li class=\"x\">item]<]minimax[>[</li></ul>]<]minimax[>[</text>",
+                value!({"text": "<ul><li class=\"x\">item</li></ul>"}),
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<br>b</text>]<]minimax[>[<i>c]<]minimax[>[</i>]<]minimax[>[</text>",
+                value!({"text": "a<br>b</text><i>c</i>"}),
+            ),
+            (
+                "]<]minimax[>[<file>a<text>x</text>]<]minimax[>[</file>]<]minimax[>[<lines>3]<]minimax[>[</lines>",
+                value!({"file": "a<text>x</text>", "lines": 3}),
+            ),
+            // A tag with attributes, or any tail after its name, is no parameter's.
+            (
+                "]<]minimax[>[<text>]<]minimax[>[<file d=\"M0 0\">x]<]minimax[>[</file>]<]minimax[>[</text>",
+                value!({"text": "<file d=\"M0 0\">x</file>"}),
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<file/>b]<]minimax[>[</text>",
+                value!({"text": "a<file/>b"}),
+            ),
+        ] {
+            let events = read_in_any_pieces(&save(), &save_call(body));
+            assert_eq!(arguments(&events), written, "{body}");
+            assert!(malformed(&events).is_empty(), "{body}: {events:#?}");
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)], "{body}");
+        }
+    }
+
+    /// A tag that names a parameter whose type constrains its text ends the string only where
+    /// a value of that type begins behind it: a digit, or a sign and a digit, for an integer
+    /// and a number; one of the words the template writes for a boolean; the start of one of
+    /// an enumerated parameter's values. The tag is held for that, with at most 64 bytes of
+    /// whitespace behind it and the few bytes the type needs. Anything else behind it, a tag
+    /// or the call's end included, and the tag is the string's text, with what followed it:
+    /// the call reads as it did, whole, with no reason given.
+    #[test]
+    fn a_tag_that_names_a_typed_parameter_ends_the_string_only_before_a_value_of_its_type() {
+        let near = " ".repeat(64);
+        let far = " ".repeat(65);
+        for (body, written, ends_the_string) in [
+            (
+                "]<]minimax[>[<file>a]<]minimax[>[<lines>\n 3]<]minimax[>[</lines>".to_string(),
+                value!({"file": "a", "lines": 3}),
+                true,
+            ),
+            (
+                "]<]minimax[>[<file>a]<]minimax[>[<lines>-3]<]minimax[>[</lines>".to_string(),
+                value!({"file": "a", "lines": -3}),
+                true,
+            ),
+            (
+                "]<]minimax[>[<file>a]<]minimax[>[<ratio>0.5]<]minimax[>[</ratio>".to_string(),
+                value!({"file": "a", "ratio": 0.5}),
+                true,
+            ),
+            (
+                "]<]minimax[>[<file>a]<]minimax[>[<last>true]<]minimax[>[</last>".to_string(),
+                value!({"file": "a", "last": true}),
+                true,
+            ),
+            (
+                "]<]minimax[>[<file>a]<]minimax[>[<speed>fast]<]minimax[>[</speed>".to_string(),
+                value!({"file": "a", "speed": "fast"}),
+                true,
+            ),
+            (
+                format!("]<]minimax[>[<file>a]<]minimax[>[<lines>{near}3]<]minimax[>[</lines>"),
+                value!({"file": "a", "lines": 3}),
+                true,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<lines>b]<]minimax[>[</lines>c]<]minimax[>[</text>".to_string(),
+                value!({"text": "a<lines>b</lines>c"}),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>one]<]minimax[>[<lines>two]<]minimax[>[</text>".to_string(),
+                value!({"text": "one<lines>two"}),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<lines>-x]<]minimax[>[</lines>]<]minimax[>[</text>".to_string(),
+                value!({"text": "a<lines>-x</lines>"}),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<ratio>.]<]minimax[>[</ratio>]<]minimax[>[</text>".to_string(),
+                value!({"text": "a<ratio>.</ratio>"}),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<last>truth]<]minimax[>[</last>]<]minimax[>[</text>".to_string(),
+                value!({"text": "a<last>truth</last>"}),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<speed>quick]<]minimax[>[</speed>]<]minimax[>[</text>".to_string(),
+                value!({"text": "a<speed>quick</speed>"}),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<lines>]<]minimax[>[</lines>]<]minimax[>[</text>".to_string(),
+                value!({"text": "a<lines></lines>"}),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<lines><b>3</b>]<]minimax[>[</lines>]<]minimax[>[</text>".to_string(),
+                value!({"text": "a<lines><b>3</b></lines>"}),
+                false,
+            ),
+            (
+                format!("]<]minimax[>[<text>a]<]minimax[>[<lines>{far}3]<]minimax[>[</lines>]<]minimax[>[</text>"),
+                value!({ "text": format!("a<lines>{far}3</lines>") }),
+                false,
+            ),
+            (
+                "]<]minimax[>[<text>a]<]minimax[>[<lines>".to_string(),
+                value!({"text": "a<lines>"}),
+                false,
+            ),
+        ] {
+            let events = read_in_any_pieces(&save(), &save_call(&body));
+            assert_eq!(arguments(&events), written, "{body}");
+            let words = if ends_the_string {
+                vec![MalformedReason::OpenAtTheNextParameter]
+            } else if body.ends_with("<lines>") {
+                vec![MalformedReason::OpenAtTheMarker]
+            } else {
+                vec![]
+            };
+            assert_eq!(reported(&events), words, "{body}");
+            assert!(losses(&events).is_empty(), "{body}");
+            assert_eq!(refused(&events), "", "{body}");
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)], "{body}");
+        }
+    }
+
+    /// A string ended at the next parameter's tag is a reading the rest of the call has to bear
+    /// out, since nothing sent can be taken back. Where it does not, the call is no whole
+    /// call: one `Malformed { UnconfirmedStringEnd }` event of no bytes says so, a reason that
+    /// loses a call, and the arguments get no close. The string's own closing tag after all
+    /// (the tag that ended it was its text); a parameter the tool does not declare, or one
+    /// given twice; a closing tag that names nothing open; a value left open at the call's
+    /// closing tag; and a call that ends at the block's close.
+    #[test]
+    fn a_string_ended_at_a_tag_that_the_call_does_not_bear_out_loses_the_call() {
+        let unconfirmed = MalformedReason::UnconfirmedStringEnd;
+        let block = |inside: &str| {
+            format!("]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"save\">{inside}")
         };
-        let call = |body: &str| {
-            format!(
-                "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"edit\">{}\
-                 ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
-                body.replace('^', SEPARATOR)
-            )
-        };
-        let read = |body: &str| run_with(edit(), "", &[&call(body)]);
+        for output in [
+            save_call("]<]minimax[>[<text>a]<]minimax[>[<lines>3]<]minimax[>[</lines>]<]minimax[>[</text>"),
+            save_call("]<]minimax[>[<text>a]<]minimax[>[<lines>3]<]minimax[>[</lines>b]<]minimax[>[</text>"),
+            save_call("]<]minimax[>[<file>a]<]minimax[>[<text>x]<]minimax[>[</text>]<]minimax[>[<extra>1]<]minimax[>[</extra>"),
+            save_call("]<]minimax[>[<file>a]<]minimax[>[<text>x]<]minimax[>[</text>]<]minimax[>[<text>y]<]minimax[>[</text>"),
+            save_call("]<]minimax[>[<file>a]<]minimax[>[<text>x]<]minimax[>[</text>]<]minimax[>[</zzz>"),
+            save_call("]<]minimax[>[<file>a]<]minimax[>[<text>x"),
+            block("]<]minimax[>[<file>a]<]minimax[>[<text>x]<]minimax[>[</text>]<]minimax[>[</tool_call>"),
+        ] {
+            let events = read_in_any_pieces(&save(), &output);
+            let lost = losses(&events);
+            assert!(lost.contains(&unconfirmed), "{output}: {lost:?}");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { why, .. } if *why == unconfirmed))
+                    .count(),
+                1,
+                "{output}"
+            );
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&arguments_of(&events, 0)).is_err(),
+                "{output}: no close for the call"
+            );
+        }
+    }
 
-        // Text after the tag: the value ends at the tag, the text is refused, no close.
-        let events = read("^<content>line one^</p>line two^</content>");
-        assert_eq!(
-            bytes(&events),
-            call("^<content>line one^</p>line two^</content>")
-        );
-        assert_eq!(arguments_of(&events, 0), r#"{"content": "line one""#);
-        assert_eq!(
-            reported(&events),
-            [
-                MalformedReason::MisnamedClosingTag,
-                MalformedReason::TextBetweenTags,
-                MalformedReason::TextBetweenTags,
-                MalformedReason::StrayClosingTag,
-            ]
-        );
-        assert_eq!(losses(&events), [MalformedReason::TextBetweenTags; 2]);
-        assert_eq!(refused(&events), "line two</content>");
+    /// A closing tag behind the separator that names nothing open, inside a value, is read by
+    /// what follows it and the whitespace behind it. Text: the tag stood in the middle of the
+    /// value, so it is ignored (`StrayClosingTag`, its bytes refused) and the value goes on,
+    /// the whitespace part of it. A tag, or the call's end: it stands for the value's own
+    /// close under another name (`MisnamedClosingTag`), and the value's own closing tag after
+    /// it is ignored in turn. The tag is held for that, with at most 64 bytes of whitespace:
+    /// a longer run is the value's text, so the tag stood beside text.
+    #[test]
+    fn a_closing_tag_that_names_nothing_open_inside_a_value_is_read_by_what_follows_it() {
+        let ignored = MalformedReason::StrayClosingTag;
+        let misnamed = MalformedReason::MisnamedClosingTag;
+        let near = " ".repeat(64);
+        let far = " ".repeat(65);
+        for (body, written, words, refused_bytes) in [
+            (
+                "]<]minimax[>[<text>line one]<]minimax[>[</p>line two]<]minimax[>[</text>".to_string(),
+                value!({"text": "line oneline two"}),
+                vec![ignored],
+                "</p>".to_string(),
+            ),
+            (
+                "]<]minimax[>[<text><b>bold]<]minimax[>[</b> tail]<]minimax[>[</text>".to_string(),
+                value!({"text": "<b>bold tail"}),
+                vec![ignored],
+                "</b>".to_string(),
+            ),
+            (
+                "]<]minimax[>[<lines>3]<]minimax[>[</line>4]<]minimax[>[</lines>".to_string(),
+                value!({"lines": 34}),
+                vec![ignored],
+                String::new(),
+            ),
+            (
+                "]<]minimax[>[<text><ul><li>a]<]minimax[>[</ul>]<]minimax[>[</text>".to_string(),
+                value!({"text": "<ul><li>a"}),
+                vec![misnamed, ignored],
+                "</text>".to_string(),
+            ),
+            (
+                "]<]minimax[>[<file>]<]minimax[>[</ul>\n]<]minimax[>[</nav>]<]minimax[>[</file>".to_string(),
+                value!({"file": ""}),
+                vec![misnamed, ignored, ignored],
+                "</nav></file>".to_string(),
+            ),
+            (
+                "]<]minimax[>[<text>]<]minimax[>[</li>]<]minimax[>[<li>next]<]minimax[>[</li>]<]minimax[>[</text>".to_string(),
+                value!({"text": "", "li": "next"}),
+                vec![misnamed, ignored],
+                "</text>".to_string(),
+            ),
+            (
+                "]<]minimax[>[<text>Paris]<]minimax[>[</town>".to_string(),
+                value!({"text": "Paris"}),
+                vec![misnamed],
+                String::new(),
+            ),
+            (
+                format!("]<]minimax[>[<text>a]<]minimax[>[</p>{near}]<]minimax[>[</text>"),
+                value!({"text": "a"}),
+                vec![misnamed, ignored],
+                "</text>".to_string(),
+            ),
+            (
+                format!("]<]minimax[>[<text>a]<]minimax[>[</p>{far}]<]minimax[>[</text>"),
+                value!({ "text": format!("a{far}") }),
+                vec![ignored],
+                "</p>".to_string(),
+            ),
+        ] {
+            let events = read_in_any_pieces(&save(), &save_call(&body));
+            assert_eq!(arguments(&events), written, "{body}");
+            assert_eq!(reported(&events), words, "{body}");
+            assert!(losses(&events).is_empty(), "{body}");
+            assert_eq!(refused(&events), refused_bytes, "{body}");
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)], "{body}");
+        }
+    }
 
-        // Only closing tags after it: the call closes whole, with the value cut to nothing.
-        let events = read("^<old_string>^</ul>\n^</nav>^</old_string>");
-        assert_eq!(arguments(&events), value!({"old_string": ""}));
-        assert_eq!(
-            reported(&events),
-            [
-                MalformedReason::MisnamedClosingTag,
-                MalformedReason::StrayClosingTag,
-                MalformedReason::StrayClosingTag,
-            ]
-        );
-        assert!(losses(&events).is_empty());
-        assert_eq!(refused(&events), "</nav></old_string>");
-        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
-
-        // The same bytes without the separator before the inner tags are the value, whole.
-        let events = read("^<old_string></ul>\n</nav>^</old_string>");
-        assert_eq!(arguments(&events), value!({"old_string": "</ul>\n</nav>"}));
-        assert!(reported(&events).is_empty(), "{events:#?}");
-        let events = read("^<content>line one</p>line two^</content>");
-        assert_eq!(
-            arguments(&events),
-            value!({"content": "line one</p>line two"})
-        );
-        // And a pair the value opened and closed behind separators is its text too.
-        let events = read("^<content>^<p>line one^</p>line two^</content>");
-        assert_eq!(
-            arguments(&events),
-            value!({"content": "<p>line one</p>line two"})
-        );
-        assert!(reported(&events).is_empty(), "{events:#?}");
+    /// What the reader holds back of a string value, in bytes of the model's output: one tag
+    /// while it is read, from its `<` to its `>`; behind a closing tag that names nothing
+    /// open, or an opening tag that names a parameter whose type constrains its text, at most
+    /// 64 bytes of whitespace, and for the opening tag the bytes its type needs, five at most;
+    /// and what the engine holds of a possible marker, less than the separator's length. Fed
+    /// a byte at a time, the bytes no event has accounted for never pass that bound, and a
+    /// long value's text leaves in the step that brings it: in a well-formed call, after a
+    /// string ended at the next parameter's tag, after a closing tag in the middle of the
+    /// value was ignored, and after a tag held for the bytes behind it turned out the value's
+    /// text.
+    #[test]
+    fn a_string_value_streams_as_it_arrives_within_a_stated_bound() {
+        let long = "word ".repeat(80);
+        for body in [
+            format!("]<]minimax[>[<text>{long}]<]minimax[>[</text>"),
+            format!("]<]minimax[>[<file>{long}]<]minimax[>[<text>{long}]<]minimax[>[</text>"),
+            format!("]<]minimax[>[<text>{long}]<]minimax[>[</p>{long}]<]minimax[>[</text>"),
+            format!("]<]minimax[>[<text>{long}]<]minimax[>[</p>   \n {long}]<]minimax[>[</text>"),
+            format!("]<]minimax[>[<text>{long}]<]minimax[>[<em>{long}]<]minimax[>[</em>{long}]<]minimax[>[</text>"),
+            format!("]<]minimax[>[<file>{long}]<]minimax[>[<last>   \n false]<]minimax[>[</last>]<]minimax[>[<text>{long}]<]minimax[>[</text>"),
+            format!("]<]minimax[>[<text>{long}]<]minimax[>[<last>   \n fals{long}]<]minimax[>[</last>{long}]<]minimax[>[</text>"),
+        ] {
+            let output = save_call(&body);
+            let longest_tag = "<invoke name=\"save\">".len();
+            let bound = longest_tag + 64 + "false".len() + SEPARATOR.len();
+            let runs: Vec<std::ops::Range<usize>> = output
+                .match_indices(long.as_str())
+                .map(|(at, run)| at..at + run.len())
+                .collect();
+            let mut engine = Engine::new(minimax_m3(), save());
+            let mut accounted = 0;
+            let mut written = 0;
+            for (fed, byte) in output.char_indices() {
+                let mut out = crate::Events::new();
+                let piece = &output[fed..fed + byte.len_utf8()];
+                crate::Parser::feed(
+                    &mut engine,
+                    crate::Input::Delta {
+                        token_ids: &[],
+                        text: piece,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("a delta");
+                accounted += out.text().len();
+                let held = fed + piece.len() - accounted;
+                assert!(held <= bound, "{held} bytes held at byte {fed} of {body:.60}");
+                let fragments: usize = out
+                    .iter()
+                    .map(|event| match event {
+                        Event::ToolCallArguments { json, .. } => json.len(),
+                        _ => 0,
+                    })
+                    .sum();
+                // Inside the long runs of words every letter leaves in the step that brings it.
+                if byte.is_alphabetic() && runs.iter().any(|run| run.contains(&fed)) {
+                    assert!(fragments >= 1, "byte {fed} of {body:.60}");
+                }
+                written += fragments;
+            }
+            assert!(written >= long.len(), "{body:.60}");
+        }
     }
 
     /// The end of an invoke closes what the model left open in it, whichever end it is: the

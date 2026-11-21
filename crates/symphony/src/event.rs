@@ -310,6 +310,21 @@ malformed_reasons! {
     /// elements is refused; closing tags are ignored). The reason is its own so that the rate
     /// of the reading can be counted.
     MisnamedClosingTag => "a value closed by a closing tag of another name",
+    /// A string value of the XML syntax with no closing tag of its own, ended where the next
+    /// parameter's opening tag stands behind the template's separator: a top-level parameter
+    /// the tool types `string` and nothing else, and a tag that names a parameter the tool
+    /// declares and the call has not given, before a value of that parameter's type where
+    /// the type constrains its text. The string is closed there and the parameter opens. The event carries no bytes and stands before the closing quote, whose source is
+    /// that tag. This is a reading of what the model meant; the rest of the call has to bear
+    /// it out, or the call says [`Self::UnconfirmedStringEnd`].
+    OpenAtTheNextParameter => "a string value left open at the next parameter's opening tag",
+    /// A call in which a string value was ended at the next parameter's opening tag
+    /// ([`Self::OpenAtTheNextParameter`]) and the reading did not hold: the string's own
+    /// closing tag came after all, so the tag that ended it was its text; or the call needed
+    /// another repair after it, named a parameter the tool does not declare or gave one twice,
+    /// or ended without its own closing tag. What the client was sent of the call may be
+    /// wrong, so the call gets no close and is no whole call. The event carries no bytes.
+    UnconfirmedStringEnd => "a string value ended at the next parameter's tag, which the call did not bear out",
 }
 
 impl MalformedReason {
@@ -334,6 +349,9 @@ impl MalformedReason {
     ///   ignored; it carries no member, and the call beside it is whole without it.
     /// - [`MisnamedClosingTag`](Self::MisnamedClosingTag): the syntax read a closing tag of
     ///   another name as a value's own close; the call closes whole with the value it read.
+    /// - [`OpenAtTheNextParameter`](Self::OpenAtTheNextParameter): the syntax ended a string
+    ///   with no close of its own at the next parameter's tag; where the rest of the call
+    ///   bears that out, the call closes whole.
     /// - [`TextAfterTheArguments`](Self::TextAfterTheArguments) and
     ///   [`TextAfterTheList`](Self::TextAfterTheList): text after a call, or a list of calls,
     ///   that was read whole; the text is returned and no call is short of it.
@@ -358,6 +376,7 @@ impl MalformedReason {
             | Self::OpenAtTheParentsClose
             | Self::StrayClosingTag
             | Self::MisnamedClosingTag
+            | Self::OpenAtTheNextParameter
             | Self::TextAfterTheArguments
             | Self::TextAfterTheList => false,
             // The stream ended inside a call or a block that named none; arguments that are no
@@ -386,7 +405,8 @@ impl MalformedReason {
             | Self::ValueCutShort
             | Self::EmptyKey
             | Self::BlockWithoutACompleteCall
-            | Self::NoForcedFunction => true,
+            | Self::NoForcedFunction
+            | Self::UnconfirmedStringEnd => true,
         }
     }
 }
@@ -914,11 +934,11 @@ mod tests {
         assert_eq!(seen.len(), MalformedReason::ALL.len());
     }
 
-    /// The reasons that lose no call are the nine the method's doc names; every other reason
+    /// The reasons that lose no call are the ten the method's doc names; every other reason
     /// of the crate loses one. Pinned by name, so a reason moved from one side to the other is
     /// a change made here on purpose.
     #[test]
-    fn the_reasons_that_lose_no_call_are_the_nine_named() {
+    fn the_reasons_that_lose_no_call_are_the_ten_named() {
         let harmless: Vec<MalformedReason> = MalformedReason::ALL
             .iter()
             .copied()
@@ -936,11 +956,12 @@ mod tests {
                 MalformedReason::StrayClosingTag,
                 MalformedReason::OpenAtTheParentsClose,
                 MalformedReason::MisnamedClosingTag,
+                MalformedReason::OpenAtTheNextParameter,
             ]
         );
         assert_eq!(
             MalformedReason::ALL.len() - harmless.len(),
-            24,
+            25,
             "every other reason loses a call"
         );
     }

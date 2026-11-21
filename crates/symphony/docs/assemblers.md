@@ -490,21 +490,46 @@ What the syntax says, and what the assembler does with it:
   its own close would type it, an element with nothing in it is the empty value of its type,
   a container closes with the members it has, and what follows the tag is read in the
   container the model went back to. One `Malformed { OpenAtTheParentsClose }` event of no
-  bytes stands before the first fragment, and nothing is refused. Nothing open: the tag stands
-  for the element's own close, misnamed, and closes it the same way behind one
-  `Malformed { MisnamedClosingTag }` event of no bytes (`Assembler::close_left_open`). That
-  one is a reading of what the model meant, with a reason of its own so its rate can be
-  counted: had the model written the separator and a closing tag as part of the value, the
-  value ends there, the text after it is refused as text between elements, and where nothing
-  but closing tags follows the call closes whole with the shorter value. Two closing
-  tags behind a separator stay the element's text: one that pairs with an opening tag the value
-  took as its text behind a separator (tags the model is writing inside a declared string),
-  and any closing tag but its own once a value held for its close has the start of a tag in
-  its text, where what the model meant is no longer known. Between elements, where the syntax
+  bytes stands before the first fragment, and nothing is refused. Nothing open: what follows
+  the tag says how it reads, so the tag is held, with at most 64 bytes of whitespace behind
+  it, for the next other byte (`Assembler::settle_stray_close`). A tag behind it (the
+  separator comes, or the call's end): it stands for the element's own close, misnamed, and
+  closes it the same way behind one `Malformed { MisnamedClosingTag }` event of no bytes
+  (`Assembler::close_left_open`). Text behind it: it stood in the middle of the value, so it
+  is ignored (`StrayClosingTag`) and the value goes on, the whitespace part of it. Both are
+  readings of what the model meant, each counted under its own reason. Three closing tags
+  behind a separator stay the element's text: one that pairs with an opening tag the value
+  took as its text behind a separator (tags the model is writing inside a declared string; a
+  tag with attributes counts, and the value's own closing tag pairs with a tag of its own
+  name first); any one that names nothing open once the value took such a tag, from where
+  only the value's own closing tag behind a separator closes it; and any closing tag but its
+  own once a value held for its close has the start of a tag in its text, where what the
+  model meant is no longer known. Between elements, where the syntax
   has only tags, the separator decides nothing: a closing tag that names an open element
   further out closes through to it, and one that names nothing open is ignored (below).
   Nothing is taken from a value: the template writes it directly between the tags, with no
   escaping.
+- **A string whose close is missing ends at the next parameter's tag.** Inside a parameter of
+  the call itself that the tool types `string` and nothing else, an opening tag behind the
+  separator that names a parameter the tool declares and the call has not given is that
+  parameter: a string has no child element, so the string ends there, behind one
+  `Malformed { OpenAtTheNextParameter }` event of no bytes, and what streamed is the string
+  whole (`Assembler::ends_a_string`). Nothing of the string is held and nothing is taken
+  back. Where the named parameter's type constrains its text (an integer, a number, a
+  boolean, a null, an enumerated value), the tag ends the string only where a value of that
+  type begins behind it: the tag is held, with at most 64 bytes of whitespace and the bytes
+  the type needs, five at most, and anything else behind it leaves the tag the string's text
+  (`Assembler::weigh_candidate`); a parameter typed `string`, or with no such type, cannot be
+  told apart that way and ends the string at its tag. The call keeps one bit per declared
+  property for the parameters it has given (`Declared::place`), for the first 64; a property
+  past them is never taken for the next parameter. Every other opening tag behind a separator
+  stays the string's text: one that names no parameter of the tool, one that names a
+  parameter the call gave already, and one with attributes or any tail after its name, which
+  is no whole tag. Since nothing sent can be taken
+  back, the rest of the call has to bear the reading out: the string's own closing tag after
+  all, another repair in the call, a parameter the tool does not declare or one given twice,
+  or an end other than the call's own closing tag makes the call no whole call, said once by
+  `Malformed { UnconfirmedStringEnd }`, a reason that loses a call.
 - **A top-level null is never written.** The template leaves an argument whose value is `None`
   out (`for k, v in arguments.items() if v is not none`), so no output carries one; the
   parity test counts that as a corpus class.
