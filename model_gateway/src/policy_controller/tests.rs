@@ -1174,10 +1174,14 @@ async fn a_pair_family_serves_in_process_and_refuses_by_name_under_an_address() 
             !Arc::ptr_eq(&policies.get_decode_policy(), &unset),
             "{family}"
         );
-        // The encode family's start registers its encode policy: one object
-        // at every read.
-        let registered = Arc::ptr_eq(&policies.get_encode_policy(), &policies.get_encode_policy());
-        assert_eq!(registered, classic == "grpc_epd", "{family}");
+        // The registry keeps one encode policy either way: the one the
+        // encode family's start registers, or its fall-back, built at the
+        // first read and kept.
+        let encode = policies.get_encode_policy();
+        assert!(
+            Arc::ptr_eq(&encode, &policies.get_encode_policy()),
+            "{family}"
+        );
 
         let (config, _socket) = followed(config)?;
         let (context, gateway) = build(config).await?;
