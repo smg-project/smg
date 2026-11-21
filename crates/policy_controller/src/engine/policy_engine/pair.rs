@@ -38,6 +38,7 @@ use std::time::Instant;
 use crate::{
     engine::{
         decision::{Decision, ShedReason, Target},
+        decision_engine::HeldDecision,
         framework::{Engine, PairPools, Scratch},
         pair_classes::PartnerClasses,
         store_backed_engine::{shed, SUBSET_HINT, WIRES},
@@ -60,25 +61,6 @@ const HAS_CAPACITY: &str = "has-capacity";
 #[must_use]
 pub fn prefills_full(decision: &Decision) -> bool {
     matches!(decision, Decision::Shed(shed) if shed.emptied_by == HAS_CAPACITY)
-}
-
-/// What a request's guard holds of a pair's decision, lent for one word.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct HeldDecision<'a> {
-    /// The pick as the guard holds it: the pair's first, or a decode
-    /// call's, which takes the first one's place.
-    pub decision: &'a Decision,
-    /// The prefill side's lease, as issued.
-    pub lease: &'a Lease,
-    /// The request's session under the decode phase.
-    pub decode_session: Session,
-    /// The place in the pick of the target the host took.
-    pub index: u8,
-    /// The target the host took.
-    pub target: &'a Target,
-    /// Whether the decode side stood chosen until this word: the pick names
-    /// it and no decision issued it.
-    pub decode_chosen: bool,
 }
 
 /// What the host of a pair reads of its own admission at a decision's
