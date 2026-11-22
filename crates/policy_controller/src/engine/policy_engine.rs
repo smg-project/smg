@@ -32,7 +32,9 @@
 //! request's guard holds to its end. The engine files no lease and keeps no
 //! note of a request: the guard lends back what a later word needs
 //! ([`HeldDecision`]). A single request is decided in [`single`], and a pair
-//! in [`pair`], with its decode asked again behind its prefill.
+//! in [`pair`], with its decode asked again behind its prefill. An encode
+//! item is decided in [`single`] too, on the encode side of an encode plan:
+//! over the list of encoders its host hands for it, and under no lease.
 //!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation, and for the stages
@@ -65,12 +67,12 @@ use super::{
         AlonePick, Decided, DecisionEngine, HeldDecision, RequestMaker, WorkerLists,
     },
     framework::{
-        release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
+        release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, Plan, PoolWord,
     },
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
     store_backed_engine::{DecideOutcome, DecisionRefused, Request, SweepOutcome},
-    view::{fingerprint, Phase, WireModes, WorkerId},
+    view::{fingerprint, Phase, Session, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
@@ -133,10 +135,10 @@ pub struct PoolMembers {
     /// The wires the list's workers are dialed on ([`Self::wires`]): read
     /// of their registrations at the first whole decision over the list.
     wires: OnceLock<WireModes>,
-    /// The model of the list's first single request and the profile the
-    /// engine picks alone for it, where the document holds one
-    /// ([`Self::alone`]).
-    alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
+    /// The model and the phase of the list's first request the short path
+    /// was asked for, and the profile the engine picks alone for that
+    /// place, where the document holds one ([`Self::alone`]).
+    alone: OnceLock<(Box<str>, Phase, Option<AloneProfile>)>,
     /// The list's hash ring ([`Self::ring`]): built off the path of a
     /// request, and by no decision ([`PolicyEngine::fill_ring`]).
     ring: OnceLock<PoolRing>,
@@ -251,34 +253,43 @@ impl PoolMembers {
         &self.affinity
     }
 
-    /// The profile the engine picks alone for a single request of `model`
-    /// over this list ([`Place::Alone`]), under a binding that states no
-    /// sessions rule: `None` where the place's decision asks more than one
-    /// pick. Found once a list, for the model of its first request: a
-    /// gateway's list is one model's. Another model's request is answered
-    /// by the document at its call.
-    fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+    /// The profile the engine picks alone for a request of `model` at
+    /// `phase` over this list ([`Place::Alone`]), under a binding that
+    /// states no sessions rule: `None` where the place's decision asks more
+    /// than one pick. Found once a list, for the model and the phase of its
+    /// first request: a gateway's list is one model's and one pool's.
+    /// Another place's request is answered by the document at its call.
+    fn alone(&self, spec: &AppliedSpec, model: &str, phase: Phase) -> Option<AloneProfile> {
         let find = || {
             let engine = spec.engine();
-            let Place::Alone(profile) = engine.place_for(model, Phase::Single) else {
+            let Place::Alone(profile) = engine.place_for(model, phase) else {
                 return None;
             };
+            let binding = engine.binding(model, phase)?;
             // A sessions rule pins a keyed request ahead of the profile.
-            let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
-            (!ruled).then_some(profile)
+            let ruled = binding.sessions.is_some();
+            // An encode item is decided on the encode side of an encode
+            // plan, and under no other binding.
+            let has_side = phase != Phase::Encode || is_encode_plan(binding.plan);
+            (!ruled && has_side).then_some(profile)
         };
         // A part is one ask's: its answer is kept nowhere, so nothing is
         // allocated for it.
         if self.part {
             return find();
         }
-        let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
-        if **named == *model {
+        let (named, at, alone) = self.alone.get_or_init(|| (model.into(), phase, find()));
+        if **named == *model && *at == phase {
             *alone
         } else {
             find()
         }
     }
+}
+
+/// Whether `plan` has an encode side.
+const fn is_encode_plan(plan: Plan) -> bool {
+    matches!(plan, Plan::Epd { .. })
 }
 
 impl PolicyEngine {
@@ -485,6 +496,15 @@ impl PolicyEngine {
         among(self.picker_of(profile)?, workers, admits)
     }
 
+    /// Whether an encode item of `model` is decided on the encode side of
+    /// an encode plan: the binding that names the model for the encode
+    /// phase plans one. Under any other binding an encode item is a side
+    /// sent on its own.
+    fn has_encode_plan(&self, model: &str) -> bool {
+        let binding = self.spec.engine().binding(model, Phase::Encode);
+        binding.is_some_and(|binding| is_encode_plan(binding.plan))
+    }
+
     /// The picker of `profile`.
     #[inline]
     fn picker_of(&self, profile: AloneProfile) -> Option<&dyn Picker> {
@@ -550,8 +570,9 @@ impl PolicyEngine {
         if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
             if let Some(pick) = single::alone(self, maker.model(), plain, members) {
                 // No stage takes a word of the request: the place is
-                // the whole answer.
-                if !self.hears.intersects(EventSet::LEASE) {
+                // the whole answer. An encode item's is under every
+                // document: no lease is issued for it.
+                if plain.phase == Phase::Encode || !self.hears.intersects(EventSet::LEASE) {
                     return Ok(Some(pick));
                 }
                 picked = Some((pick, members, plain));
@@ -576,6 +597,24 @@ impl PolicyEngine {
                 let loads = maker.loads();
                 let decided = pair::decided(self, &lists, &mut request, None, loads, now);
                 *whole = Some((decided, later));
+                return Ok(None);
+            }
+            // One encode item under an encode plan's binding, over the
+            // encoders its host hands for it: the whole pass of its side's
+            // profile, as a single request's. No lease is issued for it: a
+            // host counts no request on an encoder and says no word of
+            // one. So a host asks here only under a profile that depends
+            // on no lease's events (`Engine::can_decide`).
+            (Phase::Encode, WorkerLists::Single(members))
+                if self.has_encode_plan(maker.model()) =>
+            {
+                let decision = single::decide(self, &mut request, members, maker.loads(), now);
+                let unleased = DecideOutcome {
+                    decision,
+                    lease: None,
+                    decode_session: Session::NONE,
+                };
+                *whole = Some((unleased, false));
                 return Ok(None);
             }
             // A request that hands no list of its own is decided over
@@ -1119,6 +1158,67 @@ mod tests {
         // stand in the way of a document that does not name it.
         assert!(engine.can_decide_every_plan(|plan| (plan == PlanName::Single).then_some(nothing)));
         assert!(!engine.can_decide_every_plan(|_| None));
+    }
+
+    /// An encode place is decided where it is picked alone or fed, as any
+    /// place, and its profile takes no word of a lease. The engine decides
+    /// an encode item under no lease, so a stage that hears a lease's word
+    /// or reads the profile's count of sends would be told nothing of an
+    /// item. Round robin, random and passthrough take none and ask nothing
+    /// of a host. Consistent hashing and the prefix hash take none either:
+    /// they wait on a host that feeds a ring. The bucket policy hears a
+    /// lease's issue; least load, power of two and the default policy read
+    /// a count of sends. None of the four is decided at an encode place,
+    /// whatever its host feeds. A pair's side is held to no such rule: each
+    /// is decided at the prefill place of the same plan.
+    #[test]
+    fn an_encode_place_is_decided_under_a_profile_that_takes_no_word_of_a_lease() {
+        let plan = PlanName::Epd;
+        let epd = |encode: &str, prefill: &str| {
+            let document = PolicySpec::epd_presets(encode, prefill, "round_robin");
+            let mut document = document.expect("built-in presets");
+            document.generation = 1;
+            engine_of(&document)
+        };
+        let nothing = Needs::default();
+        for encode in ["round_robin", "random", "passthrough"] {
+            let own = epd(encode, "round_robin");
+            let engine = own.spec().engine();
+            assert!(engine.can_decide(plan, nothing), "{encode}");
+            let encode_alone = |named: PlanName| (named == plan).then_some(nothing);
+            assert!(engine.can_decide_every_plan(encode_alone), "{encode}");
+        }
+        for encode in ["consistent_hashing", "prefix_hash"] {
+            let own = epd(encode, "round_robin");
+            let engine = own.spec().engine();
+            let declared = engine.needs_for(MODEL, Phase::Encode);
+            assert!(declared.ring, "{encode}");
+            assert!(!engine.can_decide(plan, nothing), "{encode}");
+            assert!(engine.can_decide(plan, declared), "{encode}");
+        }
+        for (takes, sends) in [
+            ("bucket", 0),
+            ("least_load", 1),
+            ("power_of_two", 1),
+            ("cache_aware", 1),
+        ] {
+            let own = epd(takes, "round_robin");
+            let engine = own.spec().engine();
+            assert_eq!(engine.sent_credits.len(), sends, "{takes}");
+            assert!(own.hears.intersects(EventSet::LEASE), "{takes}");
+            let declared = engine.needs_for(MODEL, Phase::Encode);
+            assert!(
+                !engine.can_decide(plan, declared),
+                "{takes} at the encode place"
+            );
+            let own = epd("round_robin", takes);
+            let engine = own.spec().engine();
+            let declared = engine.needs_for(MODEL, Phase::Prefill);
+            assert!(
+                engine.can_decide(plan, declared),
+                "{takes} at the prefill place"
+            );
+        }
     }
 
     /// A pick tests a worker's health whole, as the pass does. A profile

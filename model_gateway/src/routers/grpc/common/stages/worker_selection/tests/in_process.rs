@@ -36,7 +36,10 @@ fn classic_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> Worker
 }
 
 /// The policy engine of this process under `document`, over `registry`.
-fn own_engine(registry: &Arc<WorkerRegistry>, mut document: PolicySpec) -> Arc<PolicyEngine> {
+pub(super) fn own_engine(
+    registry: &Arc<WorkerRegistry>,
+    mut document: PolicySpec,
+) -> Arc<PolicyEngine> {
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     let engine = PolicyEngine::own(Arc::new(OwnEngine::new(spec)), Arc::clone(registry));
@@ -158,7 +161,7 @@ async fn retried(stage: &WorkerSelectionStage, ctx: &mut DispatchContext) -> Arc
 }
 
 /// The status and the body of an answer.
-async fn answer_of(response: Response) -> (StatusCode, Value) {
+pub(super) async fn answer_of(response: Response) -> (StatusCode, Value) {
     let status = response.status();
     let body = to_bytes(response.into_body(), 4096).await;
     let body = body.expect("the answer's body");

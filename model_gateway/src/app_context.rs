@@ -992,7 +992,7 @@ impl AppContextBuilder {
     /// the engine decides every request of the document whole, the
     /// gateway's own engine object is built over it and the registry's
     /// lists, and the routers ask that object
-    /// ([`InProcess::decides_whole`]).
+    /// ([`InProcess::routers_ask_engine`]).
     ///
     /// Under a controller's address it starts the policy store with its
     /// operators' door, its membership feed, its policy engine with the
@@ -1019,7 +1019,7 @@ impl AppContextBuilder {
                 // whole, the routers ask it through their own arms, over
                 // the registry's lists: the gateway's engine object stands
                 // on the engine of this process, and its timer runs.
-                if started.decides_whole() {
+                if started.routers_ask_engine(config) {
                     let policy_engine = Arc::new(PolicyEngine::own(
                         Arc::clone(&started.engine),
                         Arc::clone(registry),
@@ -1074,7 +1074,8 @@ impl AppContextBuilder {
                 routing_key_override,
                 Arc::clone(&started.engine),
                 started.origin,
-                started.decides_whole(),
+                // The answer the engine object was built by.
+                started.routers_ask_engine(config),
             ),
             None => PolicyRegistry::with_override(policy, routing_key_override),
         };

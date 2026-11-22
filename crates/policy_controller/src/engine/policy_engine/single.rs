@@ -23,6 +23,13 @@
 //! worker of which is vetoed, and the test of a tried worker, so have one
 //! home.
 //!
+//! **An encode item.** One item of an encode plan's request is decided as a
+//! single request is, by the profile of the plan's encode side over the list
+//! of encoders its host hands for it: the short path where one pick decides
+//! the side, else the whole pass. No lease is issued for it, so no stage is
+//! told a word of it. Under a binding that plans no encode side it is a
+//! side sent on its own, and refused as one.
+//!
 //! **What is refused by name.** The list a host hands is its request's own:
 //! every worker of it is dialed on a wire the request states. A list that is
 //! not, a subset hint and a hard demand are declined under the stage that
@@ -61,9 +68,17 @@ const NO_STAGE: &str = "none";
 /// The short path: the place in `members`, the list its host handed, of
 /// the worker picked for a plain single request of `model`, and the profile
 /// whose picker picked it ([`AlonePick`]). `None` where the request takes
-/// the whole pass ([`decide`]): it is no single request, its place is not
-/// decided by one pick of a picker, a worker of the list is not dialed on a
-/// wire it states, or the picker's turns land on no eligible worker.
+/// the whole pass ([`decide`]): it is neither a single request nor an encode
+/// item, its place is not decided by one pick of a picker, a worker of the
+/// list is not dialed on a wire it states, or the picker's turns land on no
+/// eligible worker.
+///
+/// An encode item is picked so on the encode side of an encode plan, over
+/// the list of encoders its host hands for it. The plan's two rules for an
+/// encoder, that it pairs with the request's prefill and takes the item's
+/// media, are that host's: it hands the encoders that pass them, as it
+/// narrows a prefill's candidates by their window, and the pick asks
+/// neither.
 ///
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
@@ -75,14 +90,14 @@ pub(super) fn alone(
     plain: Plain,
     members: &PoolMembers,
 ) -> Option<AlonePick> {
-    if plain.phase != Phase::Single {
+    if !matches!(plain.phase, Phase::Single | Phase::Encode) {
         return None;
     }
     // The whole pass declines such a list by name.
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
         return None;
     }
-    let profile = members.alone(&own.spec, model)?;
+    let profile = members.alone(&own.spec, model, plain.phase)?;
     let position = own.pick(profile, members, |state: RoutingState| state.eligible())?;
     Some(AlonePick {
         place: u32::try_from(position).ok()?,
@@ -314,7 +329,10 @@ mod tests {
 
     use parking_lot::Mutex;
     use smg_worker::{
-        identity::basic::Worker, load::state::one_rank_load, test_support::ready_worker,
+        identity::{basic::Worker, builder::BasicWorkerBuilder},
+        load::state::one_rank_load,
+        test_support::{no_health_check, ready_worker},
+        worker::{WorkerSpec, WorkerStatus, WorkerType},
     };
 
     use super::*;
@@ -1057,6 +1075,138 @@ mod tests {
             told(&engine, &heard),
             ["issued", "dispatched", "completed", "issued", "released"]
         );
+    }
+
+    /// The engine of the encode family's stock document: `encode` on the
+    /// encode side, `prefill` on the prefill side and round robin on the
+    /// decode side.
+    fn family(encode: &str, prefill: &str) -> PolicyEngine {
+        let document = PolicySpec::epd_presets(encode, prefill, "round_robin");
+        let mut document = document.expect("built-in presets");
+        document.generation = 1;
+        PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+    }
+
+    /// `count` ready encoders of [`MODEL`].
+    fn encoders(count: usize) -> Arc<[Arc<dyn Worker>]> {
+        (0..count)
+            .map(|at| {
+                let spec = WorkerSpec {
+                    worker_type: WorkerType::Encode,
+                    ..WorkerSpec::new(format!("grpc://encoder-{at}:9000"))
+                };
+                let worker = <BasicWorkerBuilder>::from_spec(spec)
+                    .health_config(no_health_check())
+                    .build();
+                worker.set_status(WorkerStatus::Ready);
+                Arc::new(worker) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// One encode item of [`MODEL`]'s request.
+    fn item<'a>() -> Request<'a> {
+        let mut item = request();
+        item.facts.phase = Phase::Encode;
+        item
+    }
+
+    /// An encode item under a side one pick decides is one turn of the list
+    /// of encoders its host hands, answered as a place: no request is made
+    /// and no lease takes an id. That holds under a document whose pair
+    /// takes a word on a lease too, where a single request's pick is noted:
+    /// no word is said of an encode item, so no stage is owed one.
+    #[test]
+    fn an_encode_item_is_one_turn_of_its_list_under_no_lease() {
+        for prefill in ["round_robin", "bucket"] {
+            let engine = family("round_robin", prefill);
+            let leased = engine.hears.intersects(EventSet::LEASE);
+            assert_eq!(leased, prefill == "bucket", "{prefill}");
+            let list = encoders(4);
+            let members = engine.pool_members(&list);
+            let asks = Asks::of(item(), Some(&members));
+            let mut seen = [0_u32; 4];
+            for _ in 0..8 {
+                seen[placed(&engine, &asks).place as usize] += 1;
+            }
+            assert_eq!(seen, [2; 4], "every encoder takes its turn");
+            assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+            assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+        }
+    }
+
+    /// An encode item one pick does not decide takes its side's whole pass
+    /// over the encoders handed, under no lease: a side whose picker reads
+    /// the request, and a list the turn finds no eligible encoder of, which
+    /// the binding's own rule answers. The family's rule that an encoder
+    /// pairs with the request's prefill is its host's, so an encoder's
+    /// record reads compatible and that rule empties no list.
+    #[test]
+    fn an_encode_item_one_pick_does_not_decide_takes_the_whole_pass_under_no_lease() {
+        for prefill in ["round_robin", "bucket"] {
+            let engine = family("random", prefill);
+            let list = encoders(4);
+            let members = engine.pool_members(&list);
+            let mut seen = [0_u32; 4];
+            for seed in 0..64 {
+                let mut drawn = item();
+                drawn.facts.seed = seed;
+                let asks = Asks::of(drawn, Some(&members));
+                let (decided, later) = answered(&engine, &asks).whole().expect("a whole pass");
+                assert!(decided.lease.is_none() && !later, "{prefill}");
+                assert_eq!(decided.decode_session, Session::NONE);
+                let pick = decided.decision.pick().expect("a pick");
+                let target = pick.targets.first().expect("a target");
+                assert_eq!(
+                    target.id,
+                    worker_id(list[target.position as usize].as_ref())
+                );
+                seen[target.position as usize] += 1;
+                assert_eq!(asks.made.get(), 1);
+            }
+            assert!(seen.iter().all(|&picks| picks > 0), "{seen:?}");
+            assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+        }
+
+        let engine = family("round_robin", "round_robin");
+        let list = encoders(4);
+        for encoder in list.iter() {
+            encoder.set_overloaded(true);
+        }
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(item(), Some(&members));
+        let (decided, _) = answered(&engine, &asks).whole().expect("a whole pass");
+        assert!(decided.lease.is_none());
+        match decided.decision {
+            Decision::Pick(pick) => assert_eq!(pick.trace.lifted, LiftedVeto::Overload),
+            Decision::Shed(shed) => assert_eq!(shed.emptied_by, "not-overloaded"),
+            Decision::Queue(_) => panic!("no queue is planned"),
+        }
+    }
+
+    /// An encode item that hands no list has no decision, as a decode sent
+    /// on its own has none. Nor has one that hands its list under a binding
+    /// that plans no encode side, a single request's or a pair's: no lease
+    /// would be issued for it, and such a binding's profile may take a word
+    /// of one.
+    #[test]
+    fn an_encode_item_with_no_list_is_refused_as_a_side_on_its_own() {
+        let engine = family("round_robin", "round_robin");
+        let asks = Asks::of(item(), None);
+        let refused = engine.decide_under(GatewayId::LOCAL, &asks, Instant::now());
+        assert_eq!(refused.err(), Some(DecisionRefused::PairSide));
+
+        let mut pair = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
+        pair.generation = 1;
+        let pair = PolicyEngine::new(AppliedSpec::validate(&pair).expect("the document validates"));
+        for engine in [preset("round_robin"), preset("least_load"), pair] {
+            let list = encoders(2);
+            let members = engine.pool_members(&list);
+            let asks = Asks::of(item(), Some(&members));
+            let refused = engine.decide_under(GatewayId::LOCAL, &asks, Instant::now());
+            assert_eq!(refused.err(), Some(DecisionRefused::PairSide));
+            assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+        }
     }
 
     /// A decision that panics costs its request alone and is counted.

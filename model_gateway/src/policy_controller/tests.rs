@@ -1359,6 +1359,247 @@ async fn a_pair_family_serves_in_process_and_refuses_by_name_under_an_address() 
     Ok(())
 }
 
+/// An encode gateway with the policy controller picked: `encode` on its
+/// encode side and `sides` on each side of its pair.
+fn encode_gateway(encode: Option<PolicyConfig>, sides: PolicyConfig) -> RouterConfig {
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    config.mode = RoutingMode::EncodePrefillDecode {
+        encode_urls: vec![],
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        encode_policy: encode,
+        prefill_policy: Some(sides.clone()),
+        decode_policy: Some(sides),
+    };
+    config
+}
+
+/// What `router` answers a request for a model nobody serves.
+async fn unserved(router: &dyn RouterTrait) -> (StatusCode, String) {
+    let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+    let routed = router
+        .route_generate(None, &meta, body(json!({"text": "hi"})), "model-a")
+        .await;
+    refusal(routed).await
+}
+
+/// The least load policy with each setting at its flag's default.
+fn least_load() -> PolicyConfig {
+    PolicyConfig::LeastLoad {
+        kv_pressure_weight: 0.15,
+        mean_prefill_tokens: 1024,
+        default_throughput: 2000.0,
+    }
+}
+
+/// An encode gateway of one router asks the engine object where the engine
+/// decides all three sides whole: its encode side under round robin, random
+/// or passthrough, beside a pair it decides, which least load on a side is.
+/// The router is the family's own, its stages hold the engine object, and
+/// no classic policy is built for a side.
+///
+/// Under an encode side the engine does not decide, the gateway keeps the
+/// classic router with its side policies and no engine object, as with the
+/// setting off. Consistent hashing, the side's default, and the prefix hash
+/// wait on a hash ring. Least load, power of two, bucket and the default
+/// policy each take a word of a lease, and an encode item has none.
+#[tokio::test]
+async fn an_encode_gateway_asks_the_engine_where_it_decides_all_three_sides() -> Case {
+    use super::{routed_by, PlanName, RoutedBy};
+    use crate::{
+        config::PowerOfTwoLoadMetric,
+        routers::grpc::{mode::Mode, router::GrpcRouter},
+    };
+
+    /// The gateway of `config` with the setting off.
+    async fn off(mut config: RouterConfig) -> Result<Arc<Gateway>, String> {
+        config.policy_controller = false;
+        build_gateway(config).await
+    }
+
+    let round_robin = PolicyConfig::RoundRobin;
+    for (encode, sides) in [
+        (PolicyConfig::RoundRobin, round_robin.clone()),
+        (PolicyConfig::Random, round_robin.clone()),
+        (PolicyConfig::Passthrough, round_robin.clone()),
+        (PolicyConfig::RoundRobin, least_load()),
+    ] {
+        let which = format!("{} encoders, {} pairs", encode.name(), sides.name());
+        let config = encode_gateway(Some(encode), sides);
+        let (context, gateway) = build(config.clone()).await?;
+        let router = gateway
+            .select_router_for_request(None)
+            .ok_or("the router is missing")?;
+        assert_eq!(router.router_type(), "grpc_epd", "{which}");
+        let engine = context.policy_engine.as_ref().ok_or("the engine object")?;
+        let placed = routed_by(&context, PlanName::Epd);
+        assert!(matches!(placed, RoutedBy::PolicyEngine(_)), "{which}");
+        // No classic policy is built for a side the engine places.
+        let policies = &context.policy_registry;
+        let unset = policies.get_default_policy();
+        assert!(
+            Arc::ptr_eq(&policies.get_prefill_policy(), &unset),
+            "{which}"
+        );
+        assert!(
+            Arc::ptr_eq(&policies.get_decode_policy(), &unset),
+            "{which}"
+        );
+        // The family's stages hold the engine object.
+        let held = Arc::strong_count(engine);
+        let stages = GrpcRouter::new(&context, Mode::EncodePrefillDecode)?;
+        assert!(Arc::strong_count(engine) > held, "{which}");
+        drop(stages);
+        // A model nobody serves reads the answer of the setting off.
+        let classic = off(config).await?;
+        assert_eq!(
+            unserved(gateway.as_ref()).await,
+            unserved(classic.as_ref()).await,
+            "{which}"
+        );
+    }
+
+    for encode in [
+        None,
+        Some(PolicyConfig::ConsistentHashing),
+        Some(PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: Vec::new(),
+        }),
+        Some(least_load()),
+        Some(PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::ExpectedWait,
+        }),
+        Some(PolicyConfig::Bucket {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            bucket_adjust_interval_secs: 5,
+        }),
+        Some(PolicyConfig::cache_aware(0.3, 64, 1.5, 120, 1 << 20)),
+    ] {
+        let which = encode.as_ref().map_or("the default", PolicyConfig::name);
+        let config = encode_gateway(encode.clone(), round_robin.clone());
+        let (context, gateway) = build(config.clone()).await?;
+        let router = gateway
+            .select_router_for_request(None)
+            .ok_or("the router is missing")?;
+        assert_eq!(router.router_type(), "grpc_epd", "{which}");
+        assert!(context.policy_engine.is_none(), "{which}");
+        assert!(
+            routed_by(&context, PlanName::Epd).is_policy_registry(),
+            "{which}"
+        );
+        // The classic pass reads its sides' policies.
+        let policies = &context.policy_registry;
+        let unset = policies.get_default_policy();
+        assert!(
+            !Arc::ptr_eq(&policies.get_prefill_policy(), &unset),
+            "{which}"
+        );
+        assert!(
+            !Arc::ptr_eq(&policies.get_decode_policy(), &unset),
+            "{which}"
+        );
+        let classic = off(config).await?;
+        assert_eq!(
+            unserved(gateway.as_ref()).await,
+            unserved(classic.as_ref()).await,
+            "{which}"
+        );
+    }
+    Ok(())
+}
+
+/// A gateway of many routers under the encode mode's own document, round
+/// robin on each side. The engine decides that document whole, and it plans
+/// no single request. The regular routers read the engine object as it
+/// stands, so none stands there: every family keeps its classic placement
+/// pass and answers as with the setting off, and the registry holds the
+/// encode family's side policies. The same settings in a gateway of one
+/// router build the object, and the encode family's stages ask it.
+#[tokio::test]
+async fn many_routers_keep_the_encode_modes_document_classic() -> Case {
+    use super::{routed_by, start_in_process, PlanName, RoutedBy};
+    use crate::routers::{
+        factory::{router_ids, RouterId},
+        grpc::{mode::Mode, router::GrpcRouter},
+        RouterFactory,
+    };
+
+    /// One router a gateway of many routers mounts: its id, its label, and
+    /// the router or why it was not built.
+    type Mounted = (RouterId, &'static str, Result<Box<dyn RouterTrait>, String>);
+    /// The router `routers` mounts under `id`, taken out of them.
+    fn family(
+        routers: &mut Vec<Mounted>,
+        id: &RouterId,
+    ) -> Result<Box<dyn RouterTrait>, Box<dyn Error>> {
+        let at = routers.iter().position(|(mounted, ..)| mounted == id);
+        Ok(routers.swap_remove(at.ok_or("a family has no entry")?).2?)
+    }
+
+    let one = encode_gateway(Some(PolicyConfig::RoundRobin), PolicyConfig::RoundRobin);
+    let mut many = one.clone();
+    many.enable_igw = true;
+    // The engine decides the document whole in both gateways. Its routers
+    // ask the engine in the gateway of one router alone.
+    for config in [&one, &many] {
+        let started = start_in_process(config, None)?.ok_or("an engine")?;
+        assert!(started.decides_whole());
+        assert_eq!(started.routers_ask_engine(config), !config.enable_igw);
+    }
+
+    let context = Arc::new(AppContext::from_config(many.clone(), 30, None, None).await?);
+    assert!(context.policy_engine.is_none());
+    for plan in [PlanName::Single, PlanName::PdPair, PlanName::Epd] {
+        assert!(routed_by(&context, plan).is_policy_registry(), "{plan:?}");
+    }
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    let mut picked_off = many.clone();
+    picked_off.policy_controller = false;
+    let classic = Arc::new(AppContext::from_config(picked_off.clone(), 30, None, None).await?);
+    let mut mounted = RouterFactory::create_igw_routers(&many.policy, &context).await;
+    let mut unpicked = RouterFactory::create_igw_routers(&picked_off.policy, &classic).await;
+    assert!(!Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(!Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    for id in [
+        router_ids::HTTP_REGULAR,
+        router_ids::GRPC_REGULAR,
+        router_ids::HTTP_PD,
+        router_ids::GRPC_PD,
+        router_ids::GRPC_EPD,
+    ] {
+        let (router, classic) = (family(&mut mounted, &id)?, family(&mut unpicked, &id)?);
+        assert_eq!(router.router_type(), classic.router_type());
+        assert_eq!(
+            unserved(router.as_ref()).await,
+            unserved(classic.as_ref()).await,
+            "{}",
+            router.router_type()
+        );
+    }
+
+    // One router under the same settings: the object stands, and the
+    // encode family's stages hold it.
+    let (context, gateway) = build(one).await?;
+    let engine = context.policy_engine.as_ref().ok_or("the engine object")?;
+    let placed = routed_by(&context, PlanName::Epd);
+    assert!(matches!(placed, RoutedBy::PolicyEngine(_)));
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the router is missing")?;
+    assert_eq!(router.router_type(), "grpc_epd");
+    let held = Arc::strong_count(engine);
+    let stages = GrpcRouter::new(&context, Mode::EncodePrefillDecode)?;
+    assert!(Arc::strong_count(engine) > held);
+    drop(stages);
+    Ok(())
+}
+
 /// Where the engine of this process places a gateway's pairs, it pairs by
 /// its document's own rule, and the gateway's pair functions read that rule
 /// beside it: the registry says the pairing of a supplied document, not the

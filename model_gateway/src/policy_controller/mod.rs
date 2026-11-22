@@ -17,10 +17,12 @@
 //! where the gateway follows no controller and the engine decides the
 //! pair plan of the document in force whole ([`routed_by`]): a gRPC pair
 //! router in its selection stage, an HTTP pair router for each attempt's
-//! pair, through prefill admission. A pair family whose plan the routing
+//! pair, through prefill admission. The gRPC encode pair router asks it the
+//! same way where the engine decides the encode plan whole: for the pair,
+//! then for the encoder of each item. A pair family whose plan the routing
 //! settings' document does not name keeps its classic placement pass
 //! there, beside the families the engine places: the gRPC encode pair
-//! family does today. A pair family mounts a refusing router under its
+//! family does in a gateway of many routers. A pair family mounts a refusing router under its
 //! usual id where nothing places it ([`undecided()`]): under a followed
 //! controller, and where no binding of a document its operator supplied
 //! plans the family. The routes that pick a
@@ -219,16 +221,43 @@ impl InProcess {
     /// engine through, and no classic policy places one.
     ///
     /// They do where the engine decides every request of the document in
-    /// force whole today: single requests and pairs, under no sessions
-    /// rule, each place picked by its picker alone or decided by a profile
-    /// that asks nothing outside the inputs this process provides for a
-    /// decision of its plan ([`decision_inputs`]). Under any other
-    /// document the routers keep their classic placement pass, whose
+    /// force whole today: single requests, pairs and encode requests, under
+    /// no sessions rule, each place picked by its picker alone or decided
+    /// by a profile that asks nothing outside the inputs this process
+    /// provides for a decision of its plan ([`decision_inputs`]). Under any
+    /// other document the routers keep their classic placement pass, whose
     /// policies ask the engine for the pick. The set grows with what the
     /// engine decides whole, and this question goes when it decides every
     /// document.
     pub(crate) fn decides_whole(&self) -> bool {
         can_decide_every_plan(&self.engine)
+    }
+
+    /// Whether a gateway of `config` builds its engine object, which its
+    /// routers ask for the whole decision of a request: the engine can
+    /// decide every request of the document ([`Self::decides_whole`]), and
+    /// each router that reads the object has a plan of the document to ask
+    /// it under.
+    ///
+    /// The second condition holds one layout back. A gateway of many
+    /// routers mounts the regular routers beside the pair families, and
+    /// the regular routers ask the object wherever it is built. Under a
+    /// routing settings' document that plans no single request (the encode
+    /// mode's plans its own family alone) they would ask the engine for
+    /// requests no binding plans, which the classic policies serve. So no
+    /// object is built there, and every family keeps its classic placement
+    /// pass ([`routed_by`]). A document its operator supplied keeps its own
+    /// answers: a request it does not plan is refused.
+    ///
+    /// The second condition goes once the regular routers ask [`routed_by`]
+    /// who places single requests where they are built, as the pair
+    /// families do: the engine object is then built for the families it
+    /// places, and the encode family of such a gateway is placed by it too.
+    pub(crate) fn routers_ask_engine(&self, config: &RouterConfig) -> bool {
+        let singles_unplanned = config.enable_igw
+            && self.origin == DocumentOrigin::Settings
+            && !self.has_plan(PlanName::Single);
+        self.decides_whole() && !singles_unplanned
     }
 
     /// Whether the engine can decide every request the document in force
@@ -237,7 +266,7 @@ impl InProcess {
     /// a plan no binding names ([`routed_by`]).
     pub(crate) fn can_decide(&self, plan: PlanName) -> bool {
         let engine = self.engine.spec().engine();
-        decision_inputs(plan).is_some_and(|inputs| engine.can_decide(plan, inputs))
+        engine.can_decide(plan, decision_inputs(plan))
     }
 
     /// Whether a binding of the document in force plans requests as
@@ -250,23 +279,38 @@ impl InProcess {
 /// Whether `engine` can decide every request of its document in this
 /// process ([`InProcess::decides_whole`]).
 fn can_decide_every_plan(engine: &smg_policy_controller::engine::PolicyEngine) -> bool {
-    engine
-        .spec()
-        .engine()
-        .can_decide_every_plan(decision_inputs)
+    let engine = engine.spec().engine();
+    engine.can_decide_every_plan(|plan| Some(decision_inputs(plan)))
 }
 
 /// The inputs this process provides for a decision of `plan`: the one
-/// place that says which plans its routes hand the engine. `None` for the
-/// encode plan: no route hands the engine an encode request yet, so a
-/// document that plans one is not decided whole, and the encode family
-/// keeps its classic placement pass.
-fn decision_inputs(plan: PlanName) -> Option<Needs> {
+/// place that says what its routes hand the engine for a request of each
+/// plan. Its routes hand the engine the requests of all three.
+fn decision_inputs(plan: PlanName) -> Needs {
     match plan {
-        PlanName::Single => Some(single_inputs()),
-        PlanName::PdPair => Some(pair_inputs()),
-        PlanName::Epd => None,
+        PlanName::Single => single_inputs(),
+        PlanName::PdPair => pair_inputs(),
+        PlanName::Epd => encode_inputs(),
     }
+}
+
+/// The inputs this process provides for an encode request's decision from
+/// its own data, beyond its three lists' worker objects: a pair's
+/// ([`pair_inputs`]).
+///
+/// The encode route asks the request's pair as a pair route does. It then
+/// asks each item's encoder over the encode pool: that ask states the
+/// request's prompt size, and its list's records read the load monitor's
+/// snapshot, lent as to any ask of a list.
+///
+/// An item is decided under no lease, so the engine decides the encode side
+/// under a profile that depends on no lease's events alone
+/// ([`Engine::can_decide`](smg_policy_controller::engine::Engine::can_decide)).
+/// Not provided yet, beyond what a pair is not provided: the key an item is
+/// placed by. A side that places by it reads a hash ring, and no decision
+/// is provided one here.
+fn encode_inputs() -> Needs {
+    pair_inputs()
 }
 
 /// The inputs this process provides for a pair's decision from its own

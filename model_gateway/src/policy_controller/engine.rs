@@ -496,6 +496,24 @@ impl From<PrefillAcquireError<Self>> for Unplaced {
 }
 
 impl Unplaced {
+    /// Whether the engine found that the list it decided over holds no
+    /// worker for the ask: no endpoint its filters left, a pool it sheds
+    /// whole under its overload rule, or no target the gateway could send
+    /// to. A route that asks for a part of a request behind another (an
+    /// encode item, behind its pair) reads such an ask as the selection
+    /// with no policy engine reads a pool with nobody available. Any other
+    /// verdict is the engine's own, and its answer stands.
+    pub(crate) fn found_nobody(&self) -> bool {
+        matches!(
+            self,
+            Self::NoTargetHolds
+                | Self::Shed {
+                    reason: ShedReason::NoEndpoints | ShedReason::Saturated,
+                    ..
+                }
+        )
+    }
+
     /// The answer for a request of `model` that has no worker: the status,
     /// the code and the retry hint, one function for every router.
     ///

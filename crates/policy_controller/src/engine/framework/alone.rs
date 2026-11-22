@@ -5,13 +5,14 @@
 //! and a phase. [`Engine::place_for`] says what the document holds for such a
 //! place, found once where that policy is built and never at a request.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use super::{profile_index, Binding, Engine, Marks, Profile};
+use super::{profile_index, Binding, Engine, Marks, Plan, Profile};
 use crate::{
     document::spec::{Needs, PlanName},
     engine::view::Phase,
     stages::filters::RowTests,
+    tracking::{dispatch_credit::DispatchCredit, lease::EventSet},
 };
 
 /// A profile whose whole decision is one pick of its picker
@@ -190,6 +191,17 @@ impl Engine {
     /// stages read a worker's record and nothing more. The set of places
     /// grows with the inputs a host provides.
     ///
+    /// The encode side of an encode plan has one more condition. Such a
+    /// host has an encode item decided under no lease, as it holds no load
+    /// guard on an encoder, so no stage is told an event of the item. A
+    /// side whose profile depends on a lease's events would decide on
+    /// state nothing keeps, so the engine cannot decide it: one whose
+    /// scorer or picker hears a lease's issue, dispatch, completion or
+    /// release ([`Lifecycle::hears`]), and one a stage of which reads the
+    /// profile's count of sends, which a dispatch's event feeds.
+    ///
+    /// [`Lifecycle::hears`]: crate::stages::Lifecycle::hears
+    ///
     /// A host that serves each plan's requests by a route of their own
     /// asks this a plan at a time: the routes of a plan the engine cannot
     /// decide keep the host's other placement, beside the routes of a plan
@@ -235,12 +247,32 @@ impl Engine {
     /// `binding`, given the `inputs` it provides for a decision of the
     /// binding's plan ([`Self::can_decide`]).
     fn can_decide_binding(&self, binding: &Binding, inputs: Needs) -> bool {
+        let encode_side =
+            |phase| phase == Phase::Encode && matches!(binding.plan, Plan::Epd { .. });
         let decided = |(phase, index, profile): (Phase, u16, &Profile)| {
+            // No event of an encode item reaches a stage.
+            if encode_side(phase) && self.depends_on_lease_events(profile) {
+                return false;
+            }
             let needs = self.profile_needs.get(usize::from(index));
             self.in_the_way(index, profile, phase).is_none()
                 || needs.is_some_and(|needs| needs.within(inputs))
         };
         binding.sessions.is_none() && self.places_of(binding).all(decided)
+    }
+
+    /// Whether a stage of `profile` depends on a lease's events
+    /// ([`Self::can_decide`]): a scorer or the picker hears one, or a
+    /// stage reads the profile's count of sends. A filter hears no event.
+    fn depends_on_lease_events(&self, profile: &Profile) -> bool {
+        let scorers = profile.scorers.iter();
+        let heard = scorers.map(|weighted| weighted.scorer.hears());
+        let heard = heard.fold(profile.picker.hears(), EventSet::union);
+        let counts_sends = || {
+            let named = |sent: &Arc<DispatchCredit>| sent.profile == profile.name;
+            self.sent_credits.iter().any(named)
+        };
+        heard.intersects(EventSet::LEASE) || counts_sends()
     }
 
     /// The first stage of `profile`, which stands at `index`, that asks

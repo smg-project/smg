@@ -425,10 +425,11 @@ impl PoolRecords {
                     // A worker object states no zone.
                     Some(lists.positions(kind, None, &labels))
                 };
+                let role = Role::from(spec.worker_type);
                 Candidate {
                     position,
                     id,
-                    role: Role::from(spec.worker_type),
+                    role,
                     // Values wider than a record's fields take the largest
                     // value they hold.
                     dp_rank: u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX),
@@ -441,6 +442,10 @@ impl PoolRecords {
                     // writes its own.
                     has_capacity: true,
                     has_room: true,
+                    // Nor is which encoder pairs with a request's prefill:
+                    // an encoder reads compatible, and a host that asks
+                    // for an encode item hands the encoders that pair.
+                    ec_compatible: role == Role::Encode,
                     // The low 32 bits of the registration key's
                     // fingerprint.
                     key: id.0 as u32,
@@ -578,7 +583,8 @@ impl PoolRecords {
     /// decision's.
     ///
     /// Left for the caller to write where it holds them: the pair class
-    /// (zero), the two admission bits (open) and the session key's pin.
+    /// (zero), the two admission bits (open), an encoder's compatibility
+    /// with a pair (set) and the session key's pin.
     ///
     /// No lock is taken here beyond what a read of a worker object takes.
     /// Nothing is allocated once `rows` has grown to the list. The one

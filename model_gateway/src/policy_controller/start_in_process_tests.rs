@@ -9,8 +9,9 @@ use smg_policy_controller::{
         DecodePick, IndexKind, IndexSpec, Needs, OverloadSpec, Pairing, PlanName, PolicySpec,
         ShadowSpec, PRESETS,
     },
-    engine::{Candidate, Phase, RequestFacts, Scorer, TieBand},
+    engine::{Candidate, Phase, Picker, RequestFacts, Scorer, Targets, TieBand},
     stages::{Lifecycle, StageRegistry},
+    tracking::{EventKind, EventSet},
 };
 
 use super::{single_inputs, start_in_process, would_start, InProcess, StartError};
@@ -58,7 +59,7 @@ fn pair_sides() -> Result<PolicySpec, Box<dyn Error>> {
 }
 
 /// An encode pair document whose binding holds its three sides' phases
-/// alone: a plan the engine of this process does not decide whole.
+/// alone.
 fn encode_sides() -> Result<PolicySpec, Box<dyn Error>> {
     let mut document = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin")?;
     document.bindings[0].matcher.phase = vec![Phase::Encode, Phase::Prefill, Phase::Decode];
@@ -66,13 +67,105 @@ fn encode_sides() -> Result<PolicySpec, Box<dyn Error>> {
 }
 
 /// `document` with the encode pair binding of [`encode_sides`] behind its
-/// own bindings: the engine does not decide the whole of it, so a registry
-/// policy places the requests of a gateway that runs it.
+/// own bindings.
 fn beside_encode(mut document: PolicySpec) -> Result<PolicySpec, Box<dyn Error>> {
     let encode = encode_sides()?;
     document.profiles.extend(encode.profiles);
     document.bindings.extend(encode.bindings);
     Ok(document)
+}
+
+/// A picker of a host's own build that places over a pool by itself and
+/// takes a word of each lease it is issued.
+#[derive(Debug)]
+struct LeaseHearingPicker;
+
+impl Lifecycle for LeaseHearingPicker {
+    fn hears(&self) -> EventSet {
+        EventSet::NONE.with(EventKind::Issued)
+    }
+}
+
+impl Picker for LeaseHearingPicker {
+    fn name(&self) -> &'static str {
+        "lease-hearing"
+    }
+
+    fn pick(
+        &self,
+        _: &RequestFacts<'_>,
+        _: &[Candidate],
+        _: &[u32],
+        _: &[f32],
+        _: TieBand,
+        _: &mut Targets,
+    ) {
+    }
+
+    fn picks_alone(&self) -> bool {
+        true
+    }
+
+    // It only places: a stage that does not say so is taken as one that
+    // may refuse by a report, and is not picked alone.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+}
+
+/// The stock stages and [`LeaseHearingPicker`]: a host's own.
+fn host_stages() -> Result<StageRegistry, Box<dyn Error>> {
+    let mut stages = StageRegistry::builtin();
+    stages.picker("lease-hearing", || Box::new(LeaseHearingPicker))?;
+    Ok(stages)
+}
+
+/// A configuration at its defaults but the setting, with `document`
+/// supplied by that host.
+fn supplied_by_host(document: PolicySpec) -> Result<RouterConfig, Box<dyn Error>> {
+    Ok(supplied(with_lease_hearing_encoder(document)?))
+}
+
+/// `document` with [`LeaseHearingPicker`] the picker of its encode side.
+/// Every place of it is still picked alone. An encode item is decided
+/// under no lease, so the engine does not decide the whole of a document
+/// whose encode side takes a lease's word: a registry policy places the
+/// requests of a gateway that runs it.
+fn with_lease_hearing_encoder(mut document: PolicySpec) -> Result<PolicySpec, Box<dyn Error>> {
+    let encode = document.profiles.get_mut("encode");
+    encode.ok_or("the encode side's profile")?.pick = "lease-hearing".into();
+    Ok(document)
+}
+
+/// What the start of a host that registers [`LeaseHearingPicker`] leaves
+/// for `config`.
+fn host_start(config: &RouterConfig) -> Result<Option<InProcess>, Box<dyn Error>> {
+    Ok(start_in_process(config, Some(host_stages()?))?)
+}
+
+/// The words that host's start refuses `config` in.
+fn host_refusal(config: &RouterConfig) -> Result<String, Box<dyn Error>> {
+    let refused = start_in_process(config, Some(host_stages()?))
+        .err()
+        .ok_or("the start took the document")?;
+    Ok(refused.to_string())
+}
+
+/// The device the cases below read a registry policy's rules through: a
+/// document that is not decided whole, though every place of it is picked
+/// alone, starts, and its routers keep their classic placement pass.
+#[test]
+fn a_host_picker_that_hears_a_lease_leaves_an_encode_document_to_the_registry() -> Case {
+    let whole = start_in_process(&supplied(encode_sides()?), None)?;
+    assert!(whole.ok_or("an engine")?.decides_whole());
+    let heard = host_start(&supplied_by_host(encode_sides()?)?)?.ok_or("an engine")?;
+    assert!(!heard.decides_whole());
+    assert_eq!(
+        heard.engine.not_alone(),
+        None,
+        "every place is picked alone"
+    );
+    Ok(())
 }
 
 /// The gateway's own placement runs a binding's overload thresholds, its
@@ -195,14 +288,16 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
     assert_eq!(answer(&running, &ruled), Some(words.clone()));
     assert_eq!(words, refusal(&supplied(ruled))?);
 
-    // A second pair binding, under a plan the engine of this process does
-    // not decide whole.
-    let mut twice = encode_sides()?;
-    let again = twice.bindings[0].clone();
-    twice.bindings.push(again);
-    let words = not_run(2, "*", "plan", "an earlier binding plans the pair");
-    assert_eq!(answer(&running, &twice), Some(words.clone()));
-    assert_eq!(words, refusal(&supplied(twice))?);
+    // A rule of the document's own that nothing runs: a pair's decode
+    // picked after its prefill.
+    let mut later = pair_sides()?;
+    later.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let words = answer(&running, &later).ok_or("a later decode was taken")?;
+    assert!(
+        words.starts_with("the policy document states `plans.pd-pair.decode`"),
+        "{words}"
+    );
+    assert_eq!(words, refusal(&supplied(later))?);
 
     // A document the start takes.
     let taken = PolicySpec::preset("round_robin")?;
@@ -229,9 +324,11 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
 /// Where the routers ask the engine for every request of a document, the
 /// engine finds a pair's binding by the request's model: a pair binding
 /// that names some models and a second pair binding are run as written,
-/// and start. Where a registry policy still places the pair, one policy
-/// stands for each side, for every model. Such a binding would never be
-/// found, and a second one never asked: the start refuses each by name.
+/// and start. So are an encode pair's: its pair and each of its items are
+/// asked under the request's model. Where a registry policy still places
+/// the pair, one policy stands for each side, for every model. Such a
+/// binding would never be found, and a second one never asked: the start
+/// refuses each by name.
 #[test]
 fn a_pair_binding_of_some_models_starts_where_the_engine_decides_whole() -> Case {
     let whole = |document: PolicySpec| -> Result<bool, Box<dyn Error>> {
@@ -249,11 +346,22 @@ fn a_pair_binding_of_some_models_starts_where_the_engine_decides_whole() -> Case
     twice.bindings.push(pair_sides()?.bindings.remove(0));
     assert!(whole(twice)?);
 
-    // The encode plan is decided whole by no engine of this process.
+    let mut named = encode_sides()?;
+    named.bindings[0].matcher.model = "alpha-*".to_owned();
+    assert_eq!(named.bindings[0].plan, Some(PlanName::Epd));
+    assert!(whole(named.clone())?);
+
+    let mut twice = named;
+    twice.bindings.push(encode_sides()?.bindings.remove(0));
+    assert!(whole(twice)?);
+
+    // Where a registry policy still places the pair, one policy stands for
+    // each side, for every model. Such a binding would never be found, and
+    // a second one never asked: the start refuses each by name.
     let mut named = encode_sides()?;
     named.bindings[0].matcher.model = "alpha-*".to_owned();
     assert_eq!(
-        refusal(&supplied(named))?,
+        host_refusal(&supplied_by_host(named)?)?,
         not_run(
             1,
             "alpha-*",
@@ -266,7 +374,7 @@ fn a_pair_binding_of_some_models_starts_where_the_engine_decides_whole() -> Case
     let again = twice.bindings[0].clone();
     twice.bindings.push(again);
     assert_eq!(
-        refusal(&supplied(twice))?,
+        host_refusal(&supplied_by_host(twice)?)?,
         not_run(2, "*", "plan", "an earlier binding plans the pair")
     );
     Ok(())
@@ -276,7 +384,8 @@ fn a_pair_binding_of_some_models_starts_where_the_engine_decides_whole() -> Case
 /// phase, by a list that names no phase or by name, takes its models'
 /// single requests from every binding behind it. Where the routers ask the
 /// engine for every request of the document, the engine declines such a
-/// request by its binding, so the document is run as written and starts.
+/// request by its binding, so the document is run as written and starts: a
+/// pair's, and an encode pair's by itself and behind a pair's binding.
 /// Where a registry policy still places the gateway's requests, the classic
 /// policy would place them and no line would say so: in a gateway that
 /// places single requests the start refuses the binding by `match.phase`,
@@ -290,11 +399,16 @@ fn a_pair_binding_holds_its_sides_phases_where_a_registry_policy_places_singles(
         ..supplied(document)
     };
     // The engine decides a round robin pair's document whole: it starts
-    // in a regular gateway and in a gateway of many routers.
+    // in a regular gateway and in a gateway of many routers. So do the
+    // encode plan's own document, whose binding names no phase, and a
+    // pair's binding ahead of an encode pair's.
     let mut named = pair()?;
     named.bindings[0].matcher.phase = vec![Phase::Single, Phase::Prefill, Phase::Decode];
-    for document in [pair()?, named, pair_sides()?] {
-        assert!(start_in_process(&supplied(document.clone()), None)?.is_some());
+    let encode = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin")?;
+    let beside = beside_encode(pair()?)?;
+    for document in [pair()?, named, pair_sides()?, encode.clone(), beside] {
+        let started = start_in_process(&supplied(document.clone()), None)?;
+        assert!(started.is_some_and(|started| started.decides_whole()));
         assert!(start_in_process(&many_routers(document), None)?.is_some());
     }
 
@@ -307,13 +421,15 @@ fn a_pair_binding_holds_its_sides_phases_where_a_registry_policy_places_singles(
         "this gateway places single requests and a pair binding plans none: \
          a pair binding holds its sides' phases alone (`phase: [prefill, decode]`)",
     );
-    assert_eq!(refusal(&supplied(beside_encode(pair()?)?))?, words);
-    assert_eq!(refusal(&many_routers(beside_encode(pair()?)?))?, words);
+    let beside = || -> Result<PolicySpec, Box<dyn Error>> {
+        with_lease_hearing_encoder(beside_encode(pair()?)?)
+    };
+    assert_eq!(host_refusal(&supplied(beside()?))?, words);
+    assert_eq!(host_refusal(&many_routers(beside()?))?, words);
 
     // The encode plan's binding names its three sides.
-    let encode = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin")?;
     assert_eq!(
-        refusal(&supplied(encode))?,
+        host_refusal(&supplied_by_host(encode)?)?,
         not_run(
             1,
             "*",
@@ -322,6 +438,7 @@ fn a_pair_binding_holds_its_sides_phases_where_a_registry_policy_places_singles(
              a pair binding holds its sides' phases alone (`phase: [encode, prefill, decode]`)",
         )
     );
+    assert!(host_start(&supplied_by_host(encode_sides()?)?)?.is_some());
 
     // A pair mode places no single request.
     let pair_mode = RouterConfig {
@@ -337,11 +454,14 @@ fn a_pair_binding_holds_its_sides_phases_where_a_registry_policy_places_singles(
     Ok(())
 }
 
-/// The document's own rules, apart from its bindings. The placement pairs
-/// by the routing settings' mode and picks a pair's decode with its
-/// prefill, and no decision is kept for explain: a supplied document that
-/// states one of them otherwise is refused by the field. A pair plan's rule
-/// in a document that plans no pair has no request, and states nothing.
+/// The document's own rules, apart from its bindings. The placement picks
+/// a pair's decode with its prefill, and no decision is kept for explain: a
+/// supplied document that states one of them otherwise is refused by the
+/// field. The engine pairs by the document's own rule, so a pairing other
+/// than the routing settings' mode starts where the routers ask the engine
+/// for every request, and is refused where a registry policy still places
+/// the pair. A pair plan's rule in a document that plans no pair has no
+/// request, and states nothing.
 #[test]
 fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
     let pair = pair_sides;
@@ -352,7 +472,6 @@ fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
              {instead}, or run the gateway under a controller's address"
         )
     };
-    let by_mode = "the gateway's placement pairs by the routing settings' mode";
 
     let mut document = pair()?;
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
@@ -367,29 +486,41 @@ fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
 
     // Where the routers ask the engine for every request of the document,
     // the engine pairs by the document's own rule: a pairing other than the
-    // routing settings' mode starts.
-    let mut document = pair()?;
-    document.plans.pd_pair.pairing = Pairing::Strict;
-    assert!(start_in_process(&supplied(document), None)?.is_some());
+    // routing settings' mode starts, under a pair plan and under an encode
+    // pair plan, whichever mode the settings state.
+    let planned: [fn() -> Result<PolicySpec, Box<dyn Error>>; 2] = [pair_sides, encode_sides];
+    for sides in planned {
+        let mut document = sides()?;
+        document.plans.pd_pair.pairing = Pairing::Strict;
+        assert!(start_in_process(&supplied(document), None)?.is_some());
+        let strict = RouterConfig {
+            pd_pairing_mode: PdPairingMode::Strict,
+            ..supplied(sides()?)
+        };
+        assert!(start_in_process(&strict, None)?.is_some());
+    }
 
     // Where a registry policy still places the pair, the placement pairs by
     // the routing settings' mode.
+    let by_mode = "the gateway's placement pairs by the routing settings' mode";
     let mut document = encode_sides()?;
     document.plans.pd_pair.pairing = Pairing::Strict;
     assert_eq!(
-        refusal(&supplied(document.clone()))?,
+        host_refusal(&supplied_by_host(document.clone())?)?,
         stated("plans.pd-pair.pairing", by_mode, "Remove the field")
     );
     // The mode the routing settings state is the one that placement runs:
     // a document that states it starts, and one that leaves it out is told
     // the mode to state.
-    let strict = |document: PolicySpec| RouterConfig {
-        pd_pairing_mode: PdPairingMode::Strict,
-        ..supplied(document)
+    let strict = |document: PolicySpec| -> Result<RouterConfig, Box<dyn Error>> {
+        Ok(RouterConfig {
+            pd_pairing_mode: PdPairingMode::Strict,
+            ..supplied_by_host(document)?
+        })
     };
-    assert!(start_in_process(&strict(document), None)?.is_some());
+    assert!(host_start(&strict(document)?)?.is_some());
     assert_eq!(
-        refusal(&strict(encode_sides()?))?,
+        host_refusal(&strict(encode_sides()?)?)?,
         stated(
             "plans.pd-pair.pairing",
             by_mode,
@@ -688,12 +819,22 @@ fn a_binding_of_some_models_holds_singles_where_a_registry_policy_places_pairs()
             let whole = places_pairs(two_bindings(phase)?);
             assert!(start_in_process(&whole, None)?.is_some());
         }
+        // Beside an encode pair's binding too.
+        for phase in [vec![], vec![Phase::Single]] {
+            let whole = places_pairs(beside_encode(two_bindings(phase)?)?);
+            assert!(start_in_process(&whole, None)?.is_some());
+        }
+        // Where a registry policy still places a pair.
+        let beside = |phase| -> Result<RouterConfig, Box<dyn Error>> {
+            Ok(places_pairs(with_lease_hearing_encoder(beside_encode(
+                two_bindings(phase)?,
+            )?)?))
+        };
         assert_eq!(
-            refusal(&places_pairs(beside_encode(two_bindings(vec![])?)?))?,
+            host_refusal(&beside(vec![])?)?,
             not_run(1, "alpha-*", "match.phase", held)
         );
-        let single = beside_encode(two_bindings(vec![Phase::Single])?)?;
-        assert!(start_in_process(&places_pairs(single), None)?.is_some());
+        assert!(host_start(&beside(vec![Phase::Single])?)?.is_some());
     }
     Ok(())
 }
@@ -909,6 +1050,95 @@ fn the_engine_decides_whole_a_pair_this_process_feeds() -> Case {
         };
         let classic = matches!(name, "cache_aware" | "consistent_hashing" | "prefix_hash");
         assert_eq!(started.decides_whole(), !classic, "{name}");
+    }
+    Ok(())
+}
+
+/// An encode gateway of `encode` on its encode side and `sides` on each
+/// side of its pair, with the setting.
+fn encode_mode(encode: Option<PolicyConfig>, sides: Option<PolicyConfig>) -> RouterConfig {
+    RouterConfig {
+        policy_controller: true,
+        policy: PolicyConfig::RoundRobin,
+        mode: RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: encode,
+            prefill_policy: sides.clone(),
+            decode_policy: sides,
+        },
+        ..RouterConfig::default()
+    }
+}
+
+/// An encode gateway's document is decided whole where its pair's is and
+/// its encode side takes no word of a lease and reads nothing this process
+/// does not feed: round robin, random and passthrough. An encode item is
+/// decided under no lease, so least load, power of two, bucket and the
+/// default policy keep the classic pass on that side, as consistent
+/// hashing, the side's default, and the prefix hash do for their hash ring.
+/// The pair's sides are decided as a pair gateway's are. The routing
+/// settings refuse the manual policy on a side.
+#[test]
+fn the_engine_decides_whole_an_encode_request_this_process_feeds() -> Case {
+    let whole = |config: &RouterConfig| -> Result<bool, Box<dyn Error>> {
+        let started = start_in_process(config, None)?;
+        Ok(started
+            .ok_or("the setting starts an engine")?
+            .decides_whole())
+    };
+    assert!(!whole(&encode_mode(None, None))?, "the side's default");
+    for policy in policies() {
+        let name = policy.name();
+        let encode = encode_mode(Some(policy.clone()), None);
+        let pair = encode_mode(Some(PolicyConfig::RoundRobin), Some(policy));
+        if name == "manual" {
+            assert!(start_in_process(&encode, None).is_err());
+            assert!(start_in_process(&pair, None).is_err());
+            continue;
+        }
+        let moves = matches!(name, "round_robin" | "random" | "passthrough");
+        assert_eq!(whole(&encode)?, moves, "{name} on the encode side");
+        let classic = matches!(name, "cache_aware" | "consistent_hashing" | "prefix_hash");
+        assert_eq!(whole(&pair)?, !classic, "{name} on the pair's sides");
+    }
+    Ok(())
+}
+
+/// An encode gateway under a document its operator supplied. One whose
+/// three sides the engine decides starts, decided whole. One whose encode
+/// side the engine does not decide stops the start by the place's name:
+/// the profile, its first stage that asks more than a pick, and the phase.
+/// So a side that takes a word of a lease is refused there, and never
+/// decided on state nothing keeps.
+#[test]
+fn a_supplied_encode_document_starts_decided_whole_or_stops_by_its_place() -> Case {
+    // The routing settings at their defaults for the mode, so the document
+    // is its operator's own.
+    let supplied = |document: PolicySpec| RouterConfig {
+        mode: encode_mode(None, None).mode,
+        ..supplied(document)
+    };
+    for encode in ["round_robin", "random", "passthrough"] {
+        let document = PolicySpec::epd_presets(encode, "round_robin", "round_robin")?;
+        let started = start_in_process(&supplied(document), None)?.ok_or("an engine")?;
+        assert!(started.decides_whole(), "{encode}");
+    }
+    for (encode, stage) in [
+        ("prefix_hash", "the scorer `consistent-hash`"),
+        ("least_load", "the scorer `least-load`"),
+        ("power_of_two", "the scorer `least-load`"),
+        ("bucket", "the scorer `bucket`"),
+        ("cache_aware", "the scorer `warmup-slice`"),
+    ] {
+        let document = PolicySpec::epd_presets(encode, "round_robin", "round_robin")?;
+        let refused = refusal(&supplied(document))?;
+        let named = format!(
+            "the policy document's profile `encode` is not decided in this process yet: \
+             it holds {stage} (binding `*`, phase encode)"
+        );
+        assert_eq!(refused, named, "{encode}");
     }
     Ok(())
 }
