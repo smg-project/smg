@@ -2699,9 +2699,9 @@ impl RouterTrait for Router {
         }
         // The id is the client's text and goes out as one path segment. The
         // form encoder writes a space as `+`, which a path reads as a plus.
-        let id: String = url::form_urlencoded::byte_serialize(response_id.as_bytes())
-            .map(|part| if part == "+" { "%20" } else { part })
-            .collect();
+        let id = url::form_urlencoded::byte_serialize(response_id.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20");
         let endpoint = format!("v1/responses/{id}/cancel");
         self.route_simple_request(headers, &endpoint, Method::POST)
             .await
