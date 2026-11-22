@@ -219,7 +219,6 @@ impl HarmonyStreamingProcessor {
                     &tx,
                     router_stop_strings,
                     reservation,
-                    &source,
                 ))
                 .await
                 .unwrap_or_else(|panicked| Err(panicked.into()));
@@ -296,7 +295,7 @@ impl HarmonyStreamingProcessor {
     /// Process streaming chunks from a single stream
     #[expect(
         clippy::too_many_arguments,
-        reason = "keeps the stream, request metadata, reservation and source separate"
+        reason = "keeps the stream, request metadata and reservation separate"
     )]
     async fn process_single_stream(
         start_time: Instant,
@@ -307,7 +306,6 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         router_stop_strings: Vec<String>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: &utils::StreamSource,
     ) -> Result<(), utils::StreamFailure> {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
@@ -323,7 +321,6 @@ impl HarmonyStreamingProcessor {
             &router_stop_strings,
             None,
             reservation,
-            Some(source),
         )
         .await
     }
@@ -370,7 +367,6 @@ impl HarmonyStreamingProcessor {
             &router_stop_strings,
             Some(pd_timing),
             reservation,
-            None,
         )
         .await?;
 
@@ -404,7 +400,6 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: &[String],
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let mut decode = ChatDecode::new(start_time, dispatch_wait, pd_timing, dispatch);
         while let Some(result) = decode_stream.next().await {
@@ -457,7 +452,6 @@ impl HarmonyStreamingProcessor {
                 reservation,
                 original_request,
                 tx,
-                source,
             )
             .await
     }
@@ -1988,7 +1982,6 @@ impl ChatDecode {
         reservation: Option<Arc<SharedReservationHandle>>,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         // Every `n>1` choice shares one prompt; each Complete reports that same full length, so
         // max (not sum) is the actual prompt cost. cached_tokens is a property of that same
@@ -2018,18 +2011,18 @@ impl ChatDecode {
             ),
         };
 
-        // A clean decode EOF with fewer closed choices (a decode `Complete`, or the router's
-        // stop with the chunk's counts) than this request's `n>1` choices has only partial
-        // usage -- settling with that would understate the real cost. Deliberately checked
-        // against the decode stream's own closes, not `prompt_tokens`: in PD mode
-        // `prompt_tokens` can already be non-empty from the prefill phase alone, which would
-        // otherwise mask a decode phase that never actually finished.
-        let complete = self.closed_choices() >= original_request.choices();
         if let Some(handle) = reservation {
-            if complete {
-                handle.settle_success(counts.settlement()).await;
-            } else {
+            // A clean decode EOF with fewer closed choices (a decode `Complete`, or the router's
+            // stop with the chunk's counts) than this request's `n>1` choices has only partial
+            // usage -- settling with that would understate the real cost. Deliberately checked
+            // against the decode stream's own closes, not `prompt_tokens`: in PD mode
+            // `prompt_tokens` can already be non-empty from the prefill phase alone, which would
+            // otherwise mask a decode phase that never actually finished.
+            let expected_choices = original_request.choices();
+            if self.closed_choices() < expected_choices {
                 handle.close_reserved_only().await;
+            } else {
+                handle.settle_success(counts.settlement()).await;
             }
         }
 
@@ -2055,10 +2048,6 @@ impl ChatDecode {
                 tx,
             )
             .await?;
-        }
-
-        if let Some(source) = source.filter(|_| complete) {
-            source.completed(counts.prompt, counts.completion);
         }
 
         // Headers may arrive with the first chunk. Both clocks start at the

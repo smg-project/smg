@@ -81,7 +81,6 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
     policies::PolicyRegistry,
-    policy_controller::engine::{Placed, PolicyEngine},
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
@@ -119,11 +118,6 @@ pub(crate) enum Endpoint {
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    policy_engine: Option<Arc<PolicyEngine>>,
-    /// Whether the pair's policy settings keep a request to the worker it
-    /// names (`placement::pair_keeps_target`). No role policy is built under
-    /// the policy controller, so the selection stage is told.
-    pair_keeps_target: bool,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
@@ -165,8 +159,6 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
-            policy_engine: None,
-            pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory,
             reasoning_parser_factory,
@@ -191,8 +183,6 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
-            policy_engine: None,
-            pair_keeps_target: false,
             prefill_admission,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -219,22 +209,6 @@ impl PipelineDeps {
     #[must_use]
     pub(crate) fn with_grouped_dp_sticky(mut self, sticky: GroupedDpSticky) -> Self {
         self.grouped_dp_sticky = sticky;
-        self
-    }
-
-    /// Place regular requests through the policy engine `policy_engine`, where
-    /// the context holds one.
-    #[must_use]
-    pub(crate) fn with_policy_engine(mut self, policy_engine: Option<Arc<PolicyEngine>>) -> Self {
-        self.policy_engine = policy_engine;
-        self
-    }
-
-    /// Tell the selection stage whether the pair's policy settings keep a
-    /// request to the worker it names (`placement::pair_keeps_target`).
-    #[must_use]
-    pub(crate) fn with_pair_keeps_target(mut self, keeps: bool) -> Self {
-        self.pair_keeps_target = keeps;
         self
     }
 
@@ -298,8 +272,6 @@ impl PipelineDeps {
         Self {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            policy_engine: None,
-            pair_keeps_target: false,
             prefill_admission: None,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -380,8 +352,6 @@ impl RequestPipeline {
             mode.worker_selection(),
             deps.prefill_admission.clone(),
         )
-        .with_policy_engine(deps.policy_engine.clone())
-        .with_pair_keeps_target(deps.pair_keeps_target)
         .with_queue_timeout(deps.queue_timeout);
         let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
@@ -604,7 +574,7 @@ impl RequestPipeline {
             acquire_clients(
                 workers,
                 &ctx.input.model_id,
-                self.rechecks_overload(ctx.state.placed.as_ref()),
+                self.worker_registry.overload_shed_enabled(),
             )
             .await
         )?);
@@ -615,17 +585,6 @@ impl RequestPipeline {
             stages.request_building.name(),
             stages.request_building.build(ctx).await
         )
-    }
-
-    /// Whether client acquisition re-checks the chosen workers' overload
-    /// flag: under `--worker-overload-shed`, for a selection the classic
-    /// policies made. A placement the policy engine made is not
-    /// re-checked. There the overload veto is the controller's, read from
-    /// its rows, and the flag on the object mirrors it for the gateway's
-    /// other readers: a worker flagged under another pool's thresholds
-    /// still takes the send the controller decided.
-    fn rechecks_overload(&self, placed: Option<&Placed>) -> bool {
-        placed.is_none() && self.worker_registry.overload_shed_enabled()
     }
 
     /// One dispatch attempt: (re-)selection for retries, plan stamping,
@@ -658,7 +617,7 @@ impl RequestPipeline {
                 acquire_clients(
                     workers,
                     &dctx.model_id,
-                    self.rechecks_overload(dctx.placed.as_ref()),
+                    self.worker_registry.overload_shed_enabled(),
                 )
                 .await?,
             );
@@ -841,7 +800,7 @@ impl RequestPipeline {
                 // the backoff window (a fresh context dropped them here before).
                 // This releases its PD admission claim too, so the retry is not
                 // queued behind its own predecessor's bootstrap rooms.
-                dctx.release_attempt(&failure, Instant::now());
+                dctx.load_guards = None;
                 dctx.pd_prefill_guard = None;
                 // A stream that failed after its call was taken is the worker's
                 // failure too: charged here, where the request's ledger is.
@@ -876,12 +835,9 @@ impl RequestPipeline {
                 // the HTTP routers count the answer of a route; the attempts
                 // are the retry families' count.
                 let retryable = retry_config.filter(|_| is_retryable_response(&failure));
-                let Some(config) = retryable.filter(|_| self.retry_follows(last_attempt, &dctx))
-                else {
+                let Some(config) = retryable.filter(|_| !last_attempt) else {
                     self.record_error(metrics_endpoint, &dctx.model_id, &failure);
-                    // Exhausted is a request whose attempts ran out, not one
-                    // whose retry the selection could not place.
-                    if retryable.is_some() && last_attempt {
+                    if retryable.is_some() {
                         if let Some(endpoint) = metrics_endpoint {
                             self.record_retries_exhausted(endpoint);
                         }
@@ -913,13 +869,6 @@ impl RequestPipeline {
                 attempt = next_attempt;
             }
         }
-    }
-
-    /// Whether a retry follows a failed attempt that may be retried: an
-    /// attempt is left, and the selection can place one. Where it cannot,
-    /// there is no next attempt, and the failure stands as the answer.
-    fn retry_follows(&self, last_attempt: bool, dctx: &DispatchContext) -> bool {
-        !last_attempt && self.stages.worker_selection.places_retry(dctx)
     }
 
     /// The pools a retry of `model_id` re-selects from, narrowed to the
@@ -1093,21 +1042,6 @@ impl RequestPipeline {
         }
     }
 
-    /// A placed dispatch that answered whole says its end with the
-    /// settlement's token counts.
-    fn ended_whole(dctx: &DispatchContext, usage: UsageSettlement) {
-        if let Some(placement) = dctx.placement() {
-            placement.completed(usage.actual_input_tokens, usage.completion_tokens);
-        }
-    }
-
-    /// The settlement of an answer that succeeded: the reservation's, then
-    /// the placement's end.
-    async fn settle_success(dctx: &DispatchContext, usage: UsageSettlement) {
-        Self::settle_reservation(dctx.rate_limit_cell.as_deref(), usage).await;
-        Self::ended_whole(dctx, usage);
-    }
-
     /// The settlement of a non-streamed chat or messages answer: the engine's
     /// counters the response stage recorded (see `ResponseState::engine_counts`);
     /// all zeros, a full refund, when none were (the stage always records
@@ -1248,7 +1182,11 @@ impl RequestPipeline {
                 Some(FinalResponse::Chat(response)) => {
                     // The engine's counts: the usage shown excludes the unbilled
                     // stub and may carry the parser's reasoning split.
-                    Self::settle_success(&dctx, Self::recorded_settlement(&dctx.response)).await;
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::recorded_settlement(&dctx.response),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, json_response(&response))
                 }
@@ -1306,7 +1244,11 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Generate(response)) => {
-                    Self::settle_success(&dctx, Self::generate_settlement(&response)).await;
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::generate_settlement(&response),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     let body = generate_response_body(single_prompt, n, response);
                     Self::routed_response(&dctx, json_response(&body))
@@ -1349,8 +1291,8 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Completion(response)) => {
-                    Self::settle_success(
-                        &dctx,
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
                         Self::completion_settlement(response.usage.as_ref()),
                     )
                     .await;
@@ -1399,7 +1341,11 @@ impl RequestPipeline {
                     // The engine's counts: the Messages usage reports no cache
                     // hits and the greater of the engine's and the parser's
                     // thinking count.
-                    Self::settle_success(&dctx, Self::recorded_settlement(&dctx.response)).await;
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::recorded_settlement(&dctx.response),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, json_response(&response))
                 }
@@ -1444,7 +1390,11 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Decisions(response)) => {
-                    Self::settle_success(&dctx, Self::decisions_settlement(&response.usage)).await;
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::decisions_settlement(&response.usage),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, json_response(&response))
                 }
@@ -1486,8 +1436,8 @@ impl RequestPipeline {
                 Some(FinalResponse::Embedding(response)) => {
                     // The prompt tokens the engine counted; an embedding has
                     // no completion.
-                    Self::settle_success(
-                        &dctx,
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
                         Self::prompt_only_settlement(response.usage.prompt_tokens),
                     )
                     .await;
@@ -1539,7 +1489,11 @@ impl RequestPipeline {
                 Some(FinalResponse::Transcription { text, format }) => {
                     // The engine's counts of the transcript's generation, as
                     // the response stage recorded them.
-                    Self::settle_success(&dctx, Self::recorded_settlement(&dctx.response)).await;
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::recorded_settlement(&dctx.response),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(
                         &dctx,
@@ -1586,8 +1540,8 @@ impl RequestPipeline {
                 Some(FinalResponse::Classify(response)) => {
                     // The prompt tokens the engine counted; a classification
                     // has no completion.
-                    Self::settle_success(
-                        &dctx,
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
                         Self::prompt_only_settlement(response.usage.prompt_tokens),
                     )
                     .await;
@@ -1651,9 +1605,9 @@ impl RequestPipeline {
                 Some(FinalResponse::Chat(response)) => {
                     // The engine's counts the response stage recorded, as
                     // `execute_chat` settles them.
-                    let usage = Self::recorded_settlement(&dctx.response);
-                    rate_limit_cell.settle(usage).await;
-                    Self::ended_whole(&dctx, usage);
+                    rate_limit_cell
+                        .settle(Self::recorded_settlement(&dctx.response))
+                        .await;
                     Ok((response, dctx.parser))
                 }
                 Some(_) => {
@@ -1725,9 +1679,9 @@ impl RequestPipeline {
             Ok(RunOutcome::Final(mut dctx, _)) => {
                 match dctx.response.responses_iteration_result.take() {
                     Some(iteration_result) => {
-                        let usage = Self::recorded_settlement(&dctx.response);
-                        rate_limit_cell.settle(usage).await;
-                        Self::ended_whole(&dctx, usage);
+                        rate_limit_cell
+                            .settle(Self::recorded_settlement(&dctx.response))
+                            .await;
                         Ok(*iteration_result)
                     }
                     None => {

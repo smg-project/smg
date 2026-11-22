@@ -376,7 +376,6 @@ fn bench_simple_policy_pick(c: &mut Criterion) {
             named: Some(NamedList {
                 list: &list,
                 positions: None,
-                members: None,
             }),
             ..Default::default()
         };

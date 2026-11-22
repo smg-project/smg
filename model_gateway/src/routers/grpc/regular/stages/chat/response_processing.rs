@@ -75,8 +75,7 @@ impl ChatResponseProcessingStage {
                 ctx.workers.as_ref(),
                 &dispatch,
                 metrics_labels::ENDPOINT_CHAT,
-            )
-            .with_placement(ctx.placement().cloned());
+            );
             let response = self
                 .streaming_processor
                 .clone()

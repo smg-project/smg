@@ -14,13 +14,7 @@
 //! router-error families count it under one `error_type`, and one WARN names
 //! the worker, the route and the cause.
 
-use std::{
-    error::Error as _,
-    sync::{
-        atomic::{AtomicU16, Ordering},
-        Arc,
-    },
-};
+use std::{error::Error as _, sync::Arc};
 
 use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
@@ -124,9 +118,6 @@ pub(crate) struct RelaySource {
     worker: Arc<dyn Worker>,
     worker_type: &'static str,
     backend: &'static str,
-    /// Where a reader outside the relay task learns of a cut: the status of
-    /// the cut's class, written before the body's end. Zero while it stands.
-    mark: Option<Arc<AtomicU16>>,
 }
 
 impl RelaySource {
@@ -168,14 +159,7 @@ impl RelaySource {
             worker,
             worker_type,
             backend,
-            mark: None,
         }
-    }
-
-    /// The same source, writing a cut's status on `mark`.
-    pub(crate) fn marking(mut self, mark: Arc<AtomicU16>) -> Self {
-        self.mark = Some(mark);
-        self
     }
 
     /// The worker the response is read from.
@@ -214,9 +198,6 @@ impl RelaySource {
             cut.cause
         );
         self.worker.record_outcome(cut.status.as_u16());
-        if let Some(mark) = &self.mark {
-            mark.store(cut.status.as_u16(), Ordering::Relaxed);
-        }
         Metrics::record_worker_error(
             self.worker_type,
             metrics_labels::CONNECTION_HTTP,

@@ -12,7 +12,6 @@ use http::{header::HeaderName, HeaderMap};
 use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
-use smg_policy_controller::engine::{AloneProfile, Phase, Place, PolicyEngine};
 use smg_worker::{
     identity::{
         basic::{RequestCompletionSink, Worker, WorkerType},
@@ -33,15 +32,14 @@ use super::{
     hash_ring::HashRing,
     kept_rings::KeptRings,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, DPRankLoadPolicy, EnginePolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     policies::kv_index::event_monitor::KvEventMonitor,
-    policy_controller::engine::PolicyEngine as GatewayEngine,
     routers::common::{
         header_utils::{
             extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
@@ -49,20 +47,6 @@ use crate::{
         snapshot::{ModelWorkerSnapshot, WorkerRegistry, WorkerRegistryExt},
     },
 };
-
-/// How the document of the policy engine a registry asks came to be
-/// ([`PolicyRegistry::with_policy_engine`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DocumentOrigin {
-    /// The document the gateway's routing settings mean, made from them or
-    /// handed back by the operator: it says what they say, so a worker's
-    /// `policy` label chooses a model's policy as ever.
-    Settings,
-    /// Supplied by the operator, and saying another thing than the routing
-    /// settings: its bindings say which profile places a model, whatever a
-    /// worker's `policy` label says.
-    Supplied,
-}
 
 /// A side of a pair deployment: the place of one of the registry's side
 /// policies ([`PolicyRegistry::set_side_policy`]).
@@ -72,64 +56,6 @@ pub enum Side {
     Decode,
     Encode,
 }
-
-impl Side {
-    const fn phase(self) -> Phase {
-        match self {
-            Self::Prefill => Phase::Prefill,
-            Self::Decode => Phase::Decode,
-            Self::Encode => Phase::Encode,
-        }
-    }
-}
-
-/// The policy engine a registry's policies ask, with its document's origin.
-#[derive(Clone, Debug)]
-struct AskedEngine {
-    engine: Arc<PolicyEngine>,
-    origin: DocumentOrigin,
-    /// Whether the routers ask the engine for each request's whole
-    /// decision under its document. The start log says so of a policy the
-    /// engine does not pick by itself.
-    whole: bool,
-}
-
-impl AskedEngine {
-    /// The label of the object that decides by `profile`, which the
-    /// selection counter counts under and the log names. Under a supplied
-    /// document it is the profile's name as the document writes it: the
-    /// settings' policy names nothing of that document. Under the document
-    /// the routing settings mean it is `classic`, the name of the classic
-    /// policy of the place, as ever.
-    fn label(&self, profile: AloneProfile, classic: &'static str) -> &'static str {
-        match self.origin {
-            DocumentOrigin::Settings => classic,
-            DocumentOrigin::Supplied => self.engine.profile_label(profile),
-        }
-    }
-}
-
-/// A place as the start log names it: the model, or every model, and the
-/// phase.
-struct Placed<'a> {
-    model: &'a str,
-    phase: Phase,
-}
-
-impl std::fmt::Display for Placed<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let phase = self.phase.name();
-        if self.model == EVERY_MODEL {
-            write!(f, "every model ({phase} requests)")
-        } else {
-            write!(f, "model {} ({phase} requests)", self.model)
-        }
-    }
-}
-
-/// The model id a policy that serves every model is asked for with: the
-/// bindings of every model match it, and no other binding does.
-const EVERY_MODEL: &str = "";
 
 /// Routes a request completion to the policy that placed the request: the
 /// prefill, decode or encode policy by worker type, else the model's policy.
@@ -249,10 +175,6 @@ pub struct PolicyRegistry {
     /// Encode policy for EPD mode (set once at startup, lock-free reads via OnceLock)
     encode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
-    /// The encode policy of a gateway that set none
-    /// ([`Self::get_encode_policy`]), built at its first read and kept.
-    encode_fallback: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
-
     /// Optional KV event monitor for event-driven cache-aware routing.
     /// When set, new CacheAwarePolicy instances are injected with this monitor.
     kv_event_monitor: Arc<RwLock<Option<Arc<KvEventMonitor>>>>,
@@ -270,13 +192,6 @@ pub struct PolicyRegistry {
 
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
-
-    /// The policy engine the policies built here ask, where the gateway
-    /// keeps one in its own process ([`Self::with_policy_engine`]): the
-    /// policy of a place whose profile the engine picks by itself is built
-    /// as the object that asks it ([`Self::policy_at`]). `None` builds
-    /// every policy as the classic one.
-    policy_engine: Option<AskedEngine>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
@@ -333,47 +248,7 @@ impl PolicyRegistry {
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
     ) -> Self {
-        Self::build(default_policy_config, routing_key_override, None)
-    }
-
-    /// [`Self::with_override`] for a gateway that keeps the policy engine
-    /// in its own process. The registry is built as ever and holds the
-    /// policies it ever held: the default one, one a model, one a side of a
-    /// pair. Each is the policy of a place, a model and a phase, and the
-    /// engine finds the place's profile by its document's bindings where
-    /// the policy is built. `origin` says how that document came to be:
-    /// under one made from the routing settings a worker's `policy` label
-    /// chooses a model's policy as ever, and under a supplied one the
-    /// binding that names the model does. `whole` says whether the routers
-    /// ask the engine for each request's whole decision under the document:
-    /// the start log's line for a policy the engine does not pick by itself
-    /// says who decides it by that.
-    pub fn with_policy_engine(
-        default_policy_config: PolicyConfig,
-        routing_key_override: RoutingKeyOverrideConfig,
-        engine: Arc<PolicyEngine>,
-        origin: DocumentOrigin,
-        whole: bool,
-    ) -> Self {
-        let asked = AskedEngine {
-            engine,
-            origin,
-            whole,
-        };
-        Self::build(default_policy_config, routing_key_override, Some(asked))
-    }
-
-    fn build(
-        default_policy_config: PolicyConfig,
-        routing_key_override: RoutingKeyOverrideConfig,
-        policy_engine: Option<AskedEngine>,
-    ) -> Self {
-        let default_policy = Self::policy_at(
-            policy_engine.as_ref(),
-            &default_policy_config,
-            EVERY_MODEL,
-            Phase::Single,
-        );
+        let default_policy = Self::create_policy_from_config(&default_policy_config);
         let routing_key_sticky = routing_key_override.enabled.then(|| {
             Arc::new(ManualPolicy::with_config(ManualConfig {
                 eviction_interval_secs: routing_key_override.eviction_interval_secs,
@@ -404,12 +279,10 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             encode_policy: Arc::new(OnceLock::new()),
-            encode_fallback: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
-            policy_engine,
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
@@ -453,18 +326,6 @@ impl PolicyRegistry {
     #[cfg(any(test, feature = "test-util"))]
     pub fn hash_rings_are_current(&self, registry: &WorkerRegistry) -> bool {
         self.rings.are_current(registry)
-    }
-
-    /// The registry of a gateway where `policy_engine`, the gateway's object
-    /// over the policy engine of this process, places the requests: the
-    /// task that fills the hash rings fills the engine's
-    /// ([`KeptRings::filling`]). `None` leaves the rings as they are.
-    #[must_use]
-    pub(crate) fn with_rings_of(mut self, policy_engine: Option<Arc<GatewayEngine>>) -> Self {
-        if policy_engine.is_some() {
-            self.rings = Arc::new(KeptRings::filling(policy_engine));
-        }
-        self
     }
 
     /// Starts the task that fills the hash rings off the request path
@@ -811,23 +672,10 @@ impl PolicyRegistry {
     /// atomically inside [`super::CacheAwarePolicy::set_mesh_tree_sync`]); every
     /// future cache-aware policy created here inherits both. Pass `None`
     /// to detach.
-    ///
-    /// The mesh shares the classic policy's trees and nothing else. Where
-    /// the policy engine of this process decides, no decision reads those
-    /// trees, so an attach says once, as a warning, that the gateways of the
-    /// mesh do not share which worker holds a prompt's prefix.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
         {
             let mut guard = self.mesh_tree_sync.write();
             guard.clone_from(&adapter);
-        }
-        if adapter.is_some() && self.policy_engine.is_some() {
-            warn!(
-                "A mesh is attached and the policy controller decides in this process: the \
-                 gateways of the mesh do not share which worker holds a prompt's prefix while \
-                 the policy controller is on. Each gateway keeps its own record of the prefixes \
-                 it sent."
-            );
         }
         Self::maybe_inject_mesh_tree_sync(&self.default_policy, adapter.as_ref());
         if let Some(p) = self.prefill_policy.get() {
@@ -1020,49 +868,10 @@ impl PolicyRegistry {
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
-        // The model's own place, where a policy engine is asked. This runs
-        // once for a model, until no worker serves it.
-        if let Some(asked) = &self.policy_engine {
-            let supplied = asked.origin == DocumentOrigin::Supplied;
-            match (asked.engine.place(model_id, Phase::Single), policy_hint) {
-                // The document the settings make says what they say: a
-                // label chooses the model's policy, as ever.
-                (Place::Alone(_), Some(_)) if !supplied => {}
-                (Place::Alone(profile), label) => {
-                    // A supplied document's binding places the model,
-                    // whatever its workers' label says.
-                    if let Some(label) = label {
-                        warn!(
-                            "Model {model_id}: the policy document's binding places it, \
-                             not its workers' policy label '{label}'"
-                        );
-                    }
-                    let name = self.default_policy_config.name();
-                    let place = Placed {
-                        model: model_id,
-                        phase: Phase::Single,
-                    };
-                    return Self::engine_object(asked, profile, name, &place);
-                }
-                (Place::Unbound, _) if supplied => {
-                    warn!(
-                        "Model {model_id}: no binding of the policy document plans its single requests, \
-                         the classic policies place them"
-                    );
-                    Metrics::record_policy_unbound_model();
-                }
-                // A binding that plans no single request names the model: a
-                // pair's, whose requests the side policies place. The start
-                // refuses a supplied document under which this gateway
-                // would place a single request of such a model.
-                (Place::Unbound | Place::NoSide | Place::NotAlone { .. }, _) => {}
-            }
-        }
-
         // 1. Check policy hint from worker
         if let Some(policy_type) = policy_hint {
             debug!("Using policy hint '{}' for model {}", policy_type, model_id);
-            return self.create_policy_from_type(model_id, policy_type);
+            return self.create_policy_from_type(policy_type);
         }
 
         // 2. Use default policy
@@ -1075,30 +884,10 @@ impl PolicyRegistry {
     /// operator's tunables; other types are built with their defaults.
     /// Integration injection happens at publication in
     /// [`Self::on_worker_added`].
-    fn create_policy_from_type(
-        &self,
-        model_id: &str,
-        policy_type: &str,
-    ) -> Arc<dyn LoadBalancingPolicy> {
+    fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         if Self::hint_matches_config(policy_type, self.default_policy_config.name()) {
-            Self::policy_at(
-                self.policy_engine.as_ref(),
-                &self.default_policy_config,
-                model_id,
-                Phase::Single,
-            )
+            Self::create_policy_from_config(&self.default_policy_config)
         } else if let Some(policy) = PolicyFactory::create_by_name(policy_type) {
-            if self.policy_engine.is_some() {
-                let place = Placed {
-                    model: model_id,
-                    phase: Phase::Single,
-                };
-                info!(
-                    "Policy `{}` of {place}: the classic policy decides it, \
-                     its workers' policy label names it",
-                    policy.name()
-                );
-            }
             policy
         } else {
             warn!("Unknown policy type '{}', using default", policy_type);
@@ -1113,90 +902,17 @@ impl PolicyRegistry {
         hint == config_name || hint == config_name.replace('_', "")
     }
 
-    /// The policy of one place, `model` at `phase`, whose classic policy is
-    /// `config`.
-    ///
-    /// With no engine it is the classic policy (PolicyFactory's). With one,
-    /// the engine finds the place's profile by its document's bindings
-    /// ([`PolicyEngine::place`]), here and at no request. Where one pick of
-    /// that profile's picker is its whole decision, the policy is the
-    /// object that asks the engine ([`Self::engine_object`]), and
-    /// `config`'s name only labels it. Where the engine does not pick the
-    /// profile so yet, or no binding names the place, it is the classic
-    /// policy. The log says which: one line for each policy this registry
-    /// builds and keeps with an engine asked. Under a document the routers
-    /// ask the engine whole for, the line of a profile the engine does not
-    /// pick by itself says the engine decides it by its whole pass: the
-    /// classic policy is built all the same, for a route with no arm to
-    /// the engine.
-    fn policy_at(
-        asked: Option<&AskedEngine>,
-        config: &PolicyConfig,
-        model: &str,
-        phase: Phase,
-    ) -> Arc<dyn LoadBalancingPolicy> {
-        let Some(asked) = asked else {
-            return PolicyFactory::create_from_config(config);
-        };
-        let name = config.name();
-        let place = Placed { model, phase };
-        match asked.engine.place(model, phase) {
-            Place::Alone(profile) => Self::engine_object(asked, profile, name, &place),
-            Place::NotAlone { profile, stage } => {
-                if asked.whole {
-                    info!(
-                        "Policy `{name}` of {place}: the policy engine decides it by its whole \
-                         pass (the profile `{profile}`); the classic policy is kept for a route \
-                         with no arm to the engine"
-                    );
-                } else {
-                    info!(
-                        "Policy `{name}` of {place}: the classic policy decides it, \
-                         the policy engine does not pick the profile `{profile}` by itself yet ({stage})"
-                    );
-                }
-                PolicyFactory::create_from_config(config)
-            }
-            Place::Unbound => {
-                info!(
-                    "Policy `{name}` of {place}: the classic policy decides it, \
-                     no binding of the policy document names the place"
-                );
-                PolicyFactory::create_from_config(config)
-            }
-            Place::NoSide => {
-                info!(
-                    "Policy `{name}` of {place}: the classic policy decides it, \
-                     the binding of the policy document that names the place plans no {} request",
-                    phase.name()
-                );
-                PolicyFactory::create_from_config(config)
-            }
-        }
-    }
-
-    /// The object that asks the engine under `profile`, which the engine
-    /// found for `place`: the one site that builds it, and the one line
-    /// that says the engine decides a policy. `name` is the classic policy
-    /// of the place, which labels the object under the document the
-    /// routing settings mean ([`AskedEngine::label`]).
-    fn engine_object(
-        asked: &AskedEngine,
-        profile: AloneProfile,
-        name: &'static str,
-        place: &Placed<'_>,
-    ) -> Arc<dyn LoadBalancingPolicy> {
-        let label = asked.label(profile, name);
-        info!("Policy `{label}` of {place}: the policy engine decides it");
-        Arc::new(EnginePolicy::of(&asked.engine, profile, label))
+    /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
+    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        PolicyFactory::create_from_config(config)
     }
 
     /// Builds the policy of a pair's `side` from the side's own `config`
     /// and sets it, once at startup, as [`Self::set_prefill_policy`] sets
-    /// a policy handed whole. The registry keeps one policy a side, so the
-    /// side's place is every model at the side's phase. A gateway of many
-    /// routers asks this once from each of its pair routers: the first
-    /// policy set stands, and a later call builds nothing.
+    /// a policy handed whole. The registry keeps one policy a side. A
+    /// gateway of many routers asks this once from each of its pair
+    /// routers: the first policy set stands, and a later call builds
+    /// nothing.
     pub fn set_side_policy(&self, side: Side, config: &PolicyConfig) {
         let kept = match side {
             Side::Prefill => &self.prefill_policy,
@@ -1206,12 +922,7 @@ impl PolicyRegistry {
         if kept.get().is_some() {
             return;
         }
-        let policy = Self::policy_at(
-            self.policy_engine.as_ref(),
-            config,
-            EVERY_MODEL,
-            side.phase(),
-        );
+        let policy = Self::create_policy_from_config(config);
         match side {
             Side::Prefill => self.set_prefill_policy(policy),
             Side::Decode => self.set_decode_policy(policy),
@@ -1304,22 +1015,12 @@ impl PolicyRegistry {
 
     /// Get the encode policy for EPD mode. Falls back to consistent_hashing so
     /// repeated multimodal items keep stable affinity even when the main policy is
-    /// load-oriented or random. The fallback is built as every policy of
-    /// this registry is, at its first read, and kept; a gateway's start
-    /// sets the encode policy of a deployment that has an encode side, so
-    /// no request of it comes here.
+    /// load-oriented or random.
     pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
-        if let Some(policy) = self.encode_policy.get() {
-            return Arc::clone(policy);
-        }
-        Arc::clone(self.encode_fallback.get_or_init(|| {
-            Self::policy_at(
-                self.policy_engine.as_ref(),
-                &PolicyConfig::ConsistentHashing,
-                EVERY_MODEL,
-                Phase::Encode,
-            )
-        }))
+        self.encode_policy
+            .get()
+            .map(Arc::clone)
+            .unwrap_or_else(|| PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing))
     }
 
     /// Whether any registered policy (default or per-model) routes on
@@ -1390,26 +1091,8 @@ impl PolicyRegistry {
     /// Whether `worker`'s stream carries its KV events into its model's
     /// index: what the policy that places requests on it reads
     /// ([`Self::policy_for_worker`]).
-    ///
-    /// Where the gateway keeps the policy engine in its own process, the
-    /// engine's document says it too: the profile that decides the worker's
-    /// model at the worker's phase reads cache events or it does not
-    /// (`Needs::events`). Either word starts the stream. A stream that
-    /// carried load records alone under such a profile would leave the
-    /// model's index empty, and every request would read as held by nobody
-    /// with no error to show it.
     pub(crate) fn worker_needs_kv_events(&self, worker: &dyn Worker) -> bool {
-        let by_engine = self.policy_engine.as_ref().is_some_and(|asked| {
-            let phase = match worker.worker_type() {
-                WorkerType::Prefill => Phase::Prefill,
-                WorkerType::Decode => Phase::Decode,
-                WorkerType::Encode => Phase::Encode,
-                WorkerType::Regular => Phase::Single,
-            };
-            let engine = asked.engine.spec().engine();
-            engine.needs_for(worker.model_id(), phase).events
-        });
-        by_engine || self.policy_for_worker(worker).needs_kv_events()
+        self.policy_for_worker(worker).needs_kv_events()
     }
 
     /// Initialize cache-aware policy with workers if applicable
@@ -1493,11 +1176,6 @@ impl PolicyRegistry {
     /// on worker removal alongside the cache-aware cleanup above.
     pub fn remove_worker_from_policies(&self, worker_url: &str) {
         self.each_policy(|policy| policy.remove_worker(worker_url));
-        // The engine's record of the prefixes it sent names the worker to
-        // no later request.
-        if let Some(asked) = &self.policy_engine {
-            asked.engine.forget(worker_url);
-        }
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
@@ -3488,29 +3166,5 @@ mod tests {
             picks, RECORDED,
             "the replay picked {picks:?}; the recorded sequence is the decision"
         );
-    }
-
-    /// The policy controller's strip hands the key this registry's own
-    /// strip hands: a suffix's counter has any number of digits on both.
-    #[test]
-    fn the_controllers_strip_hands_the_registrys_key() {
-        let padded = "9".repeat(21);
-        for key in [
-            "conv_t2",
-            "conv_t2_r1",
-            "conv_r3",
-            "conv_t2_t3",
-            "_t1",
-            "conv_t",
-            "conv",
-            &format!("conv_t{padded}"),
-            &format!("conv_t2_r{padded}"),
-        ] {
-            assert_eq!(
-                smg_policy_controller::document::strip_lineage(key),
-                PolicyRegistry::strip_header_key(key),
-                "{key}"
-            );
-        }
     }
 }

@@ -17,13 +17,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from smg.router_args import DOCUMENT_REPLACES, RouterArgs
+from smg.router_args import RouterArgs
 
 ROOT = Path(__file__).resolve().parents[3]
 GATEWAY_SRC = ROOT / "model_gateway" / "src"
 CLI_DIR = GATEWAY_SRC / "cli"
 CLI_MODULE = CLI_DIR / "mod.rs"
-NATIVE_MODULE = ROOT / "bindings" / "python" / "src" / "lib.rs"
 
 
 def cli_source() -> str:
@@ -52,7 +51,6 @@ def test_the_executable_takes_the_stock_allocator_in_one_line():
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
-    "--print-policy-spec": "the binary prints its policy document and exits; the launcher does not",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
@@ -574,62 +572,6 @@ def test_the_launcher_encode_policy_choices_are_the_cli_choices(launcher):
     cli_choices = re.findall(r'"([a-z_]+)"', attribute.group(1).split("value_parser", 1)[1])
     assert cli_choices == ["random", "round_robin", "consistent_hashing"]
     assert list(launcher["--encode-policy"].choices) == cli_choices
-
-
-def test_the_launcher_policy_controller_choices_are_the_cli_choices(launcher):
-    attribute = re.search(
-        r"value_parser\s*=\s*\[([^\]]+)\][^\]]*\)\]\s*policy_controller: String,",
-        cli_source(),
-    )
-    assert attribute, "the CLI's --policy-controller choices are missing"
-    assert list(launcher["--policy-controller"].choices) == re.findall(
-        r'"([a-z]+)"', attribute.group(1)
-    )
-
-
-def test_the_launchers_leave_policy_unset_and_describe_the_same_default(rust, launcher):
-    option = launcher["--policy"]
-    assert rust.flags["--policy"] is option.default is None
-    assert constructor_defaults()["policy"] == ("None", None)
-
-    declaration = re.search(
-        r"(?P<help>(?:^[ \t]*/// [^\n]+\n)+)"
-        r"\s*#\[arg\((?P<attribute>[^\n]+)\)\]\n\s*policy: Option<String>,",
-        CLI_MODULE.read_text(),
-        re.MULTILINE,
-    )
-    assert declaration, "the CLI's --policy declaration moved"
-    choices = re.search(r"value_parser\s*=\s*\[([^\]]+)\]", declaration["attribute"])
-    assert choices, "the CLI's --policy choices are missing"
-    assert sorted(option.choices) == sorted(re.findall(r'"([a-z_]+)"', choices[1]))
-    cli_help = " ".join(line.split("/// ", 1)[1] for line in declaration["help"].splitlines())
-    default_help = (
-        "Defaults to cache_aware."
-        " A policy document replaces the routing flags, and --policy is refused beside one."
-    )
-    assert cli_help.endswith(default_help)
-    assert option.help.endswith(default_help)
-
-
-def test_the_launchers_list_the_same_options_a_document_replaces():
-    block = re.search(
-        r"const DOCUMENT_REPLACES: \[&str; (\d+)\] = \[(.*?)\];", CLI_MODULE.read_text(), re.S
-    )
-    assert block, "the CLI's list of the flags a document replaces moved"
-    cli = re.findall(r'"([a-z_0-9]+)"', block[2])
-    assert len(cli) == int(block[1])
-    # The launcher spells the interval with its unit and folds the disable
-    # flag into worker_overload_protection.
-    cli.remove("disable_worker_overload_protection")
-    cli[cli.index("eviction_interval")] = "eviction_interval_secs"
-    assert list(DOCUMENT_REPLACES) == cli
-
-
-def test_the_native_start_lists_the_same_options_a_document_replaces():
-    # The native start refuses by its own copy of the list: a third home.
-    block = re.search(r"let moved: Vec<&str> = moved!\[(.*?)\]", NATIVE_MODULE.read_text(), re.S)
-    assert block, "the native start's list of the settings a document replaces moved"
-    assert re.findall(r"[a-z_0-9]+", block[1]) == list(DOCUMENT_REPLACES)
 
 
 @pytest.mark.parametrize("use_router_prefix", [False, True])

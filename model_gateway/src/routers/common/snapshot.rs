@@ -10,7 +10,6 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_policy_controller::engine::PoolMembers;
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -195,11 +194,6 @@ pub struct ModelWorkerSnapshot {
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
-    /// What the policy engine keeps of each pool (see
-    /// [`Self::pool_members_cell`]), each in a box of its own: the value
-    /// stands on cache lines of its own, and a snapshot no engine picks
-    /// over holds the empty cells alone.
-    pool_members: [OnceLock<Box<PoolMembers>>; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -213,7 +207,6 @@ impl ModelWorkerSnapshot {
             labels: OnceLock::new(),
             media: OnceLock::new(),
             hash_ring: OnceLock::new(),
-            pool_members: std::array::from_fn(|_| OnceLock::new()),
         }
     }
 
@@ -377,21 +370,6 @@ impl ModelWorkerSnapshot {
                 ))
             })
             .clone()
-    }
-
-    /// The cell for what the policy engine keeps of `pool`, as the placement
-    /// hands it on beside the pool's name ([`NamedList::members`]): the
-    /// pool's own list ([`Self::pool`]) and the word a rotation counts its
-    /// turns in. The policy object that asks the engine fills the cell at
-    /// its first pick over the pool and borrows the value at each pick
-    /// after. A registry holds one engine, the one its policies ask, so
-    /// one engine fills a snapshot's cells. Nothing is built for a pool no
-    /// such policy picks over, and nothing that changes while the
-    /// membership stands is kept: a worker's health stays on the worker.
-    ///
-    /// [`NamedList::members`]: crate::policies::NamedList::members
-    pub(crate) fn pool_members_cell(&self, pool: RoutingPool) -> &OnceLock<Box<PoolMembers>> {
-        &self.pool_members[pool.index()]
     }
 
     /// The workers of `pool`, projected once per snapshot and borrowed from
