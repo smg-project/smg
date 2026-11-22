@@ -54,7 +54,7 @@ the scanner and the token ledger are the engine's own.
 |---|---|
 | `Parser` (`feed`) | The one trait: one instance per generated choice, fed `Input`s, filling `Events`. |
 | `Input`, `TokenSpan`, `EngineFinish` | The lifecycle steps and the token-to-byte alignment the gateway's decoder gives. |
-| `formats::for_model`, `formats::Table` | The registry: the table that reads a model id's output, with the model's own turn opener, for every checkpoint in the models table below with a table; `Table::named` the table an operator names (`Table::name`: the gateway's `--tool-call-parser` and `--reasoning-parser`, or a worker's labels, take one in place of a legacy parser's name). |
+| `formats::for_model`, `formats::Table` | The registry: the table that reads a model id's output, with the model's own turn opener, for every checkpoint in the models table below with a table; `Table::named` the table an operator names (`Table::name`: the gateway's `--tool-call-parser` and `--reasoning-parser`, or a worker's labels, take one in place of a legacy parser's name); `formats::for_stem` the table of a checkpoint served under another name, by the longest listed name that stands in its own as whole words. |
 | `Event`, `Events`, `Text` | The output: `Content`, `ReasoningStart`/`Reasoning`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArguments`/`ToolCallEnd`, `Dropped`, `Malformed`, `Finish`. `Text` carries the bytes and the engine tokens they cost. |
 | `DropReason`, `MalformedReason`, `FinishReason` | Why bytes were dropped, why a region could not be parsed, and the refined finish (`tool_calls` when calls were made). |
 | `CallEnd` | How each call ended, on its `ToolCallEnd`: closed by the model, left open at the model's own stop, or cut. A driver that must not hand on a call the model did not finish reads it there. |
@@ -226,8 +226,10 @@ Qwen3 table takes its call syntax as a second selector (JSON calls, or the tagge
 and later and Qwen3-Coder). `formats::for_model` picks the table from the model id by its exact
 repository name in any case, the group's primary or any checkpoint under **Also**, so a model
 listed here with a table needs neither flag once the gateway reads it with Symphony (a quantized
-or renamed checkpoint is not listed: the flags, or its workers' labels, name its table until its
-group names it, else it keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
+or renamed checkpoint is not listed: the flags, or its workers' labels, name its table; with no
+name set, `formats::for_stem` reads it with the table of the longest listed checkpoint name that
+stands in its own as whole words (none where two such names side by side read
+differently), and a model no listed name stands in keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
 name whose format a table reads to that table (`qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, a
 launcher's `muse` for `muse_spark`; the map is the gateway's `routers::grpc::utils::ALIASES`, beside
 its parser resolution), so a deployment's existing flags keep a working parser under Symphony, the

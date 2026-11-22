@@ -50,7 +50,8 @@ pub enum ParserChoice {
     /// (`routers::grpc::regular::symphony::names::reads`):
     /// the table its worker labels select, when they select anything; else the registry's table
     /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
-    /// select, for a model the registry does not know. Names select a table when it answers to
+    /// select, for a model the registry does not know; else, no name set, the table of the registry
+    /// checkpoint whose name stands in the model's. Names select a table when it answers to
     /// them: its own name, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml`
     /// for `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse`
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name

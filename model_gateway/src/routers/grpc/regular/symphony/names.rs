@@ -5,7 +5,7 @@ use std::{borrow::Cow, sync::Arc};
 
 use llm_tokenizer::traits::Tokenizer;
 use symphony::{
-    formats::{for_model_shared, table_for, Table},
+    formats::{for_model_shared, for_stem, table_for, Table},
     Format,
 };
 
@@ -93,7 +93,8 @@ pub(crate) fn labels_select_nothing(names: &Names) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fallback {
     /// No table reads the model and no name is set for it: the registry does not know the model,
-    /// and neither its labels nor the flags name anything.
+    /// neither its labels nor the flags name anything, and no checkpoint's name inside the
+    /// model's own gives a table (`symphony::formats::for_stem`).
     NoTable,
     /// A reasoning name alone that no table answers to (`deepseek_r1`, `qwen3_thinking`), in the
     /// labels or the flags, for a model the registry does not know: every table reads the thought
@@ -146,16 +147,21 @@ fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
 /// set for the model ([`ModelNames`]) and the registry: the names of the model's card (its
 /// workers' labels), when they select anything; else the registry's table, for a model it knows
 /// (`symphony::formats::for_model`); else the gateway's `--tool-call-parser` and
-/// `--reasoning-parser`, for a model the registry does not know; else the legacy parsers, with
-/// their own detection, the reason named ([`Fallback`]). So a fleet-wide name reads the models
+/// `--reasoning-parser`, for a model the registry does not know; else, no name set, the table
+/// of the checkpoint whose name stands in the model's (`symphony::formats::for_stem`: a guess,
+/// so it ranks under every name); else the legacy parsers, with their own detection, the
+/// reason named ([`Fallback`]). So a fleet-wide name reads the models
 /// the registry has no table for and never a family it has one for, and a worker's labels read
 /// their model whatever the registry has. A table the labels select reads a model the registry
 /// gives the same table with the model's own turn opener; another model, or one the registry
-/// does not know, replays from the table's own. A reasoning name alone that gives way
-/// ([`gives_way`]: `kimi`) is passed over in either source, as before its table came, and its
-/// table reads the model where the legacy parsers would read with the name: neither source
-/// selects anything, and it is the reasoning name in force, the labels' before the flags'. The
-/// registry is asked once per path, as before the flags came apart.
+/// does not know, replays from the table's own. So does a renamed checkpoint under a name that
+/// names its stem's own table, as before the stem: the stem is asked only where no name is set,
+/// and gives such a name neither its group's turn opener nor its text after the thought. A
+/// reasoning name alone that gives way ([`gives_way`]: `kimi`) is passed over in either source,
+/// as before its table came, and its table reads the model where the legacy parsers would read
+/// with the name: neither source selects anything, and it is the reasoning name in force, the
+/// labels' before the flags'. The registry is asked once per path, as before the flags came
+/// apart.
 pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
     match selection(&names.labels) {
         Selection::Template => Decision::Template,
@@ -183,7 +189,11 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
                     .and_then(answering_to)
                 {
                     Some(table) => Decision::Table(table.shared()),
-                    None => Decision::Legacy(nothing_reason(names)),
+                    None => match nothing_reason(names) {
+                        Fallback::NoTable => for_stem(model)
+                            .map_or(Decision::Legacy(Fallback::NoTable), Decision::Table),
+                        reason => Decision::Legacy(reason),
+                    },
                 },
             },
         },
@@ -1395,7 +1405,7 @@ mod tests {
             Some(Fallback::ReasoningNameOnly)
         );
         assert_eq!(
-            why(&labeled(r1, &pythonic), unknown),
+            why(&labeled(r1.clone(), &pythonic), unknown),
             Some(Fallback::LegacyToolName)
         );
 
@@ -1404,6 +1414,35 @@ mod tests {
         assert_eq!(why(&ModelNames::default(), known), None);
         assert_eq!(why(&names(None, Some("deepseek_r1")), known), None);
         assert_eq!(why(&names(None, Some("qwen3")), unknown), None);
+        // No name at all and a checkpoint's name inside the model's own: that checkpoint's table.
+        let renamed = "acme/Qwen3-8B-ft-q4";
+        assert!(matches!(
+            decision(&ModelNames::default(), renamed),
+            Decision::Table(stem) if Some(&stem) == for_model_shared(known).as_ref()
+        ));
+        // A name set anywhere outranks the stem.
+        assert_eq!(
+            why(&ModelNames::flagged(&r1), renamed),
+            Some(Fallback::ReasoningNameOnly)
+        );
+        assert_eq!(
+            why(&names(None, Some("deepseek_r1")), renamed),
+            Some(Fallback::ReasoningNameOnly)
+        );
+        assert_eq!(
+            why(&ModelNames::flagged(&pythonic), renamed),
+            Some(Fallback::LegacyToolName)
+        );
+        assert_eq!(
+            why(&names(Some("passthrough"), None), renamed),
+            Some(Fallback::Passthrough)
+        );
+        // And a table the flags name reads it in place of the stem's.
+        let mistral = pair(Some("mistral"), None);
+        assert!(matches!(
+            decision(&ModelNames::flagged(&mistral), renamed),
+            Decision::Table(format) if format.name() != Table::Qwen3.name()
+        ));
         assert!(matches!(
             reading(
                 ParserChoice::Symphony,

@@ -358,7 +358,8 @@ static NO_NAMES: Names = Names {
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
 /// and the gateway's flags, which every model shares. Symphony reads the two in that order with
 /// its registry between them (`regular::symphony::names::reads`): the card's names when they select
-/// anything, else the registry's table for a model it knows, else the flags; the legacy parsers
+/// anything, else the registry's table for a model it knows, else the flags, else (no name set)
+/// the table of the checkpoint whose name stands in the model's; the legacy parsers
 /// take each kind's first name, from the flags only one a legacy parser of the kind has
 /// ([`ParserResolver::tool_parser`], [`ParserResolver::legacy_tool`]).
 #[derive(Clone, Debug, PartialEq, Eq)]

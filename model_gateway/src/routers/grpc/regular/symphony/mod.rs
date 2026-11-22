@@ -10,7 +10,9 @@
 //! `--reasoning-parser` flags) and the registry: the labels, when they select anything; else the
 //! registry's table for a model it knows (`symphony::formats::for_model`); else the flags, for a
 //! model the registry does not know, so that a fleet-wide name never reads a family the registry
-//! has a table for; else the legacy parsers with their own detection. Names select a table when
+//! has a table for; else, no name set, the table of the checkpoint whose name stands in the
+//! model's (`symphony::formats::for_stem`); else the legacy parsers with their own detection.
+//! Names select a table when
 //! it answers to them (`utils::answering_to`: its own name, a legacy parser's
 //! that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, or a launcher's name
 //! for a family whose table has no older parser, `muse` for `muse_spark`), the tool-call name

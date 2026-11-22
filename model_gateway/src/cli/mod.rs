@@ -1524,9 +1524,11 @@ struct ModelArgs {
     /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
     /// existing flags keep a working parser); any other legacy parser's
     /// name keeps the legacy parsers (the Symphony crate lists each with
-    /// the reason, passthrough among them), and no name leaves the legacy
-    /// parsers to detect. A request's X-SMG-Parser header overrides the
-    /// flag for that request.
+    /// the reason, passthrough among them). With no name, a model whose
+    /// id holds a registry checkpoint's name in whole words reads with
+    /// that checkpoint's table, and any other model is left to the
+    /// legacy parsers to detect. A request's X-SMG-Parser header
+    /// overrides the flag for that request.
     #[arg(long, default_value = "symphony", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
     parser: String,
 

@@ -376,10 +376,64 @@ pub fn for_model(model: &str) -> Option<Format> {
 /// [`for_model`]'s table, built once and shared, as [`Table::shared`] shares a table: the engines
 /// that read a model's output hold the one copy.
 pub fn for_model_shared(model: &str) -> Option<Arc<Format>> {
-    let (index, group) = group_for(model)?;
-    Some(Arc::clone(
-        GROUP_FORMATS[index].get_or_init(|| Arc::new(group.format())),
-    ))
+    group_for(model).map(|(index, _)| shared(index))
+}
+
+/// The table of the group at `index`, built once and shared.
+fn shared(index: usize) -> Arc<Format> {
+    Arc::clone(GROUP_FORMATS[index].get_or_init(|| Arc::new(GROUPS[index].format())))
+}
+
+/// The table of the checkpoint whose name stands inside `model`'s repository name as whole
+/// words, shared as [`for_model_shared`]'s is: the family's table for a checkpoint served under
+/// another name with words added (`acme/Qwen3.5-27B-ft-q4`). Of names that stand one inside
+/// another the longest counts; names that stand side by side (a student named after its
+/// teacher) must read alike, table, turn opener and text after the thought, or there is no
+/// table. It is a guess where [`for_model`] is a row, so a caller asks it after its own sources.
+/// A word is what `-` and `_` separate. The whole name is not looked up (that is
+/// [`for_model`]'s), a name of one word is never a stem (`Inkling` must not read
+/// `Inkling-2-Small`), and a name of more than 16 words is not looked up at all: one probe of
+/// the index for each run of words, no allocation.
+pub fn for_stem(model: &str) -> Option<Arc<Format>> {
+    const CUTS: [char; 2] = ['-', '_'];
+    let repository = repository(model);
+    if repository.matches(CUTS).count() >= 16 {
+        return None;
+    }
+    let repositories: &HashMap<Caseless<'_>, usize, FxBuildHasher> = &REPOSITORIES;
+    let reads = |index: usize| {
+        let group = &GROUPS[index];
+        (group.table, group.opener, group.after)
+    };
+    // Every name found so far ends at or before `reach`: a later piece that ends there is nested.
+    let (mut found, mut reach) = (None, 0);
+    let starts = std::iter::once(0).chain(repository.match_indices(CUTS).map(|(at, _)| at + 1));
+    for start in starts {
+        let ends = std::iter::once(repository.len())
+            .chain(repository.rmatch_indices(CUTS).map(|(at, _)| at));
+        for end in ends {
+            if end <= start.max(reach) {
+                break;
+            }
+            if start == 0 && end == repository.len() {
+                continue;
+            }
+            let Some(piece) = repository.get(start..end) else {
+                continue;
+            };
+            if !piece.contains(CUTS) {
+                break;
+            }
+            if let Some(&index) = repositories.get(&Caseless(piece)) {
+                if found.is_some_and(|other| reads(other) != reads(index)) {
+                    return None;
+                }
+                (found, reach) = (Some(index), end);
+                break;
+            }
+        }
+    }
+    found.map(shared)
 }
 
 /// The table [`for_model`] builds for `model`, by name; `None` for a model the registry does not
@@ -644,18 +698,32 @@ mod tests {
 
     #[test]
     fn a_model_the_registry_does_not_know_resolves_to_none() {
-        for model in [
-            "Qwen/QwQ-32B",
-            "Qwen/Qwen3-8B-FP8",
+        // Each with the checkpoint whose name stands inside it as whole words, which `for_stem`
+        // reads it by, in any case: the longest of nested names, none where two side by side
+        // read differently; never a name of one word, nor in 17 words.
+        for (model, stem) in [
+            ("Qwen/QwQ-32B", None),
+            ("Qwen/Qwen3-8B-FP8", Some("Qwen/Qwen3-8B")),
+            ("acme/qwen3.5-27b-ft-q4", Some("Qwen/Qwen3.5-27B")),
+            (
+                "acme/DeepSeek-R1-0528-Qwen3-8B-ft",
+                Some("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"),
+            ),
+            ("acme/Qwen3-8B-Qwen3.5-27B", None),
+            ("acme/Qwen3-8B-Qwen3-14B", Some("Qwen/Qwen3-8B")),
+            ("acme/Inkling-ft-q4", None),
+            ("a-b-c-d-e-f-g-h-i-j-k-l-m-n-o-Qwen3-8B", None),
             // A base checkpoint without the Instruct template: not a name a group lists.
-            "meta-llama/Llama-3.1-8B",
-            "Qwen",
-            "Qwen/",
-            "",
-            "/",
+            ("meta-llama/Llama-3.1-8B", None),
+            ("Qwen", None),
+            ("Qwen/", None),
+            ("", None),
+            ("/", None),
         ] {
             assert_eq!(table_for(model), None, "{model}");
             assert!(for_model(model).is_none(), "{model}");
+            assert_eq!(for_stem(model), stem.and_then(for_model_shared), "{model}");
+            assert_eq!(stem.is_some(), for_stem(model).is_some(), "{model}");
         }
     }
 
