@@ -55,7 +55,7 @@ use smg_worker::identity::basic::Worker;
 use crate::{
     document::spec::{AppliedSpec, IndexKind},
     engine::{
-        decision::Decision,
+        decision::{Decision, PlacedBy, Target},
         view::{
             AffinityFacts, AffinityHolder, AffinityRows, HashKind, Phase, RequestFacts, WorkerId,
         },
@@ -1102,6 +1102,20 @@ pub fn column(
     read
 }
 
+/// The worker a decision sent its request to by the profile's stages: the
+/// pick's first target, and none for a pick the binding's sessions rule
+/// placed alone ([`PlacedBy::Rule`]: a pin of the key followed, or the
+/// rule's own assignment). The one test in front of every write that keeps
+/// where a prompt went: a gateway's sticky map hands a request it places to
+/// no policy, so the policy's record never sees that request's prompt.
+fn sent_by_stages(decision: &Decision) -> Option<&Target> {
+    let pick = decision.pick()?;
+    match pick.placed_by() {
+        PlacedBy::Stages => pick.targets.first(),
+        PlacedBy::Rule => None,
+    }
+}
+
 /// Behind a pick made over a column ([`column()`]): records the request's
 /// prefix as sent to the picked worker `id`, where the record of sent
 /// prefixes speaks for that worker. The record says where a prefix was
@@ -1199,10 +1213,9 @@ impl Table {
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
-        let target = decision.pick().and_then(|pick| pick.targets.first());
         // The index speaks for a worker whose cache events are heard: the
         // record takes no entry for it.
-        let Some(target) = target.filter(|target| !self.heard(target.position)) else {
+        let Some(target) = sent_by_stages(&decision).filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = buffers.deepest.contains(&target.id);
@@ -1231,8 +1244,7 @@ impl Table {
         let (Some(read), Some(record)) = (read, self.record.as_deref()) else {
             return decision;
         };
-        let target = decision.pick().and_then(|pick| pick.targets.first());
-        let Some(target) = target.filter(|target| !self.heard(target.position)) else {
+        let Some(target) = sent_by_stages(&decision).filter(|to| !self.heard(to.position)) else {
             return decision;
         };
         let held = read.deepest.contains(&target.position);

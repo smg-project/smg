@@ -11,7 +11,7 @@ use smg_worker::test_support::ready_worker;
 
 use super::*;
 use crate::{
-    document::spec::{PolicySpec, ScoreStage, WarmupSliceParams},
+    document::spec::{PolicySpec, ScoreStage, ShadowSpec, WarmupSliceParams},
     engine::{
         decision::{Pick, Shed, ShedReason, Target, Targets, Trace},
         framework::Scratch,
@@ -362,6 +362,95 @@ fn the_record_names_the_worker_a_prefix_was_sent_to() {
     bed.decide(&request(&longer, 7, NOW), Some(1));
     assert_eq!(bed.holders(&longer, NOW), [(1, 0, 6)]);
     assert_eq!(bed.affinity.left_out(), 0);
+}
+
+/// A pick the binding's sessions rule placed alone leaves no prefix in the
+/// record, at either of its writes: the one behind a decision named its
+/// rows, and the one behind a decision handed the column whole. The same
+/// pick by the profile's stages is recorded at both. A profile that is
+/// named no row keeps no record of its own: its list keeps one for a shadow
+/// that is named rows, and the column shows what that record holds. A
+/// gateway's sticky map hands a request it places to no policy, so the
+/// policy's record never takes it
+/// (`model_gateway/src/policies/registry.rs:543-546`, `:589-590`).
+#[test]
+fn a_pick_the_sessions_rule_placed_is_recorded_at_neither_write() {
+    for whole in [false, true] {
+        let spec = if whole {
+            // The shadow is the preset's profile, named rows. The live
+            // profile's two warm-up stages rule by different windows: it is
+            // named no row and reads the column whole.
+            let mut document = PolicySpec::preset("cache_aware").expect("the preset");
+            document.generation = 1;
+            let twin = document.profiles["cache_aware"].clone();
+            document.profiles.insert("twin".into(), twin);
+            document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+            let profile = document
+                .profiles
+                .get_mut("cache_aware")
+                .expect("the preset's profile");
+            profile.score.push(
+                ScoreStage::WarmupSlice(WarmupSliceParams {
+                    weight: 1.0,
+                    secs: Some(7),
+                    ..WarmupSliceParams::default()
+                })
+                .into(),
+            );
+            AppliedSpec::validate(&document).expect("the document validates")
+        } else {
+            preset("cache_aware")
+        };
+        let cap = spec.engine().affinity_rows_cap(MODEL, Phase::Single);
+        assert_eq!(cap == 0, whole, "the form of the write");
+        let record = spec.engine().pool_record_for(MODEL, Phase::Single);
+        assert!(record.is_some(), "whole: {whole}: the list keeps a record");
+        let (affinity, _, _) = hosted(false);
+        let bed = Bed::new(affinity, spec, 4);
+        let asked = prompt(1_000, 4);
+        // One decision of the prompt by `answer`, and the blocks the record
+        // held for each worker when it was asked.
+        let decided = |answer: &dyn Fn() -> Decision| {
+            let mut held = vec![0; bed.ids.len()];
+            decide(
+                &bed.affinity,
+                &bed.pool,
+                &bed.spec,
+                &bed.workers,
+                &bed.ids,
+                &mut request(&asked, 7, NOW),
+                |facts| {
+                    assert_eq!(facts.named.is_none(), whole);
+                    match facts.named {
+                        Some(rows) => {
+                            for holder in rows.holders {
+                                held[holder.row as usize] = holder.predicted_blocks;
+                            }
+                        }
+                        None => {
+                            for (row, worker) in facts.affinity.iter().enumerate() {
+                                held[row] = worker.predicted_blocks;
+                            }
+                        }
+                    }
+                    answer()
+                },
+            );
+            held
+        };
+        let by_stages = || picked(1, bed.ids[1]);
+        let by_rule = || {
+            let mut decision = by_stages();
+            if let Decision::Pick(pick) = &mut decision {
+                pick.targets.by_rule();
+            }
+            decision
+        };
+        assert_eq!(decided(&by_rule), [0; 4], "whole: {whole}");
+        assert_eq!(decided(&by_rule), [0; 4], "whole: {whole}: the rule's pick");
+        assert_eq!(decided(&by_stages), [0; 4], "whole: {whole}");
+        assert_eq!(decided(&shed), [0, 4, 0, 0], "whole: {whole}: the stages'");
+    }
 }
 
 /// A pick that meets a held record waits for nobody: it writes nothing, the

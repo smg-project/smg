@@ -335,9 +335,11 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{AppliedSpec, Assignment, PolicySpec},
+        document::spec::{
+            AppliedSpec, Assignment, PolicySpec, ScoreStage, ShadowSpec, WarmupSliceParams,
+        },
         engine::{
-            decision::{LiftedVeto, Target, Targets, MAX_TARGETS},
+            decision::{LiftedVeto, PlacedBy, Target, Targets, MAX_TARGETS},
             decision_engine::{
                 Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
             },
@@ -1364,6 +1366,168 @@ pub(crate) mod tests {
             let asks = Asks::of(side, None);
             let refused = engine.decide_without_lease(&asks, Instant::now());
             assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
+        }
+    }
+
+    /// A request its sessions rule places alone says so on its pick and
+    /// leaves no prompt in the record, in three forms. A pin followed by its
+    /// one worker's record. A pin the whole pass follows, under a binding
+    /// with a shadow. And a key's first request under a rule whose own
+    /// assignment places it, where no stage of the profile is asked. A
+    /// gateway's sticky map hands none of the three to its policy, so the
+    /// policy's record never sees the prompt
+    /// (`model_gateway/src/policies/registry.rs:540-546` for a pin under
+    /// its cap, `:589-590` for the map's own assignment). A request of that
+    /// prompt that carries no key is then placed by the policy, and not
+    /// held to the session's worker. The first form's pin is followed ahead
+    /// of every write of the record, so that form holds the word alone: the
+    /// two others hold the record, and run again under a profile that reads
+    /// the column whole, where the record's other write stands. No recorded
+    /// sheet runs this.
+    #[test]
+    fn a_request_its_sessions_rule_places_alone_records_no_prompt() {
+        for (form, shadowed, assignment, whole) in [
+            ("a pin by one record", false, Assignment::Delegate, false),
+            ("a shadow", true, Assignment::Delegate, false),
+            ("the rule's assignment", false, Assignment::Random, false),
+            ("a shadow, the column", true, Assignment::Delegate, true),
+            ("the rule's, the column", true, Assignment::Random, true),
+        ] {
+            let engine = {
+                let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+                let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
+                document.profiles = default.profiles;
+                let binding = &mut document.bindings[0];
+                binding.profile = Some("cache_aware".into());
+                let rule = binding.sessions.as_mut().expect("the stock rule");
+                rule.assignment = assignment;
+                if shadowed {
+                    let twin = document.profiles["cache_aware"].clone();
+                    document.profiles.insert("twin".into(), twin);
+                    document.bindings[0].shadow = Some(ShadowSpec::Profile("twin".into()));
+                }
+                if whole {
+                    // A second warm-up stage that rules by another window:
+                    // the live profile is named no row and reads the column
+                    // whole, and its list keeps the record for the shadow.
+                    let profile = document.profiles.get_mut("cache_aware");
+                    profile.expect("the preset's profile").score.push(
+                        ScoreStage::WarmupSlice(WarmupSliceParams {
+                            weight: 1.0,
+                            secs: Some(7),
+                            ..WarmupSliceParams::default()
+                        })
+                        .into(),
+                    );
+                }
+                document.generation = 1;
+                let applied = AppliedSpec::validate(&document).expect("the document validates");
+                let cap = applied.engine().affinity_rows_cap(MODEL, Phase::Single);
+                assert_eq!(cap == 0, whole, "{form}: the form of the record's write");
+                let record = applied.engine().pool_record_for(MODEL, Phase::Single);
+                assert!(record.is_some(), "{form}: the list keeps a record");
+                PolicyEngine::new(applied)
+            };
+            let list = pool(8);
+            let members = engine.pool_members(&list);
+            let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+            // One request sent to its first target and served there: the
+            // place it went to, and who placed it.
+            let sent = |tokens: &[u32], key: u64, seed: u64| {
+                let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+                let mut asked = request();
+                asked.facts.seed = seed;
+                asked.facts.session_key = Identity::hashed(key);
+                hashes.write_to(&mut asked.facts);
+                let asks = Asks::of(asked, Some(&members));
+                let now = Instant::now();
+                let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                    .expect("a decision");
+                let pick = *guard.decision().pick().expect("a pick");
+                let target = guard.take(0).expect("the first target");
+                guard.dispatched(now);
+                guard.completed(
+                    &Outcome {
+                        side: Side::Single,
+                        served: target.id,
+                        status: 200,
+                        class: TransportClass::Ok,
+                        ttft_micros: 0,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        duration_micros: 0,
+                    },
+                    now,
+                );
+                (target.position, pick.placed_by(), pick.trace.drew_first())
+            };
+            let mut held = 0;
+            for key in 1..=6_u32 {
+                let seed = u64::from(key);
+                // The key's first request, then one of a prompt nobody was
+                // sent: the rule alone places the one this form is about.
+                let (first, by, _) = sent(&prompt(key * 100_000), seed, seed);
+                let fresh = prompt(key * 100_000 + 50_000);
+                let asked = if assignment == Assignment::Delegate {
+                    assert_eq!(by, PlacedBy::Stages, "{form}: the stages place a new key");
+                    let (went, by, unpassed) = sent(&fresh, seed, 1);
+                    assert_eq!((went, by), (first, PlacedBy::Rule), "{form}: key {key}");
+                    // The whole pass follows the pin under a shadow alone.
+                    assert_eq!(unpassed, !shadowed, "{form}: key {key}");
+                    fresh
+                } else {
+                    assert_eq!(by, PlacedBy::Rule, "{form}: key {key}");
+                    prompt(key * 100_000)
+                };
+                // The same prompt with no key: the policy places it.
+                let (went, by, _) = sent(&asked, 0, seed + 40);
+                assert_eq!(by, PlacedBy::Stages, "{form}: no key");
+                held += u32::from(went == first);
+            }
+            assert!(
+                held < 6,
+                "{form}: each of six prompts went back to its session's worker"
+            );
+        }
+    }
+
+    /// A request with no key is never its sessions rule's, also where the
+    /// profile's picker leaves the placement to the binding: the binding's
+    /// placing assignment places such a request, under a rule and under
+    /// none, and its pick keeps the stages' word. The rule's word is for
+    /// its key alone, which the same assignment places.
+    #[test]
+    fn a_request_with_no_key_is_never_its_sessions_rules() {
+        for ruled in [true, false] {
+            let engine = {
+                let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+                if !ruled {
+                    document.bindings[0].sessions = None;
+                }
+                document.generation = 1;
+                let applied = AppliedSpec::validate(&document).expect("the document validates");
+                PolicyEngine::new(applied)
+            };
+            let list = pool(8);
+            let members = engine.pool_members(&list);
+            let placed_by = |key: u64| {
+                let mut asked = request();
+                asked.facts.seed = 7;
+                asked.facts.session_key = Identity::hashed(key);
+                let asks = Asks::of(asked, Some(&members));
+                let now = Instant::now();
+                let guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                    .expect("a decision");
+                guard.decision().pick().expect("a pick").placed_by()
+            };
+            assert_eq!(placed_by(0), PlacedBy::Stages, "no key, ruled: {ruled}");
+            // A key is the rule's where a rule stands, and no one's else.
+            let keyed = if ruled {
+                PlacedBy::Rule
+            } else {
+                PlacedBy::Stages
+            };
+            assert_eq!(placed_by(9), keyed, "a key, ruled: {ruled}");
         }
     }
 

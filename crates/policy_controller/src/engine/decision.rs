@@ -52,17 +52,22 @@ pub struct Pair {
 pub struct Targets {
     items: [Target; MAX_TARGETS],
     len: u8,
+    /// Who placed the pick ([`Pick::placed_by`]), in the byte the count
+    /// and the overlap left spare between them.
+    placed_by: PlacedBy,
     /// What the profile's prefix stage says of the first target
     /// ([`Pick::overlap`]), in the bytes the count left spare.
     overlap: Overlap,
 }
 
-/// Two lists are equal where their targets and what they state of the first
-/// are. The entries past a count are no part of a list:
+/// Two lists are equal where their targets, what they state of the first
+/// and who placed them are. The entries past a count are no part of a list:
 /// [`Targets::clear`] leaves them as they stood.
 impl PartialEq for Targets {
     fn eq(&self, other: &Self) -> bool {
-        self.overlap == other.overlap && self.as_slice() == other.as_slice()
+        self.placed_by == other.placed_by
+            && self.overlap == other.overlap
+            && self.as_slice() == other.as_slice()
     }
 }
 
@@ -74,6 +79,7 @@ impl fmt::Debug for Targets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Targets")
             .field("items", &self.as_slice())
+            .field("placed_by", &self.placed_by)
             .field("overlap", &self.overlap)
             .finish()
     }
@@ -89,6 +95,7 @@ impl Targets {
                 pair: None,
             }; MAX_TARGETS],
             len: 0,
+            placed_by: PlacedBy::Stages,
             overlap: Overlap::NONE,
         }
     }
@@ -97,6 +104,14 @@ impl Targets {
     /// ([`Self::lead`]) says nothing of its new first target.
     pub(crate) fn state(&mut self, overlap: Overlap) {
         self.overlap = overlap;
+    }
+
+    /// States that the binding's sessions rule placed the pick, with no
+    /// stage of the profile asked ([`PlacedBy::Rule`]). The word is the
+    /// decision's: a list led anew, emptied or turned into a pair's keeps
+    /// it.
+    pub(crate) fn by_rule(&mut self) {
+        self.placed_by = PlacedBy::Rule;
     }
 
     /// Append a target; a list already full keeps what it has.
@@ -142,6 +157,7 @@ impl Targets {
     /// list is full.
     pub fn lead(&mut self, target: Target) {
         let mut led = Self::new();
+        led.placed_by = self.placed_by;
         led.push(target);
         for t in self.as_slice() {
             if *t != target {
@@ -424,6 +440,35 @@ impl Overlap {
     };
 }
 
+/// Who placed a pick's first target. It answers one question: did the
+/// binding's sessions rule place it alone? The rule does, with no stage of
+/// the profile asked, where it follows a pin of the request's key, and
+/// where its own assignment places the key.
+///
+/// It has two readers, both in a host that keeps what a profile's stages did
+/// with a request: the write of the record of sent prompts, and the store of
+/// a prompt in a lent token tree. Neither keeps anything behind a pick the
+/// rule placed, as a gateway's sticky map keeps a request it places from the
+/// gateway's policy.
+///
+/// The word does not cross the crate's frame: no wire message carries it,
+/// since the record is written where the decision is made.
+///
+/// One byte, in the one a pick's targets had spare between their count and
+/// what is stated of the first: a pick is no larger for it
+/// ([`Pick::placed_by`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlacedBy {
+    /// The profile's stages. Every pick no sessions rule placed reads this:
+    /// a request with no key is never the rule's, whoever placed it.
+    #[default]
+    Stages,
+    /// The binding's sessions rule alone: a pin of the key followed, or the
+    /// rule's own assignment.
+    Rule,
+}
+
 /// A pick: ordered targets, the trace, and what a sessions rule did with
 /// the request's key (`None` without one). The host copies that verdict
 /// onto the lease it commits, and fills the lease's session from the
@@ -441,6 +486,12 @@ impl Pick {
     /// ([`Overlap`]); nothing where no stage said.
     pub const fn overlap(&self) -> Overlap {
         self.targets.overlap
+    }
+
+    /// Who placed the pick ([`PlacedBy`]): the profile's stages, unless the
+    /// binding's sessions rule placed it alone.
+    pub const fn placed_by(&self) -> PlacedBy {
+        self.targets.placed_by
     }
 }
 
@@ -755,6 +806,37 @@ mod tests {
         pick.targets.state(held);
         pick.targets.clear();
         assert_eq!(pick.overlap(), Overlap::NONE);
+    }
+
+    /// The word of who placed a pick costs the pick no byte: it sits in the
+    /// one a list's count and overlap left spare between them. A pick no
+    /// rule placed reads the stages. The word is the decision's: a list led
+    /// anew, turned into a pair's or emptied keeps it.
+    #[test]
+    fn the_word_of_who_placed_a_pick_costs_the_pick_no_byte() {
+        assert_eq!(size_of::<PlacedBy>(), 1);
+        assert_eq!(size_of::<Targets>(), MAX_TARGETS * size_of::<Target>() + 8);
+        assert_eq!(size_of::<Pick>(), 256);
+        assert_eq!(Pick::default().placed_by(), PlacedBy::Stages);
+        let target = |position: u32| Target {
+            position,
+            id: WorkerId(u64::from(position) + 1),
+            dp_rank: 0,
+            pair: None,
+        };
+        let mut pick = Pick::default();
+        pick.targets.push(target(0));
+        pick.targets.push(target(1));
+        let by_stages = pick;
+        pick.targets.by_rule();
+        assert_eq!(pick.placed_by(), PlacedBy::Rule);
+        assert_ne!(pick, by_stages);
+        pick.targets.lead(target(1));
+        assert_eq!(pick.placed_by(), PlacedBy::Rule);
+        pick.targets.pair_under(&target(2));
+        assert_eq!(pick.placed_by(), PlacedBy::Rule);
+        pick.targets.clear();
+        assert_eq!(pick.placed_by(), PlacedBy::Rule);
     }
 
     /// The decode side's verdict costs a pair no byte: it sits in one the
