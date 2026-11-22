@@ -719,7 +719,7 @@ fn concat_byte_slices(slices: &[&[u8]], len: usize) -> AnyhowResult<Vec<u8>> {
         return Ok(bytes);
     }
 
-    let mut bytes = buffer_pool::take(len);
+    let mut bytes = buffer_pool::try_take(len).context("cannot reserve the joined wire")?;
     let mut remaining = bytes.as_mut_slice();
     execution::scope(|spawner| {
         for group in slices.chunks(slices.len().div_ceil(tasks)) {
@@ -2340,7 +2340,10 @@ mod buffer_pool_tests {
         static MINE: BufferPool = BufferPool::new();
         buffer_pool::with_pool(&MINE, || {
             // Two parts of 153,600 bytes, under the size a join is split at:
-            // their 307,200 bytes are the 512 KiB class.
+            // their 307,200 bytes are the 512 KiB class, which holds a buffer.
+            let idle = buffer_pool::take(307_200);
+            let address = idle.as_ptr();
+            buffer_pool::recycle(idle);
             let part = |fill: u8| {
                 EncoderInput::wire(
                     vec![fill; 153_600],
@@ -2354,7 +2357,7 @@ mod buffer_pool_tests {
                 .expect("joined")
                 .into_bytes_as(EncoderDtype::BFloat16)
                 .expect("written");
-            assert_eq!((joined.len(), joined.capacity()), (307_200, 512 << 10));
+            assert_eq!((joined.as_ptr(), joined.len()), (address, 307_200));
             assert!(joined[..153_600].iter().all(|&byte| byte == 1));
             assert!(joined[153_600..].iter().all(|&byte| byte == 2));
         });

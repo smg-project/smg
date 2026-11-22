@@ -980,13 +980,11 @@ async fn a_pooled_buffer_is_cached_at_its_exact_length() {
     let prefix = MediaBatch::Images(images[..4].to_vec());
     preprocess_modality(&prefix, &ctx).await.unwrap();
     let grown = preprocess_modality(&batch, &ctx).await.unwrap();
-    assert_eq!(
-        grown
-            .encoder_input
-            .shared_allocation()
-            .map(|(_, capacity)| capacity),
-        Some(len)
-    );
+    let stored = grown.encoder_input.shared_allocation();
+    assert_eq!(stored.map(|(_, capacity)| capacity), Some(len));
+    // The cache kept it: the replay views the joined allocation, without a gather.
+    let replay = preprocess_modality(&batch, &ctx).await.unwrap();
+    assert_eq!(replay.encoder_input.shared_allocation(), stored);
 }
 
 /// Keep newly computed images when an overlapping request cannot replace its old backing.
