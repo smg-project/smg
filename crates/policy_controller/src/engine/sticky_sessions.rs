@@ -30,13 +30,35 @@ pub struct SessionRule {
     /// Requests of one key a worker carries before the next is placed
     /// elsewhere; `0` for no cap.
     pub inflight_cap: u16,
-    /// Idle time after which a key's pins are forgotten; `None` for never.
+    /// Idle time after which a key's pins are forgotten, at the rule's next
+    /// sweep; `None` for never.
     pub ttl_micros: Option<u64>,
-    /// How often idle keys are swept, on the decision clock; `0` for never
-    /// (a rule without a TTL). The table sweeps at the shortest interval
-    /// among its rules ([`SessionTable::new`]).
+    /// How often idle keys are swept, on the decision clock: a key is
+    /// forgotten at the first multiple of this interval at or after the end
+    /// of its idle time. `0` for never (a rule without a TTL; under a TTL
+    /// the key ends with its idle time). The table walks its shards at the
+    /// shortest interval among its rules ([`SessionTable::new`]).
     pub sweep_micros: u64,
     pub recovery: Recovery,
+}
+
+impl SessionRule {
+    /// The first sweep at or after `idle_ends`, the end of a key's idle time,
+    /// under the interval `sweep_micros`: the instant the key is forgotten.
+    /// Sweeps fall on its multiples on the decision clock, whichever pass
+    /// walks the table. No interval ends the key with its idle time, and so
+    /// does a sweep at the clock's last instant or past it: that instant reads
+    /// as no end ([`SessionExpiry::Never`]). Out of line: under an interval a
+    /// key comes here once a sweep at most, under none at every read.
+    #[cold]
+    #[inline(never)]
+    fn sweep_at_or_after(sweep_micros: u64, idle_ends: u64) -> u64 {
+        // No multiple of an interval of zero, and none past the clock.
+        match idle_ends.checked_next_multiple_of(sweep_micros) {
+            Some(sweep) if sweep != u64::MAX => sweep,
+            _ => idle_ends,
+        }
+    }
 }
 
 /// What a decision under a sessions rule did with its key. It travels on the
@@ -110,8 +132,7 @@ pub enum SessionExpiry {
     Never,
     /// No decision has read the key since its entry was made: a dispatch
     /// made the entry anew, behind the end of an absence, a forget or the
-    /// end of the key's TTL, and the next decision's read starts the key
-    /// over.
+    /// key's own end, and the next decision's read starts the key over.
     Unread,
 }
 
@@ -160,8 +181,9 @@ impl Claim {
 #[derive(Clone, Copy, Debug, Default)]
 struct Entry {
     pins: SessionPins,
-    /// The instant the key's pins expire on the decision clock; `u64::MAX`
-    /// under a rule without a TTL, and `0` until a decision reads the key.
+    /// The instant the key's pins expire on the decision clock: its rule's
+    /// first sweep at or after the end of its idle time. `u64::MAX` under a
+    /// rule without a TTL, and `0` until a decision reads the key.
     expires_at_micros: u64,
     /// The newest decision instant that set the expiry and recovery rule.
     touched_at_micros: u64,
@@ -184,9 +206,23 @@ impl Entry {
         if now_micros < self.touched_at_micros {
             return;
         }
-        self.expires_at_micros = rule
-            .ttl_micros
-            .map_or(u64::MAX, |ttl| now_micros.saturating_add(ttl));
+        match rule.ttl_micros {
+            Some(ttl) => {
+                let idle_ends = now_micros.saturating_add(ttl);
+                // A key is forgotten at its rule's first sweep at or after the
+                // end of its idle time. In an engine a key meets one rule and
+                // one interval while its table lives. So an end less than one
+                // interval above this one is that sweep still: it is kept, and
+                // no division runs. An end another rule wrote stays inside
+                // that interval alone: past it this rule's sweep replaces it.
+                let ahead = self.expires_at_micros.checked_sub(idle_ends);
+                if ahead.is_none_or(|ahead| ahead >= rule.sweep_micros) {
+                    self.expires_at_micros =
+                        SessionRule::sweep_at_or_after(rule.sweep_micros, idle_ends);
+                }
+            }
+            None => self.expires_at_micros = u64::MAX,
+        }
         self.touched_at_micros = now_micros;
         self.recovery = rule.recovery;
     }
@@ -274,7 +310,7 @@ pub(crate) const RENAMED_WORKERS: usize = 4_096;
 ///
 /// A decision of a key takes one lock, the mutex of its key's shard. The
 /// read of the pins is a write: it renews the key's idle time, and starts a
-/// key over whose time has passed, so a shard is behind a mutex and not a
+/// key over that is past its end, so a shard is behind a mutex and not a
 /// lock readers share. The claim of a key no pin takes is under the same
 /// mutex, and so is a dispatch. Two decisions meet on a mutex only where
 /// their keys fall in one shard.
@@ -346,8 +382,8 @@ impl SessionTable {
 
     /// The table with `micros` as the time a worker that left keeps its
     /// pins: the longest TTL among the rules that look
-    /// keys up in it, so a key loses no pin to an absence before its own
-    /// rule would forget it.
+    /// keys up in it, so a key loses no pin to an absence before its idle
+    /// time ends.
     #[must_use]
     pub fn with_absence(mut self, micros: u64) -> Self {
         self.absence_micros = micros;
@@ -393,7 +429,7 @@ impl SessionTable {
     /// renewed, its recovery rule recorded) and the table swept when a sweep
     /// is due, where no pass of the table's host sweeps it
     /// ([`Self::sweep_due`]): under such a host a read walks no shard but
-    /// its key's. A key never seen, or one whose TTL passed, has empty pins:
+    /// its key's. A key never seen, or one past its end, has empty pins:
     /// expiry is the key's own compare, the sweep only reclaims.
     /// Always inlined: the keyed decision has two forms, and a second caller
     /// would otherwise move this out of line under the first.
@@ -451,7 +487,9 @@ impl SessionTable {
     /// becomes the key's preferred pin where the key still has none, under
     /// the entry's lock, and the pins that stand are returned. It is a pin
     /// a dispatch made, never a claim: no commit withdraws it. A key that
-    /// took a pin since the decision read it keeps that pin.
+    /// took a pin since the decision read it keeps that pin. The key is
+    /// touched under no sweep interval: only a decision lent pins of record
+    /// writes one back, and such a decision reads the table under none.
     pub(crate) fn restore(
         &self,
         key: Session,
@@ -470,7 +508,11 @@ impl SessionTable {
             // The entry may be new here: between this decision's read and
             // this write another decision pinned the key, and the end of
             // that worker's absence, or a forget, took its last pin.
-            entry.touch(now_micros, rule);
+            let lent = SessionRule {
+                sweep_micros: 0,
+                ..*rule
+            };
+            entry.touch(now_micros, &lent);
         }
         entry.pins
     }
@@ -725,7 +767,7 @@ impl SessionTable {
         self.sweep_if_due(now_micros);
     }
 
-    /// Whether a sweep is due: of the keys whose TTL passed, once per the
+    /// Whether a sweep is due: of the keys past their end, once per the
     /// table's sweep interval, or of a worker that left. A table that owes
     /// neither never walks its shards. Always inlined with its callers
     /// ([`Self::lookup`], [`Self::sweep_due`]): the check is one compare on
@@ -741,7 +783,7 @@ impl SessionTable {
 
     /// The sweep that is due at `due`, out of line. A leave not yet stamped
     /// takes its end, the absence's time from this decision. A worker whose
-    /// absence ended is forgotten, and every key whose TTL passed where the
+    /// absence ended is forgotten, and every key past its end where the
     /// pass over the idle keys is due: one walk of the table for both, and
     /// none where neither is owed. The pass keeps its own instant, so a
     /// sweep a leave asked for walks no shard for the keys ahead of it.
@@ -801,8 +843,8 @@ impl SessionTable {
     }
 
     /// The pins of `key` as a decision at `now_micros` finds them, with
-    /// nothing written: a key the table never read, or one whose TTL
-    /// passed, has none, as at [`Self::lookup`]. The key's idle time is not
+    /// nothing written: a key the table never read, or one past its end,
+    /// has none, as at [`Self::lookup`]. The key's idle time is not
     /// renewed and no sweep runs: a decision that goes on to follow one of
     /// these pins renews it by that read.
     pub(crate) fn pins_at(&self, key: Session, now_micros: u64) -> SessionPins {
@@ -961,10 +1003,15 @@ mod tests {
         assert_eq!(table.held(s(1)), None);
         table.lookup(s(1), 50, &RULE);
         table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+        // Idle until 1 050: the rule's next sweep is at 1 100.
         assert_eq!(
             table.held(s(1)),
-            Some(([WorkerId(1), WorkerId(0)], SessionExpiry::At(1_050)))
+            Some(([WorkerId(1), WorkerId(0)], SessionExpiry::At(1_100)))
         );
+        // A read past the idle time and ahead of that sweep renews the key.
+        assert_eq!(table.lookup(s(1), 1_060, &RULE), [WorkerId(1), WorkerId(0)]);
+        let renewed = table.held(s(1)).map(|(_, ends)| ends);
+        assert_eq!(renewed, Some(SessionExpiry::At(2_100)));
         let for_ever = SessionRule {
             ttl_micros: None,
             sweep_micros: 0,
@@ -985,8 +1032,8 @@ mod tests {
 
     /// The read with nothing written gives a key's pins as a decision at
     /// that instant finds them: none for a key the table never read, the
-    /// pins until its idle time ends, and none from that instant. It makes
-    /// no key, renews nothing and forgets nothing.
+    /// pins until the key's end, and none from that instant. It makes no
+    /// key, renews nothing and forgets nothing.
     #[test]
     fn a_keys_pins_are_read_as_they_stand_with_nothing_written() {
         let table = SessionTable::new(RULE.sweep_micros);
@@ -995,8 +1042,8 @@ mod tests {
         table.lookup(s(1), 50, &RULE);
         table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(7));
         let held = table.held(s(1));
-        assert_eq!(table.pins_at(s(1), 1_049), [WorkerId(7), WorkerId(0)]);
-        assert_eq!(table.pins_at(s(1), 1_050), [WorkerId(0); 2], "its end");
+        assert_eq!(table.pins_at(s(1), 1_099), [WorkerId(7), WorkerId(0)]);
+        assert_eq!(table.pins_at(s(1), 1_100), [WorkerId(0); 2], "its end");
         assert_eq!(table.pins_at(s(1), u64::MAX), [WorkerId(0); 2]);
         assert_eq!(table.held(s(1)), held, "nothing renewed or forgotten");
         // Under a rule with no idle time the pins stand at every instant
@@ -1018,7 +1065,7 @@ mod tests {
         assert_eq!(table.pins_at(s(3), 50), [WorkerId(0); 2]);
     }
 
-    /// A key whose TTL passed is forgotten at its next lookup even when no
+    /// A key past its end is forgotten at its next lookup even when no
     /// sweep ran since: the compare is the key's own, the walk only reclaims.
     #[test]
     fn an_expired_key_is_forgotten_at_its_lookup_before_any_sweep() {
@@ -1027,6 +1074,108 @@ mod tests {
         rarely.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(rarely.lookup(s(1), 500, &RULE), [WorkerId(1), WorkerId(0)]);
         assert_eq!(rarely.lookup(s(1), 2_000, &RULE), [WorkerId(0); 2]);
+    }
+
+    /// The rounding writes no end a host would misread. A rule with an idle
+    /// time and no sweep interval ends a key with its idle time. A sweep at
+    /// the clock's last instant, which reads as no end, is not taken.
+    #[test]
+    fn a_keys_end_is_never_rounded_to_no_end() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        let ends = |key, now, sweep_micros| {
+            let rule = SessionRule {
+                ttl_micros: Some(60),
+                sweep_micros,
+                ..RULE
+            };
+            table.lookup(s(key), now, &rule);
+            table.held(s(key)).map(|(_, ends)| ends)
+        };
+        assert_eq!(ends(1, 10, 0), Some(SessionExpiry::At(70)));
+        // The clock's last instant is a multiple of five.
+        assert_eq!(
+            ends(2, u64::MAX - 63, 5),
+            Some(SessionExpiry::At(u64::MAX - 3))
+        );
+    }
+
+    /// One key read under two rules, as no engine reads one: a key meets one
+    /// rule while its table lives. An end another rule wrote stays where it
+    /// stands less than one interval above the new idle end, and one a whole
+    /// interval above is replaced by this rule's sweep.
+    #[test]
+    fn an_end_another_rule_wrote_stays_inside_one_interval_alone() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        let ends = |key, now, ttl, sweep_micros| {
+            let rule = SessionRule {
+                ttl_micros: Some(ttl),
+                sweep_micros,
+                ..RULE
+            };
+            table.lookup(s(key), now, &rule);
+            table.held(s(key)).map(|(_, ends)| ends)
+        };
+        // A sweep every 70 ends a read at 30 at 1 050. RULE's read at 40
+        // ends the idle time at 1 040, and 1 050 stands inside one interval
+        // of 100 above it: RULE alone gives 1 100.
+        assert_eq!(ends(1, 30, 1_000, 70), Some(SessionExpiry::At(1_050)));
+        assert_eq!(ends(1, 40, 1_000, 100), Some(SessionExpiry::At(1_050)));
+        // An end exactly one interval above the new idle end is replaced.
+        assert_eq!(ends(2, 0, 1_100, 0), Some(SessionExpiry::At(1_100)));
+        assert_eq!(ends(2, 0, 1_000, 100), Some(SessionExpiry::At(1_000)));
+    }
+
+    /// The table against a model of the gateway's sticky map, over seeded
+    /// histories of one key. The map ends an entry at an eviction tick
+    /// alone, one tick an interval, where the entry's last use is the idle
+    /// time old, and every use renews the entry with no compare
+    /// (`model_gateway/src/policies/manual.rs:168-179`, `:395`, `:234`).
+    /// Each request finds its key kept or started over as the map does,
+    /// under reads that sweep and under a host's own pass. A model, not a
+    /// recorded line: no recorded row moves time.
+    #[test]
+    fn a_keys_pins_end_as_an_entry_of_the_gateways_sticky_map_does() {
+        let mut seed = 7_u64;
+        let mut draw = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let (mut requests, mut differ) = (0_u32, 0_u32);
+        for history in 0..20_000 {
+            let idle = [1, 7, 30, 60, 61, 100, 240, 1_000][draw(8) as usize];
+            let interval = [1, 7, 60, 100, 3_600][draw(5) as usize];
+            let rule = SessionRule {
+                ttl_micros: Some(idle),
+                sweep_micros: interval,
+                ..RULE
+            };
+            let table = SessionTable::new(interval).with_shards(1);
+            // The map's one entry: the instant of its last use while it is
+            // kept, and the map's next tick.
+            let (mut used, mut tick) = (None, interval);
+            let mut now = 0;
+            for _ in 0..2 + draw(39) {
+                let long = 1 + draw(2 * idle + 2 * interval);
+                now += [0, 1, long, 1 + draw(idle + 1)][draw(4) as usize];
+                if history % 2 == 1 {
+                    table.sweep_due(now);
+                }
+                let kept = table.lookup(s(1), now, &rule) != [WorkerId(0); 2];
+                table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+                // A tick at a use's instant runs ahead of the use.
+                while tick <= now {
+                    if used.is_some_and(|used| tick - used >= idle) {
+                        used = None;
+                    }
+                    tick += interval;
+                }
+                differ += u32::from(kept != used.replace(now).is_some());
+                requests += 1;
+            }
+        }
+        assert_eq!((differ, requests), (0, 420_215), "answers that differ");
     }
 
     #[test]
@@ -1340,14 +1489,18 @@ mod tests {
     fn a_restored_pin_on_a_key_the_table_dropped_lives_by_the_rules_ttl() {
         // The key's entry left the table between the decision's read and
         // the write (the end of an absence took its last pin): the pin
-        // restored is the key's from that instant, for one TTL.
+        // restored is the key's from that instant. The write-back ends it
+        // with its idle time, and a read under the rule moves the end to
+        // the rule's sweep.
         let table = SessionTable::new(RULE.sweep_micros);
         assert_eq!(
             table.restore(s(9), 10, &RULE, WorkerId(3)),
             [WorkerId(3), WorkerId(0)]
         );
+        let end = table.held(s(9)).map(|(_, end)| end);
+        assert_eq!(end, Some(SessionExpiry::At(1_010)));
         assert_eq!(table.lookup(s(9), 11, &RULE), [WorkerId(3), WorkerId(0)]);
-        assert_eq!(table.lookup(s(9), 1_011, &RULE), [WorkerId(0); 2]);
+        assert_eq!(table.lookup(s(9), 1_100, &RULE), [WorkerId(0); 2]);
     }
 
     #[test]
@@ -1641,8 +1794,8 @@ mod tests {
     }
 
     /// A leave asks for a sweep, and that sweep walks no idle key ahead of
-    /// the pass over them: the pass keeps its own instant. The key whose
-    /// TTL passed stays until the pass is due, as with no leave.
+    /// the pass over them: the pass keeps its own instant. The key past its
+    /// end stays until the pass is due, as with no leave.
     #[test]
     fn a_leave_walks_no_idle_key_before_their_pass_is_due() {
         let rule = SessionRule {
@@ -1657,8 +1810,9 @@ mod tests {
             table.dispatched(s(key), SessionVerdict::Pinned, WorkerId(worker));
         }
         table.left(WorkerId(9));
-        // Key 1 is idle past its TTL at 300, and the leave's sweep runs.
-        table.lookup(s(2), 300, &rule);
+        // Key 1 is past its end, the sweep at 1,000, and the leave's sweep
+        // runs.
+        table.lookup(s(2), 1_005, &rule);
         assert_eq!(table.absent(), 1, "the leave is stamped");
         assert!(table.pins(s(1)).is_some(), "no pass before 1,010");
         table.lookup(s(2), 1_010, &rule);

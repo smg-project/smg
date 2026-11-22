@@ -3,7 +3,7 @@
 //! held to the whole decision of a twin engine over every worker's record.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -17,7 +17,7 @@ use crate::{
         policy_engine::{PolicyEngine, PoolMembers},
         records::{self, Live},
         sticky_sessions::SessionVerdict,
-        view::{Constraints, Identity, RequestFacts, WorkerId},
+        view::{Constraints, Identity, PinSource, RequestFacts, Session, WorkerId},
     },
     store::GatewayId,
     tracking::{
@@ -279,9 +279,78 @@ fn the_engines_pass_drops_the_session_keys_past_their_end() {
     drop(first);
     let sessions = engine.spec().engine().sessions();
     assert_eq!(sessions.len(), 1);
-    // The stock rule forgets a key four hours after its last request.
+    // The stock rule forgets a key at its first sweep, one a minute, four
+    // hours after its last request.
     engine.sweep(now + Duration::from_secs(14_000));
     assert_eq!(sessions.len(), 1, "inside the idle time");
     engine.sweep(now + Duration::from_secs(14_500));
     assert_eq!(sessions.len(), 0, "past its end");
+}
+
+/// A key used again after its idle time and ahead of its rule's next sweep
+/// follows its pin, and one used at that sweep is placed anew. The gateway's
+/// sticky map ends an idle entry at an eviction tick alone, and every use
+/// renews it (`model_gateway/src/policies/manual.rs:395`, `:234`).
+#[test]
+fn a_key_idle_past_its_time_keeps_its_worker_until_the_sweep() {
+    // Idle after a minute, swept every hour of the engine's clock.
+    let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+    document.generation = 1;
+    let rule = document.bindings[0].sessions.as_mut();
+    let rule = rule.expect("the stock rule");
+    (rule.ttl_s, rule.sweep_s) = (60, 3_600);
+    let engine = PolicyEngine::new(AppliedSpec::validate(&document).expect("it validates"));
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let (asks, now) = (keyed(61, &members), Instant::now());
+    // A request of the key, dispatched and served: what its rule did, and where.
+    let served_at = |secs: u64| {
+        let at = now + Duration::from_secs(secs);
+        let decided = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, at);
+        let mut decided = decided.expect("a decision");
+        let verdict = decided.decision().pick().expect("a pick").session_verdict;
+        let target = decided.take(0).expect("the first target");
+        decided.dispatched(at);
+        decided.completed(&served(target.id), at);
+        (verdict, target.id)
+    };
+    let (placed, worker) = served_at(0);
+    assert!(matches!(placed, SessionVerdict::Claimed(_)));
+    assert_eq!(served_at(61), (SessionVerdict::Pinned, worker));
+    assert!(matches!(served_at(3_600).0, SessionVerdict::Claimed(_)));
+}
+
+/// Pins of record: one worker for every key, and whether it was asked.
+#[derive(Debug)]
+struct Elsewhere(WorkerId, OnceLock<()>);
+
+impl PinSource for Elsewhere {
+    fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
+        let _ = self.1.set(());
+        Some(self.0)
+    }
+}
+
+/// This engine reads no pins of record: a request that lends a record naming
+/// another worker is decided as one that lends none, where the whole pass
+/// places its key and where its pin is followed. The record is never asked.
+#[test]
+fn a_request_that_lends_pins_of_record_is_decided_as_one_that_lends_none() {
+    let (engine, twin) = (preset("manual"), preset("manual"));
+    let list = pool(16);
+    let (members, others) = (engine.pool_members(&list), twin.pool_members(&list));
+    // The whole pass places the key, then the key's pin is followed.
+    let twice = |engine: &PolicyEngine, asks: &Asks<'_>| {
+        [(); 2].map(|()| targets(&decided(engine, asks).decision))
+    };
+    let plain = twice(&twin, &keyed(41, &others));
+    let mut ids = list
+        .iter()
+        .map(|worker| records::worker_id(worker.as_ref()));
+    let other = ids.find(|id| *id != plain[0][0].1).expect("another worker");
+    let record = Elsewhere(other, OnceLock::new());
+    let mut lent = keyed(41, &members);
+    lent.request.constraints.pins = Some(&record);
+    assert_eq!(twice(&engine, &lent), plain);
+    assert!(record.1.get().is_none(), "the record is not asked");
 }

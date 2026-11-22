@@ -2132,13 +2132,18 @@ pub struct SessionsSpec {
     /// `view.headers`. Left out under `routing_key` too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
-    /// How long an idle key stays pinned, in seconds; above zero (default
-    /// 14400), `4294967295` for ever.
+    /// How long an idle key stays pinned, in seconds, before the rule's
+    /// next sweep forgets it; above zero (default 14400), `4294967295` for
+    /// ever. A host that keeps a record of the pins, as the controller's
+    /// own service does, forgets the key at `ttl_s` itself.
     #[serde(default = "default_ttl_s")]
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
-    /// The sweep cadence of idle keys, in seconds; above zero (default 120),
-    /// `4294967295` for never, allowed under a `ttl_s` for ever alone.
+    /// The sweep cadence of idle keys, in seconds: a key idle for `ttl_s`
+    /// is forgotten at the next sweep, and one used again ahead of it stays
+    /// pinned. Above zero (default 120), `4294967295` for never, allowed
+    /// under a `ttl_s` for ever alone. Under a host that keeps a record of
+    /// the pins the sweep only reclaims.
     #[serde(default = "default_sweep_s")]
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
