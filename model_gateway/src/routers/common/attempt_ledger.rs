@@ -25,7 +25,7 @@
 //! window closes on that worker only, its partner stays selectable, and
 //! when no other worker of the side's kind is available the answer stands.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
@@ -103,12 +103,32 @@ pub(crate) fn is_definitive_failure(response: &Response) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct AttemptLedger {
     inner: Mutex<Ledger>,
+    /// Made at the request's first failure, or for its first holder.
+    charges: OnceLock<Charges>,
+}
+
+/// The workers (by URL) one request already charged a circuit-breaker
+/// failure. A task that outlives its attempt holds a clone, so the outcome it
+/// meets late is counted by the request's rule.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Charges(Arc<Mutex<Vec<String>>>);
+
+impl Charges {
+    /// [`AttemptLedger::record_outcome`], through the request's charges.
+    pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
+        if worker.is_breaker_failure(status_code) {
+            let mut charged = self.0.lock();
+            if charged.iter().any(|url| url == worker.url()) {
+                return;
+            }
+            charged.push(worker.url().to_string());
+        }
+        worker.record_outcome(status_code);
+    }
 }
 
 #[derive(Debug, Default)]
 struct Ledger {
-    /// Workers (by URL) already charged a circuit-breaker failure.
-    charged: Vec<String>,
     /// Engines (by base URL, so one DP rank's answer stands for its
     /// siblings) that answered the request definitively.
     answered: Vec<String>,
@@ -120,13 +140,16 @@ impl AttemptLedger {
     /// request fails on the worker.
     pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
         if worker.is_breaker_failure(status_code) {
-            let mut ledger = self.inner.lock();
-            if ledger.charged.iter().any(|url| url == worker.url()) {
-                return;
-            }
-            ledger.charged.push(worker.url().to_string());
+            self.charges().record_outcome(worker, status_code);
+        } else {
+            worker.record_outcome(status_code);
         }
-        worker.record_outcome(status_code);
+    }
+
+    /// The request's charges, for a task that outlives the attempt it
+    /// reports on.
+    pub(crate) fn charges(&self) -> &Charges {
+        self.charges.get_or_init(Charges::default)
     }
 
     /// Charge the worker whose stream failed under the attempt

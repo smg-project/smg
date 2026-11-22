@@ -38,6 +38,7 @@ use crate::{
         common::{
             attempt_ledger::{
                 is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+                Charges,
             },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
@@ -1852,7 +1853,7 @@ fn parallel_side_failed_first(
         {
             Retirement::PartnerSilent
         } else {
-            Retirement::PartnerFailed
+            Retirement::PartnerFailed(sides.ledger.charges().clone())
         };
         retire_pd_side(
             side.partner(),
@@ -2101,13 +2102,15 @@ pub(crate) fn pd_start_failure_response(
 /// Why a PD side still dispatching is retired off the request path (see
 /// [`retire_pd_side`]), and what its late result is worth to its worker's
 /// record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum Retirement {
     /// Its partner failed to start, and the request with it. The side's own
     /// late failure is still this request's one word on its worker: sampled
-    /// on the breaker and counted as a dispatch's is. A late stream is
-    /// aborted and earns no success: the side never produced anything.
-    PartnerFailed,
+    /// on the breaker through the request's charges, so the attempts of one
+    /// request charge the worker once, and counted as a dispatch's is. A late
+    /// stream is aborted and earns no success: the side never produced
+    /// anything.
+    PartnerFailed(Charges),
     /// Its partner, the prefill, fell silent: the request charged that
     /// prefill where its bound passed, and this side's late result is not its
     /// worker's fault (the handoff it waited for never came), so it is
@@ -2130,22 +2133,25 @@ pub(crate) enum Retirement {
 }
 
 impl Retirement {
-    fn cause(self) -> &'static str {
+    fn cause(&self) -> &'static str {
         match self {
-            Self::PartnerFailed => "its partner failed",
+            Self::PartnerFailed(_) => "its partner failed",
             Self::PartnerSilent => "its partner fell silent",
             Self::Silent => "its silence bound passed",
             Self::HandoffSilent => "its first-token bound passed during the handoff",
         }
     }
 
-    fn defer_abort(self) -> bool {
+    fn defer_abort(&self) -> bool {
         matches!(self, Self::PartnerSilent | Self::HandoffSilent)
     }
 
-    /// Whether the late result is this request's word on the worker.
-    fn charges(self) -> bool {
-        matches!(self, Self::PartnerFailed)
+    /// The request's charges, where the late result is its word on the worker.
+    fn charges(&self) -> Option<&Charges> {
+        match self {
+            Self::PartnerFailed(charges) => Some(charges),
+            Self::PartnerSilent | Self::Silent | Self::HandoffSilent => None,
+        }
     }
 }
 
@@ -2178,11 +2184,11 @@ pub(crate) fn retire_pd_side(
 ) {
     tokio::spawn(async move {
         let result = dispatch.await;
-        if let Some(status) = result
-            .breaker_status()
-            .filter(|_| retirement.charges() && result.is_err())
-        {
-            worker.record_outcome(status);
+        if let (Some(charges), Some(status)) = (
+            retirement.charges(),
+            result.breaker_status().filter(|_| result.is_err()),
+        ) {
+            charges.record_outcome(worker.as_ref(), status);
         }
         let cause = retirement.cause();
         match result {
@@ -2199,7 +2205,7 @@ pub(crate) fn retire_pd_side(
                     drop(stream);
                 }
             }
-            Err(error) if retirement.charges() => {
+            Err(error) if retirement.charges().is_some() => {
                 UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
                 error!(
                     function = "retire_pd_side",
@@ -2868,10 +2874,11 @@ pub(crate) mod tests {
             "a late failure after the prefill fell silent is not the decode worker's fault"
         );
         assert!(Retirement::PartnerSilent.defer_abort());
-        assert!(!Retirement::PartnerSilent.charges());
-        assert!(Retirement::PartnerFailed.charges());
-        assert!(!Retirement::PartnerFailed.defer_abort());
-        assert!(!Retirement::Silent.charges());
+        assert!(Retirement::PartnerSilent.charges().is_none());
+        let partner_failed = Retirement::PartnerFailed(Charges::default());
+        assert!(partner_failed.charges().is_some());
+        assert!(!partner_failed.defer_abort());
+        assert!(Retirement::Silent.charges().is_none());
     }
 
     /// A side retired because its partner failed to start samples only a late
@@ -2899,7 +2906,7 @@ pub(crate) mod tests {
             "grpc",
             Arc::clone(&decode),
             late,
-            Retirement::PartnerFailed,
+            Retirement::PartnerFailed(Charges::default()),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
@@ -2908,6 +2915,50 @@ pub(crate) mod tests {
             decode.circuit_breaker_state(),
             CircuitState::Open,
             "the late stream earned no success between the two failures"
+        );
+    }
+
+    /// Two attempts of one request each retire the decode side after the
+    /// prefill failed to start: the side's late failures are that request's
+    /// one word on its worker, so a breaker set to two stays closed and the
+    /// next request's failure opens it.
+    #[tokio::test]
+    async fn the_retired_sides_of_one_request_charge_one_breaker_failure() {
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30003")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let mut workers = tokenspeed_pair();
+        if let WorkerSelection::Disaggregated { decode: side, .. } = &mut workers {
+            *side = Arc::clone(&decode);
+        }
+        let ledger = AttemptLedger::default();
+        let sides = PdSides::of(&workers, &ledger, &tokenspeed_request(1, None), false);
+        let refused = tonic::Status::unavailable("prefill refused");
+        for _attempt in 0..2 {
+            let late = answers_after(Duration::ZERO);
+            drop(parallel_side_failed_first(
+                &sides,
+                PdSide::Prefill,
+                &refused,
+                late,
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "one request charged the retired decode worker once an attempt"
+        );
+        AttemptLedger::default().record_outcome(decode.as_ref(), 503);
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "the retired side's late failure was charged once: the next request's opens the breaker"
         );
     }
 
