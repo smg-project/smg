@@ -43,6 +43,8 @@ mod decision_slots;
 mod discovery;
 pub(crate) mod election;
 mod floor;
+#[cfg(feature = "in-process")]
+mod frame_request;
 mod gateways;
 mod generations;
 #[cfg(all(test, feature = "worker-host"))]
