@@ -88,16 +88,21 @@ pub enum HashKind {
 /// size in tokens is its bytes over this.
 pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
 
+/// The first `tokens` tokens of a request hashed in `kind`, in the unit its
+/// blocks are sized in: tokens, and under the text kind their bytes.
+pub(crate) fn units_within(tokens: u32, kind: HashKind) -> u32 {
+    match kind {
+        HashKind::Token => tokens,
+        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
+    }
+}
+
 /// How many whole blocks of `block_size` lie within the first `tokens`
 /// tokens of a request hashed in `kind`: the tokens over the block size,
 /// under the text kind their bytes over the window's size in bytes. A
 /// block size is one at least.
 pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
-    let units = match kind {
-        HashKind::Token => tokens,
-        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
-    };
-    units / block_size
+    units_within(tokens, kind) / block_size
 }
 
 /// Where a candidate's load row came from.
