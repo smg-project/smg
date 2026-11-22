@@ -680,7 +680,7 @@ struct PieceCache {
     /// sentencepiece path: a scratch string of the thread.
     mapped: String,
     /// When the thread's last long text started, and its bytes
-    /// (`Self::reads_back`).
+    /// (`Self::reads_back`); none when it ran with a processor to spare.
     last_long: Option<(Instant, usize)>,
 }
 
@@ -2886,6 +2886,12 @@ impl NativeEncoder {
         framed: bool,
         at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
+        // Counted from here to the return: a thread that normalizes or
+        // cuts a long text is inside it as well.
+        let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
+            let others = self.inside.fetch_add(1, Ordering::Relaxed);
+            (Inside(&self.inside), others)
+        });
         // The scanners' word scans, chosen once per call on the input's
         // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
         // them; a short input walks its runs byte by byte, the chain
@@ -2960,16 +2966,16 @@ impl NativeEncoder {
         // Only while more threads are inside a long text than the process
         // has processors, and the clock is read only then. Not for a unit
         // on the pool: it is no text of its thread.
-        let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
-            let others = self.inside.fetch_add(1, Ordering::Relaxed);
-            (Inside(&self.inside), others)
-        });
-        if inside
-            .as_ref()
-            .is_some_and(|(_, others)| *others >= self.processors)
-            && cache.reads_back(Instant::now(), text.len())
-        {
-            cache.packed.read_through();
+        match &inside {
+            Some((_, others)) if *others >= self.processors => {
+                if cache.reads_back(Instant::now(), text.len()) {
+                    cache.packed.read_through();
+                }
+            }
+            // A long text run with a processor to spare: the next gap is
+            // not measured across it.
+            Some(_) => cache.last_long = None,
+            None => {}
         }
         self.encode_serial(model, units, words, at_start, &mut ids, &mut cache)?;
         ids.extend_from_slice(after);

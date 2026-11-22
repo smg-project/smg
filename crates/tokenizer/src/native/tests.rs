@@ -4572,6 +4572,9 @@ fn a_thread_keeps_its_whole_share_where_no_miss_asks_the_learned_table() {
 /// A long text has the thread's table read back only when the one before
 /// it started longer ago than that one is given to encode, and within the
 /// band: not the first, not one that follows at once, not one after a rest.
+/// A long text is noted for the next one only while more threads are
+/// inside a long text than there are processors, and it leaves the count
+/// when it returns.
 #[test]
 fn a_long_text_reads_the_table_back_after_a_lost_processor() {
     let mut cache = PieceCache::with_share(1);
@@ -4585,6 +4588,19 @@ fn a_long_text_reads_the_table_back_after_a_lost_processor() {
     assert!(cache.reads_back(waited, bytes), "the thread waited");
     let rested = waited + READ_BACK_WITHIN;
     assert!(!cache.reads_back(rested, bytes), "the thread rested");
+
+    let (tokenizer, mut native) = waiting_fixture();
+    native.processors = 1;
+    let text = "xy ".repeat(READ_BACK_MIN_BYTES);
+    for (others, noted) in [(1, true), (0, false)] {
+        native.inside.store(others, Ordering::Relaxed);
+        native
+            .encode(Some(tokenizer.get_model()), &text, false)
+            .expect("ids");
+        let last_long = native.thread_piece_cache().borrow().last_long;
+        assert_eq!(last_long.is_some(), noted, "{others} more inside");
+        assert_eq!(native.inside.load(Ordering::Relaxed), others);
+    }
 }
 
 /// Threads that share at one time encode as a young thread does: sixteen
