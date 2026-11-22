@@ -46,8 +46,8 @@ use super::{
 };
 use crate::{
     document::AppliedSpec,
-    store::{pairing::Refusal, DecodeRefused, GatewayId, Said},
-    tracking::lease::{Lease, Side},
+    store::{pairing::Refusal, GatewayId},
+    tracking::lease::{Lease, Said, Side},
 };
 
 /// A request its host makes under the document a decision is made under.
@@ -536,4 +536,19 @@ pub enum DecisionRefused {
     /// The store takes no decode side under the lease a decode call
     /// named, for the reason it carries.
     Decode(DecodeRefused),
+}
+
+/// Why a call could not issue the decode side of a pair's lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeRefused {
+    /// No lease of the gateway under that id.
+    NoLease,
+    /// The lease was filed without a chosen decode side.
+    NotChosen,
+    /// The prefill side is waiting for dispatch or has ended.
+    PrefillNotHeld,
+    /// The chosen side was already issued or dispatched, even if it has
+    /// ended, or its host gave it up, or it took as many calls as one
+    /// lease takes.
+    DecodeStands,
 }

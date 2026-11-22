@@ -9,7 +9,7 @@
 //! calls the lifecycle once per side. Every stateful built-in keeps its state
 //! behind these events alone.
 
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use crate::{
     engine::{
@@ -133,6 +133,33 @@ pub enum ReleaseReason {
     Expired,
     /// An immediate deregistration released the worker's leases.
     WorkerRemoved,
+}
+
+/// The time a gateway has to name a lease's dispatch: the design's default.
+/// A lease still issued past it is released as abandoned.
+pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a gateway's `Dispatched` report says beside its lease.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dispatch {
+    /// Which target of the pick the gateway dispatched to.
+    pub target_index: u8,
+    pub side: Side,
+    /// Decision to dispatch on the gateway's clock, in microseconds.
+    pub since_decision_micros: u32,
+}
+
+/// What a host says of a lease
+/// ([`DecisionEngine::say`](crate::engine::DecisionEngine::say)): a side's
+/// dispatch, a side's end, or a release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// The dispatch the frame names, and the instant the frame was read.
+    Dispatched(Dispatch, Instant),
+    /// The outcome of the side that ended.
+    Completed(Outcome),
+    /// The side given up, where the frame names one, and the reason.
+    Released(Option<Side>, ReleaseReason),
 }
 
 /// A membership change the host reports. A host tells a join when it takes

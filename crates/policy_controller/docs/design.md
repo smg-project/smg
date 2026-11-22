@@ -732,10 +732,11 @@ Main has two engines behind one trait (`DecisionEngine`, `engine/decision_engine
 gets worker objects of its own (section 10), so its service calls the same engine a gateway
 calls. The switch is made whole, in one change, after the kept engine is proven (decision 5).
 
-The two engines still share types. `Request`, `DecideOutcome`, `DecisionRefused`, `SweepOutcome`
-and a few helpers are defined in the old engine's file, and `Said` (section 6) in the store. They
-move into the kept engine's own modules first, with no behaviour change. Without that move,
-deleting the old engine breaks the kept one.
+The two engines still share types. `Request`, `DecideOutcome`, `DecisionRefused`, `DecodeRefused`
+and `SweepOutcome` are defined in the trait's file, and `Said` (section 6) beside `Lease`. They
+were moved there with no behaviour change, because deleting the old engine would otherwise break
+the kept one. `GatewayId` and `pairing::Refusal`, the answer of `pair_refusal`, are still defined
+in the store.
 
 ### 5.8 What changes in the kept engine **[planned]**
 
@@ -770,7 +771,6 @@ pub struct Lease {
     pub tokens: u32,                     // the prompt size the request stated
 }
 
-// store/leases.rs today; it moves beside `Lease` before the old engine is deleted (5.7)
 pub enum Said {
     Dispatched(Dispatch, Instant),         // the request was sent to a target
     Completed(Outcome),                    // one side ended, with its outcome
@@ -1540,10 +1540,10 @@ behind the one before.
 | 13 | A request with no routing key under a sessions rule is decided by one pick | a case that counts the records read, failing before; the bench's cell; the `manual` and sticky lines unmoved |
 | 14 | A pair is decided with the host's load reports, as a single request is | a case that fails before; the bench's pair cell |
 
-One more change runs beside them: the types both engines share move out of the old engine's file
-into the kept engine's modules, with no behaviour change (section 5.7).
+One more change ran beside them: the types both engines share moved out of the old engine's file
+and the store's lease file into the kept engine's modules, with no behaviour change (section 5.7).
 
 Behind them, in the crate: `random` and `round_robin` details of the short path; pairs and encode
-requests over worker lists; the shadow's types moved to their own file. Waiting for a decision:
+requests over worker lists. Waiting for a decision:
 the hash ring (3), new recorders (2), the controller's parts (5, 10), shadow and explain on the
 kept engine (7), CI's run of the kept engine's tests and the published set (11).

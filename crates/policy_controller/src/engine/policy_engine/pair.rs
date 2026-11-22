@@ -58,8 +58,7 @@ use crate::{
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,
-    store::leases::DISPATCH_TTL,
-    tracking::lease::{Lease, LeaseId, LeaseKind, Side},
+    tracking::lease::{Lease, LeaseId, LeaseKind, Side, DISPATCH_TTL},
 };
 
 /// The filter that empties a pair's prefill list where every prefill the
@@ -429,9 +428,9 @@ mod tests {
             view::{Health, Identity, Role, WireModes},
         },
         stages::{Best, HasCapacity, StageRegistry},
-        store::{Dispatch, GatewayId, Said},
+        store::GatewayId,
         tracking::{
-            lease::{Outcome, ReleaseReason, TransportClass},
+            lease::{Dispatch, Outcome, ReleaseReason, Said, TransportClass},
             DecisionGuard,
         },
     };

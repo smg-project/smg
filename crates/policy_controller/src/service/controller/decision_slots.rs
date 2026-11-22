@@ -190,6 +190,7 @@ use super::{
 use crate::{
     engine::{
         decision::Decision,
+        decision_engine::DecodeRefused,
         decision_slot::DecisionSlot,
         framework::{release, Engine},
         store_backed_engine::{
@@ -205,10 +206,9 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{
-        leases::DISPATCH_TTL, AtWork, DecodeIssue, DecodeRefused, GatewayId, LeaseRefused,
-        LookOutcome, MemoryStore, StoreSnapshot,
+        AtWork, DecodeIssue, GatewayId, LeaseRefused, LookOutcome, MemoryStore, StoreSnapshot,
     },
-    tracking::lease::{Lease, LeaseId, ReleaseReason},
+    tracking::lease::{Lease, LeaseId, ReleaseReason, DISPATCH_TTL},
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -1343,11 +1343,11 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
-            leases::DISPATCH_TTL, DecodeIssue, Dispatch, GatewayId, HealthSink, LeaseState,
-            LeasesStore, MemoryStore, Said, StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
-            WorkerFacts, WorkerStatus, WorkersStore,
+            DecodeIssue, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
+            StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, ReleaseReason, Side},
+        tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
     };
 
     /// How long a case waits for a decider before it fails.
@@ -3514,8 +3514,8 @@ pub(crate) mod tests {
     ) -> crate::store::AtWork {
         use crate::{
             engine::decision_slot::DecisionSlot,
-            store::{Hand, LookOutcome, Said},
-            tracking::lease::ReleaseReason,
+            store::{Hand, LookOutcome},
+            tracking::lease::{ReleaseReason, Said},
         };
 
         let now = Instant::now();
