@@ -404,7 +404,7 @@ impl ByteLevelTable {
     /// step's piece, with the text slice's boundary checks, is not built for
     /// a pass that only sums lengths.
     #[inline]
-    fn token_bytes(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
+    pub(crate) fn token_bytes(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
         let (kind, span) = self.locate(id)?;
         let store = if kind.text() {
             self.text.as_bytes()

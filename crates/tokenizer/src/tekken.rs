@@ -40,6 +40,11 @@ pub(crate) const EOS: &str = "</s>";
 pub(crate) const UNK: &str = "<unk>";
 pub(crate) const PAD: &str = "<pad>";
 
+/// The split pattern of the real files. A test proves it against the own
+/// encoder, so a load with it skips that check (see `SHIPPED_PATTERNS` in
+/// `tiktoken.rs`).
+pub(crate) const PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// The special tokens of a file that lists none: the reference reader's
 /// list for the versions up to v7, which predate the `special_tokens` block.
 const DEPRECATED_SPECIAL_TOKENS: [&str; 20] = [
@@ -269,9 +274,6 @@ pub(crate) mod testing {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::{json, Value};
 
-    /// The split pattern of the real files.
-    pub(crate) const PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-
     pub(crate) const MERGES: [&str; 4] = ["he", "ll", "hell", "hello"];
 
     /// The file text: the 256 bytes and `merges` ranked in order, `specials`
@@ -297,7 +299,7 @@ pub(crate) mod testing {
             .collect();
         let mut file = json!({
             "config": {
-                "pattern": PATTERN,
+                "pattern": super::PATTERN,
                 "num_vocab_tokens": vocab.len(),
                 "default_vocab_size": vocab_size,
                 "default_num_special_tokens": num_special,

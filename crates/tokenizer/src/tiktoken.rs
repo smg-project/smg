@@ -2,8 +2,9 @@ use std::{
     borrow::Cow,
     cell::OnceCell,
     collections::{HashMap, HashSet},
+    mem,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 use anyhow::{Error, Result};
@@ -72,6 +73,15 @@ impl Renderer {
 /// This pattern is correct for OpenAI models and most open-source tiktoken models. Models
 /// with a tokenizer-specific regex specialize the pattern inside `load_from_path`.
 const CL100K_BASE_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The split patterns the crate ships. A test builds the file's own encoder
+/// from each, so a load that leaves that encoder unbuilt takes one of them
+/// as it is; any other pattern is compiled at such a load.
+const SHIPPED_PATTERNS: [&str; 3] = [
+    CL100K_BASE_PATTERN,
+    kimi_k2_tokenizer::KIMI_K2_PATTERN,
+    tekken::PATTERN,
+];
 
 type Rank = u32;
 
@@ -200,16 +210,79 @@ fn parse_special_tokens(config: &serde_json::Value) -> SpecialTokens {
     }
 }
 
+/// What `CoreBPE::new` takes: the ranks, the special tokens, the split pattern.
+type OwnEncoderParts = (FxHashMap<Vec<u8>, Rank>, FxHashMap<String, Rank>, String);
+
+/// The file's own encoder (the `tiktoken_rs` one). A load builds it where
+/// encodes or decodes run on it: a built-in encoding, a file the direct
+/// encoder declines, a vocabulary too sparse for the decode table. Behind
+/// the direct encoder and the decode table no call asks it (the direct
+/// encoder hands no piece back, the table answers every decode) and its
+/// build is a quarter of such a load: there it waits for a first need.
+struct OwnEncoder {
+    /// A build the library refuses answers every later call as well.
+    built: OnceLock<Result<CoreBPE, String>>,
+    /// The ranks, the special tokens and the split pattern a first need
+    /// builds the encoder from.
+    parts: Mutex<OwnEncoderParts>,
+    /// The special tokens' texts, as `CoreBPE::special_tokens` gives them.
+    specials: Box<[String]>,
+}
+
+impl OwnEncoder {
+    fn built(core: CoreBPE) -> Self {
+        Self {
+            specials: core
+                .special_tokens()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            built: OnceLock::from(Ok(core)),
+            parts: Mutex::default(),
+        }
+    }
+
+    fn on_first_need(
+        ranks: FxHashMap<Vec<u8>, Rank>,
+        specials: FxHashMap<String, Rank>,
+        pattern: String,
+    ) -> Self {
+        Self {
+            built: OnceLock::new(),
+            specials: specials.keys().cloned().collect(),
+            parts: Mutex::new((ranks, specials, pattern)),
+        }
+    }
+
+    /// The encoder, built now if it was not yet; a second caller waits for
+    /// the first one's build.
+    fn get(&self) -> Result<&CoreBPE> {
+        self.built
+            .get_or_init(|| {
+                let (ranks, specials, pattern) =
+                    mem::take(&mut *self.parts.lock().unwrap_or_else(PoisonError::into_inner));
+                CoreBPE::new(ranks, specials, &pattern).map_err(|refused| refused.to_string())
+            })
+            .as_ref()
+            .map_err(|refused| Error::msg(refused.clone()))
+    }
+
+    fn special_tokens(&self) -> HashSet<&str> {
+        self.specials.iter().map(String::as_str).collect()
+    }
+}
+
 /// Tiktoken tokenizer wrapper — supports the built-in OpenAI encodings, hub-loaded
 /// tiktoken models and `tekken.json` vocabularies (see `tekken.rs`).
 pub struct TiktokenTokenizer {
     /// Shared so a deferred chat encode can own a handle and run on another
     /// thread after the render call returned.
-    tokenizer: Arc<CoreBPE>,
+    tokenizer: Arc<OwnEncoder>,
     /// The crate's direct byte-level encoder over the file's ranks, when the
     /// file fits it (see [`NativeEncoder::from_ranks`]): every encode of
-    /// text goes through it, decode stays with `tokenizer`. `None` keeps
-    /// every encode in `tokenizer`. Shared as `tokenizer` is.
+    /// text goes through it; a decode reads `byte_level`, or `tokenizer`
+    /// where no table is. `None` keeps every encode in `tokenizer`. Shared
+    /// as `tokenizer` is.
     native: Option<Arc<NativeEncoder>>,
     special_tokens: SpecialTokens,
     /// The ids by their text where no `text_index` is; beside one, only the
@@ -218,10 +291,10 @@ pub struct TiktokenTokenizer {
     /// The ids by their text over `byte_level`, for a vocabulary file with
     /// that table.
     text_index: Option<TextIndex>,
-    /// The added tokens' texts by id (`added_tokens_decoder`), read before
-    /// the encoder by `id_to_token`: an added token shadows a rank sharing
-    /// its id, as `vocab` and the other backend order them. Empty for a
-    /// built-in encoding.
+    /// The added tokens' texts by id (`added_tokens_decoder`), read first
+    /// by `id_to_token`: an added token shadows a rank sharing its id, as
+    /// `vocab` and the other backend order them. Empty for a built-in
+    /// encoding.
     added_texts: HashMap<TokenIdType, String>,
     vocab_size: usize,
     chat_template: ChatTemplateState,
@@ -338,7 +411,7 @@ impl TiktokenTokenizer {
     /// Create a new Tiktoken tokenizer for the specified built-in model
     pub fn new(model: TiktokenModel) -> Result<Self> {
         let tokenizer =
-            Arc::new(match model {
+            match model {
                 TiktokenModel::O200kBase => o200k_base()
                     .map_err(|e| Error::msg(format!("Failed to load o200k_base: {e}")))?,
                 TiktokenModel::Cl100kBase => cl100k_base()
@@ -352,7 +425,7 @@ impl TiktokenTokenizer {
                 TiktokenModel::R50kBase => {
                     r50k_base().map_err(|e| Error::msg(format!("Failed to load r50k_base: {e}")))?
                 }
-            });
+            };
 
         let special_tokens = Self::get_special_tokens_for_model(model);
         // Built-in encodings have no tokenizer_config.json; every token the
@@ -369,11 +442,14 @@ impl TiktokenTokenizer {
             TiktokenModel::P50kBase | TiktokenModel::P50kEdit => 50281,
             TiktokenModel::R50kBase => 50257,
         };
-        let byte_level = byte_level_ids(vocab_size, &skip_token_ids)
-            .map(|ids_end| byte_level_table(&tokenizer, ids_end, &skip_token_ids));
+        let byte_level = byte_level_ids(vocab_size, &skip_token_ids).map(|ids_end| {
+            byte_level_table(ids_end, &skip_token_ids, |id| {
+                tokenizer.decode_bytes(&[id]).ok()
+            })
+        });
 
         Ok(TiktokenTokenizer {
-            tokenizer,
+            tokenizer: Arc::new(OwnEncoder::built(tokenizer)),
             // A built-in encoding keeps its ranks to itself.
             native: None,
             special_tokens,
@@ -577,7 +653,7 @@ impl TiktokenTokenizer {
 
         // Calculate true vocab size from max token ID (handles sparse/reserved IDs),
         // build the text-to-id map (borrowing the ranks) and the added tokens' texts
-        // by id, then pass the ranks by value to CoreBPE
+        // by id, then pass the ranks by value to the file's own encoder
         let vocab_size = ranks
             .values()
             .copied()
@@ -597,9 +673,46 @@ impl TiktokenTokenizer {
         let text_map = ids_end
             .is_none()
             .then(|| build_vocab_map(&ranks, &specials));
-        let tokenizer = Arc::new(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?);
-        let byte_level =
-            ids_end.map(|ids_end| byte_level_table(&tokenizer, ids_end, &skip_token_ids));
+        // Every id's bytes as the file's own encoder decodes one: a rank's
+        // token, else the special token its map by id holds.
+        // `one_token_a_rank`: no two tokens share a rank (the own encoder
+        // refuses such a set with a panic).
+        let mut one_token_a_rank = true;
+        let byte_level = ids_end.map(|ids_end| {
+            let mut by_id: Vec<Option<&[u8]>> = vec![None; ids_end];
+            for (token, &rank) in &ranks {
+                if let Some(slot) = by_id.get_mut(rank as usize) {
+                    one_token_a_rank &= slot.is_none();
+                    *slot = Some(token);
+                }
+            }
+            let special_by_id: FxHashMap<Rank, &str> = special_tokens_encoder
+                .iter()
+                .map(|(text, &id)| (id, text.as_str()))
+                .collect();
+            for (&id, text) in &special_by_id {
+                if let Some(slot @ None) = by_id.get_mut(id as usize) {
+                    *slot = Some(text.as_bytes());
+                }
+            }
+            byte_level_table(ids_end, &skip_token_ids, |id| {
+                by_id.get(id as usize).copied().flatten()
+            })
+        });
+        // The own encoder at load only where an encode or a decode runs on
+        // it. Where it waits for a first need the library compiles a split
+        // pattern the crate does not ship here, as an encoder over no ranks:
+        // a pattern it refuses fails the load as before.
+        let tokenizer = Arc::new(
+            if native.is_some() && byte_level.is_some() && one_token_a_rank {
+                if !SHIPPED_PATTERNS.contains(&&*pattern) {
+                    CoreBPE::new(FxHashMap::default(), FxHashMap::default(), &pattern)?;
+                }
+                OwnEncoder::on_first_need(ranks, special_tokens_encoder, String::from(&*pattern))
+            } else {
+                OwnEncoder::built(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?)
+            },
+        );
         let text_index = byte_level.as_deref().map(TextIndex::build);
         // Beside the index the map keeps only an added token the index does
         // not answer with its own id (one whose id a rank holds in the
@@ -613,9 +726,9 @@ impl TiktokenTokenizer {
                 .collect(),
             _ => HashMap::new(),
         };
-        // Counted and announced once the file's own encoder has loaded too,
-        // the point the Hugging Face path counts at as well (before the chat
-        // template is read).
+        // Counted and announced once the file's own encoder has loaded or is
+        // left for a first need, the point the Hugging Face path counts at
+        // as well (before the chat template is read).
         if native.is_some() {
             encode_path::note_load(EncodePath::Native);
             tracing::info!(path = %EncodePath::Native, "tiktoken encode path");
@@ -1084,22 +1197,23 @@ fn byte_level_ids(vocab_size: usize, skip_token_ids: &HashSet<TokenIdType>) -> O
     Some(ids_end)
 }
 
-/// The bytes every id below `ids_end` decodes to, read back from the BPE: a
-/// rank's byte string, a special token's text. `skip_token_ids` marks the
-/// ones `skip_special_tokens` strips, as `decode` strips them.
-fn byte_level_table(
-    bpe: &CoreBPE,
+/// The bytes every id below `ids_end` decodes to, as `bytes_of` gives them (a
+/// rank's byte string, a special token's text; `None` for an id neither
+/// holds). `skip_token_ids` marks the ones `skip_special_tokens` strips, as
+/// `decode` strips them.
+fn byte_level_table<B: AsRef<[u8]>>(
     ids_end: usize,
     skip_token_ids: &HashSet<TokenIdType>,
+    bytes_of: impl Fn(TokenIdType) -> Option<B>,
 ) -> Arc<ByteLevelTable> {
     let mut table = ByteLevelTableBuilder::with_capacity(ids_end);
     for id in 0..ids_end {
         let Ok(id) = TokenIdType::try_from(id) else {
             break;
         };
-        match bpe.decode_bytes(&[id]) {
-            Ok(bytes) => table.push(&bytes, skip_token_ids.contains(&id)),
-            Err(_) => table.push_absent(),
+        match bytes_of(id) {
+            Some(bytes) => table.push(bytes.as_ref(), skip_token_ids.contains(&id)),
+            None => table.push_absent(),
         }
     }
     table.finish()
@@ -1268,7 +1382,7 @@ fn last_run_start(window: &str, from: usize, reach: usize) -> Option<usize> {
 /// The ids are the segments' own encodes, one after another: a prompt's ids
 /// are the ids of any split of its segments, encoded apart and joined.
 fn encode_segments(
-    bpe: &CoreBPE,
+    bpe: &OwnEncoder,
     native: Option<&NativeEncoder>,
     segments: &[PromptSegment],
     checkpoint_pieces: bool,
@@ -1302,7 +1416,7 @@ fn ids_capacity(segments: &[PromptSegment]) -> usize {
 /// holds some of the segments' ids already writes the rest around them into
 /// one buffer.
 fn encode_segments_into(
-    bpe: &CoreBPE,
+    bpe: &OwnEncoder,
     native: Option<&NativeEncoder>,
     allowed: &HashSet<&str>,
     segments: &[PromptSegment],
@@ -1333,7 +1447,7 @@ fn encode_segments_into(
 /// encoder when the vocabulary has one, else through the file's.
 #[inline(always)]
 fn encode_piece(
-    bpe: &CoreBPE,
+    bpe: &OwnEncoder,
     native: Option<&NativeEncoder>,
     allowed: &HashSet<&str>,
     piece: &str,
@@ -1357,11 +1471,12 @@ fn encode_piece(
     }
     if allow_special {
         let (ids_of_piece, _) = bpe
+            .get()?
             .encode(piece, allowed)
             .map_err(|e| Error::msg(format!("tiktoken encode failed: {e}")))?;
         ids.extend(ids_of_piece);
     } else {
-        ids.extend(bpe.encode_ordinary(piece));
+        ids.extend(bpe.get()?.encode_ordinary(piece));
     }
     Ok(())
 }
@@ -1369,17 +1484,17 @@ fn encode_piece(
 /// The ids of one piece with the special tokens recognized: on the direct
 /// encoder when the vocabulary has one, else through the file's.
 fn encode_with_special_tokens(
-    bpe: &CoreBPE,
+    bpe: &OwnEncoder,
     native: Option<&NativeEncoder>,
     piece: &str,
-) -> Vec<TokenIdType> {
+) -> Result<Vec<TokenIdType>> {
     if let Some(native) = native {
         match native.encode(None, piece, false) {
-            Ok(ids) => return ids,
+            Ok(ids) => return Ok(ids),
             Err(fallback) => encode_path::note_fallback(fallback),
         }
     }
-    bpe.encode_with_special_tokens(piece)
+    Ok(bpe.get()?.encode_with_special_tokens(piece))
 }
 
 impl Encoder for TiktokenTokenizer {
@@ -1394,16 +1509,17 @@ impl Encoder for TiktokenTokenizer {
         let mut tokens: Vec<TokenIdType> = if self.checkpoint_pieces && may_cut(input) {
             // The first piece's ids take the later pieces': a text of one piece, as most
             // long texts are, is not copied.
-            checkpoint_pieces(input)
-                .into_iter()
-                .map(|piece| encode_with_special_tokens(&self.tokenizer, native, piece))
-                .reduce(|mut ids, piece_ids| {
-                    ids.extend(piece_ids);
-                    ids
-                })
-                .unwrap_or_default()
+            let mut pieces = checkpoint_pieces(input).into_iter();
+            let mut ids = match pieces.next() {
+                Some(piece) => encode_with_special_tokens(&self.tokenizer, native, piece)?,
+                None => Vec::new(),
+            };
+            for piece in pieces {
+                ids.extend(encode_with_special_tokens(&self.tokenizer, native, piece)?);
+            }
+            ids
         } else {
-            encode_with_special_tokens(&self.tokenizer, native, input)
+            encode_with_special_tokens(&self.tokenizer, native, input)?
         };
         if let Some(bos) = self.bos.filter(|_| add_special_tokens) {
             tokens.insert(0, bos);
@@ -1443,10 +1559,24 @@ impl TiktokenTokenizer {
     /// The bytes known ids stand for, in order: what `decode` renders before
     /// the UTF-8 validation.
     fn bytes_of(&self, token_ids: &[TokenIdType]) -> Vec<u8> {
-        self.tokenizer
-            ._decode_native_and_split(token_ids.to_vec())
-            .flatten()
-            .collect()
+        let Some(table) = &self.byte_level else {
+            // No table: the load built the own encoder.
+            return self.tokenizer.get().map_or_else(
+                |_| Vec::new(),
+                |core| {
+                    core._decode_native_and_split(token_ids.to_vec())
+                        .flatten()
+                        .collect()
+                },
+            );
+        };
+        let mut bytes = Vec::new();
+        for &id in token_ids {
+            if let Some((token, _)) = table.token_bytes(id) {
+                bytes.extend_from_slice(token);
+            }
+        }
+        bytes
     }
 }
 
@@ -1455,9 +1585,10 @@ impl Decoder for TiktokenTokenizer {
     /// do: whole tokens appended as text, the other bytes converted per run,
     /// specials dropped by the table's per-id marks when asked, in place of
     /// the crate's lookup per id; bytes that are not UTF-8 render lossily and
-    /// are logged as the crate path logs its fallback. An id the table lacks,
-    /// or a vocabulary too sparse for one, takes the crate's decode below,
-    /// with its unknown-id error and its lossy fallback.
+    /// are logged as the crate path logs its fallback. An id the table lacks
+    /// is answered here with the crate's unknown-id error; a vocabulary too
+    /// sparse for a table takes the crate's decode below, with that error
+    /// and its lossy fallback.
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         if let Some((text, lossy)) = self
             .byte_level
@@ -1473,7 +1604,20 @@ impl Decoder for TiktokenTokenizer {
             return Ok(text);
         }
         let token_ids = self.kept_ids(token_ids, skip_special_tokens);
-        match self.tokenizer.decode(&token_ids) {
+        let decoded = match &self.byte_level {
+            // The table holds every id the own encoder decodes: the first
+            // id it lacks is the one the library names, in its words. With
+            // none (a skipped id was the one), the kept ids decode above.
+            Some(table) => match token_ids
+                .iter()
+                .find(|&&id| table.token_bytes(id).is_none())
+            {
+                Some(&token) => Err(Error::from(DecodeKeyError { token })),
+                None => return self.decode(&token_ids, false),
+            },
+            None => self.tokenizer.get()?.decode(&token_ids),
+        };
+        match decoded {
             Ok(text) => Ok(text),
             Err(err) if is_unknown_tiktoken_decode_error(&err) => Err(Error::msg(format!(
                 "tiktoken decode failed for unknown token id: {err}"
@@ -1576,16 +1720,22 @@ impl TokenizerTrait for TiktokenTokenizer {
 
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
         // An added token first (it shadows a rank sharing its id, as the
-        // text-to-id map ordered them), then the file's encoder, which holds
-        // every rank's bytes and the special tokens; an id whose bytes are
-        // not text has no token string, as before.
+        // text-to-id map ordered them), then the decode table or, where none
+        // is, the file's encoder: each holds every rank's bytes and the
+        // special tokens; an id whose bytes are not text has no token
+        // string, as before.
         if let Some(text) = self.added_texts.get(&id) {
             return Some(text.clone());
         }
-        self.tokenizer
-            .decode_bytes(&[id])
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
+        match &self.byte_level {
+            Some(table) => table.token_bytes(id).map(|(bytes, _)| bytes.to_vec()),
+            None => self
+                .tokenizer
+                .get()
+                .ok()
+                .and_then(|core| core.decode_bytes(&[id]).ok()),
+        }
+        .and_then(|bytes| String::from_utf8(bytes).ok())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2391,6 +2541,60 @@ mod tests {
         dir
     }
 
+    /// A file the direct encoder takes loads without its own encoder and
+    /// no call builds it: not an encode, a decode, a token's text or a
+    /// stream's end, and not an id outside the vocabulary, whose error the
+    /// table writes in the words the own encoder gives it.
+    #[test]
+    fn a_taken_file_answers_without_its_own_encoder() {
+        let dir = split_vocabulary_dir();
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        let encoding = tokenizer.encode("a中<|open|>", false).unwrap();
+        let ids = encoding.token_ids();
+        assert_eq!(ids, [97, 256, 0xAD, 301]);
+        assert_eq!(tokenizer.decode(ids, false).unwrap(), "a中<|open|>");
+        assert_eq!(tokenizer.id_to_token(97).as_deref(), Some("a"));
+        // The end of a stream on a cut character reads the ids' bytes.
+        tokenizer
+            .finish_decode(&mut vec![97, 256], &mut String::new(), &mut 0, false)
+            .unwrap();
+        let unknown = tokenizer.decode(&[97, 302, 303], false).unwrap_err();
+        assert!(tokenizer.tokenizer.built.get().is_none());
+
+        let own = tokenizer.tokenizer.get().unwrap();
+        assert_eq!(
+            unknown.to_string(),
+            format!(
+                "tiktoken decode failed for unknown token id: {}",
+                own.decode(&[97, 302, 303]).unwrap_err()
+            )
+        );
+        assert_eq!(own.encode_with_special_tokens("a中<|open|>"), ids);
+        assert_eq!(own.decode(ids).unwrap(), "a中<|open|>");
+    }
+
+    /// A load that leaves the own encoder unbuilt compiles only a pattern the
+    /// crate does not ship: this test is that compile for the shipped ones,
+    /// and another pattern the library refuses still fails the load.
+    #[test]
+    fn a_load_compiles_only_a_pattern_the_crate_does_not_ship() {
+        for pattern in SHIPPED_PATTERNS {
+            CoreBPE::new(FxHashMap::default(), FxHashMap::default(), pattern).unwrap();
+        }
+        // The direct encoder takes this pattern; the library refuses its size.
+        let unshipped = tekken::PATTERN.replace(r"|\p{N}|", r"|\p{N}{2000}|");
+        let mut file: serde_json::Value =
+            serde_json::from_str(&tekken::testing::minimal()).unwrap();
+        file["config"]["pattern"] = unshipped.into();
+        let dir = tekken::testing::dir_with(&file.to_string());
+        let path = dir.path().join(tekken::FILE_NAME);
+        let read = tekken::read(&path).unwrap();
+        let mut specials: Vec<_> = read.specials.into_iter().collect();
+        specials.sort();
+        assert!(NativeEncoder::from_ranks(&read.ranks, &read.pattern, &specials).is_ok());
+        assert!(TiktokenTokenizer::from_tekken_file(&path).is_err());
+    }
+
     /// A tiktoken-file checkpoint reads the processor's legacy
     /// `chat_template.json` beside it as the conversion of a checkpoint
     /// does: a request without tools renders through the processor's
@@ -2991,7 +3195,11 @@ mod tests {
         ] {
             assert_eq!(
                 tokenizer.encode(text, false).unwrap().token_ids(),
-                tokenizer.tokenizer.encode_with_special_tokens(text),
+                tokenizer
+                    .tokenizer
+                    .get()
+                    .unwrap()
+                    .encode_with_special_tokens(text),
                 "{text:?}"
             );
         }
@@ -3616,7 +3824,12 @@ mod tests {
         assert_eq!(other.encode(&text, false).unwrap().token_ids(), &whole[..]);
         let expected: Vec<TokenIdType> = checkpoint_pieces(&text)
             .into_iter()
-            .flat_map(|piece| kimi.tokenizer.encode_with_special_tokens(piece))
+            .flat_map(|piece| {
+                kimi.tokenizer
+                    .get()
+                    .unwrap()
+                    .encode_with_special_tokens(piece)
+            })
             .collect();
         assert_eq!(expected, pieces);
     }
@@ -3967,12 +4180,12 @@ mod tests {
         assert!(ids.contains(&100257));
         assert_eq!(
             tokenizer.decode(&ids, false).unwrap(),
-            tokenizer.tokenizer.decode(&ids).unwrap()
+            tokenizer.tokenizer.get().unwrap().decode(&ids).unwrap()
         );
         let kept: Vec<TokenIdType> = ids.iter().copied().filter(|id| *id != 100257).collect();
         assert_eq!(
             tokenizer.decode(&ids, true).unwrap(),
-            tokenizer.tokenizer.decode(&kept).unwrap()
+            tokenizer.tokenizer.get().unwrap().decode(&kept).unwrap()
         );
     }
 
