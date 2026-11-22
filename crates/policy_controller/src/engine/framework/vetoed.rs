@@ -13,6 +13,12 @@
 //! thresholds alone first. A doubt is not an outage. The pick's trace says
 //! which veto it lifted ([`LiftedVeto`]).
 //!
+//! A pair's decode side is put to the rule: its set carries the pair
+//! binding's word ([`Set::ruled`]), so partners whose every usable worker
+//! is vetoed are steered or shed as a single request's pool is, over their
+//! own rows. A pair's first decision asks for the overload veto alone, and
+//! its prefill side is put to no rule.
+//!
 //! A profile that places a request by its session key reads the same word
 //! ahead of its pass ([`keeps_its_key`]): where the binding steers, a keyed
 //! request is decided with the veto lifted ([`Engine::keep`]), so the key
@@ -57,8 +63,10 @@ pub(super) enum AllVetoed {
     /// no other worker can.
     Shed,
     /// No rule is asked: a pool a veto empties is shed at the stage that
-    /// emptied it. A set's word, never a binding's: a side of a pair and
-    /// the rule's own passes carry it ([`Set::shedding`]).
+    /// emptied it. A set's word, never a binding's. The rule's own passes
+    /// carry it ([`Set::shedding`]), and so does a pass of a pair that says
+    /// no binding's word ([`Set::side`]): a prefill side's, one that only
+    /// names a shed's stage, a shadow's run, an encode item's.
     Unasked,
 }
 
@@ -322,9 +330,11 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// every pass.
 ///
 /// A set put to no rule is shed where it emptied ([`AllVetoed::Unasked`]):
-/// each side of a pair, and the rule's own passes, so the rule is asked
-/// once a decision. A pool nobody is usable in with its vetoes lifted is
-/// shed at the stage that says why.
+/// the rule's own passes, so no pass of the rule asks it again, and a
+/// pair's passes that say no binding's word. A single request asks the
+/// rule once. A pair asks it of its decode side: over the decode pool where
+/// no decode is open, then over the chosen prefill's partners. A pool nobody
+/// is usable in with its vetoes lifted is shed at the stage that says why.
 ///
 /// Cold and out of line: a pass whose filters keep a row never comes here.
 #[cold]
@@ -577,8 +587,9 @@ mod tests {
         engine::{
             decision::{Decision, LiftedVeto, ShedReason},
             framework::{
-                tests::Stored, Binding, DecisionScope, Engine, Filter, Marks, PairPools, Picker,
-                Plan, Profile, Scorer, Scratch, TieBand, WeightedScorer, DRAW_FROM, WRITTEN_ROWS,
+                tests::Stored, Binding, DecisionScope, Engine, Filter, Marks, PairPools, PairSide,
+                Picker, Plan, Profile, Scorer, Scratch, TieBand, WeightedScorer, DRAW_FROM,
+                WRITTEN_ROWS,
             },
             sticky_sessions::{SessionRule, SessionVerdict},
             view::{
@@ -1252,15 +1263,212 @@ mod tests {
         (shed_of(&decision), asked.load(Ordering::Relaxed))
     }
 
-    /// Each side of a pair sheds a pool the overload veto empties: the pair
-    /// plan does not enter the rule. Under a binding that steers, a prefill
-    /// side over its thresholds on every worker is shed at the veto, and the
-    /// filter listed behind the veto is asked about no prefill.
+    /// A pair's prefill side sheds a pool the overload veto empties: it is
+    /// put to no rule. Under a binding that steers, a prefill side over its
+    /// thresholds on every worker is shed at the veto, and the filter listed
+    /// behind the veto is asked about no prefill.
     #[test]
-    fn a_pairs_side_sheds_at_the_veto_and_is_filtered_once() {
+    fn a_pairs_prefill_side_sheds_at_the_veto_and_is_filtered_once() {
         let none: (&[u32], &[u32]) = (&[], &[]);
         let side = pairs_side_shed(Box::new(NotOverloaded), [over(0, 1), over(1, 2)], none);
         assert_eq!(side, ((ShedReason::Saturated, "not-overloaded"), 0));
+    }
+
+    /// A pair's engine built by hand: each side filters by the health stage
+    /// and the overload veto and takes the best of equals, so a side the
+    /// rule steers is the only one whose pick the requests in flight
+    /// decide. `shed` makes its binding shed a pool the veto empties. The
+    /// decode side's shadow is a twin of its profile.
+    fn pair_engine(shed: bool) -> Engine {
+        let side = |name: &str| Profile {
+            name: name.into(),
+            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+            scorers: vec![],
+            picker: Box::new(Best),
+        };
+        let mut engine = Engine::new(
+            vec![side("prefill"), side("decode"), side("twin")],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                shadow: None,
+                decode_shadow: Some(2),
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        if shed {
+            engine.shed_when_all_vetoed(0);
+        }
+        engine
+    }
+
+    /// `worker` in the pair class `class`: classes pair by their number.
+    fn classed(mut worker: Candidate, class: u32) -> Candidate {
+        worker.pair_class = class;
+        worker
+    }
+
+    /// The pair `engine` decides over `prefills` and `decodes`.
+    fn decide_pair(engine: &Engine, prefills: &[Candidate], decodes: &[Candidate]) -> Decision {
+        let pools = PairPools {
+            prefills,
+            decodes,
+            ..PairPools::default()
+        };
+        engine.decide_pair(
+            &facts(1),
+            &PoolFacts::default(),
+            pools,
+            &Constraints::default(),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    }
+
+    /// The pair a pick names first: its prefill's position, then its decode's.
+    fn pair_of(decision: &Decision) -> (u32, u32) {
+        let pick = decision.pick().expect("a pick");
+        let first = pick.targets.first().expect("a target");
+        let decode = first.pair.expect("a pair's target").decode_position;
+        (first.position, decode)
+    }
+
+    /// Under a binding that steers, a pair's decode side over its thresholds
+    /// on every worker goes to the decode that holds the fewest requests
+    /// among the chosen prefill's partners. No decode is open, so the rule
+    /// first says which decodes it keeps and the prefill is chosen for
+    /// them: a prefill whose class holds no decode is passed over. A doubted
+    /// decode among them is not kept, however few requests it holds.
+    #[test]
+    fn a_pairs_decode_side_over_on_every_worker_goes_to_the_fewest_in_flight() {
+        let engine = pair_engine(false);
+        let prefills = [classed(free(0, 0), 2), classed(free(1, 0), 1)];
+        let mut decodes = [over(0, 3), over(1, 1), over(2, 2)].map(|worker| classed(worker, 1));
+        let decision = decide_pair(&engine, &prefills, &decodes);
+        assert_eq!(pair_of(&decision), (1, 1));
+        assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+        decodes[1].health.stalled = true;
+        let decision = decide_pair(&engine, &prefills, &decodes);
+        assert_eq!(pair_of(&decision), (1, 2));
+        assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+    }
+
+    /// Under a binding that sheds, a pair's decode side over its thresholds
+    /// on every worker is shed as saturated.
+    #[test]
+    fn a_binding_that_sheds_sheds_a_pairs_decode_side_over_on_every_worker() {
+        let (prefills, decodes) = ([classed(free(0, 1), 1)], [classed(over(0, 1), 1)]);
+        let decision = decide_pair(&pair_engine(true), &prefills, &decodes);
+        assert_eq!(
+            shed_of(&decision),
+            (ShedReason::Saturated, "not-overloaded")
+        );
+    }
+
+    /// What a pair's first decision leaves refused, as it was. Decodes of
+    /// one class all over stay unasked while a decode of another class is
+    /// open. A decode pool doubted on every worker opens no prefill, and a
+    /// prefill pool over on every worker is put to no rule.
+    #[test]
+    fn a_pairs_first_decision_answers_for_a_decode_pool_over_alone() {
+        let engine = pair_engine(false);
+        let prefills = [classed(free(0, 0), 1), classed(free(1, 5), 2)];
+        let decodes = [
+            classed(over(0, 0), 1),
+            classed(over(1, 0), 1),
+            classed(free(2, 9), 2),
+        ];
+        let decision = decide_pair(&engine, &prefills, &decodes);
+        assert_eq!(pair_of(&decision), (1, 2));
+        assert_eq!(decision.trace().lifted, LiftedVeto::None);
+        let (idle, busy) = ([classed(free(0, 0), 1)], [classed(over(0, 0), 1)]);
+        let suspect = [classed(doubted(0, 0), 1)];
+        let refused = decide_pair(&engine, &idle, &suspect);
+        assert_eq!(shed_of(&refused), (ShedReason::NoEndpoints, "healthy"));
+        let refused = decide_pair(&engine, &busy, &idle);
+        assert_eq!(shed_of(&refused), (ShedReason::Saturated, "not-overloaded"));
+    }
+
+    /// A decode asked for a held prefill is put to the rule, both its tiers.
+    /// Partners over their thresholds on every worker go to the one that
+    /// holds the fewest requests, and under a binding that sheds they are
+    /// shed as saturated. Partners doubted on every worker go to the fewest
+    /// requests under either word, and never to one a hold stands on.
+    #[test]
+    fn a_decode_asked_for_a_held_prefill_is_put_to_the_rule() {
+        let prefills = [classed(free(0, 0), 1)];
+        let asked = |engine: &Engine, decodes: &[Candidate]| {
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            engine.decide_decode(
+                &facts(1),
+                &PoolFacts::default(),
+                pools,
+                prefills[0].id,
+                None,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+        };
+        let busy = [over(0, 2), over(1, 1)].map(|worker| classed(worker, 1));
+        let steered = asked(&pair_engine(false), &busy);
+        assert_eq!(pair_of(&steered), (0, 1));
+        assert_eq!(steered.trace().lifted, LiftedVeto::Overload);
+        assert_eq!(
+            shed_of(&asked(&pair_engine(true), &busy)),
+            (ShedReason::Saturated, "not-overloaded")
+        );
+        let mut suspect = [doubted(0, 2), doubted(1, 1), doubted(2, 0)];
+        suspect[2].health.breaker_open = true;
+        let suspect = suspect.map(|worker| classed(worker, 1));
+        for shed in [false, true] {
+            let steered = asked(&pair_engine(shed), &suspect);
+            assert_eq!(pair_of(&steered), (0, 1), "shedding: {shed}");
+            assert_eq!(steered.trace().lifted, LiftedVeto::Liveness);
+        }
+    }
+
+    /// A pair the rule placed gets no decode shadow, at its first decision
+    /// and where its decode is asked again, under either lift: a shadow's
+    /// run says no binding's word, and a twin would shed the partners its
+    /// live side was steered among. Beside a pair no rule placed the twin
+    /// names the live decode.
+    #[test]
+    fn a_pair_the_rule_placed_gets_no_decode_shadow() {
+        let (engine, prefills) = (pair_engine(false), [classed(free(0, 0), 1)]);
+        let (req, pool, cx) = (facts(1), PoolFacts::default(), Constraints::default());
+        let shadows = |made: [fn(u32, u32) -> Candidate; 2]| {
+            let decodes = [made[0](0, 2), made[1](1, 1)].map(|worker| classed(worker, 1));
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            };
+            let (held, side, scratch) = (prefills[0].id, PairSide::Decode, &mut Scratch::new());
+            let first = engine.decide_pair(&req, &pool, pools, &cx, &cx, scratch);
+            // A first decision refuses decodes all doubted, and asks no shadow.
+            let twin = first.pick().map(|live| {
+                let said = engine.shadow_side(0, side, &req, &pool, pools, &cx, &cx, live, scratch);
+                said.map(|shadow| order(&shadow)[0])
+            });
+            let again = engine.decide_decode(&req, &pool, pools, held, None, &cx, scratch);
+            let live = again.pick().expect("a decode");
+            let later = engine.shadow_decode_later(0, &req, &pool, pools, held, live, &cx, scratch);
+            let later = later.map(|shadow| order(&shadow)[0]);
+            (twin, later, live.trace.lifted == LiftedVeto::Liveness)
+        };
+        assert_eq!(shadows([free, over]), (Some(Some(0)), Some(0), false));
+        assert_eq!(shadows([over, over]), (Some(None), None, false));
+        assert_eq!(shadows([doubted, doubted]), (None, None, true));
     }
 
     /// An engine of one profile: `veto` and a filter that refuses every row,
@@ -3526,25 +3734,24 @@ mod tests {
         assert_eq!(asked.load(Ordering::Relaxed), pool.len());
     }
 
-    /// A side of a pair is put to the liveness tier no more than to the
+    /// A pair's prefill side is put to the liveness tier no more than to the
     /// overload tier: a prefill side doubted on every worker is shed at the
     /// health stage, and the filter listed behind that stage is asked about
     /// no prefill.
     #[test]
-    fn a_pairs_side_doubted_on_every_worker_sheds_at_the_health_stage() {
+    fn a_pairs_prefill_side_doubted_on_every_worker_sheds_at_the_health_stage() {
         let none: (&[u32], &[u32]) = (&[], &[]);
         let side = pairs_side_shed(Box::new(Healthy), [doubted(0, 1), doubted(1, 2)], none);
         assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 0));
     }
 
-    /// A hold changes nothing on a side of a pair, which is put to no tier.
-    /// A prefill side the host holds on every row, and one with a doubted
-    /// row among held ones, are shed at the health stage, and the filter
-    /// listed behind that stage is asked about no prefill. No tier reads a
-    /// side's held rows: a rule put to a pair's side brings them with it,
-    /// in the same change.
+    /// A hold changes nothing on a pair's prefill side, which is put to no
+    /// tier. A prefill side the host holds on every row, and one with a
+    /// doubted row among held ones, are shed at the health stage, and the
+    /// filter listed behind that stage is asked about no prefill. The tier a
+    /// decode asked again is put to reads a hold as a single request's does.
     #[test]
-    fn a_pairs_side_under_a_hold_sheds_at_the_health_stage() {
+    fn a_pairs_prefill_side_under_a_hold_sheds_at_the_health_stage() {
         for held in [&[0, 1][..], &[0]] {
             let masks: (&[u32], &[u32]) = (&[0, 1], held);
             let side = pairs_side_shed(Box::new(Healthy), [free(0, 1), free(1, 2)], masks);

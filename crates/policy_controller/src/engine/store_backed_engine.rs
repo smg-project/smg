@@ -3999,7 +3999,7 @@ impl StoreBackedEngine {
         let (binding, left) = (due.binding, taken.left);
         let mut said = Shadow::NotDue;
         let (store, own) = (&*self.store, &self.parts[at]);
-        let decided = decode_with(world, store, taken, lease, buffers, own, |prefill| {
+        let decided = decode_with(world, store, taken, lease, buffers, own, |held| {
             let said = &mut said;
             move |engine: &Engine,
                   pair: &PairBuffers,
@@ -4012,13 +4012,13 @@ impl StoreBackedEngine {
                     return;
                 };
                 // The call's facts, as its live decode read them.
-                let facts = RequestFacts {
+                let call = RequestFacts {
                     phase: Phase::Decode,
                     ..*facts
                 };
                 let pools = pair.pools();
                 *said = side_shadow(engine, (binding, PairSide::Decode), live, left, || {
-                    engine.shadow_decode_later(binding, &facts, pool, pools, prefill, cx, scratch)
+                    engine.shadow_decode_later(binding, &call, pool, pools, held, live, cx, scratch)
                 });
             }
         });
