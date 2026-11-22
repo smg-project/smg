@@ -132,15 +132,17 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 ///
 /// Filters out hop-by-hop and SMG-owned headers that must not be forwarded, and
 /// the upstream's `server` header: the upstream's software and version are not the
-/// client's to read, and the gateway's own answers carry no `server` header.
+/// client's to read, and the gateway's own answers carry no `server` header. An
+/// answer that also carries `transfer-encoding` loses its `content-length`
+/// (RFC 9112, 6.3): the gateway's own framing describes the body it sends.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     // A message with both fields is framed by its transfer coding: the length
     // it also carries is removed before the message goes on (RFC 9112, 6.3).
-    let chunked = reqwest_headers.contains_key(http::header::TRANSFER_ENCODING);
+    let framed_by_transfer_coding = reqwest_headers.contains_key(http::header::TRANSFER_ENCODING);
 
     for (name, value) in reqwest_headers {
-        if chunked && name == http::header::CONTENT_LENGTH {
+        if framed_by_transfer_coding && name == http::header::CONTENT_LENGTH {
             continue;
         }
         // Use case-insensitive checks to avoid string allocation.
