@@ -462,6 +462,34 @@ mod tests {
         assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
     }
 
+    /// Passthrough's plain single request is answered as a place: the first
+    /// worker of the list its host's test admits. That is the gateway's
+    /// classic rule, the position of the first worker whose routing state
+    /// the selection admits (`model_gateway/src/policies/passthrough.rs:48`
+    /// at main `882be6f4f`). No pass over the pool ran, no request was made
+    /// and no lease took an id.
+    #[test]
+    fn passthrough_is_the_first_admitted_worker_answered_as_a_place() {
+        let engine = preset("passthrough");
+        for workers in [1, 2, 8, 64] {
+            let list = pool(workers);
+            let members = engine.pool_members(&list);
+            let asks = Asks::of(request(), Some(&members));
+            for refused in 0..workers.min(12) {
+                // Classic's rule, asked of the same worker objects.
+                let classic = list
+                    .iter()
+                    .position(|worker| worker.routing_state().eligible());
+                assert_eq!(classic, Some(refused));
+                let place = placed(&engine, &asks).place;
+                assert_eq!(place as usize, refused, "{workers} workers");
+                list[refused].set_overloaded(true);
+            }
+            assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+        }
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+    }
+
     /// Under a document a stage of which takes a word on a lease, a plain
     /// request of a place one pick decides is still never made, and its
     /// pick is noted: a whole decision of one target under a lease that
