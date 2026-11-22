@@ -19,6 +19,7 @@
 //! in the exporter's format and with the exporter's histogram configuration.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::{Display, Write as _},
     sync::{
@@ -283,12 +284,10 @@ impl WorkerSeries {
     pub fn render_into(&self, out: &mut String) {
         let descriptions = self.descriptions.read();
 
-        let mut counters: BTreeMap<String, Vec<(Vec<String>, u64)>> = BTreeMap::new();
+        let mut counters: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
         self.registry.visit_counters(|key, counter| {
-            counters
-                .entry(sanitize_metric_name(key.name()))
-                .or_default()
-                .push((label_pairs(key), counter.load(Ordering::Acquire)));
+            let sample = (label_text(key), counter.load(Ordering::Acquire));
+            gather(&mut counters, key.name(), sample);
         });
         for (name, mut series) in counters {
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -299,15 +298,13 @@ impl WorkerSeries {
             out.push('\n');
         }
 
-        let mut gauges: BTreeMap<String, Vec<(Vec<String>, f64)>> = BTreeMap::new();
+        let mut gauges: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
         self.registry.visit_gauges(|key, gauge| {
-            gauges
-                .entry(sanitize_metric_name(key.name()))
-                .or_default()
-                .push((
-                    label_pairs(key),
-                    f64::from_bits(gauge.load(Ordering::Acquire)),
-                ));
+            let sample = (
+                label_text(key),
+                f64::from_bits(gauge.load(Ordering::Acquire)),
+            );
+            gather(&mut gauges, key.name(), sample);
         });
         for (name, mut series) in gauges {
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -320,12 +317,9 @@ impl WorkerSeries {
 
         self.run_upkeep();
         let distributions = self.distributions.lock();
-        let mut by_name: BTreeMap<String, Vec<(Vec<String>, &Distribution)>> = BTreeMap::new();
+        let mut by_name: BTreeMap<String, Vec<(String, &Distribution)>> = BTreeMap::new();
         for (key, distribution) in distributions.iter() {
-            by_name
-                .entry(sanitize_metric_name(key.name()))
-                .or_default()
-                .push((label_pairs(key), distribution));
+            gather(&mut by_name, key.name(), (label_text(key), distribution));
         }
         for (name, mut series) in by_name {
             let kind = self.distribution_builder.get_distribution_type(&name);
@@ -479,16 +473,76 @@ fn keyed_to(key: &Key, url: &str) -> bool {
     worker_url(key) == Some(url)
 }
 
-fn label_pairs(key: &Key) -> Vec<String> {
-    key.labels()
-        .map(|label| {
-            format!(
-                "{}=\"{}\"",
-                sanitize_label_key(label.key()),
-                sanitize_label_value(label.value())
-            )
-        })
-        .collect()
+/// `text` as `clean` writes it, borrowed when that is `text` itself: `valid`
+/// holds for each of its characters at its index. A scrape cleans the names
+/// and labels of every series, and nearly all of them are clean already.
+fn cleaned<'t>(
+    text: &'t str,
+    valid: impl Fn(usize, char) -> bool,
+    clean: impl FnOnce(&str) -> String,
+) -> Cow<'t, str> {
+    if text.chars().enumerate().all(|(i, c)| valid(i, c)) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(clean(text))
+    }
+}
+
+/// Whether the exporter's cleaner keeps `c` at index `i` of a family name.
+/// The three rules repeat its own (`metrics_exporter_prometheus::formatting`),
+/// which are private to it.
+fn metric_name_char(i: usize, c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || c == ':' || (i != 0 && c.is_ascii_digit())
+}
+
+/// The same for a label name.
+fn label_key_char(i: usize, c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || (i != 0 && c.is_ascii_digit())
+}
+
+/// The same for a label value: every character but the three it escapes.
+fn label_value_char(_: usize, c: char) -> bool {
+    !matches!(c, '\n' | '"' | '\\')
+}
+
+/// Put `sample` with the family `name` cleans to; a name that is clean
+/// already is allocated for the family's first sample alone.
+fn gather<V>(families: &mut BTreeMap<String, Vec<V>>, name: &str, sample: V) {
+    let name = cleaned(name, metric_name_char, sanitize_metric_name);
+    match families.get_mut(name.as_ref()) {
+        Some(family) => family.push(sample),
+        None => {
+            families.insert(name.into_owned(), vec![sample]);
+        }
+    }
+}
+
+/// The labels of `key` as a sample line prints them, in one string. A cleaned
+/// pair ends with its closing quote and a quote inside a value is escaped, so
+/// no pair is the start of another: the samples of a family sort by this
+/// text as they would by the list of its pairs.
+fn label_text(key: &Key) -> String {
+    let pairs = key.labels();
+    let mut text = String::with_capacity(
+        pairs
+            .clone()
+            .map(|label| label.key().len() + label.value().len() + 4)
+            .sum(),
+    );
+    for label in pairs {
+        if !text.is_empty() {
+            text.push(',');
+        }
+        text.push_str(&cleaned(label.key(), label_key_char, sanitize_label_key));
+        text.push_str("=\"");
+        text.push_str(&cleaned(
+            label.value(),
+            label_value_char,
+            sanitize_label_value,
+        ));
+        text.push('"');
+    }
+    text
 }
 
 fn write_family(out: &mut String, name: &str, kind: &str, description: Option<&SharedString>) {
@@ -502,7 +556,7 @@ fn write_sample(
     out: &mut String,
     name: &str,
     suffix: Option<&str>,
-    labels: &[String],
+    labels: &str,
     extra: Option<(&str, &dyn Display)>,
     value: &dyn Display,
 ) {
@@ -513,7 +567,7 @@ fn write_sample(
     }
     if !labels.is_empty() || extra.is_some() {
         out.push('{');
-        out.push_str(&labels.join(","));
+        out.push_str(labels);
         if let Some((key, value)) = extra {
             if !labels.is_empty() {
                 out.push(',');
@@ -527,7 +581,7 @@ fn write_sample(
 
 #[cfg(test)]
 mod tests {
-    use metrics::{counter, describe_counter, gauge, histogram};
+    use metrics::{counter, describe_counter, gauge, histogram, Label};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use metrics_util::parse_quantiles;
 
@@ -696,5 +750,76 @@ mod tests {
             Some("health{worker=\"http://w\\\"1\\\\\",note=\"a\\nb\"} 1"),
             "{workers}"
         );
+    }
+
+    /// A scrape writes the labels of a series straight from its key and
+    /// calls the exporter's cleaners only for a text that needs them: a
+    /// clean text is borrowed, and the page must read as those cleaners
+    /// write every name, and keep its samples in the order of their label
+    /// pairs.
+    #[test]
+    fn a_scrape_reads_as_the_exporters_cleaners_write_and_order_it() {
+        // A clean family name, label name and worker address are borrowed
+        // under the rules the scrape applies.
+        assert!(matches!(
+            cleaned("requests_total", metric_name_char, sanitize_metric_name),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            cleaned(WORKER_LABEL, label_key_char, sanitize_label_key),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            cleaned(WORKER_A, label_value_char, sanitize_label_value),
+            Cow::Borrowed(WORKER_A)
+        ));
+
+        // Every ASCII character and one beyond: first in a text, later in
+        // it, and behind a backslash.
+        let texts: Vec<String> = (0..=0x7f_u8)
+            .map(char::from)
+            .chain(['é'])
+            .flat_map(|c| [format!("{c}"), format!("a{c}"), format!("\\{c}")])
+            .collect();
+        let series = store();
+        let (_, workers) = scrape(&series, || {
+            gauge!("labels", "worker" => "a").set(1.0);
+            for text in &texts {
+                counter!(text.clone(), "worker" => "w").increment(1);
+                let labels = vec![
+                    Label::new("worker", text.clone()),
+                    Label::new(text.clone(), "v"),
+                ];
+                gauge!("labels", labels).set(1.0);
+            }
+        });
+
+        let mut families: BTreeMap<String, usize> = BTreeMap::new();
+        for text in &texts {
+            *families.entry(sanitize_metric_name(text)).or_default() += 1;
+        }
+        let mut expected = String::new();
+        for (name, samples) in families {
+            expected.push_str(&format!("# TYPE {name} counter\n"));
+            expected.push_str(&format!("{name}{{worker=\"w\"}} 1\n").repeat(samples));
+            expected.push('\n');
+        }
+        let mut pairs: Vec<Vec<String>> = texts
+            .iter()
+            .map(|text| {
+                vec![
+                    format!("worker=\"{}\"", sanitize_label_value(text)),
+                    format!("{}=\"v\"", sanitize_label_key(text)),
+                ]
+            })
+            .collect();
+        pairs.push(vec![String::from("worker=\"a\"")]);
+        pairs.sort();
+        expected.push_str("# TYPE labels gauge\n");
+        for pairs in pairs {
+            expected.push_str(&format!("labels{{{}}} 1\n", pairs.join(",")));
+        }
+        expected.push('\n');
+        assert_eq!(workers, expected);
     }
 }
