@@ -90,14 +90,14 @@ pub struct WorkerDescriptor {
     pub check_interval_secs: u64,
 }
 
-/// What a host keeps of one membership generation.
+/// What a program keeps of one membership generation.
 ///
 /// The registry ends a generation at every membership change: a
 /// registration, a removal, a property rebuild and a refresh of a worker's
 /// cards each publish a new one, and so does the first read of the
 /// model-less generation after any of them. At each publish it builds the
-/// host's value from the generation's members, and a reader that asks for a
-/// generation gets that value. What a host derives from one generation
+/// program's value from the generation's members, and a reader that asks for a
+/// generation gets that value. What a program derives from one generation
 /// lives in its value and falls with it, and a selection of several roles
 /// reads every role from the one value it took.
 ///
@@ -133,7 +133,7 @@ struct GlobalRoutingSnapshot<G> {
 
 /// Model index using immutable snapshots for lock-free reads.
 /// Updates create new snapshots (copy-on-write semantics), each with its
-/// host's value of the generation ([`Generation`]).
+/// program's value of the generation ([`Generation`]).
 ///
 /// The maps a request's model id or a worker's URL is looked up in hash with
 /// [`FxBuildHasher`]: the keys are the server's own (registration and
