@@ -6,7 +6,10 @@ README beside this folder is the user's guide (how to write a policy document, h
 service). This file is the design.
 
 It describes the crate as it stands on main (read at commit `882be6f4f`, 2026-11-22) and what is
-planned. Every part has one of three marks:
+planned. One thing on that commit is on its way out: the gateway still calls the engine through
+an earlier integration, which a pull request of its own removes first (stage 0 of section 16).
+Where the text speaks of the gateway, it speaks of main with that integration taken out. Every
+part has one of three marks:
 
 - **[built]**: on main as described.
 - **[partly]**: on main in part. The text says which part.
@@ -50,8 +53,9 @@ in two places:
 | Engine in the gateway | the engine, inside the gateway | the gateway, in the same structures as classic | **[planned]** |
 | Engine in a controller | the controller | the controller | **[planned]** |
 
-Today the gateway does not call the engine. An earlier integration was taken out so that the crate
-can be finished first. Section 9 says how the gateway gets it back, as one small change.
+On main the gateway still calls the engine through an earlier integration. That integration is
+taken out first (stage 0 of section 16), so that the crate can be finished before the gateway
+depends on it. Section 9 says how the gateway gets the engine back, as one small change.
 
 ### The seven rules
 
@@ -133,7 +137,7 @@ Lines of each folder under `src/`, tests included, counted on main.
 
 The engine that stays (section 5.7) is `engine/policy_engine.rs` and the folder beside it: 6,228
 lines with their tests, and 1,818 more for the record writer and its tests. The engine that goes
-is `engine/store_backed_engine.rs`: 9,865 lines.
+is `engine/store_backed_engine.rs` and the folder beside it: 12,461 lines with their tests.
 
 ## 3. The policy document **[built]**
 
@@ -586,7 +590,7 @@ pub struct RequestFacts<'a> {
     pub budget_micros: u32,        // time left for the decision
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a PoolRing>, // the list's hash ring, where a policy needs one
-    // nine more fields: see 5.8
+    // nine more fields: `affinity`, `named` and `ring_awaited`, and the six that 5.8 removes
 }
 
 pub struct Constraints<'a> {
@@ -714,12 +718,17 @@ Main has two engines behind one trait (`DecisionEngine`, `engine/decision_engine
 |---|---|---|
 | decides over | the host's worker objects, read in place | records copied into the policy store |
 | keeps leases | no: the host hands the lease back with each event | yes, in the store |
-| used by | nothing on main, once the gateway's integration is out | the controller's service |
-| size | 6,228 lines | 9,865 lines, plus the store's tables |
+| used by | the gateway's earlier integration, until stage 0 takes it out; then nothing | the controller's service |
+| size | 6,228 lines with its folder | 12,461 lines with its folder, plus the store's tables |
 
 **The design keeps `PolicyEngine` and removes the store-backed engine [planned].** The controller
 gets worker objects of its own (section 10), so its service calls the same engine a gateway
 calls. The switch is made whole, in one change, after the kept engine is proven (decision 5).
+
+The two engines still share types. `Request`, `DecideOutcome`, `DecisionRefused`, `SweepOutcome`
+and a few helpers are defined in the old engine's file, and `Said` (section 6) in the store. They
+move into the kept engine's own modules first, with no behaviour change. Without that move,
+deleting the old engine breaks the kept one.
 
 ### 5.8 What changes in the kept engine **[planned]**
 
@@ -754,6 +763,7 @@ pub struct Lease {
     pub tokens: u32,                     // the prompt size the request stated
 }
 
+// store/leases.rs today; it moves beside `Lease` before the old engine is deleted (5.7)
 pub enum Said {
     Dispatched(Dispatch, Instant),         // the request was sent to a target
     Completed(Outcome),                    // one side ended, with its outcome
@@ -853,8 +863,8 @@ into blocks, inside `make`; borrow the load snapshot; try the targets in order, 
 worker's health again; keep the decision's lease and report each event; turn a refusal into a
 status.
 
-That is too much. The integration that was taken out of the gateway needed a module of its own of
-19 files and 13,856 lines (tests included) for it, and a branch in every route.
+That is too much. The gateway's earlier integration needs a module of its own of 19 files and
+13,856 lines (tests included) for it, and a branch in every route.
 
 ### 8.2 The contract as designed **[planned]**
 
@@ -971,8 +981,8 @@ The design adds no second mechanism where one exists.
 
 ## 9. The gateway as a host **[planned]**
 
-The gateway does not call the engine today. This section is the shape of the one change that
-brings it back, after the crate meets section 16's tests.
+After stage 0 the gateway does not call the engine. This section is the shape of the one change
+that brings it back, after the crate meets section 16's tests.
 
 ### 9.1 Where classic chooses a worker
 
@@ -1171,7 +1181,7 @@ On main: 18 sheets, 482 lines.
 
 | | Sheets | Lines |
 |---|---|---|
-| replayed, no defect | 15 | 426 |
+| replayed and passing | 15 | 426 |
 | recorded, replayed by nothing (`pair_select`, `rank_pin`, `constraint_decider`) | 3 | 56 |
 | replayed through the engine that stays (`PolicyEngine`) | **0** | **0** |
 | replayed lines held to an answer of the crate's own, not classic's | | 23 |
@@ -1342,7 +1352,7 @@ this decision.
 
 | Option | Cost |
 |---|---|
-| (a) Whole: the kept engine is finished and proven in the crate, the controller's parts are added beside the old engine, one small change switches the deciding threads, one deletion follows. | Nothing of the new path runs in a controller until the switch. |
+| (a) Whole: the kept engine is finished and proven in the crate, the controller's parts are added beside the old engine, one small change switches the deciding threads, one deletion follows. | Nothing of the new path runs in a controller until the switch. The types both engines share move out of the old engine's file first (section 5.7). |
 | (b) Document by document, behind a test at apply. | A test at apply, two load pollers for a time, a temporary call, and refactors inside the old engine that are deleted afterwards. |
 
 **Recommendation: (a).**
@@ -1447,6 +1457,9 @@ behind the one before.
 | 12 | A sampling pick converts a list's load reports once | the bench's cell before and after |
 | 13 | A request with no routing key under a sessions rule is decided by one pick | a case that counts the records read, failing before; the bench's cell; the `manual` and sticky lines unmoved |
 | 14 | A pair is decided with the host's load reports, as a single request is | a case that fails before; the bench's pair cell |
+
+One more change runs beside them: the types both engines share move out of the old engine's file
+into the kept engine's modules, with no behaviour change (section 5.7).
 
 Behind them, in the crate: `random` and `round_robin` details of the short path; pairs and encode
 requests over worker lists; the shadow's types moved to their own file. Waiting for a decision:
