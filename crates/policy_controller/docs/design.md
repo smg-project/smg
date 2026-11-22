@@ -1222,10 +1222,12 @@ Four things follow, and they are the first work of section 16.
    `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The first 20 are in the four host sheets: the
    rules that hold them apart are the old engine's, and the kept engine has none of them. The
    other three are the kept engine's. The 2 of `prefix_hash` differ from classic there too (a
-   key folds whole blocks), and they turn with the ring of decision 3. The 1 of `manual`
-   cannot be asked (validation refuses a sessions rule under a pair plan). Each of the 23 is
-   made equal to classic or named as an accepted difference: the 3 in stage 1, the 20 in
-   stage 4.
+   key folds whole blocks). One of them turns in the crate on a ring its caller lends
+   (decision 3). The other measures which tokens are in a prompt's head, which is then the
+   caller's recipe: it is proven at stage 3, by a gateway test of classic's own function. The
+   1 of `manual` cannot be asked (validation refuses a sessions rule under a pair plan). Each
+   of the 23 is made equal to classic or named as an accepted difference: two in stage 1, one
+   at stage 3, the 20 in stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
    `least_load` and `consistent_hashing`. Their only recorded lines are over pools in trouble.
    New recorders are decision 2.
@@ -1482,7 +1484,7 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | Stage | Work | Ends when |
 |---|---|---|
 | 0 | The earlier gateway integration is taken out. | The gateway routes by classic alone; every classic test and bench cell is as before. |
-| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 14 sheets that record a decision (408 of section 13.1's 482) replays through the kept engine over worker objects; each difference from classic is fixed or accepted as a named difference. |
+| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 14 sheets that record a decision (408 of section 13.1's 482) replays through the kept engine over worker objects; each difference from classic is fixed, accepted as a named difference, or left by name to stage 3's proof (one `prefix_hash` line). |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
 | 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; a cluster run beside classic. |
 | 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. |
