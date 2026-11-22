@@ -14,7 +14,10 @@
 //!   its rank, its wire, and its engine kind, zone and labels as the
 //!   document lists them. It lists the pool's engines and numbers the pool. The
 //!   gateway keeps the value beside the list it was made from. No live
-//!   value of a worker is in it.
+//!   value of a worker is in it. What no worker object holds, the program
+//!   that holds it says here too, once a worker
+//!   ([`PoolRecords::with_fixed_facts`]): whether the worker takes images,
+//!   and what it states for a request's hard demands.
 //! - **Once a load snapshot.** A snapshot is published whole and never
 //!   changed, so a worker's report reads the same at every decision that
 //!   holds the snapshot. One decision that writes every record of a list
@@ -58,10 +61,12 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, worker::Wor
 
 use super::{
     decision::Decision,
+    demands::DemandFacts,
     framework::{Engine, Scratch},
     view::{
-        fingerprint, Candidate, Constraints, Engines, Health, OverloadRegime, PoolFacts,
-        RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
+        fingerprint, Candidate, Constraints, Engines, FixedFacts, Health, OverloadRegime,
+        PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,
+        LOAD_REPORT_CLOCK_HISTORY_MS,
     },
 };
 use crate::{document::spec::AppliedSpec, load::load_row};
@@ -361,6 +366,10 @@ pub struct PoolRecords {
     fixed: Box<[Candidate]>,
     /// Each worker's id, by position.
     ids: Box<[WorkerId]>,
+    /// What each worker states for a request's hard demands, by position
+    /// ([`FixedFacts::demands`]), and none where no worker of the list
+    /// states one: such a list allocates no column.
+    demand_facts: Option<Box<[DemandFacts]>>,
     /// The ids in their own order, each with its worker's position
     /// ([`Self::place_of`]). Empty where two rows of the list carry one
     /// id.
@@ -396,13 +405,32 @@ pub struct PoolRecords {
 
 impl PoolRecords {
     /// The records of `workers`, under the document `spec` and on `clock`,
-    /// whose count of pools this moves.
+    /// whose count of pools this moves. Nothing is said of a worker beside
+    /// its object ([`Self::with_fixed_facts`]).
     ///
     /// Called once a list. It reads each worker's registration and none of
     /// its live state.
     #[must_use]
     pub fn new(workers: &[Arc<dyn Worker>], spec: &AppliedSpec, clock: &DecisionClock) -> Self {
+        Self::with_fixed_facts(workers, spec, clock, |_| FixedFacts::default())
+    }
+
+    /// [`Self::new`], with what the program says of each worker beside its
+    /// object ([`FixedFacts`]): `facts_of` is asked once a worker, here, and
+    /// never at a decision. Whether a worker takes images goes into its
+    /// record. What it states for a request's hard demands goes into a
+    /// column beside the records ([`Self::demand_facts`]), which the first
+    /// worker that states one makes: a list where none does allocates
+    /// nothing for it.
+    #[must_use]
+    pub fn with_fixed_facts(
+        workers: &[Arc<dyn Worker>],
+        spec: &AppliedSpec,
+        clock: &DecisionClock,
+        mut facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
+    ) -> Self {
         let lists = spec.lists();
+        let mut demand_facts: Option<Box<[DemandFacts]>> = None;
         let fixed: Box<[Candidate]> = workers
             .iter()
             .zip(0u32..)
@@ -424,6 +452,14 @@ impl PoolRecords {
                         .collect();
                     Some(lists.positions(kind, spec.zone.as_deref(), &labels))
                 };
+                let FixedFacts { vision, demands } = facts_of(worker);
+                if demands != DemandFacts::default() {
+                    let column = demand_facts
+                        .get_or_insert_with(|| vec![DemandFacts::default(); workers.len()].into());
+                    if let Some(entry) = column.get_mut(position as usize) {
+                        *entry = demands;
+                    }
+                }
                 Candidate {
                     position,
                     id,
@@ -436,6 +472,7 @@ impl PoolRecords {
                     engine_kind: listed.map_or(0, |listed| listed.engine_kind),
                     zone: listed.map_or(0, |listed| listed.zone),
                     labels: listed.map_or(0, |listed| listed.labels),
+                    vision,
                     // No admission window is the record's to know: both
                     // bits read open, and a caller that holds a window
                     // writes its own.
@@ -465,6 +502,7 @@ impl PoolRecords {
         Self {
             fixed,
             ids,
+            demand_facts,
             places: places.into(),
             engine_rows,
             engine_ends,
@@ -516,10 +554,21 @@ impl PoolRecords {
 
     /// The fixed half of each worker's record, by its place in the list:
     /// its position, id, key, role, rank, wire, engine kind, zone and
-    /// labels, and every live field at rest.
+    /// labels, whether it takes images where the program said so, and
+    /// every live field at rest.
     #[must_use]
     pub fn fixed(&self) -> &[Candidate] {
         &self.fixed
+    }
+
+    /// What each worker states for a request's hard demands, by its place
+    /// in the list, as the program said when the records were made
+    /// ([`Self::with_fixed_facts`]): one entry a worker. `None` where no
+    /// worker of the list states one, so a request that demands something
+    /// tests once and reads no column.
+    #[must_use]
+    pub fn demand_facts(&self) -> Option<&[DemandFacts]> {
+        self.demand_facts.as_deref()
     }
 
     /// The generation of the document the records were read under. Records

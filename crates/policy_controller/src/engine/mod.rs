@@ -68,8 +68,8 @@ pub use store_backed_engine::{
 };
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
-    Constraints, Engines, HashKind, Header, Health, Identity, KeyedRow, LoadRow, MediaCounts,
-    ModelFingerprint, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session,
-    SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
+    Constraints, Engines, FixedFacts, HashKind, Header, Health, Identity, KeyedRow, LoadRow,
+    MediaCounts, ModelFingerprint, OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role,
+    Session, SignalSource, WireModes, WorkerId, ZoneCapacity, TEXT_BYTES_PER_TOKEN,
 };
 pub use warm_up::{WarmUpRule, WarmUpState};

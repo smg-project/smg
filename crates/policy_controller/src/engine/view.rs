@@ -7,6 +7,7 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
+use super::demands::DemandFacts;
 use crate::{load::signals, policies::consistent_hashing::PoolRing, tracking::in_flight};
 
 /// The stable identity of a candidate: a hash of the registration key and the
@@ -806,6 +807,22 @@ pub struct Candidate {
     /// Zero when the host carries none. After the contract's first cut (the
     /// wire numbers its fields in the record's order).
     pub key: u32,
+}
+
+/// What a program says of a worker for the half of its record that no
+/// request changes, where the worker object holds no such fact: whether
+/// the worker takes images, and what it states for a request's hard
+/// demands. A host that keeps these beside its workers tells them to what
+/// writes the workers' records, once a list: a gateway of its own
+/// registrations, a controller of the stored worker an object stands for.
+/// The default says nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixedFacts {
+    /// Whether the worker takes images ([`Candidate::vision`]).
+    pub vision: bool,
+    /// What the worker states for a request's hard demands: its entry of
+    /// the column beside the records.
+    pub demands: DemandFacts,
 }
 
 /// How far back the store's decision clock starts.

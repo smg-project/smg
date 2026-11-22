@@ -4,12 +4,14 @@
 //! builds its view of the pool from its own rows
 //! ([`StoreSnapshot::view`]), with the demand column beside it
 //! ([`StoreSnapshot::demand_facts`]). The record writer builds
-//! [`PoolRecords`] from worker objects. This case writes one fleet to a
-//! store, has the worker host lay the fleet's objects
-//! ([`Objects::follow`]), and compares what a decision is handed by each,
-//! field by field. The store's count of the workers that stand outside the
-//! document's lists ([`OutsideLists`]) is compared beside them: it is what
-//! tells an operator that a zone was mistyped.
+//! [`PoolRecords`] from worker objects, and is told by the objects' holder
+//! what a row states that its object does not carry
+//! ([`Objects::fixed_facts`]). This case writes one fleet to a store, has
+//! the worker host lay the fleet's objects ([`Objects::follow`]), and
+//! compares what a decision is handed by each, field by field. The
+//! store's count of the workers that stand outside the document's lists
+//! ([`OutsideLists`]) is compared beside them: it is what tells an
+//! operator that a zone was mistyped.
 //!
 //! How to read it:
 //!
@@ -74,20 +76,9 @@ const DIFFERS: &[(&str, &str)] = &[
         "from where a row is reachable is not carried to its object",
     ),
     (
-        "candidate.vision",
-        "whether a row takes images is not carried to its object, and the writer is handed no source of it",
-    ),
-    (
         "candidate.wire_modes",
         "an object speaks one wire of the set its row states",
     ),
-    (
-        "demand.host_pipeline",
-        "the writer keeps no demand column yet",
-    ),
-    ("demand.references", "the writer keeps no demand column yet"),
-    ("demand.runtime", "the writer keeps no demand column yet"),
-    ("demand.window", "the writer keeps no demand column yet"),
     (
         "outside.engines",
         "the store counts the workers whose engine family the document does not list: the writer drops the bit",
@@ -573,20 +564,22 @@ fn by_the_store(store: &MemoryStore, now: Instant) -> Handed {
     }
 }
 
-/// The writer's side: the records of the registry's list, written for one
-/// decision. The writer keeps no demand column and no count of the workers
-/// outside the lists: every record states nothing for a demand, and the
-/// count reads zero.
-fn by_the_writer(registry: &WorkerRegistry<Members>, spec: &AppliedSpec, now: Instant) -> Handed {
-    let workers = registry.get_by_model(MODEL);
+/// The writer's side: the records of the registry's list, made with what
+/// the objects' holder says of each object's row and written for one
+/// decision. The writer keeps no count of the workers outside the lists:
+/// the count reads zero.
+fn by_the_writer(objects: &Objects<Members>, spec: &AppliedSpec, now: Instant) -> Handed {
+    let workers = objects.registry().get_by_model(MODEL);
     let clock = DecisionClock::new();
-    let records = PoolRecords::new(&workers, spec, &clock);
+    let records = PoolRecords::with_fixed_facts(&workers, spec, &clock, objects.fixed_facts());
+    let demanded = records.demand_facts();
     let live = Live::at(spec.engine(), &clock, now, None, None);
     let mut written = Vec::new();
     let (written, pool) = records.write(&workers, &live, &mut written);
-    let rows = written.iter().map(|row| {
+    let rows = written.iter().zip(0..).map(|(row, at): (_, usize)| {
         let mut fields = candidate_fields(row);
-        fields.extend(demand_fields(DemandFacts::default()));
+        let stated = demanded.and_then(|column| column.get(at)).copied();
+        fields.extend(demand_fields(stated.unwrap_or_default()));
         (row.key, fields)
     });
     Handed {
@@ -664,14 +657,13 @@ fn the_writers_records_differ_from_the_stores_view_in_the_listed_fields_alone() 
     }
     store.publish_now();
 
-    let registry = Arc::new(WorkerRegistry::<Members>::new());
-    let objects = Objects::new(Arc::clone(&registry));
+    let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()));
     objects.follow(&store);
     assert_eq!(objects.len(), fleet().len(), "one object a row");
 
     let now = Instant::now();
     let stored = by_the_store(&store, now);
-    let written = by_the_writer(&registry, &document(), now);
+    let written = by_the_writer(&objects, &document(), now);
     let keys = |side: &Handed| side.rows.keys().copied().collect::<Vec<_>>();
     assert_eq!(
         keys(&stored).len(),

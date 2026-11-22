@@ -937,3 +937,60 @@ fn a_workers_place_is_found_by_its_id_and_by_no_id_two_rows_carry() {
         assert_eq!(pool.place_of(worker_id(worker.as_ref())), None);
     }
 }
+
+/// What a program says of a worker beside its object is asked once a
+/// worker when the records are made. Whether the worker takes images is in
+/// its record, fixed and written. What it states for a request's hard
+/// demands stands in a column of the list's length, which only a worker
+/// that states one makes.
+#[test]
+fn what_a_program_says_of_a_worker_is_read_once_when_the_records_are_made() {
+    let workers = fleet(3);
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let window = DemandFacts {
+        window: 4_096,
+        ..DemandFacts::default()
+    };
+
+    // Nothing said: no column, and no worker takes images.
+    let silent = PoolRecords::new(&workers, &spec, &clock);
+    assert_eq!(silent.demand_facts(), None);
+    assert!(silent.fixed().iter().all(|row| !row.vision));
+
+    // The bit alone makes no column.
+    let asked = Cell::new(0);
+    let sees = PoolRecords::with_fixed_facts(&workers, &spec, &clock, |worker| {
+        asked.set(asked.get() + 1);
+        FixedFacts {
+            vision: worker.url() == url(1),
+            ..FixedFacts::default()
+        }
+    });
+    assert_eq!(asked.get(), 3, "once a worker");
+    assert_eq!(sees.demand_facts(), None);
+    let takes_images = |rows: &[Candidate]| rows.iter().map(|row| row.vision).collect::<Vec<_>>();
+    assert_eq!(takes_images(sees.fixed()), [false, true, false]);
+
+    // One worker that states a demand makes the column, of the list's
+    // length, with nothing stated for the others.
+    let stated = PoolRecords::with_fixed_facts(&workers, &spec, &clock, |worker| FixedFacts {
+        vision: worker.url() == url(1),
+        demands: if worker.url() == url(2) {
+            window
+        } else {
+            DemandFacts::default()
+        },
+    });
+    let nothing = DemandFacts::default();
+    assert_eq!(stated.demand_facts(), Some(&[nothing, nothing, window][..]));
+
+    // A decision's records carry the bit, whole and one worker's alone, and
+    // no decision asks the program again.
+    let live = Live::at(spec.engine(), &clock, Instant::now(), None, None);
+    let mut rows = Vec::new();
+    let (written, _) = sees.write(&workers, &live, &mut rows);
+    assert_eq!(takes_images(written), [false, true, false]);
+    assert!(sees.read(&workers, &live, 1).is_some_and(|row| row.vision));
+    assert_eq!(asked.get(), 3);
+}

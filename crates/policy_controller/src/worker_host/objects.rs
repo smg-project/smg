@@ -31,7 +31,7 @@ use super::{
     object::{builder, dial_address, status, unchecked},
 };
 use crate::{
-    engine::view::{LoadRow, WorkerId},
+    engine::view::{FixedFacts, LoadRow, WorkerId},
     store::{
         MembershipChange, MembershipTail, MemoryStore, Overload, Reachability, WorkerFacts,
         WorkerRow, WorkersStore,
@@ -631,6 +631,39 @@ impl<G: Generation> Objects<G> {
             .map(|laid| laid.standing)
     }
 
+    /// What the rows say of their objects for the half of a record that
+    /// no request changes ([`FixedFacts`]): whether a row's worker takes
+    /// images, and what it states for a request's hard demands. An object
+    /// carries neither, so a host that writes records of its objects asks
+    /// here, once a list.
+    ///
+    /// The answer holds the holder's read lock until it is dropped: one
+    /// lock a list, and no write of the holder inside a list's build. It
+    /// finds an object's row among the rows that dial the object's
+    /// address, in the holder's own maps, and asks the registry nothing.
+    /// It says nothing of an object the holder did not lay, and of one
+    /// another object has taken the place of.
+    pub fn fixed_facts(&self) -> impl FnMut(&Arc<dyn Worker>) -> FixedFacts + '_ {
+        let held = self.held.read();
+        move |object| {
+            let spec = &object.metadata().spec;
+            let address = spec.dp_base_url.as_deref().unwrap_or(&spec.url);
+            let stands_for = |row: &WorkerId| {
+                let laid = held.objects.get(row).and_then(|id| held.rows.get(id));
+                laid.is_some_and(|laid| Arc::ptr_eq(&laid.object, object))
+            };
+            let dialing = held.ranks.get(address).into_iter().flatten();
+            dialing
+                .map(|(_, row)| row)
+                .find(|row| stands_for(row))
+                .and_then(|row| held.facts.get(row))
+                .map_or_else(FixedFacts::default, |facts| FixedFacts {
+                    vision: facts.vision,
+                    demands: facts.demand_facts,
+                })
+        }
+    }
+
     /// The registry's id of the object that stands for `row`.
     pub fn object(&self, row: WorkerId) -> Option<ObjectId> {
         self.held.read().objects.get(&row).cloned()
@@ -1181,6 +1214,7 @@ mod tests {
             spec::{BindingSpec, Match, OverloadSpec},
             AppliedSpec, PolicySpec,
         },
+        engine::demands::DemandFacts,
         store::{
             GatewayId, HealthSink, JournalKinds, LoadSink as _, LoadSource, MemoryStore,
             Registrant, WorkerFacts, WorkerPatch, WorkerStatus,
@@ -2094,6 +2128,46 @@ mod tests {
             replica.follow();
             assert!(checked(&replica, A), "the row once any gateway dials it");
         }
+    }
+
+    /// What a row states for a request's hard demands is said of the row's
+    /// own object, rank by rank: nothing of a row that states nothing, and
+    /// nothing of an object the holder did not lay, though it dials a
+    /// row's address.
+    #[test]
+    fn the_holder_says_of_an_object_what_its_row_states_for_a_demand() {
+        let demands = |window| DemandFacts {
+            runtime: 7,
+            references: true,
+            window,
+            ..DemandFacts::default()
+        };
+        let replica = Replica::new();
+        replica.store.upsert(WorkerFacts {
+            vision: true,
+            demand_facts: demands(8_192),
+            ..facts(A, 1)
+        });
+        replica.store.upsert(facts(B, 1));
+        for (key, rank, window) in [(C, 0, 2_048), (D, 1, 4_096)] {
+            replica.store.upsert(WorkerFacts {
+                demand_facts: demands(window),
+                ..rank_facts(key, E, rank)
+            });
+        }
+        replica.follow();
+
+        let stranger = object(&replica.row(A));
+        let mut facts_of = replica.objects.fixed_facts();
+        let whole = FixedFacts {
+            vision: true,
+            demands: demands(8_192),
+        };
+        assert_eq!(facts_of(&replica.at(A)), whole);
+        assert_eq!(facts_of(&replica.at(B)), FixedFacts::default());
+        assert_eq!(facts_of(&replica.at(C)).demands.window, 2_048);
+        assert_eq!(facts_of(&replica.at(D)).demands.window, 4_096);
+        assert_eq!(facts_of(&stranger), FixedFacts::default());
     }
 
     /// The first act: by the snapshot for a row that stood before the first
