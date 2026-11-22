@@ -4490,7 +4490,7 @@ pub(crate) mod tests {
             decision_slot::DecisionSlot,
             demands::{DemandFacts, Demands},
             framework::{self, DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
-            sticky_sessions::SessionVerdict,
+            sticky_sessions::{SessionExpiry, SessionVerdict},
             view::{
                 Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts,
                 RequestFacts, Role, Session, WireModes, WorkerId,
@@ -8165,6 +8165,43 @@ pub(crate) mod tests {
         let dropped = SweepOutcome { leases: 0, pins: 1 };
         assert_eq!(door.sweep(at(61)), dropped, "a second past the pin's end");
         assert_eq!(sessions.len(), 0);
+    }
+
+    /// Under a rule that sweeps, a key ends with its idle time here, in the
+    /// engine's table and of record: the door lends its decisions the pins
+    /// of record, whose ends count no sweep. A lease dispatched behind a
+    /// reload writes that end too. Idle time 60 s, a sweep every 3,600 s.
+    #[test]
+    fn a_key_ends_with_its_idle_time_in_the_table_and_of_record() {
+        let store = fleet(1);
+        let door = StoreBackedEngine::new(Arc::clone(&store));
+        let ruled = |generation: u64| {
+            let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+            document.generation = generation;
+            let rule = document.bindings[0].sessions.as_mut();
+            let rule = rule.expect("the preset's rule");
+            (rule.ttl_s, rule.sweep_s) = (60, 3_600);
+            AppliedSpec::validate(&document).expect("the document validates")
+        };
+        store.apply(ruled(2)).expect("a later generation");
+        let now = Instant::now();
+        // A keyed decision's key, its lease and the end of its idle time.
+        let decide = |id: &[u8], key: u64| {
+            let decided = door.decide(GATEWAY, &keyed(id, key, 7), now);
+            let lease = decided.expect("a decision").lease;
+            let lease = lease.expect("a pick's lease").lease;
+            (lease.session, lease.id, lease.issued_micros + 60_000_000)
+        };
+        let of_record = |key: Session| SessionsStore::lookup(&*store, key.get())?.ends;
+        let (key, lease, idle_end) = decide(b"r-1", 7);
+        let held = store.snapshot().spec().engine().sessions().held(key);
+        assert_eq!(held.map(|(_, end)| end), Some(SessionExpiry::At(idle_end)));
+        report(&door, lease, dispatched());
+        assert_eq!(of_record(key), Some(idle_end), "behind a dispatch");
+        let (key, lease, idle_end) = decide(b"r-2", 8);
+        store.apply(ruled(3)).expect("a reload");
+        report(&door, lease, dispatched());
+        assert_eq!(of_record(key), Some(idle_end), "behind a reload");
     }
 
     /// A request for [`MODEL`] under the session key `key`.

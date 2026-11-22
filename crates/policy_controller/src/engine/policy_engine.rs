@@ -489,6 +489,16 @@ impl PolicyEngine {
         Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
     }
 
+    /// The request `maker` makes, as this engine decides it: with no pins of
+    /// record lent ([`Constraints::pins`](super::view::Constraints::pins)).
+    /// Its session table is the only one it reads, whatever the entry.
+    #[inline(always)]
+    fn made<'w>(&'w self, maker: &'w impl RequestMaker) -> Request<'w> {
+        let mut request = maker.make(&self.spec);
+        request.constraints.pins = None;
+        request
+    }
+
     /// A whole decision under the engine's catch: a panic in it costs its
     /// request alone and is counted ([`DecisionEngine::faults`]).
     #[inline]
@@ -561,7 +571,7 @@ impl PolicyEngine {
                 return Ok(None);
             }
         }
-        let mut request = maker.make(&self.spec);
+        let mut request = self.made(maker);
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
             (Phase::Single, WorkerLists::Single(members)) => {
@@ -623,7 +633,7 @@ impl DecisionEngine for PolicyEngine {
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
         self.caught(|| {
-            let mut request = maker.make(&self.spec);
+            let mut request = self.made(maker);
             Ok(match maker.workers() {
                 WorkerLists::Pair(lists) => {
                     pair::decided(self, &lists, &mut request, Some(held), now)

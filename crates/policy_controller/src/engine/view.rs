@@ -1335,7 +1335,9 @@ pub struct Constraints<'a> {
     /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
     /// table holds no pin of, and no other stage reads it. `None` where
     /// the engine's table is the only one, as in a host that embeds the
-    /// engine. In-process only.
+    /// engine. In-process only. A decision lent them ends a key with its
+    /// idle time in the engine's table too, as the record counts no sweep.
+    /// The engine over worker lists reads none.
     pub pins: Option<&'a dyn PinSource>,
     /// The places of the pool's list the request may take, ascending, each
     /// once, where its host holds it to a part of the pool: the workers a

@@ -3862,6 +3862,18 @@ fn absence(bindings: &[Binding]) -> u64 {
     longest.max().unwrap_or(stated)
 }
 
+/// The rule a decision reads the session table under: its binding's, with
+/// no sweep interval where the host lends pins of record
+/// ([`Constraints::pins`]). Such a record ends a pin with its idle time, so
+/// the table ends the key there too and the two never disagree.
+fn read_under(rule: &SessionRule, cx: &Constraints<'_>) -> SessionRule {
+    let sweep_micros = cx.pins.map_or(rule.sweep_micros, |_| 0);
+    SessionRule {
+        sweep_micros,
+        ..*rule
+    }
+}
+
 /// The stages a sessions rule places a key by when its binding's profile does
 /// not decide (every assignment but `delegate`).
 #[derive(Debug, Default)]
@@ -5863,8 +5875,10 @@ impl Engine {
             !handed || scratch.kept_last,
             "the shadow takes a reading behind a plain decision"
         );
+        // The table is read under the rule as this host reads it.
+        let read = read_under(rule, cx);
         let mut pins = if WRITE_SESSIONS {
-            self.sessions.lookup(key, facts.now_micros, rule)
+            self.sessions.lookup(key, facts.now_micros, &read)
         } else if handed {
             found.pins
         } else {
@@ -8540,7 +8554,8 @@ mod tests {
         );
         assert_eq!(engine.sessions().held(key), pinned);
 
-        facts.now_micros += 31;
+        // Idle until 112: the rule's next sweep is at 121.
+        facts.now_micros += 33;
         let expired = engine
             .shadow(&facts, &pool, &rows, &cx, &mut scratch)
             .expect("an expired pin leaves a fresh placement");
