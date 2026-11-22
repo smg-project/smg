@@ -203,7 +203,7 @@ impl RouterFactory {
     /// Register the prefill/decode policies of a pair family (HTTP PD and
     /// gRPC PD), each from its own config or, when unset, the main policy.
     /// They are registered where the family takes its classic placement
-    /// pass ([`policy_controller::placing`]). Where a policy engine places
+    /// pass ([`policy_controller::routed_by`]). Where a policy engine places
     /// the pair plan, or the family refuses, no classic policy decides for
     /// a pair, and one built anyway would start its own tasks.
     fn set_pd_policies(
@@ -212,7 +212,7 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        if !policy_controller::placing(ctx, PlanName::PdPair).is_classic() {
+        if !policy_controller::routed_by(ctx, PlanName::PdPair).is_policy_registry() {
             return;
         }
         Self::set_pair_sides(
@@ -248,7 +248,7 @@ impl RouterFactory {
     /// Encode defaults to consistent hashing over each item's content hash;
     /// prefill/decode default to the main policy when unset. They are
     /// registered where the family takes its classic placement pass
-    /// ([`policy_controller::placing`]), though the gateway's own engine
+    /// ([`policy_controller::routed_by`]), though the gateway's own engine
     /// object stands for the other families: a gateway of many routers
     /// mounts the encode family beside them. None is registered where a
     /// policy engine places the encode plan, or the family refuses.
@@ -259,7 +259,7 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        if !policy_controller::placing(ctx, PlanName::Epd).is_classic() {
+        if !policy_controller::routed_by(ctx, PlanName::Epd).is_policy_registry() {
             return;
         }
         let default_encode_policy = PolicyConfig::ConsistentHashing;

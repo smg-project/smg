@@ -13,7 +13,7 @@ use smg_policy_controller::{
     stages::{Lifecycle, StageRegistry},
 };
 
-use super::{fed, start_in_process, would_start, InProcess, StartError};
+use super::{single_inputs, start_in_process, would_start, InProcess, StartError};
 use crate::config::{
     CacheIndexKind, ManualAssignmentMode, PdPairingMode, PolicyConfig, PowerOfTwoLoadMetric,
     RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
@@ -779,7 +779,7 @@ impl Scorer for ByMedia {
 /// stage that declares nothing starts.
 #[test]
 fn a_stage_that_reads_media_is_not_decided_whole_while_no_route_states_it() -> Case {
-    assert!(!fed().media);
+    assert!(!single_inputs().media);
     let stages = || -> Result<StageRegistry, Box<dyn Error>> {
         let mut stages = StageRegistry::builtin();
         stages.scorer("by-media", || Box::new(ByMedia))?;
@@ -834,7 +834,7 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
         .engine()
         .needs_for("a-model", Phase::Single);
     assert!(declared.affinity && declared.loads);
-    assert!(declared.within(fed()));
+    assert!(declared.within(single_inputs()));
     // Of every routing policy, the engine decides whole all but the three
     // that place by a hash ring or by a header of the request.
     for policy in policies() {
@@ -854,7 +854,7 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
         .spec()
         .engine()
         .needs_for("a-model", Phase::Single);
-    assert!(declared.prompt_size && declared.within(fed()));
+    assert!(declared.prompt_size && declared.within(single_inputs()));
 
     // A supplied document whose profile reads who holds the prompt is
     // decided whole, so it starts: the prefix stage by itself, and the
@@ -879,10 +879,11 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
 }
 
 /// A pair gateway's document is decided whole where each side's stages read
-/// nothing this process does not feed a pair's decision: a worker's record,
-/// its load report or the prompt's size. A side that reads who holds the
-/// prompt or a hash ring keeps the classic pass, and the routing settings
-/// refuse the manual policy on a side.
+/// nothing outside the inputs this process provides for a pair's decision:
+/// a worker's record, its load report or the prompt's size. A side that
+/// reads who holds the prompt or a hash ring keeps the classic pass. A
+/// manual side stops the start: the policy crate's check refuses the
+/// session rule that policy writes under a pair plan.
 #[test]
 fn the_engine_decides_whole_a_pair_this_process_feeds() -> Case {
     for policy in policies() {
@@ -898,11 +899,14 @@ fn the_engine_decides_whole_a_pair_this_process_feeds() -> Case {
             },
             ..RouterConfig::default()
         };
-        let Ok(started) = start_in_process(&config, None) else {
-            assert_eq!(name, "manual");
-            continue;
+        let started = match start_in_process(&config, None) {
+            Ok(started) => started.ok_or("the setting starts an engine")?,
+            Err(refused) => {
+                assert!(matches!(refused, StartError::Spec(_)), "{name}: {refused}");
+                assert_eq!(name, "manual");
+                continue;
+            }
         };
-        let started = started.ok_or("the setting starts an engine")?;
         let classic = matches!(name, "cache_aware" | "consistent_hashing" | "prefix_hash");
         assert_eq!(started.decides_whole(), !classic, "{name}");
     }

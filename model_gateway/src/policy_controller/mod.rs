@@ -15,7 +15,7 @@
 //! primary model the router's workers serve where it names none. A regular
 //! gRPC router asks it in its selection stage. A pair router asks it too
 //! where the gateway follows no controller and the engine decides the
-//! pair plan of the document in force whole ([`placing`]): a gRPC pair
+//! pair plan of the document in force whole ([`routed_by`]): a gRPC pair
 //! router in its selection stage, an HTTP pair router for each attempt's
 //! pair, through prefill admission. A pair family whose plan the routing
 //! settings' document does not name keeps its classic placement pass
@@ -221,62 +221,66 @@ impl InProcess {
     /// They do where the engine decides every request of the document in
     /// force whole today: single requests and pairs, under no sessions
     /// rule, each place picked by its picker alone or decided by a profile
-    /// that asks nothing this process does not feed a whole decision of
-    /// its plan ([`fed`], [`fed_a_pair`]). Under any other document the
-    /// routers keep their classic placement pass, whose policies ask the
-    /// engine for the pick. The set grows with what the engine decides
-    /// whole, and this question goes when it decides every document.
+    /// that asks nothing outside the inputs this process provides for a
+    /// decision of its plan ([`decision_inputs`]). Under any other
+    /// document the routers keep their classic placement pass, whose
+    /// policies ask the engine for the pick. The set grows with what the
+    /// engine decides whole, and this question goes when it decides every
+    /// document.
     pub(crate) fn decides_whole(&self) -> bool {
-        decided_whole(&self.engine)
+        can_decide_every_plan(&self.engine)
     }
 
-    /// Whether the engine decides whole every request the document in
-    /// force plans as `plan`, under what this process feeds a whole
-    /// decision of that plan ([`fed_whole`]). It decides none of a plan no
-    /// binding names ([`placing`]).
-    pub(crate) fn decides(&self, plan: PlanName) -> bool {
+    /// Whether the engine can decide every request the document in force
+    /// plans as `plan`, given the inputs this process provides for a
+    /// decision of that plan ([`decision_inputs`]). It can decide none of
+    /// a plan no binding names ([`routed_by`]).
+    pub(crate) fn can_decide(&self, plan: PlanName) -> bool {
         let engine = self.engine.spec().engine();
-        fed_whole(plan).is_some_and(|fed| engine.decides(plan, fed))
+        decision_inputs(plan).is_some_and(|inputs| engine.can_decide(plan, inputs))
     }
 
     /// Whether a binding of the document in force plans requests as
     /// `plan`.
-    fn plans(&self, plan: PlanName) -> bool {
-        self.engine.spec().engine().plans(plan)
+    fn has_plan(&self, plan: PlanName) -> bool {
+        self.engine.spec().engine().has_plan(plan)
     }
 }
 
-/// Whether `engine` decides every request of its document whole in this
+/// Whether `engine` can decide every request of its document in this
 /// process ([`InProcess::decides_whole`]).
-fn decided_whole(engine: &smg_policy_controller::engine::PolicyEngine) -> bool {
-    engine.spec().engine().decided_whole(fed_whole)
+fn can_decide_every_plan(engine: &smg_policy_controller::engine::PolicyEngine) -> bool {
+    engine
+        .spec()
+        .engine()
+        .can_decide_every_plan(decision_inputs)
 }
 
-/// What this process feeds a whole decision of `plan`: the one place that
-/// says which plans its routes ask the engine whole for. `None` for the
+/// The inputs this process provides for a decision of `plan`: the one
+/// place that says which plans its routes hand the engine. `None` for the
 /// encode plan: no route hands the engine an encode request yet, so a
 /// document that plans one is not decided whole, and the encode family
 /// keeps its classic placement pass.
-fn fed_whole(plan: PlanName) -> Option<Needs> {
+fn decision_inputs(plan: PlanName) -> Option<Needs> {
     match plan {
-        PlanName::Single => Some(fed()),
-        PlanName::PdPair => Some(fed_a_pair()),
+        PlanName::Single => Some(single_inputs()),
+        PlanName::PdPair => Some(pair_inputs()),
         PlanName::Epd => None,
     }
 }
 
-/// What this process feeds a pair's whole decision from its own data,
-/// beyond its two lists' worker objects.
+/// The inputs this process provides for a pair's decision from its own
+/// data, beyond its two lists' worker objects.
 ///
 /// Both pair routes read a request's prompt and state its size. Each
 /// worker's load report is read in the load monitor's snapshot, lent once a
 /// decision ([`engine::PolicyEngine::read_loads`]), by the records of both
 /// lists.
 ///
-/// Not fed yet, so a pair whose side reads one keeps the classic placement
-/// pass: who holds a prompt, a hash ring, a header of the request, a named
-/// signal's cells.
-fn fed_a_pair() -> Needs {
+/// Not provided yet, so a pair whose side reads one keeps the classic
+/// placement pass: who holds a prompt, a hash ring, a header of the
+/// request, a named signal's cells.
+fn pair_inputs() -> Needs {
     Needs {
         prompt_size: true,
         loads: true,
@@ -284,8 +288,8 @@ fn fed_a_pair() -> Needs {
     }
 }
 
-/// What this process feeds a single request's whole decision from its own
-/// data, beyond the worker objects' live state.
+/// The inputs this process provides for a single request's decision from
+/// its own data, beyond the worker objects' live state.
 ///
 /// The routers hash a request's prompt, by its tokens or its text, where
 /// the document's stages read the hashes.
@@ -301,12 +305,12 @@ fn fed_a_pair() -> Needs {
 /// ([`engine::PolicyEngine::read_loads`]), and a worker's count of session
 /// keys in flight on the worker object, with the rest of its record.
 ///
-/// Not fed yet, so a profile that reads one keeps the classic placement
-/// pass: a hash ring, a header of the request, a named signal's cells, and
-/// the media a request carries. No route states a request's media counts
-/// to the engine: a stage that declared them would read none for every
-/// request, with no error.
-fn fed() -> Needs {
+/// Not provided yet, so a profile that reads one keeps the classic
+/// placement pass: a hash ring, a header of the request, a named signal's
+/// cells, and the media a request carries. No route states a request's
+/// media counts to the engine: a stage that declared them would read none
+/// for every request, with no error.
+fn single_inputs() -> Needs {
     Needs {
         token_hashes: true,
         text_hashes: true,
@@ -474,7 +478,7 @@ fn engine_for(
         // A place the engine does not pick alone is decided by its whole
         // pass where the routers ask the engine for every request of the
         // document, and by nothing where they do not.
-        let whole = decided_whole(&engine);
+        let whole = can_decide_every_plan(&engine);
         if let Some(place) = engine.not_alone().filter(|_| !whole) {
             return Err(StartError::NotAlone {
                 profile: place.profile.to_owned(),
@@ -776,82 +780,80 @@ pub(crate) fn feeds(
     (feed, follower)
 }
 
-/// How the requests of one plan's family are placed in this gateway
-/// ([`placing`]).
+/// What routes the requests of one plan in this gateway ([`routed_by`]).
 #[derive(Clone, Copy)]
-pub(crate) enum Placing<'a> {
-    /// A policy engine places them: the family's router is built with it.
-    Engine(&'a Arc<engine::PolicyEngine>),
-    /// The family's classic placement pass places them, with the family's
-    /// own policies.
-    Classic,
-    /// Nothing places them: the family refuses each by name.
+pub(crate) enum RoutedBy<'a> {
+    /// A policy engine: the plan's router is built with it.
+    PolicyEngine(&'a Arc<engine::PolicyEngine>),
+    /// The policies of the policy registry, in the router's classic
+    /// placement pass.
+    PolicyRegistry,
+    /// Nothing: the plan's router refuses each request by name.
     Refused,
 }
 
-impl<'a> Placing<'a> {
-    /// The engine a family's router is built with. `None` over the classic
-    /// placement pass, and for a family that refuses.
-    pub(crate) fn engine(self) -> Option<&'a Arc<engine::PolicyEngine>> {
+impl<'a> RoutedBy<'a> {
+    /// The engine the plan's router is built with. `None` where the policy
+    /// registry routes, and for a plan that refuses.
+    pub(crate) fn policy_engine(self) -> Option<&'a Arc<engine::PolicyEngine>> {
         match self {
-            Self::Engine(policy_engine) => Some(policy_engine),
-            Self::Classic | Self::Refused => None,
+            Self::PolicyEngine(policy_engine) => Some(policy_engine),
+            Self::PolicyRegistry | Self::Refused => None,
         }
     }
 
-    /// Whether the family's classic placement pass places its requests.
-    pub(crate) fn is_classic(self) -> bool {
-        matches!(self, Self::Classic)
+    /// Whether the policy registry's policies route the plan's requests.
+    pub(crate) fn is_policy_registry(self) -> bool {
+        matches!(self, Self::PolicyRegistry)
     }
 }
 
-/// How the requests of `plan`'s family are placed in this gateway: what
-/// the family's router is built from. It is asked once where a router is
-/// built, and never by a request.
+/// What routes the requests of `plan` in this gateway: what the plan's
+/// router is built from. It is asked once where a router is built, and
+/// never by a request.
 ///
-/// A context with no engine object places every family by its classic
-/// pass: the setting is off, or the engine does not decide every plan of
+/// A context with no engine object routes every plan by the policy
+/// registry: the setting is off, or the engine cannot decide every plan of
 /// the document in force.
 ///
 /// Under a followed controller each request is the controller's to decide.
-/// The regular routers ask its engine. No ask reaches it for a pair family
+/// The regular routers ask its engine. No ask reaches it for a pair plan
 /// yet, so each of them refuses by name.
 ///
-/// Where the gateway decides in its own process, the engine object places
-/// a family whose plan the engine decides whole ([`InProcess::decides`]).
-/// A family whose plan no binding of the document names is answered by who
-/// wrote the document. The routing settings mean a classic policy for it,
-/// so it keeps its classic placement pass beside the engine object. A
-/// document its operator supplied is the whole of what the operator means,
-/// so the family refuses by name: its classic pass would run a rule
-/// nobody wrote.
-pub(crate) fn placing(context: &AppContext, plan: PlanName) -> Placing<'_> {
+/// Where the gateway decides in its own process, the engine object routes
+/// a plan the engine can decide ([`InProcess::can_decide`]). A plan no
+/// binding of the document names is answered by who wrote the document.
+/// The routing settings mean a policy of the registry for it, so it keeps
+/// its classic placement pass beside the engine object. A document its
+/// operator supplied is the whole of what the operator means, so the plan
+/// refuses by name: the registry's policy would run a rule nobody wrote.
+pub(crate) fn routed_by(context: &AppContext, plan: PlanName) -> RoutedBy<'_> {
     let Some(policy_engine) = context.policy_engine.as_ref() else {
-        return Placing::Classic;
+        return RoutedBy::PolicyRegistry;
     };
     let Some(started) = &context.in_process else {
-        let pair_family = plan != PlanName::Single;
-        return if pair_family && context.follows_controller() {
-            Placing::Refused
+        let pair_plan = plan != PlanName::Single;
+        return if pair_plan && context.follows_controller() {
+            RoutedBy::Refused
         } else {
-            Placing::Engine(policy_engine)
+            RoutedBy::PolicyEngine(policy_engine)
         };
     };
-    if started.decides(plan) {
-        Placing::Engine(policy_engine)
-    } else if started.origin == DocumentOrigin::Supplied && !started.plans(plan) {
-        Placing::Refused
+    if started.can_decide(plan) {
+        RoutedBy::PolicyEngine(policy_engine)
+    } else if started.origin == DocumentOrigin::Supplied && !started.has_plan(plan) {
+        RoutedBy::Refused
     } else {
-        Placing::Classic
+        RoutedBy::PolicyRegistry
     }
 }
 
-/// The refusing router for a pair family nothing places in this gateway
-/// ([`Placing::Refused`]): the HTTP pair, the gRPC pair or the gRPC encode
-/// pair router of `plan`. It mounts under the family's usual id so the
-/// gateway can select it. `None` where the family is its own router.
+/// The refusing router for a pair plan nothing routes in this gateway
+/// ([`RoutedBy::Refused`]): the HTTP pair, the gRPC pair or the gRPC encode
+/// pair router of `plan`. It mounts under the router's usual id so the
+/// gateway can select it. `None` where the plan has a router of its own.
 pub(crate) fn undecided(context: &AppContext, plan: PlanName) -> Option<Box<dyn RouterTrait>> {
-    matches!(placing(context, plan), Placing::Refused)
+    matches!(routed_by(context, plan), RoutedBy::Refused)
         .then(|| Box::new(Undecided) as Box<dyn RouterTrait>)
 }
 

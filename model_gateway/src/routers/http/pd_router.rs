@@ -599,8 +599,8 @@ impl PDRouter {
             rate_limit_manager: ctx.rate_limit_manager.clone(),
             // The engine that places the pair plan, where one does:
             // elsewhere the router takes its classic placement pass.
-            policy_engine: policy_controller::placing(ctx, PlanName::PdPair)
-                .engine()
+            policy_engine: policy_controller::routed_by(ctx, PlanName::PdPair)
+                .policy_engine()
                 .cloned(),
             keeps_target: placement::pair_keeps_target(
                 &ctx.router_config.mode,
@@ -3817,7 +3817,7 @@ fn upstream_error_message(body: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod own_tests;
+mod in_process_tests;
 
 #[cfg(test)]
 mod placed_tests;

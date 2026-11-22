@@ -173,65 +173,72 @@ impl Engine {
         })
     }
 
-    /// Whether the document plans requests as `plan`, and each of them is
-    /// one a host has decided whole in its own process, where it feeds a
-    /// whole decision of that plan `fed`. The host says which plans it
-    /// decides so, and nothing here names one. Each binding of the plan
-    /// states no sessions rule, and each place of it is one of two:
+    /// Whether a host that asks the engine in its own process can have it
+    /// decide every request the document plans as `plan`, given the
+    /// `inputs` the host provides for a decision of that plan. `false`
+    /// where no binding plans requests so. The host says which plans it
+    /// hands the engine, and nothing here names one. Each binding of the
+    /// plan states no sessions rule, and each place of it is one of two:
     ///
     /// - one pick of its picker decides it ([`Self::not_alone`]), which
     ///   asks nothing of the host;
-    /// - its stages declare nothing a host must feed outside `fed`
-    ///   ([`Needs::within`]): the whole pass of the host's own process
-    ///   decides it over records written from the host's own data.
+    /// - its stages declare no need outside `inputs` ([`Needs::within`]):
+    ///   the engine decides it over records written from the host's own
+    ///   data.
     ///
-    /// A host that feeds nothing still has decided whole a place whose
+    /// A host that provides nothing can still have a place decided whose
     /// stages read a worker's record and nothing more. The set of places
-    /// grows with what a host feeds a whole decision.
+    /// grows with the inputs a host provides.
     ///
     /// A host that serves each plan's requests by a route of their own
-    /// asks this a plan at a time: the routes of a plan the document does
-    /// not decide so keep the host's other placement, beside the routes of
-    /// a plan it does.
+    /// asks this a plan at a time: the routes of a plan the engine cannot
+    /// decide keep the host's other placement, beside the routes of a plan
+    /// it can.
     #[must_use]
-    pub fn decides(&self, plan: PlanName, fed: Needs) -> bool {
-        self.plans(plan) && self.planned(plan).all(|binding| self.decided(binding, fed))
+    pub fn can_decide(&self, plan: PlanName, inputs: Needs) -> bool {
+        self.has_plan(plan)
+            && self
+                .bindings_with_plan(plan)
+                .all(|binding| self.can_decide_binding(binding, inputs))
     }
 
     /// Whether a binding of the document plans requests as `plan`.
     #[must_use]
-    pub fn plans(&self, plan: PlanName) -> bool {
-        self.planned(plan).next().is_some()
+    pub fn has_plan(&self, plan: PlanName) -> bool {
+        self.bindings_with_plan(plan).next().is_some()
     }
 
     /// The bindings of the document that plan requests as `plan`.
-    fn planned(&self, plan: PlanName) -> impl Iterator<Item = &Binding> {
+    fn bindings_with_plan(&self, plan: PlanName) -> impl Iterator<Item = &Binding> {
         self.bindings
             .iter()
             .map(|entry| &entry.binding)
             .filter(move |binding| binding.plan.name() == plan)
     }
 
-    /// Whether every request of the document is one a host has decided
-    /// whole in its own process: each plan a binding names is decided
-    /// ([`Self::decides`]). `fed` answers what the host feeds a whole
-    /// decision of a plan, and `None` for a plan it decides no request of.
+    /// Whether such a host can have the engine decide every request of the
+    /// document: every plan a binding names ([`Self::can_decide`]).
+    /// `inputs` answers what the host provides for a decision of a plan,
+    /// and `None` for a plan whose requests it does not hand the engine.
     #[must_use]
-    pub fn decided_whole(&self, fed: impl Fn(PlanName) -> Option<Needs>) -> bool {
+    pub fn can_decide_every_plan(&self, inputs: impl Fn(PlanName) -> Option<Needs>) -> bool {
         self.bindings
             .iter()
             .map(|entry| &entry.binding)
-            .all(|binding| fed(binding.plan.name()).is_some_and(|fed| self.decided(binding, fed)))
+            .all(|binding| {
+                inputs(binding.plan.name())
+                    .is_some_and(|inputs| self.can_decide_binding(binding, inputs))
+            })
     }
 
-    /// Whether every request of `binding` is one a host has decided whole
-    /// in its own process, where it feeds a whole decision of the
-    /// binding's plan `fed` ([`Self::decides`]).
-    fn decided(&self, binding: &Binding, fed: Needs) -> bool {
+    /// Whether such a host can have the engine decide every request of
+    /// `binding`, given the `inputs` it provides for a decision of the
+    /// binding's plan ([`Self::can_decide`]).
+    fn can_decide_binding(&self, binding: &Binding, inputs: Needs) -> bool {
         let decided = |(phase, index, profile): (Phase, u16, &Profile)| {
             let needs = self.profile_needs.get(usize::from(index));
             self.in_the_way(index, profile, phase).is_none()
-                || needs.is_some_and(|needs| needs.within(fed))
+                || needs.is_some_and(|needs| needs.within(inputs))
         };
         binding.sessions.is_none() && self.places_of(binding).all(decided)
     }

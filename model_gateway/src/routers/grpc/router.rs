@@ -183,11 +183,15 @@ impl GrpcRouter {
         // the family's plan. Elsewhere they take the classic placement
         // pass, though the gateway's engine object stands for the families
         // mounted beside this one.
-        let placed_by = |plan| policy_controller::placing(ctx, plan).engine().cloned();
+        let engine_for = |plan| {
+            policy_controller::routed_by(ctx, plan)
+                .policy_engine()
+                .cloned()
+        };
         let policy_engine = match mode {
             Mode::Regular => ctx.policy_engine.clone(),
-            Mode::PrefillDecode => placed_by(PlanName::PdPair),
-            Mode::EncodePrefillDecode => placed_by(PlanName::Epd),
+            Mode::PrefillDecode => engine_for(PlanName::PdPair),
+            Mode::EncodePrefillDecode => engine_for(PlanName::Epd),
         };
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(

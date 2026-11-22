@@ -1109,7 +1109,7 @@ async fn many_routers_mount_the_grpc_pair_router_unless_they_follow_a_controller
 /// policy is built, as under a controller's address.
 #[tokio::test]
 async fn many_routers_serve_a_pair_family_the_settings_document_does_not_name() -> Case {
-    use super::{placing, Placing, PlanName};
+    use super::{routed_by, PlanName, RoutedBy};
     use crate::routers::{
         factory::{router_ids, RouterId},
         grpc::{mode::Mode, router::GrpcRouter},
@@ -1163,15 +1163,18 @@ async fn many_routers_serve_a_pair_family_the_settings_document_does_not_name() 
     let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
     let engine = context.policy_engine.as_ref().ok_or("the engine object")?;
     for placed in [PlanName::Single, PlanName::PdPair] {
-        assert!(matches!(placing(&context, placed), Placing::Engine(_)));
+        assert!(matches!(
+            routed_by(&context, placed),
+            RoutedBy::PolicyEngine(_)
+        ));
     }
-    assert!(placing(&context, PlanName::Epd).is_classic());
+    assert!(routed_by(&context, PlanName::Epd).is_policy_registry());
     let routers = families(&config, &context).await?;
     for ((router, (_, family, plan)), classic) in routers.iter().zip(FAMILIES).zip(&classic) {
         assert_eq!(router.router_type(), family);
         let answered = answer(router.as_ref()).await;
         assert_ne!(answered.1, BY_NAME, "{family}");
-        if placing(&context, plan).is_classic() {
+        if routed_by(&context, plan).is_policy_registry() {
             assert_eq!(&answered, classic, "{family}");
         }
     }
@@ -1206,8 +1209,8 @@ async fn many_routers_serve_a_pair_family_the_settings_document_does_not_name() 
         assert!(context.policy_engine.is_some(), "{why}");
         let refusing = families(&config, &context).await?;
         for (router, (_, family, plan)) in refusing.iter().zip(FAMILIES) {
-            let placed = placing(&context, plan);
-            assert!(matches!(placed, Placing::Refused), "{family}, {why}");
+            let placed = routed_by(&context, plan);
+            assert!(matches!(placed, RoutedBy::Refused), "{family}, {why}");
             assert_refusing_router(router.as_ref(), family).await?;
         }
         // No classic pair policy is built for a family that refuses.

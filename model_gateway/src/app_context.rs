@@ -174,7 +174,7 @@ pub struct AppContext {
     /// there: the store, its door, its feed and the follower are a
     /// gateway's that follows one. `None` with the setting off and under an
     /// address. A pair family's router reads it where it is built
-    /// ([`policy_controller::placing`]).
+    /// ([`policy_controller::routed_by`]).
     pub(crate) in_process: Option<InProcess>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
@@ -1091,7 +1091,7 @@ impl AppContextBuilder {
         // decides over.
         let pairing = match &self.in_process {
             Some(started) if placing.is_some() => {
-                pair_lists::mode_of(started.engine.spec().pairing())
+                pair_lists::pairing_mode(started.engine.spec().pairing())
             }
             _ => config.pd_pairing_mode,
         };

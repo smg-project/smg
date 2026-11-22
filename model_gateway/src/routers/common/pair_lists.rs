@@ -32,7 +32,7 @@ pub(crate) type PairNarrowing<'a> =
 
 /// The mode the snapshot's pair index is built under for a document's
 /// `pairing`: the two name one rule.
-pub(crate) const fn mode_of(pairing: Pairing) -> PdPairingMode {
+pub(crate) const fn pairing_mode(pairing: Pairing) -> PdPairingMode {
     match pairing {
         Pairing::Off => PdPairingMode::Off,
         Pairing::Lenient => PdPairingMode::Lenient,
@@ -40,38 +40,40 @@ pub(crate) const fn mode_of(pairing: Pairing) -> PdPairingMode {
     }
 }
 
-/// What one decision of a pair holds of the registry: the snapshot of the
-/// model's workers as it stood at the read, and the snapshot's pair index
-/// for the route's wire under the document's pairing mode.
-pub(crate) struct PdPairRead {
+/// The prefill and decode workers of one model as one decision of a pair
+/// reads them in the registry: the snapshot of the model's workers as it
+/// stood then, and the snapshot's pair index for the route's wire under
+/// the document's pairing mode.
+pub(crate) struct PdPairSnapshot {
     snapshot: Arc<ModelWorkerSnapshot>,
     index: Arc<PdPairIndex>,
-    /// Lists of the read's own, paired again, for a request that may not
-    /// take every worker of the two pools: the workers its route's rule
-    /// leaves, and of those the ones dialed on the route's wires. Nothing is
-    /// kept of them.
-    own: Option<(PdPairIndex, [PoolMembers; 2])>,
+    /// The two lists narrowed for one request, paired again, where the
+    /// request may not take every worker of the two pools: the workers its
+    /// route's rule leaves, and of those the ones dialed on the route's
+    /// wires. Nothing is kept of them.
+    narrowed: Option<(PdPairIndex, [PoolMembers; 2])>,
 }
 
-impl PdPairRead {
+impl PdPairSnapshot {
     /// Reads the registry once for a pair of `model` whose route dials
     /// `wires`: the HTTP pools for a route that dials HTTP, the gRPC
     /// pipeline's for any other. The pairing mode is the one the document
-    /// `engine` decides under states. `among` is the route's own narrowing
-    /// of the two pools by the request, asked here of this read's snapshot.
-    pub(crate) fn of(
+    /// `engine` decides under states. `narrowing` is the route's own
+    /// narrowing of the two pools by the request, asked here of this
+    /// snapshot.
+    pub(crate) fn read(
         registry: &WorkerRegistry,
         engine: &PolicyEngine,
         model: &str,
         wires: WireModes,
-        among: Option<PairNarrowing<'_>>,
+        narrowing: Option<PairNarrowing<'_>>,
     ) -> Self {
         let wire = if wires.intersects(WireModes::HTTP) {
             PdWire::Http
         } else {
             PdWire::Grpc
         };
-        let mode = mode_of(engine.spec().pairing());
+        let mode = pairing_mode(engine.spec().pairing());
         let snapshot = registry.get_routing_snapshot(model);
         let index = snapshot.pd_pairs(wire, mode);
         let (prefill, decode) = wire.pools();
@@ -79,8 +81,8 @@ impl PdPairRead {
         let [prefill, decode] = pooled;
         let served = prefill.wires().union(decode.wires());
         let off_wires = !wires.is_empty() && !wires.contains(served);
-        let stated = among.and_then(|among| among(&snapshot, &index));
-        let own = (stated.is_some() || off_wires).then(|| {
+        let stated = narrowing.and_then(|narrow| narrow(&snapshot, &index));
+        let narrowed = (stated.is_some() || off_wires).then(|| {
             let lists = stated.unwrap_or_else(|| pooled.map(|pool| Arc::clone(pool.workers())));
             let [prefill, decode] = lists.map(|list| -> Arc<[Arc<dyn Worker>]> {
                 if !off_wires {
@@ -98,7 +100,7 @@ impl PdPairRead {
         Self {
             snapshot,
             index,
-            own,
+            narrowed,
         }
     }
 
@@ -109,7 +111,7 @@ impl PdPairRead {
         engine: &PolicyEngine,
         limit: Option<&'a PrefillAdmission>,
     ) -> PdPairLists<'a> {
-        let (index, [prefill, decode]) = match &self.own {
+        let (index, [prefill, decode]) = match &self.narrowed {
             Some((index, [prefill, decode])) => (index, [prefill, decode]),
             None => {
                 let (prefill, decode) = self.index.wire.pools();

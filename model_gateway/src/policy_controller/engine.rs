@@ -87,7 +87,7 @@ use crate::{
     routers::{
         common::{
             overload::{routable_but_for_veto, WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE},
-            pair_lists::{PairNarrowing, PdPairRead},
+            pair_lists::{PairNarrowing, PdPairSnapshot},
             placement::{self, no_available_workers_because},
             prefill_admission::{
                 acquire_decided, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -404,9 +404,9 @@ impl RequestMaker for Made<'_, '_> {
 
 /// A pair's ask as the engine of this process takes it up: the ask, made as
 /// any other, over the two lists of its route's wire.
-struct MadeOver<'m, 'r, 'a>(&'m Made<'r, 'a>, PairLists<'m>);
+struct MadeForPair<'m, 'r, 'a>(&'m Made<'r, 'a>, PairLists<'m>);
 
-impl RequestMaker for MadeOver<'_, '_, '_> {
+impl RequestMaker for MadeForPair<'_, '_, '_> {
     fn model(&self) -> &str {
         self.0.model()
     }
@@ -1045,11 +1045,11 @@ impl PolicyEngine {
     /// The registry's two lists for a pair's `ask` as they stand now, with
     /// the engine of this process, where it decides over them. `None` under
     /// a followed controller, whose engine reads its own rows.
-    fn pair_read(&self, ask: &Ask<'_>) -> Option<(PdPairRead, &OwnEngine)> {
+    fn pair_snapshot(&self, ask: &Ask<'_>) -> Option<(PdPairSnapshot, &OwnEngine)> {
         match (&self.workers, &*self.door) {
             (Workers::Listed(registry), Decider::Own(engine)) => {
-                let read = PdPairRead::of(registry, engine, ask.model, ask.wires, None);
-                Some((read, &**engine))
+                let pools = PdPairSnapshot::read(registry, engine, ask.model, ask.wires, None);
+                Some((pools, &**engine))
             }
             _ => None,
         }
@@ -1515,7 +1515,8 @@ impl PolicyEngine {
     /// ([`Unplaced::RoomTaken`]). A request behind a waiter joins the queue
     /// with no decision, unless a side holds no worker it can be sent to
     /// ([`Self::probe_listed`]). Each pass reads the registry anew, and
-    /// `among`, the route's narrowing by the request, is asked of that read.
+    /// `among`, the route's narrowing by the request, is asked of that
+    /// snapshot.
     async fn place_pair_listed(
         &self,
         (registry, engine): (&WorkerRegistry, &OwnEngine),
@@ -1528,13 +1529,13 @@ impl PolicyEngine {
         // What the attempt's passes share: the workers its commits could
         // not send to, and whether its first ask is still to make.
         let attempt = (Mutex::new(Vec::new()), AtomicBool::new(true));
-        let read = || PdPairRead::of(registry, engine, ask.model, ask.wires, among);
+        let pools = || PdPairSnapshot::read(registry, engine, ask.model, ask.wires, among);
         acquire_decided(
             admission,
             routing_key,
             Placed::worker,
-            || ready(self.probe_listed(engine, &read(), ask, holds, admission, &attempt)),
-            || ready(self.pair_listed(engine, &read(), ask, holds, admission, &attempt)),
+            || ready(self.probe_listed(engine, &pools(), ask, holds, admission, &attempt)),
+            || ready(self.pair_listed(engine, &pools(), ask, holds, admission, &attempt)),
             |mut placed: Placed, room| {
                 let (Some(room), Some(admission)) = (room, admission) else {
                     return Ok(placed);
@@ -1557,7 +1558,7 @@ impl PolicyEngine {
     }
 
     /// One pass of a pair's placement where `engine`, the engine of this
-    /// process, decides: one decision over the two lists of `read`, the
+    /// process, decides: one decision over the two lists of `pools`, the
     /// registry's as they stand now, and its commit.
     ///
     /// The decision stays where its guard holds it. Its targets are walked
@@ -1571,13 +1572,13 @@ impl PolicyEngine {
     fn pair_listed(
         &self,
         engine: &OwnEngine,
-        read: &PdPairRead,
+        pools: &PdPairSnapshot,
         ask: &Ask<'_>,
         holds: &impl Fn(&dyn Worker) -> bool,
         admission: Option<&PrefillAdmission>,
         (missed, first): &(Mutex<Vec<WorkerId>>, AtomicBool),
     ) -> Result<Placed, Unplaced> {
-        let pair = read.lists(engine, admission);
+        let pair = pools.lists(engine, admission);
         let mut missed = missed.lock();
         // The monitor's snapshot for this decision, where the document
         // reads load reports: lent once, and both lists' records read it.
@@ -1590,7 +1591,7 @@ impl PolicyEngine {
             source: Cell::new(None),
         };
         let now = Instant::now();
-        let over = MadeOver(&made, pair.lists());
+        let over = MadeForPair(&made, pair.lists());
         let decided = DecisionGuard::decide_under(Arc::clone(&self.door), GATEWAY, &over, now);
         let seconds = now.elapsed().as_secs_f64();
         // A key's source counts once an attempt, at its first ask.
@@ -1674,17 +1675,17 @@ impl PolicyEngine {
     fn probe_listed(
         &self,
         engine: &OwnEngine,
-        read: &PdPairRead,
+        pools: &PdPairSnapshot,
         ask: &Ask<'_>,
         holds: &impl Fn(&dyn Worker) -> bool,
         admission: Option<&PrefillAdmission>,
         attempt: &(Mutex<Vec<WorkerId>>, AtomicBool),
     ) -> Option<Unplaced> {
-        let pair = read.lists(engine, admission);
+        let pair = pools.lists(engine, admission);
         if pair.each_side(|worker| sendable(worker, holds)) {
             return None;
         }
-        match self.pair_listed(engine, read, ask, holds, admission, attempt) {
+        match self.pair_listed(engine, pools, ask, holds, admission, attempt) {
             Ok(mut placed) => {
                 placed.released(ReleaseReason::CommitFailed, Instant::now());
                 None
@@ -2661,13 +2662,15 @@ impl Placed {
         // Where the engine of this process decides, the call is made over
         // the registry's two lists as they stand now, and a decode is the
         // worker at its place in them.
-        let read = policy_engine.pair_read(ask);
-        let lists = read.as_ref().map(|(read, engine)| read.lists(engine, None));
+        let pools = policy_engine.pair_snapshot(ask);
+        let lists = pools
+            .as_ref()
+            .map(|(pools, engine)| pools.lists(engine, None));
         let started = Instant::now();
         // The call's request is made as the first ask's was: from the
         // world the door decides it under, by the sources of that document.
         let decided = match &lists {
-            Some(lists) => handle.decide_decode_under(&MadeOver(&made, lists.lists()), now),
+            Some(lists) => handle.decide_decode_under(&MadeForPair(&made, lists.lists()), now),
             None => handle.decide_decode_under(&made, now),
         }
         .copied();
@@ -2773,7 +2776,7 @@ pub(crate) use ride::{BehindAnswer, Sent};
 #[cfg(test)]
 mod decode_again_tests;
 #[cfg(test)]
-mod own_pair_tests;
+mod in_process_pair_tests;
 #[cfg(test)]
 mod own_tests;
 #[cfg(test)]
