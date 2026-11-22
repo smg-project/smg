@@ -80,7 +80,7 @@ use crate::{
     names::intern,
     policies::consistent_hashing::PoolRing,
     stages::Lifecycle,
-    store::{pairing::Refusal, GatewayId},
+    store::GatewayId,
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
 };
 
@@ -748,12 +748,6 @@ impl DecisionEngine for PolicyEngine {
     ) -> PromptHashes {
         let size = self.affinity.block_size(model);
         PromptHashes::under_document(&self.spec, size, tokens, text, seeds)
-    }
-
-    // The host's own pair index says why a fleet pairs nothing: the engine
-    // keeps none.
-    fn pair_refusal(&self, _: &str, _: WireModes) -> Option<Refusal> {
-        None
     }
 
     fn faults(&self) -> u64 {

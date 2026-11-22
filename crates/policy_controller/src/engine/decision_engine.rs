@@ -46,7 +46,7 @@ use super::{
 };
 use crate::{
     document::AppliedSpec,
-    store::{pairing::Refusal, GatewayId},
+    store::GatewayId,
     tracking::lease::{Lease, Said, Side},
 };
 
@@ -443,11 +443,6 @@ pub trait DecisionEngine {
         text: Option<&str>,
         seeds: HashSeeds,
     ) -> PromptHashes;
-
-    /// Why no prefill of `model` pairs with a decode of it, among the
-    /// workers on the side of `wires`. `None` where a pair can be made,
-    /// and where a pool holds no worker on that side.
-    fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal>;
 
     /// How many decisions panicked, a shadow's beside a live decision that
     /// stood among them.
