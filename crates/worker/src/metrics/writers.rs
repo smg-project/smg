@@ -1412,8 +1412,9 @@ impl Metrics {
         if handles::keep_handles() {
             let recorded = handles::ENGINE_LOADS.with_borrow_mut(|kept| {
                 // A worker and a model seen before are found by one lookup
-                // each. `for_worker` and `engine_rank` look twice, to
-                // insert on a first sight, which still goes through them.
+                // each, and a new rank under them is made here as
+                // `engine_rank` makes it. `for_worker` and `engine_rank` look
+                // twice, to insert on a first sight, which still goes through them.
                 let seen = kept
                     .current()
                     .get_mut(worker_url)
