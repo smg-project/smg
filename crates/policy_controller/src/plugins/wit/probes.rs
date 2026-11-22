@@ -183,16 +183,7 @@ pub(crate) fn all() -> Vec<Probe> {
     let lease = Lease::default();
     let pair = Pair::default();
     let target = Target::default();
-    let outcome = Outcome {
-        side: Side::Single,
-        served: WorkerId(0),
-        status: 0,
-        class: TransportClass::Ok,
-        ttft_micros: 0,
-        tokens_in: 0,
-        tokens_out: 0,
-        duration_micros: 0,
-    };
+    let outcome = Outcome::reported(0, TransportClass::Ok);
     vec![
         probe!("load", before [], LoadRow {
             running, queued, waiting_uncached_tokens, kv_usage_permille, active_kv_permille,
