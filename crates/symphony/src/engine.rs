@@ -298,9 +298,11 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// delimiter to close it (the forced arguments, which are the whole output), a value that
     /// is whole where the bytes end, as a number or a literal the bytes end on is. Asked before
     /// the stop or the cut ends the call, for the word its end carries ([`CallEnd`]): such a
-    /// call was not left open, and its end says `Closed`. Every other syntax closes a call with
-    /// bytes of its own, and one the output's end reaches before them is open.
-    fn ends_with_the_output(&self) -> bool {
+    /// call was not left open, and its end says `Closed`. `cut` says the output's end is a cut
+    /// and not the model's own stop: a value that more bytes could have continued (a number)
+    /// is whole at the stop alone. Every other syntax closes a call with bytes of its own, and
+    /// one the output's end reaches before them is open.
+    fn ends_with_the_output(&self, _cut: bool) -> bool {
         false
     }
 
@@ -1348,7 +1350,7 @@ impl Engine {
         let mut finished: Events<'static> = std::mem::take(&mut self.scratch);
         let mut as_marker = closed == Closed::Marker;
         // Asked before the ending takes the call: whether the output's end is the call's own.
-        let own_end = closed != Closed::Marker && call.ends_with_the_output();
+        let own_end = closed != Closed::Marker && call.ends_with_the_output(closed == Closed::Cut);
         let taken = match closed {
             Closed::Marker => call.close(terminal, &mut finished),
             Closed::Stop => {

@@ -271,6 +271,13 @@ impl Arguments {
         self.whole.is_some() || (self.started && self.invalid_from.is_none() && self.prefix.whole())
     }
 
+    /// Whether the value is a number: the one value more bytes can continue once it reads
+    /// whole, so that where its bytes were cut it may be the start of another number.
+    pub fn is_a_number(&self) -> bool {
+        self.value
+            .starts_with(|c: char| c == '-' || c.is_ascii_digit())
+    }
+
     /// Append the next bytes, push the events they complete, holding the string values `strings`
     /// holds, and return how many of them the value took: all of them before its end, up to its
     /// end in the piece that carries it, and none once it is whole.

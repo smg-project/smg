@@ -307,7 +307,7 @@ pub enum CallEnd {
     /// object), or the stream's stop where the table's stop row stands for the closing marker
     /// the stop decoder hides. Or the output ended where a call with no delimiter of its own
     /// was whole: the forced arguments, which are the whole output, when their value is a
-    /// number or a literal the bytes end on.
+    /// literal the bytes end on, or a number the model's own stop found.
     #[default]
     Closed,
     /// The model's own end of output found the call open, in a state the table has no stop row
@@ -317,7 +317,9 @@ pub enum CallEnd {
     Stop,
     /// The stream was cut inside the call: by the token limit, an abort, or a finish the crate
     /// does not read. Nothing is closed for the client, and a `Malformed` event before the end
-    /// says that the arguments are no whole value.
+    /// says that the arguments are no whole value. One cut call has whole arguments and no
+    /// such event: the forced arguments that are a number where the cut came, which read whole
+    /// and may be the start of a longer number (`12` of `123`).
     Cut,
 }
 
