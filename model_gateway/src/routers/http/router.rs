@@ -1655,7 +1655,7 @@ impl Router {
     /// body cut short in transit a 502 `read_response_body_failed` and one in
     /// no rerank shape a 502 `call_upstream_decode_error`, the relay's own codes
     /// for a worker body it could not read and one it could not decode.
-    async fn build_rerank_response(
+    pub(super) async fn build_rerank_response(
         req: RerankResponseSpec,
         canonical_model: Option<&str>,
         response: Response,
@@ -1721,7 +1721,7 @@ impl Router {
 
 /// Post-dispatch inputs for the rerank response builder; the request itself
 /// (documents included) is released at dispatch.
-struct RerankResponseSpec {
+pub(super) struct RerankResponseSpec {
     model: String,
     rid: Option<openai_protocol::common::StringOrArray>,
     top_k: Option<usize>,
