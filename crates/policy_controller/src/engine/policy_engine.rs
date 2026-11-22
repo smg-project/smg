@@ -83,6 +83,15 @@ use crate::{
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
 };
 
+/// How many documents the engines of this process took so far.
+static APPLIED: AtomicU64 = AtomicU64::new(0);
+
+/// The number of the next document an engine of this process takes: each
+/// is drawn here, so no two applied documents share one.
+fn next_applied() -> u64 {
+    APPLIED.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// The engine of one policy document, for a gateway that decides in its own
 /// process.
 ///
@@ -91,6 +100,9 @@ use crate::{
 #[derive(Debug)]
 pub struct PolicyEngine {
     spec: AppliedSpec,
+    /// The number of the document the engine decides under
+    /// ([`Self::applied`]).
+    applied: u64,
     /// The pools made so far: each draws the place its turns start at from
     /// its number.
     epochs: AtomicU64,
@@ -245,6 +257,7 @@ impl PolicyEngine {
         Self {
             hears,
             spec,
+            applied: next_applied(),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
             faults: AtomicU64::new(0),
@@ -331,6 +344,21 @@ impl PolicyEngine {
     #[must_use]
     pub fn spec(&self) -> &AppliedSpec {
         &self.spec
+    }
+
+    /// The number of the document the engine decides under, which no other
+    /// applied document of the process has. A list's value is made under it
+    /// and read under it alone ([`Self::members_of`]), and nothing else
+    /// reads it.
+    pub(super) fn applied(&self) -> u64 {
+        self.applied
+    }
+
+    /// How many values of a list the engine made so far, for a case that
+    /// counts the fills of a cell.
+    #[cfg(test)]
+    pub(super) fn values_made(&self) -> u64 {
+        self.epochs.load(Ordering::Relaxed)
     }
 
     /// The engine's value of one pool: `pool` is the shared list the
