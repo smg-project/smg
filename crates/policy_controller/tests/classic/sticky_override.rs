@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use smg_policy_controller::{
     document::{
-        Assignment, LoadMetricSetting, ModeSettings, Pairing, PolicySettings, PolicySpec,
-        RoutingKeyOverrideSettings, RoutingSettings,
+        Assignment, LoadMetricSetting, PolicySettings, PolicySpec, RoutingKeyOverrideSettings,
+        RoutingSettings,
     },
     engine::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
@@ -114,18 +114,7 @@ impl Row {
             other => return Err(format!("no settings are written here for `{other}`")),
         };
         let settings = RoutingSettings {
-            mode: ModeSettings::Regular,
             policy,
-            enable_igw: false,
-            policy_spec: None,
-            grouped_dp_sticky: None,
-            dp_minimum_tokens_scheduler: false,
-            pd_pairing_mode: Pairing::Lenient,
-            worker_warmup_secs: 60,
-            worker_warmup_share: 0.25,
-            worker_warmup_blocks: 1024,
-            worker_warmup_thin_ratio: 0.5,
-            worker_warmup_divert_every: 8,
             routing_key_override: RoutingKeyOverrideSettings {
                 enabled: overridden,
                 headers: vec![HEADER.into()],
@@ -133,10 +122,7 @@ impl Row {
                 max_idle_secs,
                 assignment_mode: self.assignment,
             },
-            worker_overload_protection: true,
-            worker_overload_waiting_requests: Some(8),
-            worker_overload_token_usage: Some(0.8),
-            worker_overload_shed: false,
+            ..RoutingSettings::default()
         };
         settings.policy_document().map_err(|err| err.to_string())
     }
