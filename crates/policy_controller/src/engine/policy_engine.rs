@@ -73,7 +73,7 @@ use super::{
     lease_events,
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    view::{fingerprint, Phase, WireModes, WorkerId},
+    view::{fingerprint, FixedFacts, Phase, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
@@ -122,7 +122,8 @@ pub struct PolicyEngine {
 /// Made by [`PolicyEngine::pool_members`] from a list the gateway's
 /// registry published, and kept by the gateway beside that list. It holds
 /// the list itself, not a copy: a worker's live facts are read on the
-/// list's objects.
+/// list's objects. [`PolicyEngine::pool_members_with_fixed_facts`] makes
+/// it too, for a host that says facts of its workers.
 #[derive(Debug)]
 pub struct PoolMembers {
     workers: Arc<[Arc<dyn Worker>]>,
@@ -130,8 +131,11 @@ pub struct PoolMembers {
     /// itself ([`PolicyEngine::pick`]): a rotation counts its turns here.
     rotation: OwnWord,
     /// What a whole decision reads of the list beside its workers' live
-    /// state ([`Self::records`]): made at the list's first whole decision,
-    /// and by no pick a placement pass asks ([`PolicyEngine::pick`]).
+    /// state ([`Self::records`]): made with the list where its host says
+    /// facts of its workers
+    /// ([`PolicyEngine::pool_members_with_fixed_facts`]), and else at the
+    /// list's first whole decision, and by no pick a placement pass asks
+    /// ([`PolicyEngine::pick`]).
     records: OnceLock<PoolRecords>,
     /// The wires the list's workers are dialed on ([`Self::wires`]): read
     /// of their registrations at the first whole decision over the list.
@@ -165,9 +169,11 @@ impl PoolMembers {
 
     /// The list's records under the document `spec`, on `clock`: the half
     /// of each worker's record that no request changes, the pool's engines
-    /// and its number ([`PoolRecords`]). Made at the first call and kept
-    /// for as long as the list stands; every later call is one read. No
-    /// live value of a worker is kept in them.
+    /// and its number ([`PoolRecords`]). Made with the list where its host
+    /// says facts of its workers
+    /// ([`PolicyEngine::pool_members_with_fixed_facts`]), and else at the
+    /// first call; kept for as long as the list stands, and every later
+    /// call is one read. No live value of a worker is kept in them.
     #[must_use]
     pub fn records(&self, spec: &AppliedSpec, clock: &DecisionClock) -> &PoolRecords {
         self.records
@@ -310,6 +316,11 @@ impl PolicyEngine {
     /// Called once a list, by the gateway, which keeps the value for as
     /// long as the list stands. It reads no worker, so its cost does not
     /// grow with the list.
+    ///
+    /// For a program that knows nothing of its workers beside their
+    /// objects. Under this value every worker states nothing: none takes
+    /// images. A program that knows any such fact calls
+    /// [`Self::pool_members_with_fixed_facts`].
     #[must_use]
     pub fn pool_members(&self, pool: &Arc<[Arc<dyn Worker>]>) -> PoolMembers {
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed) + 1;
@@ -323,6 +334,31 @@ impl PolicyEngine {
             alone: OnceLock::new(),
             ring: OnceLock::new(),
             affinity: PoolAffinity::default(),
+        }
+    }
+
+    /// [`Self::pool_members`], for a program that knows anything of its
+    /// workers beside their objects ([`FixedFacts`]): whether a worker
+    /// takes images. Such a program calls this one for every list.
+    /// `facts_of` is asked once a worker, here, and never at a decision:
+    /// every fact a program says of a worker is a field of that one answer.
+    ///
+    /// The list's records are made of the answers at this call, and not at
+    /// the list's first whole decision: a list's records are also made
+    /// with no request at hand, by its ring's fill and by a pick that is
+    /// noted. So the cost grows with the list, once a list, off the path
+    /// of a request: a wave of registrations pays it once for each list
+    /// published.
+    #[must_use]
+    pub fn pool_members_with_fixed_facts(
+        &self,
+        pool: &Arc<[Arc<dyn Worker>]>,
+        facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
+    ) -> PoolMembers {
+        let records = PoolRecords::with_fixed_facts(pool, &self.spec, &self.clock, facts_of);
+        PoolMembers {
+            records: OnceLock::from(records),
+            ..self.pool_members(pool)
         }
     }
 
@@ -811,6 +847,31 @@ mod tests {
             .expect("the preset's profile");
         profile.filter.push(filter.into());
         engine_of(&document)
+    }
+
+    /// What a host says of its workers when it hands their list is in the
+    /// list's records, each worker's at its place: the worker it named
+    /// takes images and no other does. The host is asked once a worker, in
+    /// the list's order, at the call. A list handed with nothing said says
+    /// of no worker that it takes images.
+    #[test]
+    fn a_lists_records_take_the_image_bit_its_host_says() {
+        let engine = preset("round_robin");
+        let (list, asked) = (pool(4), Cell::new(0));
+        let members = engine.pool_members_with_fixed_facts(&list, |worker| {
+            asked.set(asked.get() + 1);
+            FixedFacts {
+                vision: Arc::ptr_eq(worker, &list[1]),
+            }
+        });
+        assert_eq!(asked.get(), 4, "asked at the call, once a worker");
+        let sees = |members: &PoolMembers| {
+            let fixed = members.records(&engine.spec, &engine.clock).fixed();
+            fixed.iter().map(|row| row.vision).collect::<Vec<_>>()
+        };
+        assert_eq!(sees(&members), [false, true, false, false]);
+        assert_eq!(asked.get(), 4, "and not again where the records are read");
+        assert_eq!(sees(&engine.pool_members(&list)), [false; 4]);
     }
 
     /// The value made of a pool holds the shared list itself, and making it
