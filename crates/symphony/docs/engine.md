@@ -145,6 +145,16 @@ is a later step).
   any finish but `Stop` is cut as before; a driver hands a stop sequence of the request's that
   matched inside the call over as such a finish, so that it never completes the call (the stop
   row in `format`).
+- Each `ToolCallEnd` says which of the three endings closed its call (`CallEnd`, the event's
+  `ended`): `closed` for the model's own end of the call (its closing terminal, what the syntax
+  reads as its end, or the stop where the table's stop row stands for the marker), `stop` for a
+  call the model's stop found open in a state with no stop row, `cut` for one a cut found open.
+  The engine writes it where the region ends (`Engine::close_call`); an assembler ends every call
+  as closed, since only the engine knows how the region ended. The events and their order are
+  what they were, so a driver that does not read the field sees no change. One that must not hand
+  on a call the model did not finish reads it there. A block that named no call has no end to
+  carry the word: the output's end that found it open refuses its bytes in that last step,
+  before the `Finish`.
 - A table can say that the template discards the text of a state (`Format::framing`): Hugging
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is

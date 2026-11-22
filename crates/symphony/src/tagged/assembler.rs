@@ -33,7 +33,7 @@
 use std::borrow::Cow;
 
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, CallEnd, DropReason, Event, Events, MalformedReason, Text},
     ids::CallIds,
     markers::Scanner,
     tagged::{
@@ -269,6 +269,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::default(),
+            ended: CallEnd::Closed,
         });
     }
 
@@ -501,6 +502,7 @@ impl Assembler {
                 out.push(Event::ToolCallEnd {
                     index: self.index,
                     source: Text::uncounted(bytes),
+                    ended: CallEnd::Closed,
                 });
                 self.ended();
             }
@@ -1040,6 +1042,7 @@ mod tests {
         Event::ToolCallEnd {
             index: 0,
             source: Text::uncounted(source.to_owned()),
+            ended: CallEnd::Closed,
         }
     }
 
@@ -1304,6 +1307,7 @@ mod tests {
         let end_of = |index: u32| Event::ToolCallEnd {
             index,
             source: Text::uncounted("</function>"),
+            ended: CallEnd::Closed,
         };
         let expected = vec![
             start(3, "<function=f>"),

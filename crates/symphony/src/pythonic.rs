@@ -30,7 +30,7 @@
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{CallEnd, DropReason, Event, Events, MalformedReason, Text},
     ids::CallIds,
     tagged::{
         assembler::push_escaped,
@@ -845,6 +845,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::uncounted(")"),
+            ended: CallEnd::Closed,
         });
     }
 
@@ -1488,7 +1489,7 @@ mod tests {
                 [
                     Event::ToolCallStart { index: 0, .. },
                     Event::Malformed { why: MalformedReason::UnterminatedRegion, .. },
-                    Event::ToolCallEnd { index: 0, source },
+                    Event::ToolCallEnd { index: 0, source, .. },
                 ] if source.text.is_empty()
             ),
             "{events:?}"
@@ -1506,7 +1507,7 @@ mod tests {
                     Event::ToolCallStart { index: 0, .. },
                     Event::ToolCallArguments { json, source, .. },
                     Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
-                    Event::ToolCallEnd { index: 0, source: end },
+                    Event::ToolCallEnd { index: 0, source: end, .. },
                 ] if json == r#"{"city": "Par"#
                     && source.text == "city=\"Par"
                     && text.text.is_empty()
@@ -2220,6 +2221,7 @@ mod tests {
         let end = |index: u32| Event::ToolCallEnd {
             index,
             source: Text::uncounted(""),
+            ended: CallEnd::Closed,
         };
         for ending in [Ending::Close, Ending::Stream] {
             assert_eq!(

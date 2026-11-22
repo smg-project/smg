@@ -23,7 +23,7 @@
 //! [`Declared::forced`]: crate::Declared::forced
 
 use crate::{
-    event::{Event, Events, MalformedReason, Text},
+    event::{CallEnd, Event, Events, MalformedReason, Text},
     json::{
         arguments::{Arguments, AsWritten},
         prefix::json_space,
@@ -112,6 +112,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::default(),
+            ended: CallEnd::Closed,
         });
     }
 }

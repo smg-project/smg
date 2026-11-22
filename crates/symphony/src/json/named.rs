@@ -363,7 +363,7 @@ mod tests {
         assert_eq!(arguments(&events), ARGUMENTS);
         assert!(matches!(
             events.last(),
-            Some(Event::ToolCallEnd { index: 0, source }) if source.text.is_empty()
+            Some(Event::ToolCallEnd { index: 0, source, .. }) if source.text.is_empty()
         ));
     }
 
