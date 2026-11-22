@@ -720,12 +720,43 @@ async fn polled_once(stop: std::pin::Pin<&mut impl std::future::Future<Output = 
     }
 }
 
+/// A start made while a stop waits writes its event task's handle into the
+/// slot, and the stop, dropped then, leaves it there: the next stop ends
+/// the task that start made. The stop is polled once: the event task is
+/// told to end, and ends at its next turn.
+#[tokio::test]
+async fn a_stop_dropped_behind_a_start_leaves_the_starts_event_task_its_slot() {
+    let (registry, monitor) = build_monitor();
+    registry
+        .register(ready_worker("http://w1:8080", "llama-3"))
+        .unwrap();
+    monitor.start_event_loop();
+
+    let started = {
+        let stop = monitor.stop();
+        tokio::pin!(stop);
+        assert!(!polled_once(stop.as_mut()).await, "the stop ended");
+        monitor.start_event_loop();
+        let slot = monitor.event_task.lock();
+        slot.as_ref().map(JoinHandle::abort_handle)
+    };
+    let started = started.expect("the start's event task");
+
+    monitor.stop().await;
+    assert!(
+        started.is_finished(),
+        "the event task a start made beside a dropped stop outlived the next stop"
+    );
+}
+
 /// A stop dropped at its first wait keeps the event task's handle, so the
 /// stop behind it waits for that task's end too. The event task's poll of
 /// a replacement is held inside the sink while both stops are polled:
 /// neither takes a group's loop while that poll runs. The poll then starts
 /// the loop of the group the replacement adds, and the second stop ends it
-/// with every other task.
+/// with every other task. While the poll is held the case waits on its
+/// own thread alone, and the sink lets no poll of a worker run: no timer
+/// of the runtime is needed, and no task waits for the reports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_behind_one_dropped_at_its_first_wait_waits_for_the_event_task() {
     let (entered, in_forget) = mpsc::channel();
@@ -754,7 +785,7 @@ async fn a_stop_behind_one_dropped_at_its_first_wait_waits_for_the_event_task() 
 
     // The event task's poll of the replacement stands inside the sink.
     assert!(registry.replace(&id, serving(&["a", "b"])));
-    assert!(within_two_seconds(|| in_forget.try_recv().is_ok()).await);
+    in_forget.recv_timeout(Duration::from_secs(5)).unwrap();
 
     {
         let stop = monitor.stop();
@@ -2645,7 +2676,9 @@ async fn a_replaced_workers_late_eviction_leaves_its_successors_report() {
 }
 
 /// The monitor's own sink with a stop inside `forget`: a case holds the
-/// collector there while another thread pushes a record.
+/// collector there while another thread pushes a record. It asks no
+/// worker for its load, so a monitor started over it runs no poll: a poll
+/// that ends while the stop stands would wait for the reports it holds.
 struct StoppedAtForget {
     classic: ClassicLoadSink<crate::test_support::Members>,
     entered: mpsc::Sender<()>,
@@ -2692,6 +2725,10 @@ impl LoadSink for StoppedAtForget {
 
     fn reset(&self) {
         self.classic.reset();
+    }
+
+    fn polls(&self, _worker: &dyn Worker) -> bool {
+        false
     }
 }
 

@@ -1402,6 +1402,12 @@ impl<G: Generation> WorkerMonitor<G> {
     /// groups it takes. A stop dropped at a later wait has told every other
     /// task to end. It has reset nothing: a later stop does.
     ///
+    /// A host makes its stops and starts in turn, and a start behind a
+    /// stop's end or its drop: a start writes its tasks' handles over those
+    /// of tasks that still stand, and no stop ends a task with no handle.
+    /// A stop dropped behind such a start leaves the start's event task
+    /// its slot.
+    ///
     /// Called by no task of the monitor: the call waits for each of them.
     pub async fn stop(&self) {
         Awaited::out_of(&self.event_task).ended().await;
@@ -2194,7 +2200,9 @@ impl<G> Drop for WorkerMonitor<G> {
 
 /// A task's handle, out of its slot while [`WorkerMonitor::stop`] waits for
 /// the task's end. Dropped ahead of that end, it puts the handle back: the
-/// stop behind a dropped one waits for the task too.
+/// stop behind a dropped one waits for the task too. It puts it back into
+/// an empty slot alone. A handle a start wrote there meanwhile stays: that
+/// start's task is the one a later stop ends.
 struct Awaited<'a> {
     slot: &'a Mutex<Option<JoinHandle<()>>>,
     handle: Option<JoinHandle<()>>,
@@ -2218,7 +2226,10 @@ impl<'a> Awaited<'a> {
 impl Drop for Awaited<'_> {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            *self.slot.lock() = Some(handle);
+            let mut slot = self.slot.lock();
+            if slot.is_none() {
+                *slot = Some(handle);
+            }
         }
     }
 }
