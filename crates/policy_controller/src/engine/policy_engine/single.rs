@@ -315,6 +315,7 @@ mod tests {
     use parking_lot::Mutex;
     use smg_worker::{
         identity::basic::Worker, load::state::one_rank_load, test_support::ready_worker,
+        worker::WorkerStatus,
     };
 
     use super::*;
@@ -467,7 +468,8 @@ mod tests {
     /// classic rule, the position of the first worker whose routing state
     /// the selection admits (`model_gateway/src/policies/passthrough.rs:48`
     /// at main `882be6f4f`). No pass over the pool ran, no request was made
-    /// and no lease took an id.
+    /// and no lease took an id. A list that admits no worker is the whole
+    /// decision's: the request is made once.
     #[test]
     fn passthrough_is_the_first_admitted_worker_answered_as_a_place() {
         let engine = preset("passthrough");
@@ -477,15 +479,19 @@ mod tests {
             let asks = Asks::of(request(), Some(&members));
             for refused in 0..workers.min(12) {
                 // Classic's rule, asked of the same worker objects.
-                let classic = list
-                    .iter()
-                    .position(|worker| worker.routing_state().eligible());
+                let classic = list.iter().position(|w| w.routing_state().eligible());
                 assert_eq!(classic, Some(refused));
                 let place = placed(&engine, &asks).place;
                 assert_eq!(place as usize, refused, "{workers} workers");
-                list[refused].set_overloaded(true);
+                // The first is refused by its status alone, the others by overload.
+                list[refused].set_overloaded(refused > 0);
+                list[0].set_status(WorkerStatus::NotReady);
             }
             assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+            if workers <= 12 {
+                let _ = decided(&engine, &asks);
+                assert_eq!(asks.made.get(), 1, "no worker is admitted: made once");
+            }
         }
         assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
     }

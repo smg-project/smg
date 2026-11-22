@@ -5,13 +5,14 @@
 //! A cell is one such list under one document, with the request its callers
 //! make: one entry of [`CELLS`]. A caller asks the one entry a host asks
 //! for a request ([`PolicyEngine::decide_at`]) and says what the host then
-//! owes the engine of it. A place answered alone owes nothing. A whole
-//! decision is held by a guard, which is told the dispatch and the end
-//! ([`DecisionGuard`]).
+//! owes the engine of it. A place answered alone owes nothing, and neither
+//! does a decision that is not leased. A leased one is held by a guard,
+//! which is told the dispatch and the end ([`DecisionGuard`]).
 //!
 //! The request is made, the clock read and the load snapshot borrowed
-//! where the engine asks for them: a place answered alone takes none. No
-//! other work of a host is done: no route, no metric, no in-flight count.
+//! where the engine asks for them, the snapshot under a document that reads
+//! load reports alone: a place answered alone takes none. No other work of
+//! a host is done: no route, no metric, no in-flight count.
 //!
 //! ```text
 //! cargo bench -p smg-policy-controller --features in-process --bench in_process -- \
@@ -19,10 +20,10 @@
 //! ```
 //!
 //! `--workers` is the list's size: every worker is ready and has a load
-//! report. `--publish-ms N` publishes the reports again, as a new snapshot,
-//! every `N` milliseconds while the callers run; `0`, the default,
-//! publishes once. `--callers` threads each make `--decisions` timed
-//! decisions behind untimed first ones. The result is one line.
+//! report, published once. `--overloaded 1` puts every worker over its
+//! overload threshold, so the list admits no worker. `--callers` threads
+//! each make `--decisions` timed decisions behind untimed first ones. The
+//! result is one line.
 //!
 //! A time needs a quiet machine. A count of instructions does not: run a
 //! cell twice under callgrind with one caller and two values of
@@ -45,11 +46,11 @@ use std::{
     env,
     hint::black_box,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Barrier,
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use counting_alloc::{calls, Counting};
@@ -78,7 +79,8 @@ const MODEL: &str = "bench-model";
 const CALLER_WARM: u64 = 256;
 
 /// A cell: its name, the preset its document is, and the request of one
-/// turn of its callers, by the turn's seed.
+/// turn of its callers, by the turn's seed. The request is plain for every
+/// seed or for none: the bench asks it once a cell.
 type Cell = (&'static str, &'static str, fn(u64) -> Request<'static>);
 
 /// The cells. A change that moves a policy's cost adds its entry here.
@@ -91,12 +93,12 @@ const CELLS: [Cell; 6] = [
     ("bucket", "bucket", plain),
 ];
 
-/// A plain single request: a first attempt that asks only a worker.
+/// A plain single request of 1,024 prompt tokens: it asks only a worker.
 fn plain(seed: u64) -> Request<'static> {
     let facts = RequestFacts {
         model: MODEL,
         phase: Phase::Single,
-        prompt_tokens: 64,
+        prompt_tokens: 1_024,
         seed,
         ..RequestFacts::default()
     };
@@ -120,7 +122,7 @@ struct Run {
     workers: usize,
     callers: usize,
     decisions: u64,
-    publish_ms: u64,
+    overloaded: bool,
 }
 
 fn run() -> Run {
@@ -129,7 +131,7 @@ fn run() -> Run {
         workers: 64,
         callers: 1,
         decisions: 1_000_000,
-        publish_ms: 0,
+        overloaded: false,
     };
     let mut switches = env::args().skip(1);
     while let Some(switch) = switches.next() {
@@ -147,20 +149,22 @@ fn run() -> Run {
             "--workers" => run.workers = number() as usize,
             "--callers" => run.callers = number() as usize,
             "--decisions" => run.decisions = number(),
-            "--publish-ms" => run.publish_ms = number(),
+            "--overloaded" => run.overloaded = number() != 0,
             other => panic!("no switch {other}"),
         }
     }
     run
 }
 
-/// One report a worker: queued token-work, KV pressure and a live rate.
+/// One report a worker: queued token-work, running requests, KV pressure
+/// and a live rate, as the gateway's decision bench gives its fleet.
 fn reports(workers: &[Arc<dyn Worker>]) -> HashMap<String, WorkerLoadResponse> {
     let report = |(at, worker): (usize, &Arc<dyn Worker>)| {
         let draw = |salt: u64| mix(at as u64 * 16 + salt);
         let rate = [0.0, 500.0 + (draw(3) % 3_500) as f64][usize::from(draw(3) % 4 != 0)];
         let queued = (draw(1) % 8_192) as i32;
-        let report = one_rank_load(queued, (draw(2) % 95) as f64 / 100.0, rate);
+        let mut report = one_rank_load(queued, (draw(2) % 95) as f64 / 100.0, rate);
+        report.loads[0].num_running_reqs = (draw(4) % 12) as i32;
         (worker.url().to_owned(), report)
     };
     workers.iter().enumerate().map(report).collect()
@@ -192,23 +196,25 @@ impl RequestMaker for Stated<'_> {
     }
 
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
-        Some(self.loads.get_or_init(|| self.host.loads.borrow().clone()))
+        let feed = self.host.loads.as_ref()?;
+        Some(self.loads.get_or_init(|| feed.borrow().clone()))
     }
 }
 
 /// A list of worker objects as a host keeps it: the engine with what it
-/// keeps of the list, the load monitor's side, and the cell's request.
+/// keeps of the list, the load monitor's feed where the document reads load
+/// reports, and the cell's request.
 struct Host {
     engine: PolicyEngine,
     members: PoolMembers,
-    loads: LoadReceiver,
+    loads: Option<LoadReceiver>,
     request: fn(u64) -> Request<'static>,
     plain: Option<Plain>,
 }
 
 impl Host {
     /// One request by the engine's one entry: the place in the list it was
-    /// sent to, with the dispatch and the end told where a decision is held.
+    /// sent to, with the dispatch and the end told where a decision is leased.
     fn place(&self, seed: u64) -> Option<u32> {
         let stated = Stated {
             host: self,
@@ -221,22 +227,24 @@ impl Host {
         match self.engine.decide_at(&stated, clock).ok()? {
             Decided::Alone(pick) => Some(pick.place),
             Decided::Whole(decided, later) => {
-                let now = *dated.get()?;
-                let mut held =
-                    DecisionGuard::holding(&self.engine, GatewayId::LOCAL, decided, later, now);
-                let target = *held.decision().pick()?.targets.first()?;
-                held.dispatched(now);
-                let end = Outcome {
-                    side: Side::Single,
-                    served: target.id,
-                    status: 200,
-                    class: TransportClass::Ok,
-                    ttft_micros: 0,
-                    tokens_in: 64,
-                    tokens_out: 0,
-                    duration_micros: 0,
-                };
-                held.completed(&end, now);
+                let target = *decided.decision.pick()?.targets.first()?;
+                if decided.lease.is_some() {
+                    let now = *dated.get()?;
+                    let mut held =
+                        DecisionGuard::holding(&self.engine, GatewayId::LOCAL, decided, later, now);
+                    held.dispatched(now);
+                    let end = Outcome {
+                        side: Side::Single,
+                        served: target.id,
+                        status: 200,
+                        class: TransportClass::Ok,
+                        ttft_micros: 0,
+                        tokens_in: 1_024,
+                        tokens_out: 0,
+                        duration_micros: 0,
+                    };
+                    held.completed(&end, now);
+                }
                 Some(target.position)
             }
         }
@@ -249,44 +257,34 @@ fn main() {
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
         .collect();
-    let mut document = PolicySpec::preset(preset).expect("a preset's name");
-    document.generation = 1;
+    for worker in workers.iter().filter(|_| run.overloaded) {
+        worker.set_overloaded(true);
+    }
+    let document = PolicySpec::preset(preset).expect("a preset's name");
     let engine = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid preset"));
     let members = engine.pool_members(&workers);
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
-    let loads = reports(&workers);
-    feed.publish(&loads);
+    feed.publish(&reports(&workers));
+    let feed_read = engine.spec().needs().loads;
     let host = Host {
         engine,
         members,
-        loads: receiver.expect("the feed's reader"),
+        loads: receiver.filter(|_| feed_read),
         request,
         plain: request(0).plain(),
     };
     let decide = |seed: u64| host.place(seed);
     // The list's first requests, untimed: what they build once.
     for turn in 0..(run.workers as u64 * 8).max(4_096) {
-        assert!(decide(mix(turn)).is_some(), "a ready worker takes it");
+        assert!(decide(mix(turn)).is_some(), "a worker takes it");
     }
 
     // Each caller makes its first decisions untimed; all start together.
     let start = Barrier::new(run.callers + 1);
     let (busy_nanos, placed, allocations) =
         (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
-    let (publications, published) = (AtomicU64::new(0), AtomicBool::new(false));
-    let converted_before = host.members.conversions();
     let wall = thread::scope(|scope| {
-        // The monitor's side: the reports again, as a new snapshot.
-        if run.publish_ms > 0 {
-            scope.spawn(|| {
-                while !published.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(run.publish_ms));
-                    feed.publish(&loads);
-                    publications.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-        }
         let one_caller = |caller: u64| {
             let seed = |turn: u64| mix(caller << 40 | turn);
             for turn in 0..CALLER_WARM {
@@ -310,19 +308,16 @@ fn main() {
         for caller in callers {
             caller.join().expect("a caller that ends");
         }
-        published.store(true, Ordering::Relaxed);
         started.elapsed()
     });
     let total = run.decisions * run.callers as u64;
-    assert_eq!(placed.into_inner(), total, "a ready worker takes it");
+    assert_eq!(placed.into_inner(), total, "a worker takes it");
     println!(
-        "cell={} workers={} callers={} publish_ms={} publications={} conversions={} allocations_per_decision={:.4} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "cell={} workers={} callers={} overloaded={} allocations_per_decision={:.4} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         name,
         run.workers,
         run.callers,
-        run.publish_ms,
-        publications.into_inner(),
-        host.members.conversions() - converted_before,
+        run.overloaded,
         allocations.into_inner() as f64 / total as f64,
         total,
         wall.as_secs_f64(),
