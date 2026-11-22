@@ -11,7 +11,7 @@ use crate::{
         Candidate, Constraints, Engine, Filter, LoadRow, Pair, PoolFacts, RequestFacts, Scorer,
         Scratch, Target, TieBand, WorkerId,
     },
-    stages::{pickers, Lifecycle, StageRegistry},
+    stages::{pickers, scorers::SLICE_MICROS, Lifecycle, StageRegistry},
     store::{
         Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
         WorkerFacts, WorkerStatus, WorkersStore,
@@ -183,7 +183,9 @@ fn a_send_of_no_stated_size_leaves_the_count_with_its_release() {
     let mut a = row(179, 5);
     send(&engine, &a, START, 0);
     send(&engine, &a, START + 9, 0);
-    send(&engine, &a, START + 20, TOKENS);
+    // A slice of the row's credit behind the first two: a report takes
+    // whole slices.
+    send(&engine, &a, START + 9 + SLICE_MICROS, TOKENS);
     assert_eq!(
         sent.read(&clock(0), &a),
         CreditedDispatches {
@@ -205,8 +207,9 @@ fn a_retired_batch_takes_its_sends_of_no_stated_size_with_it() {
     for _ in 0..300 {
         send(&engine, &a, START, 0);
     }
+    // A slice behind them: a batch goes from the row's oldest slice.
     for _ in 300..8201 {
-        send(&engine, &a, START + 1, 13);
+        send(&engine, &a, START + SLICE_MICROS, 13);
     }
     // The 256 oldest sends went, each of no stated size.
     assert_eq!(
@@ -234,8 +237,9 @@ fn a_busy_rows_tally_retires_its_oldest_batch() {
             ..CreditedDispatches::default()
         }
     );
+    // A slice behind them: a batch goes from the row's oldest slice.
     for _ in 8037..8201 {
-        send(&engine, &a, START + 1, 19);
+        send(&engine, &a, START + SLICE_MICROS, 19);
     }
     assert_eq!(
         sent.read(&clock(0), &a),
@@ -260,10 +264,12 @@ fn the_row_report_ends_sends_at_its_sample_and_earlier() {
     a.load = Some(LoadRow::default());
     a.load_sampled_at_micros = at - 1;
     assert_eq!(sent.read(&facts, &a), one(TOKENS));
-    send(&engine, &a, START + 7, 293);
+    // The second send is a slice of the row's credit behind the first: a
+    // report takes whole slices.
+    send(&engine, &a, START + SLICE_MICROS, 293);
     a.load_sampled_at_micros = at;
     assert_eq!(sent.read(&facts, &a), one(293));
-    a.load_sampled_at_micros = at + 8;
+    a.load_sampled_at_micros = at + SLICE_MICROS;
     assert_eq!(sent.read(&facts, &a), CreditedDispatches::default());
 }
 
@@ -276,10 +282,12 @@ fn the_limit_ends_sends_at_its_cutoff_and_earlier() {
     a.load_sampled_at_micros = at - 1;
     send(&engine, &a, START - 2, 281);
     send(&engine, &a, START, TOKENS);
-    send(&engine, &a, START + 4, 331);
+    // A slice of the row's credit behind the first two: the limit ends
+    // whole slices, as a report does.
+    send(&engine, &a, START + SLICE_MICROS, 331);
 
     assert_eq!(sent.read(&clock(at + 17_000), &a), one(331));
-    a.load_sampled_at_micros = at + 4;
+    a.load_sampled_at_micros = at + SLICE_MICROS;
     assert_eq!(
         sent.read(&clock(at + 17_001), &a),
         CreditedDispatches::default()
@@ -319,7 +327,7 @@ fn the_two_number_read_releases_the_sends_a_report_reflects() {
     let mut a = row(347, 3);
     let at = START + u64::from(DELAY);
     send(&engine, &a, START, TOKENS);
-    send(&engine, &a, START + 7, 293);
+    send(&engine, &a, START + SLICE_MICROS, 293);
     a.load = Some(LoadRow::default());
     a.load_sampled_at_micros = at;
 
@@ -339,7 +347,7 @@ fn a_release_leaves_a_later_send_of_no_stated_size_in_the_read_that_ran_it() {
     let (engine, sent) = built(None);
     let mut a = row(353, 5);
     send(&engine, &a, START, 0);
-    send(&engine, &a, START + 9, 0);
+    send(&engine, &a, START + SLICE_MICROS, 0);
     // A report that reflects the first send: the read that releases it
     // still counts the second, and counts it as of no stated size.
     a.load = Some(LoadRow::default());

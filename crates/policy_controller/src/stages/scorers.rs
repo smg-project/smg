@@ -7,7 +7,6 @@
 
 use std::{
     cell::Cell,
-    collections::VecDeque,
     sync::{
         atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -378,15 +377,28 @@ impl Scorer for FewestSessions {
     }
 }
 
-/// The dispatches credited to one rank since its last load report, oldest
-/// first within each lane. What a decision reads (the held token-work and
-/// requests) rides
-/// one atomic word, so deciding threads read a row without a lock. The
-/// dispatches themselves sit in [`DISPATCH_LANES`] lanes, each behind its own
-/// lock and fed by the threads mapped to it: concurrent dispatches to one row
-/// (deciders that read the same minimum book the same rank) rarely share a
-/// lock. `oldest_micros` tells a decision whether its report's sample reaches
+/// The dispatches credited to one rank since its last load report. What a
+/// decision reads (the held token-work and requests) rides one atomic word,
+/// so deciding threads read a row without a lock. The dispatches themselves
+/// sit in [`DISPATCH_LANES`] lanes, each behind its own lock and fed by the
+/// threads mapped to it: concurrent dispatches to one row (deciders that
+/// read the same minimum book the same rank) rarely share a lock.
+/// `oldest_micros` tells a decision whether its report's sample releases
 /// any held dispatch without taking one.
+///
+/// A lane keeps its dispatches as sums over slices of time ([`TimeSlices`]),
+/// inside the row: a row is one size whatever it holds, and a dispatch, a
+/// release and a retirement allocate nothing. The price is a dispatch held
+/// for one report more, in the case said there.
+///
+/// A row is under 10 KB: eight lanes, each of 64 slices at 16 bytes and 64
+/// counts at 2, on cache lines of its own. A fleet holds one row for each
+/// rank of each worker it dispatched to: 5 MB for 512 workers of one rank,
+/// whatever their traffic.
+///
+/// A row is entered at its rank's first dispatch ([`Credits::entry`]): the
+/// row and one copy of the tally's table, once a rank for as long as its
+/// worker stands.
 #[derive(Debug)]
 pub(crate) struct RankCredit {
     /// The held token-work in the high bits and the held requests in the low
@@ -400,13 +412,14 @@ pub(crate) struct RankCredit {
     /// the held word does not. The held word's subtraction there is a
     /// `Release` and the read of both words loads the held word with
     /// `Acquire`, so a reader finds that order on every target. A read
-    /// loads the two words apart: across a record or a release it may see
-    /// one without the other for the dispatch in flight, and across a
-    /// retirement for its batch.
+    /// loads the two words apart: across a record it may see one without
+    /// the other for the dispatch in flight, across a release for one
+    /// slice's dispatches, and across a retirement for its batch.
     unsized_held: AtomicU16,
-    /// The lowest of the lanes' front instants; `u64::MAX` when none. A
-    /// dispatch lowers it under its lane's lock; a release recomputes it
-    /// under every lane's lock, so it never reads above any lane's front.
+    /// The lowest of the lanes' oldest instants ([`TimeSlices::oldest`]);
+    /// `u64::MAX` when none. A dispatch lowers it under its lane's lock; a
+    /// release recomputes it under every lane's lock, so it never reads
+    /// above any lane's own.
     oldest_micros: AtomicU64,
     /// Held by the one retirement in progress: of the dispatches that read
     /// the bound together, the first retires and the rest land while the row
@@ -460,22 +473,287 @@ impl Default for Told {
     }
 }
 
-/// A lane's dispatches: the instant and the token-work of each, oldest first.
-type Dispatches = VecDeque<(u64, u32)>;
+/// Slices a lane keeps.
+const LANE_SLICES: usize = 64;
 
-/// One lane of a row's dispatches, on a cache line of its own: the threads
-/// mapped to it append here, and its traffic never invalidates another lane.
+/// A slice's width in a lane at rest, as a power of two of microseconds:
+/// 1,024 of them, a millisecond.
+const SLICE_MICROS_LOG2: u32 = 10;
+
+/// That width in microseconds: dispatches this far apart are in two slices.
+#[cfg(test)]
+pub(crate) const SLICE_MICROS: u64 = 1 << SLICE_MICROS_LOG2;
+
+/// The dispatches of one slice of a lane's time, as sums.
+#[derive(Clone, Copy, Debug)]
+struct TimeSlice {
+    /// The slice's token-work and its count of dispatches, laid out as the
+    /// row's held word is ([`RankCredit::held`]). Zero where it holds none.
+    held: u64,
+    /// The instant of the slice's newest dispatch: a report sampled at or
+    /// after it reflects every dispatch of the slice.
+    newest_micros: u64,
+}
+
+impl TimeSlice {
+    const EMPTY: Self = Self {
+        held: 0,
+        newest_micros: 0,
+    };
+}
+
+/// One lane's dispatches, oldest first, as sums over slices of time:
+/// [`LANE_SLICES`] slices of one width, laid end to end. The lane is one
+/// size whatever it holds and sits inside its row, so a dispatch, a release
+/// and a retirement allocate nothing, and each is a bounded number of
+/// steps under the lane's lock.
+///
+/// A dispatch lands in the slice of its instant. One dated at or before
+/// the lane's newest dispatch (a dispatch that waited for a retirement on a
+/// shared lane, or one a stepped clock dated earlier) lands in the newest
+/// slice. One dated past the last slice merges the lane's slices in pairs,
+/// in one pass of at most 63 slices, as often as it takes to reach it. The
+/// width doubles each time, so a lane grown to a width held at least
+/// thirty-two times that width when it grew.
+///
+/// A release takes whole slices off the lane's front: each one whose
+/// newest dispatch the report's sample reaches. No dispatch goes before a
+/// report reflects it. A dispatch made at or before a sample goes with
+/// that sample, unless its slice also holds a dispatch made after the
+/// sample: then it is held one report longer, and a reader prices it once
+/// more. What is held too long is within one slice, the sample's own.
+///
+/// A release that empties the lane brings its width back to a millisecond.
+/// One that finds the lane a quarter full or less and leaves it one slice
+/// lays the slices behind that one narrower, by as many halvings as keep
+/// what it found within half the lane. So the width follows the time
+/// between two reports, and does not stay where one long silence took it.
+/// The slice left is not split: it is the lane's first until a release
+/// takes it, and spans less than the lane's width and the width before
+/// the narrowing together. Every other slice spans less than the lane's
+/// width. A release that leaves more slices keeps the width: slices laid
+/// on two widths would merge into ones wider than either. For the same
+/// reason the width does not go back to a millisecond at every release.
+#[derive(Debug)]
+struct TimeSlices {
+    /// `slices[..len]` are in use. The first and the last of them hold a
+    /// dispatch; one between them may hold none.
+    slices: [TimeSlice; LANE_SLICES],
+    /// Each slice's dispatches of no tokens, at the slice's place.
+    unsized_sends: [u16; LANE_SLICES],
+    len: usize,
+    /// The instant the first slice begins at, by the lane's width. Behind
+    /// a release that narrowed the slices it is counted back from the
+    /// newest dispatch, and may wrap below zero: only an instant past that
+    /// dispatch is placed by it.
+    origin_micros: u64,
+    /// The slices' width, as a power of two of microseconds.
+    width_log2: u32,
+}
+
+// A lane owns nothing behind a pointer: all it holds is in its row. And a
+// merge of pairs counts on a power of two.
+const _: () = assert!(!std::mem::needs_drop::<TimeSlices>() && LANE_SLICES.is_power_of_two());
+
+impl TimeSlices {
+    const fn new() -> Self {
+        Self {
+            slices: [TimeSlice::EMPTY; LANE_SLICES],
+            unsized_sends: [0; LANE_SLICES],
+            len: 0,
+            origin_micros: 0,
+            width_log2: SLICE_MICROS_LOG2,
+        }
+    }
+
+    /// The instant of the oldest slice's newest dispatch, the earliest
+    /// sample a release takes a slice at; `u64::MAX` where the lane holds
+    /// none.
+    fn oldest(&self) -> u64 {
+        if self.len == 0 {
+            u64::MAX
+        } else {
+            self.slices[0].newest_micros
+        }
+    }
+
+    /// The dispatches the lane holds.
+    fn sends(&self) -> u64 {
+        self.slices[..self.len]
+            .iter()
+            .map(|slice| slice.held & REQUEST_MASK)
+            .sum()
+    }
+
+    /// Holds one dispatch of `tokens` made at `at_micros`, and says
+    /// whether the lane's oldest instant moved.
+    fn add(&mut self, at_micros: u64, tokens: u32) -> bool {
+        let held = RankCredit::weight(tokens);
+        let unsized_send = u16::from(tokens == 0);
+        let Some(last) = self.len.checked_sub(1) else {
+            // A lane at rest: its first slice begins at this dispatch.
+            self.origin_micros = at_micros;
+            self.width_log2 = SLICE_MICROS_LOG2;
+            self.slices[0] = TimeSlice {
+                held,
+                newest_micros: at_micros,
+            };
+            self.unsized_sends[0] = unsized_send;
+            self.len = 1;
+            return true;
+        };
+        // Instants mostly rise, so the lane's newest dispatch is asked
+        // first: a dispatch no newer than it joins the newest slice.
+        if at_micros <= self.slices[last].newest_micros {
+            self.slices[last].held += held;
+            self.unsized_sends[last] += unsized_send;
+            return false;
+        }
+        let oldest = self.slices[0].newest_micros;
+        let mut place = at_micros.wrapping_sub(self.origin_micros) >> self.width_log2;
+        if place >= LANE_SLICES as u64 {
+            place = self.widen(place);
+        }
+        // A dispatch newer than the lane's newest is in the last slice or
+        // past it.
+        let place = place as usize;
+        debug_assert!(place >= self.len - 1, "a newer dispatch lands no earlier");
+        if place < self.len {
+            let newest = &mut self.slices[place];
+            newest.held += held;
+            newest.newest_micros = at_micros;
+            self.unsized_sends[place] += unsized_send;
+        } else {
+            self.slices[self.len..place].fill(TimeSlice::EMPTY);
+            self.unsized_sends[self.len..place].fill(0);
+            self.slices[place] = TimeSlice {
+                held,
+                newest_micros: at_micros,
+            };
+            self.unsized_sends[place] = unsized_send;
+            self.len = place + 1;
+        }
+        self.slices[0].newest_micros != oldest
+    }
+
+    /// Merges the slices in pairs, in one pass, as often as it takes for
+    /// `place`, a slice past the last, to be one of the lane's, and says
+    /// which it then is. Each merge of pairs doubles the width.
+    fn widen(&mut self, place: u64) -> u64 {
+        let doublings = u64::BITS - place.leading_zeros() - LANE_SLICES.trailing_zeros();
+        for at in 1..self.len {
+            let into = at >> doublings;
+            let (slice, unsized_sends) = (self.slices[at], self.unsized_sends[at]);
+            if at == into << doublings {
+                self.slices[into] = slice;
+                self.unsized_sends[into] = unsized_sends;
+            } else {
+                // A slice that holds none names no instant.
+                let merged = &mut self.slices[into];
+                merged.held += slice.held;
+                merged.newest_micros = merged.newest_micros.max(slice.newest_micros);
+                self.unsized_sends[into] += unsized_sends;
+            }
+        }
+        self.len = ((self.len - 1) >> doublings) + 1;
+        self.width_log2 += doublings;
+        place >> doublings
+    }
+
+    /// Drops the first `taken` slices: the ones behind them are the lane's
+    /// first.
+    fn drop_front(&mut self, taken: usize) {
+        self.slices.copy_within(taken..self.len, 0);
+        self.unsized_sends.copy_within(taken..self.len, 0);
+        self.len -= taken;
+        self.origin_micros = self
+            .origin_micros
+            .wrapping_add((taken as u64) << self.width_log2);
+    }
+
+    /// Takes off the lane's front each slice a report sampled at
+    /// `sampled_at_micros` reflects whole, its held word and its
+    /// dispatches of no tokens shown to `gone` as it goes.
+    fn release(&mut self, sampled_at_micros: u64, mut gone: impl FnMut(u64, u16)) {
+        let mut taken = 0;
+        while taken < self.len {
+            let slice = self.slices[taken];
+            if slice.held != 0 {
+                if slice.newest_micros > sampled_at_micros {
+                    break;
+                }
+                gone(slice.held, self.unsized_sends[taken]);
+            }
+            taken += 1;
+        }
+        let found = self.len;
+        if taken > 0 {
+            self.drop_front(taken);
+        }
+        // A lane found a quarter full or less is wider than the time
+        // between two reports needs. Where one slice is left, whether the
+        // release took any or none, the slices laid from here on are
+        // narrower, by as many halvings as keep what the release found
+        // within half the lane, and the instant past the slice's newest
+        // dispatch begins the first of them.
+        if self.len != 1 || found > LANE_SLICES / 4 {
+            return;
+        }
+        let narrower = (LANE_SLICES / 2 / found)
+            .ilog2()
+            .min(self.width_log2 - SLICE_MICROS_LOG2);
+        if narrower > 0 {
+            self.width_log2 -= narrower;
+            self.origin_micros = self.slices[0]
+                .newest_micros
+                .wrapping_add(1)
+                .wrapping_sub(1 << self.width_log2);
+        }
+    }
+
+    /// Takes up to `sends` of the lane's oldest dispatches off its first
+    /// slice, at that slice's mean token-work, with its dispatches of no
+    /// tokens in proportion and rounded down, so no more of them stay than
+    /// dispatches. Hands back what went, as a held word and a count of
+    /// dispatches of no tokens. For a lane that holds a dispatch.
+    fn retire(&mut self, sends: u64) -> (u64, u16) {
+        let (held, unsized_sends) = (self.slices[0].held, self.unsized_sends[0]);
+        let held_sends = held & REQUEST_MASK;
+        if sends >= held_sends {
+            // The whole slice, with the ones behind it that hold none.
+            let empty = self.slices[1..self.len]
+                .iter()
+                .take_while(|slice| slice.held == 0)
+                .count();
+            self.drop_front(1 + empty);
+            return (held, unsized_sends);
+        }
+        let tokens = (held >> REQUEST_BITS) * sends / held_sends;
+        let unsized_gone = (u64::from(unsized_sends) * sends / held_sends) as u16;
+        let gone = tokens << REQUEST_BITS | sends;
+        self.slices[0].held -= gone;
+        self.unsized_sends[0] -= unsized_gone;
+        (gone, unsized_gone)
+    }
+}
+
+/// One lane of a row's dispatches, on cache lines of its own: the threads
+/// mapped to it write here, and its traffic never invalidates another lane.
 #[derive(Debug)]
 #[repr(align(64))]
 struct DispatchLane {
-    dispatches: Mutex<Dispatches>,
-    /// The instant at this lane's front; `u64::MAX` when none.
+    slices: Mutex<TimeSlices>,
+    /// The lane's oldest instant ([`TimeSlices::oldest`]); `u64::MAX` when it
+    /// holds none.
     oldest_micros: AtomicU64,
 }
 
 /// Lanes per rank row. A deciding thread keeps the lane it drew first; a
 /// host with more deciding threads than lanes shares them.
 const DISPATCH_LANES: usize = 8;
+
+// A row's size is its lanes', and stays under 10 KB.
+const _: () = assert!(size_of::<RankCredit>() <= 10 * 1024);
 
 /// Dispatches kept per rank row between reports, over its lanes: a dispatch
 /// past the bound retires the row's oldest batch, by instant across the
@@ -487,17 +765,10 @@ const DISPATCH_LANES: usize = 8;
 /// never fill.
 pub(crate) const RANK_CREDIT_KEPT: u64 = 8_192;
 
-/// Dispatches an overflow retires, by instant across the lanes under every
-/// lane's lock: the eight locks and the merge cost once per batch rather
-/// than once per dispatch. Eight deciders in a never-released regime paid
-/// 1.9x per decision retiring one at a time, and 2.1x retiring a batch
-/// from the oldest lane alone, whose few entries made the batch a handful.
-/// Where the lanes interleave by instant the order itself has a price: the
-/// bench's `least_load_rising` row reads 1.2x the drain of one
-/// lane at this batch and 1.9x at a batch of 64 (a merge taking
-/// one lane's lock at a time read 2.8x), paid in the overflow regime
-/// alone, a rank row holding more than the bound unreleased between two
-/// load reports.
+/// Dispatches an overflow retires, from the oldest slices across the lanes
+/// under every lane's lock: the eight locks cost once per batch rather than
+/// once per dispatch. Paid in the overflow regime alone, a rank row holding
+/// more than the bound unreleased between two load reports.
 pub(crate) const RETIRE_BATCH: usize = 256;
 
 /// The low bits of [`RankCredit::held`] that count requests: room for the
@@ -563,16 +834,15 @@ pub(crate) fn take_lane(lane: usize) {
 impl Default for DispatchLane {
     fn default() -> Self {
         Self {
-            dispatches: Mutex::new(Dispatches::new()),
+            slices: Mutex::new(TimeSlices::new()),
             oldest_micros: AtomicU64::new(u64::MAX),
         }
     }
 }
 
 impl DispatchLane {
-    fn publish_oldest(&self, dispatches: &Dispatches) {
-        let oldest = dispatches.front().map_or(u64::MAX, |&(at, _)| at);
-        self.oldest_micros.store(oldest, Ordering::Release);
+    fn publish_oldest(&self, slices: &TimeSlices) {
+        self.oldest_micros.store(slices.oldest(), Ordering::Release);
     }
 }
 
@@ -606,62 +876,44 @@ impl RankCredit {
             self.retire_oldest_batch();
         }
         let lane = &self.lanes[lane_of_this_thread()];
-        let mut dispatches = lane.dispatches.lock();
-        // At its instant's place: a dispatch that waited for a retirement
-        // on a shared lane, or one a stepped clock dated earlier, lands
-        // behind a later one, and the release and the retirement read a
-        // lane from its oldest. Instants mostly rise, so the lane's newest
-        // is asked first: a dispatch no older than it is a push, and the
-        // place is searched for the one that is. The lane's front moves
-        // only where the dispatch lands there.
-        let newest = dispatches.back().map(|&(held_at, _)| held_at);
-        let front = if newest.is_some_and(|newest| newest > at_micros) {
-            let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
-            dispatches.insert(at, (at_micros, tokens));
-            at == 0
-        } else {
-            dispatches.push_back((at_micros, tokens));
-            newest.is_none()
-        };
+        let mut slices = lane.slices.lock();
+        let moved = slices.add(at_micros, tokens);
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
         if tokens == 0 {
             self.unsized_held.fetch_add(1, Ordering::Relaxed);
         }
-        if front {
-            lane.publish_oldest(&dispatches);
-        }
-        // Under the lane's lock: a release, which holds every lane, never
-        // recomputes the row's oldest past this dispatch. Dispatch instants
-        // mostly rise, so this is a read.
-        if at_micros < self.oldest_micros.load(Ordering::Acquire) {
-            self.oldest_micros.fetch_min(at_micros, Ordering::AcqRel);
-        }
-    }
-
-    /// Takes a lane's oldest dispatch out of the held word. The
-    /// subtraction is a `Release`: a read that loads the word with
-    /// `Acquire` finds every write made ahead of it, the count of the
-    /// dispatches of no tokens among them ([`Self::sent_through`]).
-    fn pop_oldest(&self, dispatches: &mut Dispatches) {
-        if let Some((_, tokens)) = dispatches.pop_front() {
-            self.held.fetch_sub(Self::weight(tokens), Ordering::Release);
+        // The lane's oldest instant moves only where the dispatch lands in
+        // the lane's first slice or merges it.
+        if moved {
+            lane.publish_oldest(&slices);
+            // Under the lane's lock: a release, which holds every lane,
+            // never recomputes the row's oldest past this dispatch. An
+            // instant that rose leaves the row's where it was: a value too
+            // low costs a release walk, never a missed one.
+            let oldest = slices.oldest();
+            if oldest < self.oldest_micros.load(Ordering::Acquire) {
+                self.oldest_micros.fetch_min(oldest, Ordering::AcqRel);
+            }
         }
     }
 
     /// Every lane's dispatches under their locks, taken in lane order: the
     /// one order the release and the retirement share, so neither waits on
     /// the other for a second lane.
-    fn lock_lanes(&self) -> [MutexGuard<'_, Dispatches>; DISPATCH_LANES] {
-        std::array::from_fn(|i| self.lanes[i].dispatches.lock())
+    fn lock_lanes(&self) -> [MutexGuard<'_, TimeSlices>; DISPATCH_LANES] {
+        std::array::from_fn(|i| self.lanes[i].slices.lock())
     }
 
-    /// Retires [`RETIRE_BATCH`] of the row's oldest dispatches by instant
-    /// across the lanes, one retirement at a time and under every lane's
-    /// lock as the release path holds them: one lock per lane and one
-    /// subtraction from the held word per batch. A row a release took below
-    /// the bound in the meantime keeps its dispatches. The row's oldest
-    /// instant stays where it was: a value too low costs a release walk,
-    /// never a missed one.
+    /// Retires [`RETIRE_BATCH`] of the row's oldest dispatches, one
+    /// retirement at a time and under every lane's lock as the release
+    /// path holds them: one lock per lane and one subtraction from the
+    /// held word per batch. They go from the oldest slice across the
+    /// lanes, at that slice's mean token-work ([`TimeSlices::retire`]), and
+    /// from the next oldest where it holds fewer: a full row gives up a
+    /// batch, never a whole slice for being the oldest. A row a release
+    /// took below the bound in the meantime keeps its dispatches. The
+    /// row's oldest instant stays where it was: a value too low costs a
+    /// release walk, never a missed one.
     fn retire_oldest_batch(&self) {
         // One retirement at a time: a dispatch that finds one in progress
         // lands while the row is within a batch above the bound, and past
@@ -688,30 +940,33 @@ impl RankCredit {
         if self.held.load(Ordering::Relaxed) & REQUEST_MASK < RANK_CREDIT_KEPT {
             return;
         }
+        let mut left = RETIRE_BATCH as u64;
         let mut retired = 0;
         let mut unsized_retired = 0;
-        for _ in 0..RETIRE_BATCH {
-            // The lane whose front is the oldest; none when every lane is
-            // empty.
+        while left > 0 {
+            // The lane whose first slice is the oldest; none when every
+            // lane is empty.
             let oldest = held_lanes
                 .iter()
                 .enumerate()
-                .filter_map(|(i, dispatches)| dispatches.front().map(|&(at, _)| (at, i)))
+                .filter(|(_, slices)| slices.len > 0)
+                .map(|(i, slices)| (slices.oldest(), i))
                 .min();
             let Some((_, i)) = oldest else {
                 break;
             };
-            if let Some((_, tokens)) = held_lanes[i].pop_front() {
-                retired += Self::weight(tokens);
-                unsized_retired += u16::from(tokens == 0);
-            }
+            let (held, unsized_sends) = held_lanes[i].retire(left);
+            left -= held & REQUEST_MASK;
+            retired += held;
+            unsized_retired += unsized_sends;
         }
         self.unsized_held
             .fetch_sub(unsized_retired, Ordering::Relaxed);
-        // A `Release`, as a release's subtraction is: see `pop_oldest`.
+        // A `Release`, as a release's subtraction is
+        // ([`Self::release_through`]).
         self.held.fetch_sub(retired, Ordering::Release);
-        for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
-            lane.publish_oldest(dispatches);
+        for (slices, lane) in held_lanes.iter().zip(&self.lanes) {
+            lane.publish_oldest(slices);
         }
     }
 
@@ -724,9 +979,10 @@ impl RankCredit {
     }
 
     /// The held token-work and requests once the dispatches made at or
-    /// before `through_micros` are released: a report sampled then
-    /// reflects them, or a time limit ends them. An instant that reaches
-    /// none of them reads the word alone. Inlined into a reader's row
+    /// before `through_micros` are released, by whole slices
+    /// ([`TimeSlices`]): a report sampled then reflects them, or a time limit
+    /// ends them. An instant that reaches no slice reads the word alone.
+    /// Inlined into a reader's row
     /// loop: two loads and a compare a row, the release behind a call
     /// that hands the held word back, so the loop keeps nothing of the
     /// row across it.
@@ -757,8 +1013,9 @@ impl RankCredit {
         }
     }
 
-    /// Whether the row holds a dispatch made at or before the sample: one
-    /// a report sampled then reflects, which its release takes.
+    /// Whether a release at the sample takes a slice of the row: the
+    /// sample is at or past the row's oldest instant, which is the newest
+    /// dispatch of some lane's oldest slice or an instant below it.
     #[inline(always)]
     fn reaches(&self, sampled_at_micros: u64) -> bool {
         self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros
@@ -779,34 +1036,34 @@ impl RankCredit {
         }
     }
 
-    /// Releases every lane's dispatches made at or before the sample and
-    /// recomputes the row's oldest, under every lane's lock in lane order,
-    /// so no dispatch lands between the lanes' reads and the store. Hands
-    /// back the held word as it stands once the locks are free: a read of
-    /// two numbers takes them from it and keeps nothing of the row across
-    /// the call. Out of line: a decision reads a row far more often than
-    /// a report releases from it, and with this body inlined the read was
-    /// too large to stay in a second scorer's row loop.
+    /// Releases every lane's slices the sample reaches and recomputes the
+    /// row's oldest, under every lane's lock in lane order, so no dispatch
+    /// lands between the lanes' reads and the store. Hands back the held
+    /// word as it stands once the locks are free: a read of two numbers
+    /// takes them from it and keeps nothing of the row across the call.
+    /// Out of line: a decision reads a row far more often than a report
+    /// releases from it, and with this body inlined the read was too large
+    /// to stay in a second scorer's row loop.
     #[cold]
     #[inline(never)]
     fn release_through(&self, sampled_at_micros: u64) -> u64 {
         let mut held_lanes = self.lock_lanes();
-        // No dispatch lands under every lane's lock, so the count of the
-        // held dispatches of no tokens stands still here: a row that
-        // holds none releases by the loop it ran before that count was
-        // kept.
-        if self.unsized_held.load(Ordering::Relaxed) != 0 {
-            self.release_marked(&mut held_lanes, sampled_at_micros);
-        } else {
-            for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-                while dispatches
-                    .front()
-                    .is_some_and(|&(at, _)| at <= sampled_at_micros)
-                {
-                    self.pop_oldest(dispatches);
+        for (slices, lane) in held_lanes.iter_mut().zip(&self.lanes) {
+            slices.release(sampled_at_micros, |held, unsized_sends| {
+                // A slice's dispatches of no tokens leave their count
+                // first and the held word next: a read that crosses the
+                // release counts no more of them than dispatches, and
+                // misses the price of one slice's at most. The held
+                // word's subtraction is a `Release`: a read that loads the
+                // word with `Acquire` finds every write made ahead of it
+                // ([`Self::sent_through`]).
+                if unsized_sends != 0 {
+                    self.unsized_held
+                        .fetch_sub(unsized_sends, Ordering::Relaxed);
                 }
-                lane.publish_oldest(dispatches);
-            }
+                self.held.fetch_sub(held, Ordering::Release);
+            });
+            lane.publish_oldest(slices);
         }
         let oldest = self
             .lanes
@@ -821,36 +1078,11 @@ impl RankCredit {
         self.held.load(Ordering::Relaxed)
     }
 
-    /// The release of a row that holds a dispatch of no tokens: each one
-    /// that goes leaves that count first and the held word next, so a
-    /// read that crosses the release misses the price of one dispatch at
-    /// most.
-    #[cold]
-    #[inline(never)]
-    fn release_marked(
-        &self,
-        held_lanes: &mut [MutexGuard<'_, Dispatches>; DISPATCH_LANES],
-        sampled_at_micros: u64,
-    ) {
-        for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-            while let Some(&(at, tokens)) = dispatches.front() {
-                if at > sampled_at_micros {
-                    break;
-                }
-                if tokens == 0 {
-                    self.unsized_held.fetch_sub(1, Ordering::Relaxed);
-                }
-                self.pop_oldest(dispatches);
-            }
-            lane.publish_oldest(dispatches);
-        }
-    }
-
     /// Dispatches held over every lane, for tests and dumps.
     fn len(&self) -> usize {
         self.lanes
             .iter()
-            .map(|lane| lane.dispatches.lock().len())
+            .map(|lane| lane.slices.lock().sends() as usize)
             .sum()
     }
 }
@@ -3176,31 +3408,44 @@ pub(crate) mod tests {
 
     #[test]
     fn a_read_across_a_release_counts_no_more_unsized_dispatches_than_dispatches() {
-        // One thread releases a row that holds dispatches of no tokens
-        // alone, and this one reads the row's two words as they stand. The
-        // count of those dispatches goes down ahead of the held word at
-        // each one, so no read sees more of them than dispatches. A round
-        // whose reads all land beside the release shows nothing: the
-        // rounds go on until a read lands inside one, a few at most.
-        const HELD: u64 = 6_000;
+        // One thread releases rows that hold dispatches of no tokens
+        // alone, a slice at a time, and this one reads each row's two
+        // words as they stand. A slice's count of those dispatches goes
+        // down ahead of the held word, so no read sees more of them than
+        // dispatches. A round whose reads all land beside the releases
+        // shows nothing: the rounds go on until a read lands inside one, a
+        // few at most.
+        const SLICES: u64 = LANE_SLICES as u64 - 1;
+        const ROWS: usize = 96;
         for _ in 0..32 {
-            let row = RankCredit::default();
-            for at in 1..=HELD {
-                row.record(at, 0);
-            }
+            let rows: Vec<RankCredit> = (0..ROWS)
+                .map(|_| {
+                    let row = RankCredit::default();
+                    for at in 1..=SLICES {
+                        row.record(at << SLICE_MICROS_LOG2, 0);
+                    }
+                    row
+                })
+                .collect();
             let crossed = std::thread::scope(|s| {
-                let release = s.spawn(|| row.sent_through(HELD));
+                let release = s.spawn(|| {
+                    for row in &rows {
+                        row.sent_through(SLICES << SLICE_MICROS_LOG2);
+                    }
+                });
                 let mut crossed = false;
                 while !release.is_finished() {
-                    // An instant ahead of every dispatch releases none.
-                    let read = row.sent_through(0);
-                    assert!(
-                        read.unsized_requests <= read.requests,
-                        "{} dispatches of no tokens beside {} dispatches",
-                        read.unsized_requests,
-                        read.requests
-                    );
-                    crossed |= read.requests != 0 && u64::from(read.requests) != HELD;
+                    for row in &rows {
+                        // An instant ahead of every dispatch releases none.
+                        let read = row.sent_through(0);
+                        assert!(
+                            read.unsized_requests <= read.requests,
+                            "{} dispatches of no tokens beside {} dispatches",
+                            read.unsized_requests,
+                            read.requests
+                        );
+                        crossed |= read.requests != 0 && u64::from(read.requests) != SLICES;
+                    }
                 }
                 crossed
             });
@@ -3208,6 +3453,403 @@ pub(crate) mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn a_dispatch_in_the_samples_own_slice_stays_one_report_longer() {
+        // A slice holds two dispatches, one made before the sample and one
+        // after it: the sample takes neither, and the one that reaches the
+        // later dispatch takes both.
+        let row = RankCredit::default();
+        row.record(100, 7);
+        row.record(600, 9);
+        assert_eq!(row.sent_through(300).requests, 2);
+        assert_eq!(row.sent_through(599).requests, 2);
+        let held = row.sent_through(600);
+        assert_eq!((held.requests, held.tokens), (0, 0));
+
+        // A dispatch whose slice holds none made after the sample goes
+        // with it: the two are a slice apart.
+        let row = RankCredit::default();
+        row.record(100, 7);
+        row.record(100 + SLICE_MICROS, 9);
+        let held = row.sent_through(300);
+        assert_eq!((held.requests, held.tokens), (1, 9));
+    }
+
+    #[test]
+    fn a_lane_past_its_slices_merges_them_in_pairs() {
+        // One dispatch a millisecond fills the lane's slices, and the next
+        // merges them in pairs: no dispatch goes, and a slice is two
+        // milliseconds wide. A sample at the first dispatch of a pair
+        // takes the pairs before it and leaves that one whole.
+        let row = RankCredit::default();
+        let sends = LANE_SLICES as u64 + 1;
+        for at in 0..sends {
+            row.record(at * SLICE_MICROS, 1);
+        }
+        assert_eq!(row.len() as u64, sends);
+        assert_eq!(
+            u64::from(row.sent_through(4 * SLICE_MICROS).requests),
+            sends - 4
+        );
+        assert_eq!(
+            u64::from(row.sent_through(5 * SLICE_MICROS).requests),
+            sends - 6
+        );
+    }
+
+    #[test]
+    fn a_lane_a_release_finds_nearly_empty_lays_narrower_slices() {
+        // Two dispatches 64 milliseconds apart make the lane's slices two
+        // milliseconds wide, and a release takes the first. The lane then
+        // holds two dispatches in three slices: the next release finds it
+        // a quarter full or less and leaves it one slice, and the slices
+        // behind that one are a millisecond wide again. Two dispatches a
+        // millisecond apart are in two of them, and a sample between them
+        // takes the first alone.
+        let row = RankCredit::default();
+        let wide = LANE_SLICES as u64 * SLICE_MICROS;
+        row.record(0, 1);
+        row.record(wide, 1);
+        assert_eq!(row.sent_through(0).requests, 1);
+        row.record(wide + 4 * SLICE_MICROS, 1);
+        assert_eq!(row.sent_through(wide).requests, 1);
+        let next = wide + 4 * SLICE_MICROS + 1;
+        row.record(next, 1);
+        row.record(next + SLICE_MICROS, 1);
+        assert_eq!(row.sent_through(next).requests, 1);
+    }
+
+    #[test]
+    fn a_lane_a_release_finds_fuller_keeps_its_width() {
+        // A lane merged to two milliseconds a slice and found more than a
+        // quarter full keeps that width behind a release: two dispatches a
+        // millisecond apart share a slice, and a sample between them takes
+        // neither.
+        let row = RankCredit::default();
+        for at in 0..=LANE_SLICES as u64 {
+            row.record(at * SLICE_MICROS, 1);
+        }
+        let last = LANE_SLICES as u64 * SLICE_MICROS;
+        assert_eq!(row.sent_through(last - 1).requests, 1);
+        row.record(last + 1, 1);
+        row.record(last + 1 + SLICE_MICROS, 1);
+        assert_eq!(row.sent_through(last + 1).requests, 3);
+        assert_eq!(row.sent_through(last + 1 + SLICE_MICROS).requests, 0);
+    }
+
+    #[test]
+    fn a_release_that_leaves_two_slices_keeps_the_lanes_width() {
+        // A lane two milliseconds a slice holds three dispatches four
+        // milliseconds apart. A release takes the first and leaves two
+        // slices: the lane is a quarter full or less, and keeps its width,
+        // because slices laid on two widths would merge into wider ones.
+        // Two dispatches a millisecond apart then share the newest slice,
+        // and a sample between them takes neither.
+        let row = RankCredit::default();
+        let wide = LANE_SLICES as u64 * SLICE_MICROS;
+        row.record(0, 1);
+        row.record(wide, 1);
+        assert_eq!(row.sent_through(0).requests, 1);
+        row.record(wide + 4 * SLICE_MICROS, 1);
+        row.record(wide + 8 * SLICE_MICROS, 1);
+        assert_eq!(row.sent_through(wide).requests, 2);
+        let next = wide + 8 * SLICE_MICROS + 1;
+        row.record(next, 1);
+        row.record(next + SLICE_MICROS, 1);
+        assert_eq!(row.sent_through(next).requests, 3);
+        assert_eq!(row.sent_through(next + SLICE_MICROS).requests, 0);
+    }
+
+    #[test]
+    fn a_release_that_takes_nothing_narrows_behind_the_lanes_one_slice() {
+        // Thirty seconds of silence leave the lane's slices half a second
+        // wide, and the dispatch that ends the silence alone in the lane.
+        // A dispatch a quarter of a millisecond later joins its slice. A
+        // report sampled between the two takes nothing, and finds the lane
+        // one slice: the slices behind it are narrower, so the next
+        // dispatch is in one of its own, and the report that reaches the
+        // first two takes them and leaves it.
+        let row = RankCredit::default();
+        row.record(0, 1);
+        row.record(30_000_000, 1);
+        assert_eq!(row.sent_through(29_999_999).requests, 1);
+        row.record(30_000_250, 1);
+        assert_eq!(row.sent_through(30_000_100).requests, 2);
+        row.record(30_000_500, 1);
+        assert_eq!(row.sent_through(30_000_300).requests, 1);
+    }
+
+    /// A lane beside an exact list of its dispatches: what a release to the
+    /// microsecond would hold, and what the lane's merges cost.
+    struct LaneRun {
+        lane: TimeSlices,
+        /// Every dispatch made, oldest first: its instant, and the
+        /// token-work made up to it and with it.
+        made: Vec<(u64, u64)>,
+        tokens: u32,
+        /// What the lane's first slice may span beyond the lane's width:
+        /// the width before the narrowing that left it, and nothing once a
+        /// release took it.
+        first_extra: u64,
+        widened: u32,
+        narrowed: u32,
+        /// Slices moved by merges, in all and by the merge that moved most.
+        moved: u64,
+        moved_most: u64,
+    }
+
+    impl LaneRun {
+        fn dispatch(&mut self, at_micros: u64) {
+            self.tokens = self.tokens % 7 + 1;
+            let (len, width) = (self.lane.len, self.lane.width_log2);
+            self.lane.add(at_micros, self.tokens);
+            if len == 0 {
+                self.first_extra = 0;
+            } else if self.lane.width_log2 > width {
+                // One pass moved every slice but the first.
+                let moved = len as u64 - 1;
+                self.widened += 1;
+                self.moved += moved;
+                self.moved_most = self.moved_most.max(moved);
+            }
+            let before = self.made.last().map_or(0, |&(_, tokens)| tokens);
+            self.made.push((at_micros, before + u64::from(self.tokens)));
+        }
+
+        /// The dispatches made at or before `at_micros`, and their
+        /// token-work.
+        fn made_through(&self, at_micros: u64) -> (u64, u64) {
+            let count = self.made.partition_point(|&(at, _)| at <= at_micros);
+            let tokens = count.checked_sub(1).map_or(0, |last| self.made[last].1);
+            (count as u64, tokens)
+        }
+
+        /// One report sampled at `sampled_at_micros`, no earlier than the
+        /// report before it, and the lane read against the list behind it.
+        fn report(&mut self, sampled_at_micros: u64) {
+            let (width, before) = (1_u64 << self.lane.width_log2, self.lane.sends());
+            // No slice spans more than the lane's width, but the first
+            // behind a narrowing: the one this release stops at is read by
+            // the widths it found.
+            let reach = width + self.first_extra;
+            self.lane.release(sampled_at_micros, |_, _| {});
+            let narrowed = (1_u64 << self.lane.width_log2) < width;
+            self.narrowed += u32::from(narrowed);
+            let held = self.lane.sends();
+            self.first_extra = match (held < before, narrowed) {
+                // The first slice went: the one left was laid on the width
+                // the release found.
+                (true, true) => width,
+                (true, false) => 0,
+                (false, true) => self.first_extra.max(width),
+                (false, false) => self.first_extra,
+            };
+            let held_tokens: u64 = self.lane.slices[..self.lane.len]
+                .iter()
+                .map(|slice| slice.held >> REQUEST_BITS)
+                .sum();
+            let (made, made_tokens) = self.made_through(u64::MAX);
+            let (reflected, reflected_tokens) = self.made_through(sampled_at_micros);
+            // No dispatch goes before a report reflects it.
+            let (exact, exact_tokens) = (made - reflected, made_tokens - reflected_tokens);
+            assert!(
+                held >= exact && held_tokens >= exact_tokens,
+                "at {sampled_at_micros}: the lane holds {held} dispatches of {held_tokens}, \
+                 the list {exact} of {exact_tokens}"
+            );
+            // What is held too long was dispatched within one slice of the
+            // sample.
+            let (far, far_tokens) = self.made_through(sampled_at_micros.saturating_sub(reach));
+            assert!(
+                held - exact <= reflected - far
+                    && held_tokens - exact_tokens <= reflected_tokens - far_tokens,
+                "at {sampled_at_micros}: {} dispatches held too long, {} made within {reach} \
+                 microseconds of the sample",
+                held - exact,
+                reflected - far
+            );
+        }
+    }
+
+    #[test]
+    fn a_lane_that_widens_and_narrows_again_and_again_stays_within_its_error() {
+        // Traffic alternates. A dense stretch: four dispatches a
+        // millisecond for 64 milliseconds, with a report every sixteen
+        // milliseconds sampled a little behind the newest dispatch. In one
+        // round of eight, 80 milliseconds more with no report, so the lane
+        // fills. Then a silence of a tenth of a second to thirty seconds,
+        // ended by one dispatch and a report. A silence widens the lane
+        // and the stretch behind it narrows it again.
+        //
+        // After every report the lane holds no less than an exact list of
+        // its dispatches does, and what it holds more was dispatched
+        // within one slice of the sample. A dispatch pays a merge of at
+        // most 63 slices, and under one slice moved on average.
+        //
+        // The run is 1,159,320 dispatches, 450 merges and 598 narrowings,
+        // and a dispatch moves 0.004 slices on average. Each of the
+        // rule's two conditions is here because the case fails without
+        // it. A release that takes a slice whose newest dispatch is up to
+        // 600 microseconds past the sample: the lane holds no dispatch
+        // where the list holds two. Narrowing where a release leaves
+        // several slices: fifteen dispatches are held too long where
+        // eleven were made within one slice of the sample, because a
+        // merge of pairs joined two slices each as wide as the lane.
+        let mut run = LaneRun {
+            lane: TimeSlices::new(),
+            made: Vec::new(),
+            tokens: 0,
+            first_extra: 0,
+            widened: 0,
+            narrowed: 0,
+            moved: 0,
+            moved_most: 0,
+        };
+        let silences = [100_000, 700_000, 5_000_000, 30_000_000];
+        let mut now = 0_u64;
+        for round in 0..400_usize {
+            for dispatch in 0..256 {
+                now += 250;
+                run.dispatch(now);
+                if dispatch % 64 == 63 {
+                    run.report(now - 300);
+                }
+            }
+            if round % 8 == 7 {
+                for _ in 0..320 {
+                    now += 250;
+                    run.dispatch(now);
+                }
+            }
+            now += silences[round % silences.len()];
+            run.dispatch(now);
+            run.report(now - 300);
+            if round % 32 == 3 {
+                // Behind a thirty-second silence, reports sampled late. A
+                // sparse stretch, and a report two seconds old: it finds
+                // the lane a quarter full or less and leaves several
+                // slices, so the lane keeps its width. Twenty seconds
+                // with no report follow, and then five reports sampled
+                // inside the sparse stretch: what each holds too long is
+                // within one of the slices that stayed.
+                for _ in 0..40 {
+                    now += 100_000;
+                    run.dispatch(now);
+                }
+                let sparse = now;
+                run.report(sparse - 2_200_000);
+                for _ in 0..80_000 {
+                    now += 250;
+                    run.dispatch(now);
+                }
+                for behind in [1_900_000, 1_500_000, 1_100_000, 700_000, 300_000] {
+                    run.report(sparse - behind);
+                }
+            }
+        }
+        let dispatches = run.made.len() as u64;
+        assert!(run.widened >= 300, "{} merges", run.widened);
+        assert!(run.narrowed >= 300, "{} narrowings", run.narrowed);
+        assert_eq!(run.moved_most, LANE_SLICES as u64 - 1);
+        assert!(
+            run.moved < dispatches,
+            "{} slices moved over {dispatches} dispatches",
+            run.moved
+        );
+    }
+
+    #[test]
+    fn a_lane_a_release_emptied_is_a_millisecond_wide_again() {
+        // A lane that held ten seconds in wide slices holds nothing after
+        // a release: its next dispatches are laid a millisecond a slice.
+        let row = RankCredit::default();
+        row.record(0, 1);
+        row.record(10_000_000, 1);
+        assert_eq!(row.sent_through(10_000_000).requests, 0);
+        row.record(20_000_000, 1);
+        row.record(20_000_000 + SLICE_MICROS, 1);
+        assert_eq!(row.sent_through(20_000_000).requests, 1);
+    }
+
+    #[test]
+    fn a_dispatch_dated_before_the_lanes_newest_joins_the_newest_slice() {
+        // A dispatch a stepped clock dated before the lane's newest sits
+        // with the newest: the sample that reaches its own instant does
+        // not take it, and the one that reaches the newest takes both.
+        let row = RankCredit::default();
+        row.record(10 * SLICE_MICROS, 5);
+        row.record(2 * SLICE_MICROS, 5);
+        assert_eq!(row.sent_through(3 * SLICE_MICROS).requests, 2);
+        assert_eq!(row.sent_through(10 * SLICE_MICROS).requests, 0);
+    }
+
+    #[test]
+    fn a_row_past_its_bound_gives_up_a_batch_at_its_oldest_slices_mean() {
+        // A row holds its bound in one slice, half of it dispatches of no
+        // tokens. The dispatch past the bound retires a batch of that
+        // slice at its mean: the slice stays, a batch lighter in each of
+        // its three counts.
+        let row = RankCredit::default();
+        for _ in 0..RANK_CREDIT_KEPT / 2 {
+            row.record(1, 10);
+            row.record(1, 0);
+        }
+        let (held, unsized_held) = row.held_for_test();
+        assert_eq!(
+            (held.requests, held.tokens, u64::from(unsized_held)),
+            (
+                RANK_CREDIT_KEPT,
+                RANK_CREDIT_KEPT / 2 * 10,
+                RANK_CREDIT_KEPT / 2
+            )
+        );
+        row.record(2, 10);
+        let kept = RANK_CREDIT_KEPT - RETIRE_BATCH as u64;
+        let (held, unsized_held) = row.held_for_test();
+        assert_eq!(
+            (held.requests, held.tokens, u64::from(unsized_held)),
+            (kept + 1, kept / 2 * 10 + 10, kept / 2)
+        );
+        assert_eq!(row.len() as u64, kept + 1);
+    }
+
+    #[test]
+    fn a_retirement_takes_the_oldest_slice_whole_and_the_rest_from_the_next() {
+        // Two lanes: the first holds three old dispatches, the second the
+        // rest of the bound in one newer slice. The batch takes the old
+        // slice whole and the rest of its count from the newer one, at
+        // that one's mean.
+        let row = RankCredit::default();
+        let newer = RANK_CREDIT_KEPT - 3;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                take_lane(0);
+                for _ in 0..3 {
+                    row.record(10, 100);
+                }
+            });
+        });
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                take_lane(1);
+                for _ in 0..newer {
+                    row.record(5_000, 10);
+                }
+                // Past the bound: one retirement, then this dispatch.
+                row.record(5_000, 10);
+            });
+        });
+        let (held, _) = row.held_for_test();
+        let batch = RETIRE_BATCH as u64;
+        assert_eq!(held.requests, RANK_CREDIT_KEPT - batch + 1);
+        assert_eq!(held.tokens, (newer - (batch - 3)) * 10 + 10);
+        // The old slice is gone: a sample that reached it finds nothing.
+        assert_eq!(
+            u64::from(row.sent_through(10).requests),
+            RANK_CREDIT_KEPT - batch + 1
+        );
     }
 
     #[test]
@@ -3837,8 +4479,9 @@ pub(crate) mod tests {
         );
 
         // A dispatch in the window is credited behind both reports. One a
-        // stepped clock dates before the newer sample is credited behind
-        // the standing report alone.
+        // stepped clock dates before the newer sample sits with the row's
+        // newest dispatch, the one in the window, and is credited behind
+        // both reports as that one is.
         dispatch(3_500);
         dispatch(2_500);
         assert_eq!(
@@ -3849,13 +4492,13 @@ pub(crate) mod tests {
         let number = kept_of(&told, slots[0], &next[0]);
         assert_eq!(number, None, "no number ahead of the show");
 
-        // The world is shown. Its first decision releases what the report
-        // reflects, on both stages, and the told one keeps the number from
-        // it: the newer report's two requests and 3,600 tokens, and the
-        // one dispatch made after its sample.
+        // The world is shown. Its first decision releases the dispatch the
+        // report reflects whole, on both stages, and the told one keeps
+        // the number from it: the newer report's two requests and 3,600
+        // tokens, and the two dispatches the row still holds.
         assert_eq!(scores(&told, &next), scores(&untold, &next), "shown");
-        assert_eq!((held(&told), held(&untold)), (1, 1), "a decision releases");
-        assert_eq!(kept_of(&told, slots[0], &next[0]), Some((7_200.0, 3)));
+        assert_eq!((held(&told), held(&untold)), (2, 2), "a decision releases");
+        assert_eq!(kept_of(&told, slots[0], &next[0]), Some((9_400.0, 4)));
         assert_eq!(
             scores(&told, &next),
             scores(&untold, &next),

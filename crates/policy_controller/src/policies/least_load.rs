@@ -515,7 +515,7 @@ mod tests {
             scorers::{
                 take_lane,
                 tests::{candidate, kept, report, RETIRE_WAITS},
-                SessionAffinity, RANK_CREDIT_KEPT, RETIRE_BATCH,
+                SessionAffinity, RANK_CREDIT_KEPT, RETIRE_BATCH, SLICE_MICROS,
             },
         },
     };
@@ -1222,11 +1222,11 @@ mod tests {
     }
 
     #[test]
-    fn a_dispatch_landing_behind_a_later_instant_keeps_its_lane_oldest_first() {
+    fn a_dispatch_landing_behind_a_later_instant_joins_its_lanes_newest_slice() {
         // Two dispatches land on one lane in reverse instant order (a thread
         // that waited past another's landing, or a clock that stepped): the
-        // lane holds the older one at its front, so a report's release past
-        // it takes that one and leaves the newer.
+        // older one sits with the newer, so a report sampled between the two
+        // takes neither, and the report that reaches the newer takes both.
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
         let mut pool: Vec<Candidate> = vec![candidate(0, 0)];
         pool[0].load = Some(report(0, 0));
@@ -1246,10 +1246,17 @@ mod tests {
         ll.score(&RequestFacts::default(), &sampled, &kept, &mut scores);
         assert_eq!(
             ll.held(pool[0].id),
-            1,
-            "the release through the older dispatch takes it from behind the later one"
+            2,
+            "a sample between the two takes neither"
         );
-        assert_eq!(ll.held_word_at(pool[0].id, 0), (7, 1));
+        assert_eq!(ll.held_word_at(pool[0].id, 0), (14, 2));
+        sampled[0].load_sampled_at_micros = 20_000;
+        ll.score(&RequestFacts::default(), &sampled, &kept, &mut scores);
+        assert_eq!(
+            ll.held(pool[0].id),
+            0,
+            "the sample that reaches the newer takes both"
+        );
     }
 
     #[test]
@@ -1322,13 +1329,17 @@ mod tests {
 
     #[test]
     fn concurrent_dispatches_and_releases_keep_the_tally_exact() {
-        // Eight threads, one per lane, each book 500 dispatches at rising
-        // instants on their own rank and on one shared rank, and every
-        // fifty score over a pool sampled at a midpoint that moves forward,
-        // so releases run while other lanes add. A sample at the midpoint
-        // then leaves the later half of every lane, exact in the lanes and
-        // in the held word a decision reads, and a sample past every
-        // dispatch releases them all.
+        // Eight threads, one per lane, each book 500 dispatches a
+        // millisecond apart on their own rank and on one shared rank, with
+        // a pause of ten seconds behind the first half. Every fifty score
+        // over a pool sampled at a midpoint that moves forward through the
+        // first half, so releases run while other lanes add and merge
+        // their slices. A sample in the pause then leaves the later half
+        // of every lane, exact in the lanes and in the held word a decision
+        // reads: no slice holds a dispatch of each half. A sample past
+        // every dispatch releases them all.
+        const PAUSE: u64 = 10_000_000;
+        let at = |n: u64| 2_000 + n * SLICE_MICROS + if n > 250 { PAUSE } else { 0 };
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
         let mut pool: Vec<Candidate> = (0..9).map(|i| candidate(i, 0)).collect();
         for c in &mut pool {
@@ -1351,14 +1362,14 @@ mod tests {
                     let mut scores = vec![0.0f32; 9];
                     for n in 0..500u64 {
                         let lease = Lease {
-                            issued_micros: 2_000 + n,
+                            issued_micros: at(n),
                             tokens: 7,
                             ..Lease::default()
                         };
                         ll.on_dispatched(&lease, &target_of(&pool[t as usize]), Side::Single, 0);
                         ll.on_dispatched(&lease, &target_of(&pool[8]), Side::Single, 0);
                         if n % 50 == 0 {
-                            let midpoint = sampled_at(pool, 2_000 + n / 2);
+                            let midpoint = sampled_at(pool, at(n / 2));
                             ll.score(&RequestFacts::default(), &midpoint, kept, &mut scores);
                         }
                     }
@@ -1366,7 +1377,7 @@ mod tests {
             }
         });
         let mut scores = vec![0.0f32; 9];
-        let midpoint = sampled_at(&pool, 2_250);
+        let midpoint = sampled_at(&pool, at(250));
         ll.score(&RequestFacts::default(), &midpoint, &kept, &mut scores);
         for c in &pool[..8] {
             assert_eq!(ll.held(c.id), 249, "{:?}", c.id);
@@ -1378,7 +1389,7 @@ mod tests {
             (8 * 249 * 7, 8 * 249),
             "the shared rank's word"
         );
-        let past = sampled_at(&pool, 3_000);
+        let past = sampled_at(&pool, at(500));
         ll.score(&RequestFacts::default(), &past, &kept, &mut scores);
         assert!(past.iter().all(|c| ll.held(c.id) == 0));
         assert!(past.iter().all(|c| ll.held_word_at(c.id, 0) == (0, 0)));
