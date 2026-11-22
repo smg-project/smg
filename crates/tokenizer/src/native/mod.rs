@@ -4673,9 +4673,11 @@ impl NativeEncoder {
     }
 
     /// The piece `text[piece]` of a sentencepiece unit, compiled into the
-    /// walk's loop as [`Self::tokenize_piece_in_place`] is into its own: the
-    /// key by its one read of the text, the packed table's probe, an entry's
-    /// inline ids. Every other piece leaves the loop by a call.
+    /// walk's loop: the key by its one read of the text, as in
+    /// [`Self::tokenize_piece_in_place`], the packed table's probe and a
+    /// hit's ids, a spilled entry's too. A miss, a piece longer than a key
+    /// and a short piece the one read does not cover leave the loop by a
+    /// call.
     #[inline(always)]
     fn tokenize_raw_piece(
         &self,
@@ -4700,9 +4702,9 @@ impl NativeEncoder {
         self.tokenize_raw_piece_slow(chars, &text[piece], vacancy, mapped, ids, cache);
     }
 
-    /// [`Self::tokenize_raw_piece`] for the short pieces its loop does not
-    /// answer by the one read: a piece near the end of the text, whose key
-    /// is read on its own, and one whose ids are in the spill.
+    /// [`Self::tokenize_raw_piece`] for a short piece its loop's one read
+    /// does not cover: one with fewer than sixteen bytes of the text from its
+    /// start on, whose key is read on its own.
     #[cold]
     #[inline(never)]
     fn tokenize_raw_piece_off_loop(
