@@ -1323,6 +1323,20 @@ pub struct Constraints<'a> {
     /// the engine's table is the only one, as in a host that embeds the
     /// engine. In-process only.
     pub pins: Option<&'a dyn PinSource>,
+    /// The places of the pool's list the request may take, ascending, each
+    /// once, where its host holds it to a part of the pool: the workers a
+    /// retry may still take, the worker a request names, the workers that
+    /// meet its route's rule. `None`: every place.
+    ///
+    /// The request's own fact and no veto of a worker: no stage reads it,
+    /// and a profile that lists no filter is held to it like any other. A
+    /// decision's staged pass opens its set with these places and hands no
+    /// target outside them. A pass that draws from the pool and a keyed
+    /// request's reads by place do not ask them yet, so no host states
+    /// places until they do. They are places of the one list a single
+    /// request is decided over, and a pair's host states none: each list
+    /// of a pair would be held to the same places. In-process only.
+    pub places: Option<&'a [u32]>,
 }
 
 impl Constraints<'_> {

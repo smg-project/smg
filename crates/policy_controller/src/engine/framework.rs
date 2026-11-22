@@ -44,6 +44,7 @@ mod alone;
 mod encode;
 mod engines;
 mod keyed;
+mod places;
 mod vetoed;
 
 pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
@@ -1757,6 +1758,10 @@ fn only(classes: &[u32]) -> Option<u32> {
 /// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
 /// a prefill whose classes hold no decode by the partners.
 ///
+/// The set opens with the places the request is held to, where its host
+/// holds it to any, and with no other row ([`places`]): what a filter then
+/// keeps is among them, under any profile.
+///
 /// A pool a hard filter empties is put to the set's all-vetoed rule before
 /// its stage is returned ([`vetoed::emptied`]). Where the rule steers, the
 /// rows it kept stay in `buf.kept` behind the stage's name, and the plan's
@@ -1788,11 +1793,12 @@ fn filter(
                 None => kept
                     .extend(rows.filter(|&i| classed(classes, candidates[i as usize].pair_class))),
             }
+            places::hold(kept, cx);
             if kept.is_empty() {
                 return Some("partners");
             }
         }
-        None => kept.extend(0..candidates.len() as u32),
+        None => places::open(kept, candidates.len(), cx),
     }
     if kept.is_empty() {
         return Some("none");
@@ -2338,7 +2344,9 @@ fn leads(
 /// pool and no soft filter steps aside, and each stage drops the rows its
 /// own `keep` refuses. Where none does, the pass says nothing of the pool:
 /// the staged pass alone names the stage that emptied it, lets a soft
-/// filter step aside and asks the all-vetoed rule.
+/// filter step aside and asks the all-vetoed rule. It keeps no row for a
+/// request its host holds to places ([`places`]): the staged pass opens its
+/// set with them.
 ///
 /// `tests` is the set as the decision asks it: the request's own facts
 /// are read once, by the caller ([`RowTests::asked`]). The host's mask is
@@ -2355,6 +2363,9 @@ fn keep_folded(
     kept: &mut Vec<u32>,
 ) -> bool {
     kept.clear();
+    if places::held(cx) {
+        return false;
+    }
     if tests.masked(cx) {
         for (i, c) in (0u32..).zip(candidates) {
             if tests.keeps(facts, c, cx) && !cx.masks(i) {
