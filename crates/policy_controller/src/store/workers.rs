@@ -193,8 +193,9 @@ impl WorkerFacts {
 
     /// Why no row holds `zone`, where none does: a zone's one test of
     /// length, with the words of its refusal. The store, the controller's
-    /// registration and a gateway's workers API all ask here, so the
-    /// three take the same zones.
+    /// registration and a gateway's workers API all ask here, so a zone the
+    /// workers API takes the other two take; the API alone also refuses a
+    /// control character in one.
     pub fn zone_refusal(zone: &str) -> Option<&'static str> {
         (zone.len() > Self::NAME_BYTES).then_some("a zone is at most 256 bytes")
     }
