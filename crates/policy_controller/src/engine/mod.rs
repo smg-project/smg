@@ -27,6 +27,7 @@ pub(crate) mod prefix_pass;
 pub(crate) mod prompt_hashes;
 #[cfg(feature = "in-process")]
 pub(crate) mod records;
+pub(crate) mod shadow;
 pub(crate) mod sticky_sessions;
 pub(crate) mod store_backed_engine;
 pub(crate) mod view;
@@ -63,12 +64,13 @@ pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
+pub use shadow::SHADOW_ROWS;
 pub use sticky_sessions::{
     SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
 pub use store_backed_engine::{
-    DecisionExplanation, DecisionNames, DecisionRecord, StoreBackedEngine, SHADOW_ROWS,
+    DecisionExplanation, DecisionNames, DecisionRecord, StoreBackedEngine,
 };
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,

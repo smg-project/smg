@@ -58,6 +58,7 @@ use crate::{
             KEEPS_SLOT_STATE, SAMPLES_DECISIONS, SHADOWS,
         },
         prompt_hashes::{HashSeeds, PromptHashes},
+        shadow::{Counted, Shadow, ShadowCounts, Shadowed, SHADOW_FLOOR},
         sticky_sessions::{SessionExpiry, SessionVerdict},
         view::{
             fingerprint, AffinityFacts, AffinityRows, Candidate, Constraints, HashKind, KeyedRow,
@@ -141,11 +142,6 @@ pub(crate) fn unnamed(_: &RequestFacts<'_>, _: &Constraints<'_>) -> Option<Affin
     None
 }
 
-/// How many of a generation's bindings count their shadows in a row of
-/// their own ([`StoreBackedEngine::shadowed`]). The bindings behind them count
-/// in the last row. A host that shows the counts walks this many rows.
-pub const SHADOW_ROWS: usize = 16;
-
 /// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
 /// members, each decision counts the candidates it lost; where a host
@@ -164,38 +160,6 @@ pub(crate) struct Part {
     /// laid at its first: the part of a decider that shadows nothing
     /// stays its one pair of lines.
     shadowed: OnceLock<Box<ShadowCounts>>,
-}
-
-/// One decider's counts of its shadows, on lines of their own: a row a
-/// binding by its position in its generation, a count a kind. A table
-/// for each place a shadow is asked ([`Counted`]).
-#[derive(Debug, Default)]
-#[repr(align(128))]
-struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; 4]);
-
-impl ShadowCounts {
-    fn of(&self, binding: u32, table: Counted, kind: ShadowKind) -> &AtomicU64 {
-        let table = match table {
-            Counted::Single => 0,
-            Counted::Side(side) => 1 + side.index(),
-            Counted::Later => 3,
-        };
-        let row = (binding as usize).min(SHADOW_ROWS - 1);
-        &self.0[table][row][kind.index()]
-    }
-}
-
-/// Where a shadow was asked: the table it is counted in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Counted {
-    /// Beside a single's decision.
-    Single,
-    /// Beside this side of a pair, at the pair's decision.
-    Side(PairSide),
-    /// Beside a decode decided after its prefill, at that second
-    /// decision. The pair's first decision counted its decode side
-    /// beside the decode it named first: the two are never one count.
-    Later,
 }
 
 impl Part {
@@ -603,36 +567,6 @@ pub(crate) fn decide_in<A: RequestForm>(
         decision,
         booking.map(|booking| Booking { built, ..booking }),
     )
-}
-
-/// What a request's budget must still hold at the end of its live
-/// decision for its shadow to be asked. A shadow asked with less could
-/// take a served answer past its budget, where the decider's last read
-/// refuses it.
-pub(crate) const SHADOW_FLOOR: Duration = Duration::from_millis(1);
-
-/// What a decision's shadow said beside it, where one was due.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Shadowed {
-    /// The position of the request's binding in its generation.
-    pub(crate) binding: u32,
-    /// The shadow's decision beside the live one, and
-    /// [`ShadowKind::Skipped`] where the shadow was due and not asked.
-    pub(crate) kind: ShadowKind,
-    /// The first target of the shadow's pick.
-    pub(crate) first: Option<WorkerId>,
-}
-
-/// What became of a decision's shadow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shadow {
-    /// None was due: the request's binding asks none, or the door made
-    /// the decision itself over a view its gateway left no row.
-    NotDue,
-    /// One was due: what it said, or that it was not asked.
-    Said(Shadowed),
-    /// The shadow panicked, and the panic was held where it was asked.
-    Faulted,
 }
 
 /// [`ByEngine`] under a generation that shadows. The live decision is
