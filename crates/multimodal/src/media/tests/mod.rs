@@ -315,11 +315,12 @@ use futures::stream;
 use super::{
     checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
     decoder_unavailable, effective_sample_fps, ensure_input_byte_limit,
-    expected_sampled_frame_count, fallback_failed, fps_filter_for_metadata,
-    parse_ffmpeg_duration_seconds, parse_ffprobe_video_info, parse_ppm_stream,
-    read_file_with_limit, run_video_command_output, split_png_stream, video_metadata_from,
-    video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector, MediaConnectorConfig,
-    MediaConnectorError, MediaSource, ProbedVideoInfo, VideoFetchConfig, VideoMetadata,
+    expected_sampled_frame_count, expected_stdout_bytes, fallback_failed, fps_filter_for_metadata,
+    is_video_budget_error, parse_ffmpeg_duration_seconds, parse_ffprobe_video_info,
+    parse_ppm_stream, read_file_with_limit, run_video_command_output, split_png_stream,
+    video_metadata_from, video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector,
+    MediaConnectorConfig, MediaConnectorError, MediaSource, ProbedVideoInfo, VideoFetchConfig,
+    VideoMetadata,
 };
 use crate::error::MediaFault;
 
@@ -459,6 +460,12 @@ fn ffprobe_metadata_prefers_short_video_stream_over_long_container() {
     };
     assert_eq!(expected_sampled_frame_count(metadata, cfg), 4);
     assert_eq!(fps_filter_for_metadata(metadata, cfg), "fps=4.000000");
+    assert_eq!(expected_stdout_bytes(None, metadata, 4096), 4096);
+    let unknown = VideoMetadata {
+        duration_seconds: None,
+        ..metadata
+    };
+    assert_eq!(expected_stdout_bytes(None, unknown, 4096), 0);
 }
 
 #[test]
@@ -549,6 +556,40 @@ fn a_failed_fallback_keeps_an_internal_origin() {
     );
 }
 
+#[tokio::test]
+async fn a_sized_command_output_is_read_into_one_reservation() {
+    // The test binary listing its tests: a child every builder has, with the
+    // same output on every run.
+    let list = || {
+        let mut command =
+            tokio::process::Command::new(std::env::current_exe().expect("test binary"));
+        command.arg("--list");
+        command
+    };
+    let unsized_run = run_video_command_output(list(), "test binary", 0)
+        .await
+        .expect("the listing");
+    let bytes = unsized_run.stdout.len();
+    let output = run_video_command_output(list(), "test binary", bytes)
+        .await
+        .expect("the listing");
+    assert_eq!(output.stdout.len(), bytes);
+    // A buffer that grew while it was read holds the capacity of its last doubling.
+    assert_eq!(output.stdout.capacity(), bytes);
+}
+
+#[tokio::test]
+async fn a_refused_output_reservation_ends_the_decode() {
+    // A decoder that is not there: a spawn tried first would answer for it.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let command = tokio::process::Command::new(dir.path().join("ffmpeg"));
+    let error = run_video_command_output(command, "ffmpeg", usize::MAX)
+        .await
+        .expect_err("no allocator gives usize::MAX bytes");
+    assert_eq!(error.fault(), MediaFault::Internal);
+    assert!(is_video_budget_error(&error), "{error}");
+}
+
 /// A decoder this process cannot start is this process's fault, not the
 /// media's, whatever clip the request sent: the executable is not there,
 /// or is there but cannot be run; so is a backend this build does not
@@ -557,7 +598,7 @@ fn a_failed_fallback_keeps_an_internal_origin() {
 async fn a_decoder_that_cannot_start_is_our_fault() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let missing = dir.path().join("ffprobe");
-    let error = run_video_command_output(tokio::process::Command::new(&missing), "ffprobe")
+    let error = run_video_command_output(tokio::process::Command::new(&missing), "ffprobe", 0)
         .await
         .expect_err("a decoder that is not there");
     assert!(
@@ -574,9 +615,10 @@ async fn a_decoder_that_cannot_start_is_our_fault() {
 
     let not_executable = dir.path().join("ffmpeg");
     std::fs::write(&not_executable, b"not a program").expect("a plain file");
-    let error = run_video_command_output(tokio::process::Command::new(&not_executable), "ffmpeg")
-        .await
-        .expect_err("a decoder that cannot be run");
+    let error =
+        run_video_command_output(tokio::process::Command::new(&not_executable), "ffmpeg", 0)
+            .await
+            .expect_err("a decoder that cannot be run");
     assert!(
         matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
         "{error}"
