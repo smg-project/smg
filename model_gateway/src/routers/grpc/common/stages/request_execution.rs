@@ -1444,7 +1444,7 @@ fn batch_breaker_status<T>(
 /// the client's request streams, which gives the decode side a first token
 /// to watch for (the caller's flag: the sequential shape sends its prefill
 /// request unstreamed whatever the client asked, so the prefill request
-/// cannot say).
+/// cannot say), and whether the prefill side waits on encode workers.
 pub(crate) struct PdSides<'a> {
     pub(crate) workers: &'a WorkerSelection,
     pub(crate) ledger: &'a AttemptLedger,
@@ -1453,6 +1453,7 @@ pub(crate) struct PdSides<'a> {
     pub(crate) request_id: String,
     pub(crate) prompt_tokens: u64,
     pub(crate) streaming: bool,
+    pub(crate) awaits_encode: bool,
 }
 
 impl<'a> PdSides<'a> {
@@ -1473,6 +1474,7 @@ impl<'a> PdSides<'a> {
             request_id,
             prompt_tokens,
             streaming,
+            awaits_encode: prefill_request.awaits_encode(),
         }
     }
 }
@@ -1841,7 +1843,9 @@ fn parallel_side_failed_first(
             (
                 sides.decode_label,
                 sides.prefill_label,
-                workers.prefill_worker(),
+                // A retired wait would hold the request's encode watch past
+                // the request: a prefill side behind one is dropped instead.
+                workers.prefill_worker().filter(|_| !sides.awaits_encode),
             )
         }
     };
@@ -4028,6 +4032,126 @@ pub(crate) mod tests {
         assert!(
             supervisor.is_closed(),
             "without a bound the retired call has let go of the watch too"
+        );
+    }
+
+    /// The decode side fails to start while the prefill side still
+    /// dispatches behind its request's encode watch: the prefill side is
+    /// dropped, not retired. Its call is cancelled, its worker is neither
+    /// sampled nor counted for it, and the request's encode sends end once
+    /// the request lets go of the watch.
+    #[test]
+    fn a_prefill_side_behind_an_encode_watch_is_dropped_when_its_decode_partner_fails_first() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let workers = tokenspeed_pair();
+                let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+                // One failure short of opening: a sampled failure opens it.
+                for _ in 1..CircuitBreakerConfig::default().failure_threshold {
+                    prefill.record_circuit_breaker_outcome(false);
+                }
+                let ledger = AttemptLedger::default();
+                // The prefill request carries its encode rooms.
+                let request = ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+                    request_id: "chatcmpl-decode-failed-first".to_string(),
+                    encode_bootstrap_info: Some(ts::EncodeBootstrapInfo {
+                        items: vec![ts::EncodeItemBootstrapInfo::default()],
+                    }),
+                    ..Default::default()
+                }));
+                let sides = PdSides::of(&workers, &ledger, &request, false);
+                // The request's encode dispatch: one send in flight.
+                let (watch, supervisor) = encode_watch();
+                let (send, mut send_ended) = oneshot::channel::<()>();
+                let mut supervised = Box::pin(supervise_encode_sends(
+                    Box::pin(futures::stream::once(async move {
+                        let _send = send;
+                        std::future::pending().await
+                    })),
+                    supervisor.clone(),
+                ));
+                // The prefill call: it fails late for whoever still awaits it.
+                let (late_failure, call) = oneshot::channel::<tonic::Status>();
+
+                let outcome = dispatch_pd_sides(
+                    Box::pin(dispatch_prefill_within(
+                        PrefillWait {
+                            bound: None,
+                            encode: Some(watch.clone()),
+                        },
+                        Box::pin(async move { Err(call.await.expect("the late failure")) }),
+                        Some(Arc::clone(&prefill)),
+                        workers.decode_worker().cloned(),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-decode-failed-first".to_string(),
+                        256,
+                    )),
+                    Box::pin(async {
+                        tokio::task::yield_now().await;
+                        Err(tonic::Status::unavailable("decode refused"))
+                    }),
+                    None,
+                    Some(encode_race(&prefill, watch.clone())),
+                )
+                .await;
+                let PdDispatchOutcome::FailedFirst {
+                    side,
+                    error,
+                    partner,
+                } = outcome
+                else {
+                    panic!("the decode side's failure, its partner still dispatching");
+                };
+                assert_eq!(side, PdSide::Decode);
+                parallel_side_failed_first(&sides, side, &error, partner);
+
+                assert!(
+                    late_failure
+                        .send(tonic::Status::unavailable("prefill failed late"))
+                        .is_err(),
+                    "the pending prefill call is dropped: nothing awaits its late failure"
+                );
+                assert_eq!(
+                    supervisor.receiver_count(),
+                    1,
+                    "the attempt has left no copy of the watch behind"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), &mut supervised)
+                        .await
+                        .is_err(),
+                    "the sends stay in flight while the request holds the watch"
+                );
+                assert!(
+                    prefill.circuit_breaker_can_execute(),
+                    "no failure is sampled on the prefill worker"
+                );
+
+                // The request is over.
+                drop(watch);
+                tokio::time::timeout(Duration::from_secs(5), supervised)
+                    .await
+                    .expect("the supervisor ends with the request");
+                assert_eq!(
+                    send_ended.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed),
+                    "the send in flight is dropped with the supervisor"
+                );
+            });
+        });
+        let rendered = handle.render();
+        assert!(
+            !rendered.lines().any(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains(r#"worker_type="prefill""#)
+            }),
+            "no dispatch failure is counted on the prefill worker: {rendered}"
         );
     }
 
