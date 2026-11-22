@@ -1126,6 +1126,207 @@ mod tests {
         assert_ne!(moved, pins[0]);
     }
 
+    /// A request stated ahead by a maker that states no plain request
+    /// ([`RequestMaker::plain`]'s own answer), as a host that hands a
+    /// decision's targets to another process states none: the leasing
+    /// entry then makes the request and decides it whole.
+    struct Whole<'a>(Asks<'a>);
+
+    impl RequestMaker for Whole<'_> {
+        fn model(&self) -> &str {
+            self.0.model()
+        }
+
+        fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+            self.0.make(spec)
+        }
+
+        fn workers(&self) -> WorkerLists<'_> {
+            self.0.workers()
+        }
+
+        fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+            self.0.loads()
+        }
+    }
+
+    /// The entry for a host that files leases itself answers the decision
+    /// alone. Under a document whose stages take every word of a lease and
+    /// whose picker places a plain request by itself, the entry still makes
+    /// each request once and decides it whole: its pick names its
+    /// alternates, where the leasing entry answers the one place. No id is
+    /// taken and no stage hears an issue: the host tells the stages, under
+    /// the lease it files.
+    #[test]
+    fn a_decision_without_a_lease_takes_no_id_and_tells_no_stage() {
+        let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
+        let place = engine.place(MODEL, Phase::Single);
+        assert!(matches!(place, Place::Alone(_)), "{place:?}");
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        assert!(asks.plain().is_some(), "a plain request");
+        let mut last = None;
+        for _ in 0..8 {
+            let decision = engine.decide_without_lease(&asks, Instant::now());
+            let decision = decision.expect("a decision");
+            let pick = decision.pick().expect("a pick");
+            assert_eq!(pick.targets.len(), 4, "the pick and its alternates");
+            for target in pick.targets.iter() {
+                let worker = &list[target.position as usize];
+                assert_eq!(target.id, worker_id(worker.as_ref()));
+            }
+            last = Some(decision);
+        }
+        assert_eq!(asks.made.get(), 8, "each request is made once");
+        assert!(heard.lock().is_empty(), "no stage heard an issue");
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+
+        // The host files the pick's lease and tells the stages under it.
+        let decision = last.expect("a decision");
+        let pick = decision.pick().expect("a pick");
+        let first = *pick.targets.first().expect("the target");
+        let lease = Lease {
+            id: LeaseId(77),
+            kind: LeaseKind::Credit,
+            side: Side::Single,
+            target_index: 0,
+            booked: first.id,
+            generation: pick.trace.generation,
+            session: Session::NONE,
+            session_verdict: SessionVerdict::None,
+            issued_micros: 0,
+            tokens: 0,
+        };
+        engine.spec().engine().on_decision_issued(&lease, &decision);
+        assert_eq!(heard.lock().as_slice(), [("issued", first.id, 0)]);
+    }
+
+    /// The entry makes the leasing entry's whole decision of the same
+    /// request, under every stock policy: two engines made alike, the
+    /// leasing one asked by a maker that states no plain request, name the
+    /// same workers in the same order, request after request, by the
+    /// request's seed and by a rotation's turns. With a load snapshot lent
+    /// both read it: a policy that scores by load hands the worker with the
+    /// shortest queue at every seed.
+    #[test]
+    fn a_decision_without_a_lease_is_the_leasing_entrys_whole_decision() {
+        use crate::document::spec::PRESETS;
+
+        let places = |decision: &Decision| -> Vec<u32> {
+            let targets = decision.pick().map(|pick| pick.targets.iter());
+            targets.map_or_else(Vec::new, |targets| {
+                targets.map(|target| target.position).collect()
+            })
+        };
+        let reports = (0..8)
+            .map(|at| {
+                let queued = if at == 5 { 0 } else { 90_000 };
+                let url = format!("http://worker-{at}:8000");
+                (url, one_rank_load(queued, 0.1, 1_000.0))
+            })
+            .collect();
+        let snapshot = LoadSnapshot::from_loads_for_test(reports);
+        for policy in PRESETS {
+            for loads in [None, Some(Arc::clone(&snapshot))] {
+                let (leasing, bare) = (preset(policy), preset(policy));
+                let list = pool(8);
+                let (theirs, ours) = (leasing.pool_members(&list), bare.pool_members(&list));
+                for seed in 0..16 {
+                    let asked = |members| {
+                        let mut seeded = request();
+                        seeded.facts.seed = seed;
+                        Asks {
+                            loads: loads.clone(),
+                            ..Asks::of(seeded, Some(members))
+                        }
+                    };
+                    let whole = Whole(asked(&theirs));
+                    let decided = leasing.decide_under(GatewayId::LOCAL, &whole, Instant::now());
+                    let decided = decided.expect("an answer").whole();
+                    let whole = places(&decided.expect("a whole decision").0.decision);
+                    assert!(!whole.is_empty(), "{policy}, seed {seed}: a pick");
+                    let alone = bare.decide_without_lease(&asked(&ours), Instant::now());
+                    let alone = places(&alone.expect("a decision"));
+                    assert_eq!(alone, whole, "{policy}, seed {seed}");
+                    if policy == "least_load" && loads.is_some() {
+                        assert_eq!(alone[0], 5, "seed {seed}: the shortest queue");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The entry reads no pins of record, as the one entry reads none: a
+    /// request that lends a record naming another worker is decided as one
+    /// that lends none, and the record is never asked.
+    #[test]
+    fn a_decision_without_a_lease_reads_no_pins_of_record() {
+        use std::sync::OnceLock;
+
+        use crate::engine::view::PinSource;
+
+        /// Pins of record: one worker for every key, and whether it was
+        /// asked.
+        #[derive(Debug)]
+        struct Elsewhere(WorkerId, OnceLock<()>);
+
+        impl PinSource for Elsewhere {
+            fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
+                let _ = self.1.set(());
+                Some(self.0)
+            }
+        }
+
+        let (engine, twin) = (preset("manual"), preset("manual"));
+        let list = pool(16);
+        let (members, others) = (engine.pool_members(&list), twin.pool_members(&list));
+        let keyed = || {
+            let mut keyed = request();
+            keyed.facts.seed = 41;
+            keyed.facts.session_key = Identity::hashed(41);
+            keyed
+        };
+        let named = |engine: &PolicyEngine, asks: &Asks<'_>| {
+            let decision = engine.decide_without_lease(asks, Instant::now());
+            let decision = decision.expect("a decision");
+            let first = decision.pick().and_then(|pick| pick.targets.first());
+            first.map(|target| target.id).expect("a pick")
+        };
+        let plain = named(&twin, &Asks::of(keyed(), Some(&others)));
+        let mut ids = list.iter().map(|worker| worker_id(worker.as_ref()));
+        let other = ids.find(|id| *id != plain).expect("another worker");
+        let record = Elsewhere(other, OnceLock::new());
+        let mut lent = keyed();
+        lent.constraints.pins = Some(&record);
+        assert_eq!(named(&engine, &Asks::of(lent, Some(&members))), plain);
+        assert!(record.1.get().is_none(), "the record is not asked");
+    }
+
+    /// A single request with no list is decided over no worker, as the one
+    /// entry decides it. A request of any phase but `Single` is refused,
+    /// a prefill too: a pair has no entry of this kind yet.
+    #[test]
+    fn a_decision_without_a_lease_is_a_single_requests() {
+        let engine = preset("round_robin");
+        let asks = Asks::of(request(), None);
+        let none = engine.decide_without_lease(&asks, Instant::now());
+        let Ok(Decision::Shed(shed)) = none else {
+            panic!("a shed, not {none:?}");
+        };
+        assert_eq!(
+            (shed.reason, shed.emptied_by),
+            (ShedReason::NoEndpoints, "none")
+        );
+        for phase in [Phase::Prefill, Phase::Decode, Phase::Encode] {
+            let mut side = request();
+            side.facts.phase = phase;
+            let asks = Asks::of(side, None);
+            let refused = engine.decide_without_lease(&asks, Instant::now());
+            assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
+        }
+    }
+
     /// What a stage heard of a lease: the word, the worker the lease told
     /// books (the target's own at a dispatch), and the lease's index.
     type Heard = Arc<Mutex<Vec<(&'static str, WorkerId, u8)>>>;

@@ -589,6 +589,50 @@ impl PolicyEngine {
         }
     }
 
+    /// One single request's decision and nothing its host hears of later:
+    /// no lease is issued, no id is taken and no stage is told. For a host
+    /// that files a pick's lease itself and tells the stages of the issue
+    /// under that lease ([`Lifecycle::on_decision_issued`] of the
+    /// document's engine), as a controller's service does in its store.
+    ///
+    /// The request is made once and decided whole, at `now`: the decision
+    /// is the one [`Self::decide_at`] makes of a request that is not plain
+    /// ([`RequestMaker::plain`]). No pick is made ahead of the request, so
+    /// a pick names its alternates: a host that hands a decision's targets
+    /// to another process cannot ask again cheaply.
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionRefused::PairSide`] for a request of any phase but
+    /// `Single`: a pair has no entry of this kind yet. The leasing entry
+    /// tests a pair's wires beside its issue, ahead of the lists' own
+    /// decision. [`DecisionRefused::Faulted`] where the decision panicked.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the controller's service calls it once it decides by this engine"
+        )
+    )]
+    pub(crate) fn decide_without_lease(
+        &self,
+        maker: &impl RequestMaker,
+        now: Instant,
+    ) -> Result<super::decision::Decision, DecisionRefused> {
+        self.caught(|| {
+            let mut request = self.made(maker);
+            match (request.facts.phase, maker.workers()) {
+                (Phase::Single, WorkerLists::Single(members)) => {
+                    Ok(self.decide_made(maker, &mut request, members, now))
+                }
+                (Phase::Single, _) => Ok(single::over_none(self, &request)),
+                (Phase::Prefill | Phase::Decode | Phase::Encode, _) => {
+                    Err(DecisionRefused::PairSide)
+                }
+            }
+        })
+    }
+
     /// A made single request's whole decision over its host's list, for
     /// every entry that decides one. It reads the snapshot the request
     /// gives where it gives one, and the newest the engine's own task
