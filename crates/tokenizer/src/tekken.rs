@@ -301,18 +301,27 @@ impl<'a> Walk<'a> {
                 b'\\' => match *bytes.get(at + 1)? {
                     b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => at += 2,
                     b'u' => {
-                        let hex = bytes.get(at + 2..at + 6)?;
-                        // Whether half a surrogate pair is an error is the
-                        // JSON reader's rule and changed between its
-                        // versions.
-                        let surrogate = matches!(
-                            hex,
-                            [b'd' | b'D', b'8' | b'9' | b'a'..=b'f' | b'A'..=b'F', ..]
-                        );
-                        if surrogate || !hex.iter().all(u8::is_ascii_hexdigit) {
-                            return None;
-                        }
-                        at += 6;
+                        // The code unit of the four hex digits at `at`.
+                        let unit = |at: usize| {
+                            let hex = bytes.get(at..at + 4)?;
+                            hex.iter().try_fold(0u32, |unit, &digit| {
+                                Some((unit << 4) | char::from(digit).to_digit(16)?)
+                            })
+                        };
+                        at += match unit(at + 2)? {
+                            // A high half right before a low half is one
+                            // character to every version of the JSON
+                            // reader; whether any other half is an error
+                            // is its rule and changed between its versions.
+                            0xD800..=0xDBFF
+                                if matches!(bytes.get(at + 6..at + 8), Some(b"\\u"))
+                                    && matches!(unit(at + 8), Some(0xDC00..=0xDFFF)) =>
+                            {
+                                12
+                            }
+                            0xD800..=0xDFFF => return None,
+                            _ => 6,
+                        };
                     }
                     _ => return None,
                 },
@@ -768,24 +777,52 @@ mod tests {
 
     /// The walk over the ranked tokens reads the vocabulary the JSON reader
     /// reads; a token written any other way sends the file to the JSON
-    /// reader.
+    /// reader, which reads or refuses it as before.
     #[test]
     fn the_walk_reads_the_ranked_tokens_as_the_json_reader_does() {
-        let text = testing::minimal();
-        let parsed = vocabulary(serde_json::from_str(&text).unwrap()).unwrap();
-        let reordered = text.replacen(
-            "\"rank\":7,\"token_bytes\":\"Bw==\"",
-            "\"token_bytes\":\"Bw==\",\"rank\":7",
-            1,
-        );
-        assert!(written_layout(&text).is_some());
-        assert!(reordered != text && written_layout(&reordered).is_none());
-        for text in [text, reordered] {
-            let dir = testing::dir_with(&text);
-            let loaded = read(&dir.path().join(FILE_NAME)).unwrap();
-            assert_eq!(loaded.ranks, parsed.ranks);
-            assert_eq!(loaded.specials, parsed.specials);
-            assert_eq!(loaded.pattern, parsed.pattern);
+        let compact = testing::minimal();
+        let edit = |from: &str, to: &str| {
+            let text = compact.replacen(from, to, 1);
+            assert_ne!(text, compact, "{from} is not in the file");
+            text
+        };
+        let value: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        // A file, and whether the walk takes it.
+        let files = [
+            (compact.clone(), true),
+            (serde_json::to_string_pretty(&value).unwrap(), true),
+            (edit(r#""\u0007""#, r#""\ud83d\ude00""#), true),
+            (edit(r#""\u0007""#, r#""\ud83d""#), false),
+            (edit(r#""\u0007""#, "\"\u{7}\""), false),
+            (
+                edit(
+                    r#""rank":7,"token_bytes":"Bw==""#,
+                    r#""token_bytes":"Bw==","rank":7"#,
+                ),
+                false,
+            ),
+            (edit(r#""rank":7,"#, r#""rank":07,"#), false),
+            (edit(r#""rank":7,"#, r#""rank":7.0,"#), false),
+            (edit(r#""rank":7,"#, r#""rank":4294967296,"#), false),
+            (edit(r#""Bw==""#, r#""Bw=\u003d""#), false),
+            (edit(r#""hello"}]"#, r#""hello"},]"#), false),
+        ];
+        for (row, (text, walked)) in files.into_iter().enumerate() {
+            assert_eq!(written_layout(&text).is_some(), walked, "row {row}");
+            let loaded = read(&testing::dir_with(&text).path().join(FILE_NAME));
+            match (loaded, serde_json::from_str::<File>(&text)) {
+                (Ok(loaded), Ok(file)) => {
+                    let parsed = vocabulary(file).unwrap();
+                    assert_eq!(loaded.ranks, parsed.ranks, "row {row}");
+                    assert_eq!(loaded.specials, parsed.specials, "row {row}");
+                    assert_eq!(loaded.pattern, parsed.pattern, "row {row}");
+                }
+                (Err(loaded), Err(parsed)) => {
+                    let loaded = format!("{loaded:#}");
+                    assert!(loaded.ends_with(&parsed.to_string()), "row {row}: {loaded}");
+                }
+                (loaded, _) => panic!("row {row}: one reader refuses (read: {})", loaded.is_ok()),
+            }
         }
     }
 
