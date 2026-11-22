@@ -1704,7 +1704,7 @@ fn object_inputs(content: &mut [messages::ContentBlock], function: &'static str)
 #[cfg(test)]
 mod tool_use_input_tests {
     use serde_json::json;
-    use symphony::{adapt, Event, Events, FinishReason, Text};
+    use symphony::{adapt, CallEnd, Event, Events, FinishReason, Text};
 
     use super::{messages, object_inputs, tool_use_input};
 
@@ -1764,6 +1764,7 @@ mod tool_use_input_tests {
             events.push(Event::ToolCallEnd {
                 index: 0,
                 source: Text::new("", 0),
+                ended: CallEnd::Closed,
             });
             events.push(Event::Finish {
                 reason: FinishReason::ToolCalls,

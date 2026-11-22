@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(arguments_of(&events, 0), r#"{"drink_id": "lat"#);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
+            Event::ToolCallEnd { index: 0, source, .. } if source.text.is_empty()
         )));
         assert!(matches!(
             events.last(),

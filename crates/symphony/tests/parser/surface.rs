@@ -5,7 +5,7 @@
 use symphony::{
     declared::Declared,
     engine::Engine,
-    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{CallEnd, DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallId, CallSyntax, Emits, Format, Whitespace},
     grammar::{
         AddedTokens, Bound, Grammar, GrammarBackend, GrammarStart, Inexpressible, Lark, Output,
@@ -31,6 +31,7 @@ const RE_EXPORTS: [(&str, &[&str]); 9] = [
     (
         "event",
         &[
+            "CallEnd",
             "DropReason",
             "Event",
             "Events",
@@ -131,6 +132,7 @@ fn every_pinned_name_resolves_under_its_module() {
     fn reads<R: ValueRead>() {}
     named::<Declared>();
     named::<(
+        CallEnd,
         DropReason,
         Event,
         Events,
@@ -165,6 +167,7 @@ mod at_the_root {
         named::<symphony::Declared>();
         named::<symphony::Engine>();
         named::<(
+            symphony::CallEnd,
             symphony::DropReason,
             symphony::Event,
             symphony::Events,

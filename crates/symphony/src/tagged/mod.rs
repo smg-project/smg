@@ -31,7 +31,7 @@ pub(crate) use assembler::Assembler;
 pub use assembler::{Placement, Spelling};
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{CallEnd, DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     Declared,
 };
@@ -160,6 +160,7 @@ pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut E
     out.push(Event::ToolCallEnd {
         index,
         source: Text::uncounted(terminal.to_owned()),
+        ended: CallEnd::Closed,
     });
 }
 

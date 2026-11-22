@@ -796,7 +796,7 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     }
                 }
             }
-            Event::ToolCallEnd { index, source } => {
+            Event::ToolCallEnd { index, source, .. } => {
                 breach("end-before-start", started.contains(index), || {
                     format!("{}: an end before the call's start", place())
                 });
@@ -1111,7 +1111,7 @@ fn check_adapters(case: &Case, whole: &[Event], pieces: &[Event]) {
 
 #[cfg(test)]
 mod tests {
-    use symphony::Text;
+    use symphony::{CallEnd, Text};
 
     use super::*;
 
@@ -1324,6 +1324,7 @@ mod tests {
         Event::ToolCallEnd {
             index,
             source: Text::uncounted(source.to_string()),
+            ended: CallEnd::Closed,
         }
     }
 

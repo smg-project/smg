@@ -135,9 +135,14 @@ impl Ledger {
                 json,
                 source: self.text(source.text),
             },
-            Event::ToolCallEnd { index, source } => Event::ToolCallEnd {
+            Event::ToolCallEnd {
+                index,
+                source,
+                ended,
+            } => Event::ToolCallEnd {
                 index,
                 source: self.text(source.text),
+                ended,
             },
             other @ (Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. }) => other,
         }
