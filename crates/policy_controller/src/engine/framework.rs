@@ -6875,10 +6875,11 @@ impl Engine {
     /// over their thresholds, or doubted, are put to the binding's all-vetoed
     /// rule, both its tiers: the rule picks afresh among them, whatever
     /// decode the first decision named. Over partners all over their
-    /// thresholds it keeps to the ones the request has not tried while one
-    /// is left, as a first decision does. A pair's first decision lifts the
-    /// overload veto alone ([`Self::decide_pair`]). Here the prefill has
-    /// run, and a refusal fails its request.
+    /// thresholds the profile's soft filter keeps to the ones the request
+    /// has not tried while one is left, as in a first decision. A pair's
+    /// first decision lifts the overload veto alone
+    /// ([`Self::decide_pair`]). Here the prefill has run, and a refusal
+    /// fails its request.
     ///
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode

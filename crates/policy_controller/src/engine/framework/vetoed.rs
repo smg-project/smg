@@ -43,7 +43,7 @@ use crate::{
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
     },
     stages::{
-        filters::{Healthy, NotOverloaded},
+        filters::{Healthy, NotOverloaded, NotTried},
         pickers::Best,
         scorers::LeastRequests,
     },
@@ -300,19 +300,21 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// busy; a doubted one may be gone. Each lift runs the profile's filters
 /// once more, and the rows such a pass keeps are the usable ones. So a hard
 /// filter listed behind a veto does not hide such a pool, and the answer
-/// does not turn on the order a document lists its filters in. The retry's
-/// tried list is set aside for those passes, as the gateway's fallback
-/// sets it aside: a worker an earlier attempt tried is taken again when it
-/// holds the fewest requests. One pass reads the list first: the one that
-/// lifts the overload veto over a chosen prefill's partners. The profile's
-/// soft filter then keeps to the partners the request has not tried while
-/// one is left, as the gateway's pair selection does. That pass stands
-/// where every partner it keeps is untried. Where it keeps a tried one or
-/// nobody, the pass with the list set aside decides. The pair presets list
-/// that filter behind the room filter, the order the gateway narrows in.
-/// The host's list of workers it just failed to reach stays in every pass:
-/// the soft filter passes over such a worker while another usable one
-/// stands, and takes it as the last resort.
+/// does not turn on the order a document lists its hard filters in. The
+/// retry's tried list is set aside for those passes, as the gateway's
+/// fallback sets it aside: a worker an earlier attempt tried is taken again
+/// when it holds the fewest requests. On a retry one pass reads the list
+/// first: the one that lifts the overload veto over a chosen prefill's
+/// partners. The profile's soft filter then keeps to the partners the
+/// request has not tried while one is left, as the gateway's pair selection
+/// does. That pass stands where every partner it keeps passes that filter's
+/// own test: not tried, and not one the host just failed to reach. Where it
+/// keeps another or nobody, the pass with the list set aside decides. A
+/// first attempt names no tried worker, and takes that pass alone. The pair
+/// presets list the soft filter behind the room filter, the order the
+/// gateway narrows in. The host's list of workers it just failed to reach
+/// stays in every pass: the soft filter passes over such a worker while
+/// another usable one stands, and takes it as the last resort.
 ///
 /// The overload veto is lifted under [`AllVetoed::Steer`], where it stood
 /// in the emptied pass and a row reads as over its thresholds. Under a veto
@@ -374,11 +376,14 @@ pub(super) fn emptied(
             overload_lifted: true,
             ..*cx
         };
-        // A chosen prefill's partners keep to the ones the request has not
-        // tried while one is left: their pass reads the tried list first,
-        // and stands where every partner it keeps is untried.
-        let untried = |&at: &u32| !facts.tried.contains(&candidates[at as usize].id);
+        // On a retry a chosen prefill's partners keep to the ones the
+        // request has not tried while one is left: their pass reads the
+        // tried list first, and stands where every partner it keeps passes
+        // the soft filter's own test. With no tried list it is the pass
+        // below, and is not run.
+        let untried = |&at: &u32| NotTried.keep(facts, &candidates[at as usize], &pass);
         if set.class.is_some()
+            && !facts.tried.is_empty()
             && filter(profile, facts, &pass, buf, set.shedding()).is_none()
             && buf.kept.iter().all(untried)
         {
@@ -1508,6 +1513,58 @@ mod tests {
         assert_eq!(pair_of(&decision), (0, 1));
     }
 
+    /// Three partners of class 1 over their thresholds, holding `in_flight`
+    /// requests in their order, and their ids. The ids are their own: a
+    /// tried list names a decode and no prefill.
+    fn partners(in_flight: [u32; 3]) -> ([Candidate; 3], [WorkerId; 3]) {
+        let mut decodes = [0, 1, 2].map(|at| classed(over(at, in_flight[at as usize]), 1));
+        for decode in &mut decodes {
+            decode.id = WorkerId(200 + u64::from(decode.position));
+        }
+        (decodes, decodes.map(|decode| decode.id))
+    }
+
+    /// The decodes a request is given among `decodes`, one prefill's
+    /// partners, best first. It tried `tried`, and its host just failed to
+    /// reach `gone`. A first decision names them. A decode asked again
+    /// behind the prefill names the same over a scratch of its own, and
+    /// both say the lifted overload veto.
+    fn given(
+        engine: &Engine,
+        decodes: &[Candidate],
+        tried: &[WorkerId],
+        gone: &[WorkerId],
+    ) -> Vec<u32> {
+        let prefills = [classed(free(0, 0), 1)];
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes,
+            ..PairPools::default()
+        };
+        // A request that names a tried worker says its retry number.
+        let req = RequestFacts {
+            tried,
+            attempt: u8::from(!tried.is_empty()),
+            ..facts(1)
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let reached = Constraints {
+            excluded: gone,
+            ..Constraints::default()
+        };
+        let first = engine.decide_pair(&req, &pool, pools, &cx, &reached, &mut Scratch::new());
+        let (held, fresh) = (prefills[0].id, &mut Scratch::new());
+        let again = engine.decide_decode(&req, &pool, pools, held, None, &reached, fresh);
+        let named = |decision: &Decision| {
+            assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+            let targets = decision.pick().expect("a pick").targets.iter();
+            let decodes = targets.map(|target| target.pair.expect("a pair").decode_position);
+            decodes.collect::<Vec<_>>()
+        };
+        assert_eq!(named(&first), named(&again));
+        named(&first)
+    }
+
     /// The pass that opens the prefills sets the retry's tried list aside,
     /// and the partners' pass does where reading the list leaves nobody: a
     /// hard filter that reads the list hides no prefill and refuses no lone
@@ -1515,6 +1572,15 @@ mod tests {
     /// decode only while another partner is left
     /// (`model_gateway/src/routers/common/placement.rs:1562-1570`), and
     /// places this pair.
+    ///
+    /// The partners' pass sets the list aside too where reading it keeps a
+    /// partner the host just failed to reach. Under a profile that lists
+    /// `not-tried` behind the hard filter, the request then goes to a tried
+    /// partner the host can reach. Under one that lists no `not-tried` no
+    /// filter reads the host's list: the fewest in flight of all takes the
+    /// request, as before a retry read the tried list. The gateway keeps
+    /// one list for a tried worker and one it failed to reach (`was_tried`,
+    /// `:1177-1179` there), and tells no such states apart.
     #[test]
     fn a_tried_decode_still_opens_its_prefill() {
         /// Refuses a worker an earlier attempt tried: a hard filter.
@@ -1548,20 +1614,37 @@ mod tests {
         let decision = engine.decide_pair(&req, &pool, pools, &cx, &cx, &mut Scratch::new());
         assert_eq!(pair_of(&decision), (0, 0));
         assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+        // Two tried partners beside one the host just failed to reach,
+        // under `not-tried` behind the hard filter: the tried ones.
+        let (decodes, ids) = partners([0, 1, 2]);
+        let mut listed = vetoes();
+        listed.push(Box::new(Untried));
+        listed.push(Box::new(NotTried));
+        let listed = pair_engine_of(false, [vetoes(), listed]);
+        assert_eq!(given(&listed, &decodes, &ids[..2], &ids[2..]), [0, 1]);
+        // One tried, one the host failed to reach and one neither, under
+        // the hard filter alone. The pass that reads the list keeps the
+        // last two, and does not stand.
+        assert_eq!(given(&engine, &decodes, &ids[..1], &ids[1..2]), [0, 1, 2]);
     }
 
     /// A retry over partners all over their thresholds keeps to the ones the
-    /// request has not tried while one is left, and takes the fewest in
-    /// flight among those. With every partner tried the fewest in flight of
-    /// all takes it. A tried partner with a room stays ahead of untried ones
-    /// with none. The gateway's own pair selection orders a pick's partners
-    /// so: the rooms, the untried ones, the least loaded
+    /// request has not tried while one is left. The fewest in flight among
+    /// those takes it, and the others of them stand behind as alternates.
+    /// With every partner tried the list narrows nobody. A tried partner
+    /// with a room stays ahead of untried ones with none. The gateway's own
+    /// pair selection orders a pick's partners so: the rooms, the untried
+    /// ones, the least loaded
     /// (`model_gateway/src/routers/common/placement.rs:1561`, `:1568-1570`,
-    /// `:1575-1578`, `narrow_to` at `:266-282`). Where the list names every
-    /// partner but one the host just failed to reach, that one stays the
-    /// last resort: the gateway's retry keeps one list, so that answer is
-    /// the engine's own. So is a decode asked again behind its prefill,
-    /// which answers the same: the gateway asks no decode again.
+    /// `:1575-1578`, `narrow_to` at `:266-282`). It names one pair
+    /// (`:1621-1625`), so the alternates are the engine's own. Where the
+    /// list names every partner but one the host just failed to reach, that
+    /// one stays the last resort: the gateway's retry keeps one list, so
+    /// that answer is the engine's own. So is a decode asked again behind
+    /// its prefill: the gateway asks no decode again. So is the answer
+    /// under a document that lists `not-tried` ahead of the room filter,
+    /// an order the gateway has not: a partner the host just failed to
+    /// reach takes no retry there from tried ones the host can reach.
     #[test]
     fn a_retry_keeps_to_the_untried_partners_while_one_is_left() {
         // The decode side's filters in the pair presets' order.
@@ -1569,54 +1652,42 @@ mod tests {
         reads_tried.push(Box::new(HasRoom));
         reads_tried.push(Box::new(NotTried));
         let engine = pair_engine_of(false, [vetoes(), reads_tried]);
-        let prefills = [classed(free(0, 0), 1)];
-        let mut decodes = [over(0, 0), over(1, 1), over(2, 2)].map(|worker| classed(worker, 1));
-        for decode in &mut decodes {
-            decode.id = WorkerId(200 + u64::from(decode.position));
-        }
-        let ids = decodes.map(|decode| decode.id);
-        let (pool, cx) = (PoolFacts::default(), Constraints::default());
-        // The decode a first decision names among `decodes` for a request
-        // that tried `tried` and whose host just failed to reach `gone`,
-        // and the one a decode asked again behind the prefill names.
-        let placed = |decodes: &[Candidate], tried: &[WorkerId], gone: &[WorkerId]| {
-            let pools = PairPools {
-                prefills: &prefills,
-                decodes,
-                ..PairPools::default()
-            };
-            let req = RequestFacts { tried, ..facts(1) };
-            let reached = Constraints {
-                excluded: gone,
-                ..Constraints::default()
-            };
-            let scratch = &mut Scratch::new();
-            let first = engine.decide_pair(&req, &pool, pools, &cx, &reached, scratch);
-            let held = prefills[0].id;
-            let again = engine.decide_decode(&req, &pool, pools, held, None, &reached, scratch);
-            assert_eq!(first.trace().lifted, LiftedVeto::Overload);
-            (pair_of(&first).1, pair_of(&again).1)
-        };
+        // The lightest untried partner stands last among them.
+        let (decodes, ids) = partners([0, 2, 1]);
         let mut roomy = decodes;
         roomy[0].has_room = true;
         // Where the list moves no answer: none, every partner tried, every
         // partner but one the host failed to reach, a tried one with a room.
-        assert_eq!(placed(&decodes, &[], &[]), (0, 0));
-        assert_eq!(placed(&decodes, &ids, &[]), (0, 0));
-        assert_eq!(placed(&decodes, &ids[1..], &ids[..1]), (1, 1));
-        assert_eq!(placed(&roomy, &ids[..1], &[]), (0, 0));
-        // Where it does: the untried partners while one is left.
-        assert_eq!(placed(&decodes, &ids[..1], &[]), (1, 1));
-        assert_eq!(placed(&decodes, &ids[..2], &[]), (2, 2));
+        assert_eq!(given(&engine, &decodes, &[], &[]), [0, 2, 1]);
+        assert_eq!(given(&engine, &decodes, &ids, &[]), [0, 2, 1]);
+        assert_eq!(given(&engine, &decodes, &ids[1..], &ids[..1]), [2, 1]);
+        assert_eq!(given(&engine, &roomy, &ids[..1], &[]), [0]);
+        // Where it does: the untried partners while one is left, the
+        // fewest in flight first, and no tried one behind them.
+        assert_eq!(given(&engine, &decodes, &ids[..1], &[]), [2, 1]);
+        assert_eq!(given(&engine, &decodes, &ids[..2], &[]), [2]);
+        // A document may list `not-tried` ahead of the room filter. The
+        // one partner with a room is one the host just failed to reach,
+        // and the others are tried: the pass that reads the list keeps
+        // that one alone, and the tried ones take the retry. In the
+        // presets' order the room goes first, as in the gateway.
+        let mut reversed = vetoes();
+        reversed.push(Box::new(NotTried));
+        reversed.push(Box::new(HasRoom));
+        let reversed = pair_engine_of(false, [vetoes(), reversed]);
+        assert_eq!(given(&reversed, &roomy, &ids[1..], &ids[..1]), [2, 1]);
+        assert_eq!(given(&engine, &roomy, &ids[1..], &ids[..1]), [0]);
     }
 
     /// A decode asked for a held prefill is put to the rule, both its tiers.
     /// Partners over their thresholds on every worker go to the one that
     /// holds the fewest requests, and under a binding that sheds they are
     /// shed as saturated. Partners doubted on every worker go to the fewest
-    /// requests under either word, and never to one a hold stands on. The
-    /// gateway's own selection asks no decode again, so these answers are
-    /// the engine's own.
+    /// requests under either word, and never to one a hold stands on. A
+    /// first attempt's partners are filtered once under the lifted veto: a
+    /// filter behind the veto is asked about each once, and its refusal
+    /// stands. The gateway's own selection asks no decode again, so these
+    /// answers are the engine's own.
     #[test]
     fn a_decode_asked_for_a_held_prefill_is_put_to_the_rule() {
         let prefills = [classed(free(0, 0), 1)];
@@ -1644,6 +1715,13 @@ mod tests {
             shed_of(&asked(&pair_engine(true), &busy)),
             (ShedReason::Saturated, "not-overloaded")
         );
+        // The request names no tried worker: one pass under the lifted veto.
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut refused = vetoes();
+        refused.push(Box::new(Refuses(Arc::clone(&count))));
+        let shed = asked(&pair_engine_of(false, [vetoes(), refused]), &busy);
+        assert_eq!(shed_of(&shed), (ShedReason::NoEndpoints, "refuses"));
+        assert_eq!(count.load(Ordering::Relaxed), busy.len());
         let mut suspect = [doubted(0, 2), doubted(1, 1), doubted(2, 0)];
         suspect[2].health.breaker_open = true;
         let suspect = suspect.map(|worker| classed(worker, 1));
