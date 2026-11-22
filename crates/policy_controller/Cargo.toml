@@ -222,8 +222,15 @@ discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
 # The engine in a gateway's own process: one front over the gateway's worker
 # objects, which reads a worker's health where the worker crate keeps it. It
 # names nothing of the store. Off by default: it brings the worker crate's
-# runtime.
-in-process = ["dep:smg-worker", "smg-worker/runtime"]
+# runtime. The engine's own task takes Tokio's timer, which that runtime
+# builds already.
+in-process = [
+    "dep:smg-worker",
+    "dep:tokio",
+    "smg-worker/runtime",
+    "tokio/macros",
+    "tokio/time",
+]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.

@@ -487,6 +487,9 @@ pub struct PolicyEngine {
     epochs: AtomicU64,    // how many list values were made
     faults: AtomicU64,    // decisions that panicked
     unheard: AtomicU64,   // lease events that panicked inside a stage
+    upkeep_faults: AtomicU64, // runs of the upkeep that panicked in the engine's own task
+    loads: task::Loads,   // the host's load channel, once handed, and the newest load snapshot
+                          // the engine's own task keeps at hand
 }
 ```
 
@@ -845,7 +848,8 @@ At start:
 | keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
 | tells the engine when a worker joins | `engine.joined(address)` |
 | tells the engine when a worker is removed | `engine.forget(address)` |
-| runs the upkeep about once a second | `engine.sweep(now)` |
+| hands its load monitor's channel | `engine.set_loads(channel)`, and again where it builds another monitor; an engine whose document reads no load report keeps none |
+| spawns the engine's own task, once | `engine.run()`: the upkeep once a second, and the newest load snapshot kept at hand |
 
 For each request the host implements a small trait and calls the engine. A host writes `model`
 and `make`; the other three methods have default bodies:
@@ -857,7 +861,7 @@ pub trait RequestMaker {
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>; // builds the request
     fn plain(&self) -> Option<Plain>;                 // what a plain request states, if it is plain
     fn workers(&self) -> WorkerLists<'_>;             // the worker list, or a pair's two lists
-    fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // the load snapshot for this decision
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a single request's snapshot of the host's own; without one the engine reads its own
 }
 
 pub enum WorkerLists<'a> {
@@ -873,9 +877,8 @@ pub enum Decided {
 ```
 
 Then the host itself has to: derive the routing key by the document's rule and hash the prompt
-into blocks, inside `make`; borrow the load snapshot; try the targets in order, checking each
-worker's health again; keep the decision's lease and report each event; turn a refusal into a
-status.
+into blocks, inside `make`; try the targets in order, checking each worker's health again; keep
+the decision's lease and report each event; turn a refusal into a status.
 
 That is too much. The gateway's earlier integration needs a module of its own of 19 files and
 13,856 lines (tests included) for it, and a branch in every route.
@@ -901,10 +904,12 @@ runtime.spawn(engine.run());         // the engine's own background task
 
 The engine lives as long as the process, so a placement holds a plain reference to it.
 
-The engine's background task does what a host does by hand today: the upkeep once a second; a
-worker that joined or was removed told to the policies; and the newest load snapshot kept at
-hand, swapped when the monitor publishes one, so that a decision reads it without touching the
-channel.
+The engine's background task does what a host did by hand. Two of its jobs are built
+(`PolicyEngine::run`): the upkeep once a second, and the newest load snapshot kept at hand,
+swapped when the monitor publishes one, so that a decision reads it without touching the
+channel. One is planned: a worker that joined or was removed told to the policies. A host that
+builds another load monitor hands its channel again (`engine.set_loads`): a channel ends with
+its monitor.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
 host's `Generation` type. The engine fills the cell at the list's first decision.
