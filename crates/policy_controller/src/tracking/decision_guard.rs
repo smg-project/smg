@@ -461,6 +461,22 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         self.decided.lease.as_ref()
     }
 
+    /// Whether the handle still owes its lease a word on some side: a
+    /// dispatch, an end, or the release in their place. A handle that
+    /// owes nothing says nothing at its drop.
+    #[must_use]
+    pub(crate) fn owes(&self) -> bool {
+        !matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing))
+    }
+
+    /// The target the handle names at its dispatch: the pick's first, or
+    /// the one a take moved to. A pair's decode is in it.
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn target(&self) -> &Target {
+        &self.target
+    }
+
     /// Takes the target at `index` of the pick, best first: the one the
     /// host's commit holds, which its dispatch then names. A host that
     /// takes none dispatches to the first. A take says nothing to the
@@ -764,7 +780,7 @@ impl<D: Deref<Target: DecisionEngine>> Drop for DecisionGuard<D> {
     /// handle that owes nothing says nothing and reads no clock.
     fn drop(&mut self) {
         // The common drop: the request completed, on every side.
-        if matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing)) {
+        if !self.owes() {
             return;
         }
         self.released(ReleaseReason::Abandoned, Instant::now());
@@ -945,6 +961,10 @@ mod tests {
         const HELD: usize = 488;
         assert_eq!(size_of::<DecisionGuard<Arc<StoreBackedEngine>>>(), HELD);
         assert_eq!(size_of::<DecisionGuard<&StoreBackedEngine>>(), HELD);
+        // A placement is the handle and what its host reads of the answer:
+        // two worker pointers, the routing key and the profile.
+        #[cfg(feature = "in-process")]
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 56);
     }
 
     /// A request that is served: its lease is booked at the issue, moves

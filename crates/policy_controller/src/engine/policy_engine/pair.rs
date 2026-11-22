@@ -1171,6 +1171,112 @@ mod tests {
         }
     }
 
+    /// A placement says a pair's words as a guard driven by hand says
+    /// them, each side's under its own lease and the index of the target
+    /// taken. It writes into each end the worker that served, from that
+    /// target, whatever its host wrote there. Its two workers are the
+    /// lists' own objects at the target's places. An encode side's send
+    /// and end say nothing. A pair told such an end behind its two sends
+    /// still owes both sides. A pair whose host said those two alone and
+    /// let go is released whole, as a guard dropped unsent.
+    #[test]
+    fn a_placement_says_a_pairs_words_and_names_the_workers_that_served() {
+        let host: &'static Host = Box::leak(Box::new(Host::of(1, 2)));
+        let classes = every(1, 2);
+        let asks = host.asks(&classes, false);
+        let whole = || {
+            let now = Instant::now();
+            let answer = host.engine.decide_under(GatewayId::LOCAL, &asks, now);
+            let (decided, later) = answer
+                .expect("an answer")
+                .whole()
+                .expect("a whole decision");
+            let taken = target_at(&decided.decision, 1);
+            (decided, later, now, taken, taken.pair.expect("a pair"))
+        };
+        // What the stages heard since the last call: each word with its
+        // side and its lease's index, and the worker each completion names.
+        let words = || {
+            let heard = std::mem::take(&mut *host.heard.lock());
+            let told: Vec<_> = heard.iter().map(|word| (word.0, word.1, word.3)).collect();
+            let ended = heard.iter().filter(|word| word.0 == "completed");
+            let served: Vec<_> = ended.map(|word| (word.1, WorkerId(word.6))).collect();
+            (told, served)
+        };
+
+        let (decided, later, now, taken, pair) = whole();
+        let profile = decided.decision.pick().expect("a pick").trace.profile;
+        assert_ne!(profile, 0, "the document's second profile picked");
+        let prefill = &host.prefills[taken.position as usize];
+        let decode = &host.decodes[pair.decode_position as usize];
+        let placement = crate::tracking::Placement::taken(
+            &host.engine,
+            decided,
+            later,
+            now,
+            1,
+            Arc::clone(prefill),
+            Some(Arc::clone(decode)),
+        );
+        let mut placement = placement.expect("a placement");
+        assert!(Arc::ptr_eq(&placement.worker, prefill));
+        assert!(Arc::ptr_eq(
+            placement.decode.as_ref().expect("a decode"),
+            decode
+        ));
+        let ids = (placement.id(), placement.decode_id());
+        assert_eq!(ids, (taken.id, Some(pair.decode_id)));
+        assert_eq!(placement.profile, profile);
+        placement.sent(Side::Prefill);
+        placement.sent(Side::Decode);
+        placement.ended(Side::Encode, outcome(Side::Encode, WorkerId(77)));
+        // Its host names no worker and another side in each outcome.
+        placement.ended(Side::Prefill, outcome(Side::Single, WorkerId(0)));
+        assert!(placement.owes_events(), "the decode side has not ended");
+        placement.ended(Side::Decode, outcome(Side::Single, WorkerId(0)));
+        assert!(!placement.owes_events());
+        drop(placement);
+        let (decided, later, now, _, _) = whole();
+        let unsent = crate::tracking::Placement::taken(
+            &host.engine,
+            decided,
+            later,
+            now,
+            1,
+            Arc::clone(prefill),
+            Some(Arc::clone(decode)),
+        );
+        let mut unsent = unsent.expect("a placement");
+        unsent.sent(Side::Encode);
+        unsent.ended(Side::Encode, outcome(Side::Encode, WorkerId(77)));
+        drop(unsent);
+        let (through_placements, served) = words();
+        let named = [(Side::Prefill, taken.id), (Side::Decode, pair.decode_id)];
+        assert_eq!(served, named);
+
+        let (decided, later, now, _, _) = whole();
+        let mut guard = DecisionGuard::holding(&host.engine, GatewayId::LOCAL, decided, later, now);
+        let taken = guard.take(1).expect("a target");
+        let decode = taken.pair.expect("a pair").decode_id;
+        guard.dispatched(now);
+        guard.dispatched_decode(now);
+        guard.completed(&outcome(Side::Prefill, taken.id), now);
+        guard.completed(&outcome(Side::Decode, decode), now);
+        drop(guard);
+        let (decided, later, now, _, _) = whole();
+        let mut guard = DecisionGuard::holding(&host.engine, GatewayId::LOCAL, decided, later, now);
+        assert!(guard.take(1).is_some());
+        drop(guard);
+        assert_eq!(through_placements, words().0);
+        let told: Vec<_> = through_placements.iter().map(|word| word.0).collect();
+        // Each word is told of both sides: the pair sent and ended, then
+        // the pair let go.
+        let sent_and_ended = ["issued", "dispatched", "completed"].map(|word| [word; 2]);
+        let let_go = ["issued", "released"].map(|word| [word; 2]);
+        assert_eq!(told, [sent_and_ended.concat(), let_go.concat()].concat());
+        assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 0));
+    }
+
     /// A decision names each worker by its place in the list its host
     /// handed and by its id, and reads the workers and the host's admission
     /// as they stand at the call.

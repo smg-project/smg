@@ -1255,6 +1255,393 @@ mod tests {
         assert_eq!((engine.faults(), engine.unheard()), (0, 0));
     }
 
+    /// A placement says a single's words as a guard driven by hand says
+    /// them, and names the list's own worker at the place of the target
+    /// taken. Four requests, each once through a placement and once
+    /// through a guard: one sent to an alternate and ended, one sent and
+    /// dropped, one dropped unsent, and one whose pick has no target at the
+    /// index taken, which makes no placement and gives its lease up.
+    #[test]
+    fn a_placement_says_a_singles_words_as_its_guard_says_them() {
+        let (engine, heard) = hearing(false);
+        let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        let ended = |side: Side, served: WorkerId| Outcome {
+            side,
+            served,
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+        let whole = || {
+            let answer = answered(engine, &asks).whole();
+            let (decided, later) = answer.expect("a whole decision");
+            (decided, later, Instant::now())
+        };
+        // One request as a placement with the target at `index` taken, and
+        // that target.
+        let taken_at = |index: usize| {
+            let (decided, later, now) = whole();
+            let targets = decided.decision.pick().expect("a pick").targets;
+            let taken = targets.as_slice().get(index).copied();
+            let worker = Arc::clone(&list[taken.map_or(0, |taken| taken.position as usize)]);
+            let placement =
+                crate::tracking::Placement::taken(engine, decided, later, now, index, worker, None);
+            (placement, taken)
+        };
+        let by_hand = || {
+            let (decided, later, now) = whole();
+            (
+                DecisionGuard::holding(engine, GatewayId::LOCAL, decided, later, now),
+                now,
+            )
+        };
+        // What the stage heard since the last call: each word with its
+        // worker, and each word with its lease's index.
+        let words = || {
+            let heard = std::mem::take(&mut *heard.lock());
+            let told: Vec<_> = heard.iter().map(|word| (word.0, word.2)).collect();
+            (heard, told)
+        };
+
+        // Sent to an alternate and ended. Its host wrote another side and no
+        // worker into the outcome.
+        let (placement, alternate) = taken_at(1);
+        let mut placement = placement.expect("a placement");
+        let alternate = alternate.expect("a target");
+        let at = alternate.position as usize;
+        assert!(Arc::ptr_eq(&placement.worker, &list[at]));
+        assert_eq!(
+            (placement.id(), placement.decode_id()),
+            (alternate.id, None)
+        );
+        assert!(placement.decode.is_none() && placement.routing_key.is_none());
+        placement.routing_key = Some("a-key");
+        let mut placement = placement.kept();
+        assert_eq!(
+            placement.routing_key, None,
+            "a kept placement borrows nothing"
+        );
+        assert!(placement.owes_events());
+        placement.sent(Side::Single);
+        placement.sent(Side::Single);
+        assert!(placement.owes_events(), "sent, and not ended");
+        placement.ended(Side::Single, ended(Side::Decode, WorkerId(0)));
+        assert!(!placement.owes_events());
+        drop(placement);
+        // Sent and dropped: a cancelled end.
+        let mut placement = taken_at(0).0.expect("a placement");
+        placement.sent(Side::Single);
+        drop(placement);
+        // Dropped unsent: a release.
+        drop(taken_at(0).0.expect("a placement"));
+        // No target at the index taken: no placement, and the lease is given
+        // up.
+        assert!(taken_at(9).0.is_none());
+        let (heard_of_placements, through_placements) = words();
+
+        let (mut guard, now) = by_hand();
+        let taken = guard.take(1).expect("a target");
+        guard.dispatched(now);
+        guard.completed(&ended(Side::Single, taken.id), now);
+        drop(guard);
+        let (mut guard, now) = by_hand();
+        guard.dispatched(now);
+        drop(guard);
+        drop(by_hand());
+        let (mut guard, _) = by_hand();
+        assert!(guard.take(9).is_none());
+        drop(guard);
+        assert_eq!(through_placements, words().1);
+        assert_eq!(
+            through_placements,
+            [
+                ("issued", 0),
+                ("dispatched", 1),
+                ("completed", 1),
+                ("issued", 0),
+                ("dispatched", 0),
+                ("completed", 0),
+                ("issued", 0),
+                ("released", 0),
+                ("issued", 0),
+                ("released", 0),
+            ]
+        );
+        // The dispatch names the target taken, and the end is told under
+        // the lease moved there.
+        let on_the_alternate = [heard_of_placements[1].1, heard_of_placements[2].1];
+        assert_eq!(on_the_alternate, [alternate.id; 2]);
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+    }
+
+    /// [`Hears`] as a stage that also keeps the outcome of each end it is
+    /// told.
+    #[derive(Debug)]
+    struct Ends(Hears, Arc<Mutex<Vec<Outcome>>>);
+
+    impl Lifecycle for Ends {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.0.on_decision_issued(lease, decision);
+        }
+
+        fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
+            self.0.on_dispatched(lease, target, side, since);
+        }
+
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+            self.0.on_completed(lease, outcome);
+            self.1.lock().push(*outcome);
+        }
+    }
+
+    impl Picker for Ends {
+        fn name(&self) -> &'static str {
+            "ends"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// An encode side's end says nothing through a placement, as its send
+    /// says nothing: no lease stands for such a side. A single request's
+    /// placement is told one before the request is sent and one behind its
+    /// send. No stage hears a word of either, and the request is still
+    /// owed its end. Its own end behind them is said once, under the
+    /// request's side and the worker of the target taken, whatever its
+    /// host wrote there.
+    #[test]
+    fn an_encode_sides_end_through_a_placement_says_nothing() {
+        let (heard, ends) = (Heard::default(), Arc::new(Mutex::new(Vec::new())));
+        let kept = (Arc::clone(&heard), Arc::clone(&ends));
+        let engine = picked_by("ends", move || {
+            let hears = Hears {
+                heard: Arc::clone(&kept.0),
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            };
+            Box::new(Ends(hears, Arc::clone(&kept.1)))
+        });
+        let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
+        let first = decided
+            .decision
+            .pick()
+            .and_then(|pick| pick.targets.first().copied());
+        let first = first.expect("a target");
+        let worker = Arc::clone(&list[first.position as usize]);
+        let now = Instant::now();
+        let placement =
+            crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+        let mut placement = placement.expect("a placement");
+        let ended = |side: Side| Outcome {
+            side,
+            served: WorkerId(77),
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+        let words = || std::mem::take(&mut *heard.lock());
+        assert_eq!(words(), [("issued", first.id, 0)]);
+        // Unsent: no dispatch is said for it, and no end.
+        placement.ended(Side::Encode, ended(Side::Encode));
+        assert!(placement.owes_events(), "the request has not ended");
+        assert!(words().is_empty(), "an encode side's end is no word");
+        placement.sent(Side::Single);
+        assert_eq!(words(), [("dispatched", first.id, 0)]);
+        // Sent: the request's lease stands.
+        placement.ended(Side::Encode, ended(Side::Encode));
+        assert!(placement.owes_events(), "the request has not ended");
+        assert!(words().is_empty(), "an encode side's end is no word");
+        assert!(ends.lock().is_empty());
+        // The request's own end. Its host wrote another side there.
+        placement.ended(Side::Single, ended(Side::Decode));
+        assert!(!placement.owes_events());
+        assert_eq!(words(), [("completed", first.id, 0)]);
+        let told = Outcome {
+            side: Side::Single,
+            served: first.id,
+            ..ended(Side::Decode)
+        };
+        assert_eq!(*ends.lock(), [told]);
+        drop(placement);
+        assert!(words().is_empty(), "the drop says nothing more");
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+    }
+
+    /// A placement under no lease owes nothing and says nothing: a place's,
+    /// and a whole decision's under a document no stage of which takes a
+    /// word. It names the list's own worker, counts under the profile that
+    /// picked, and takes its worker's id when it is asked, and no lease's.
+    /// The profile that picks is the document's second: a spare one of
+    /// another name stands ahead of it.
+    #[test]
+    fn a_placement_under_no_lease_owes_nothing_and_says_nothing() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        document.generation = 1;
+        let spare = document.profiles["round_robin"].clone();
+        document.profiles.insert("a_spare".into(), spare);
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let ended = Outcome {
+            side: Side::Single,
+            served: WorkerId(0),
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+
+        let pick = placed(engine, &Asks::of(request(), Some(&members)));
+        assert_eq!(pick.profile, 1, "the document's second profile picked");
+        let worker = &list[pick.place as usize];
+        let mut placement = crate::tracking::Placement::alone(Arc::clone(worker), pick);
+        assert!(!placement.owes_events());
+        placement.sent(Side::Single);
+        placement.ended(Side::Single, ended);
+        assert!(Arc::ptr_eq(&placement.worker, worker));
+        assert_eq!(placement.id(), worker_id(worker.as_ref()));
+        assert_eq!(
+            (placement.decode_id(), placement.profile),
+            (None, pick.profile)
+        );
+        assert!(placement.decode.is_none() && placement.routing_key.is_none());
+
+        // A retry is decided whole, and under this document with no lease.
+        let tried = [worker_id(list[0].as_ref())];
+        let mut retry = request();
+        retry.facts.tried = &tried;
+        let asks = Asks::of(retry, Some(&members));
+        let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
+        let picked = decided.decision.pick().expect("a pick");
+        let first = picked.targets.first().expect("a target");
+        let (profile, target) = (picked.trace.profile, *first);
+        assert_eq!(profile, 1, "the document's second profile picked");
+        let worker = &list[target.position as usize];
+        let now = Instant::now();
+        let placement = crate::tracking::Placement::taken(
+            engine,
+            decided,
+            later,
+            now,
+            0,
+            Arc::clone(worker),
+            None,
+        );
+        let mut placement = placement.expect("a placement");
+        assert!(!placement.owes_events());
+        placement.sent(Side::Single);
+        placement.ended(Side::Single, ended);
+        assert!(Arc::ptr_eq(&placement.worker, worker));
+        assert_eq!((placement.id(), placement.profile), (target.id, profile));
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+    }
+
+    /// [`Hears`] as a stage that keeps the span each dispatch states since
+    /// its decision.
+    #[derive(Debug)]
+    struct Spans(Hears, Arc<Mutex<Vec<u32>>>);
+
+    impl Lifecycle for Spans {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, since: u32) {
+            self.1.lock().push(since);
+        }
+    }
+
+    impl Picker for Spans {
+        fn name(&self) -> &'static str {
+            "spans"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A placement dates its lease at the instant its host hands, the
+    /// decision's, and reads the clock itself at a send: the span the
+    /// dispatch states counts from the one to the other.
+    #[test]
+    fn a_placements_dispatch_counts_from_the_decisions_instant() {
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&spans);
+        let engine = picked_by("spans", move || {
+            let hears = Hears {
+                heard: Heard::default(),
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            };
+            Box::new(Spans(hears, Arc::clone(&kept)))
+        });
+        let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
+        let first = decided
+            .decision
+            .pick()
+            .and_then(|pick| pick.targets.first());
+        let worker = Arc::clone(&list[first.expect("a target").position as usize]);
+        // The decision stood a second before its request went out.
+        let second = Duration::from_secs(1);
+        let decided_at = Instant::now().checked_sub(second);
+        let decided_at = decided_at.expect("an earlier instant");
+        let placement =
+            crate::tracking::Placement::taken(engine, decided, later, decided_at, 0, worker, None);
+        let mut placement = placement.expect("a placement");
+        placement.sent(Side::Single);
+        drop(placement);
+        let stated = spans.lock().clone();
+        assert_eq!(stated.len(), 1, "one dispatch");
+        assert!(stated[0] >= 1_000_000, "{stated:?}");
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+    }
+
     /// A word of a lease is told where a stage takes it and to nobody
     /// where none does. One request is sent and completed and one is given
     /// up unsent: a document whose one stage takes one kind of word hears
