@@ -24,10 +24,9 @@
 //!   keeps nobody.
 //!
 //! Not held to the places yet: a row read by its place in the keyed
-//! decision (a key's pin, the members of a ring's walk), and the pick of a
-//! plain request, which reads no constraint. So a request that states
-//! places is not plain, and until the keyed reads ask, the engine over
-//! worker lists declines it by name.
+//! decision (a key's pin), and the pick of a plain request, which reads no
+//! constraint. So a request that states places is not plain, and until the
+//! keyed reads ask, the engine over worker lists declines it by name.
 //!
 //! The places are those of the one list a single request is decided over,
 //! and one set of places cannot hold a pair's two lists. A prefill side, a

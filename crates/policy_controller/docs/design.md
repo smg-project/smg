@@ -260,7 +260,7 @@ Validation turns a `PolicySpec` into an `AppliedSpec`: the built profiles and bi
 stage objects, and what is resolved once from the document (block size, hash depth, each
 binding's routing-key sources, the signals). What a stage remembers lives in its stage object
 inside the `AppliedSpec`, so it belongs to one generation of the document. Two things live beside
-it. What belongs to one worker list (round robin's counter, the list's hash ring) is in the
+it. What belongs to one worker list (round robin's counter) is in the
 engine's value for that list (section 5.2). The record of sent prefixes is in the engine object
 (section 5.1).
 
@@ -513,7 +513,6 @@ pub struct PoolMembers {
     records: OnceLock<PoolRecords>,  // the unchanging half of each worker's record (5.3)
     wires: OnceLock<WireModes>,      // which protocols (HTTP, gRPC) the list's workers speak
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>, // the profile one pick can decide (5.6)
-    ring: OnceLock<PoolRing>,        // the list's hash ring, built off the request path
     affinity: PoolAffinity,          // this list's lookup table for cache affinity
 }
 ```
@@ -572,7 +571,7 @@ pub struct Request<'a> {
     pub constraints: Constraints<'a>, // what only the deciding host knows
 }
 
-// engine/view.rs (the fields a stage reads; 30 in all)
+// engine/view.rs (the fields a stage reads; 28 in all)
 pub struct RequestFacts<'a> {
     pub model: &'a str,            // the resolved model id
     pub phase: Phase,              // Single, Prefill, Decode or Encode
@@ -594,8 +593,7 @@ pub struct RequestFacts<'a> {
     pub seed: u64,                 // the only randomness a stage gets; kept in the trace
     pub budget_micros: u32,        // time left for the decision
     pub now_micros: u64,           // the host's clock at the decision
-    pub ring: Option<&'a PoolRing>, // the list's hash ring, where a policy needs one
-    // nine more fields: `affinity`, `named` and `ring_awaited`, and the six that 5.8 removes
+    // eight more fields: `affinity` and `named`, and the six that 5.8 removes
 }
 
 pub struct Constraints<'a> {
@@ -698,8 +696,7 @@ round robin and `passthrough`.
 4. **The binding.** The first binding in document order whose model pattern and phase match gives
    the plan and the profile. No match is a refusal, `PolicyDeclined`, naming `binding`.
 5. **Short answers for a routing key.** A request with a routing key may be answered from the
-   key's pin in the session table, or from its owner on the list's hash ring. Only the records of
-   the workers the key names are read.
+   key's pin in the session table. Only the records of the workers the key names are read.
 6. **Cache affinity.** A profile that reads which worker holds the prompt's beginning has those
    workers named before the pass, and the pick recorded after it.
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
@@ -822,7 +819,7 @@ the decode side adds `has-room`.
 | `round_robin` | none | `round-robin` | one counter for each worker list; for the full pass, one rotation for each set of surviving workers, in a fixed table |
 | `power_of_two` | `least-load` | `power-of-two` | what was dispatched to each worker since its last load report |
 | `least_load` | `least-load` | `best` | the same |
-| `consistent_hashing` | `consistent-hash` | `best` | one hash ring for each worker list |
+| `consistent_hashing` | `consistent-hash` | `best` | one hash ring, of the workers its decisions have read |
 | `prefix_hash` | `consistent-hash` by the routing key, else by the prompt's first 256 tokens, with a bounded-load rule; `least-requests` | `best` | the same ring |
 | `manual` | none | `manual`, with a sessions rule | routing key to pinned worker, with an expiry |
 | `cache_aware` | `warmup-slice`, `prefix-affinity`, `kv-pressure`, `least-load` | `best` over a sample of 16 | the record of sent prefixes; the warm-up counters; the dispatch count of `least-load` |
@@ -844,7 +841,6 @@ At start:
 | builds the engine from the document | `PolicyEngine::new(spec)` |
 | hands its index of cache events | `engine.affinity().set_indexes(indexes)`; the host implements `CacheIndexes` and `CacheIndex` |
 | keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
-| builds each list's hash ring off the request path | `engine.fill_ring(..)` |
 | tells the engine when a worker joins | `engine.joined(address)` |
 | tells the engine when a worker is removed | `engine.forget(address)` |
 | runs the upkeep about once a second | `engine.sweep(now)` |
@@ -904,9 +900,9 @@ runtime.spawn(engine.run());         // the engine's own background task
 The engine lives as long as the process, so a placement holds a plain reference to it.
 
 The engine's background task does what a host does by hand today: the upkeep once a second; a
-worker that joined or was removed told to the policies; each list's hash ring built off the
-request path; and the newest load snapshot kept at hand, swapped when the monitor publishes one,
-so that a decision reads it without touching the channel.
+worker that joined or was removed told to the policies; and the newest load snapshot kept at
+hand, swapped when the monitor publishes one, so that a decision reads it without touching the
+channel.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
 host's `Generation` type. The engine fills the cell at the list's first decision.

@@ -64,8 +64,8 @@ use parking_lot::{Condvar, Mutex};
 use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec},
     engine::{
-        Constraints, Decided, Phase, Plain, PolicyEngine, PoolMembers, Request, RequestFacts,
-        RequestMaker, WorkerId, WorkerLists,
+        Constraints, Decided, Identity, Phase, Plain, PolicyEngine, PoolMembers, Request,
+        RequestFacts, RequestMaker, WorkerId, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -114,7 +114,7 @@ type Cell = (
 );
 
 /// The cells. A change that moves a policy's cost adds its entry here.
-const CELLS: [Cell; 7] = [
+const CELLS: [Cell; 8] = [
     ("round_robin", || preset("round_robin"), plain, |_| ()),
     ("random", || preset("random"), plain, |_| ()),
     ("passthrough", || preset("passthrough"), plain, |_| ()),
@@ -126,6 +126,12 @@ const CELLS: [Cell; 7] = [
         || sessions_over("cache_aware"),
         session,
         sessions,
+    ),
+    (
+        "consistent_hashing",
+        || preset("consistent_hashing"),
+        keyed,
+        |_| (),
     ),
 ];
 
@@ -169,7 +175,7 @@ fn session(seed: u64) -> Request<'static> {
     let sessions = SESSIONS.get().expect("the cell's sessions");
     let (key, prompt) = &sessions[(seed % sessions.len() as u64) as usize];
     let mut request = plain(seed);
-    request.facts.session_key = smg_policy_controller::engine::Identity::plain(key);
+    request.facts.session_key = Identity::plain(key);
     request.facts.session_counted = true;
     prompt.write_to(&mut request.facts);
     request
@@ -189,6 +195,17 @@ fn plain(seed: u64) -> Request<'static> {
         facts,
         constraints: Constraints::default(),
     }
+}
+
+/// The routing keys a keyed cell's callers send, one a turn by its seed.
+const KEYS: u64 = 1_024;
+
+/// [`plain`]'s request with a routing key, one of [`KEYS`]: a ring places
+/// it by the key.
+fn keyed(seed: u64) -> Request<'static> {
+    let mut request = plain(seed);
+    request.facts.session_key = Identity::hashed(mix(seed % KEYS) | 1);
+    request
 }
 
 /// A mix of `value`'s bits: a seed a request, a report's numbers a worker.
