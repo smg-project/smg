@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    document::{Assignment, PolicySpec, Recovery, SessionsSpec},
+    document::{
+        Assignment, LoadMetricSetting, ModeSettings, Pairing, PolicySettings, PolicySpec,
+        RoutingKeyOverrideSettings, RoutingSettings,
+    },
     engine::{
         Candidate, Constraints, Engine, Health, Identity, PoolFacts, RequestFacts, Scratch,
         WorkerId,
@@ -65,30 +68,44 @@ pub struct Row {
 }
 
 impl Row {
-    /// The preset of the row's policy with a sessions rule on its binding,
-    /// as a document states the override: the row's assignment, the cap a
-    /// rule takes when its document names none, and the pin order of the
-    /// assignment. The latest worker leads under `delegate`, the first
-    /// owner under the map's own modes.
-    fn spec(&self) -> PolicySpec {
-        let recovery = if self.assignment == Assignment::Delegate {
-            Recovery::Latest
-        } else {
-            Recovery::Original
+    /// The document a gateway's routing settings give for the row
+    /// ([`RoutingSettings::policy_document`]): the row's policy with every
+    /// setting at its flag's default, under the sticky override with the
+    /// row's assignment. Or the settings' refusal, in its own words.
+    fn spec(&self) -> Result<PolicySpec, String> {
+        let policy = match self.policy.as_str() {
+            "random" => PolicySettings::Random,
+            "power_of_two" => PolicySettings::PowerOfTwo {
+                load_metric: LoadMetricSetting::ExpectedWait,
+            },
+            other => return Err(format!("no settings are written here for `{other}`")),
         };
-        let sessions: SessionsSpec = serde_json::from_value(serde_json::json!({
-            "sticky_header": HEADER,
-            "assignment": self.assignment,
-            "recovery": recovery,
-        }))
-        .expect("the document's form of a sessions rule");
-        let mut spec = PolicySpec::preset(&self.policy).expect("the preset's form");
-        spec.view.headers = vec![HEADER.into()];
-        spec.bindings
-            .first_mut()
-            .expect("the preset's binding")
-            .sessions = Some(sessions);
-        spec
+        let settings = RoutingSettings {
+            mode: ModeSettings::Regular,
+            policy,
+            enable_igw: false,
+            policy_spec: None,
+            grouped_dp_sticky: None,
+            dp_minimum_tokens_scheduler: false,
+            pd_pairing_mode: Pairing::Lenient,
+            worker_warmup_secs: 60,
+            worker_warmup_share: 0.25,
+            worker_warmup_blocks: 1024,
+            worker_warmup_thin_ratio: 0.5,
+            worker_warmup_divert_every: 8,
+            routing_key_override: RoutingKeyOverrideSettings {
+                enabled: true,
+                headers: vec![HEADER.into()],
+                eviction_interval_secs: 60,
+                max_idle_secs: 14_400,
+                assignment_mode: self.assignment,
+            },
+            worker_overload_protection: true,
+            worker_overload_waiting_requests: Some(8),
+            worker_overload_token_usage: Some(0.8),
+            worker_overload_shed: false,
+        };
+        settings.policy_document().map_err(|err| err.to_string())
     }
 }
 
@@ -111,7 +128,7 @@ impl Bed {
     /// The bed, or the validator's words when this crate does not build the
     /// row's form.
     fn new(row: &Row) -> Result<Self, String> {
-        let engine = row.spec().validate().map_err(|err| err.to_string())?;
+        let engine = row.spec()?.validate().map_err(|err| err.to_string())?;
         let pool = row
             .workers
             .iter()
