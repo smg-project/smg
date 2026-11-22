@@ -2689,12 +2689,15 @@ fn judge_prefill_side(
 /// partner had stalled mid-stream. Without a bound or a worker to charge,
 /// the call is awaited as it is. The request's encode dispatch, when one is
 /// watched (`wait`), is raced beside both sides' dispatches by the caller
-/// ([`dispatch_pd_sides`]), bound or not, and here beside the clock: once it
+/// ([`dispatch_pd_sides`]), bound or not, and here beside the call: once it
 /// has failed the caller has given the side up and retired it off the
 /// request path, so from then on the call is awaited as it is, with no
 /// silence verdict to charge the worker for the embedding that is not
-/// coming. The first-response phase races the watch again
-/// ([`first_prefill_response_within`], through its own [`PrefillWait`]).
+/// coming, and without the watch: held by a retired call it would keep the
+/// request's other encode sends alive past the request (see
+/// [`supervise_encode_sends`]). The first-response phase races the watch
+/// again ([`first_prefill_response_within`], through its own
+/// [`PrefillWait`]).
 pub(crate) async fn dispatch_prefill_within(
     wait: PrefillWait,
     mut dispatch: SideDispatch,
@@ -2706,6 +2709,11 @@ pub(crate) async fn dispatch_prefill_within(
 ) -> StreamResult {
     let PrefillWait { bound, mut encode } = wait;
     let (Some(bound), Some(worker)) = (bound, worker) else {
+        tokio::select! {
+            biased;
+            _ = encode_dispatch_failed(encode.as_mut()) => drop(encode),
+            result = &mut dispatch => return result,
+        }
         return dispatch.await;
     };
     let mut deadline = bound.deadline;
@@ -2720,6 +2728,7 @@ pub(crate) async fn dispatch_prefill_within(
             // side up and retires it off the request path, where the call
             // is awaited as it is. A silence verdict here would charge the
             // worker with the embedding that is not coming.
+            drop(encode);
             return dispatch.await;
         };
         if let Ok(result) = timed {
@@ -3992,6 +4001,33 @@ pub(crate) mod tests {
                 .await
                 .is_err(),
             "the retired call is awaited as it is, past its bound"
+        );
+        assert!(
+            supervisor.is_closed(),
+            "the retired call has let go of the watch"
+        );
+        // Without a bound the retired call lets go of the watch the same way.
+        let mut unbound = Box::pin(dispatch_prefill_within(
+            PrefillWait {
+                bound: None,
+                encode: Some(supervisor.subscribe()),
+            },
+            never_answers(),
+            None,
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-failed-retired".to_string(),
+            256,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut unbound)
+                .await
+                .is_err(),
+            "the retired call is awaited as it is"
+        );
+        assert!(
+            supervisor.is_closed(),
+            "without a bound the retired call has let go of the watch too"
         );
     }
 

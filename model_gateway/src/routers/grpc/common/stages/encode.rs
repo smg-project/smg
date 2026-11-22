@@ -818,7 +818,18 @@ mod tests {
             target: EncodeTarget::Grpc(format!("http://{address}")),
             bootstrap_room: 42,
         }]));
-        let dropped = held.recv().await.expect("the encoder holds the call");
+        let mut dropped = tokio::time::timeout(Duration::from_secs(5), held.recv())
+            .await
+            .expect("the encode send never reached the encoder")
+            .expect("the encoder holds the call");
+
+        // While the request holds the watch, its call stays open.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut dropped)
+                .await
+                .is_err(),
+            "the call was dropped while its request still held the watch"
+        );
 
         // The request is over.
         drop(watch);
