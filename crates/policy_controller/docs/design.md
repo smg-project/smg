@@ -1245,12 +1245,17 @@ Five things follow, and they are the first work of section 16.
 5. **Decision 3 (a) parts the `prefix_hash` sheet in two.** 31 of its 47 lines say where their
    requests stand on a ring: 30 list their workers in a request's ring order and one has
    nothing to hash. They replay on a ring their caller lends and hold their recorded answers,
-   the held ten-token line among them. The other 16 measure which tokens are in a prompt's key
-   (15 lines) or how 2,000 prompts spread over eight workers (1 line); the second held line is
-   one of the 15. With a lent ring a request's place is the host's to state, so these 16 test
-   the host's recipe. In the crate they stay on the crate's own ring with its own hashes, as
-   on main: 15 hold and one is held apart. At stage 3 a gateway test puts the 16 through
-   classic's own key function, classic's ring and the engine, and each must read as recorded.
+   the held ten-token line among them. That replay calls the decision function over hand-built
+   candidates. Through `PolicyEngine` over worker objects with a lent ring no recorded line is
+   measured yet. The other 16 measure which tokens are in a prompt's key (15 lines) or how
+   2,000 prompts spread over eight workers (1 line); the second held line is one of the 15.
+   With a lent ring a request's place is the host's to state, so these 16 test the host's
+   recipe. In the crate they stay on the crate's own ring with its own hashes, which a caller
+   that lends no ring still runs: 15 hold classic's shares, as on main, and one is held apart.
+   A gateway never runs that ring. Classic's key recipe is inside its policy's own selection
+   today, and its ring lookup takes a key and not a position. So at stage 3 the gateway's
+   change cuts both into functions that classic and the lender call, and a gateway test puts
+   all 47 lines through them, classic's ring and the engine, count for count.
 
 Hosted CI's test of the crate does not enable the feature the kept engine is behind, so it runs
 none of that engine's own tests. Only the gateway enables that feature today, so after stage 0
@@ -1400,7 +1405,7 @@ different modes would disagree.
 
 | Option | Cost |
 |---|---|
-| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only, written locally and not opened: one deletion and five changes. The crate's ring beside a worker list is deleted (1,650 lines removed, 145 added, 14 files). The five changes are 409, 84, 468, 252 and 428 changed lines, 727 of product and 914 of proof, and three of them pass 400 lines. The host lends its ring through a trait of two methods and states where a request stands on it. The crate then writes no hash and no ring for such a host, so a request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines then test the host's recipe and are proven at stage 3 (section 13.1). A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
+| (a) The host lends the ring it keeps; the engine asks it which workers a routing key reaches. | Crate only, written locally and not opened: one deletion and five changes. The crate's ring beside a worker list is deleted (1,650 lines removed, 145 added, 14 files). The five changes are 409, 84, 468, 252 and 428 changed lines, 727 of product and 914 of proof, and three of them pass 400 lines. The host lends its ring through a trait of two methods and states where a request stands on it. The crate then writes no hash and no ring for such a host, so a request is placed on classic's own ring. The price in proof: 16 of the 47 recorded `prefix_hash` lines test which tokens are in a key. In the crate they keep replaying on the crate's own ring, share for share as on main. A gateway then never runs that ring, so for a gateway they are proven at stage 3 (section 13.1), where the change also cuts classic's key recipe and classic's ring lookup into functions that classic and the lender both call. A controller has no classic ring to be lent: until (b) it keeps its own ring and places a routing key on another worker than a gateway would. |
 | (b) Classic's ring (one file, 508 lines) moves to a crate both sides use. | A pure move, about 15 lines changed beside it. The gateway, the engine and the controller then build one ring type. |
 | (c) The crate's ring is changed to classic's hashes. | About 125 lines. Classic's recipe written twice; a gateway would keep two rings for a model. |
 
@@ -1499,9 +1504,9 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | Stage | Work | Ends when |
 |---|---|---|
 | 0 | The earlier gateway integration is taken out. | The gateway routes by classic alone; every classic test and bench cell is as before. |
-| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 14 sheets that record a decision replays through the kept engine over worker objects: 408 of section 13.1's 482 lines, or 392 if decision 3 is (a), whose 16 `prefix_hash` lines are proven at stage 3. Each difference from classic is fixed or accepted as a named difference. |
+| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 14 sheets that record a decision (408 of section 13.1's 482) replays through the kept engine over worker objects. Each difference from classic is fixed or accepted as a named difference. Under decision 3 (a) the 16 `prefix_hash` lines that test a key's tokens replay there with no ring lent, and their proof for a gateway is stage 3's. |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
-| 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 16 `prefix_hash` lines of section 13.1 read as recorded through classic's own key function, classic's ring and the engine; a cluster run beside classic. |
+| 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; under decision 3 (a), the 47 `prefix_hash` lines of section 13.1 read as recorded through the gateway's own entry with the engine on; a cluster run beside classic. |
 | 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. |
 | 5 | **A gateway under a controller** (section 11). | A cluster run: gateways under a controller beside classic, with the controller stopped and started under load. |
 
