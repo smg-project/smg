@@ -319,7 +319,8 @@ impl<G> Objects<G> {
     ///
     /// Without it an object built from a row states no threshold, and a
     /// load monitor writes no verdict on it: the store alone judges such a
-    /// worker, for its own decisions, and nothing writes the object's flag.
+    /// worker, for its own decisions, and the holder does not copy its
+    /// verdict onto the object's flag.
     ///
     /// The monitor and the store do not read the same thresholds. A policy
     /// document's binding thresholds, which the store reads for each signal
