@@ -5502,6 +5502,97 @@ pub(crate) mod tests {
         assert_eq!(to_one, 4, "{sent:?}");
     }
 
+    /// One prefill and three decodes under round robin, and their engine.
+    fn three_decodes() -> (Arc<MemoryStore>, StoreBackedEngine) {
+        let store = MemoryStore::new();
+        for (name, role) in [
+            ("p0", Role::Prefill),
+            ("d0", Role::Decode),
+            ("d1", Role::Decode),
+            ("d2", Role::Decode),
+        ] {
+            member(&store, name, role);
+        }
+        let document = PolicySpec::pair_presets("round_robin", "round_robin").expect("a spec");
+        apply_pair_document(&store, document).expect("the document applies");
+        let store = Arc::new(store);
+        let door = StoreBackedEngine::new(Arc::clone(&store));
+        (store, door)
+    }
+
+    /// A pair decided with its decode left for later, and its prefill
+    /// dispatched under the index `named`: the lease, and the decode of
+    /// each target of the pick, best first.
+    fn prefill_sent_to(
+        door: &StoreBackedEngine,
+        asked: &Request<'_>,
+        named: u8,
+        now: Instant,
+    ) -> (LeaseId, Vec<WorkerId>) {
+        let answer = door.decide(GATEWAY, asked, now).expect("the pair");
+        let lease = answer.lease.expect("a lease").lease.id;
+        let pick = answer.decision.pick().expect("a pick");
+        let pairs = pick.targets.iter().filter_map(|target| target.pair);
+        let decodes: Vec<WorkerId> = pairs.map(|pair| pair.decode_id).collect();
+        assert_eq!(decodes.len(), 3, "a target for each decode");
+        let sent = Dispatch {
+            side: Side::Prefill,
+            target_index: named,
+            since_decision_micros: 0,
+        };
+        door.report(GATEWAY, lease, Said::Dispatched(sent, now));
+        (lease, decodes)
+    }
+
+    /// The decode a decode call books for `lease`.
+    fn decode_again(
+        door: &StoreBackedEngine,
+        asked: &Request<'_>,
+        lease: LeaseId,
+        now: Instant,
+    ) -> WorkerId {
+        let again = door.decide_decode(GATEWAY, asked, lease, now);
+        let decode = again.expect("a decode decision").lease;
+        decode.expect("the decode's lease").lease.booked
+    }
+
+    /// A pair's prefill dispatched to another target of its pick than the
+    /// first: the decode decided again behind it is that target's decode,
+    /// the one its host took, as over a host's own lists
+    /// (`the_guards_decode_call_keeps_the_decode_its_host_took`). The file
+    /// keeps the index the prefill's dispatch names. A dispatch that names
+    /// no target of the pick moves nothing: the first target's decode
+    /// stands.
+    #[test]
+    fn a_decode_decided_again_is_the_decode_of_the_target_its_prefill_took() {
+        let (_, door) = three_decodes();
+        let (asked, now) = (later_request(b"pair"), Instant::now());
+        // The index the prefill's dispatch names, and the target whose
+        // decode the call starts from.
+        for (named, taken) in [(1, 1), (2, 2), (0, 0), (3, 0)] {
+            let (lease, decodes) = prefill_sent_to(&door, &asked, named, now);
+            let booked = decode_again(&door, &asked, lease, now);
+            assert_eq!(booked, decodes[taken], "the dispatch named {named}");
+            let gone = Said::Released(None, ReleaseReason::ClientGone);
+            door.report(GATEWAY, lease, gone);
+        }
+    }
+
+    /// The index outlives a decode call's issue. An issue taken back
+    /// leaves the side chosen with the first pick's targets, and the next
+    /// call starts again from the decode of the target the prefill went
+    /// to.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_decode_issue_taken_back_keeps_the_target_its_prefill_took() {
+        let (store, door) = three_decodes();
+        let (asked, now) = (later_request(b"pair"), Instant::now());
+        let (lease, decodes) = prefill_sent_to(&door, &asked, 1, now);
+        assert_eq!(decode_again(&door, &asked, lease, now), decodes[1]);
+        assert!(store.take_back_decode(GATEWAY, lease, ReleaseReason::Abandoned));
+        assert_eq!(decode_again(&door, &asked, lease, now), decodes[1]);
+    }
+
     #[test]
     fn the_call_issues_the_decode_on_the_loads_of_its_instant() {
         let store = pair_fleet(1, 2).expect("a pair fleet");
