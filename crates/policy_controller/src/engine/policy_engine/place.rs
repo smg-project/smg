@@ -22,12 +22,17 @@
 //! can be sent to: ready ([`ready`]), and admitted by its route's own rule
 //! ([`PlaceRequest::admits`]). Where no target of a decision can be sent
 //! to, the engine decides again with the workers it could not send to
-//! excluded, three decisions a call at most ([`ASKS`]). The caller is
+//! excluded, three decisions a call ([`ASKS`]). Behind a single request's
+//! decision none of whose targets can be sent to, where the rule refused
+//! one that was ready, the later decisions are held to the workers of the
+//! list the rule takes ([`hold_to_rule`]), and the call makes one decision
+//! among them at least: a fourth where its third found them. The caller is
 //! answered a [`Placement`], which it keeps with the request, or the reason
 //! there is none ([`Unplaced`]).
 //!
-//! A request with a pair's two lists is placed the same way, a target at a
-//! time over both its workers ([`pair`]).
+//! A request with a pair's two lists is placed a target at a time over both
+//! its workers ([`pair`]), three decisions a call at most. Its later
+//! decisions are not held to the workers the rule takes.
 //!
 //! A pair's decode decided again behind its prefill is placed by the same
 //! read of a worker, over the decodes that decision names
@@ -199,7 +204,11 @@ pub struct PlaceRequest<'a> {
     /// two sides each by its own id.
     pub tried: &'a [WorkerId],
     /// The time left for the decision, in microseconds. Zero leaves it
-    /// unbounded.
+    /// unbounded. A single request's first decision is given all of it,
+    /// and each later one what its call has left: the call reads the
+    /// clock once ahead of its first decision, for a request that states
+    /// a budget and for no other. Each decision of a pair is given all of
+    /// it.
     pub budget_micros: u32,
     /// Whether the caller asks a pair's decode again behind its prefill's
     /// answer. Where the document picks the decode after the prefill, such
@@ -218,12 +227,20 @@ pub struct PlaceRequest<'a> {
     /// from a caller that keeps no ring: the stage places by its own.
     pub ring: Option<&'a dyn LentRing>,
     /// The route's own rule for a worker its request may be sent to, and
-    /// `None` for a route that has none. It is asked of a worker the engine
-    /// picked and never of the list: a request whose first pick it admits
-    /// pays one call of it, and a pair's request one for each of its two
-    /// workers. A worker it refuses is passed over like one that is not
-    /// ready. A rule that holds for every request of a route belongs to the
-    /// list its caller hands.
+    /// `None` for a route that has none. It is asked of the workers the
+    /// engine picked: a request whose first pick it admits pays one call
+    /// of it, and a pair's request one for each of its two workers. Behind
+    /// a single request's decision none of whose picks can be sent to,
+    /// where it refused one that was ready, it is asked of every worker of
+    /// the list, once a call, and the call decides again among the workers
+    /// it takes ([`PolicyEngine::place`]). A pick it is asked of is ready.
+    /// A worker of the list it is asked of may not be: it answers for a
+    /// worker in any state. No request is sent to a worker it refuses when
+    /// it is asked of that worker as a pick, whatever it said of the
+    /// worker before. It is asked of no pair's list: a pair's worker it
+    /// refuses is passed over like one that is not ready. A rule that
+    /// holds for every request of a route belongs to the list its caller
+    /// hands.
     pub admits: Option<WorkerRule<'a>>,
 }
 
@@ -296,6 +313,13 @@ pub(super) struct Made<'r, 'a> {
     /// The targets earlier decisions of this call named that could not be
     /// sent to.
     missed: &'r [WorkerId],
+    /// The places of the list the decision is held to: the workers the
+    /// route's rule takes, for an ask behind the decision that had the
+    /// rule asked of the list ([`Call::admitted`]). `None`: every place.
+    places: Option<&'r [u32]>,
+    /// The time left for the decision, in microseconds: the request's own
+    /// budget, or what its call has left of it ([`Call::left`]).
+    budget_micros: u32,
     /// The prompt's block hashes, made at the request's first making and
     /// borrowed by each one after it.
     hashes: OnceCell<PromptHashes>,
@@ -325,6 +349,8 @@ impl<'r, 'a> Made<'r, 'a> {
             engine,
             request,
             missed,
+            places: None,
+            budget_micros: request.budget_micros,
             hashes: OnceCell::new(),
             of_call: None,
             headers: OnceCell::new(),
@@ -334,7 +360,8 @@ impl<'r, 'a> Made<'r, 'a> {
     }
 
     /// `request` for one ask of `call`: its decision leaves out the targets
-    /// the call missed so far, and borrows the prompt's hashes where an
+    /// the call missed so far, is held to the places the call keeps
+    /// ([`Call::admitted`]), and borrows the prompt's hashes where an
     /// earlier ask of the call made them. The headers of the document's
     /// view and the key's place on a lent ring are made again by each ask
     /// that makes the request: a later ask is the call's cold path.
@@ -343,8 +370,12 @@ impl<'r, 'a> Made<'r, 'a> {
         request: &'r PlaceRequest<'a>,
         call: &'r Call,
     ) -> Self {
+        // The places are kept behind a target the rule refused, which the
+        // call missed: a request held to them is never plain.
+        debug_assert!(call.admitted.is_none() || !call.missed.is_empty());
         Self {
             of_call: Some(&call.hashes),
+            places: call.admitted.as_deref(),
             ..Self::new(engine, request, call.missed.as_slice())
         }
     }
@@ -434,7 +465,7 @@ impl RequestMaker for Made<'_, '_> {
             ring_positions: place.as_slice(),
             attempt: request.attempt,
             tried: request.tried,
-            budget_micros: request.budget_micros,
+            budget_micros: self.budget_micros,
             headers: headers.as_slice(),
             media: request.media,
             seed: fresh_seed(),
@@ -456,6 +487,7 @@ impl RequestMaker for Made<'_, '_> {
             facts,
             constraints: Constraints {
                 excluded: self.missed,
+                places: self.places,
                 decode_later: later,
                 demands: request.demands,
                 ..Constraints::default()
@@ -499,8 +531,11 @@ pub enum Unplaced {
     Shed {
         /// Why.
         reason: ShedReason,
-        /// The stage that left no worker, or what of the request the
-        /// engine does not decide: a caller's refusal line names it.
+        /// The stage that left no worker, what of the request the engine
+        /// does not decide, or what of the request ended its call: a
+        /// route's rule that takes no worker of the list (`admits`), a
+        /// budget the call's earlier decisions used up (`budget`). A
+        /// caller's refusal line names it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.
@@ -517,13 +552,25 @@ pub enum Unplaced {
     /// is not refused: its caller waits for a prefill's room and places
     /// it again. A document with no capacity filter never answers this.
     PrefillsFull,
-    /// The call's decisions named workers and none of their targets can be
-    /// sent to now: a target holds where its worker, and a pair's decode
-    /// beside it, is ready, let through by its circuit breaker and admitted
-    /// by its route's rule. A caller answers that it has no worker for the
-    /// request. The answer does not say whether the rule refused the picks
-    /// or they were not ready: a caller that answers the two apart reads
-    /// its list itself.
+    /// The call's decisions named workers and none of their targets could
+    /// be sent to when the call came to it: a target holds where its
+    /// worker, and a pair's decode beside it, is ready, let through by its
+    /// circuit breaker and admitted by its route's rule. A caller answers
+    /// that it has no worker for the request.
+    ///
+    /// For a single request, a rule that answers each worker one way
+    /// within a call is not the cause: a request whose rule takes no
+    /// worker of its list is shed under the rule's name (`admits`), and
+    /// one whose rule takes some is decided among them. Under a profile
+    /// that filters by health a list with no ready worker is shed by that
+    /// filter. So this answer is left for a worker that stopped being
+    /// ready between a decision's read of it and the send, for a profile
+    /// that lists no such filter, and for a rule that refused as a pick a
+    /// worker it took when it was asked of the list.
+    ///
+    /// For a pair, the answer does not say whether the rule refused the
+    /// picks or they were not ready: a caller that answers the two apart
+    /// reads its lists itself.
     NoWorkers,
     /// The engine refused the call's last decision, for the reason it
     /// carries: it made none in its place. Where the call decided again,
@@ -561,6 +608,14 @@ const ENCODE_ITEMS: &str = "encode-items";
 /// no item is declined under: this call does not ask the engine's entry for
 /// an encode request yet.
 const ENCODE_LISTS: &str = "encode-lists";
+
+/// What a request is shed under where its route's rule takes no worker of
+/// its list: the rule's own name on a request ([`PlaceRequest::admits`]).
+const ADMITS: &str = "admits";
+
+/// What a request is shed under where its call's earlier decisions left
+/// none of its budget ([`PlaceRequest::budget_micros`]).
+const BUDGET: &str = "budget";
 
 /// The refusal of a request this call does not place, by name: the shed a
 /// decision answers for what no stage of it runs.
@@ -687,9 +742,65 @@ pub(super) fn give_up(
     }
 }
 
-/// The asks of one call at most: the first, and two more that leave out the
+/// Holds the later asks of `call` to the workers of the list its route's
+/// rule takes. The rule is asked of every worker of `members`, ready or
+/// not, in the list's order, and the places it takes are kept, ascending,
+/// each once ([`Call::admitted`]). It is asked of the list once a call:
+/// behind the first decision none of whose targets can be sent to, where
+/// it refused one that was ready, and while the call holds no decision. A
+/// rule that panics here leaves no lease behind. Out of line: a request
+/// whose picks the rule admits runs none of it. A single request's ask
+/// alone comes here: a pair's later decisions are made over its two lists
+/// whole.
+///
+/// A worker that is not ready is asked too. A rule that takes no worker
+/// is so told from a rule whose workers are not ready: the first is the
+/// rule's own answer, and the second is the decision's, by the filter
+/// that left nobody.
+///
+/// The ask that finds the rule's workers is followed by one decision
+/// among them at least. Where it is the call's last ([`ASKS`]), the call
+/// is given one more: no ask behind that one finds them again, so a call
+/// makes four decisions at most.
+///
+/// # Errors
+///
+/// The shed of a request whose rule takes no worker of the list
+/// ([`ShedReason::NoEndpoints`], under `admits`): no further decision is
+/// made.
+#[cold]
+#[inline(never)]
+fn hold_to_rule(
+    request: &PlaceRequest<'_>,
+    members: Option<&PoolMembers>,
+    call: &mut Call,
+) -> Result<(), Unplaced> {
+    if call.admitted.is_some() {
+        return Ok(());
+    }
+    let workers = members.map_or(&[][..], |list| &list.workers()[..]);
+    let places: Vec<u32> = (0..)
+        .zip(workers)
+        .filter_map(|(place, worker)| admitted(request, worker.as_ref()).then_some(place))
+        .collect();
+    if places.is_empty() {
+        return Err(Unplaced::Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by: ADMITS,
+            retry_after_secs: 1,
+        });
+    }
+    call.admitted = Some(places);
+    // One ask is left behind this one, whichever of the call's it is.
+    call.spent = call.spent.min(ASKS - 2);
+    Ok(())
+}
+
+/// The asks of one call: the first, and two more that leave out the
 /// workers the call could not send to. An ask is one decision of the call
-/// and the walk of its targets.
+/// and the walk of its targets. A single request's call whose third ask
+/// found the workers its route's rule takes is given a fourth among them
+/// ([`hold_to_rule`]).
 const ASKS: usize = 3;
 
 /// What one ask of a call hands on to the next.
@@ -706,15 +817,58 @@ pub(super) struct Call {
     hashes: OnceCell<PromptHashes>,
     /// The asks of the call that took no target.
     spent: usize,
+    /// The places of the list whose worker the route's rule takes
+    /// ([`PlaceRequest::admits`]), ascending, each once, from the first
+    /// decision none of whose targets could be sent to where the rule
+    /// refused one that was ready ([`hold_to_rule`]). The call's later
+    /// asks are held to them ([`Constraints::places`]). `None` ahead of
+    /// that decision, and for a request with no rule.
+    admitted: Option<Vec<u32>>,
+    /// The instant of the call's first ask, for a request that states a
+    /// budget: the budget is counted from it ([`Call::left`]). `None` for
+    /// a request that states no budget: no clock is read for its budget.
+    began: Option<Instant>,
 }
 
 impl Call {
+    /// What the call's next decision is given of the request's budget, in
+    /// microseconds: all of it for the first decision, whose instant is
+    /// kept, and the budget less the time since for a later one. A
+    /// request that states no budget (`0`) is given none, and no clock is
+    /// read for its budget.
+    ///
+    /// # Errors
+    ///
+    /// The shed of a request none of whose budget is left
+    /// ([`ShedReason::Deadline`], under `budget`): no further decision is
+    /// made.
+    fn left(&mut self, request: &PlaceRequest<'_>) -> Result<u32, Unplaced> {
+        let budget = request.budget_micros;
+        if budget == 0 {
+            return Ok(0);
+        }
+        let Some(began) = self.began else {
+            self.began = Some(Instant::now());
+            return Ok(budget);
+        };
+        let spent = u32::try_from(began.elapsed().as_micros()).unwrap_or(u32::MAX);
+        match budget.saturating_sub(spent) {
+            0 => Err(Unplaced::Shed {
+                reason: ShedReason::Deadline,
+                emptied_by: BUDGET,
+                retry_after_secs: 1,
+            }),
+            left => Ok(left),
+        }
+    }
+
     /// What an ask answers where no target of its decision can be sent to:
     /// the answer of `ask`, the call's next ask, while the call has an ask
     /// left, and no worker for the request ([`Unplaced::NoWorkers`]) behind
-    /// its last, [`ASKS`] asks a call at most. The next ask answers in this
-    /// one's place, and a request whose first ask takes a target pays for no
-    /// other.
+    /// its last: [`ASKS`] asks a call, and one more where the last of them
+    /// found the workers the route's rule takes ([`hold_to_rule`]). The
+    /// next ask answers in this one's place, and a request whose first ask
+    /// takes a target pays for no other.
     #[cold]
     pub(super) fn again<'a>(
         &mut self,
@@ -740,16 +894,23 @@ fn named(engine: &PolicyEngine, members: Option<&PoolMembers>, place: u32) -> Op
 
 /// One ask for a single request over `members`, the list its caller handed:
 /// one decision, and the first of its targets that can be sent to
-/// ([`walk`], by [`sendable`]). Where none can, the decision is given up by
-/// name, its targets join the ones the call's next ask leaves out
+/// ([`walk`]): ready ([`ready`]) and admitted by its route's rule. At a
+/// pick the rule is asked of a worker that is ready, and of no other.
+/// Where none can be sent to, the decision is given up by name, its
+/// targets join the ones the call's next ask leaves out
 /// ([`Call::missed`]), and the call's next ask answers ([`Call::again`]).
+/// Where the rule refused one of them that was ready, the call's later
+/// asks are held to the workers the rule takes ([`hold_to_rule`]).
 fn single<'a>(
     engine: &'static PolicyEngine,
     request: &PlaceRequest<'a>,
     members: Option<&PoolMembers>,
     call: &mut Call,
 ) -> Result<Placement<'a>, Unplaced> {
-    let made = Made::asked(engine, request, call);
+    let made = Made {
+        budget_micros: call.left(request)?,
+        ..Made::asked(engine, request, call)
+    };
     let (decided, dated) = decide(engine, &made).map_err(Unplaced::Refused)?;
     let key = made.key();
     let at = |place: u32| members?.workers().get(place as usize);
@@ -772,6 +933,9 @@ fn single<'a>(
             if !admitted(request, worker.as_ref()) {
                 let id = named(engine, members, pick.place).ok_or(Unplaced::NoWorkers)?;
                 call.missed.push(id);
+                // The pick read the worker ready, and a place holds no
+                // decision: the rule is asked of the list at once.
+                hold_to_rule(request, members, call)?;
                 return call.again(|call| single(engine, request, members, call));
             }
             let mut placement = Placement::alone(Arc::clone(worker), engine.label_at(pick.profile));
@@ -780,6 +944,8 @@ fn single<'a>(
         }
         Decided::Whole(decided, later) => {
             let now = dated.unwrap_or_else(Instant::now);
+            // Whether the rule refused a target that was ready.
+            let refused = Cell::new(false);
             let taken = walk(
                 engine,
                 decided,
@@ -787,13 +953,23 @@ fn single<'a>(
                 now,
                 &mut call.missed,
                 |target| match at(target.position) {
-                    Some(worker) if sendable(request, worker.as_ref()) => {
-                        Ok((Arc::clone(worker), None))
+                    Some(worker) if ready(worker.as_ref()) => {
+                        if admitted(request, worker.as_ref()) {
+                            Ok((Arc::clone(worker), None))
+                        } else {
+                            refused.set(true);
+                            Err([Some(target.id), None])
+                        }
                     }
                     _ => Err([Some(target.id), None]),
                 },
             )?;
             let Some(mut placement) = taken else {
+                // The walk gave the decision up: the rule is asked of the
+                // list while the call holds none.
+                if refused.get() {
+                    hold_to_rule(request, members, call)?;
+                }
                 return call.again(|call| single(engine, request, members, call));
             };
             placement.routing_key = key;
@@ -819,17 +995,30 @@ impl PolicyEngine {
     /// Where no target of a decision can be sent to, the engine decides
     /// again with their workers excluded ([`Constraints::excluded`], which
     /// a profile's `not-tried` filter honours while another worker
-    /// remains), three decisions a call at most, each given the request's
-    /// whole budget ([`PlaceRequest::budget_micros`]). Once the excluded
-    /// workers and the tried ones cover the list, the filter keeps them
-    /// all, and a later decision can name an excluded worker again.
+    /// remains), three decisions a call. The first is given the request's
+    /// whole budget ([`PlaceRequest::budget_micros`]), and each later one
+    /// what the call has left of it: a request none of whose budget is
+    /// left when a decision is due is shed ([`ShedReason::Deadline`],
+    /// under `budget`). Once the excluded workers and the tried ones cover
+    /// the list, the filter keeps them all, and a later decision can name
+    /// an excluded worker again.
     ///
     /// A worker the rule refuses is left out like one that is not ready.
-    /// The rule is asked of a decision's picks and never of the list, so a
-    /// request can be answered no worker while its list holds a worker the
-    /// rule takes: where three decisions' picks are all refused, where
-    /// that worker is overloaded and a worker the rule refuses is not, and
-    /// where an earlier attempt of the request tried it.
+    /// The rule is asked of a decision's picks first: a request whose
+    /// first pick it admits pays one call of it. Behind the first decision
+    /// none of whose picks can be sent to, where the rule refused one that
+    /// was ready, the decision is given up and the rule is asked of every
+    /// worker of the list, ready or not, once a call. The call's later
+    /// decisions are held to the places of the workers it takes
+    /// ([`Constraints::places`]): the one such worker of a long list is
+    /// found, one over its overload thresholds is answered by the
+    /// binding's rule for a list wholly over them, and one an earlier
+    /// attempt tried is handed again where no other is left. The call
+    /// makes one decision among them at least, a fourth where its third
+    /// found them. A request whose rule takes no worker of the list is
+    /// shed with no endpoint, under `admits`. One whose rule takes workers
+    /// none of which is ready is answered by the decision held to them,
+    /// which names the filter that left nobody.
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
@@ -844,12 +1033,19 @@ impl PolicyEngine {
     /// decision does not learn that the rule refused the first: the
     /// prompt's next request is drawn to the refused worker again.
     ///
-    /// A request with a pair's two lists is placed the same way over both.
-    /// The first target both of whose workers can be sent to is taken, the
-    /// rule asked of each of the two: the placement names the prefill as
-    /// its worker and the decode beside it. Where no target holds, the
-    /// sides that could not be sent to are excluded, each by its own id,
-    /// and a side that held stays a candidate of the next decision.
+    /// A request with a pair's two lists is placed over both, a target at
+    /// a time. The first target both of whose workers can be sent to is
+    /// taken, the rule asked of each of the two: the placement names the
+    /// prefill as its worker and the decode beside it. Where no target
+    /// holds, the sides that could not be sent to are excluded, each by
+    /// its own id, and a side that held stays a candidate of the next
+    /// decision: three decisions a call at most, each given the request's
+    /// whole budget. The rule is asked of a pair's picks and never of its
+    /// lists, so a pair can be answered no worker while its lists hold
+    /// workers the rule takes: where three decisions' picks are all
+    /// refused, where such a worker is overloaded and a worker the rule
+    /// refuses is not, and where an earlier attempt of the request tried
+    /// it.
     /// Which workers pair is the caller's word, in the classes its lists
     /// carry: no pair is tested here again. Prefills that are all at the
     /// caller's limit answer [`Unplaced::PrefillsFull`], on which the

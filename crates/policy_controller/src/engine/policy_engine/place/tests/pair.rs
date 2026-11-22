@@ -49,6 +49,7 @@ fn paired_picking(keyed: bool, decode: DecodePick) -> (&'static PolicyEngine, He
         kept.lock().push(Arc::clone(&own));
         Box::new(InOrder {
             heard: own,
+            budgets: Budgets::default(),
             panics: false,
         })
     });
@@ -658,10 +659,11 @@ fn the_routes_rule_is_asked_of_both_workers_of_a_pairs_target() {
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 
-/// A pair's call makes three decisions at most, as a single request's
-/// does. Over lists whose first three prefills cannot be sent to, each
-/// decision names the next prefill, each is given up by name, and the
-/// request has no worker though a fourth prefill could be sent to.
+/// A pair's call makes three decisions at most: none of them is held to
+/// the workers a route's rule takes. Over lists whose first three prefills
+/// cannot be sent to, each decision names the next prefill, each is given
+/// up by name, and the request has no worker though a fourth prefill could
+/// be sent to.
 #[test]
 fn a_pairs_call_makes_three_decisions_at_most() {
     let (engine, heard) = paired(false);
