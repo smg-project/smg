@@ -4107,7 +4107,8 @@ impl NativeEncoder {
     /// tokens; no first loop keeps none). Then the pieces are answered, the
     /// last hole first, and each is learned as [`Self::seeded`] and the slow
     /// call learn it: at its vacancy, unless the cache was cleared since the
-    /// miss, when the piece asks the table again. An answer of one id is
+    /// waiting pieces were last answered (`PieceCache::answered_clears`),
+    /// when the piece asks the table again. An answer of one id is
     /// written into its hole. An answer that is not one id stays in the
     /// thread's scratch list until the last piece is answered; one pass
     /// from the last hole down then places them all: the output grows once,
