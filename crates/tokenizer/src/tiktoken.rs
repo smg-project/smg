@@ -899,6 +899,9 @@ impl TiktokenTokenizer {
             structural_controls,
         };
         tokenizer.mark_built_controls();
+        if let Some(native) = &tokenizer.native {
+            native.rehearse(None);
+        }
         Ok(tokenizer)
     }
 
