@@ -1094,6 +1094,130 @@ async fn many_routers_mount_the_grpc_pair_router_unless_they_follow_a_controller
     Ok(())
 }
 
+/// A gateway of many routers mounts the three pair families beside the
+/// regular ones, over its one document. Under the routing settings' own
+/// document the engine places its pairs. That document names no encode
+/// plan, so the encode pair family keeps its classic router and its side
+/// policies beside the engine object: it answers as with the setting off,
+/// and its stages hold no engine object. The two pair families take the
+/// classic pass the same way under a settings' document that plans single
+/// requests alone (the `manual` policy's), where the engine object stands
+/// for it. Under a document its operator supplied that plans single
+/// requests alone, each of the three families refuses by name and no side
+/// policy is built, as under a controller's address.
+#[tokio::test]
+async fn many_routers_serve_a_pair_family_the_settings_document_does_not_name() -> Case {
+    use super::{placing, Placing, PlanName};
+    use crate::routers::{
+        factory::{router_ids, RouterId},
+        grpc::{mode::Mode, router::GrpcRouter},
+        RouterFactory,
+    };
+
+    /// Each pair family: its id, its router's type and its plan.
+    const FAMILIES: [(RouterId, &str, PlanName); 3] = [
+        (router_ids::HTTP_PD, "pd", PlanName::PdPair),
+        (router_ids::GRPC_PD, "grpc_pd", PlanName::PdPair),
+        (router_ids::GRPC_EPD, "grpc_epd", PlanName::Epd),
+    ];
+    /// Each pair family's router of `context`, as a gateway of many
+    /// routers mounts it.
+    async fn families(
+        config: &RouterConfig,
+        context: &Arc<AppContext>,
+    ) -> Result<Vec<Box<dyn RouterTrait>>, Box<dyn Error>> {
+        let mut mounted = RouterFactory::create_igw_routers(&config.policy, context).await;
+        let mut routers = Vec::new();
+        for (id, ..) in &FAMILIES {
+            let at = mounted
+                .iter()
+                .position(|(mounted, ..)| mounted == id)
+                .ok_or("a pair family has no entry")?;
+            routers.push(mounted.swap_remove(at).2?);
+        }
+        Ok(routers)
+    }
+    /// What `router` answers a request for a model nobody serves.
+    async fn answer(router: &dyn RouterTrait) -> (StatusCode, String) {
+        let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+        let routed = router
+            .route_generate(None, &meta, body(json!({"text": "hi"})), "model-a")
+            .await;
+        refusal(routed).await
+    }
+
+    let mut many = quiet();
+    many.enable_igw = true;
+    // With the setting off: the classic line's answers.
+    let context = Arc::new(AppContext::from_config(many.clone(), 30, None, None).await?);
+    let mut classic = Vec::new();
+    for router in families(&many, &context).await? {
+        classic.push(answer(router.as_ref()).await);
+    }
+
+    // The settings' own document plans single requests and pairs, and the
+    // engine decides both whole.
+    let config = picked(many.clone());
+    let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+    let engine = context.policy_engine.as_ref().ok_or("the engine object")?;
+    for placed in [PlanName::Single, PlanName::PdPair] {
+        assert!(matches!(placing(&context, placed), Placing::Engine(_)));
+    }
+    assert!(placing(&context, PlanName::Epd).is_classic());
+    let routers = families(&config, &context).await?;
+    for ((router, (_, family, plan)), classic) in routers.iter().zip(FAMILIES).zip(&classic) {
+        assert_eq!(router.router_type(), family);
+        let answered = answer(router.as_ref()).await;
+        assert_ne!(answered.1, BY_NAME, "{family}");
+        if placing(&context, plan).is_classic() {
+            assert_eq!(&answered, classic, "{family}");
+        }
+    }
+    // The encode family's classic pass reads its sides' policies, so the
+    // registry holds them though the engine object stands.
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    assert!(!Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(!Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    drop(routers);
+    // The encode family builds its stages with no engine object. The pair
+    // family, which the engine places, holds the context's.
+    let held = Arc::strong_count(engine);
+    let encode = GrpcRouter::new(&context, Mode::EncodePrefillDecode)?;
+    assert_eq!(Arc::strong_count(engine), held, "the encode family");
+    let pair = GrpcRouter::new(&context, Mode::PrefillDecode)?;
+    assert!(Arc::strong_count(engine) > held, "the pair family");
+    drop((encode, pair));
+
+    // The document of a gateway of one regular router plans single
+    // requests alone. Supplied to this gateway, no binding of it plans a
+    // pair family, and the engine object stands for its single requests.
+    let mut one_router = many.clone();
+    one_router.enable_igw = false;
+    let supplied = running(many.clone(), one_router.policy_document()?);
+    let (following, _socket) = followed(picked(many))?;
+    for (config, why) in [
+        (supplied, "a supplied document"),
+        (following, "a controller's address"),
+    ] {
+        let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+        assert!(context.policy_engine.is_some(), "{why}");
+        let refusing = families(&config, &context).await?;
+        for (router, (_, family, plan)) in refusing.iter().zip(FAMILIES) {
+            let placed = placing(&context, plan);
+            assert!(matches!(placed, Placing::Refused), "{family}, {why}");
+            assert_refusing_router(router.as_ref(), family).await?;
+        }
+        // No classic pair policy is built for a family that refuses.
+        let policies = &context.policy_registry;
+        let unset = policies.get_default_policy();
+        assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset), "{why}");
+        assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset), "{why}");
+        stop_follower(&context).await?;
+    }
+    Ok(())
+}
+
 /// Under a controller's address a pair is the controller's to decide, and
 /// no ask reaches it for a pair yet. The gRPC pair family refuses by name
 /// there, as it did, though the gateway's document plans pairs.

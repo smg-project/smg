@@ -807,7 +807,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{Needs, PolicySpec},
+        document::spec::{Needs, PlanName, PolicySpec},
         engine::framework::InTheWay,
     };
 
@@ -1019,11 +1019,18 @@ mod tests {
     /// reads a hash ring and one under a sessions rule are not decided so.
     /// A pair's decision is fed apart from a single's: a pair is decided
     /// whole where each side is picked alone or reads nothing the host
-    /// does not feed a pair's decision.
+    /// does not feed a pair's decision. The host says what it feeds each
+    /// plan, and a plan it decides no request of is not decided.
     #[test]
     fn a_document_is_decided_whole_where_each_place_is_picked_alone_or_fed() {
+        // A host that decides single requests fed `fed`, pairs fed
+        // nothing, and no encode request.
         let whole = |engine: &PolicyEngine, fed: Needs| {
-            engine.spec().engine().decided_whole(fed, Needs::default())
+            engine.spec().engine().decided_whole(|plan| match plan {
+                PlanName::Single => Some(fed),
+                PlanName::PdPair => Some(Needs::default()),
+                PlanName::Epd => None,
+            })
         };
         let nothing = Needs::default();
         for name in ["round_robin", "random", "passthrough"] {
@@ -1065,7 +1072,47 @@ mod tests {
         let reports = scored.spec().engine().needs_for(MODEL, Phase::Prefill);
         assert!(reports.loads);
         assert!(!whole(&scored, reports));
-        assert!(scored.spec().engine().decided_whole(nothing, reports));
+        let pairs_fed = |plan: PlanName| (plan == PlanName::PdPair).then_some(reports);
+        assert!(scored.spec().engine().decided_whole(pairs_fed));
+    }
+
+    /// A host asks a plan at a time. A document decides a plan where a
+    /// binding names it and each of its places is picked alone or fed. It
+    /// decides no plan it does not name, so the routes of such a plan keep
+    /// the host's other placement beside the routes of a plan the document
+    /// decides. A document is decided whole where each plan it names is,
+    /// and not where its host decides no request of one.
+    #[test]
+    fn a_plan_is_decided_where_the_document_names_it_and_its_host_feeds_it() {
+        let nothing = Needs::default();
+        let mut pair = PolicySpec::pair_presets("least_load", "round_robin").expect("presets");
+        pair.generation = 1;
+        let pair = engine_of(&pair);
+        let engine = pair.spec().engine();
+        let reports = engine.needs_for(MODEL, Phase::Prefill);
+        assert!(engine.decides(PlanName::PdPair, reports));
+        assert!(
+            !engine.decides(PlanName::PdPair, nothing),
+            "its prefill reads reports"
+        );
+        assert!(engine.plans(PlanName::PdPair));
+        for unnamed in [PlanName::Single, PlanName::Epd] {
+            assert!(!engine.plans(unnamed), "{unnamed:?}");
+            assert!(!engine.decides(unnamed, reports), "{unnamed:?}");
+        }
+        assert!(
+            !engine.decided_whole(|plan| (plan != PlanName::PdPair).then_some(reports)),
+            "a host that decides no pair"
+        );
+
+        let single = preset("round_robin");
+        let engine = single.spec().engine();
+        assert!(engine.decides(PlanName::Single, nothing));
+        assert!(!engine.decides(PlanName::PdPair, nothing));
+        // A plan its host decides no request of does not stand in the way
+        // of a document that does not name it.
+        assert!(engine.decided_whole(|plan| (plan == PlanName::Single).then_some(nothing)));
+        assert!(!engine.decided_whole(|_| None));
     }
 
     /// A pick tests a worker's health whole, as the pass does. A profile

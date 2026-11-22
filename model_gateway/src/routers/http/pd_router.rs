@@ -61,7 +61,11 @@ use crate::{
         otel_trace::with_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
-    policy_controller::engine::{self, Ask, Hashes, PolicyEngine, Prompt, Sent, Unplaced},
+    policy_controller::{
+        self,
+        engine::{self, Ask, Hashes, PolicyEngine, Prompt, Sent, Unplaced},
+        PlanName,
+    },
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -593,7 +597,11 @@ impl PDRouter {
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
-            policy_engine: ctx.policy_engine.clone(),
+            // The engine that places the pair plan, where one does:
+            // elsewhere the router takes its classic placement pass.
+            policy_engine: policy_controller::placing(ctx, PlanName::PdPair)
+                .engine()
+                .cloned(),
             keeps_target: placement::pair_keeps_target(
                 &ctx.router_config.mode,
                 &ctx.router_config.policy,
@@ -1461,7 +1469,7 @@ impl PDRouter {
         // A request that names no worker pays the header's probe alone.
         header_utils::extract_target_worker(headers)?;
         self.keeps_target
-            .then(|| crate::policy_controller::refused("an explicit target worker"))
+            .then(|| policy_controller::refused("an explicit target worker"))
     }
 
     /// The attempt's pair as the policy controller placed it, with the load

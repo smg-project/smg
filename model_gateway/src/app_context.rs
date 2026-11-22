@@ -173,14 +173,8 @@ pub struct AppContext {
     /// decides under as written. Nothing of a followed controller is built
     /// there: the store, its door, its feed and the follower are a
     /// gateway's that follows one. `None` with the setting off and under an
-    /// address.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the policy registry and the policy routes each took what they read at the build"
-        )
-    )]
+    /// address. A pair family's router reads it where it is built
+    /// ([`policy_controller::placing`]).
     pub(crate) in_process: Option<InProcess>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,

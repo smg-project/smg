@@ -53,6 +53,7 @@ use crate::{
     config::{types::RetryConfig, GroupedDpSticky},
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
+    policy_controller::{self, PlanName},
     routers::{
         common::{
             json_response, placement,
@@ -178,6 +179,16 @@ impl GrpcRouter {
         // selection stage is told what the pair's settings keep.
         let settings = &ctx.router_config;
         let pair_keeps_target = placement::pair_keeps_target(&settings.mode, &settings.policy);
+        // A pair family's stages ask a policy engine only where one places
+        // the family's plan. Elsewhere they take the classic placement
+        // pass, though the gateway's engine object stands for the families
+        // mounted beside this one.
+        let placed_by = |plan| policy_controller::placing(ctx, plan).engine().cloned();
+        let policy_engine = match mode {
+            Mode::Regular => ctx.policy_engine.clone(),
+            Mode::PrefillDecode => placed_by(PlanName::PdPair),
+            Mode::EncodePrefillDecode => placed_by(PlanName::Epd),
+        };
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -192,7 +203,7 @@ impl GrpcRouter {
         )
         .with_request_timeout(request_timeout)
         .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_policy_engine(ctx.policy_engine.clone())
+        .with_policy_engine(policy_engine.clone())
         .with_pair_keeps_target(pair_keeps_target);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
@@ -205,7 +216,7 @@ impl GrpcRouter {
         )
         .with_request_timeout(request_timeout)
         .with_grouped_dp_sticky(grouped_dp_sticky)
-        .with_policy_engine(ctx.policy_engine.clone())
+        .with_policy_engine(policy_engine)
         .with_pair_keeps_target(pair_keeps_target);
 
         // Present in every mode: chat/generate, messages, completion.

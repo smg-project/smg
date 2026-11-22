@@ -7,8 +7,12 @@
 
 use std::fmt;
 
-use super::{profile_index, Binding, Engine, Marks, Plan, Profile};
-use crate::{document::spec::Needs, engine::view::Phase, stages::filters::RowTests};
+use super::{profile_index, Binding, Engine, Marks, Profile};
+use crate::{
+    document::spec::{Needs, PlanName},
+    engine::view::Phase,
+    stages::filters::RowTests,
+};
 
 /// A profile whose whole decision is one pick of its picker
 /// ([`Engine::place_for`]), by its place in the document.
@@ -142,56 +146,94 @@ impl Engine {
 
     /// Every place a binding of the document names, with its profile and
     /// the profile's place in the document: each binding in the document's
-    /// order, at each phase it covers and its plan has a side for.
+    /// order, at each of its places ([`Self::places_of`]).
     fn places(&self) -> impl Iterator<Item = (&Binding, Phase, u16, &Profile)> {
-        const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
         self.bindings.iter().flat_map(move |entry| {
             let binding = &entry.binding;
-            PHASES.into_iter().filter_map(move |phase| {
-                if !binding.covers(phase) {
-                    return None;
-                }
-                let index = profile_index(binding, phase)?;
-                let profile = self.profiles.get(usize::from(index))?;
-                Some((binding, phase, index, profile))
-            })
+            self.places_of(binding)
+                .map(move |(phase, index, profile)| (binding, phase, index, profile))
         })
     }
 
-    /// Whether every request of the document is one a host has decided
-    /// whole in its own process: a single request, whose decision the host
-    /// feeds `fed`, or a pair, whose decision it feeds `pair_fed`. Each
-    /// binding plans single requests or a pair and states no sessions rule,
-    /// and each place of it is one of two:
+    /// Every place `binding` names, with its profile and the profile's
+    /// place in the document: each phase the binding covers and its plan
+    /// has a side for.
+    fn places_of<'a>(
+        &'a self,
+        binding: &'a Binding,
+    ) -> impl Iterator<Item = (Phase, u16, &'a Profile)> {
+        const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+        PHASES.into_iter().filter_map(move |phase| {
+            if !binding.covers(phase) {
+                return None;
+            }
+            let index = profile_index(binding, phase)?;
+            let profile = self.profiles.get(usize::from(index))?;
+            Some((phase, index, profile))
+        })
+    }
+
+    /// Whether the document plans requests as `plan`, and each of them is
+    /// one a host has decided whole in its own process, where it feeds a
+    /// whole decision of that plan `fed`. The host says which plans it
+    /// decides so, and nothing here names one. Each binding of the plan
+    /// states no sessions rule, and each place of it is one of two:
     ///
     /// - one pick of its picker decides it ([`Self::not_alone`]), which
     ///   asks nothing of the host;
-    /// - its stages declare nothing a host must feed outside what the host
-    ///   feeds a decision of its plan ([`Needs::within`]): the whole pass
-    ///   of a gateway's own process decides it over records written from
-    ///   the gateway's own data.
+    /// - its stages declare nothing a host must feed outside `fed`
+    ///   ([`Needs::within`]): the whole pass of the host's own process
+    ///   decides it over records written from the host's own data.
     ///
     /// A host that feeds nothing still has decided whole a place whose
     /// stages read a worker's record and nothing more. The set of places
     /// grows with what a host feeds a whole decision.
+    ///
+    /// A host that serves each plan's requests by a route of their own
+    /// asks this a plan at a time: the routes of a plan the document does
+    /// not decide so keep the host's other placement, beside the routes of
+    /// a plan it does.
     #[must_use]
-    pub fn decided_whole(&self, fed: Needs, pair_fed: Needs) -> bool {
-        let planned = |entry: &super::Entry| {
-            matches!(entry.binding.plan, Plan::Single | Plan::PdPair)
-                && entry.binding.sessions.is_none()
-        };
-        let decided = |(binding, phase, index, profile): (&Binding, Phase, u16, &Profile)| {
-            if self.in_the_way(index, profile, phase).is_none() {
-                return true;
-            }
-            let fed = match binding.plan {
-                Plan::Single => fed,
-                Plan::PdPair | Plan::Epd { .. } => pair_fed,
-            };
+    pub fn decides(&self, plan: PlanName, fed: Needs) -> bool {
+        self.plans(plan) && self.planned(plan).all(|binding| self.decided(binding, fed))
+    }
+
+    /// Whether a binding of the document plans requests as `plan`.
+    #[must_use]
+    pub fn plans(&self, plan: PlanName) -> bool {
+        self.planned(plan).next().is_some()
+    }
+
+    /// The bindings of the document that plan requests as `plan`.
+    fn planned(&self, plan: PlanName) -> impl Iterator<Item = &Binding> {
+        self.bindings
+            .iter()
+            .map(|entry| &entry.binding)
+            .filter(move |binding| binding.plan.name() == plan)
+    }
+
+    /// Whether every request of the document is one a host has decided
+    /// whole in its own process: each plan a binding names is decided
+    /// ([`Self::decides`]). `fed` answers what the host feeds a whole
+    /// decision of a plan, and `None` for a plan it decides no request of.
+    #[must_use]
+    pub fn decided_whole(&self, fed: impl Fn(PlanName) -> Option<Needs>) -> bool {
+        self.bindings
+            .iter()
+            .map(|entry| &entry.binding)
+            .all(|binding| fed(binding.plan.name()).is_some_and(|fed| self.decided(binding, fed)))
+    }
+
+    /// Whether every request of `binding` is one a host has decided whole
+    /// in its own process, where it feeds a whole decision of the
+    /// binding's plan `fed` ([`Self::decides`]).
+    fn decided(&self, binding: &Binding, fed: Needs) -> bool {
+        let decided = |(phase, index, profile): (Phase, u16, &Profile)| {
             let needs = self.profile_needs.get(usize::from(index));
-            needs.is_some_and(|needs| needs.within(fed))
+            self.in_the_way(index, profile, phase).is_none()
+                || needs.is_some_and(|needs| needs.within(fed))
         };
-        self.bindings.iter().all(planned) && self.places().all(decided)
+        binding.sessions.is_none() && self.places_of(binding).all(decided)
     }
 
     /// The first stage of `profile`, which stands at `index`, that asks

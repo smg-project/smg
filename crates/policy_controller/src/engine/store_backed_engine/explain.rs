@@ -5,7 +5,6 @@ use std::{collections::VecDeque, time::Instant};
 
 use super::{DecisionCall, RequestForm, Shadowed};
 use crate::{
-    document::spec::PlanName,
     engine::{
         decision::{Decision, ShadowKind},
         framework::{Engine, Plan},
@@ -77,13 +76,8 @@ impl DecisionRecord {
             return None;
         }
         let binding = engine.binding_at(self.binding?)?;
-        let plan = match binding.plan {
-            Plan::Single => PlanName::Single,
-            Plan::PdPair => PlanName::PdPair,
-            Plan::Epd { .. } => PlanName::Epd,
-        };
         let mut names = DecisionNames {
-            plan: plan.name(),
+            plan: binding.plan.name().name(),
             ..DecisionNames::default()
         };
         let Some(at) = trace.made_under() else {

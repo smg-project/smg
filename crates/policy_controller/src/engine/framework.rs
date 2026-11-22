@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    document::spec::{Assignment, Needs},
+    document::spec::{Assignment, Needs, PlanName},
     engine::{
         decision::{
             Decision, LiftedVeto, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets,
@@ -2812,6 +2812,18 @@ pub enum Plan {
         /// The encode profile, by position.
         encode: u16,
     },
+}
+
+impl Plan {
+    /// The plan's name, as a document's binding states it.
+    #[must_use]
+    pub const fn name(self) -> PlanName {
+        match self {
+            Self::Single => PlanName::Single,
+            Self::PdPair => PlanName::PdPair,
+            Self::Epd { .. } => PlanName::Epd,
+        }
+    }
 }
 
 /// The profile a binding resolves a phase to, by position; `None` when the

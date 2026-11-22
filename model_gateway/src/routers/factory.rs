@@ -18,7 +18,7 @@ use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     policies::{DPRankLoadPolicy, MinimumTokensPolicy, Side},
-    policy_controller,
+    policy_controller::{self, PlanName},
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -146,12 +146,10 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The pair router asks the policy engine where this gateway
-        // decides pairs in its own process. Its family refuses by name
-        // elsewhere under that engine.
-        if let Some(router) =
-            policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
-        {
+        // Where nothing places the pair family it refuses by name.
+        // Elsewhere the pair router is built with the policy engine that
+        // places the pair plan, or over its classic placement pass.
+        if let Some(router) = policy_controller::undecided(ctx, PlanName::PdPair) {
             return Ok(router);
         }
         Self::set_pd_policies(
@@ -184,17 +182,15 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The regular router and the pair router ask the policy engine in
-        // their selection stage. The pair router serves where the document
-        // in force plans pairs and the gateway follows no controller, and
-        // its family refuses by name elsewhere under that engine. The
-        // encode mode places no request through the policy engine yet.
+        // The regular router asks the policy engine in its selection
+        // stage. The pair family and the encode pair family refuse by name
+        // where nothing places them. Elsewhere each is its own router,
+        // built with the policy engine that places its plan or over its
+        // classic placement pass.
         let refusing = match mode {
             Mode::Regular => None,
-            Mode::PrefillDecode => {
-                policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
-            }
-            Mode::EncodePrefillDecode => policy_controller::undecided(ctx),
+            Mode::PrefillDecode => policy_controller::undecided(ctx, PlanName::PdPair),
+            Mode::EncodePrefillDecode => policy_controller::undecided(ctx, PlanName::Epd),
         };
         if let Some(router) = refusing {
             return Ok(router);
@@ -204,22 +200,39 @@ impl RouterFactory {
         Ok(Box::new(router))
     }
 
-    /// Register the prefill/decode policies (HTTP PD, gRPC PD and gRPC EPD),
-    /// each from its own config or, when unset, the main policy. Under the
-    /// gateway's own policy engine none is registered: no classic policy
-    /// decides for a pair there, and one built anyway would start its own
-    /// tasks.
+    /// Register the prefill/decode policies of a pair family (HTTP PD and
+    /// gRPC PD), each from its own config or, when unset, the main policy.
+    /// They are registered where the family takes its classic placement
+    /// pass ([`policy_controller::placing`]). Where a policy engine places
+    /// the pair plan, or the family refuses, no classic policy decides for
+    /// a pair, and one built anyway would start its own tasks.
     fn set_pd_policies(
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        if ctx.policy_engine.is_some() {
+        if !policy_controller::placing(ctx, PlanName::PdPair).is_classic() {
             return;
         }
-        // The registry builds each side's policy: it is the one place that
-        // knows whether a policy engine is asked.
+        Self::set_pair_sides(
+            prefill_policy_config,
+            decode_policy_config,
+            main_policy_config,
+            ctx,
+        );
+    }
+
+    /// Builds and sets the policies of a pair's two sides, each from its own
+    /// config or, when unset, the main policy. The registry builds each
+    /// side's policy: it is the one place that knows whether a policy
+    /// engine is asked.
+    fn set_pair_sides(
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) {
         let registry = &ctx.policy_registry;
         registry.set_side_policy(
             Side::Prefill,
@@ -233,9 +246,12 @@ impl RouterFactory {
 
     /// Register the encode/prefill/decode policies for a gRPC EPD deployment.
     /// Encode defaults to consistent hashing over each item's content hash;
-    /// prefill/decode default to the main policy when unset. Under the
-    /// gateway's own policy engine none is registered, as in
-    /// [`Self::set_pd_policies`].
+    /// prefill/decode default to the main policy when unset. They are
+    /// registered where the family takes its classic placement pass
+    /// ([`policy_controller::placing`]), though the gateway's own engine
+    /// object stands for the other families: a gateway of many routers
+    /// mounts the encode family beside them. None is registered where a
+    /// policy engine places the encode plan, or the family refuses.
     fn set_epd_policies(
         encode_policy_config: Option<&PolicyConfig>,
         prefill_policy_config: Option<&PolicyConfig>,
@@ -243,7 +259,7 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        if ctx.policy_engine.is_some() {
+        if !policy_controller::placing(ctx, PlanName::Epd).is_classic() {
             return;
         }
         let default_encode_policy = PolicyConfig::ConsistentHashing;
@@ -251,7 +267,7 @@ impl RouterFactory {
             Side::Encode,
             encode_policy_config.unwrap_or(&default_encode_policy),
         );
-        Self::set_pd_policies(
+        Self::set_pair_sides(
             prefill_policy_config,
             decode_policy_config,
             main_policy_config,
