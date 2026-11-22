@@ -639,7 +639,7 @@ impl EncoderInput {
                         norm,
                     })
                 } else {
-                    Self::wire(concat_byte_slices(&slices, byte_len), dtype, joined, norm)
+                    Self::wire(concat_byte_slices(&slices, byte_len)?, dtype, joined, norm)
                         .map_err(anyhow::Error::msg)
                 }
             }
@@ -707,14 +707,16 @@ impl EncoderInput {
 }
 
 /// Copy large byte batches into disjoint output bands on the shared pool.
-fn concat_byte_slices(slices: &[&[u8]], len: usize) -> Vec<u8> {
+fn concat_byte_slices(slices: &[&[u8]], len: usize) -> AnyhowResult<Vec<u8>> {
     let tasks = execution::task_count(len, slices.len(), 1);
     if tasks == 1 {
-        let mut bytes = Vec::with_capacity(len);
+        // Pooled like the banded join below: a buffer of the exact length is
+        // no class of the pool, so every request would allocate it anew.
+        let mut bytes = buffer_pool::take_empty(len).context("cannot reserve the joined wire")?;
         for slice in slices {
             bytes.extend_from_slice(slice);
         }
-        return bytes;
+        return Ok(bytes);
     }
 
     let mut bytes = buffer_pool::take(len);
@@ -733,7 +735,7 @@ fn concat_byte_slices(slices: &[&[u8]], len: usize) -> Vec<u8> {
             });
         }
     });
-    bytes
+    Ok(bytes)
 }
 
 /// A borrowed [`EncoderInput`]: the whole, or rows of it. Per-destination
@@ -2328,6 +2330,33 @@ mod buffer_pool_tests {
             assert_eq!(MINE.held(), 2 << 20, "the float32 wire came back");
             let again = buffer_pool::take(values * 4);
             assert_eq!(again.as_ptr(), address);
+        });
+    }
+
+    /// A join that runs as one task takes its buffer from the pool, as the
+    /// banded join does.
+    #[test]
+    fn a_join_of_one_task_takes_its_buffer_from_the_pool() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            // Two parts of 153,600 bytes, under the size a join is split at:
+            // their 307,200 bytes are the 512 KiB class.
+            let part = |fill: u8| {
+                EncoderInput::wire(
+                    vec![fill; 153_600],
+                    EncoderDtype::BFloat16,
+                    vec![100, 768],
+                    norm(),
+                )
+                .expect("a wire")
+            };
+            let joined = EncoderInput::concat(&[&part(1), &part(2)])
+                .expect("joined")
+                .into_bytes_as(EncoderDtype::BFloat16)
+                .expect("written");
+            assert_eq!((joined.len(), joined.capacity()), (307_200, 512 << 10));
+            assert!(joined[..153_600].iter().all(|&byte| byte == 1));
+            assert!(joined[153_600..].iter().all(|&byte| byte == 2));
         });
     }
 }

@@ -916,9 +916,11 @@ async fn bf16_batch_cache_reuses_large_batches_across_image_families() {
 }
 
 /// A budget between a wire's length and its pooled class stores the batch
-/// once: the replay views the allocation of the fill, without a gather.
+/// once: the replay views the allocation of the fill, without a gather. The
+/// joined output of a growing request, a pooled buffer too, is stored at its
+/// exact length the same way.
 #[tokio::test]
-async fn a_batch_whose_pooled_class_is_over_the_budget_is_cached_at_its_exact_length() {
+async fn a_pooled_buffer_is_cached_at_its_exact_length() {
     let batch = MediaBatch::Images(
         (0..8u8)
             .map(|id| {
@@ -967,6 +969,24 @@ async fn a_batch_whose_pooled_class_is_over_the_budget_is_cached_at_its_exact_le
         let bytes = output.encoder_input.write_as(EncoderDtype::BFloat16);
         assert_eq!(bytes, expected);
     }
+
+    // A request that grows from four of the images to all eight is answered
+    // by a join of two allocations, which the cache then keeps.
+    components.pixel_cache = Some(Arc::new(PixelCache::new(4 * len)));
+    let ctx = context(&components, &config, spec, model, model, wire, None);
+    let MediaBatch::Images(images) = &batch else {
+        panic!("an image batch");
+    };
+    let prefix = MediaBatch::Images(images[..4].to_vec());
+    preprocess_modality(&prefix, &ctx).await.unwrap();
+    let grown = preprocess_modality(&batch, &ctx).await.unwrap();
+    assert_eq!(
+        grown
+            .encoder_input
+            .shared_allocation()
+            .map(|(_, capacity)| capacity),
+        Some(len)
+    );
 }
 
 /// Keep newly computed images when an overlapping request cannot replace its old backing.
