@@ -559,8 +559,8 @@ impl PolicyEngine {
 /// its guard's drop: no table holds it, and no pass looks for it.
 ///
 /// What every pick shares is the id counter alone, one atomic step on cache
-/// lines of its own. No lock of the engine is taken: a stage's own lock is
-/// its stage's.
+/// lines of its own. No lock of the engine is waited for, only the one build
+/// of a list's records, wires or one-pick profile: a stage's lock is its own.
 ///
 /// A panic in a decision costs that request its decision and is counted
 /// ([`DecisionEngine::faults`]). A panic in a stage that hears a word is

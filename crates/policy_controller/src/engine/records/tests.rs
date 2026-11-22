@@ -464,10 +464,10 @@ fn assert_drawn_as_written(
             matches!(whole, Decision::Shed(_))
         );
     }
-    // A draw converts no list's reports: where every decision was a draw's,
-    // the list holds what it held.
+    // Where every decision was a draw's, the list was converted one time, ahead
+    // of them or by them: the targets above are the whole write's either side.
     if draws as u64 == seeds {
-        assert_eq!(drawn_pool.conversions(), u64::from(converted));
+        assert_eq!(drawn_pool.conversions(), 1);
     }
     draws
 }
@@ -753,9 +753,9 @@ fn a_decision_that_meets_a_conversion_under_way_converts_nothing_and_waits_for_n
     let (loads, _) = reports(&[100, 200], Duration::from_millis(40));
 
     // Another decision holds the list's claim: it is converting.
-    let claim = Claim::take(&pool.converting).expect("the claim is free");
+    let claim = pool.converting.try_lock().expect("the claim is free");
     assert!(
-        Claim::take(&pool.converting).is_none(),
+        pool.converting.try_lock().is_none(),
         "one decision holds it"
     );
     let live = Live::at(spec.engine(), &clock, Instant::now(), Some(&loads), None);
@@ -775,7 +775,99 @@ fn a_decision_that_meets_a_conversion_under_way_converts_nothing_and_waits_for_n
     let _ = pool.write(&workers, &live, &mut rows);
     assert!(held(&pool).is_some_and(|converted| converted.is_of(&loads)));
     assert_eq!(pool.conversions(), 1);
-    assert!(Claim::take(&pool.converting).is_some(), "given back");
+    assert!(pool.converting.try_lock().is_some(), "given back");
+}
+
+/// One draw of `spec`'s engine over `pool` under `loads`, by `seed`.
+fn drawn(
+    spec: &AppliedSpec,
+    clock: &DecisionClock,
+    pool: &PoolRecords,
+    workers: &[Arc<dyn Worker>],
+    loads: &Arc<LoadSnapshot>,
+    seed: u64,
+) -> Decision {
+    let live = Live::at(spec.engine(), clock, Instant::now(), Some(loads), None);
+    let mut facts = RequestFacts { seed, ..single() };
+    let cx = Constraints::default();
+    decide(spec.engine(), pool, workers, &live, &mut facts, &cx)
+}
+
+/// Draws convert a list's reports once they looked up as many as it holds: a
+/// pick of two looks up two a decision, so the 32nd pays the last of the 64 and
+/// converts. Later draws copy the list's rows, and a new snapshot counts again.
+#[test]
+fn draws_convert_a_lists_reports_once_they_looked_up_a_lists_length() {
+    let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
+    let workers = fleet(64);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let queued: Vec<i32> = (0..64).map(|at| at * 10).collect();
+    for snapshot in 1..=2 {
+        let (loads, _) = reports(&queued, Duration::from_millis(5));
+        for seed in 1..=31 {
+            let decision = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+            assert_eq!(decision.pick().expect("a pick").targets.len(), 2);
+            assert_eq!(pool.conversions(), snapshot - 1, "decision {seed}");
+        }
+        let _ = drawn(&spec, &clock, &pool, &workers, &loads, 32);
+        assert_eq!(pool.conversions(), snapshot, "the draw that pays the last");
+        assert!(held(&pool).is_some_and(|rows| rows.is_of(&loads)));
+        for seed in 33..=200 {
+            let _ = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+        }
+        assert_eq!(pool.conversions(), snapshot, "the rows are copied");
+    }
+}
+
+/// A snapshot published after one that is gone starts the list's count again,
+/// wherever it stands in memory: the list names the snapshot it counted under,
+/// so 62 look-ups under one and four under each of 64 later convert nothing.
+#[test]
+fn a_later_snapshot_does_not_inherit_a_lists_count() {
+    let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
+    let workers = fleet(64);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let queued: Vec<i32> = (0..64).map(|at| at * 10).collect();
+    let (first, _) = reports(&queued, Duration::from_millis(5));
+    for seed in 1..=31 {
+        let _ = drawn(&spec, &clock, &pool, &workers, &first, seed);
+    }
+    // One more decision would convert. The snapshot goes, its place stays named.
+    let place = Arc::as_ptr(&first).addr();
+    drop(first);
+    for later in 0..64 {
+        let (loads, _) = reports(&queued, Duration::from_millis(5));
+        if later == 0 {
+            assert_ne!(Arc::as_ptr(&loads).addr(), place, "the place is named");
+        }
+        for seed in [100 + later, 200 + later] {
+            let _ = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+            assert_eq!(pool.conversions(), 0, "snapshot {later}");
+        }
+    }
+}
+
+/// A draw that finds the list's claim taken counts nothing and waits for
+/// nothing: the count starts with the first draw that takes the claim.
+#[test]
+fn a_draw_that_finds_the_claim_taken_counts_nothing() {
+    let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
+    let workers = fleet(64);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let queued: Vec<i32> = (0..64).map(|at| at * 10).collect();
+    let (loads, _) = reports(&queued, Duration::from_millis(5));
+    let claim = pool.converting.try_lock().expect("the claim is free");
+    for seed in 1..=40 {
+        let _ = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+    }
+    assert_eq!(claim.records, 0, "80 look-ups, none counted");
+    drop(claim);
+    for seed in 1..=31 {
+        let _ = drawn(&spec, &clock, &pool, &workers, &loads, seed);
+    }
+    assert_eq!(pool.conversions(), 0, "62 counted");
+    let _ = drawn(&spec, &clock, &pool, &workers, &loads, 32);
+    assert_eq!(pool.conversions(), 1);
 }
 
 #[test]

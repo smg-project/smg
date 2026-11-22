@@ -41,7 +41,7 @@ use smg_policy_controller::{
 };
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: Counting = Counting(std::alloc::System);
 
 /// What `work` returns, and the allocation calls this thread made during it.
 fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
