@@ -53,6 +53,7 @@ use crate::{
         },
         decision_slot::DecisionSlot,
         demands::{self, DemandFacts, Demands},
+        explain::{DecisionExplanation, DecisionRecord, SampleCount, Samples},
         framework::{
             release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
             KEEPS_SLOT_STATE, SAMPLES_DECISIONS, SHADOWS,
@@ -77,11 +78,6 @@ use crate::{
         lease::{Dispatch, Lease, LeaseId, LeaseKind, Outcome, Said, Side, DISPATCH_TTL},
     },
 };
-
-mod explain;
-
-pub use explain::{DecisionExplanation, DecisionNames, DecisionRecord};
-pub(crate) use explain::{SampleCount, Samples};
 
 /// A request as the store-backed engine reads it: what the rows' narrowing,
 /// the engine's request and the lease take of it, in whatever form it was
@@ -3591,7 +3587,8 @@ impl StoreBackedEngine {
         if count.keeps(0, engine, &answer.decision) {
             let (binding, said, sides) = said();
             let mut samples = self.seats[at].samples.lock();
-            samples.push(0, binding, taken, &answer.decision, said, sides);
+            let asked = (taken.now, taken.gateway, taken.request.id());
+            samples.push(0, binding, asked, &answer.decision, said, sides);
         }
     }
 

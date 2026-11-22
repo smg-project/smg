@@ -17,6 +17,7 @@ pub(crate) mod decision;
 pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
+pub(crate) mod explain;
 pub(crate) mod framework;
 #[cfg(feature = "in-process")]
 pub(crate) mod lease_events;
@@ -45,6 +46,7 @@ pub use decision_engine::{
 };
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
+pub use explain::{DecisionExplanation, DecisionNames, DecisionRecord};
 pub use framework::{
     AloneProfile, Binding, DecisionScope, DrawUnit, EncodeItems, EncodePlaced, EncodePool,
     EncoderFacts, Engine, Filter, InTheWay, NotAlone, OverloadThresholds, PairPools, PairSide,
@@ -69,9 +71,7 @@ pub use sticky_sessions::{
     DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
-pub use store_backed_engine::{
-    DecisionExplanation, DecisionNames, DecisionRecord, StoreBackedEngine,
-};
+pub use store_backed_engine::StoreBackedEngine;
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,
     Constraints, Engines, FixedFacts, HashKind, Header, Health, Identity, KeyedRow, LoadRow,
