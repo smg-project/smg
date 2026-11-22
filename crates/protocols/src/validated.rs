@@ -1064,12 +1064,15 @@ mod tests {
     }
 
     /// The body of a request under `content_type`, through the extractor.
-    async fn extract(content_type: &str, body: &str) -> Result<BodyRequest, (StatusCode, Value)> {
+    async fn extract(
+        content_type: &str,
+        body: impl AsRef<[u8]>,
+    ) -> Result<BodyRequest, (StatusCode, Value)> {
         let request = Request::builder()
             .method("POST")
             .uri("/")
             .header("content-type", content_type)
-            .body(Body::from(body.to_string()))
+            .body(Body::from(body.as_ref().to_vec()))
             .unwrap_or_default();
         match ValidatedJson::<BodyRequest>::from_request(request, &()).await {
             Ok(ValidatedJson(body)) => Ok(body),
@@ -1089,7 +1092,8 @@ mod tests {
     /// A good body under `application/json` is parsed once, directly; one that
     /// fails is parsed again by axum's extractor, whose rejection names the
     /// failing field as before; a content type that is not the plain one goes
-    /// to axum's extractor as a whole.
+    /// to axum's extractor as a whole. A byte that is not UTF-8 inside a string
+    /// the type skips refuses no body under either.
     #[tokio::test]
     async fn bodies_parse_once_and_a_failure_keeps_its_named_path() {
         let good = r#"{"value":0.5,"name":"x"}"#;
@@ -1139,6 +1143,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.to_string().contains("syntax"), "{body}");
+        let skipped = b"{\"value\":0.5,\"name\":\"x\",\"extra\":\"\xff\"}";
+        for content_type in ["application/json", "application/vnd.api+json"] {
+            assert!(
+                extract(content_type, skipped).await.is_ok(),
+                "a byte that is not UTF-8 inside a string the type skips does not refuse the body: {content_type}"
+            );
+        }
     }
 
     /// A body under a `Content-Encoding` the gateway does not decode is a
