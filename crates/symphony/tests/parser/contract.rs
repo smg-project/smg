@@ -333,6 +333,10 @@ fn kimi_k2() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::KimiK2.format(), Declared::default()))
 }
 
+fn kimi() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Kimi.format(), Declared::default()))
+}
+
 fn mistral() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Mistral.format(), Declared::default()))
 }
@@ -976,6 +980,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::KimiK2),
     },
     Subject {
+        name: "kimi",
+        new: kimi,
+        outputs: KIMI_OUTPUTS,
+        table: Some(Table::Kimi),
+    },
+    Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
@@ -1353,6 +1363,17 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
     "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi",
     " to=self<|message|>A thought cut<|eom|><|start|>assistant to=us",
     "unframed text",
+];
+
+/// The Kimi table: a thought between the older pair and the answer, a call behind such a
+/// thought, the answer alone, a thought cut, text before a thought, and the line's own pair.
+const KIMI_OUTPUTS: &[&str] = &[
+    "◁think▷The user greets me.◁/think▷Hello!",
+    "◁think▷Need the weather.◁/think▷<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "Hello!",
+    "◁think▷The user gre",
+    "First. ◁think▷Then a thought.◁/think▷Then the rest.",
+    "<think>a plan</think>Sure.",
 ];
 
 /// The Kimi K2 table: a thought and a call; two calls; content and a call with no arguments; a

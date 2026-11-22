@@ -13,7 +13,7 @@ pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
-pub use aliases::{answering_to, ALIASES, UNANSWERED};
+pub use aliases::{answering_to, gives_way, ALIASES, UNANSWERED};
 pub(crate) use chat_utils::{
     completion_finish_reason, decode_ids_blocking, encode_blocking, encode_blocking_in_batch,
     encode_prompt_blocking, encode_texts_blocking, filter_chat_request_by_tool_choice,

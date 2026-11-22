@@ -1149,3 +1149,25 @@ wrapper state for the block, an arguments state per call):
   and the older parsers read that back as raw text (the module tests pin how the table reads
   those bytes: a thought and JSON content, no call). What the table leaves open: the recorded
   sets, and the live reading against the engine's own server.
+- **`kimi` is this table with a second pair of markers for the thought.** `kimi()` builds the same
+  rows and adds `◁think▷` and `◁/think▷`, the pair of the gateway's older `kimi` reasoning parser,
+  which the older parsers paired with this line's calls. A thought `◁think▷` opens is a state of
+  its own, which `◁/think▷` alone leaves: all between the two is the thought, a `</think>` and the
+  markers of a call among it, as the older parser read it. A `◁think▷` the prompt writes opens no
+  thought: the table names two turn anchors where `kimi_k2` names a turn opener, the turn's opener
+  and `◁think▷` alone, so the output starts in the content behind the last anchor the prompt
+  holds, whatever stands before it, as the older parser, which read no prompt, had it.
+  No prompt leaves that state open, then, and the structural tags, which close a thought the
+  prompt left open with `</think>`, never meet it. Two limits come with the anchor: a thought
+  between `<think>` and `</think>` that the prompt left open and that quotes `◁think▷` is read
+  from the content, its `</think>` shown there; and a prompt without the line's opener is replayed
+  from behind its last `◁think▷`, and not at all where it holds none. A call's id is minted, not
+  the header's: the older parsers left the ids of this name to the gateway, which numbers them by
+  the conversation for a model it knows as Kimi by its name, and still does. No group of the
+  registry reads with it: an operator names it. Under the gateway the name read alone gives way:
+  the registry's table reads a model it knows, and a table another source's names select reads the
+  others, as before the table came; `kimi` reads where nothing else does. Two departures from the
+  older `kimi` parser: text before `◁think▷` is content when the output is read whole, as the
+  older parser's streamed reading had it (its whole reading put that text in the thought); and a
+  thought between `<think>` and `</think>` is read as a thought, where the older parser left it in
+  the content with its markers.

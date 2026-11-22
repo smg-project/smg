@@ -12,7 +12,7 @@ use symphony::{
 use super::{telemetry, template::Templates, SymphonyError};
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
-    routers::grpc::utils::{answering_to, ModelNames, Names},
+    routers::grpc::utils::{answering_to, gives_way, ModelNames, Names},
 };
 
 /// The legacy parser that leaves its channel as written: an operator's choice no table reads
@@ -52,7 +52,7 @@ pub(crate) fn named_table(names: &Names) -> Option<Table> {
 /// answers to, which is the way back for one model when its table misbehaves, or by `passthrough`
 /// alone, the choice to leave the thought as written, which no table does; or nothing, by no name
 /// at all, or a reasoning name alone that no table answers to, since every table reads the thought
-/// channel.
+/// channel, or one that gives way ([`gives_way`]).
 enum Selection {
     Template,
     Table(Table),
@@ -65,6 +65,11 @@ fn selection(names: &Names) -> Selection {
         return Selection::Template;
     }
     match named_table(names) {
+        // A reasoning name alone that gives way: [`decision`] reads with its table where
+        // neither source selects anything.
+        Some(_) if names.tool.is_none() && names.reasoning.as_deref().is_some_and(gives_way) => {
+            Selection::Nothing
+        }
         Some(table) => Selection::Table(table),
         None if names.tool.is_none() && !is_passthrough(names.reasoning.as_deref()) => {
             Selection::Nothing
@@ -74,8 +79,9 @@ fn selection(names: &Names) -> Selection {
 }
 
 /// Whether `names`, one source's, select nothing (no name at all, or a reasoning name alone that no
-/// table answers to, `passthrough` excepted), so that [`decision`] passes them over for the next
-/// source: a worker labeled so is read by the registry's table, as an unlabeled one is.
+/// table answers to, `passthrough` excepted, or that gives way), so that [`decision`] passes them
+/// over for the next source: a worker labeled so is read by the registry's table, as an unlabeled
+/// one is.
 pub(crate) fn labels_select_nothing(names: &Names) -> bool {
     matches!(selection(names), Selection::Nothing)
 }
@@ -145,8 +151,11 @@ fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
 /// the registry has no table for and never a family it has one for, and a worker's labels read
 /// their model whatever the registry has. A table the labels select reads a model the registry
 /// gives the same table with the model's own turn opener; another model, or one the registry
-/// does not know, replays from the table's own. The registry is asked once per path, as before
-/// the flags came apart.
+/// does not know, replays from the table's own. A reasoning name alone that gives way
+/// ([`gives_way`]: `kimi`) is passed over in either source, as before its table came, and its
+/// table reads the model where the legacy parsers would read with the name: neither source
+/// selects anything, and it is the reasoning name in force, the labels' before the flags'. The
+/// registry is asked once per path, as before the flags came apart.
 pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
     match selection(&names.labels) {
         Selection::Template => Decision::Template,
@@ -163,7 +172,19 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
                 Selection::Template => Decision::Template,
                 Selection::Table(table) => Decision::Table(table.shared()),
                 Selection::Legacy => Decision::Legacy(legacy_reason(names.flags)),
-                Selection::Nothing => Decision::Legacy(nothing_reason(names)),
+                // The reasoning name in force is the labels' before the flags', as the legacy
+                // parsers take it: its table reads when it is one that gives way.
+                Selection::Nothing => match names
+                    .labels
+                    .reasoning
+                    .as_deref()
+                    .or(names.flags.reasoning.as_deref())
+                    .filter(|name| gives_way(name))
+                    .and_then(answering_to)
+                {
+                    Some(table) => Decision::Table(table.shared()),
+                    None => Decision::Legacy(nothing_reason(names)),
+                },
             },
         },
     }
@@ -536,7 +557,7 @@ mod tests {
             Some(Table::KimiK3)
         );
         // The Kimi K2 line's older parsers: the tool-call name, and its thought parsers alone;
-        // the `kimi` thought parser reads another family's markers and selects none.
+        // the `kimi` thought parser reads another pair of markers, which its own table reads.
         assert_eq!(
             named_table(&pair(Some("kimik2"), Some("kimi_thinking"))),
             Some(Table::KimiK2)
@@ -545,7 +566,7 @@ mod tests {
             named_table(&pair(None, Some("kimi_k25"))),
             Some(Table::KimiK2)
         );
-        assert_eq!(named_table(&pair(None, Some("kimi"))), None);
+        assert_eq!(named_table(&pair(None, Some("kimi"))), Some(Table::Kimi));
         assert_eq!(named_table(&pair(None, Some("Ling"))), Some(Table::Ling));
         assert_eq!(
             named_table(&pair(Some("qwen3_tagged"), None)),
@@ -723,6 +744,7 @@ mod tests {
             ("kimik2", "kimi_k2"),
             ("kimi_thinking", "kimi_k2"),
             ("kimi_k25", "kimi_k2"),
+            ("kimi", "kimi"),
             ("inkling", "inkling"),
             ("minimax", "minimax_m2"),
             ("minimax_m2", "minimax_m2"),
@@ -1253,6 +1275,50 @@ mod tests {
         // it does not.
         assert_eq!(read(&ModelNames::default(), known), table("qwen3"));
         assert_eq!(read(&ModelNames::default(), unknown), Ok(None));
+    }
+
+    /// A reasoning name that gives way, alone in a source: the registry's table reads a model it
+    /// knows and the table the flags' tool-call name selects reads another, as before the name's
+    /// table came. The name's table reads where the legacy parsers would read with the name:
+    /// nothing else selects anything, and a worker's own reasoning name stands before the flag's.
+    #[test]
+    fn a_reasoning_name_that_gives_way_reads_where_no_other_table_does() {
+        let unknown = "acme/ministral-3-14b-instruct-w4a16";
+        let kimi = || pair(None, Some("kimi"));
+        let cases = [
+            (
+                kimi(),
+                Names::default(),
+                "moonshotai/Kimi-K3",
+                Some("kimi_k3"),
+            ),
+            (kimi(), pair(Some("qwen"), None), unknown, Some("qwen3")),
+            (kimi(), Names::default(), unknown, Some("kimi")),
+            (
+                Names::default(),
+                kimi(),
+                "moonshotai/Kimi-K3",
+                Some("kimi_k3"),
+            ),
+            (Names::default(), kimi(), unknown, Some("kimi")),
+            (pair(None, Some("cohere_cmd")), kimi(), unknown, None),
+        ];
+        let read = cases.each_ref().map(|(labels, flags, model, _)| {
+            let labels = labels.clone();
+            reads(
+                ParserChoice::Symphony,
+                &ModelNames { labels, flags },
+                model,
+                &templates(),
+            )
+            .map(|format| format.map(|format| format.name().to_string()))
+        });
+        assert_eq!(
+            read,
+            cases
+                .each_ref()
+                .map(|(.., table)| Ok(table.map(str::to_string)))
+        );
     }
 
     /// The legacy parsers read for a reason the decision names: one source's way back

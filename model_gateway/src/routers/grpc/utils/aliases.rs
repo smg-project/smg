@@ -69,7 +69,7 @@ pub const ALIASES: [(&str, Table); 19] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 12] = [
+pub const UNANSWERED: [(&str, &str); 11] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -109,11 +109,6 @@ pub const UNANSWERED: [(&str, &str); 12] = [
          every family that names pythonic has a table; llama4_pythonic names the Llama 4 \
          table exactly",
     ),
-    (
-        "kimi",
-        "a thought between `◁think▷` and `◁/think▷`, which no table reads: the Kimi K2 \
-         line's table reads `<think>`",
-    ),
     ("step3", "Step 3's calls and thought: no table"),
     ("sarashina", "Sarashina's calls: no table"),
     (
@@ -128,6 +123,23 @@ pub const UNANSWERED: [(&str, &str); 12] = [
          cohere has none",
     ),
 ];
+
+/// The legacy reasoning parsers' names that give way where they stand alone ([`gives_way`]): a
+/// table answers to each, and before the table came each selected nothing, its parser reading
+/// the thought beside whatever read the calls. A source that names one and no tool-call parser
+/// still selects nothing while another reader is left: the registry's table reads a model it
+/// knows, and what the next source's names select reads the others. The name's table reads
+/// where nothing else does, in the place of the legacy parsers.
+pub const GIVING_WAY: [&str; 1] = ["kimi"];
+
+/// Whether `name` is a reasoning parser's that gives way where it stands alone
+/// (`GIVING_WAY`).
+pub fn gives_way(name: &str) -> bool {
+    let name = name.trim();
+    GIVING_WAY
+        .iter()
+        .any(|legacy| legacy.eq_ignore_ascii_case(name))
+}
 
 #[cfg(test)]
 mod tests {
