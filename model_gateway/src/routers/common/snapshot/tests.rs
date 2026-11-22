@@ -820,3 +820,29 @@ fn a_model_the_registry_never_saw_has_no_generation() {
     assert!(registry.model_routing_snapshot("never-seen").is_none());
     assert!(registry.get_routing_snapshot("never-seen").is_empty());
 }
+
+/// The snapshot's size, its alignment and where its first pool's list
+/// stands. Every request borrows its pool from the snapshot and the routes
+/// read its cells, so where they stand is part of what a request costs, and
+/// no count of instructions shows a change of it. The members, the pools
+/// and the engine's cells are one value of the worker crate inside the
+/// snapshot: they take the bytes the three took as fields of the snapshot's
+/// own, with the lists where they stood. A change that grows the snapshot
+/// or moves its lists states the new figures here.
+#[test]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn a_snapshot_keeps_its_size_its_alignment_and_the_place_of_its_lists() {
+    assert_eq!(align_of::<ModelWorkerSnapshot>(), 128);
+    assert_eq!(size_of::<ModelWorkerSnapshot>(), 896);
+
+    let registry = WorkerRegistry::new();
+    registry
+        .register(worker_with_a_window("grpc://127.0.0.1:8441", "qwen", 8_192))
+        .unwrap();
+    let snapshot = registry.model_routing_snapshot("qwen").unwrap();
+    let start = std::ptr::from_ref::<ModelWorkerSnapshot>(&snapshot).addr();
+    // The first pool's list, which a request of the HTTP regular route
+    // reads first.
+    let first_list = std::ptr::from_ref(snapshot.pool(RoutingPool::HttpRegular)).addr();
+    assert_eq!(first_list - start, 16);
+}

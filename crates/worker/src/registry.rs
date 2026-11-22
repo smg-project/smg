@@ -40,7 +40,10 @@ use crate::{
 };
 
 pub mod event;
+mod model_pools;
 mod pool;
+
+pub use model_pools::{ModelPools, PoolKey};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

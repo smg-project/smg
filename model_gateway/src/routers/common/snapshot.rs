@@ -1,8 +1,9 @@
 //! The gateway's value of a membership generation ([`Generation`]): the
-//! members, and the cells that keep what the routers derive from them (the
-//! routing pools, the prefill and decode pairs, the window floors, the
-//! labels the workers say together, the hash ring). The registry builds
-//! one at every publish; the routing readers hand it to a request.
+//! members with their routing pools ([`ModelPools`]), and the cells that
+//! keep what else the routers derive from them (the prefill and decode
+//! pairs, the window floors, the labels the workers say together, the hash
+//! ring). The registry builds one at every publish; the routing readers
+//! hand it to a request.
 
 use std::{
     ops::Deref,
@@ -15,7 +16,7 @@ use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
     pd::pairing::PdPairingMode,
-    registry::{self, Generation},
+    registry::{self, Generation, ModelPools, PoolKey},
 };
 use symphony::grammar::GrammarStart;
 
@@ -55,7 +56,6 @@ pub(crate) enum RoutingPool {
 }
 
 type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
-type LazyRoutingPool = OnceLock<WorkerSnapshot>;
 
 impl RoutingPool {
     const COUNT: usize = 8;
@@ -105,6 +105,20 @@ impl RoutingPool {
             }
             Self::External => worker.metadata().spec.runtime_type == RuntimeType::External,
         }
+    }
+}
+
+/// The gateway's pools as the keys of a generation's lists
+/// ([`ModelPools`]): a pool's place and its rule are the two above.
+impl PoolKey<{ RoutingPool::COUNT }> for RoutingPool {
+    #[inline]
+    fn index(self) -> usize {
+        Self::index(self)
+    }
+
+    #[inline]
+    fn matches(self, worker: &dyn Worker) -> bool {
+        Self::matches(self, worker)
     }
 }
 
@@ -171,8 +185,12 @@ pub(crate) struct ModelLabels {
 #[derive(Debug)]
 #[repr(align(128))]
 pub struct ModelWorkerSnapshot {
-    all: WorkerSnapshot,
-    pools: [LazyRoutingPool; RoutingPool::COUNT],
+    /// The members, the routing pools projected from them ([`Self::pool`])
+    /// and, beside each pool, the cell for what the policy engine keeps of
+    /// it ([`Self::pool_members_cell`]). An engine's value is in a box of
+    /// its own: it stands on cache lines of its own, and a snapshot no
+    /// engine picks over holds the empty cells alone.
+    pools: ModelPools<RoutingPool, Box<PoolMembers>, { RoutingPool::COUNT }>,
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
     pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
@@ -188,24 +206,17 @@ pub struct ModelWorkerSnapshot {
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
-    /// What the policy engine keeps of each pool (see
-    /// [`Self::pool_members_cell`]), each in a box of its own: the value
-    /// stands on cache lines of its own, and a snapshot no engine picks
-    /// over holds the empty cells alone.
-    pool_members: [OnceLock<Box<PoolMembers>>; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
     fn new(all: WorkerSnapshot) -> Self {
         Self {
-            all,
-            pools: std::array::from_fn(|_| OnceLock::new()),
+            pools: ModelPools::of(all),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
             hash_ring: OnceLock::new(),
-            pool_members: std::array::from_fn(|_| OnceLock::new()),
         }
     }
 
@@ -218,7 +229,7 @@ impl ModelWorkerSnapshot {
     /// per-worker card scans run once, not per request. The rule itself
     /// stays with the router's detector.
     pub(crate) fn harmony(&self, decide: impl FnOnce(&[Arc<dyn Worker>]) -> bool) -> bool {
-        *self.harmony.get_or_init(|| decide(&self.all))
+        *self.harmony.get_or_init(|| decide(self.pools.members()))
     }
 
     /// The window floor of `pool` for `model_id`: `read` reads the pool's
@@ -271,12 +282,12 @@ impl ModelWorkerSnapshot {
         model_id: &str,
         read: impl FnOnce(&[Arc<dyn Worker>]) -> ModelLabels,
     ) -> Option<&ModelLabels> {
-        if self.all.is_empty() {
+        if self.pools.members().is_empty() {
             return None;
         }
         let (spelling, labels) = self
             .labels
-            .get_or_init(|| (model_id.into(), read(&self.all)));
+            .get_or_init(|| (model_id.into(), read(self.pools.members())));
         (**spelling == *model_id).then_some(labels)
     }
 
@@ -295,7 +306,7 @@ impl ModelWorkerSnapshot {
     /// members: `kept` saves hashing and decides nothing of the ring filled.
     pub(crate) fn fill_hash_ring(&self, kept: Option<Arc<HashRing>>) -> &Arc<HashRing> {
         self.hash_ring.get_or_init(|| {
-            let urls = || self.all.iter().map(|worker| worker.url());
+            let urls = || self.pools.members().iter().map(|worker| worker.url());
             match kept {
                 Some(kept) if kept.is_over(urls()) => kept,
                 Some(kept) => Arc::new(kept.updated(urls())),
@@ -312,9 +323,9 @@ impl ModelWorkerSnapshot {
     /// nothing hashed. Any other ring is left out, and so is every ring
     /// once the cell is filled.
     pub(crate) fn put_hash_ring(&self, ring: &Arc<HashRing>, listed: &[Arc<str>]) {
-        let same_list = listed.len() == self.all.len()
-            && self
-                .all
+        let members = self.pools.members();
+        let same_list = listed.len() == members.len()
+            && members
                 .iter()
                 .zip(listed)
                 .all(|(worker, url)| &**url == worker.url());
@@ -329,7 +340,7 @@ impl ModelWorkerSnapshot {
     /// A ring keeps an order of its own, so they are the ring's own list
     /// only where that is in this order, and a copy elsewhere.
     pub(crate) fn listed_urls(&self, ring: &HashRing) -> Arc<[Arc<str>]> {
-        let urls = || self.all.iter().map(|worker| worker.url());
+        let urls = || self.pools.members().iter().map(|worker| worker.url());
         if ring.is_over(urls()) {
             Arc::clone(ring.urls())
         } else {
@@ -372,23 +383,14 @@ impl ModelWorkerSnapshot {
     ///
     /// [`NamedList::members`]: crate::policies::NamedList::members
     pub(crate) fn pool_members_cell(&self, pool: RoutingPool) -> &OnceLock<Box<PoolMembers>> {
-        &self.pool_members[pool.index()]
+        self.pools.cell(pool)
     }
 
     /// The workers of `pool`, projected once per snapshot and borrowed from
     /// it: a length or membership read costs no refcount step. A caller that
     /// keeps the pool past the snapshot clones the `Arc` itself.
     pub(crate) fn pool(&self, pool: RoutingPool) -> &WorkerSnapshot {
-        self.pools[pool.index()].get_or_init(|| {
-            if self.all.iter().all(|worker| pool.matches(worker.as_ref())) {
-                return Arc::clone(&self.all);
-            }
-            self.all
-                .iter()
-                .filter(|worker| pool.matches(worker.as_ref()))
-                .cloned()
-                .collect()
-        })
+        self.pools.pool(pool)
     }
 }
 
@@ -396,7 +398,7 @@ impl Deref for ModelWorkerSnapshot {
     type Target = [Arc<dyn Worker>];
 
     fn deref(&self) -> &Self::Target {
-        &self.all
+        self.pools.members()
     }
 }
 
@@ -408,7 +410,7 @@ impl Generation for ModelWorkerSnapshot {
     }
 
     fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
-        &self.all
+        self.pools.members()
     }
 }
 
