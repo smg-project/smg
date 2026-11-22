@@ -5668,7 +5668,9 @@ impl Engine {
 
     /// Make the binding's decision with its shadow profile on the same
     /// rows. The run only updates the shadow's stages and scratch. It
-    /// claims and renews no session pin.
+    /// claims and renews no session pin, and it is lent no word of the pool
+    /// ([`PoolFacts::word`]): the live decision alone turns the list's
+    /// rotation.
     ///
     /// Make the request's live decision through [`Self::decide_keeping`]
     /// and hand this call its scratch, before the scratch decides again.
@@ -5725,6 +5727,12 @@ impl Engine {
             };
             return Some(shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, trace));
         }
+        // The pool's own word counts the live decision's turns alone: a
+        // shadow is lent none, and its picker turns a rotation of its own.
+        let pool = &PoolFacts {
+            word: None,
+            ..*pool
+        };
         let set = Set {
             candidates,
             class: None,
@@ -7467,6 +7475,42 @@ mod tests {
             engine.shadow(&malformed, &pool, &rows, &cx, &mut scratch),
             Some(engine.decide(&malformed, &pool, &rows, &cx, &mut scratch))
         );
+    }
+
+    /// A shadow is lent no word of the pool. Where the live profile and its
+    /// shadow both rotate, the live decisions take the list's rows one after
+    /// the other, and the word counts them alone, whatever the shadows
+    /// between them take.
+    #[test]
+    fn a_shadow_turns_no_rotation_of_the_live_list() {
+        use std::sync::atomic::Ordering;
+
+        let engine = Engine::new(
+            vec![round_robin_profile(), round_robin_profile()],
+            vec![Binding {
+                shadow: Some(1),
+                ..single_binding()
+            }],
+            23,
+            Needs::default(),
+        );
+        let rows = pool_of(DRAW_FROM as u32, |_| false);
+        let word = AtomicU64::new(3);
+        let pool = PoolFacts {
+            word: Some(&word),
+            ..PoolFacts::default()
+        };
+        let (facts, cx) = (request(0), Constraints::default());
+        let mut scratch = Scratch::new();
+        let mut lives = Vec::new();
+        for _ in 0..6 {
+            let live = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
+            lives.push(positions(&live)[0]);
+            let shadow = engine.shadow(&facts, &pool, &rows, &cx, &mut scratch);
+            assert!(shadow.expect("a shadow decision").pick().is_some());
+        }
+        assert_eq!(lives, [3, 4, 5, 6, 7, 8]);
+        assert_eq!(word.load(Ordering::Relaxed), 9);
     }
 
     #[test]

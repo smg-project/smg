@@ -430,7 +430,7 @@ fn assert_drawn_as_written(
 
         let live = Live::at(drawing.engine(), &clock, now, Some(loads), None);
         let mut facts = request;
-        let unsaid = drawn_pool.facts(&clock, false);
+        let unsaid = drawn_pool.facts(&live, false);
         draws += usize::from(
             drawing
                 .engine()
@@ -567,7 +567,7 @@ fn a_pick_of_two_writes_the_records_of_the_two_workers_it_draws() {
     let cx = Constraints::default();
     let mut facts = single();
     facts.now_micros = live.now_micros();
-    let unsaid = pool.facts(&clock, false);
+    let unsaid = pool.facts(&live, false);
     let drawn = spec
         .engine()
         .drawn_for(&facts, &unsaid, pool.len())
@@ -595,7 +595,7 @@ fn a_pick_of_two_writes_the_records_of_the_two_workers_it_draws() {
     // Under the draw's floor every record is written: the pool is small.
     let few = fleet(DRAW_FROM - 1);
     let pool = PoolRecords::new(&few, &spec, &clock);
-    let unsaid = pool.facts(&clock, false);
+    let unsaid = pool.facts(&live, false);
     assert!(spec
         .engine()
         .drawn_for(&facts, &unsaid, pool.len())
@@ -604,7 +604,7 @@ fn a_pick_of_two_writes_the_records_of_the_two_workers_it_draws() {
     // A profile that scores every worker is no draw's.
     let scores = applied("least_load");
     let pool = PoolRecords::new(&workers, &scores, &clock);
-    let unsaid = pool.facts(&clock, false);
+    let unsaid = pool.facts(&live, false);
     assert!(scores
         .engine()
         .drawn_for(&facts, &unsaid, pool.len())
