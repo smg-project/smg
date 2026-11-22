@@ -1619,9 +1619,13 @@ pub(crate) type DecodeBooking = (DecodeSide, Option<WorkerSlot>);
 /// both doors. The store's own test of the lease comes first, so a call
 /// it refuses runs no stage. Then the pair's rows are built and narrowed
 /// as [`pair_in`] builds them, and the engine's decode entry runs over the
-/// partners of the held prefill. The decode profile is shown the decode
-/// pool's facts: its size, its list and whether every row of it holds a
-/// report. A pick comes with what its issue files.
+/// partners of the held prefill, handed the decode the lease's first
+/// decision chose: a decode profile that keeps its pick answers that decode
+/// again while its filters keep it
+/// ([`Engine::decide_decode`](crate::engine::framework::Engine::decide_decode)).
+/// The decode profile is shown the decode pool's facts: its size, its list
+/// and whether every row of it holds a report. A pick comes with what its
+/// issue files.
 ///
 /// # Errors
 ///
@@ -1666,7 +1670,7 @@ where
         &mut Scratch,
     ),
 {
-    let prefill = store.held_prefill(taken.gateway, lease)?;
+    let (prefill, first_decode) = store.held_pair(taken.gateway, lease)?;
     let Buffers {
         pair,
         scratch,
@@ -1690,7 +1694,8 @@ where
                     phase: Phase::Decode,
                     ..*facts
                 };
-                engine.decide_decode(&facts, pool, pair.pools(), prefill, cx, scratch)
+                let pools = pair.pools();
+                engine.decide_decode(&facts, pool, pools, prefill, first_decode, cx, scratch)
             },
             |facts, decision, built, _| {
                 let (pick, (_, decodes)) = decision.pick().zip(built)?;
@@ -5522,6 +5527,50 @@ pub(crate) mod tests {
             );
         }
         assert!(!Constraints::default().decode_later);
+    }
+
+    /// Under round robin a pair's decode decided again is the decode its
+    /// first decision chose: the call hands the engine that decode, and a
+    /// second pick would turn the rotation a second time for one request.
+    /// Requests one at a time over two decodes land on each in turn. So
+    /// they do without the policy controller, where a request's pair is
+    /// selected once (`model_gateway/src/routers/common/placement.rs:1303`
+    /// and `model_gateway/src/policies/round_robin.rs:142` on main
+    /// 882be6f4f). With the rotation turned twice a request, one decode
+    /// took every one.
+    #[test]
+    fn a_decode_decided_again_under_round_robin_is_its_first_decode() {
+        let store = MemoryStore::new();
+        for (name, role) in [
+            ("p0", Role::Prefill),
+            ("d0", Role::Decode),
+            ("d1", Role::Decode),
+        ] {
+            member(&store, name, role);
+        }
+        let document = PolicySpec::pair_presets("round_robin", "round_robin").expect("a spec");
+        apply_pair_document(&store, document).expect("the document applies");
+        let door = StoreBackedEngine::new(Arc::new(store));
+        let (asked, now) = (later_request(b"pair"), Instant::now());
+        let mut sent = Vec::new();
+        for _ in 0..8 {
+            let answer = door.decide(GATEWAY, &asked, now).expect("the pair");
+            let lease = answer.lease.expect("a lease").lease.id;
+            let pick = answer.decision.pick().expect("a pick");
+            let first = pick.targets.first().and_then(|target| target.pair);
+            door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+            let again = door.decide_decode(GATEWAY, &asked, lease, now);
+            let decode = again
+                .expect("a decode decision")
+                .lease
+                .expect("the decode's lease");
+            assert_eq!(Some(decode.lease.booked), first.map(|pair| pair.decode_id));
+            sent.push(decode.lease.booked);
+            let gone = Said::Released(None, ReleaseReason::ClientGone);
+            door.report(GATEWAY, lease, gone);
+        }
+        let to_one = sent.iter().filter(|&&decode| decode == sent[0]).count();
+        assert_eq!(to_one, 4, "{sent:?}");
     }
 
     #[test]
