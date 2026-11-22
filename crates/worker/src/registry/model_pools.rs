@@ -46,10 +46,12 @@ pub trait PoolKey<const N: usize>: Copy {
 /// from the one value it took: two reads of the registry can straddle a
 /// membership change and pair workers that never stood together.
 ///
-/// It is a [`Generation`] by itself, for a host that keeps nothing more of
-/// one, and a field of the host's own value where the host does. A host
-/// that uses it bare as its registry's value puts it on cache lines of its
-/// own, apart from the count of its handles, which every request writes.
+/// It is a [`Generation`] by itself and states no alignment. Bare in a
+/// registry, its members and its first lists stand on the cache line of its
+/// handles' count, which every request that takes a handle writes: that
+/// serves a host no request reads it on. A host that places requests by it
+/// keeps it as a field of a value of its own under `#[repr(align(128))]`,
+/// which puts it on cache lines apart from that count.
 #[derive(Debug)]
 pub struct ModelPools<K, C, const N: usize> {
     members: Workers,
