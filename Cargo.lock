@@ -8296,7 +8296,6 @@ dependencies = [
  "openai-protocol",
  "openssl",
  "rand 0.10.2",
- "reasoning-parser",
  "reqwest 0.13.4",
  "rmcp",
  "rustls",
@@ -8311,7 +8310,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tool-parser",
  "tower",
  "uuid",
 ]
