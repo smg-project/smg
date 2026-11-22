@@ -1476,3 +1476,6 @@ pub(crate) mod tests {
         assert!(!store.completed_ok_since(A, served, t0));
     }
 }
+
+#[cfg(test)]
+mod words;
