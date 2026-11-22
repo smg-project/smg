@@ -337,8 +337,12 @@ mod tests {
     #[test]
     fn the_element_estimate_of_an_image_is_the_bases() {
         let omni = Qwen3OmniVisionProcessor::new();
-        let estimate = omni.inner.image_input_elements(4096, 3136);
-        assert!(estimate.is_some());
-        assert_eq!(omni.image_input_elements(4096, 3136), estimate);
+        // 4096x3136 is exactly the default max_pixels and a multiple of the
+        // 32-pixel factor, so it is kept as is: 3136 * 4096 * 3 * 2.
+        assert_eq!(omni.image_input_elements(4096, 3136), Some(77_070_336));
+        assert_eq!(
+            omni.image_input_elements(4096, 3136),
+            omni.inner.image_input_elements(4096, 3136)
+        );
     }
 }
