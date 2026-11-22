@@ -68,9 +68,9 @@ use super::{
     framework::{
         release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
     },
+    lease_events,
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    telling,
     view::{fingerprint, Phase, WireModes, WorkerId},
 };
 use crate::{
@@ -663,9 +663,9 @@ impl DecisionEngine for PolicyEngine {
         }
         let engine = self.spec.engine();
         let tell = || match held.lease.side {
-            Side::Single => telling::single(engine, held, said),
+            Side::Single => lease_events::single(engine, held, said),
             // A pair's guard holds its prefill side's lease.
-            Side::Prefill => telling::pair(engine, held, said, |at| self.clock.micros(at)),
+            Side::Prefill => lease_events::pair(engine, held, said, |at| self.clock.micros(at)),
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };

@@ -23,7 +23,7 @@
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue`]), or, where the request sends its decode later, at the decode
 //! call ([`issue_decode`]) or at the dispatch that sends the decode with no
-//! call ([`telling::pair`]). A side's dispatch and its end are told under that
+//! call ([`lease_events::pair`]). A side's dispatch and its end are told under that
 //! side's lease. It names the worker the side booked at its issue until
 //! the side's dispatch, and the worker it went to from there.
 //!
@@ -52,9 +52,9 @@ use crate::{
         decision::{shed, Decision, ShedReason, SUBSET_HINT, WIRES},
         decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         framework::{Engine, PairPools, Scratch},
+        lease_events,
         pair_classes::PartnerClasses,
         records::{DecisionClock, Live},
-        telling,
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,
@@ -262,7 +262,7 @@ fn decide_records(
 /// side's words. The stages hear the prefill's issue, and the decode's
 /// behind it unless the request sends its decode `later`: such a side
 /// stands chosen and is told at its own issue ([`issue_decode`],
-/// [`telling::pair`]).
+/// [`lease_events::pair`]).
 ///
 /// `None` for a decision that picks no pair: it issues nothing.
 pub(super) fn issue(
@@ -287,7 +287,7 @@ pub(super) fn issue(
         issued_micros: facts.now_micros,
         tokens: facts.prompt_tokens,
     };
-    let decode = telling::decode_as_issued(&lease, first, session)?;
+    let decode = lease_events::decode_as_issued(&lease, first, session)?;
     engine.on_decision_issued(&lease, decision);
     if !later {
         engine.on_decision_issued(&decode, decision);
@@ -342,7 +342,7 @@ pub(super) fn issue_decode(
     let first = decision.pick()?.targets.first()?;
     let decode = Lease {
         tokens: facts.prompt_tokens,
-        ..telling::decode_as_issued(prefill, first, decode_session(facts))?
+        ..lease_events::decode_as_issued(prefill, first, decode_session(facts))?
     };
     let issued = Lease {
         issued_micros: now_micros,
@@ -1168,7 +1168,7 @@ mod tests {
     /// One word of a held pair told to the stages, the clock reading 9,900
     /// and every worker still listed.
     fn tell(engine: &Engine, held: &HeldDecision<'_>, word: Said) {
-        telling::pair(engine, held, word, |_| 9_900);
+        lease_events::pair(engine, held, word, |_| 9_900);
     }
 
     /// Each word of a pair, both sides issued with the prefill, the host

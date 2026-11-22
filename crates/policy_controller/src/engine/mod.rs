@@ -18,6 +18,8 @@ pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
 pub(crate) mod framework;
+#[cfg(feature = "in-process")]
+pub(crate) mod lease_events;
 pub(crate) mod pair_classes;
 #[cfg(feature = "in-process")]
 pub(crate) mod policy_engine;
@@ -27,8 +29,6 @@ pub(crate) mod prompt_hashes;
 pub(crate) mod records;
 pub(crate) mod sticky_sessions;
 pub(crate) mod store_backed_engine;
-#[cfg(feature = "in-process")]
-pub(crate) mod telling;
 pub(crate) mod view;
 pub(crate) mod warm_up;
 
