@@ -212,10 +212,12 @@ pub(crate) struct Ask<'a> {
     pub pool: Option<RoutingPool>,
     /// The workers the request may take, where its route narrowed them
     /// ahead of the ask by the test its classic arm asks of a candidate: a
-    /// part of the pool's list, in the list's order. The engine of this
-    /// process decides over them alone and keeps nothing of the list. A
-    /// route that narrows nothing states none, and its ask is decided over
-    /// the pool. A followed controller's engine reads nothing here.
+    /// part of the list of the pool the ask states ([`Self::pool`]), in the
+    /// list's order. The engine of this process decides over the pool's
+    /// own records with every other worker left out, and makes nothing for
+    /// the part. A route that narrows nothing states none, and its ask is
+    /// decided over the pool. A followed controller's engine reads nothing
+    /// here.
     pub among: Option<&'a Arc<[Arc<dyn Worker>]>>,
     /// The snapshot of the model's workers the route read for this attempt,
     /// where it read one for a rule of its own. The engine of this process
@@ -346,6 +348,13 @@ struct Made<'r, 'a> {
     /// The load monitor's snapshot for this ask, where the engine of this
     /// process reads load reports: lent once an ask ([`loads::Loads`]).
     loads: Option<&'r Arc<LoadSnapshot>>,
+    /// The places of `members`' list the ask may take, ascending, where
+    /// something narrows it ([`narrow`]): `None` for the whole list.
+    kept: Option<&'r [usize]>,
+    /// Whether `kept` keeps out the workers off the ask's wires: the
+    /// object cut them itself, and the request made states no wire for the
+    /// engine to decline the pool's list by.
+    cut_by_wire: bool,
     /// Where the key of the last making came from, under the label the
     /// gateway counts it by. The door may make the request a second time,
     /// behind a lease the store refused: the policy engine counts after the
@@ -369,17 +378,21 @@ impl RequestMaker for Made<'_, '_> {
         // The document's word, like the keys: read from the generation
         // that decides.
         request.constraints.decode_later = self.ask.decode_later(spec);
+        if self.cut_by_wire {
+            request.constraints.wire_modes = WireModes::NONE;
+        }
         request
     }
 
     // An ask states no subset hint, no hard demand and no lifted veto, and
     // its host writes its standing vetoes into no mask: a first attempt
-    // that names nothing tried or missed and asks no decode again is plain.
-    // The size is the one the request made would state.
+    // that names nothing tried or missed, asks no decode again and is
+    // narrowed to no part of its pool is plain. The size is the one the
+    // request made would state.
     fn plain(&self) -> Option<Plain> {
         let ask = self.ask;
         let first = ask.tried.is_empty() && self.missed.is_empty() && ask.attempt.unwrap_or(0) == 0;
-        (first && !ask.decode_again).then(|| Plain {
+        (first && !ask.decode_again && self.kept.is_none()).then(|| Plain {
             phase: ask.phase,
             wires: ask.wires,
             prompt_tokens: ask.hashes.map_or(ask.prompt_tokens, |hashes| {
@@ -394,6 +407,10 @@ impl RequestMaker for Made<'_, '_> {
 
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         self.loads
+    }
+
+    fn kept(&self) -> Option<&[usize]> {
+        self.kept
     }
 }
 
@@ -1160,6 +1177,8 @@ impl PolicyEngine {
             missed,
             members: None,
             loads: None,
+            kept: None,
+            cut_by_wire: false,
             source: Cell::new(None),
         };
         let started = Instant::now();
@@ -1560,9 +1579,17 @@ impl PolicyEngine {
     /// ([`Ask::snapshot`]), so such a request reads the registry once. What
     /// the engine keeps of the list stands in the snapshot's cell beside
     /// it, made by the list's first ask. An ask that states no pool is
-    /// decided over no worker. An ask that states the workers it may take
-    /// ([`Ask::among`]) is decided over them alone, and the registry is not
-    /// read for it.
+    /// decided over no worker.
+    ///
+    /// What narrows an ask leaves workers of that list out of its decision
+    /// ([`narrow`]): the workers its route stated ([`Ask::among`]), its
+    /// wires where the pool's workers do not all serve them, and its
+    /// route's rule from the rule's first refusal. The decision reads the
+    /// pool's own records and its ring, and nothing is made for the part:
+    /// a keyed request narrowed to a part walks the pool's ring past the
+    /// members left out, as a classic pass asks its ring among its
+    /// candidates. A narrowing that leaves no worker leaves the attempt
+    /// none.
     ///
     /// The engine answers one of two things ([`Decided`]). A place is a
     /// worker of the list and nothing else: no stage of the document takes
@@ -1578,21 +1605,18 @@ impl PolicyEngine {
     /// next ask's missed.
     ///
     /// The route's rule (`holds`) is asked of a worker picked. The first
-    /// time it refuses one, the attempt's later asks are decided over the
-    /// workers of the list the rule holds, and over no other: the engine
-    /// picks among what the route can send to, as a classic pass narrows
-    /// its candidates ahead of its policy. Such a list is a part of its
-    /// pool ([`PoolMembers::part`]): nothing is kept of it, and the
-    /// requests narrowed to one part take its workers in turn.
+    /// time it refuses one, the attempt's later asks leave out every worker
+    /// the rule refuses: the engine picks among what the route can send
+    /// to, as a classic pass narrows its candidates ahead of its policy.
     ///
     /// Under a document that places by a hash ring, an attempt's first ask
     /// can come ahead of the ring of the list in force, which is built off
     /// the path of a request. It is then decided over the last membership
     /// whose rings stand, and a target's worker is the one the list in
     /// force holds at that worker's address ([`stood_before`]). Where no
-    /// target holds, the next ask is decided over the list in force. An ask
-    /// over a part of a pool, or over the workers on its wires, is decided
-    /// over that list as it is.
+    /// target holds, the next ask is decided over the list in force. A
+    /// narrowed ask is decided over the list in force as it is: the places
+    /// it keeps are that list's.
     fn place_listed(
         &self,
         registry: &WorkerRegistry,
@@ -1602,12 +1626,14 @@ impl PolicyEngine {
         clock: &impl Fn() -> Instant,
     ) -> Result<Placed, Unplaced> {
         let mut missed: Vec<WorkerId> = Vec::new();
-        // The workers the route's rule holds, from its first refusal of a
-        // worker picked.
-        let mut ruled: Option<Arc<[Arc<dyn Worker>]>> = None;
+        // Whether the route's rule refused a worker picked: from there the
+        // attempt's asks leave out the workers the rule refuses.
+        let mut ruled = false;
+        // The places of the pool's list a narrowed ask may take. The
+        // attempt's own: nothing is allocated while nothing narrows an ask.
+        let mut places: Vec<usize> = Vec::new();
         for asked in 0..ASKS {
             let first = asked == 0;
-            let among = ruled.as_ref().or(ask.among);
             // The model's workers as the registry lists them: the snapshot
             // the route read, where the attempt's first ask states one,
             // else one read here.
@@ -1615,51 +1641,42 @@ impl PolicyEngine {
                 Some(stated) => Cow::Borrowed(stated),
                 None => Cow::Owned(registry.get_routing_snapshot(ask.model)),
             };
-            let snapshot = match among {
-                Some(_) => None,
-                None => ask.pool.map(|pool| (listed(), pool)),
-            };
+            let snapshot = ask.pool.map(|pool| (listed(), pool));
             let kept = snapshot
                 .as_ref()
                 .map(|(snapshot, pool)| members_of(engine, snapshot, *pool));
-            // A list its route or its route's rule narrowed is a part of
-            // its pool, and the engine's for this ask alone: its turns are
-            // its set's own.
-            let narrowed = among.map(PoolMembers::part);
-            let whole = narrowed.as_ref().or(kept);
-            // An ask held to wires the list's workers do not all serve (a
+            let list = kept.map(PoolMembers::workers);
+            // An ask held to wires the pool's workers do not all serve: a
             // retry pinned to its retained plan's wire, over a pool of two
-            // wires) is made over a list of its own, the workers on those
-            // wires, as the classic arm makes one. Nothing is kept of it.
-            let dialed = whole
-                .filter(|pool| !ask.wires.is_empty() && !ask.wires.contains(pool.wires()))
-                .map(|pool| {
-                    let dialed: Arc<[Arc<dyn Worker>]> = pool
-                        .workers()
-                        .iter()
-                        .filter(|worker| {
-                            WireModes::from(*worker.connection_mode()).intersects(ask.wires)
-                        })
-                        .cloned()
-                        .collect();
-                    PoolMembers::part(&dialed)
-                });
-            let members = dialed.as_ref().or(whole);
-            let list = members.map(PoolMembers::workers);
+            // wires.
+            let off_wire =
+                kept.is_some_and(|pool| !ask.wires.is_empty() && !ask.wires.contains(pool.wires()));
+            // What narrows the ask keeps a part of the list: its places,
+            // unless they are the whole list.
+            places.clear();
+            let mut narrowed = false;
+            if let Some(list) = list.filter(|_| ask.among.is_some() || ruled || off_wire) {
+                narrow(list, ask, off_wire, ruled.then_some(holds), &mut places);
+                if places.is_empty() {
+                    return Err(Unplaced::NoTargetHolds);
+                }
+                narrowed = places.len() < list.len();
+            }
             // The monitor's snapshot for this ask, where the document reads
             // load reports: lent once, and every record of the decision is
             // read in it. The ask's instant was read before it.
             let lent = self.loads.lend();
-            // The first ask over the registry's own list is decided over
-            // the membership before it, where this list's ring is not
-            // built yet.
+            // The first ask over the whole of the registry's list is
+            // decided over the membership before it, where this list's
+            // ring is not built yet. A narrowed ask names places of the
+            // list in force, and is decided over it.
             let stood = match (kept, &snapshot) {
-                (Some(in_force), Some((_, pool))) if first && dialed.is_none() => {
+                (Some(in_force), Some((_, pool))) if first && !narrowed => {
                     stood_before(&self.standing, ask.model, *pool, in_force)
                 }
                 _ => None,
             };
-            let members = stood.as_ref().and_then(Stood::members).or(members);
+            let members = stood.as_ref().and_then(Stood::members).or(kept);
             // The worker at a place of the list the ask is decided over,
             // as the list in force holds it.
             let at = |place: u32| match &stood {
@@ -1671,6 +1688,8 @@ impl PolicyEngine {
                 missed: &missed,
                 members,
                 loads: lent.snapshot(),
+                kept: narrowed.then_some(places.as_slice()),
+                cut_by_wire: off_wire,
                 source: Cell::new(None),
             };
             // The decision's instant, where the engine dated one: a place
@@ -1714,11 +1733,9 @@ impl PolicyEngine {
                         });
                     }
                     self.trace_place(pick, worker, false);
-                    match list.filter(|_| ruled.is_none()) {
-                        Some(list) => ruled = Some(held_by(list, holds)?),
-                        // A rule that refuses a worker it held.
-                        None => missed.push(worker_id(worker.as_ref())),
-                    }
+                    // The rule's first refusal: the attempt's later asks
+                    // leave out the workers it refuses.
+                    ruled = true;
                     continue;
                 }
                 Ok(Decided::Whole(decided, later)) => (decided, later),
@@ -1800,9 +1817,7 @@ impl PolicyEngine {
                 if let Some(handle) = &mut handle {
                     handle.released(ReleaseReason::CommitFailed, now);
                 }
-                if let Some(list) = list.filter(|_| refused && ruled.is_none()) {
-                    ruled = Some(held_by(list, holds)?);
-                }
+                ruled |= refused;
                 continue;
             };
             self.trace_decision(decision, Some(&worker));
@@ -1820,23 +1835,57 @@ impl PolicyEngine {
     }
 }
 
-/// The workers of `list` a route's rule `holds`, as a list of their own in
-/// the list's order: what an attempt's later asks are decided over once the
-/// rule refused a worker picked. A rule that holds no worker of the list
-/// leaves the attempt none.
-fn held_by(
+/// The places of `list`, a pool's list, that `ask` may take, into `kept`,
+/// ascending: the list and the positions kept, as the classic pass names a
+/// narrowed list. Not kept: a worker the ask's route did not state among
+/// the workers it may take ([`Ask::among`]), one dialed on none of the
+/// ask's wires where `off_wire`, and one the route's rule refuses where
+/// `rule` is handed.
+///
+/// One pass of the list, each worker asked once: the workers a route
+/// states are a part of the list it read, in that list's order, so each is
+/// met by the object as the pass comes to it. A later ask of the attempt
+/// can read a later membership, which holds those workers in another order
+/// or no longer holds one. The pass then meets a stated worker it cannot
+/// place, and the list is passed a second time, each worker looked for
+/// among the stated ones.
+///
+/// The engine of this process decides a narrowed ask over the pool's own
+/// list, kept to these places ([`RequestMaker::kept`]), as a classic pass
+/// narrows its candidates ahead of its policy.
+fn narrow(
     list: &[Arc<dyn Worker>],
-    holds: &impl Fn(&dyn Worker) -> bool,
-) -> Result<Arc<[Arc<dyn Worker>]>, Unplaced> {
-    let held: Arc<[Arc<dyn Worker>]> = list
-        .iter()
-        .filter(|worker| holds(worker.as_ref()))
-        .cloned()
-        .collect();
-    if held.is_empty() {
-        return Err(Unplaced::NoTargetHolds);
+    ask: &Ask<'_>,
+    off_wire: bool,
+    rule: Option<&impl Fn(&dyn Worker) -> bool>,
+    kept: &mut Vec<usize>,
+) {
+    let takes = |worker: &Arc<dyn Worker>| {
+        (!off_wire || WireModes::from(*worker.connection_mode()).intersects(ask.wires))
+            && rule.is_none_or(|rule| rule(worker.as_ref()))
+    };
+    let mut stated = ask.among.map(|among| among.iter().peekable());
+    for (place, worker) in list.iter().enumerate() {
+        let named = stated
+            .as_mut()
+            .is_none_or(|stated| stated.next_if(|next| Arc::ptr_eq(next, worker)).is_some());
+        if named && takes(worker) {
+            kept.push(place);
+        }
     }
-    Ok(held)
+    let Some(among) = ask
+        .among
+        .filter(|_| stated.is_some_and(|mut stated| stated.peek().is_some()))
+    else {
+        return;
+    };
+    kept.clear();
+    for (place, worker) in list.iter().enumerate() {
+        let named = among.iter().any(|stated| Arc::ptr_eq(stated, worker));
+        if named && takes(worker) {
+            kept.push(place);
+        }
+    }
 }
 
 /// The pools the engine of this process places a regular request over: the
@@ -2350,6 +2399,8 @@ impl Placed {
             // A pair's decode call hands no list of a regular pool.
             members: None,
             loads: None,
+            kept: None,
+            cut_by_wire: false,
             source: Cell::new(None),
         };
         let started = Instant::now();

@@ -1087,6 +1087,54 @@ fn a_retry_names_the_worker_of_a_placement_its_route_did_not_keep() -> Case {
     Ok(())
 }
 
+/// Where the engine of this process places, a request that names its
+/// worker is held to that worker under a model whose classic policy keeps
+/// an explicit target: the route states the one worker the header names,
+/// found as the classic policy finds it, and the engine decides over it
+/// alone. A number that names no worker leaves the request none, and it
+/// moves to no other.
+#[tokio::test]
+async fn a_request_that_names_its_worker_is_held_to_it_in_process() -> Case {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let mut router = own_router("round_robin", &[&a, &b])?;
+    router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing));
+    let hits = || (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+    let named = |target: &'static str| {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", HeaderValue::from_static(target));
+        headers
+    };
+    let mut took = Vec::new();
+    for target in ["0", "1"] {
+        let headers = named(target);
+        let before = hits();
+        for _ in 0..4 {
+            let request = serde_json::from_value(json!({"text": "hi"}))?;
+            let response = router
+                .route_generate(Some(&headers), &meta, request, MODEL)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "target {target}");
+        }
+        let after = hits();
+        let sent = (after.0 - before.0, after.1 - before.1);
+        assert!(
+            sent == (4, 0) || sent == (0, 4),
+            "target {target}: {sent:?}"
+        );
+        took.push(sent);
+    }
+    assert_ne!(took[0], took[1], "each number names its own worker");
+    let request = serde_json::from_value(json!({"text": "hi"}))?;
+    let missed = router
+        .route_generate(Some(&named("7")), &meta, request, MODEL)
+        .await;
+    assert_eq!(missed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(hits(), (4, 4), "a miss moves to no other worker");
+    Ok(())
+}
+
 /// `request` put to `router`'s streamed path on the generate route, with
 /// what the body-path counter counted for it: each path and reason, and how
 /// many requests.
@@ -1451,40 +1499,62 @@ async fn a_request_the_engine_does_not_place_goes_back_to_the_buffered_path() ->
     Ok(())
 }
 
-/// A request that names its worker reads the buffered path's refusal on the
-/// streamed path too, where the model's classic policy holds it to that
-/// worker: no worker is asked, no body is read for it, and it is counted on
-/// neither body path. Under a policy that reads no target the header
-/// changes nothing.
+/// A request that names its worker is held to it on the streamed path as
+/// on the buffered one, where the model's classic policy holds it to that
+/// worker and the engine of this process places: each number names its own
+/// worker, and the body is streamed to it. A number that names no worker
+/// goes back to the buffered path, which answers it. Under a policy that
+/// reads no target the header changes nothing: the workers take their
+/// turns.
 #[tokio::test]
-async fn a_streamed_request_that_names_its_worker_is_refused_by_name() -> Case {
-    for (policy, refused) in [
-        (PolicyConfig::ConsistentHashing, true),
-        (PolicyConfig::RoundRobin, false),
-    ] {
-        let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
-        let mut router = own_router("round_robin", &[&url])?;
-        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
-        let request = keyed(
+async fn a_streamed_request_that_names_its_worker_is_held_to_it_in_process() -> Case {
+    let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let mut router = own_router("round_robin", &[&a, &b])?;
+    let hits = || (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
+    let named = |target: &str| {
+        keyed(
             streamed_request(&[GENERATE_BODY]),
             "x-smg-target-worker",
-            "0",
-        )?;
-        let (answer, counted) = streamed(&router, request).await;
-        let response = answer.map_err(|_| "the router buffered the request")?;
-        if refused {
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-            assert_eq!(
-                extract_error_code_from_response(&response),
-                "not_decided_by_policy_controller"
-            );
-            assert!(counted.is_empty(), "{counted:?}");
-        } else {
-            assert_eq!(response.status(), StatusCode::OK);
+            target,
+        )
+    };
+    router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing));
+    let mut took = Vec::new();
+    for target in ["0", "1"] {
+        let before = hits();
+        for _ in 0..3 {
+            let (answer, counted) = streamed(&router, named(target)?).await;
+            let response = answer.map_err(|_| "the router buffered the request")?;
+            assert_eq!(response.status(), StatusCode::OK, "target {target}");
             assert_eq!(counted, [("streamed", "pure_forward", 1)]);
         }
-        assert_eq!(hits.load(Ordering::SeqCst), usize::from(!refused));
+        let after = hits();
+        let sent = (after.0 - before.0, after.1 - before.1);
+        assert!(
+            sent == (3, 0) || sent == (0, 3),
+            "target {target}: {sent:?}"
+        );
+        took.push(sent);
     }
+    assert_ne!(took[0], took[1], "each number names its own worker");
+    let (handed_back, counted) = streamed(&router, named("7")?).await;
+    assert!(handed_back.is_err(), "a miss was streamed to a worker");
+    assert_eq!(counted, [("buffered", "no_available_worker", 1)]);
+    assert_eq!(hits(), (3, 3), "a miss moves to no other worker");
+
+    router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+    for _ in 0..4 {
+        let (answer, counted) = streamed(&router, named("0")?).await;
+        let response = answer.map_err(|_| "the router buffered the request")?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counted, [("streamed", "pure_forward", 1)]);
+    }
+    assert_eq!(
+        hits(),
+        (5, 5),
+        "the header steered a policy that reads none"
+    );
     Ok(())
 }
 

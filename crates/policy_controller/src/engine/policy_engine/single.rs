@@ -147,11 +147,19 @@ pub(super) fn noted(
 /// request that states what no stage here runs is declined under that
 /// stage's name. The list is borrowed as long as the request: its ring is
 /// lent into the request's facts.
+///
+/// `kept` are the places of the list the request may take, where its host
+/// narrowed it ([`RequestMaker::kept`](crate::engine::RequestMaker::kept)):
+/// a request narrowed to a part of its pool is decided over the pool's own
+/// records and ring, every other place read as a worker a hold stands on
+/// ([`records::Live::keeping`]). So a key's walk of the ring passes those
+/// members, and the whole pass keeps none of them.
 pub(super) fn decide<'r>(
     own: &PolicyEngine,
     request: &mut Request<'r>,
     members: &'r PoolMembers,
     loads: Option<&Arc<LoadSnapshot>>,
+    kept: Option<&[usize]>,
     now: Instant,
 ) -> Decision {
     let spec = &own.spec;
@@ -171,7 +179,7 @@ pub(super) fn decide<'r>(
     // snapshot as the host holds it, and the key's text for a stage that
     // counts the key's requests on a worker.
     let key = facts.session_key.plain;
-    let live = records::Live::at(spec.engine(), &own.clock, now, loads, key);
+    let live = records::Live::at(spec.engine(), &own.clock, now, loads, key).keeping(kept);
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin, or its key's owner on the
@@ -321,7 +329,7 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
         engine::{
-            decision::{LiftedVeto, Targets},
+            decision::{LiftedVeto, Targets, MAX_TARGETS},
             decision_engine::{Decided, DecisionEngine, RequestMaker, WorkerLists},
             framework::{Picker, Place, PoolWord, TieBand},
             prompt_hashes::HashSeeds,
@@ -364,12 +372,14 @@ mod tests {
         }
     }
 
-    /// A request stated ahead, with the list its host hands for it, and how
-    /// many times the engine made it.
+    /// A request stated ahead, with the list its host hands for it, the
+    /// places of the list it may take, and how many times the
+    /// engine made it.
     struct Asks<'a> {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
         loads: Option<Arc<LoadSnapshot>>,
+        kept: Option<&'a [usize]>,
         made: Cell<u32>,
     }
 
@@ -379,6 +389,7 @@ mod tests {
                 request,
                 members,
                 loads: None,
+                kept: None,
                 made: Cell::new(0),
             }
         }
@@ -394,8 +405,9 @@ mod tests {
             self.request
         }
 
+        // A request narrowed to a part of its list is not plain.
         fn plain(&self) -> Option<Plain> {
-            self.request.plain()
+            self.request.plain().filter(|_| self.kept.is_none())
         }
 
         fn workers(&self) -> WorkerLists<'_> {
@@ -404,6 +416,10 @@ mod tests {
 
         fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
             self.loads.as_ref()
+        }
+
+        fn kept(&self) -> Option<&[usize]> {
+            self.kept
         }
     }
 
@@ -564,6 +580,67 @@ mod tests {
         assert_eq!(read(&preset("least_load"), false), (false, 1));
         let (noting, _) = hearing_as(false, true, EventSet::LEASE);
         assert_eq!(read(&noting, false), (false, 1));
+    }
+
+    /// A request its host narrowed to a part of its pool is decided over
+    /// the pool's own records: it is made, every target it is handed stands
+    /// in the part, and each worker of the part takes requests. Under a
+    /// rotation, and under a profile that scores.
+    #[test]
+    fn a_request_narrowed_to_a_part_is_decided_over_its_pools_records() {
+        for name in ["round_robin", "least_load"] {
+            let engine = preset(name);
+            let list = pool(8);
+            let members = engine.pool_members(&list);
+            let mut asks = Asks::of(request(), Some(&members));
+            asks.kept = Some(&[3, 6]);
+            let mut first = [0_u32; 8];
+            for seed in 0..32 {
+                asks.request.facts.seed = seed;
+                let decided = decided(&engine, &asks);
+                let pick = decided.decision.pick().expect("a pick");
+                let mut places = pick.targets.iter().map(|target| target.position);
+                assert!(places.all(|place| place == 3 || place == 6), "{name}");
+                let best = pick.targets.first().expect("a target");
+                first[best.position as usize] += 1;
+            }
+            assert!(first[3] > 0 && first[6] > 0, "{name}: {first:?}");
+            assert_eq!(first[3] + first[6], 32, "{name}: {first:?}");
+            assert_eq!(asks.made.get(), 32, "{name}: a narrowed request is made");
+        }
+    }
+
+    /// A keyed request narrowed to a part of its pool walks the pool's own
+    /// ring past the members it may not take. Kept to every member but its
+    /// key's owner, it is handed the members the whole walk names behind
+    /// the owner, in the walk's order.
+    #[test]
+    fn a_keyed_request_narrowed_to_a_part_walks_its_pools_ring() {
+        let engine = preset("consistent_hashing");
+        let list = pool(16);
+        let members = engine.pool_members(&list);
+        assert!(
+            engine.fill_ring(MODEL, &members),
+            "the stock ring reads one"
+        );
+        let places = |decided: &DecideOutcome| -> Vec<u32> {
+            let pick = decided.decision.pick().expect("a pick");
+            pick.targets.iter().map(|target| target.position).collect()
+        };
+        for key in 1..=40 {
+            let mut keyed = request();
+            keyed.facts.seed = key;
+            keyed.facts.session_key = Identity::hashed(key);
+            let whole = places(&decided(&engine, &Asks::of(keyed, Some(&members))));
+            assert_eq!(whole.len(), MAX_TARGETS, "key {key}");
+            let owner = whole[0] as usize;
+            let others: Vec<usize> = (0..list.len()).filter(|&place| place != owner).collect();
+            let mut narrowed = Asks::of(keyed, Some(&members));
+            narrowed.kept = Some(&others);
+            let part = places(&decided(&engine, &narrowed));
+            assert_eq!(part.len(), MAX_TARGETS, "key {key}");
+            assert_eq!(part[..MAX_TARGETS - 1], whole[1..], "key {key}");
+        }
     }
 
     /// A place whose profile scores is never picked ahead of its request:

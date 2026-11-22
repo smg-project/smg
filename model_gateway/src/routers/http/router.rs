@@ -92,7 +92,7 @@ use crate::{
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
             sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -140,6 +140,16 @@ struct StreamRelayMode {
     is_stream: bool,
     /// The numbers the stream is re-sliced by, when its wire asks for it.
     rechunk: Option<RechunkPolicy>,
+}
+
+/// What a request that names its worker is held to, where the policy
+/// engine of this process places it ([`Router::explicit_target`]).
+struct Targeted {
+    /// The snapshot of the model's workers the target was found in: the
+    /// attempt's first ask is decided over the same list.
+    snapshot: Arc<ModelWorkerSnapshot>,
+    /// The one worker the header names, and none where it names none.
+    among: Arc<[Arc<dyn Worker>]>,
 }
 
 /// One dispatch attempt of a typed request: the inputs every stage of
@@ -822,20 +832,55 @@ impl Router {
         models.all(|other| other == model).then(|| model.to_owned())
     }
 
-    /// The refusal of a request that names its worker, where the model's
-    /// classic policy holds it to that worker ([`placement::strict_target`]).
-    /// The policy engine reads no explicit target yet and would place the
-    /// request on another worker, so the shape is refused by name.
-    fn explicit_target_refusal(
+    /// The workers a request that names its worker may take, where the
+    /// model's classic policy holds it to that worker
+    /// ([`placement::strict_target`]): the one worker the header names
+    /// among the workers of the model's pool that are a `candidate` of the
+    /// route, as the classic policy finds it among the candidates it is
+    /// handed ([`placement::targeted`]), and no worker where it names none
+    /// of them. The route states them on its ask ([`Ask::among`]) with the
+    /// snapshot they were found in ([`Ask::snapshot`]): the policy engine
+    /// of this process decides over that worker alone, in that list, and
+    /// the request moves to no other. `None` for a request that names no
+    /// worker, under a policy that reads no target, and for a pool with no
+    /// available candidate, which is placed with no reading of the header,
+    /// as on the classic line.
+    ///
+    /// A followed controller's engine reads no explicit target and would
+    /// place the request on another worker, so there the shape is refused
+    /// by name.
+    fn explicit_target(
         &self,
+        policy_engine: &PolicyEngine,
         model_id: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<Response> {
+        candidate: impl Fn(&dyn Worker) -> bool,
+    ) -> Result<Option<Targeted>, Response> {
         // A request that names no worker pays the header's probe alone.
-        header_utils::extract_target_worker(headers)?;
+        if header_utils::extract_target_worker(headers).is_none() {
+            return Ok(None);
+        }
         let policy = self.policy_registry.get_policy_or_default(model_id);
-        placement::strict_target(policy.as_ref(), headers)
-            .then(|| crate::policy_controller::refused("an explicit target worker"))
+        if !placement::strict_target(policy.as_ref(), headers) {
+            return Ok(None);
+        }
+        if !policy_engine.in_process() {
+            return Err(crate::policy_controller::refused(
+                "an explicit target worker",
+            ));
+        }
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        let candidates: Vec<Arc<dyn Worker>> = snapshot
+            .pool(RoutingPool::HttpRegular)
+            .iter()
+            .filter(|worker| candidate(worker.as_ref()))
+            .cloned()
+            .collect();
+        let among = placement::targeted(&candidates, headers);
+        Ok(among.map(|target| Targeted {
+            among: target.into_iter().collect(),
+            snapshot,
+        }))
     }
 
     /// The attempt's placement by the policy controller, or the answer of a
@@ -874,9 +919,7 @@ impl Router {
                 error::model_not_found(&model),
             ));
         }
-        if let Some(refusal) = self.explicit_target_refusal(&model, attempt.headers) {
-            return Err(refusal);
-        }
+        let target = self.explicit_target(policy_engine, &model, attempt.headers, |_| true)?;
         let id = engine::mark();
         let tried = attempt.tried_rows.lock().clone();
         // The prompt the classic arm routes by: the request's token ids
@@ -895,6 +938,8 @@ impl Router {
             tried: &tried,
             hashes: Some(&hashes),
             pool: Some(RoutingPool::HttpRegular),
+            among: target.as_ref().map(|target| &target.among),
+            snapshot: target.as_ref().map(|target| &target.snapshot),
             ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
@@ -1450,9 +1495,11 @@ impl Router {
         if pool.iter().all(|worker| worker.is_dp_aware()) {
             return Err(Self::transcription_dp_not_supported());
         }
-        if let Some(refusal) = self.explicit_target_refusal(model_id, headers) {
-            return Err(refusal);
-        }
+        // The classic line hands its policy no data-parallel worker: a
+        // target's number counts among the others.
+        let target = self.explicit_target(policy_engine, model_id, headers, |worker| {
+            !worker.is_dp_aware()
+        })?;
 
         let id = engine::mark();
         let ask = Ask {
@@ -1460,6 +1507,8 @@ impl Router {
             headers,
             rid,
             pool: Some(RoutingPool::HttpRegular),
+            among: target.as_ref().map(|target| &target.among),
+            snapshot: target.as_ref().map(|target| &target.snapshot),
             ..Ask::of(&id, model_id)
         };
         policy_engine
@@ -2755,10 +2804,8 @@ impl Router {
     ///
     /// A request the engine does not place goes back to the buffered path,
     /// which answers it with the body read, as one the classic selection
-    /// finds no worker for does. A request that names its worker where the
-    /// buffered path refuses the shape ([`Self::explicit_target_refusal`])
-    /// reads that refusal here, with no body read for it: like the version
-    /// check's, it is counted on neither body path.
+    /// finds no worker for does. A request that names its worker is held
+    /// to it as on the buffered path ([`Self::explicit_target`]).
     async fn place_streamed(
         &self,
         policy_engine: &PolicyEngine,
@@ -2768,9 +2815,9 @@ impl Router {
         let Some(model) = self.model_of_an_unnamed_request() else {
             return Err(Unstreamed::Buffered(REASON_MODEL_AMBIGUOUS));
         };
-        if let Some(refusal) = self.explicit_target_refusal(&model, Some(headers)) {
-            return Err(Unstreamed::Refused(Box::new(refusal)));
-        }
+        let target = self
+            .explicit_target(policy_engine, &model, Some(headers), |_| true)
+            .map_err(|refusal| Unstreamed::Refused(Box::new(refusal)))?;
         let id = engine::mark();
         let hashes = hinted_tokens
             .map(|tokens| policy_engine.hashes(&model, &Prompt::of(Some(tokens), None)));
@@ -2778,6 +2825,8 @@ impl Router {
             headers: Some(headers),
             hashes: hashes.as_ref(),
             pool: Some(RoutingPool::HttpRegular),
+            among: target.as_ref().map(|target| &target.among),
+            snapshot: target.as_ref().map(|target| &target.snapshot),
             ..Ask::of(&id, &model)
         };
         let placed = policy_engine

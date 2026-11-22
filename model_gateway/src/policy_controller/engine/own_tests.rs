@@ -130,6 +130,8 @@ fn a_first_ask_is_plain_and_states_the_size_its_request_would() {
             missed,
             members: None,
             loads: None,
+            kept: None,
+            cut_by_wire: false,
             source: Cell::new(None),
         };
         made.plain()
@@ -398,29 +400,44 @@ async fn a_routes_rule_narrows_the_attempt_to_the_workers_it_holds() {
 }
 
 /// An ask that states the workers it may take is decided over them alone,
-/// whatever pool it names, and they take its requests in turn.
+/// whatever pool it names, and they take its requests in turn. So is one
+/// that states them in another order than its pool's list, beside a worker
+/// the list does not hold: what a later ask of an attempt can meet, where
+/// the membership changed behind its route's read.
 #[tokio::test]
 async fn an_ask_that_states_its_workers_is_decided_over_them_alone() {
     let (policy_engine, workers) = own("round_robin", 8);
-    let among: Arc<[Arc<dyn Worker>]> = [Arc::clone(&workers[1]), Arc::clone(&workers[6])].into();
-    let mut placed_on = [0_u32; 2];
-    for _ in 0..32 {
-        let id = mark();
-        let ask = Ask {
-            pool: Some(RoutingPool::HttpRegular),
-            among: Some(&among),
-            ..Ask::of(&id, MODEL)
-        };
-        let placed = policy_engine
-            .place(&ask, Instant::now())
-            .await
-            .expect("a worker of the list");
-        let at = among
-            .iter()
-            .position(|listed| Arc::ptr_eq(listed, placed.worker()));
-        placed_on[at.expect("a worker of the list")] += 1;
+    let gone: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://worker-gone:8000")
+            .model(ModelCard::new(MODEL))
+            .health_config(no_health_check())
+            .build(),
+    );
+    let in_order: Arc<[Arc<dyn Worker>]> =
+        [Arc::clone(&workers[1]), Arc::clone(&workers[6])].into();
+    let moved: Arc<[Arc<dyn Worker>]> =
+        [Arc::clone(&workers[6]), gone, Arc::clone(&workers[1])].into();
+    for (among, turns) in [(&in_order, vec![16, 16]), (&moved, vec![16, 0, 16])] {
+        let mut placed_on = vec![0_u32; among.len()];
+        for _ in 0..32 {
+            let id = mark();
+            let ask = Ask {
+                pool: Some(RoutingPool::HttpRegular),
+                among: Some(among),
+                ..Ask::of(&id, MODEL)
+            };
+            let placed = policy_engine
+                .place(&ask, Instant::now())
+                .await
+                .expect("a worker of the list");
+            let at = among
+                .iter()
+                .position(|listed| Arc::ptr_eq(listed, placed.worker()));
+            placed_on[at.expect("a worker of the list")] += 1;
+        }
+        assert_eq!(placed_on, turns);
     }
-    assert_eq!(placed_on, [16, 16]);
+    assert_eq!(policy_engine.faults(), 0);
 }
 
 /// An attempt's first ask is decided over the snapshot its route read, where
@@ -669,6 +686,73 @@ async fn places_of(
         }
     }
     places
+}
+
+/// The places in `workers` of the workers that `asks` requests of the
+/// routing key `key` are placed on, where their route states `among` as the
+/// workers they may take: each place once. Every request is placed.
+async fn places_of_a_key_among(
+    policy_engine: &PolicyEngine,
+    workers: &[Arc<dyn Worker>],
+    key: &str,
+    among: &Arc<[Arc<dyn Worker>]>,
+    asks: usize,
+) -> Vec<usize> {
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::from_str(key).expect("a header value");
+    headers.insert("x-smg-routing-key", value);
+    let mut places = Vec::new();
+    for _ in 0..asks {
+        let id = mark();
+        let ask = Ask {
+            headers: Some(&headers),
+            pool: Some(RoutingPool::HttpRegular),
+            among: Some(among),
+            ..Ask::of(&id, MODEL)
+        };
+        let placed = policy_engine.place(&ask, Instant::now()).await;
+        let placed = placed.expect("placed, not refused");
+        let at = workers
+            .iter()
+            .position(|worker| Arc::ptr_eq(worker, placed.worker()));
+        let at = at.expect("a worker the registry lists");
+        if !places.contains(&at) {
+            places.push(at);
+        }
+    }
+    places
+}
+
+/// A keyed ask narrowed to a part of its pool is decided over the pool's
+/// own ring, and nothing is made for the part: each key keeps one worker of
+/// the part across its requests, a key whose owner stands in the part keeps
+/// that owner, and the keys spread over the part. Narrowed to one worker,
+/// as a route narrows a request that names its worker, every key goes to
+/// it.
+#[tokio::test]
+async fn a_keyed_ask_narrowed_to_a_part_walks_its_pools_ring() {
+    let (policy_engine, workers) = own("consistent_hashing", 8);
+    assert!(policy_engine.fill_rings(MODEL));
+    let whole: Arc<[Arc<dyn Worker>]> = workers.iter().cloned().collect();
+    let part: Arc<[Arc<dyn Worker>]> = [1, 4, 6].map(|at| Arc::clone(&workers[at])).into();
+    let one: Arc<[Arc<dyn Worker>]> = [Arc::clone(&workers[4])].into();
+    let mut taken = [0_u32; 8];
+    for key in 0..24 {
+        let key = format!("conversation-{key}");
+        let owner = places_of_a_key_among(&policy_engine, &workers, &key, &whole, 4).await;
+        assert_eq!(owner.len(), 1, "{key}: {owner:?}");
+        let kept = places_of_a_key_among(&policy_engine, &workers, &key, &part, 4).await;
+        assert_eq!(kept.len(), 1, "{key} moved within the part: {kept:?}");
+        assert!([1, 4, 6].contains(&kept[0]), "{key}: {kept:?}");
+        if [1, 4, 6].contains(&owner[0]) {
+            assert_eq!(kept, owner, "{key} left an owner that stands in the part");
+        }
+        taken[kept[0]] += 1;
+        let held = places_of_a_key_among(&policy_engine, &workers, &key, &one, 2).await;
+        assert_eq!(held, [4], "{key}");
+    }
+    assert!([1, 4, 6].iter().all(|&at| taken[at] > 0), "{taken:?}");
+    assert_eq!(policy_engine.faults(), 0);
 }
 
 const KEY: &str = "conversation";
