@@ -4644,6 +4644,55 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) {
+        // A unit under this length keeps the walk below, which asks each
+        // piece whether it is the first and reads a key near the end of the
+        // text inside the loop: the other walk's scan to the first cut and
+        // its call for each piece near the end cost a short unit more than
+        // its few pieces gain (counted on units between added tokens).
+        const LONG_UNIT_BYTES: usize = 256;
+        if text.len() >= LONG_UNIT_BYTES {
+            return self.encode_long_sentencepiece_unit(chars, text, marker, mapped, ids, cache);
+        }
+        let bytes = text.as_bytes();
+        // A text that starts with a space or a marker has its marker already,
+        // unless the normalizer prepends one regardless.
+        let mut leading = marker
+            && (chars.prepends_to_a_marked_text()
+                || !(text.starts_with(' ') || text.starts_with(WORD_MARKER)));
+        if leading && chars.cuts_at(&[b' ', bytes[0]], 1) {
+            self.tokenize_leading_piece(chars, "", mapped, ids, cache);
+            leading = false;
+        }
+        chars.pieces(
+            bytes,
+            #[inline(always)]
+            |start, end| {
+                if leading {
+                    leading = false;
+                    self.tokenize_leading_piece(chars, &text[start..end], mapped, ids, cache);
+                } else {
+                    let key = ShortPieceKey::at(bytes, start, end);
+                    self.tokenize_keyed_raw_piece(chars, key, text, start..end, mapped, ids, cache);
+                }
+            },
+        );
+    }
+
+    /// [`Self::encode_sentencepiece`] for a long unit: the marker's piece is
+    /// encoded before the walk, which then asks no piece whether it is the
+    /// first and reads a piece's key by one read of the text where sixteen
+    /// bytes stand from its start on. Out of line, so that each walk keeps
+    /// its own loop.
+    #[inline(never)]
+    fn encode_long_sentencepiece_unit(
+        &self,
+        chars: &CharSymbols,
+        text: &str,
+        marker: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
         let bytes = text.as_bytes();
         let mut rest = text;
         // A text that starts with a space or a marker has its marker already,
@@ -4654,7 +4703,8 @@ impl NativeEncoder {
         {
             // The marker's piece goes before the walk, which then tests no
             // piece for it: the marker alone when no token bridges it to the
-            // first byte, else the marker and the text up to its first cut.
+            // first byte, else the marker and the text up to its first cut,
+            // found a byte at a time (the whole unit when it has no cut).
             let first = if chars.cuts_at(&[b' ', bytes[0]], 1) {
                 0
             } else {
@@ -4672,8 +4722,8 @@ impl NativeEncoder {
         );
     }
 
-    /// The piece `text[piece]` of a sentencepiece unit, compiled into the
-    /// walk's loop: the key by its one read of the text, as in
+    /// The piece `text[piece]` of a long sentencepiece unit, compiled into
+    /// its walk's loop: the key by its one read of the text, as in
     /// [`Self::tokenize_piece_in_place`], the packed table's probe and a
     /// hit's ids, a spilled entry's too. A miss, a piece longer than a key
     /// and a short piece the one read does not cover leave the loop by a
@@ -4688,18 +4738,13 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) {
-        let vacancy = match ShortPieceKey::in_window(text.as_bytes(), piece.start, piece.end) {
-            Some(key) => match cache.packed.lookup(key, ids) {
-                None => return,
-                Some(vacancy) if self.seeded_raw(vacancy, ids, cache) => return,
-                vacancy => vacancy,
-            },
-            None if piece.len() > SHORT_PIECE_MAX_BYTES => None,
-            None => {
+        let key = match ShortPieceKey::in_window(text.as_bytes(), piece.start, piece.end) {
+            None if piece.len() <= SHORT_PIECE_MAX_BYTES => {
                 return self.tokenize_raw_piece_off_loop(chars, text, piece, mapped, ids, cache)
             }
+            key => key,
         };
-        self.tokenize_raw_piece_slow(chars, &text[piece], vacancy, mapped, ids, cache);
+        self.tokenize_keyed_raw_piece(chars, key, text, piece, mapped, ids, cache);
     }
 
     /// [`Self::tokenize_raw_piece`] for a short piece its loop's one read
@@ -4716,7 +4761,27 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) {
-        let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
+        let key = ShortPieceKey::of(&text.as_bytes()[piece.clone()]);
+        self.tokenize_keyed_raw_piece(chars, key, text, piece, mapped, ids, cache);
+    }
+
+    /// The piece `text[piece]` of a sentencepiece unit by its key, when it
+    /// is short enough to have one: the packed table's probe and the seed.
+    /// The rest goes out of line, and the piece is cut out of the text only
+    /// there: a hit of the packed table or of the seed never pays for it.
+    #[inline(always)]
+    #[expect(clippy::too_many_arguments)]
+    fn tokenize_keyed_raw_piece(
+        &self,
+        chars: &CharSymbols,
+        key: Option<ShortPieceKey>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let vacancy = match key {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return,
                 Some(vacancy) if self.seeded_raw(vacancy, ids, cache) => return,
