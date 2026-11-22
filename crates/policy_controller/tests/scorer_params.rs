@@ -1,8 +1,11 @@
 //! A document supplies the parameters of a scorer registered by its host.
 
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Health, Lifecycle, PolicySpec, PoolFacts, RequestFacts,
-    Scorer, Scratch, StageBuild, TieBand, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Health, PoolFacts, RequestFacts, Scorer, Scratch, TieBand, WorkerId,
+    },
+    stages::{Lifecycle, StageBuild, StageRegistry},
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -39,7 +42,7 @@ impl Scorer for PreferWorker {
 #[test]
 fn a_yaml_parameter_moves_the_pick() {
     let engine = {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .scorer_with("prefer-worker", |build: &mut StageBuild<'_>| {
                 Ok(Box::new(build.params::<PreferWorker>()?))

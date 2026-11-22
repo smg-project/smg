@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use rand::{distr::Alphanumeric, RngExt};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_policy_controller::stages::StageRegistry;
 use smg_service_discovery::RuntimeDiscoveryConfig;
 use smg_worker::identity::{
     basic::{ConnectionMode, RuntimeType},
@@ -1581,8 +1582,8 @@ impl CliArgs {
     }
 
     /// The answer of `--print-policy-spec`: the policy document this command
-    /// line means, as YAML, checked by the function a start hands its own
-    /// document to ([`policy_controller::hosted`]): the operators' door over
+    /// line means, as YAML, checked by the function a start in this process
+    /// checks its own document with ([`policy_controller::checked`]), over
     /// the stock stages. The routing part of the line is read alone
     /// ([`Self::routing_config`]). Nothing is bound or spawned.
     pub(crate) fn policy_spec_print(
@@ -1604,7 +1605,7 @@ impl CliArgs {
         };
         // A document this gateway's check refuses is still the one the flags
         // mean: it prints, with the check's word for what it refuses.
-        match policy_controller::hosted(&config, None, &yaml) {
+        match policy_controller::checked(&config, &StageRegistry::builtin(), &document, &yaml) {
             Ok(_) => PolicySpecPrint::Document(yaml),
             Err(refusal) => PolicySpecPrint::DocumentRefused {
                 document: yaml,

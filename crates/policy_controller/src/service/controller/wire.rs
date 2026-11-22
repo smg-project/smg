@@ -53,7 +53,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) use crate::engine::door::Viewed;
+pub(crate) use crate::engine::store_backed_engine::Viewed;
 use crate::{
     document::{
         operator::{Document, NeedsRow, Status},
@@ -62,10 +62,10 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, Target},
         demands::Demands,
-        door::Asked,
+        store_backed_engine::RequestForm,
         view::{
-            fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
-            ModelFingerprint, NamedAffinity, Phase, RequestFacts, Session, WireModes, WorkerId,
+            fingerprint, key_of_session, AffinityRows, Constraints, HashKind, Header, Identity,
+            MediaCounts, ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
         },
     },
     service::proto::{
@@ -353,7 +353,7 @@ impl Checked {
         &self,
         lists: &mut Lists,
         view: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         let (facts, constraints) = (&self.facts, &self.constraints);
@@ -432,6 +432,10 @@ impl Checked {
                 // the rows of the host that decides, whose view hands them.
                 signal_cells: view.signal_cells,
                 client_key: facts.client_key,
+                // No frame carries a ring: the ring stage places by its
+                // own, as it learns it from the rows.
+                ring: None,
+                ring_awaited: false,
             },
             Constraints {
                 excluded: &lists.excluded,
@@ -454,7 +458,7 @@ impl Checked {
     }
 }
 
-impl Asked for Checked {
+impl RequestForm for Checked {
     type Lists = Lists;
 
     fn model(&self) -> &str {
@@ -515,7 +519,7 @@ impl Asked for Checked {
         &self,
         lists: &mut Lists,
         viewed: Viewed<'_>,
-        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<NamedAffinity<'n>>,
+        name: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> Option<AffinityRows<'n>>,
         decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
     ) -> R {
         Self::read(self, lists, viewed, name, decide)
@@ -890,7 +894,7 @@ pub(super) fn unix_micros(at: SystemTime) -> i64 {
 
 /// What a host must feed for these rows, as the contract writes it: a row
 /// for each of the engine's rows that has a flag to set
-/// ([`crate::Engine::needs_rows`]), in their order. A need the contract's row has
+/// ([`crate::engine::Engine::needs_rows`]), in their order. A need the contract's row has
 /// no flag for is not told here: a worker's requests in flight, the
 /// sessions in flight, a key's in-flight count, the affinity column and
 /// the signal cells are the controller's own to hold.
@@ -946,11 +950,11 @@ mod tests {
         document::spec::MAX_BLOCK_HASHES,
         engine::{
             decision::{
-                Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
-                Trace,
+                Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
+                Targets, Trace,
             },
-            door,
-            door::unnamed,
+            store_backed_engine,
+            store_backed_engine::unnamed,
             view::{
                 fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
                 ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
@@ -967,11 +971,9 @@ mod tests {
 
         use prost::Message as _;
 
-        use crate::{
-            document::{
-                operator::{Document, Format, NeedsRow, Status},
-                spec::PolicySpec,
-            },
+        use crate::document::{
+            operator::{Document, Format, NeedsRow, Status},
+            spec::PolicySpec,
             Needs,
         };
 
@@ -1107,7 +1109,8 @@ mod tests {
             operator::{needs_rows, test_support::LEAST_LOAD},
             spec::PolicySpec,
         },
-        Candidate, Catalog, Filter,
+        engine::{Candidate, Filter},
+        stages::StageRegistry,
     };
 
     /// A need the contract's row has no flag for writes no row: the engine
@@ -1127,15 +1130,15 @@ mod tests {
                 true
             }
 
-            fn needs(&self) -> crate::Needs {
-                crate::Needs {
+            fn needs(&self) -> crate::document::Needs {
+                crate::document::Needs {
                     affinity: true,
-                    ..crate::Needs::default()
+                    ..crate::document::Needs::default()
                 }
             }
         }
 
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages
             .filter("held", || Box::new(Held))
             .expect("a free name");
@@ -1166,7 +1169,7 @@ mod tests {
     fn the_summary_tells_each_role_and_each_flag_apart() {
         /// Keeps every worker and reads what it is built to read.
         #[derive(Debug)]
-        struct Reads(&'static str, crate::Needs);
+        struct Reads(&'static str, crate::document::Needs);
 
         impl Filter for Reads {
             fn name(&self) -> &'static str {
@@ -1177,20 +1180,20 @@ mod tests {
                 true
             }
 
-            fn needs(&self) -> crate::Needs {
+            fn needs(&self) -> crate::document::Needs {
                 self.1
             }
         }
 
-        let tokens = crate::Needs {
+        let tokens = crate::document::Needs {
             token_hashes: true,
-            ..crate::Needs::default()
+            ..crate::document::Needs::default()
         };
-        let media = crate::Needs {
+        let media = crate::document::Needs {
             media: true,
-            ..crate::Needs::default()
+            ..crate::document::Needs::default()
         };
-        let mut stages = Catalog::builtin();
+        let mut stages = StageRegistry::builtin();
         stages
             .filter("tokens", move || Box::new(Reads("tokens", tokens)))
             .expect("a free name")
@@ -1713,12 +1716,12 @@ mod tests {
     /// its facts say, and is no pair's first request: its bit is not read.
     #[test]
     fn a_frame_keeps_its_decode_later_bit_and_its_decode_of_id() {
-        use crate::engine::{door::Asked, view::Phase};
+        use crate::engine::{store_backed_engine::RequestForm, view::Phase};
         let said = |later: bool, of: Option<u64>| {
             let mut frame = with(|facts| facts.phase = proto::Phase::Prefill.into());
             (frame.decode_later, frame.decode_of) = (later, of);
             let frame = Checked::new(frame).expect("no word is a field out of its range");
-            assert_eq!(Asked::decode_later(&frame), frame.decode_later());
+            assert_eq!(RequestForm::decode_later(&frame), frame.decode_later());
             let of = frame.decode_of().map(|lease| lease.0);
             assert_eq!(frame.asks_decode(), of.is_some());
             (frame.says_more(), frame.decode_later(), of, frame.phase())
@@ -1847,7 +1850,7 @@ mod tests {
     #[test]
     fn the_wire_carries_the_lifted_veto() {
         let steered = Trace {
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
             ..Trace::default()
         };
         assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);
@@ -1922,7 +1925,7 @@ mod tests {
             },
             ..Pick::default()
         });
-        let shed = door::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let shed = store_backed_engine::shed(ShedReason::NoEndpoints, "wires", 0, 6);
         let encoded = |decision| {
             super::decision(decision)
                 .trace

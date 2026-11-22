@@ -42,6 +42,11 @@ const OUTPUT_TOKENS: u32 = 3;
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The words tonic puts on a call whose connection closed under it.
 const CANCEL_MESSAGE: &str = "operation was canceled";
+/// More chats than a rotation over two workers needs to start one on each:
+/// the bound of a case that sends chats until one starts on a given worker.
+/// Where a rotation starts is its policy's own: classic starts at the first
+/// worker registered, the policy engine at a drawn one.
+const CHATS: usize = 4;
 
 /// What a mock engine does with a generate call.
 #[derive(Clone, Copy)]
@@ -183,16 +188,18 @@ fn router_errors(rendered: &str, error_type: &str) -> f64 {
     )
 }
 
-/// The first decode worker cancels the side's start; the request is retried
-/// on the second and answered in full. The cancelled worker is charged one
-/// backend error and never asked again; nothing counts as a validation
-/// error.
+/// A decode worker cancels the side's start; the request is retried on the
+/// other and answered in full. The cancelled worker is charged one backend
+/// error and never asked again; nothing counts as a validation error.
 #[test]
 fn a_decode_start_the_worker_cancelled_is_retried_on_another_decode_worker() {
     let prefill = Engine::new(Behaviour::Completes);
     let cancelling = Engine::new(Behaviour::CancelsStart);
     let healthy = Engine::new(Behaviour::Completes);
     let (cancelling_calls, healthy_calls) = (cancelling.clone(), healthy.clone());
+    let reached = cancelling.clone();
+    let mut chats = 0;
+    let sent = &mut chats;
     let rendered = render_after(|| async move {
         let prefill_port = start_mock_engine(prefill).await;
         let cancelling_port = start_mock_engine(cancelling).await;
@@ -203,11 +210,20 @@ fn a_decode_start_the_worker_cancelled_is_retried_on_another_decode_worker() {
             (healthy_port, WorkerType::Decode),
         ])
         .await;
-        let (status, body) = one_streaming_chat(router.as_ref()).await;
-        assert_eq!(status, http::StatusCode::OK, "{body}");
-        assert!(body.contains(r#""finish_reason":"stop""#), "{body}");
-        assert!(body.contains("data: [DONE]"), "{body}");
-        assert!(!body.contains(r#""error""#), "{body}");
+        // Round robin: chats go out until one starts its decode side on
+        // the worker that cancels. Each is answered in full.
+        while reached.calls() == 0 {
+            assert!(
+                *sent < CHATS,
+                "none of {CHATS} chats started on the worker that cancels"
+            );
+            let (status, body) = one_streaming_chat(router.as_ref()).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(body.contains(r#""finish_reason":"stop""#), "{body}");
+            assert!(body.contains("data: [DONE]"), "{body}");
+            assert!(!body.contains(r#""error""#), "{body}");
+            *sent += 1;
+        }
     });
     assert_eq!(
         cancelling_calls.calls(),
@@ -216,8 +232,8 @@ fn a_decode_start_the_worker_cancelled_is_retried_on_another_decode_worker() {
     );
     assert_eq!(
         healthy_calls.calls(),
-        1,
-        "the retry went to the other decode worker"
+        chats,
+        "the retry went to the other decode worker, as each chat before it"
     );
     assert_eq!(
         worker_errors(&rendered, "decode", "backend_error"),

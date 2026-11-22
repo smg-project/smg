@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_grpc_client::is_request_timeout;
 use smg_worker::identity::basic::Worker;
 use tracing::error as trace_error;
 
@@ -12,6 +13,7 @@ use crate::{
     observability::metrics::metrics_labels,
     routers::{
         common::{
+            attempt_ledger::mark_pending_charge,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
         },
@@ -24,7 +26,9 @@ use crate::{
             },
             utils::{
                 account_pd_side_failure, dead_rendezvous_of, mark_error_reason,
-                stream_failure::UpstreamClass, tonic_ext::TonicStatusExt, DeadRendezvous,
+                stream_failure::UpstreamClass,
+                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
+                DeadRendezvous,
             },
         },
     },
@@ -206,6 +210,8 @@ fn merge_prefill_logprobs(
 /// HTTP prefill-decode router answers for the same failure; for a single
 /// worker the code clients know. A worker's report that the engine could not
 /// continue the request under its constraint is answered for the constraint.
+/// The gateway's own request timeout, on any stream, is the timeout's one
+/// answer (`to_http_error`), final for the retry layer.
 fn stream_failed(
     side: Option<PdSide>,
     worker_name: &str,
@@ -226,13 +232,15 @@ fn stream_failed(
                 status.message()
             ),
         ),
-        (None, Some(side)) => {
+        (None, Some(side)) if !is_request_timeout(status) => {
             let mut response =
                 side.answer(SidePhase::Stream, status.http_status(), status.message());
             mark_error_reason(&mut response, status.error_reason());
             response
         }
-        (None, None) => status.to_http_error(
+        // A single worker's stream, or a side's the gateway's own request
+        // timeout cut: `to_http_error` gives that timeout its one answer.
+        (None, _) => status.to_http_error(
             "worker_stream_failed",
             format!("{worker_name} stream failed: {}", status.message()),
         ),
@@ -301,18 +309,23 @@ async fn collect_stream_responses<S: FanoutChild>(
                         "Worker stream error"
                     ),
                 }
+                let mut failure = stream_failed(side, worker_name, &status, rendezvous.as_ref());
                 // The worker's failure counts against it as a streamed
                 // answer's does; the client's status and the router-error
-                // family are the pipeline's.
+                // family are the pipeline's. The breaker's sample is taken by
+                // the dispatch loop through the request's ledger, so a replayed
+                // request charges the worker once. The engine's own report is
+                // replayed on the worker and not charged.
                 if let Some(worker) = stream.worker() {
                     UpstreamClass::account_collected_failure(worker.as_ref(), &status);
+                    if let Some(sample) = status
+                        .breaker_status()
+                        .filter(|_| !is_the_engines_own_report(&status))
+                    {
+                        mark_pending_charge(&mut failure, worker, sample);
+                    }
                 }
-                return Err(stream_failed(
-                    side,
-                    worker_name,
-                    &status,
-                    rendezvous.as_ref(),
-                ));
+                return Err(failure);
             }
         };
         if let ProtoResponseVariant::Complete(complete) = gen_response.into_response() {
@@ -332,7 +345,7 @@ mod tests {
     };
 
     use axum::http::StatusCode;
-    use smg_grpc_client::sglang_proto as sglang;
+    use smg_grpc_client::{sglang_proto as sglang, RequestDeadline};
     use smg_worker::{
         identity::basic::{ConnectionMode, WorkerType},
         test_support::RefusedAddress,
@@ -340,9 +353,12 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::routers::grpc::{
-        backend_client::BasicWorkerBuilder,
-        proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+    use crate::routers::{
+        common::retry::is_retryable_response,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+        },
     };
 
     /// A stream that is already at EOF, as sequential PD hands to the
@@ -720,6 +736,30 @@ mod tests {
             logs_contain("127.0.0.1:30000"),
             "the line still names the prefill side by host and port"
         );
+    }
+
+    /// A side's stream the request timeout cut is answered as on every other
+    /// path: under the timeout's code, and never replayed. A worker's own
+    /// deadline is still the side's failure: its code, and a replay.
+    #[test]
+    fn a_side_stream_the_request_timeout_cut_is_the_timeouts_answer_and_final() {
+        let code = |response: &Response| {
+            let header = response.headers().get(error::HEADER_X_SMG_ERROR_CODE);
+            header.and_then(|v| v.to_str().ok()).map(str::to_owned)
+        };
+        let cut = RequestDeadline::after(Duration::from_secs(3)).status();
+        let workers_own = tonic::Status::deadline_exceeded("engine deadline");
+        for side in [PdSide::Prefill, PdSide::Decode] {
+            let response = stream_failed(Some(side), side.name(), &cut, None);
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(code(&response).as_deref(), Some("call_upstream_timeout"));
+            assert!(!is_retryable_response(&response));
+
+            let response = stream_failed(Some(side), side.name(), &workers_own, None);
+            let sides_own = side.code(SidePhase::Stream);
+            assert_eq!(code(&response).as_deref(), Some(sides_own));
+            assert!(is_retryable_response(&response));
+        }
     }
 
     /// A side's stream failure read into a non-streamed answer is counted

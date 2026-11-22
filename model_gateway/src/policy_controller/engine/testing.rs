@@ -7,13 +7,14 @@ use std::{sync::Arc, time::Instant};
 use kv_index::{chain_prefix_hash, ContentHash, SequenceHash, StoredBlock};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus, UNKNOWN_MODEL_ID};
 use smg_policy_controller::{
-    document::spec::DecodePick,
-    engine::view::{LoadRow, Role, WorkerId},
+    document::{AppliedSpec, DecodePick, PolicySpec},
+    engine::{LoadRow, Role, WireModes, WorkerId},
     store::{
-        Ask as StoreAsk, BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource,
-        MemoryStore, PairBuffers, Signals, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource, MemoryStore,
+        PairBuffers, Signals, ViewQuery as StoreAsk, WorkerFacts, WorkerStatus as RowStatus,
+        WorkersStore,
     },
-    AppliedSpec, LeaseId, PolicySpec, WireModes,
+    tracking::LeaseId,
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
 
@@ -33,7 +34,7 @@ type Bed = (PolicyEngine, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
 /// The id of the lease `placed` holds: a router's case reads the lease's
 /// sides in the store by it.
 pub(crate) fn lease_of(placed: &Placed) -> LeaseId {
-    placed.handle.lease().expect("a lease").lease.id
+    placed.lease().expect("a lease").lease.id
 }
 
 /// The store a start makes under the controller with one ready row a URL,
@@ -252,7 +253,7 @@ pub(crate) fn report_loads(store: &MemoryStore, busy: &str, idle: &str) -> Insta
 /// The requests the store counts in flight on `row`, a row of [`MODEL`]'s
 /// pair pools.
 pub(crate) fn pair_in_flight(store: &MemoryStore, row: WorkerId) -> u32 {
-    store.with_world(|world| {
+    store.with_snapshot(|world| {
         let ask = StoreAsk {
             gateway: GATEWAY,
             now: Instant::now(),

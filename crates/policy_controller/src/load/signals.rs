@@ -3,19 +3,19 @@
 //! A signal here is a named number about one row at one instant: a value
 //! a report states under a name the document declares
 //! ([`SignalSpec`](crate::document::spec::SignalSpec)), published with the rows. The
-//! lifecycle's event [`Signal`](crate::Signal) is the other thing of that
+//! lifecycle's event [`Signal`](crate::tracking::Signal) is the other thing of that
 //! name: one report, health change or veto about one worker, as a stage
 //! hears it.
 //!
 //! A stage resolves a signal once, when it is built
-//! ([`StageBuild::signal_column`](crate::StageBuild::signal_column)), and
+//! ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)), and
 //! from then on holds a [`SignalColumn`]. A decision reads by the row's
 //! position and the column's number ([`SignalColumn::read`]): an index
 //! and a compare of an age. No name and no hash is read in a decision.
 //!
 //! The cells stand beside the rows, not in them: a host hands them
 //! through the request's facts
-//! ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)) for
+//! ([`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)) for
 //! a profile whose stages read a signal, and for no other.
 
 use crate::{

@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output},
 };
 
-use smg_policy_controller::PolicySpec;
+use smg_policy_controller::document::PolicySpec;
 
 /// The binary's whole answer to `args` and the print option.
 fn print(args: &[&str]) -> io::Result<Output> {

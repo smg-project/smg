@@ -25,10 +25,15 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    document::spec::DENIED_HEADERS, fingerprint, AffinityFacts, Candidate, Constraints, HashKind,
-    Health, Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome,
-    OverloadRegime, Pair, Phase, PolicySpec, PoolFacts, Queue, ReleaseReason, RequestFacts, Role,
-    Shed, ShedReason, Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    document::{PolicySpec, DENIED_HEADERS},
+    engine::{
+        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Health, Identity, LiftedVeto,
+        LoadRow, MediaCounts, OverloadRegime, Pair, Phase, PoolFacts, Queue, RequestFacts, Role,
+        Shed, ShedReason, SignalSource, Target, Trace, ZoneCapacity,
+    },
+    tracking::{
+        Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass,
+    },
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -173,6 +178,8 @@ fn request_record() -> &'static [&'static str] {
             model_fingerprint,
             signal_cells,
             client_key,
+            ring,
+            ring_awaited,
         }
     )
 }
@@ -655,6 +662,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "named",
                 "model_fingerprint",
                 "signal_cells",
+                "ring",
+                "ring_awaited",
             ],
             wire_only: &["prompt_text"],
             wire: &[
@@ -900,6 +909,8 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "model_fingerprint",
                 "signal_cells",
                 "client_key",
+                "ring",
+                "ring_awaited",
             ],
             before: &[],
             beside: &[],
@@ -1531,8 +1542,8 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     // Its zero is none, a case, on purpose: the enum's comment says why.
     let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
     let expected: Vec<(String, i32)> = cases!(
-        Lifted,
-        Lifted {
+        LiftedVeto,
+        LiftedVeto {
             None,
             Overload,
             Liveness

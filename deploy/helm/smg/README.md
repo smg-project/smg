@@ -49,6 +49,8 @@ The gateway image is on Docker Hub, engine images are on GitHub Container Regist
 
 Worker images default to `ghcr.io/smg-project/smg`. Set `workers[].image.tag` to the engine-specific tag; `workers[].image.registry` and `workers[].image.repository` override the path.
 
+The worker images are published for `linux/amd64` only. On a node of another architecture a worker's image pull fails (`ImagePullBackOff`): keep the workers on amd64 nodes with `workers[].nodeSelector` (`kubernetes.io/arch: amd64`), or set `workers[].image` to an image built for that node's architecture.
+
 A tag is text: quote one made of digits alone (`tag: "1.16"`, or `--set-string` on the command line). `global.image.tag` and `workers[].image.tag` written as a number are refused at render, as `policyController.image.tag` is: a number is not rendered as written, and `1.10` would read as `1.1`.
 
 The TRT-LLM image is published, but the chart does not template `engine: trtllm` yet: `engineDefaults` knows `vllm` and `sglang`.

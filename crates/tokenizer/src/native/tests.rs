@@ -197,7 +197,7 @@ const POOL: &[char] = &[
     '\u{7F}',
 ];
 
-fn pseudo_random(state: &mut u64) -> u64 {
+pub(super) fn pseudo_random(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;
@@ -5016,6 +5016,59 @@ fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
     assert_eq!(native.encode(Some(model), "a few words", false), Ok(short));
 }
 
+/// At the full share a thread counts its packed table by its slots, apart
+/// from its wide table and its map: it keeps a share of packed pieces and
+/// one more, at the start of a call and when it learns the next. Under a
+/// share cut for more threads the one count over the three tiers clears
+/// them, as it did.
+#[test]
+fn a_thread_at_the_full_share_counts_its_packed_table_by_its_slots() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let model = tokenizer.get_model();
+    // The threads counted, and the clears of a thread that holds a share of
+    // packed pieces and one more, and learns the next.
+    for (threads, clears) in [(1, 0), (32, 1)] {
+        let native = seeded(&tokenizer);
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        native.threads.store(threads, Ordering::Relaxed);
+        let share = native.piece_cache_share();
+        for i in 0..=share as u32 {
+            let key = ShortPieceKey::of(word(i).as_bytes()).expect("key");
+            assert!(cache.packed.insert(key, &[1], share));
+        }
+        drop(cache);
+        native
+            .encode_with(Some(model), " one more piece", false, false)
+            .expect("ids");
+        let cache = native.thread_piece_cache().borrow();
+        assert_eq!(cache.clears, clears, "{threads} threads");
+    }
+}
+
+/// A thread's second call reads the merge table through; its first does
+/// not, unless its text has `READ_AT_ONCE_BYTES`.
+#[test]
+fn a_thread_reads_the_merge_table_at_its_second_call_or_before_a_long_first_text() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let tokenizer = tokenizer_of(&shapes()[0], &mut state);
+    let model = tokenizer.get_model();
+    let native = seeded(&tokenizer);
+    let left_after = |text: &str| {
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids");
+        native.thread_piece_cache().borrow().calls_to_read
+    };
+    assert_eq!(left_after(" one more piece"), 1, "the first call");
+    assert_eq!(left_after(" one more piece"), 0, "the second call reads");
+    let long = " one more piece".repeat(READ_AT_ONCE_BYTES / 15 + 1);
+    let on_a_new_thread =
+        std::thread::scope(|scope| scope.spawn(|| left_after(&long)).join().expect("a thread"));
+    assert_eq!(on_a_new_thread, 0, "a long first text has the read first");
+}
+
 /// A thread whose share fell (threads joined) since it last read it is
 /// within the new share from the start of its next encode call, with no
 /// miss in that call.
@@ -6865,6 +6918,32 @@ fn a_long_sentencepiece_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     }
 }
 
+/// The walk tests the pairs of a text 64 at a time: under every alignment
+/// of the text to those blocks the pieces end at its cuts, the cut between
+/// the last pair of a block and the first of the next too.
+#[test]
+fn the_sentencepiece_pieces_end_at_every_cut_under_each_alignment_to_a_block() {
+    let mut state = 0x0B10_C5EA_4064_5EEDu64;
+    let model = ModelWrapper::BPE(sentencepiece_model(&mut state));
+    let chars = CharSymbols::from_model(&model, Marker::Never, None).expect("the path takes it");
+    let text = random_text(&mut state, 200, &[]);
+    let mut cuts_between_blocks = 0;
+    for from in 0..64 {
+        let text = &text.as_bytes()[from..];
+        let mut pieces = Vec::new();
+        chars.pieces(text, |start, end| pieces.push((start, end)));
+        let mut cut = Vec::new();
+        let mut start = 0;
+        for end in (1..=text.len()).filter(|&p| p == text.len() || chars.cuts_at(text, p)) {
+            cut.push((start, end));
+            start = end;
+        }
+        assert_eq!(pieces, cut, "from byte {from}");
+        cuts_between_blocks += usize::from(chars.cuts_at(text, 65));
+    }
+    assert!(cuts_between_blocks > 0);
+}
+
 #[test]
 fn a_tiktoken_vocabulary_outside_the_path_declines() {
     let mut state = 0x1234_5678_9ABC_DEF1u64;
@@ -7048,7 +7127,7 @@ fn fuzz_text(state: &mut u64, fixtures: &[String]) -> String {
 
 /// The pieces of `stages` applied in turn by their match ranges, as byte
 /// ranges: the walk the encoder made before the scanners.
-fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
+pub(super) fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
     fn walk(stages: &[Stage], text: &str, offset: usize, out: &mut Vec<(usize, usize)>) {
         if text.is_empty() {
             return;

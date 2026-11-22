@@ -30,8 +30,8 @@ use super::{
 use crate::{
     document::spec::Needs,
     engine::{
-        decider::Decider,
         decision::{Decision, Target, MAX_TARGETS},
+        decision_slot::DecisionSlot,
         framework::{self, DecisionScope, TieBand},
         view::{Candidate, Phase, PoolFacts, RequestFacts, WorkerId},
     },
@@ -845,7 +845,7 @@ struct Standing {
     /// The named decider whose kept state the thread holds, its instance in
     /// the working place, from the time it is brought to the time it is
     /// given back.
-    lent: Option<Decider>,
+    lent: Option<DecisionSlot>,
 }
 
 /// A thread's working place for a plugin: its slot, and what the thread is
@@ -931,7 +931,7 @@ pub struct Plugin {
     /// this place, and gives way to the state at rest where it does not.
     places: ThreadLocal<Working>,
     /// Where a named decider's kept state rests between its decisions, one
-    /// place a name ([`Decider`]), made at the first named use. A place's
+    /// place a name ([`DecisionSlot`]), made at the first named use. A place's
     /// lock is taken where a decision brings the state and where it gives it
     /// back, and by no stage call. It is free unless a host lets two threads
     /// act as one decider at once: the second then finds no instance, makes
@@ -1156,7 +1156,7 @@ impl Plugin {
     pub fn is_warm(&self) -> bool {
         let lent = self.lent_here();
         let kept = lent.working.slot.borrow().is_some();
-        kept || (Decider::acting().is_none() && self.spare_is_mine())
+        kept || (DecisionSlot::acting().is_none() && self.spare_is_mine())
     }
 
     /// Forgets the kept instance of the decider the calling thread acts as
@@ -1192,7 +1192,7 @@ impl Plugin {
 
     /// What the host must feed for the plugin's stages, as declared. Each
     /// stage the plugin is bound as carries these into its profile's needs
-    /// ([`crate::Profile::needs`]), and so into the engine's summary.
+    /// ([`crate::engine::Profile::needs`]), and so into the engine's summary.
     pub fn needs(&self) -> Needs {
         self.needs
     }
@@ -1245,7 +1245,7 @@ impl Plugin {
     /// the stage set that shares one `decision` resource per decision. A
     /// build that binds it to several profiles takes each set from one
     /// [`Plugin::binder`]; taken here, each set would forward the lifecycle.
-    pub fn bind(self: &Arc<Self>) -> Arc<Bound> {
+    pub fn bind(self: &Arc<Self>) -> Arc<PluginBinding> {
         self.binder().bind()
     }
 
@@ -1267,7 +1267,7 @@ impl Plugin {
     /// it: the thread that loaded, or a thread acting as a named decider.
     fn spare_is_mine(&self) -> bool {
         self.spare.left.load(Ordering::Relaxed)
-            && (Decider::acting().is_some() || std::thread::current().id() == self.spare.by)
+            && (DecisionSlot::acting().is_some() || std::thread::current().id() == self.spare.by)
     }
 
     /// The apply's own instance, where it still waits for the caller: no
@@ -1295,7 +1295,7 @@ impl Plugin {
     /// name the thread is a decider of its own from here on: what it tells
     /// reaches its instance.
     fn stand(&self) {
-        if Decider::acting().is_none() {
+        if DecisionSlot::acting().is_none() {
             let standing = &self.working().standing;
             standing.set(Standing {
                 own: true,
@@ -1305,10 +1305,10 @@ impl Plugin {
     }
 
     /// Where `decider`'s kept state rests.
-    fn rest_of(&self, decider: Decider) -> &Resting {
+    fn rest_of(&self, decider: DecisionSlot) -> &Resting {
         let rests = self
             .rests
-            .get_or_init(|| (0..Decider::COUNT).map(|_| Mutex::new(None)).collect());
+            .get_or_init(|| (0..DecisionSlot::COUNT).map(|_| Mutex::new(None)).collect());
         &rests[usize::from(decider.number())]
     }
 
@@ -1328,7 +1328,7 @@ impl Plugin {
     /// every other call.
     fn lend(&self, working: &Working, decision: u64) -> bool {
         let mut now = working.standing.get();
-        let Some(decider) = Decider::acting() else {
+        let Some(decider) = DecisionSlot::acting() else {
             // Under no name the thread acts as itself. The mark is read in
             // the place the slot is read in, so a host that names none pays
             // one load here.
@@ -1382,7 +1382,7 @@ impl Plugin {
 
     /// Whether `decider`'s rest names `working` as the place of its last
     /// bring: the state in the place is the one that bring left there.
-    fn brought_here(&self, working: &Working, decider: Decider) -> bool {
+    fn brought_here(&self, working: &Working, decider: DecisionSlot) -> bool {
         self.rest_of(decider)
             .lock()
             .as_ref()
@@ -1416,7 +1416,7 @@ impl Plugin {
     /// later bring holds is not touched: the late instance is dropped, and
     /// the ring the thread holds, which was that state's, stays the
     /// thread's.
-    fn give_back(&self, working: &Working, decider: Decider) {
+    fn give_back(&self, working: &Working, decider: DecisionSlot) {
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
         let mut slot = working.slot.borrow_mut();
@@ -1455,7 +1455,7 @@ impl Plugin {
     /// and counted, and the plugin's first writes its one warning.
     fn telling(&self) -> Option<Lent<'_>> {
         let working = self.places.get();
-        if Decider::acting().is_none()
+        if DecisionSlot::acting().is_none()
             && !working.is_some_and(|working| working.standing.get().own)
             && !self.spare_is_mine()
         {
@@ -2299,8 +2299,8 @@ pub struct Binder {
 impl Binder {
     /// Binds the plugin to one profile of this build: the stage set that
     /// shares one `decision` resource per decision.
-    pub fn bind(&self) -> Arc<Bound> {
-        Arc::new(Bound {
+    pub fn bind(&self) -> Arc<PluginBinding> {
+        Arc::new(PluginBinding {
             plugin: Arc::clone(&self.plugin),
             opens: ThreadLocal::new(),
             observer_taken: Arc::clone(&self.observer_taken),
@@ -2311,22 +2311,22 @@ impl Binder {
 /// A plugin bound to one profile: the three stage adapters of a profile
 /// share it, so one decision constructs one `decision` resource per phase
 /// whichever stages the profile asks of the plugin.
-pub struct Bound {
+pub struct PluginBinding {
     plugin: Arc<Plugin>,
     opens: ThreadLocal<RefCell<Opens>>,
     /// The build's observer, shared with the build's other bound sets.
     observer_taken: Arc<AtomicBool>,
 }
 
-impl fmt::Debug for Bound {
+impl fmt::Debug for PluginBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Bound")
+        f.debug_struct("PluginBinding")
             .field("plugin", &self.plugin.name)
             .finish_non_exhaustive()
     }
 }
 
-impl Bound {
+impl PluginBinding {
     pub fn plugin(&self) -> &Arc<Plugin> {
         &self.plugin
     }
@@ -2736,7 +2736,7 @@ impl Bound {
     }
 }
 
-impl BoundPlugin for Bound {
+impl BoundPlugin for PluginBinding {
     fn name(&self) -> &'static str {
         self.plugin.name()
     }
@@ -2954,15 +2954,15 @@ impl BoundPlugin for Bound {
 /// This open marks its phase open and counts the decision before its
 /// instance's steps, so it runs under the guard that undoes an open that
 /// stops half-way.
-impl DecisionScope for Bound {
+impl DecisionScope for PluginBinding {
     fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>) {
         let mut half_open = HalfOpen::new(self);
-        Bound::open(self, facts, candidates, pool);
+        PluginBinding::open(self, facts, candidates, pool);
         half_open.returned();
     }
 
     fn close(&self) {
-        Bound::close(self);
+        PluginBinding::close(self);
     }
 }
 

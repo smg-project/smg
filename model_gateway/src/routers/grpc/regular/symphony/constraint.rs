@@ -9,7 +9,7 @@ use openai_protocol::{
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue, ToolReference},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
     profile::ProviderProfile,
-    worker::ConstrainedDecoding,
+    worker::{ConstrainedDecoding, GrammarStart as WorkerGrammarStart},
 };
 use serde_json::{json, Value};
 use smg_worker::identity::basic::{Worker, WorkerType};
@@ -17,7 +17,7 @@ use symphony::{
     grammar::{GrammarStart, Options},
     Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
 };
-use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
+use tool_parser::ToolConstraint;
 
 #[cfg(test)]
 use super::names::reading;
@@ -1403,7 +1403,7 @@ pub(super) fn whole_turn(
 
 #[cfg(test)]
 mod tests {
-    use tool_parser::GrammarStart;
+    use openai_protocol::worker::GrammarStart;
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};

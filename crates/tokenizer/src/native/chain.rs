@@ -333,18 +333,20 @@ impl Scanner {
     /// encoder's `WORD_SCAN_MIN_BYTES`): the walk is compiled both ways and
     /// the choice is made once per unit. A unit [`block`]'s pass serves
     /// ([`Self::by_blocks`]) is read by blocks, any other by the scanner's
-    /// own loop.
-    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, f: &mut F) {
+    /// own loop. `f` is taken by value, so that a caller's closure can ask
+    /// to be compiled into the walk (`#[inline(always)]` on the closure, as
+    /// the encoder's probe does).
+    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, mut f: F) {
         if self.by_blocks(text, words) {
             if words {
-                self.pieces_by_blocks::<true, F>(text, f);
+                self.pieces_by_blocks::<true, F>(text, &mut f);
             } else {
-                self.pieces_by_blocks::<false, F>(text, f);
+                self.pieces_by_blocks::<false, F>(text, &mut f);
             }
         } else if words {
-            self.pieces_as::<true, F>(text, f);
+            self.pieces_as::<true, F>(text, &mut f);
         } else {
-            self.pieces_as::<false, F>(text, f);
+            self.pieces_as::<false, F>(text, &mut f);
         }
     }
 
@@ -399,6 +401,15 @@ impl Scanner {
         }
     }
 
+    /// A piece end off the walk's main path (a digit group or a run taken
+    /// whole, the text before a match or after the last one): the callback
+    /// out of line, so that a callback compiled into the walk stands at the
+    /// template's match alone.
+    #[inline(never)]
+    fn aside<F: FnMut(usize, usize)>(f: &mut F, start: usize, end: usize) {
+        f(start, end);
+    }
+
     /// [`Self::pieces`] by the scanner's own loop, with the word scans on or
     /// off.
     fn pieces_as<const WORDS: bool, F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
@@ -445,7 +456,7 @@ impl Scanner {
                     // class or opens a match of the template: the group is
                     // one piece, and the two stages' reads of it are left
                     // out.
-                    f(pos, end);
+                    Self::aside(f, pos, end);
                 } else {
                     self.group_pieces::<WORDS, F>(text, pos, end, f);
                 }
@@ -468,7 +479,7 @@ impl Scanner {
                     // first opens no punctuation match: the template's
                     // letter run takes the run whole, so the run is one
                     // piece and the template's read of it is left out.
-                    f(pos, end);
+                    Self::aside(f, pos, end);
                     end
                 } else {
                     self.template_pieces::<WORDS, false, F>(text, pos, end, 0, usize::MAX, f)
@@ -543,7 +554,7 @@ impl Scanner {
             match self.template_match::<WORDS>(piece, pos, c, len, stop) {
                 Some(matched) => {
                     if gap < pos {
-                        f(start + gap, start + pos);
+                        Self::aside(f, start + gap, start + pos);
                     }
                     f(start + pos, start + matched);
                     pos = matched;
@@ -558,7 +569,7 @@ impl Scanner {
             }
         }
         if gap < pos {
-            f(start + gap, start + pos);
+            Self::aside(f, start + gap, start + pos);
         }
         start + pos
     }
@@ -730,7 +741,11 @@ mod tests {
     };
 
     use super::{
-        super::{pattern::Pattern, Pieces, Stage, Walk},
+        super::{
+            pattern::Pattern,
+            tests::{pseudo_random, staged},
+            Pieces, Stage,
+        },
         *,
     };
 
@@ -771,53 +786,6 @@ mod tests {
             "the word scans and the byte loop cut {text:?} alike"
         );
         pieces
-    }
-
-    /// The pieces of the stage patterns run in turn, each over the pieces
-    /// of the one before (the recursion of `NativeEncoder::pieces`).
-    fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
-        fn walk(stages: &[Stage], text: &str, offset: usize, out: &mut Vec<(usize, usize)>) {
-            if text.is_empty() {
-                return;
-            }
-            let Some((stage, rest)) = stages.split_first() else {
-                out.push((offset, offset + text.len()));
-                return;
-            };
-            let (gaps, matches) = match stage.pieces.walk() {
-                Walk::Merged => {
-                    let mut merged = None;
-                    for (start, _) in stage.pattern.find_iter(text) {
-                        match merged {
-                            Some(from) => walk(rest, &text[from..start], offset + from, out),
-                            None if start > 0 => walk(rest, &text[..start], offset, out),
-                            None => {}
-                        }
-                        merged = Some(start);
-                    }
-                    let from = merged.unwrap_or(0);
-                    walk(rest, &text[from..], offset + from, out);
-                    return;
-                }
-                Walk::Apart { gaps, matches } => (gaps, matches),
-            };
-            let mut cursor = 0;
-            for (start, end) in stage.pattern.find_iter(text) {
-                if gaps && cursor < start {
-                    walk(rest, &text[cursor..start], offset + cursor, out);
-                }
-                if matches {
-                    walk(rest, &text[start..end], offset + start, out);
-                }
-                cursor = end;
-            }
-            if gaps && cursor < text.len() {
-                walk(rest, &text[cursor..], offset + cursor, out);
-            }
-        }
-        let mut out = Vec::new();
-        walk(stages, text, 0, &mut out);
-        out
     }
 
     /// The pieces of the engine: a `Sequence` of `Split`s over the text.
@@ -889,13 +857,6 @@ mod tests {
                 "the stage alone; text {text:?}"
             );
         }
-    }
-
-    fn pseudo_random(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
     }
 
     /// Text shaped for the chain's stages: digit runs of every length up to

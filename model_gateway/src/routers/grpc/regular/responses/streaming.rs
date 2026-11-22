@@ -56,6 +56,7 @@ use super::{
     conversions,
 };
 use crate::{
+    middleware::RequestStarted,
     observability::metrics::Metrics,
     routers::{
         common::{
@@ -706,6 +707,11 @@ pub(super) async fn execute_tool_loop_streaming(
     mcp_servers: Vec<McpServerBinding>,
     background: Option<BackgroundStream>,
 ) -> Response {
+    // The request's entry stamp, read here in the request's task: the loop
+    // runs in a task of its own, where the stamp's scope is gone, and
+    // dispatches its first generation under this stamp again.
+    let entered = RequestStarted::current().map(RequestStarted::at);
+
     // Create SSE channel for client
     let (tx, rx) = sse_channel();
     let (startup_tx, startup_rx) = stream_startup_channel();
@@ -731,6 +737,7 @@ pub(super) async fn execute_tool_loop_streaming(
             mcp_servers,
             tx.clone(),
             Some(startup_tx),
+            entered,
         )
         .await
         {
@@ -960,6 +967,16 @@ impl Turns {
 }
 
 /// Internal streaming tool loop implementation
+///
+/// `entered` is the request's entry stamp, when it came in under one. Every
+/// turn's generation is dispatched under a stamp, so its dispatch wait is
+/// recorded with its time to first token (see `context::dispatch_wait`): the
+/// first turn's under `entered`, a later turn's under one taken where that
+/// turn starts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the streamed loop needs the request state, the channel, the startup barrier and the entry stamp"
+)]
 async fn execute_tool_loop_streaming_internal(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
@@ -968,6 +985,7 @@ async fn execute_tool_loop_streaming_internal(
     mcp_servers: Vec<McpServerBinding>,
     tx: SseSender,
     mut startup: Option<StreamStartupSender>,
+    entered: Option<RequestStarted>,
 ) -> Result<(), String> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
@@ -1011,6 +1029,11 @@ async fn execute_tool_loop_streaming_internal(
 
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
+
+    // The stamp the turn under way dispatches its generation under: the
+    // request's own for the first turn. A request that came in outside a
+    // stamp has none on any turn.
+    let mut turn_entered = entered;
 
     let turns = 'turns: loop {
         trace!("Streaming MCP tool loop iteration {}", state.iteration);
@@ -1066,20 +1089,23 @@ async fn execute_tool_loop_streaming_internal(
         // it ends, a refused or failed start closes it with its debit kept.
         let startup_pending = startup.is_some();
         let reservation = Arc::new(RateLimitCell::new());
-        let response = ctx
-            .pipeline
-            .execute_chat(
-                Arc::new(chat_request),
-                params.headers.clone(),
-                params.model_id.clone(),
-                ctx.components.clone(),
-                Some(iteration_charge(&params.tenant_request_meta)),
-                Some(reservation.clone()),
-                // Tool-loop iterations are not retried.
-                None,
-                startup.take(),
-            )
-            .await;
+        let generation = ctx.pipeline.execute_chat(
+            Arc::new(chat_request),
+            params.headers.clone(),
+            params.model_id.clone(),
+            ctx.components.clone(),
+            Some(iteration_charge(&params.tenant_request_meta)),
+            Some(reservation.clone()),
+            // Tool-loop iterations are not retried.
+            None,
+            startup.take(),
+        );
+        // Dispatched under the turn's stamp: the chat stream reads its
+        // dispatch wait from it where it is built.
+        let response = match turn_entered {
+            Some(entered) => entered.scope(generation).await,
+            None => generation.await,
+        };
 
         if !response.status().is_success() {
             reservation.close_unsettled().await;
@@ -1168,6 +1194,12 @@ async fn execute_tool_loop_streaming_internal(
             }
 
             state.final_turn = tool_call_limit == Some(McpToolCallLimit::User);
+
+            // The next turn starts here, and its stamp is taken here: its
+            // dispatch wait is the gateway's time from this instant to its
+            // dispatch. Counted from the request's entry it would hold every
+            // generation and tool call before it.
+            turn_entered = turn_entered.map(|_| RequestStarted::now());
 
             // Build next request with conversation history
             current_request = build_next_request(&mut state, current_request);

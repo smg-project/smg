@@ -37,21 +37,22 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
+    engine::{LoadRow, WireModes, WorkerId},
     service::{
         controller::{
-            Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+            Config, Controller, ElectionConfig, Error, LeasePlace, Listener, Readiness, Scope,
+            State,
         },
-        elector::{ElectionSettings, Elector, FileLease, Tick},
+        elector::{ElectionSettings, Elector, FileLease, TickOutcome},
         proto::{
             self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
             replication_event::Event as Sent, worker_event::Event,
         },
     },
     store::{
-        HealthPolicy, Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
+        HealthPolicy, JournalKinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
-    LoadRow, WireModes, WorkerId,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -142,7 +143,7 @@ where
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: 2,
         discovery: None,
-        election: Election {
+        election: ElectionConfig {
             lease: place.clone(),
             settings: settings(),
             advertise: None,
@@ -212,13 +213,16 @@ fn shared(dir: &tempfile::TempDir) -> LeasePlace {
         let mut before = Elector::new(lease, "replication-9@127.0.0.1:9", settings())
             .expect("the settings are in order");
         let took = before.tick(Instant::now());
-        assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
+        assert!(matches!(took, Ok(TickOutcome::Acquired { .. })), "{took:?}");
         // A release inside the take's wait hands the wait on, so the holder
         // before leads first: its take opens no fence until a renewal one
         // renew deadline after it.
         let led = Instant::now() + settings().renew_deadline;
         let renewed = before.tick(led);
-        assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "{renewed:?}");
+        assert!(
+            matches!(renewed, Ok(TickOutcome::Renewed { .. })),
+            "{renewed:?}"
+        );
         assert!(before.fence().leader_term(led).is_some(), "{led:?}");
         assert!(before.release().expect("the release's write"));
     }
@@ -959,7 +963,7 @@ fn churn(store: &MemoryStore, stop: &AtomicBool) -> u32 {
 /// Waits, within 20 s, until `store` wrote past position `seq`.
 async fn written_past(store: &MemoryStore, seq: u64) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while store.cut(Kinds::All).at.seq <= seq {
+    while store.checkpoint(JournalKinds::All).at.seq <= seq {
         assert!(Instant::now() < deadline, "no write past {seq} in 20 s");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -1131,7 +1135,7 @@ async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
         let page = 2 * 1024 * 1024 + 64;
         assert!(standby.parts.iter().all(|part| *part <= page));
         // Every row and load row the leader holds, at its head.
-        let held = leader.store.cut(Kinds::All);
+        let held = leader.store.checkpoint(JournalKinds::All);
         let at = (restored.replication_seq, restored.replication_term);
         assert_eq!(at, (held.at.seq, held.at.term));
         assert_eq!(restored.membership_epoch, held.epoch);
@@ -1291,7 +1295,7 @@ async fn operators_snapshot_numbers(workers: u32) {
         let mut cuts = Vec::new();
         for _ in 0..11 {
             let began = Instant::now();
-            let cut = leader.store.cut(Kinds::Watched);
+            let cut = leader.store.checkpoint(JournalKinds::Watched);
             cuts.push(began.elapsed().as_micros());
             assert_eq!(cut.rows.len(), workers as usize);
         }
@@ -1887,7 +1891,7 @@ impl Replica {
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 2,
             discovery: None,
-            election: Election {
+            election: ElectionConfig {
                 lease: place.clone(),
                 settings: settings(),
                 advertise: None,
@@ -1958,7 +1962,7 @@ impl Replica {
     /// What the replica holds, without its instants: its place, then its
     /// epoch, its rows and its load rows, each row without its age.
     fn held(&self) -> ((u64, u64), impl PartialEq + std::fmt::Debug) {
-        let cut = self.store.cut(Kinds::All);
+        let cut = self.store.checkpoint(JournalKinds::All);
         let rows: Vec<_> = cut
             .rows
             .into_iter()

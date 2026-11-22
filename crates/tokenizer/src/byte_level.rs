@@ -19,11 +19,13 @@
 
 use std::{
     borrow::Cow,
+    hash::BuildHasher,
     ops::Range,
     sync::{Arc, LazyLock},
 };
 
 use anyhow::{anyhow, Result};
+use rustc_hash::FxBuildHasher;
 use tokenizers::{decoders::DecoderWrapper, Tokenizer as HfTokenizer};
 
 use crate::{
@@ -268,19 +270,16 @@ impl ByteLevelTable {
     }
 
     /// Decode a complete HF sequence using the same bytes as incremental decode.
-    /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
-    /// only after concatenation so characters may span token boundaries.
+    /// Unknown IDs are dropped, as in tokenizers; bytes that are not whole on
+    /// their own are converted per run, so characters may span token boundaries.
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
-        let mut bytes = Vec::with_capacity(self.decode_capacity(ids, skip_special_tokens));
-        for &id in ids {
-            if let Some((token_bytes, special)) = self.token_bytes(id) {
-                if !skip_special_tokens || !special {
-                    bytes.extend_from_slice(token_bytes);
-                }
-            }
-        }
-        text_of(bytes).0
+        self.concat(ids, skip_special_tokens, false)
+            .unwrap_or_default()
+            .0
     }
+
+    /// Bytes the decode copies at once for a short token.
+    const WINDOW: usize = 16;
 
     /// The ids of one streamed chunk: few enough that the exact sizing pass
     /// of [`Self::decode_capacity`] reads the entries the concatenation reads
@@ -328,21 +327,61 @@ impl ByteLevelTable {
     /// `None` at the first id without an entry, before anything is rendered,
     /// so the caller decodes the whole sequence its own way (the tiktoken
     /// backend's crate decode, with its unknown-id error and its lossy
-    /// fallback); otherwise the same bytes, concatenated and converted once,
-    /// with whether the conversion was lossy, for the caller's log.
+    /// fallback); otherwise the same text, with whether a conversion was
+    /// lossy, for the caller's log.
     pub(crate) fn decode_known(
         &self,
         ids: &[TokenIdType],
         skip_special_tokens: bool,
     ) -> Option<(String, bool)> {
-        let mut bytes = Vec::with_capacity(self.decode_capacity(ids, skip_special_tokens));
+        self.concat(ids, skip_special_tokens, true)
+    }
+
+    /// The text of `ids` and whether a conversion was lossy; `None` at an id
+    /// the vocabulary lacks when `known` is set (dropped otherwise). A token
+    /// that is whole on its own is appended as text, so nothing validates it
+    /// again. The others wait in a run that is converted when a whole token
+    /// or the end closes it: a whole token neither ends nor continues a
+    /// character, so the runs convert as the whole sequence would.
+    #[inline(always)]
+    fn concat(&self, ids: &[TokenIdType], skip: bool, known: bool) -> Option<(String, bool)> {
+        let mut text = String::with_capacity(self.decode_capacity(ids, skip));
+        let mut run = Vec::new();
+        let mut lossy = false;
         for &id in ids {
-            let (token_bytes, special) = self.token_bytes(id)?;
-            if !skip_special_tokens || !special {
-                bytes.extend_from_slice(token_bytes);
+            let Some((kind, span)) = self.locate(id) else {
+                if known {
+                    return None;
+                }
+                continue;
+            };
+            if skip && kind.special() {
+                continue;
+            }
+            if !kind.text() {
+                run.extend_from_slice(&self.bytes[span]);
+                continue;
+            }
+            if !run.is_empty() {
+                lossy |= close_run(&mut run, &mut text);
+            }
+            // A short token goes as one fixed window with the length cut
+            // back, where the buffer has the room: a copy call for a few
+            // bytes costs more than the bytes.
+            let room = text.capacity() - text.len() >= Self::WINDOW;
+            match self.text.get(span.start..span.start + Self::WINDOW) {
+                Some(window) if room && span.len() <= Self::WINDOW => {
+                    let end = text.len() + span.len();
+                    text.push_str(window);
+                    text.truncate(end);
+                }
+                _ => text.push_str(&self.text[span]),
             }
         }
-        Some(text_of(bytes))
+        if !run.is_empty() {
+            lossy |= close_run(&mut run, &mut text);
+        }
+        Some((text, lossy))
     }
 
     /// Where `id` lives: its kind and its span in the store the kind names;
@@ -359,11 +398,11 @@ impl ByteLevelTable {
     }
 
     /// The bytes of `id` from whichever store holds them, and whether it is
-    /// special. The whole-sequence decode reads every id through this rather
-    /// than through [`Self::entry`]: its loop stays one kind test, one span
-    /// and one slice of the store the kind picks; the step's piece, with the
-    /// text slice's boundary checks, is not built for a decode that only
-    /// concatenates bytes.
+    /// special. The sizing pass of a chunk's decode ([`Self::decoded_len`])
+    /// reads every id through this rather than through [`Self::entry`]: one
+    /// kind test, one span and one slice of the store the kind picks; the
+    /// step's piece, with the text slice's boundary checks, is not built for
+    /// a pass that only sums lengths.
     #[inline]
     fn token_bytes(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
         let (kind, span) = self.locate(id)?;
@@ -390,14 +429,113 @@ impl ByteLevelTable {
     }
 }
 
-/// The text of concatenated token bytes: one UTF-8 conversion, lossy only
-/// when the sequence is not valid UTF-8 (a character cut by the sequence's
-/// end, or bytes that never formed one); the flag says it was lossy.
-fn text_of(bytes: Vec<u8>) -> (String, bool) {
-    match String::from_utf8(bytes) {
-        Ok(text) => (text, false),
-        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
+/// The ids of a [`ByteLevelTable`] by their bytes, the table being the store
+/// of every id's bytes: one array of 32-bit slots, open-addressed, a slot the
+/// id and, in the bits the ids leave free, bits of the hash of its bytes, so
+/// that a probe reads the table only where those bits agree. Six bytes an id,
+/// where a map by text holds every text a second time.
+pub(crate) struct TextIndex {
+    slots: Box<[u32]>,
+    /// Bits of a slot the id takes: enough for the count of ids itself, so
+    /// that the id of all ones is never one of them and [`Self::EMPTY`] is
+    /// no slot's value.
+    id_bits: u32,
+}
+
+impl TextIndex {
+    const EMPTY: u32 = u32::MAX;
+
+    /// The index of every id `table` has bytes for; of two ids with the same
+    /// bytes the lower.
+    pub(crate) fn build(table: &ByteLevelTable) -> Self {
+        let ids = table.kind.len() as u32;
+        // Two thirds full: a miss walks about five slots, a hit two.
+        let room = ids as usize + ids as usize / 2 + 1;
+        let mut index = Self {
+            slots: vec![Self::EMPTY; room].into_boxed_slice(),
+            id_bits: u32::BITS - ids.leading_zeros(),
+        };
+        let mask = index.id_mask();
+        for id in 0..ids {
+            let Some((bytes, _)) = table.token_bytes(id) else {
+                continue;
+            };
+            let (mut at, tag) = index.place(bytes);
+            loop {
+                let slot = index.slots[at];
+                if slot == Self::EMPTY {
+                    index.slots[at] = tag | id;
+                    break;
+                }
+                if slot & !mask == tag && Self::holds(table, slot & mask, bytes) {
+                    break;
+                }
+                at = index.after(at);
+            }
+        }
+        index
     }
+
+    /// The id whose bytes in `table`, the table of the build, are `bytes`.
+    pub(crate) fn get(&self, table: &ByteLevelTable, bytes: &[u8]) -> Option<TokenIdType> {
+        let (mut at, tag) = self.place(bytes);
+        let mask = self.id_mask();
+        loop {
+            let slot = self.slots[at];
+            if slot == Self::EMPTY {
+                return None;
+            }
+            if slot & !mask == tag && Self::holds(table, slot & mask, bytes) {
+                return Some(slot & mask);
+            }
+            at = self.after(at);
+        }
+    }
+
+    fn holds(table: &ByteLevelTable, id: TokenIdType, bytes: &[u8]) -> bool {
+        table.token_bytes(id).is_some_and(|(held, _)| held == bytes)
+    }
+
+    fn id_mask(&self) -> u32 {
+        u32::MAX.checked_shr(u32::BITS - self.id_bits).unwrap_or(0)
+    }
+
+    fn after(&self, at: usize) -> usize {
+        if at + 1 == self.slots.len() {
+            0
+        } else {
+            at + 1
+        }
+    }
+
+    /// Where the probe of `bytes` starts, and the bits of their hash as a
+    /// slot holds them.
+    fn place(&self, bytes: &[u8]) -> (usize, u32) {
+        let hash = FxBuildHasher
+            .hash_one(bytes)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let at = ((hash >> 32) * self.slots.len() as u64) >> 32;
+        let tag = (hash as u32).checked_shl(self.id_bits).unwrap_or(0);
+        (at as usize, tag)
+    }
+}
+
+/// Appends the text of a run of token bytes and empties the run: one UTF-8
+/// conversion, lossy only when the run is not valid UTF-8 (a character cut by
+/// the run's end, or bytes that never formed one); true when it was lossy.
+fn close_run(run: &mut Vec<u8>, text: &mut String) -> bool {
+    let lossy = match std::str::from_utf8(run) {
+        Ok(whole) => {
+            text.push_str(whole);
+            false
+        }
+        Err(_) => {
+            text.push_str(&String::from_utf8_lossy(run));
+            true
+        }
+    };
+    run.clear();
+    lossy
 }
 
 /// The bytes a token string stands for: its chars mapped through the
@@ -845,6 +983,48 @@ pub(crate) mod tests {
         let mut dec = ByteLevelIncremental::new(Arc::clone(&table), false, UnknownId::Drop);
         assert_eq!(dec.step(id("hello")).unwrap(), "hello");
         assert!(dec.pending().is_empty());
+    }
+
+    /// The index answers every byte string of its table with the lowest id
+    /// that holds it and no other string, at every count of ids from none
+    /// on (the powers of two among them): every fifth id is absent, an odd
+    /// id repeats the bytes of the even id below it, and every other pair's
+    /// bytes are not UTF-8. Some probe goes round the end of the slots.
+    #[test]
+    fn the_text_index_answers_every_byte_string_with_its_lowest_id() {
+        let mut wrapped = false;
+        for ids in 0..=64_u32 {
+            let mut builder = ByteLevelTableBuilder::with_capacity(ids as usize);
+            let mut lowest = HashMap::new();
+            for id in 0..ids {
+                if id % 5 == 4 {
+                    builder.push_absent();
+                    continue;
+                }
+                let pair = id / 2;
+                let bytes = if pair % 2 == 0 {
+                    format!("t{pair}").into_bytes()
+                } else {
+                    vec![0xFF, pair as u8]
+                };
+                builder.push(&bytes, false);
+                lowest.entry(bytes).or_insert(id);
+            }
+            let table = builder.finish();
+            let index = TextIndex::build(&table);
+            for (bytes, &id) in &lowest {
+                assert_eq!(index.get(&table, bytes), Some(id), "of {ids} ids");
+                let at = index
+                    .slots
+                    .iter()
+                    .position(|slot| slot & index.id_mask() == id);
+                wrapped |= at.is_some_and(|at| at < index.place(bytes).0);
+            }
+            for miss in [&b""[..], b"t1", &[0xFF]] {
+                assert_eq!(index.get(&table, miss), None, "of {ids} ids");
+            }
+        }
+        assert!(wrapped, "no probe went round the end of its slots");
     }
 
     #[test]

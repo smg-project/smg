@@ -275,9 +275,9 @@ pub(crate) fn bytes_allocated_during(f: impl FnOnce()) -> u64 {
 
 /// A model directory whose `config.json` is no JSON. A tokenizer registered
 /// from it keeps the media path's lookup of the model's config on this
-/// disk, where it fails as an unreadable checkpoint does; a source with no
-/// `config.json` in it is looked up on the model hub instead, and the test's
-/// answer follows the hub's. The directory is gone once dropped: a test
+/// disk, where it fails as an unreadable checkpoint does; a directory with no
+/// `config.json` in it is a model whose configuration is found nowhere, and
+/// answers as one. The directory is gone once dropped: a test
 /// holds it while its requests run.
 pub(crate) fn unreadable_model_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");

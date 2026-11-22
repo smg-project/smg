@@ -176,6 +176,9 @@ mod handles {
         /// The role these series carry, their worker's registered one,
         /// interned once per role.
         pub(super) role: Arc<str>,
+        /// The static `role` was interned from: a record of the same writer
+        /// hands in the same one, and its test is then two words.
+        pub(super) registered: &'static str,
         /// `smg_engine_running_requests`.
         pub(super) running: Gauge,
         /// `smg_engine_waiting_requests`.
@@ -220,7 +223,8 @@ mod handles {
 
     impl EngineCoreHandles {
         /// The five core series of the rank `labels` name, under `role`.
-        pub(super) fn new(labels: &EngineLabels, role: Arc<str>) -> Self {
+        pub(super) fn new(labels: &EngineLabels, registered: &'static str) -> Self {
+            let role = intern_string(registered);
             Self {
                 running: engine_gauge("smg_engine_running_requests", labels, &role),
                 waiting: engine_gauge("smg_engine_waiting_requests", labels, &role),
@@ -228,6 +232,7 @@ mod handles {
                 gen_throughput: engine_gauge("smg_engine_gen_throughput", labels, &role),
                 cache_hit_rate: engine_gauge("smg_engine_cache_hit_rate", labels, &role),
                 role,
+                registered,
             }
         }
     }
@@ -1444,7 +1449,7 @@ impl Metrics {
         if rank
             .core
             .as_ref()
-            .is_some_and(|core| core.role.as_ref() != role)
+            .is_some_and(|core| !std::ptr::eq(core.registered, role) && core.role.as_ref() != role)
         {
             rank.core = None;
             rank.kv_capacity = None;
@@ -1453,7 +1458,7 @@ impl Metrics {
         let core = rank.core.get_or_insert_with(|| {
             handles::EngineCoreHandles::new(
                 handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
-                intern_string(role),
+                role,
             )
         });
         core.running.set(load.num_running_reqs as f64);

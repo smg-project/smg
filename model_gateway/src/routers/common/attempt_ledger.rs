@@ -61,6 +61,28 @@ pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
     });
 }
 
+/// Response extension: the worker's stream failed after the worker took the
+/// call, and its breaker is not charged yet. The stream's reader has no
+/// ledger: the dispatch loop charges it ([`AttemptLedger::charge_pending`]).
+#[derive(Clone)]
+pub(crate) struct PendingCharge {
+    worker: Arc<dyn Worker>,
+    status_code: u16,
+}
+
+/// Mark `response` as the failure of `worker`'s stream, which its breaker
+/// samples as `status_code` (see [`PendingCharge`]).
+pub(crate) fn mark_pending_charge(
+    response: &mut Response,
+    worker: &Arc<dyn Worker>,
+    status_code: u16,
+) {
+    response.extensions_mut().insert(PendingCharge {
+        worker: Arc::clone(worker),
+        status_code,
+    });
+}
+
 /// The kind of the worker whose side alone failed, where `response` names
 /// one ([`FailedSide`]).
 pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
@@ -130,6 +152,14 @@ impl AttemptLedger {
             ledger.charged.push(worker.url().to_string());
         }
         worker.record_outcome(status_code);
+    }
+
+    /// Charge the worker whose stream failed under the attempt
+    /// ([`PendingCharge`]), by the rule of [`Self::record_outcome`].
+    pub(crate) fn charge_pending(&self, response: &Response) {
+        if let Some(charge) = response.extensions().get::<PendingCharge>() {
+            self.record_outcome(charge.worker.as_ref(), charge.status_code);
+        }
     }
 
     /// Whether a retry attempt may select `worker`: not after it answered the

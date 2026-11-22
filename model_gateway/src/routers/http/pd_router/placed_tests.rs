@@ -5,13 +5,12 @@ use std::{collections::HashSet, error::Error, time::Duration};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::spec::DecodePick,
-    engine::view::{LoadRow, Role, WireModes, TEXT_BYTES_PER_TOKEN},
+    document::{AppliedSpec, DecodePick, PolicySpec},
+    engine::{LoadRow, Role, WireModes, TEXT_BYTES_PER_TOKEN},
     store::{
-        GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MemoryStore, PairingDescriptor,
-        WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        pairing::PairingDescriptor, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource,
+        MemoryStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
-    AppliedSpec, PolicySpec,
 };
 use smg_worker::identity::basic::{ConnectionMode, MORIIO_CONNECTOR};
 
@@ -500,7 +499,7 @@ async fn decode_arrivals_over(
     let (policy_engine, store, _) = bed;
     let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
     document.plans.pd_pair.decode = picked;
-    document.generation = store.with_world(|world| world.spec().generation()) + 1;
+    document.generation = store.with_snapshot(|world| world.spec().generation()) + 1;
     store
         .apply(AppliedSpec::validate(&document)?)
         .map_err(|stale| format!("{stale:?}"))?;
@@ -569,7 +568,7 @@ async fn a_decode_its_prefill_was_told_is_booked_at_the_prefills_send() -> Case 
     let (policy_engine, store, _) = bed;
     let mut document = PolicySpec::pair_presets("least_load", "least_load")?;
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
-    document.generation = store.with_world(|world| world.spec().generation()) + 1;
+    document.generation = store.with_snapshot(|world| world.spec().generation()) + 1;
     store
         .apply(AppliedSpec::validate(&document)?)
         .map_err(|stale| format!("{stale:?}"))?;

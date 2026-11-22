@@ -1,0 +1,154 @@
+{
+  "_doc": "The standard classes of the release comparison, in the order a harness process runs them: 19 image classes (one file each) and one batch of ten. The files are written by make_images.py beside this file; run.py classes joins them with a configurations file into one class list per processor configuration.",
+  "classes": [
+    {
+      "name": "jpeg-256",
+      "kind": "image",
+      "files": [
+        "size-256x256-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-1k",
+      "kind": "image",
+      "files": [
+        "size-1024x768-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-1080p",
+      "kind": "image",
+      "files": [
+        "size-1920x1080-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-4k",
+      "kind": "image",
+      "files": [
+        "size-4096x2304-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-8k",
+      "kind": "image",
+      "files": [
+        "size-8192x8192-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "png-256",
+      "kind": "image",
+      "files": [
+        "size-256x256-png.png"
+      ]
+    },
+    {
+      "name": "png-1k",
+      "kind": "image",
+      "files": [
+        "size-1024x768-png.png"
+      ]
+    },
+    {
+      "name": "png-1080p",
+      "kind": "image",
+      "files": [
+        "size-1920x1080-png.png"
+      ]
+    },
+    {
+      "name": "png-4k",
+      "kind": "image",
+      "files": [
+        "size-3840x2160-png.png"
+      ]
+    },
+    {
+      "name": "png-rgba",
+      "kind": "image",
+      "files": [
+        "png-rgba8.png"
+      ]
+    },
+    {
+      "name": "webp-lossy",
+      "kind": "image",
+      "files": [
+        "webp-lossy-q80.webp"
+      ]
+    },
+    {
+      "name": "webp-lossless",
+      "kind": "image",
+      "files": [
+        "webp-lossless.webp"
+      ]
+    },
+    {
+      "name": "jpeg-progressive",
+      "kind": "image",
+      "files": [
+        "jpeg-progressive-q90.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-cmyk",
+      "kind": "image",
+      "files": [
+        "jpeg-cmyk.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-gray",
+      "kind": "image",
+      "files": [
+        "jpeg-grayscale.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif6",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-6.jpg"
+      ]
+    },
+    {
+      "name": "gif-static",
+      "kind": "image",
+      "files": [
+        "gif-static.gif"
+      ]
+    },
+    {
+      "name": "bmp",
+      "kind": "image",
+      "files": [
+        "bmp-24.bmp"
+      ]
+    },
+    {
+      "name": "tiff",
+      "kind": "image",
+      "files": [
+        "tiff-uncompressed.tiff"
+      ]
+    },
+    {
+      "name": "batch-10x1k",
+      "kind": "batch",
+      "files": [
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg",
+        "size-1024x768-jpeg.jpg"
+      ]
+    }
+  ]
+}

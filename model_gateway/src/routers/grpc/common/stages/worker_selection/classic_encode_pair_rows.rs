@@ -401,6 +401,10 @@ impl LoadBalancingPolicy for Watched {
         self.inner.name()
     }
 
+    fn honors_routing_key(&self) -> bool {
+        self.inner.honors_routing_key()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

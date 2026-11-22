@@ -13,6 +13,7 @@
 
 use crate::shape::{Layout, Message};
 
+pub mod command;
 pub mod deepseek_v3;
 pub mod deepseek_v3_1;
 pub mod deepseek_v3_2;
@@ -24,6 +25,7 @@ pub mod function_gemma;
 pub mod gemma4;
 pub mod glm;
 pub mod glm4;
+pub mod gpt_oss;
 pub mod hy4;
 pub mod hy_v3;
 pub mod inkling;
@@ -52,6 +54,7 @@ pub mod registry;
 pub mod seed_oss;
 pub mod xlam;
 
+pub use command::command;
 pub use deepseek_v3::deepseek_v3;
 pub use deepseek_v3_1::deepseek_v3_1;
 pub use deepseek_v3_2::deepseek_v3_2;
@@ -63,6 +66,7 @@ pub use function_gemma::function_gemma;
 pub use gemma4::gemma4;
 pub use glm::glm;
 pub use glm4::glm4;
+pub use gpt_oss::gpt_oss;
 pub use hy4::hy4;
 pub use hy_v3::hy_v3;
 pub use inkling::inkling;

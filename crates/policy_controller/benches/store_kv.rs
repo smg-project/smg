@@ -46,11 +46,11 @@ use std::{
 use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use kv_index::{chain_prefix_hash, ChainBlockMap, ChainIndex};
 use smg_policy_controller::{
+    engine::{Role, WorkerId},
     store::{
         BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, LaneCounts, MemoryStore,
         SequenceHash, Signals, StoredBlock, WorkerFacts, WorkersStore, INDEX_WORKERS,
     },
-    Role, WorkerId,
 };
 
 const MODEL: &str = "m";

@@ -16,13 +16,14 @@
 use crate::{
     engine::{
         decision::{Pair, Target},
+        sticky_sessions::SessionVerdict,
         view::{
-            AffinityFacts, Candidate, Engines, HashKind, Header, Health, Identity, LoadRow,
-            MediaCounts, ModelFingerprint, NamedAffinity, OverloadRegime, Phase, PoolFacts,
-            RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+            AffinityFacts, AffinityRows, Candidate, Engines, HashKind, Header, Health, Identity,
+            LoadRow, MediaCounts, ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts,
+            Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
         },
     },
-    sessions::SessionVerdict,
+    policies::consistent_hashing::PoolRing,
     tracking::lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
 };
 
@@ -81,19 +82,22 @@ wit! {
     &[AffinityFacts] => "host-only",
     // Host-only: the rows a host names in that column's place stay in
     // process, as the column does.
-    Option<NamedAffinity<'_>> => "host-only",
+    Option<AffinityRows<'_>> => "host-only",
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
-    Option<&crate::LentCounts<'_>> => "host-only",
+    Option<&crate::tracking::PoolInFlightCounts<'_>> => "host-only",
     // Host-only: a guest reads a candidate's count of the request's session
     // key as the candidate's own field, written there or lent beside it.
-    Option<&[crate::KeyedRow]> => "host-only",
+    Option<&[crate::engine::KeyedRow]> => "host-only",
     // Host-only: the signal cells stand beside the rows of the host that
     // decides, and no contract carries them yet.
-    Option<&crate::SignalCells> => "host-only",
+    Option<&crate::load::SignalCells> => "host-only",
     // Host-only: the engines a host lists beside its rows name the rows by
     // position, and a guest is shown rows.
     Engines<'_> => "host-only",
+    // Host-only: the ring of a host's own list of workers names its
+    // members by their rows' places, and a guest is shown rows.
+    Option<&PoolRing> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -217,10 +221,10 @@ pub(crate) fn all() -> Vec<Probe> {
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
             lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
-            model_fingerprint, signal_cells, client_key,
+            model_fingerprint, signal_cells, client_key, ring, ring_awaited,
         } host [
             now_micros, pinned_at, lent_in_flight, lent_session_in_flight, session_counted,
-            affinity, named, model_fingerprint, signal_cells, client_key
+            affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_awaited
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),

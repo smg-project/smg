@@ -34,22 +34,21 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::spec::{KeySourceSpec, Pairing, RoutingKeySpec},
+    document::{
+        AppliedSpec, DerivedKey, KeySource, KeySourceSpec, Pairing, PolicySpec, RoutingKeySpec,
+    },
     engine::{
-        decision::{Decision, Shed, ShedReason, Trace},
-        door::Refused,
-        view::{
-            fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
-            WireModes, WorkerId,
-        },
+        fingerprint, Candidate, Decision, DecisionRefused, Identity, LoadRow, MediaCounts, Phase,
+        Picker, RequestFacts, Role, Shed, ShedReason, Target, Targets, TieBand, Trace, WireModes,
+        WorkerId,
     },
+    stages::{Lifecycle, StageRegistry},
     store::{
-        Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
-        LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
-        WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+        pairing::PairingDescriptor, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore,
+        LoadSink, LoadSource, MemoryStore, PairBuffers, SessionsStore, ViewQuery as StoreAsk,
+        WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Catalog, DerivedKey, KeySource, Lease, LeaseId, Lifecycle, Membership, Outcome,
-    Picker, PolicySpec, ReleaseReason, Side, Target, Targets, TieBand, TransportClass,
+    tracking::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 use smg_worker::{
     health::circuit_breaker::CircuitBreakerConfig,
@@ -59,7 +58,7 @@ use smg_worker::{
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, record_bed, store_blocks, MODEL},
-    transport_class, Ask, End, Hashes, Held, Placed, PolicyEngine, Prompt, Sent, Unplaced, GATEWAY,
+    transport_class, Ask, End, Held, Placed, PolicyEngine, Prompt, Sent, Unplaced, GATEWAY,
     NO_STAGE,
 };
 use crate::{
@@ -712,7 +711,7 @@ fn a_refused_ask_is_counted_without_a_profile() {
             .now_or_never()
             .unwrap()
             .err();
-        assert_eq!(refused, Some(Unplaced::Refused(Refused::Unleased)));
+        assert_eq!(refused, Some(Unplaced::Refused(DecisionRefused::Unleased)));
     });
     assert_decisions(&rendered, "", "refused", 1);
 }
@@ -816,17 +815,14 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
         store.set_block_size(MODEL, block_size);
         let blocks = compute_request_content_hashes(&tokens, block_size as usize);
         assert_eq!(store_blocks(&store, holder, &blocks), BatchOutcome::Applied);
-        let hashes = Hashes::of(
-            &store,
-            MODEL,
-            &Prompt {
-                tokens: Some(&tokens),
-                ..Prompt::default()
-            },
-        );
+        let hashes = Prompt {
+            tokens: Some(&tokens),
+            ..Prompt::default()
+        }
+        .hashes(&store, MODEL);
         let now = Instant::now();
         // Give plain asks a lower-load choice while affinity can still win.
-        for row in store.snapshot().1 {
+        for row in store.all_rows().1 {
             store.record(
                 row.id,
                 0,
@@ -888,8 +884,10 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
     };
     for prompt in [as_text, as_tokens] {
         let (policy_engine, store) = record_bed();
-        let hashes = Hashes::of(&store, MODEL, &prompt);
-        assert!(!hashes.blocks.is_empty());
+        let hashes = prompt.hashes(&store, MODEL);
+        let mut written = RequestFacts::default();
+        hashes.write_to(&mut written);
+        assert!(!written.block_hashes.is_empty());
         let now = Instant::now();
         let cold = Ask {
             hashes: Some(&hashes),
@@ -901,7 +899,7 @@ async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
             .expect("a worker")
             .id();
         // Every other row reports less load: the record alone brings it back.
-        for row in store.snapshot().1 {
+        for row in store.all_rows().1 {
             let running = u32::from(row.id == sent);
             let load = LoadRow {
                 running,
@@ -1153,7 +1151,7 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             None,
         ),
         (
-            Unplaced::Refused(Refused::Faulted),
+            Unplaced::Refused(DecisionRefused::Faulted),
             unavailable,
             "policy_controller_unavailable",
             Some("1"),
@@ -1675,7 +1673,7 @@ fn pair_spec(
     for binding in &mut document.bindings {
         binding.routing_key = key.cloned();
     }
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     let prefill = PairPicker {
         name: "ordered-prefill",
         limit: 4,
@@ -1822,7 +1820,7 @@ impl PairBed {
     }
 
     fn counts(&self, ids: &[WorkerId]) -> Option<Vec<u32>> {
-        self.store.with_world(|world| {
+        self.store.with_snapshot(|world| {
             let ask = StoreAsk {
                 gateway: GATEWAY,
                 now: Instant::now(),
@@ -1888,10 +1886,16 @@ async fn a_pair_lands_on_a_prefill_and_its_decode_with_the_ranks_its_targets_nam
 
 #[test]
 fn an_asks_own_token_count_wins_over_its_hashes_count() {
-    let tokens = Hashes {
-        prompt_tokens: 88,
-        ..Hashes::default()
-    };
+    let (_, store) = record_bed();
+    let prompt = [7; 88];
+    let tokens = Prompt {
+        tokens: Some(&prompt),
+        ..Prompt::default()
+    }
+    .hashes(&store, MODEL);
+    let mut counted = RequestFacts::default();
+    tokens.write_to(&mut counted);
+    assert_eq!(counted.prompt_tokens, 88, "the hashes count the prompt");
     let ask = Ask {
         hashes: Some(&tokens),
         ..pair_ask()
@@ -2064,7 +2068,7 @@ async fn a_pair_that_finds_no_room_queues_and_is_decided_again_at_its_admission(
     let Ok((placed, _guard)) = attempt.await else {
         panic!("a new decision is admitted");
     };
-    let second = placed.handle.lease().expect("a lease").lease.id;
+    let second = placed.lease().expect("a lease").lease.id;
     assert_eq!(
         bed.issued(Side::Prefill)
             .iter()
@@ -2292,7 +2296,7 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
         .commit_pair(asked, None, &mut Vec::new(), now)
         .expect("a placement");
     let (prefill, decode) = (bed.prefills[0].0, bed.decodes[0].0);
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     bed.calls.lock().clear();
     placed.dispatched(now + Duration::from_micros(5));
     placed.decode_dispatched(now + Duration::from_micros(8));
@@ -2460,7 +2464,7 @@ async fn the_routes_rule_passes_over_a_pair_at_its_commit() {
 async fn a_sent_pairs_prefill_ends_ahead_of_its_answer() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let placed = bed.commit().await.expect("a placement");
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     let mut sent = Sent::from(placed);
     let now = Instant::now();
     bed.calls.lock().clear();
@@ -2492,7 +2496,7 @@ async fn a_sent_pairs_prefill_ends_ahead_of_its_answer() {
 async fn a_prefill_that_was_not_sent_hears_no_dispatch_and_no_end() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let placed = bed.commit().await.expect("a placement");
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     let decode = bed.decodes[0].0;
     let mut sent = Sent::from(placed);
     let now = Instant::now();
@@ -2515,7 +2519,7 @@ async fn a_prefill_that_was_not_sent_hears_no_dispatch_and_no_end() {
 async fn releasing_the_decode_leaves_the_prefill_on_file() {
     let bed = PairBed::new(Pairing::Lenient, 1, 1, 1).expect("a pair fleet");
     let mut placed = bed.commit().await.expect("a placement");
-    let lease = placed.handle.lease().expect("a lease").lease.id;
+    let lease = placed.lease().expect("a lease").lease.id;
     placed.decode_released(ReleaseReason::ClientGone, Instant::now());
     let sides = bed.store.sides(GATEWAY, lease).expect("the prefill stands");
     assert_eq!(sides.record.state, LeaseState::ISSUED);
@@ -2758,7 +2762,7 @@ async fn a_probe_refuses_a_decode_ask_and_releases_a_pick_before_queuing() {
     tokio::pin!(refused);
     assert!(matches!(
         poll!(refused.as_mut()),
-        Poll::Ready(Err(Unplaced::Refused(Refused::PairSide)))
+        Poll::Ready(Err(Unplaced::Refused(DecisionRefused::PairSide)))
     ));
     assert_eq!(admission.queued_requests(), 1);
 

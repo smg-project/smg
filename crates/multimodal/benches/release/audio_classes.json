@@ -1,0 +1,157 @@
+{
+  "_doc": "The WAV classes of the release comparison, in the order a harness process runs them: one uncompressed clip each, written by make_audio.py beside this file.",
+  "classes": [
+    {
+      "name": "wav-16k-0.1s",
+      "title": "16-bit 16 kHz mono, 0.1 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-16k-mono-0.1s.wav"
+      ]
+    },
+    {
+      "name": "wav-16k-1s",
+      "title": "16-bit 16 kHz mono, 1 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-16k-mono-1s.wav"
+      ]
+    },
+    {
+      "name": "wav-16k-30s",
+      "title": "16-bit 16 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-16k-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-16k-600s",
+      "title": "16-bit 16 kHz mono, 600 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-16k-mono-600s.wav"
+      ]
+    },
+    {
+      "name": "wav-16k-clipping",
+      "title": "16-bit 16 kHz mono, clipped signal, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-16k-mono-clipping-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-16k-dc",
+      "title": "16-bit 16 kHz mono, constant offset, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-16k-mono-dc-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-16k-silence",
+      "title": "16-bit 16 kHz mono, silence, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-16k-mono-silence-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-8k",
+      "title": "16-bit 8 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-8000-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-22k",
+      "title": "16-bit 22.05 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-22050-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-44k",
+      "title": "16-bit 44.1 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-44100-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-48k",
+      "title": "16-bit 48 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-48000-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-96k",
+      "title": "16-bit 96 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-96000-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-44k-stereo",
+      "title": "16-bit 44.1 kHz stereo, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-44100-stereo-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-48k-stereo",
+      "title": "16-bit 48 kHz stereo, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-48k-2ch-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-48k-6ch",
+      "title": "16-bit 48 kHz six channels, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-16-48k-6ch-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-24bit",
+      "title": "24-bit 16 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-24-16k-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-32bit",
+      "title": "32-bit 16 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-32-16k-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-float",
+      "title": "float 16 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-f32-16k-mono-30s.wav"
+      ]
+    },
+    {
+      "name": "wav-alaw",
+      "title": "A-law 8 kHz mono, 30 s",
+      "kind": "audio",
+      "files": [
+        "wav-alaw-8k-mono-30s.wav"
+      ]
+    }
+  ]
+}

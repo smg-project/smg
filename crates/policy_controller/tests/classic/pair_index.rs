@@ -7,9 +7,9 @@
 use serde::Deserialize;
 use serde_json::Value;
 use smg_policy_controller::{
-    document::spec::Pairing,
+    document::Pairing,
+    engine::{WireModes, WorkerId},
     store::pairing::{key, wire_mismatch, Member, PairClasses, PairingDescriptor, LAYOUT_FACTS},
-    WireModes, WorkerId,
 };
 
 /// The classic policy these rows record, as a sheet's head names it.

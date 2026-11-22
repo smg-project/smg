@@ -1,6 +1,11 @@
 //! The policy document's routes through the gateway's control-plane router.
 
-use std::{convert::Infallible, error::Error, sync::Arc};
+use std::{
+    convert::Infallible,
+    error::Error,
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -10,13 +15,16 @@ use axum::{
 use serde_json::{json, Value};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
 use smg_policy_controller::{
-    document::operator::Turn,
-    engine::view::WireModes,
+    document::{operator::SerialTurn, PolicySpec},
+    engine::WireModes,
     store::{
-        EncodeOffer, GatewayId, Maker, Overload, PairingDescriptor, Reachability, WorkerFacts,
-        WorkersStore,
+        identity, pairing::PairingDescriptor, EncodeOffer, GatewayId, Overload, Reachability,
+        Registrant, WorkerFacts, WorkersStore,
     },
-    PolicySpec,
+};
+use smg_worker::{
+    identity::basic::RuntimeType, labels::DISCOVERY_PROVIDER_LABEL, model_card::ModelCard,
+    worker::WorkerStatus,
 };
 use tower::ServiceExt;
 
@@ -25,14 +33,14 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     middleware::{AuthConfig, SHED_RETRY_AFTER_SECS},
-    routers::gateway::Gateway,
+    routers::{gateway::Gateway, grpc::backend_client::BasicWorkerBuilder},
     server::{build_app, health::ProbeState, AppState},
 };
 
 type Case = Result<(), Box<dyn Error>>;
 
 /// The turn of one kind of call, read from the operators.
-type TurnOf = fn(&super::Operators) -> &Turn;
+type TurnOf = fn(&super::Operators) -> &SerialTurn;
 
 const SPEC: &str = "/policy/spec";
 const VALIDATE: &str = "/policy/spec:validate";
@@ -41,6 +49,11 @@ const SNAPSHOT: &str = "/policy/snapshot";
 /// A document apart from the one a routing configuration means.
 const OTHER: &str =
     "apiVersion: smg.policy/v1\nprofiles:\n  preview:\n    score: [least-load]\n    pick: best\n";
+
+/// A document a start takes as its operator's own where the gateway decides
+/// in its own process: the engine picks each of its places by itself.
+const GIVEN: &str = "apiVersion: smg.policy/v1\nprofiles:\n  preview:\n    \
+                     filter: [healthy, not-overloaded, not-tried]\n    pick: round-robin\n";
 
 /// A routing configuration with the policy controller picked.
 fn picked() -> RouterConfig {
@@ -113,7 +126,20 @@ fn snapshot(query: &str) -> Result<Request<Body>, http::Error> {
     by_admin(Request::get(format!("{SNAPSHOT}{query}"))).body(Body::empty())
 }
 
-/// A worker's facts under `key`, serving `models`.
+/// A worker object at `url` that serves `models`, before it is built.
+fn worker(url: &str, models: &[&str]) -> BasicWorkerBuilder {
+    let serving = models.iter().map(|model| ModelCard::new(*model));
+    serving.fold(BasicWorkerBuilder::new(url), BasicWorkerBuilder::model)
+}
+
+/// `worker` in the registry of `state`.
+fn register(state: &AppState, worker: BasicWorkerBuilder) -> Result<(), &'static str> {
+    let registry = &state.context.worker_registry;
+    let registered = registry.register(Arc::new(worker.build()));
+    registered.map(|_| ()).ok_or("the worker did not register")
+}
+
+/// A stored worker's facts under `key`, serving `models`.
 fn serving(key: &str, models: &[&str]) -> WorkerFacts {
     WorkerFacts {
         key: key.to_owned(),
@@ -224,7 +250,7 @@ async fn the_document_in_force_is_the_one_the_print_option_writes() -> Case {
 #[tokio::test]
 async fn a_given_document_is_told_as_the_one_in_force() -> Case {
     let config = RouterConfig {
-        policy_spec: Some(serde_yaml::from_str(OTHER)?),
+        policy_spec: Some(serde_yaml::from_str(GIVEN)?),
         ..picked()
     };
     let given = config.policy_document_in_force()?;
@@ -435,18 +461,18 @@ async fn a_call_past_the_ones_that_may_wait_is_refused() -> Case {
     Ok(())
 }
 
-/// A snapshot tells the store's rows in the order of their keys as
-/// registered, each address without its userinfo, under the generation
+/// A snapshot tells the registry's workers in the order of their addresses
+/// as registered, each address without its userinfo, under the generation
 /// that runs. `limit` and `models` cut the page, and a misspelt key is
 /// refused, never read as no filter.
 #[tokio::test]
-async fn a_snapshot_tells_the_stores_rows_by_key_without_their_userinfo() -> Case {
+async fn a_snapshot_tells_the_workers_by_address_without_their_userinfo() -> Case {
     let state = state(picked()).await?;
-    let store = state.context.policy_store.clone().ok_or("no store")?;
-    // The key with a userinfo sorts last as registered, and second as told.
-    store.upsert(serving("http://z.example", &["c"]));
-    store.upsert(serving("http://zz:secret@b.example", &["b"]));
-    store.upsert(serving("http://a.example", &["a", "c"]));
+    // The address with a userinfo sorts last as registered, and second as
+    // told.
+    register(&state, worker("http://z.example", &["c"]))?;
+    register(&state, worker("http://zz:secret@b.example", &["b"]))?;
+    register(&state, worker("http://a.example", &["a", "c"]))?;
     let app = app(state)?;
     let (a, b, z) = ("http://a.example", "http://b.example", "http://z.example");
     for (query, keys, truncated) in [
@@ -474,9 +500,8 @@ async fn a_snapshot_tells_the_stores_rows_by_key_without_their_userinfo() -> Cas
 #[tokio::test]
 async fn a_snapshot_stops_at_its_cap_of_rows() -> Case {
     let state = state(picked()).await?;
-    let store = state.context.policy_store.clone().ok_or("no store")?;
     for n in 0..SNAPSHOT_ROWS + 2 {
-        store.upsert(serving(&format!("http://w{n:05}.example"), &["m"]));
+        register(&state, worker(&format!("http://w{n:05}.example"), &["m"]))?;
     }
     let (status, _, page) = answered(&app(state)?, snapshot("?limit=5000")?).await?;
     assert_eq!(status, StatusCode::OK);
@@ -526,13 +551,111 @@ async fn a_snapshots_ask_keeps_the_served_calls_bounds() -> Case {
     Ok(())
 }
 
-/// The OpenAPI document gives a snapshot's page as the route writes it,
-/// for a row that states the least and for one that states every nullable
-/// fact: each value of its listed type and names, each key listed, and no
-/// required key left out.
+/// Where the gateway decides in its own process a worker is told as its
+/// object states it. Its id is the one the policy crate derives from its
+/// address, under no stored life. Its status is the object's and its
+/// pairing facts are its own. Its maker is the discovery source's, under
+/// the address it was registered at, where it carries a provenance label.
+/// A hosted provider's worker is not told, and a worker that names no
+/// model is told under no model's name.
+#[tokio::test]
+async fn a_snapshot_tells_a_worker_as_its_object_states_it() -> Case {
+    let state = state(picked()).await?;
+    let found = worker("http://found.example", &["m"])
+        .label(DISCOVERY_PROVIDER_LABEL, "finder")
+        .label("pairing_protocol", "p1")
+        .label("version", "v1")
+        .status(WorkerStatus::Ready);
+    register(&state, found)?;
+    let plain = worker("http://plain.example", &["m"]).status(WorkerStatus::NotReady);
+    register(&state, plain)?;
+    register(&state, worker("http://any.example", &[]))?;
+    let hosted = worker("http://hosted.example", &["m"]).runtime_type(RuntimeType::External);
+    register(&state, hosted)?;
+    let app = app(state)?;
+
+    let (status, _, page) = answered(&app, snapshot("")?).await?;
+    assert_eq!(status, StatusCode::OK);
+    let rows = page["rows"].as_array().ok_or("no rows")?;
+    let told = rows
+        .iter()
+        .filter_map(|row| row["registration_key"].as_str());
+    let (any, found, plain) = (
+        "http://any.example",
+        "http://found.example",
+        "http://plain.example",
+    );
+    assert_eq!(told.collect::<Vec<_>>(), [any, found, plain]);
+    let (found_row, plain_row) = (&rows[1], &rows[2]);
+    assert_eq!(found_row["id"], format!("{:016x}", identity(found, 0).0));
+    assert_eq!(found_row["incarnation"], 0);
+    assert_eq!(found_row["status"], "ready");
+    assert_eq!(plain_row["status"], "not_ready");
+    let maker = json!({"provider": "discovery", "key": found});
+    assert_eq!(found_row["maker"], maker);
+    assert_eq!(plain_row["maker"], Value::Null);
+    assert_eq!(found_row["pairing"]["protocol"], "p1");
+    assert_eq!(found_row["pairing"]["version"], "v1");
+    assert_eq!(plain_row["pairing"], Value::Null);
+    assert_eq!(found_row["labels"][DISCOVERY_PROVIDER_LABEL], "finder");
+
+    let (_, _, by_model) = answered(&app, snapshot("?models=m")?).await?;
+    let served = by_model["rows"].as_array().ok_or("no rows")?;
+    let told = served
+        .iter()
+        .filter_map(|row| row["registration_key"].as_str());
+    assert_eq!(told.collect::<Vec<_>>(), [found, plain]);
+    Ok(())
+}
+
+/// The schema the OpenAPI document gives a snapshot's page.
+fn page_schema() -> Result<Value, Box<dyn Error>> {
+    let document = serde_json::to_value(openapi_gen::document()?)?;
+    let answer = &document["paths"][SNAPSHOT]["get"]["responses"]["200"];
+    Ok(answer["content"]["application/json"]["schema"].clone())
+}
+
+/// The OpenAPI document gives a snapshot's page as the route writes it
+/// where the gateway decides in its own process, for a worker that states
+/// the least and for one that states what a worker object can: each value
+/// of its listed type and names, each key listed, and no required key left
+/// out.
 #[tokio::test]
 async fn a_snapshots_page_is_as_the_openapi_document_gives_it() -> Case {
     let state = state(picked()).await?;
+    register(&state, worker("http://least.example", &[]))?;
+    let stated = worker("http://stated.example", &["m"])
+        .label("tier", "a")
+        .label(DISCOVERY_PROVIDER_LABEL, "finder")
+        .label("pairing_protocol", "p1")
+        .label("version", "v1")
+        .label("kv_cache_dtype", "float16")
+        .bootstrap_port(Some(9000))
+        .status(WorkerStatus::Ready);
+    register(&state, stated)?;
+    let (status, _, page) = answered(&app(state)?, snapshot("")?).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["rows"].as_array().map(Vec::len), Some(2));
+    assert_eq!(page["rows"][1]["pairing"]["bootstrap_port"], 9000);
+    assert_eq!(off_schema(&page_schema()?, &page, "page"), None);
+    Ok(())
+}
+
+/// A gateway that follows a controller serves the three routes from its
+/// policy store: the document its operators' door holds, a dry run against
+/// that document, and the store's worker rows. The page is as the OpenAPI
+/// document gives it for a row that states the least and for one that
+/// states every nullable fact.
+#[tokio::test]
+async fn a_gateway_that_follows_a_controller_serves_the_routes_from_its_policy_store() -> Case {
+    // A socket that never listens: the follower dials it and tells nothing.
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut config = picked();
+    config.policy_controller_address = Some(socket.local_addr()?.to_string());
+    let digest = standing(&config)?;
+    let state = state(config).await?;
+    let follower = state.context.policy_follower.clone();
     let store = state.context.policy_store.clone().ok_or("no store")?;
     store.upsert(serving("http://least.example", &[]));
     let stated = WorkerFacts {
@@ -559,14 +682,29 @@ async fn a_snapshots_page_is_as_the_openapi_document_gives_it() -> Case {
         },
         ..serving("http://stated.example", &["m"])
     };
-    store.upsert_by(stated, Maker::provider("finder", "http://host/x")?);
-    let (status, _, page) = answered(&app(state)?, snapshot("")?).await?;
+    store.upsert_by(stated, Registrant::provider("finder", "http://host/x")?);
+    let app = app(state)?;
+
+    let (status, _, in_force) = answered(&app, read()?).await?;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(in_force["generation"], 1);
+    assert_eq!(in_force["digest"], digest);
+    let (status, _, would_run) = answered(&app, dry_run().body(Body::from(OTHER))?).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(would_run["standing"]["digest"], digest);
+    assert_eq!(would_run["would_run"]["generation"], 2);
+    let (status, _, page) = answered(&app, snapshot("")?).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["generation"], 1);
     assert_eq!(page["rows"].as_array().map(Vec::len), Some(2));
-    let document = serde_json::to_value(openapi_gen::document()?)?;
-    let schema = &document["paths"][SNAPSHOT]["get"]["responses"]["200"]["content"]
-        ["application/json"]["schema"];
-    assert_eq!(off_schema(schema, &page, "page"), None);
+    assert_eq!(page["rows"][1]["zone"], "zone-a");
+    assert_eq!(page["rows"][1]["maker"]["provider"], "finder");
+    assert_eq!(off_schema(&page_schema()?, &page, "page"), None);
+
+    if let Some(follower) = follower {
+        let follower = follower.lock().take().ok_or("the follower was taken")?;
+        follower.stop().await;
+    }
     Ok(())
 }
 

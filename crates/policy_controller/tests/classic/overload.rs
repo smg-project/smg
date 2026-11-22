@@ -20,14 +20,12 @@ use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_policy_controller::{
-    document::spec::{BindingSpec, OverloadSpec},
-    engine::view::permille,
-    load::load_report,
+    document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
+    engine::{permille, LoadRow, Role, SignalSource, WorkerId},
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        GatewayId, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers, ViewQuery,
+        WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, LoadRow, PolicySpec, Role, SignalSource, WorkerId,
 };
 
 /// What these rows record, as a sheet's head names it: the gateway's
@@ -203,7 +201,7 @@ fn load_row(figures: Figures, at: Instant, source: SignalSource) -> LoadRow {
         }],
         ..WorkerLoadResponse::default()
     };
-    load_report::load_row(&wire, Role::Single, at, at, source)
+    smg_policy_controller::load::load_row(&wire, Role::Single, at, at, source)
 }
 
 /// The store with the row's worker in it: a member row a rank, the ranks
@@ -324,7 +322,7 @@ impl Bed {
     /// engine's last answer left the rank out.
     fn verdict(&self, now: Instant) -> Option<bool> {
         let mut out = ViewBuffers::default();
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now,
             pinned: None,

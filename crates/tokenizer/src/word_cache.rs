@@ -142,6 +142,11 @@ impl Listing {
         self.spans.len() as u32
     }
 
+    /// How many bytes the text of its tokens is, all together.
+    pub(crate) fn bytes(&self) -> usize {
+        self.text.len()
+    }
+
     /// The listing of a dense vocabulary (every id below its length, none
     /// twice), or `None` for a sparse one (an id past the vocabulary's size,
     /// two tokens on one id) or one too large for the spans' width.

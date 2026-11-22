@@ -4,11 +4,11 @@ use std::{error::Error, sync::Arc, time::Instant};
 
 use smg_policy_controller::{
     document::operator::{
-        snapshot::{told, Asked, Rows},
-        Applied, Format, SpecDoor, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
+        snapshot::{worker_rows_page, Rows, WorkerRowsQuery},
+        ApplyOutcome, DocumentManager, EnforceRefused, Format, SpecRejected, MAX_DOCUMENT_BYTES,
     },
+    stages::StageRegistry,
     store::{MemoryStore, StaleGeneration, WorkerFacts, WorkersStore},
-    Catalog,
 };
 
 const START: &[u8] = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}}}"#;
@@ -16,7 +16,11 @@ const START: &[u8] = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"p
 #[test]
 fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(Arc::clone(&store), Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(
+        Arc::clone(&store),
+        Arc::new(StageRegistry::builtin()),
+        Vec::new(),
+    );
     let changed = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"score":["least-load"],"pick":"best"}}}"#;
     assert_eq!(door.status(), None);
 
@@ -26,7 +30,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert_eq!(door.standing(), (0, None));
     assert_eq!(
         door.apply(START.to_vec(), Format::Json),
-        Ok(Applied::Generation(1))
+        Ok(ApplyOutcome::Generation(1))
     );
 
     let status = door.status().expect("the start's status");
@@ -56,7 +60,10 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert_eq!(rolled.standing, (1, Some(digest)));
     assert_eq!(rolled.ran, refused.ran);
     assert_eq!(door.document(0), Ok(held));
-    assert_eq!((door.counts().applied, door.counts().rejected), (1, 2));
+    assert_eq!(
+        (door.apply_counts().applied, door.apply_counts().rejected),
+        (1, 2)
+    );
 
     for (key, model) in [
         ("grpc://b:8000", "served"),
@@ -72,23 +79,23 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
             ..WorkerFacts::default()
         });
     }
-    let asked = Asked {
+    let asked = WorkerRowsQuery {
         models: vec!["served".to_owned()],
         limit: 1,
     };
     let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
-    let page = told(&asked, Rows::Told(rows, serving), Instant::now());
+    let page = worker_rows_page(&asked, Rows::Told(rows, serving), Instant::now());
     let [row] = page.rows.as_slice() else {
         panic!("one row fits the limit");
     };
     assert_eq!(row.facts.key, "grpc://b:8000");
     assert!(page.truncated);
 
-    let asked = Asked { limit: 2, ..asked };
-    let page = told(
+    let asked = WorkerRowsQuery { limit: 2, ..asked };
+    let page = worker_rows_page(
         &asked,
         Rows::Shared(Arc::new(
-            store.cut(smg_policy_controller::store::Kinds::Watched),
+            store.checkpoint(smg_policy_controller::store::JournalKinds::Watched),
         )),
         Instant::now(),
     );
@@ -103,7 +110,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
 #[test]
 fn a_host_reads_a_refusal_as_an_error() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let guarded: Box<dyn Error> = Box::new(
         door.dry_run("another digest", START, Format::Json)
             .expect_err("no digest stands"),
@@ -127,7 +134,7 @@ fn a_host_reads_a_refusal_as_an_error() {
         words.starts_with("no document is held for generation 2: "),
         "{words}"
     );
-    let unanswered: Box<dyn Error> = Box::new(Unanswered::NotHeld(missing));
+    let unanswered: Box<dyn Error> = Box::new(EnforceRefused::NotHeld(missing));
     assert_eq!(unanswered.to_string(), words);
 }
 
@@ -136,7 +143,7 @@ fn a_host_reads_a_refusal_as_an_error() {
 #[test]
 fn a_host_counts_each_document_it_cannot_apply() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let json = Format::named("json").expect("a form's name");
     let unread = door.apply(b"[".to_vec(), json);
     assert!(
@@ -154,7 +161,10 @@ fn a_host_counts_each_document_it_cannot_apply() {
     };
     let unpublished = door.apply_where(START.to_vec(), json, |_| None, |_, _| Err(stale));
     assert_eq!(unpublished, Err(SpecRejected::Stale(stale)));
-    assert_eq!((door.counts().applied, door.counts().rejected), (0, 3));
+    assert_eq!(
+        (door.apply_counts().applied, door.apply_counts().rejected),
+        (0, 3)
+    );
 }
 
 /// A null under a built-in rule's name, the slip of a bare name written
@@ -163,7 +173,7 @@ fn a_host_counts_each_document_it_cannot_apply() {
 #[test]
 fn a_null_under_a_built_in_rule_is_told_both_forms_at_its_path() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random","filter":[{"has-room":null}]}}}"#;
     let yaml = b"apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\n    filter:\n    - has-room:\n";
     for (format, bytes) in [
@@ -192,7 +202,7 @@ fn a_null_under_a_built_in_rule_is_told_both_forms_at_its_path() {
 #[test]
 fn an_unknown_parameter_of_a_built_in_rule_is_refused_at_its_own_path() {
     let store = Arc::new(MemoryStore::new());
-    let door = SpecDoor::new(store, Arc::new(Catalog::builtin()), Vec::new());
+    let door = DocumentManager::new(store, Arc::new(StageRegistry::builtin()), Vec::new());
     let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random","filter":[{"has-room":{"arp":0,"used":{"load.running":1},"capacity":10}}]}}}"#;
     let yaml = b"apiVersion: smg.policy/v1\nprofiles:\n  p:\n    pick: random\n    filter:\n    - has-room: {arp: 0, used: {load.running: 1}, capacity: 10}\n";
     for (format, bytes) in [

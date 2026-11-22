@@ -18,6 +18,8 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
+use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
+use smg_grpc_client::is_request_timeout;
 use smg_mcp::{McpToolSession, DEFAULT_SERVER_LABEL};
 use tracing::{debug, error};
 
@@ -54,7 +56,10 @@ use crate::{
                 ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
                 ProtoResponseVariant, ProtoStream,
             },
-            regular::streaming::frames::{assistant_choice, ChatChunkFrame},
+            regular::{
+                processor::generation_start,
+                streaming::frames::{assistant_choice, ChatChunkFrame},
+            },
             utils,
         },
     },
@@ -90,6 +95,36 @@ pub(crate) struct HarmonyStreamingProcessor;
 const CLIENT_LEFT: &str = "Client disconnected";
 const RETAIN_OUTPUT_ITEM: bool = true;
 const OMIT_OUTPUT_ITEM: bool = false;
+
+/// A Responses iteration that ended without a result: the message and the
+/// code of the `error` event its caller ends the stream with.
+#[derive(Debug)]
+pub(crate) struct IterationError {
+    pub(crate) message: String,
+    pub(crate) code: &'static str,
+}
+
+impl IterationError {
+    /// The engine's stream on `side` ended with `status`: one the gateway's
+    /// request timeout cut names the timeout's code, as the 504 and the
+    /// other streams do.
+    fn upstream(side: &str, status: &tonic::Status) -> Self {
+        let mut error = Self::from(format!("{side} stream error: {}", status.message()));
+        if is_request_timeout(status) {
+            error.code = REQUEST_TIMEOUT_CODE;
+        }
+        error
+    }
+}
+
+impl From<String> for IterationError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: "processing_error",
+        }
+    }
+}
 
 /// One read of the engine stream for the client of a Responses iteration
 /// (see [`next_response`]).
@@ -155,6 +190,10 @@ impl HarmonyStreamingProcessor {
     ) -> Response {
         let source = source.with_backend(metrics_labels::BACKEND_HARMONY);
         let guards = body_guards(load_guards, reservation.as_ref());
+        // The request's wait ahead of the dispatch the stream's clocks start
+        // at, read here: the reading runs outside the request's scope (see
+        // `context::dispatch_wait`).
+        let dispatch_wait = context::dispatch_wait(generation_start(&execution_result));
         // The body's channel (see `driven_channel`).
         let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
@@ -173,6 +212,7 @@ impl HarmonyStreamingProcessor {
                 // polling the body (see `utils::isolation`).
                 let result = utils::isolation::isolated(Self::process_single_stream(
                     dispatch_start,
+                    dispatch_wait,
                     stream,
                     dispatch,
                     chat_request,
@@ -206,6 +246,7 @@ impl HarmonyStreamingProcessor {
                     &tx,
                     router_stop_strings,
                     pd_timing,
+                    dispatch_wait,
                     prefill_guards,
                     reservation,
                 ))
@@ -259,6 +300,7 @@ impl HarmonyStreamingProcessor {
     )]
     async fn process_single_stream(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
@@ -271,6 +313,7 @@ impl HarmonyStreamingProcessor {
         let mut cached_tokens = HashMap::new();
         Self::process_chat_decode_stream(
             start_time,
+            dispatch_wait,
             grpc_stream,
             &dispatch,
             &original_request,
@@ -298,6 +341,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         router_stop_strings: Vec<String>,
         pd_timing: context::PdTiming,
+        dispatch_wait: context::DispatchWait,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -316,6 +360,7 @@ impl HarmonyStreamingProcessor {
         // token yields honest PD TTFT.
         Self::process_chat_decode_stream(
             pd_timing.prefill_start,
+            dispatch_wait,
             decode_stream,
             &dispatch,
             &original_request,
@@ -343,10 +388,13 @@ impl HarmonyStreamingProcessor {
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
     /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
     /// are inserted only if not already present. `pd_timing` is `Some` only in PD mode and
-    /// yields honest PD TTFT (prefill start to first decode token).
+    /// yields honest PD TTFT (prefill start to first decode token). `dispatch_wait` is the
+    /// request's wait ahead of the dispatch at `start_time`, read by the entry point inside
+    /// the request's scope (see [`context::dispatch_wait`]).
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         mut decode_stream: ProtoStream,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
@@ -358,7 +406,7 @@ impl HarmonyStreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
         source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new(start_time, pd_timing, dispatch);
+        let mut decode = ChatDecode::new(start_time, dispatch_wait, pd_timing, dispatch);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -552,7 +600,7 @@ impl HarmonyStreamingProcessor {
         format_registry: Option<&FormatRegistry>,
         router_stop_strings: &[String],
         server_call_allowance: Option<usize>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         match execution_result {
             context::ExecutionResult::Single { stream, .. } => {
                 debug!("Processing Responses API single stream mode");
@@ -591,11 +639,15 @@ impl HarmonyStreamingProcessor {
                 .await
             }
             context::ExecutionResult::Embedding { .. } => {
-                Err("Embeddings not supported in Responses API streaming".to_string())
+                Err("Embeddings not supported in Responses API streaming"
+                    .to_string()
+                    .into())
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
-                Err("Batched results not supported in Responses API streaming".to_string())
+                Err("Batched results not supported in Responses API streaming"
+                    .to_string()
+                    .into())
             }
         }
     }
@@ -612,7 +664,7 @@ impl HarmonyStreamingProcessor {
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         server_call_allowance: Option<usize>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         // Phase 1: Drain prefill stream, for the client (see `next_response`):
         // a client that leaves during the prefill ends both sides at once. The
         // client's prompt-side usage is the prefill side's prefix-cache hit:
@@ -633,10 +685,10 @@ impl HarmonyStreamingProcessor {
                 response_id = %emitter.response_id,
                 "Client left during the prefill of the Responses stream; the request is aborted on the engines"
             );
-            return Err(CLIENT_LEFT.to_string());
+            return Err(CLIENT_LEFT.to_string().into());
         };
         let prefill_cached_tokens =
-            drained.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            drained.map_err(|status| IterationError::upstream("Prefill", &status))?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2: Process decode stream. Pass pd_timing so the first decode
@@ -670,7 +722,7 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: &[String],
         pd_timing: Option<context::PdTiming>,
         server_call_allowance: Option<usize>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         let mut decode =
             ResponsesDecode::new(pd_timing, router_stop_strings, server_call_allowance)?;
         // A fresh iteration: no finish until its terminal frame names one, so the finish of an
@@ -690,11 +742,11 @@ impl HarmonyStreamingProcessor {
                         response_id = %emitter.response_id,
                         "Client left during the Responses stream; the request is aborted on the engine"
                     );
-                    return Err(CLIENT_LEFT.to_string());
+                    return Err(CLIENT_LEFT.to_string().into());
                 }
             };
             decode.frames += 1;
-            let response = result.map_err(|e| format!("Decode stream error: {}", e.message()))?;
+            let response = result.map_err(|status| IterationError::upstream("Decode", &status))?;
             match response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
                     decode
@@ -1394,9 +1446,20 @@ impl ResponsesDecode {
         let (analysis_opt, commentary_opt, final_text_extracted) =
             HarmonyParserAdapter::parse_messages(&messages);
         self.tool_calls.clone_from(&commentary_opt);
-        // If no tool calls found, check for incomplete commentary in parser state
+        // If no tool calls found, check for incomplete commentary in parser state.
+        // A call that ended behind its header is read for a client tool alone:
+        // the loop would run a server tool on arguments the model never wrote.
         if self.tool_calls.is_none() {
-            self.tool_calls = self.parser.extract_incomplete_commentary();
+            let client_tool = self
+                .calls
+                .get(&0)
+                .is_some_and(|open| open.response_format.is_none());
+            self.tool_calls = self.parser.extract_incomplete_commentary().filter(|calls| {
+                client_tool
+                    || calls
+                        .iter()
+                        .any(|call| call.function.arguments.as_deref() != Some(""))
+            });
         }
         debug!(
             "Tool call extraction: completed_msgs={}, tool_calls={}, has_analysis={}, final_text_len={}",
@@ -1481,6 +1544,9 @@ impl ResponsesDecode {
 struct ChatDecode {
     // Timing for metrics
     start_time: Instant,
+    /// The request's wait ahead of the dispatch at `start_time`, recorded with the TTFT (see
+    /// [`context::dispatch_wait`]).
+    dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
     /// The PD dispatch instants, in PD mode: the first token records the PD pair against
     /// them and the metrics anchor at the prefill dispatch.
@@ -1529,11 +1595,13 @@ struct ChatDecode {
 impl ChatDecode {
     fn new(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         pd_timing: Option<context::PdTiming>,
         dispatch: &context::DispatchMetadata,
     ) -> Self {
         Self {
             start_time,
+            dispatch_wait,
             first_token_time: None,
             pd_timing,
             parsers: HashMap::new(),
@@ -2002,6 +2070,7 @@ impl ChatDecode {
             model_id: &original_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            dispatch_wait: self.dispatch_wait,
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             cached_tokens: Some(u64::from(counts.cached)),

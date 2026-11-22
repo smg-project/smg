@@ -36,8 +36,8 @@ use crate::{
     },
     policies::{
         as_consistent_hashing, policy_filters_unavailable_workers, policy_reads_hash_ring,
-        CacheNamespace, LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo,
-        WorkerRole,
+        CacheNamespace, ConsistentHashingPolicy, LoadBalancingPolicy, NamedList, PolicyRegistry,
+        SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{
@@ -46,7 +46,7 @@ use crate::{
             pd_admission,
             prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
             retry::mark_non_retryable,
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
     },
@@ -104,6 +104,33 @@ pub(crate) fn strict_target(policy: &dyn LoadBalancingPolicy, headers: Option<&H
         && header_utils::extract_target_worker(headers).is_some()
 }
 
+/// The worker an explicit target holds a request to, among `candidates`, as
+/// the consistent hashing policy finds it
+/// ([`ConsistentHashingPolicy::target_among`]): the header's number counts
+/// the candidates that are available when the request arrives. `None` where
+/// the request names no worker, and where no candidate is available: such a
+/// pool is steered without a reading of the header. `Some(None)` is a miss,
+/// and the request moves to no other worker.
+///
+/// For a route that narrows its candidates to the target ahead of a policy
+/// engine, where [`strict_target`] holds.
+pub(crate) fn targeted(
+    candidates: &[Arc<dyn Worker>],
+    headers: Option<&HeaderMap>,
+) -> Option<Option<Arc<dyn Worker>>> {
+    header_utils::extract_target_worker(headers)?;
+    let available: Vec<Arc<dyn Worker>> = candidates
+        .iter()
+        .filter(|worker| worker.is_available())
+        .cloned()
+        .collect();
+    if available.is_empty() {
+        return None;
+    }
+    let target = ConsistentHashingPolicy::target_among(&available, headers)?;
+    Some(target.and_then(|place| available.get(place).cloned()))
+}
+
 /// The policy half of [`strict_target`] read off a pair's settings: the
 /// prefill or the decode policy, each the `main` one where unset, is
 /// consistent hashing. Under the policy controller no role policy is built,
@@ -154,7 +181,11 @@ pub(crate) struct PlacementInputs<'a> {
     /// same worker deterministically (a routing key, a cached prefix) moves
     /// on instead of replaying on the worker that just failed. A pool with
     /// nothing else left is used whole, so a single worker is retried as
-    /// before.
+    /// before. A pair placement judges each side on its own: the prefill
+    /// side skips them while another open prefill is left, the decode side
+    /// while the picked prefill has another open partner, each after its
+    /// admission filter, so a tried worker with a place for the request is
+    /// not given up for one that has none.
     pub tried: &'a [String],
 }
 
@@ -170,7 +201,7 @@ pub(crate) enum Candidates {
 impl Candidates {
     /// `pool` whole, or its part on `wire` when a retry pins the retained
     /// plan's runtime and transport.
-    fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
+    pub(crate) fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
         match wire {
             None => Self::Shared(pool),
             Some(_) => Self::Pinned(
@@ -190,6 +221,7 @@ impl Candidates {
     }
 
     /// The snapshot's own list, when the candidates are that list whole.
+    #[cfg(test)]
     fn shared(&self) -> Option<&Arc<[Arc<dyn Worker>]>> {
         match self {
             Self::Shared(shared) => Some(shared),
@@ -262,6 +294,7 @@ impl<'a> Narrowed<'a> {
         NamedList {
             list: self.list,
             positions: Some(&self.positions),
+            members: None,
         }
     }
 
@@ -355,6 +388,27 @@ pub(crate) fn candidates(
     Candidates::of(registry.get_routing_pool(model_id, pool), wire)
 }
 
+/// The part of `candidates` a request's `filter` accepts, in their order,
+/// where it refuses one of them. `None` where no filter is stated or it
+/// refuses nobody (a media or context demand every worker meets): the
+/// candidates stay as they were drawn and nothing is collected. Each
+/// candidate is asked once.
+///
+/// The one narrowing by a request's own rule. The selection hands its policy
+/// what is left, and a route whose policy engine decides in the gateway's
+/// own process states it as the workers that engine decides over.
+#[inline]
+pub(crate) fn accepted_by(
+    candidates: &[Arc<dyn Worker>],
+    filter: Option<CandidateFilter<'_>>,
+) -> Option<Vec<Arc<dyn Worker>>> {
+    let accepts = filter?;
+    let first = candidates.iter().position(|w| !accepts(w.as_ref()))?;
+    let (passed, rest) = candidates.split_at(first);
+    let rest = rest[1..].iter().filter(|w| accepts(w.as_ref()));
+    Some(passed.iter().chain(rest).cloned().collect())
+}
+
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
 /// selectable. Records the selection metric under the chosen worker's own
 /// transport label.
@@ -366,29 +420,43 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
-    let pool = registry.get_routing_pool(model_id, pool);
-    select_single_of(registry, policies, model_id, pool, wire, inputs)
+    let snapshot = registry.get_routing_snapshot(model_id);
+    select_single_of(registry, policies, model_id, &snapshot, pool, wire, inputs)
 }
 
-/// [`select_single`] over a pool the caller drew from a snapshot it read
-/// something else from too (the pool's window floor), so that both come from
-/// one membership generation. The pool keeps its name on the way to the
-/// policy, as in [`select_single`].
+/// [`select_single`] over `pool` of a snapshot the caller read something
+/// else from too (the pool's window floor), so that both come from one
+/// membership generation. The pool is borrowed from the snapshot: the
+/// selection takes no count of the list. It keeps its name on the way to
+/// the policy, and beside the name the snapshot's cell for what the policy
+/// engine keeps of the list ([`NamedList::members`]).
 pub(crate) fn select_single_of(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
-    pool: Arc<[Arc<dyn Worker>]>,
+    snapshot: &ModelWorkerSnapshot,
+    pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
-    let candidates = Candidates::of(pool, wire);
+    let list = snapshot.pool(pool);
+    if wire.is_none() {
+        let whole = NamedList {
+            list,
+            positions: None,
+            members: Some(snapshot.pool_members_cell(pool)),
+        };
+        return select_among(registry, policies, model_id, list, Some(whole), inputs);
+    }
+    // A retry pinned to its retained plan's wire: a list of its own, which
+    // nobody names.
+    let pinned = Candidates::of(Arc::clone(list), wire);
     select_among(
         registry,
         policies,
         model_id,
-        candidates.as_slice(),
-        candidates.shared(),
+        pinned.as_slice(),
+        None,
         inputs,
     )
 }
@@ -433,7 +501,7 @@ fn select_among(
     policies: &PolicyRegistry,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
-    whole: Option<&Arc<[Arc<dyn Worker>]>>,
+    whole: Option<NamedList<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     // At most two rounds. The pass has this one caller, so it compiles into
@@ -458,7 +526,7 @@ fn select_among(
     }
 }
 
-/// One pass of the single-worker selection. `whole` is the
+/// One pass of the single-worker selection. `whole` names the
 /// snapshot's own list when `candidates` is that list as the registry holds
 /// it: the policy is told the list's name when the candidates reach it as
 /// that list, and reads which workers it was handed once something narrowed
@@ -470,33 +538,17 @@ fn select_pass(
     policies: &PolicyRegistry,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
-    whole: Option<&Arc<[Arc<dyn Worker>]>>,
+    whole: Option<NamedList<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Arc<dyn Worker>, Miss> {
     let policy = policies.get_policy_or_default(model_id);
 
     // The per-request predicate applies to every entry point, so a caller
-    // that sets it can never dispatch to a worker it rejects. Each candidate
-    // is asked once. A predicate that refuses nobody (a media or context
-    // demand every worker meets) leaves the candidates as they were drawn:
-    // nothing is collected, and the pool keeps its name.
-    let refused = inputs.candidate_filter.and_then(|accepts| {
-        let first = candidates.iter().position(|w| !accepts(w.as_ref()))?;
-        Some((accepts, first))
-    });
-    let accepted;
-    let candidates: &[Arc<dyn Worker>] = match refused {
-        Some((accepts, first)) => {
-            let (passed, rest) = candidates.split_at(first);
-            accepted = passed
-                .iter()
-                .chain(rest[1..].iter().filter(|w| accepts(w.as_ref())))
-                .cloned()
-                .collect::<Vec<_>>();
-            &accepted
-        }
-        None => candidates,
-    };
+    // that sets it can never dispatch to a worker it rejects. A predicate
+    // that refuses nobody leaves the candidates as they were drawn, and the
+    // pool keeps its name.
+    let accepted = accepted_by(candidates, inputs.candidate_filter);
+    let candidates = accepted.as_deref().unwrap_or(candidates);
 
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
@@ -555,13 +607,7 @@ fn select_pass(
     } else {
         untried = available
             .iter()
-            .filter(|worker| {
-                eligible(worker)
-                    && !inputs
-                        .tried
-                        .iter()
-                        .any(|engine| engine == worker.base_url())
-            })
+            .filter(|worker| eligible(worker) && !was_tried(worker.as_ref(), inputs.tried))
             .cloned()
             .collect::<Vec<_>>();
         if untried.is_empty() {
@@ -577,12 +623,7 @@ fn select_pass(
     // The name goes with the list itself, read here and nowhere above:
     // whatever narrowed the candidates handed on a list of its own, at
     // another address, and nobody names that one.
-    info.named = whole
-        .filter(|list| std::ptr::eq(&list[..], available))
-        .map(|list| NamedList {
-            list,
-            positions: None,
-        });
+    info.named = whole.filter(|named| std::ptr::eq(&named.list[..], available));
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
@@ -1206,6 +1247,13 @@ fn relaxed_pair(
     }))
 }
 
+/// Whether `worker`'s engine (its base URL, which the ranks of a DP-aware
+/// worker share) is one a failed attempt of the request already dispatched
+/// to ([`PlacementInputs::tried`]).
+fn was_tried(worker: &dyn Worker, tried: &[String]) -> bool {
+    tried.iter().any(|engine| engine == worker.base_url())
+}
+
 /// Pick a prefill/decode pair for `model_id`, one worker per role, each under
 /// its own policy and sticky namespace.
 ///
@@ -1229,6 +1277,16 @@ fn relaxed_pair(
 /// the least-loaded partner of the prefill its own policy picked. Only the
 /// placement by policy puts a pair on one known runtime before a pair with
 /// an unknown one: the default pairs by load over the index's lists, as before.
+///
+/// A retry's placement by policy steps aside from the engines the request
+/// already tried ([`PlacementInputs::tried`]), a side at a time: the open
+/// prefills the admission left, then the pick's open partners the rooms
+/// left, each kept to the untried ones while one is left and whole
+/// otherwise. It is a preference and refuses nobody: a worker that is the
+/// only one open on its side, or the only one with a place for the request,
+/// takes the retry. An explicit target under consistent hashing holds its
+/// side to the targeted worker ([`strict_target`]), and the default pairs by
+/// load over the whole pools, tried or not.
 ///
 /// The placement is one pass, and one more when the pass found nobody open
 /// on a side while a worker of that side the request may use is available
@@ -1499,7 +1557,17 @@ fn pair_pass(
     // The open prefills as a part of the index's own list: the policy is
     // told the list, so what it keeps for the pool does not move with the
     // workers that are open for this request.
-    let prefill = Narrowed::at(&pairs.prefill, open);
+    let mut prefill = Narrowed::at(&pairs.prefill, open);
+    // A retry steps aside from the prefill engines the request already
+    // tried while another open prefill is left: a policy that places the
+    // request the same way every time (a cached prefix, a routing key)
+    // would pick the engine that just failed again. With every open prefill
+    // tried they all stay. A strict target indexes this set and is never
+    // narrowed, as in a single placement. A first attempt has tried nobody
+    // and pays the one comparison.
+    if !inputs.tried.is_empty() && !strict_target(prefill_policy.as_ref(), inputs.headers) {
+        prefill.narrow_to(|p| !was_tried(p, inputs.tried));
+    }
     // As for a single placement: the ring is read for the policies that walk
     // it alone. No other pair pays the registry's keyed read and the ring's
     // shared count, or fills the ring of a generation it never reads.
@@ -1567,6 +1635,15 @@ fn pair_pass(
         return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
     }
     retain_decodes_with_a_room(decode_policy.as_ref(), inputs.headers, &mut decode);
+    // The decode side steps aside from the tried engines the same way, among
+    // the partners the rooms left, as the prefill side does among those the
+    // admission left. A failed attempt lists both its engines whichever side
+    // failed, and its decode has just given its room back: a tried partner
+    // with a free room keeps the retry while the untried ones are full,
+    // where the retry would wait at a gate and could be shed there.
+    if !inputs.tried.is_empty() && !strict_target(decode_policy.as_ref(), inputs.headers) {
+        decode.narrow_to(|d| !was_tried(d, inputs.tried));
+    }
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
@@ -2144,6 +2221,251 @@ mod tests {
             )
             .expect("the targeted pair is open");
             assert_eq!(pair.decode.url(), expected, "target {index}");
+        }
+    }
+
+    /// The pair a routing key is placed on in `registry` under consistent
+    /// hashing on both sides, with `tried` as the engines the request
+    /// already tried.
+    fn keyed_pair(registry: &WorkerRegistry, tried: &[String]) -> (String, String) {
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-42".parse().unwrap());
+        let pair = select_pair(
+            registry,
+            &policies,
+            MODEL,
+            &pairs_of(registry, &policies),
+            None,
+            None,
+            PlacementInputs {
+                headers: Some(&headers),
+                tried,
+                ..Default::default()
+            },
+        )
+        .expect("a pair is open");
+        (
+            pair.prefill.url().to_string(),
+            pair.decode.url().to_string(),
+        )
+    }
+
+    /// The engine of the worker registered at `url`, as a retry lists it.
+    fn engine_of(registry: &WorkerRegistry, url: &str) -> String {
+        let worker = registry.get_by_url(url).expect("registered");
+        worker.base_url().to_string()
+    }
+
+    /// A pair's retry steps aside from the engines the request already
+    /// tried, a side at a time and only while that side has another open
+    /// candidate. A routing key names the same pair every time; the tried
+    /// prefill engine moves the prefill side alone and the tried decode
+    /// engine the decode side alone; a side whose every engine was tried is
+    /// placed over all of them again, on the worker the key names.
+    #[test]
+    fn a_pairs_retry_steps_aside_from_the_tried_engines_a_side_at_a_time() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://p:2", WorkerType::Prefill, None),
+            ("grpc://d:1", WorkerType::Decode, None),
+            ("grpc://d:2", WorkerType::Decode, None),
+        ]);
+        let engine = |url: &str| engine_of(&registry, url);
+
+        let (prefill, decode) = keyed_pair(&registry, &[]);
+        assert_eq!(
+            keyed_pair(&registry, &[]),
+            (prefill.clone(), decode.clone()),
+            "with nobody tried the key names one pair"
+        );
+
+        let (moved, kept) = keyed_pair(&registry, &[engine(&prefill)]);
+        assert_ne!(moved, prefill, "the retry leaves the tried prefill engine");
+        assert_eq!(kept, decode, "and keeps the decode nobody tried");
+
+        let (kept, moved) = keyed_pair(&registry, &[engine(&decode)]);
+        assert_eq!(kept, prefill, "the prefill nobody tried stays");
+        assert_ne!(moved, decode, "the retry leaves the tried decode engine");
+
+        let (other_prefill, other_decode) =
+            keyed_pair(&registry, &[engine(&prefill), engine(&decode)]);
+        assert!(
+            other_prefill != prefill && other_decode != decode,
+            "a tried pair moves on both sides"
+        );
+
+        let every_prefill = [engine("grpc://p:1"), engine("grpc://p:2")];
+        assert_eq!(
+            keyed_pair(&registry, &every_prefill),
+            (prefill.clone(), decode.clone()),
+            "with every prefill tried the prefill side is placed over all of them"
+        );
+        let everyone = [
+            engine("grpc://p:1"),
+            engine("grpc://p:2"),
+            engine("grpc://d:1"),
+            engine("grpc://d:2"),
+        ];
+        assert_eq!(
+            keyed_pair(&registry, &everyone),
+            (prefill, decode),
+            "with every engine tried the key names its pair again"
+        );
+    }
+
+    /// The narrowing is a preference and refuses nobody: a tried worker that
+    /// is the only one open on its side takes the retry, whether it is the
+    /// only one registered or the untried one beside it is not ready.
+    #[test]
+    fn a_pairs_retry_goes_back_to_a_tried_worker_that_is_the_only_one_open() {
+        let alone = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://d:1", WorkerType::Decode, None),
+        ]);
+        let tried = [
+            engine_of(&alone, "grpc://p:1"),
+            engine_of(&alone, "grpc://d:1"),
+        ];
+        assert_eq!(
+            keyed_pair(&alone, &tried),
+            ("grpc://p:1".to_string(), "grpc://d:1".to_string())
+        );
+
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://p:2", WorkerType::Prefill, None),
+            ("grpc://d:1", WorkerType::Decode, None),
+            ("grpc://d:2", WorkerType::Decode, None),
+        ]);
+        for untried in ["grpc://p:2", "grpc://d:2"] {
+            let worker = registry.get_by_url(untried).expect("registered");
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let tried = [
+            engine_of(&registry, "grpc://p:1"),
+            engine_of(&registry, "grpc://d:1"),
+        ];
+        assert_eq!(
+            keyed_pair(&registry, &tried),
+            ("grpc://p:1".to_string(), "grpc://d:1".to_string())
+        );
+    }
+
+    /// A retry's decode side reads the rooms before it steps aside from the
+    /// tried engines: a failed attempt lists both its engines whichever side
+    /// failed, and a tried decode with a free room keeps the retry while the
+    /// untried partner is full, where the retry would wait at a gate. With a
+    /// room on each, or on neither, the retry leaves the tried decode.
+    #[test]
+    fn a_pairs_retry_keeps_a_tried_decode_with_a_room_while_the_untried_one_is_full() {
+        let registry = gated_pd_registry(2);
+        let policies = cohort_policies();
+        let pairs = pairs_of(&registry, &policies);
+        let tried = [engine_of(&registry, "grpc://d:1")];
+        let retried_decode = || {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                PlacementInputs {
+                    tried: &tried,
+                    ..Default::default()
+                },
+            )
+            .expect("a pair is open");
+            pair.decode.url().to_string()
+        };
+        let tried_decode = registry.get_by_url("grpc://d:1").expect("registered");
+        let untried_decode = registry.get_by_url("grpc://d:2").expect("registered");
+
+        for _ in 0..4 {
+            assert_eq!(retried_decode(), "grpc://d:2", "a room on each");
+        }
+
+        assert!(untried_decode.try_admit_pd(2, 2), "both rooms claimed");
+        for _ in 0..4 {
+            assert_eq!(
+                retried_decode(),
+                "grpc://d:1",
+                "the tried decode has the only room"
+            );
+        }
+
+        assert!(tried_decode.try_admit_pd(2, 2), "both rooms claimed");
+        for _ in 0..4 {
+            assert_eq!(
+                retried_decode(),
+                "grpc://d:2",
+                "a room on neither: the retry waits at the untried decode's gate"
+            );
+        }
+    }
+
+    /// An explicit target under consistent hashing holds a pair's retry to
+    /// the targeted worker on the side whose policy it is, though that
+    /// worker was tried: the target indexes the candidates, and a narrowed
+    /// list would put another worker at its index. A side under another
+    /// policy still steps aside.
+    #[test]
+    fn an_explicit_target_under_consistent_hashing_keeps_its_side_of_a_pair_on_retry() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://p:2", WorkerType::Prefill, None),
+            ("grpc://d:1", WorkerType::Decode, None),
+            ("grpc://d:2", WorkerType::Decode, None),
+        ]);
+        let place = |policies: &PolicyRegistry, index: usize, tried: &[String]| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            let pair = select_pair(
+                &registry,
+                policies,
+                MODEL,
+                &pairs_of(&registry, policies),
+                None,
+                None,
+                PlacementInputs {
+                    headers: Some(&headers),
+                    tried,
+                    ..Default::default()
+                },
+            )
+            .expect("the targeted pair is open");
+            (pair.prefill, pair.decode)
+        };
+
+        let both = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for index in 0..2 {
+            let (prefill, decode) = place(&both, index, &[]);
+            let tried = [
+                prefill.base_url().to_string(),
+                decode.base_url().to_string(),
+            ];
+            let (again_prefill, again_decode) = place(&both, index, &tried);
+            assert_eq!(
+                (again_prefill.url(), again_decode.url()),
+                (prefill.url(), decode.url()),
+                "target {index}: the retry stays on the targeted pair"
+            );
+        }
+
+        // The prefill side alone is held: the decode side, under a policy
+        // that takes no target, leaves the tried engine on every retry.
+        let prefill_only = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        prefill_only.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
+        let (prefill, decode) = place(&prefill_only, 0, &[]);
+        let tried = [
+            prefill.base_url().to_string(),
+            decode.base_url().to_string(),
+        ];
+        for _ in 0..4 {
+            let (again_prefill, again_decode) = place(&prefill_only, 0, &tried);
+            assert_eq!(again_prefill.url(), prefill.url());
+            assert_ne!(again_decode.url(), decode.url());
         }
     }
 
@@ -3917,7 +4239,12 @@ mod tests {
                 ..Default::default()
             };
             let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
-            let (drawn, whole) = (pool.as_slice(), pool.shared());
+            let drawn = pool.as_slice();
+            let whole = pool.shared().map(|list| NamedList {
+                list,
+                positions: None,
+                members: None,
+            });
             assert_eq!(
                 select_pass(&registry, &policies, MODEL, drawn, whole, inputs).err(),
                 Some(Miss::Declined),

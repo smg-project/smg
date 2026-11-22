@@ -1,9 +1,9 @@
 //! The bed the hard-demand rows replay on. A row's workers are registered
 //! in a store, each with its wire, its state and the facts it states for a
 //! request's demands, and each request is decided through the door a host
-//! in process decides through ([`Door`]), under `round_robin`. A request is
-//! decided sixteen times the pool's size, as its recorder placed it, and
-//! `placed` is the set of workers those decisions named.
+//! in process decides through ([`StoreBackedEngine`]), under `round_robin`. A
+//! request is decided sixteen times the pool's size, as its recorder placed it,
+//! and `placed` is the set of workers those decisions named.
 //!
 //! A worker states its runtime as a number: the numbers are the replay's
 //! own, as they are a registering host's, one a spelling.
@@ -18,13 +18,14 @@ use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use serde::{de::DeserializeOwned, Deserialize};
 use smg_policy_controller::{
-    document::spec::{BindingSpec, OverloadSpec},
-    engine::door::{Door, Request},
+    document::{AppliedSpec, BindingSpec, OverloadSpec, PolicySpec},
+    engine::{
+        Constraints, Decision, DemandFacts, LoadRow, Request, RequestFacts, ShedReason,
+        StoreBackedEngine, WireModes, WorkerId,
+    },
     store::{
         GatewayId, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Constraints, Decision, DemandFacts, LoadRow, PolicySpec, RequestFacts, ShedReason,
-    WireModes, WorkerId,
 };
 
 const MODEL: &str = "m";
@@ -134,7 +135,7 @@ pub struct Pooled {
 
 /// A row's pool behind the door, with each worker's id by its place.
 pub struct Bed {
-    door: Door,
+    door: StoreBackedEngine,
     ids: Vec<WorkerId>,
     now: Instant,
     seed: u64,
@@ -204,7 +205,7 @@ impl Bed {
             }
         }
         Ok(Self {
-            door: Door::new(store),
+            door: StoreBackedEngine::new(store),
             ids,
             now,
             seed: 0,

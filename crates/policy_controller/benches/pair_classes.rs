@@ -58,14 +58,14 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
-    document::spec::Pairing,
+    document::{AppliedSpec, Pairing, PolicySpec},
+    engine::{Constraints, LoadRow, RequestFacts, Role, Scratch, SignalSource, WireModes},
     store::{
-        identity, pairing::Member, Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers,
-        PairClasses, PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
-        PUBLISH_WINDOW,
+        identity,
+        pairing::{Member, PairClasses, PairingDescriptor},
+        GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, ViewBuffers, ViewQuery,
+        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Constraints, LoadRow, PolicySpec, RequestFacts, Role, Scratch, SignalSource,
-    WireModes,
 };
 
 const PREFILLS: usize = 128;
@@ -293,7 +293,7 @@ fn record_of(index: usize) -> LoadRow {
 /// A store of the default mode that holds `fleet`, every worker ready with
 /// its record on file and published; and the ask of a decision a second
 /// after the window that opened last.
-fn serving(fleet: &[WorkerFacts]) -> (MemoryStore, Ask) {
+fn serving(fleet: &[WorkerFacts]) -> (MemoryStore, ViewQuery) {
     let store = store_of(fleet, Pairing::default());
     let opened = Instant::now();
     for (index, facts) in fleet.iter().enumerate() {
@@ -306,7 +306,7 @@ fn serving(fleet: &[WorkerFacts]) -> (MemoryStore, Ask) {
     }
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
-    let ask = Ask {
+    let ask = ViewQuery {
         gateway: GatewayId(1),
         now: opened + Duration::from_secs(1),
         pinned: None,
@@ -328,7 +328,7 @@ fn sizes() {
             let classes = PairClasses::derive(&prefills, &decodes, mode);
             let entries = classes.entries();
             let decode_classes = classes.decodes().iter().map(|&(_, class)| class).max();
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: Instant::now(),
                 pinned: None,

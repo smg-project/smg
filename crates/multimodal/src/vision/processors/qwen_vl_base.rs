@@ -420,6 +420,24 @@ impl QwenVLProcessorBase {
         self
     }
 
+    /// Refuse a size of zero: the patch grid divides by each of them.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        let config = &self.config;
+        for (name, size) in [
+            ("patch_size", config.patch_size),
+            ("merge_size", config.merge_size),
+            ("temporal_patch_size", config.temporal_patch_size),
+        ] {
+            if size == 0 {
+                return Err(TransformError::ShapeError(format!(
+                    "{} {name} must be positive",
+                    config.model_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// This processor with a per-frame video budget of `video_max_pixels`.
     pub(super) fn with_video_max_pixels(mut self, video_max_pixels: usize) -> Self {
         self.config.video_max_pixels = video_max_pixels;

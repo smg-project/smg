@@ -1,0 +1,301 @@
+{
+ "base": {
+  "name": "1.15.0",
+  "revision": "v1.15.0",
+  "commit": "82c0f1fcd0ec44e29bb5dcb80ede1cd4c7a17eb3",
+  "harness_commit": "3223509933d859a924c658364a2c4c584150bf9e",
+  "harness_blob": "a66fa689169902fb5947edacbe1e55a5502efd6b",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "binary_sha256": "c45ba1e22422e5fc420336e3a9faf670e65ca05ed1ead33b99355787c323057d"
+ },
+ "head": {
+  "name": "1.16.0",
+  "revision": "3223509933d859a924c658364a2c4c584150bf9e",
+  "commit": "3223509933d859a924c658364a2c4c584150bf9e",
+  "harness_commit": "3223509933d859a924c658364a2c4c584150bf9e",
+  "harness_blob": "a66fa689169902fb5947edacbe1e55a5502efd6b",
+  "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+  "binary_sha256": "c917c8f2d988207c4748e1294ae7fdae5ee61f1d40aa017fac5de3aebe1b36f1"
+ },
+ "harness": {
+  "base": {
+   "arch": "x86_64",
+   "os": "linux",
+   "turbojpeg": true,
+   "libwebp": true,
+   "libwebp_version": "1.2.0",
+   "pool_threads": 1,
+   "allocator": "jemalloc",
+   "allocator_conf": "background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432",
+   "allocator_env": null,
+   "wire": "BFloat16",
+   "transparency": "CompositeOverWhite",
+   "write_thread": "Other",
+   "threads": 1,
+   "repeats": 10,
+   "build": "release"
+  },
+  "head": {
+   "arch": "x86_64",
+   "os": "linux",
+   "turbojpeg": true,
+   "libwebp": true,
+   "libwebp_version": "1.2.0",
+   "pool_threads": 1,
+   "allocator": "jemalloc",
+   "allocator_conf": "background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432",
+   "allocator_env": null,
+   "wire": "BFloat16",
+   "transparency": "CompositeOverWhite",
+   "write_thread": "Other",
+   "threads": 1,
+   "repeats": 10,
+   "build": "release"
+  }
+ },
+ "rounds": {
+  "rounds_asked": 15,
+  "cores": "2,4,6,8,10,12,14",
+  "repeats": 10,
+  "wire": "bf16",
+  "transparency": "composite_white",
+  "sibling_limit_percent": 10.0,
+  "timeout_seconds": 1800,
+  "binary_sha256": {
+   "base": "c45ba1e22422e5fc420336e3a9faf670e65ca05ed1ead33b99355787c323057d",
+   "head": "c917c8f2d988207c4748e1294ae7fdae5ee61f1d40aa017fac5de3aebe1b36f1"
+  },
+  "inputs": {
+   "deepseek_v41": "d84ffcb284cade5aefb7fc3dbafd46eea49f81890696f6a9bc7c2629715e3d40",
+   "gemma4": "9c87dda32768c42e8ca4c606932179851f59d4c7f471bd2457f44e8ad5d64305",
+   "glm53_flash": "32d46779036971d61c4d70698f28918e5cda42305f083066876efdd92ed357d6",
+   "kimi_k25": "b8eb5028f6f33885eafb49a262751be721e47357f9b63070878e021d22fe37df",
+   "kimi_k3": "68ed6c28e18d646ed69da10079a2cb8ae5e8a754f3a405b37ef942625b95a041",
+   "llama4": "3ea44c784c1468dc317e5e7d743ec115cb4c39e6d56d39ddd94d44f14af42d23",
+   "llava": "0f68eaac52746bd1c098cc541a0c1b8b500c5b60218d7daaa5f98214d8a8d79c",
+   "llava_next": "9cf6520e95ec93dd38df580d02d6a125e00c8a4a9530ee1ba1da0671e8ee262c",
+   "minimax_m3": "6a03537a76574a260f5daeb66989c26f7cbd78997a07a08450d1e7bc5139fb1e",
+   "muse_spark": "4d9284c554f08cfb3e3762ae499beb0e0ab79e456aed2d51fe466fe8a39cd6e5",
+   "nemotron_omni": "73ecee01af7eee2d692c48c4bc4651924eeffd9c265c4c112c286cff344a98eb",
+   "phi3_v": "1dd284a3d681c83da172f9a70d7018704d99f0888d3f3c87ac235da5c4ed30ab",
+   "pixtral": "444511148722a056c0aa0314c05d8ad0bc3539b0a30f9af79bcbd33d5d447eb6",
+   "qwen25_vl": "d013c78b31075a231444209a7b98ecaa1ce620f0d0b224ace9a83d3bc3df2d9f",
+   "qwen2_vl": "a97e734d1500aaa35dd4517a501c840512fe20c39aac1445eb489a141b1952fc",
+   "qwen3_omni": "f1961f9ef2deb95fa8e0b5708ffbcdbfbcab4d9c2e2b71366dd6db07b43bb52a",
+   "qwen3_vl": "bca91f8ab8c4c25bd0349b7a09dee7cd478d30677341fdcd7dbea8a636458626",
+   "qwen3_vl_235b": "ff885ae8cc3f61cbe28a78467a9e87e165932ce1c7816bc2c0b5e56e42233aaf",
+   "step3_vl": "86803a2e78855cbe8de157d84eb18ec80edad0bfe5e5eb1bd6039e235a2fafd6",
+   "step5_preview": "ac48b2bf0a07171e4ae15cc4e76390a959b822b0d6b3e55d4c55c0e43b64518c"
+  }
+ },
+ "rounds_read": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15
+ ],
+ "reference": {
+  "arch": "x86_64",
+  "python": "3.12.16",
+  "transformers": "5.17.0",
+  "torch": "2.13.0+cpu",
+  "pillow": "12.3.0",
+  "numpy": "2.2.6",
+  "opencv": null,
+  "pillow_libjpeg_turbo": true,
+  "repeats": 10,
+  "compute_threads_per_process": 1
+ },
+ "class_files": {
+  "size-256x256-jpeg.jpg": {
+   "bytes": 12073,
+   "sha256": "529e171c213d1e6b424ca7dc01afb1acc4c952005c2d2372129df095e5630a20"
+  },
+  "size-1024x768-jpeg.jpg": {
+   "bytes": 105674,
+   "sha256": "85d299fd11bfaeecd3674b1a8896671e50e8925e8a6056172bf4aaf6d7e90e66"
+  },
+  "size-1920x1080-jpeg.jpg": {
+   "bytes": 321431,
+   "sha256": "829791b22721b8b26a3c4a772c13a41b9d02a4f2c61dff71313f09aaa05166b4"
+  },
+  "size-4096x2304-jpeg.jpg": {
+   "bytes": 1130384,
+   "sha256": "619bd1cdbbe5627d5d3d7159dacea5c6d3ab1871548c6b08fac2b426670d50d1"
+  },
+  "size-8192x8192-jpeg.jpg": {
+   "bytes": 7827610,
+   "sha256": "8458424977a3d598deb10787ad10e22d0545fff66b4fca4175ce2c191085158c"
+  },
+  "size-256x256-png.png": {
+   "bytes": 101370,
+   "sha256": "f803283cb6ac410eb1ee0b4b5539ece88d41e75214cff68032469262e2e60604"
+  },
+  "size-1024x768-png.png": {
+   "bytes": 1208625,
+   "sha256": "34d71a6f2c503716fa92203e2c7389956fa142c501501f09dc1b594e6ffe49b5"
+  },
+  "size-1920x1080-png.png": {
+   "bytes": 3193922,
+   "sha256": "156b5fe517572f783c5197c786fe968c671203bd7c05fca1ac9cc74a272374a2"
+  },
+  "size-3840x2160-png.png": {
+   "bytes": 12766825,
+   "sha256": "c98decd3994eedff4d5d72de2817741500d2c5d0ea37c653d6c14040efaba835"
+  },
+  "png-rgba8.png": {
+   "bytes": 1644841,
+   "sha256": "8933491c1f75cb6ffeedeae9bfb4c982d150d834dddbf7f2e5e0a3103c61b399"
+  },
+  "webp-lossy-q80.webp": {
+   "bytes": 18530,
+   "sha256": "04db468dcebada46e31bdc9c5148e241520e7d62582a9d1603bdd6c809382251"
+  },
+  "webp-lossless.webp": {
+   "bytes": 1083836,
+   "sha256": "7f67fe04c9f47eab6d90c31112f54db1c3552a2aca8261aaea950b6bf8a877bb"
+  },
+  "jpeg-progressive-q90.jpg": {
+   "bytes": 91067,
+   "sha256": "9a1b4952d3b9acce114d5f31f5c934131e409203d2e2615ba142cdd2aea165a7"
+  },
+  "jpeg-cmyk.jpg": {
+   "bytes": 354641,
+   "sha256": "dafc80d8d2435238cd8956e0d4d3481710b7a9e0f111f0a1704fdebd8f533be1"
+  },
+  "jpeg-grayscale.jpg": {
+   "bytes": 91894,
+   "sha256": "539794681f51418ed543cb5d9a6039a92b48844a828146524285df192c96266a"
+  },
+  "jpeg-exif-orientation-6.jpg": {
+   "bytes": 64795,
+   "sha256": "ec17971c8fdca732787d46ecac2604ce6a2c3135c5e0705620b735bdc86c234d"
+  },
+  "gif-static.gif": {
+   "bytes": 219379,
+   "sha256": "83e4c5ce70519ae1a1c0c4593e8b5c648bce3d44badda4835b4a8444c6a81876"
+  },
+  "bmp-24.bmp": {
+   "bytes": 2359350,
+   "sha256": "fb55b08152e3b2eb556783a2185be0bbf58116b6c427dbc930b2ca90364a1364"
+  },
+  "tiff-uncompressed.tiff": {
+   "bytes": 2359436,
+   "sha256": "26b84f85289a45ff4e6ee1b0c11199e900ff95db74df0dbc6b12e0d27146aa87"
+  }
+ },
+ "configurations": {
+  "deepseek_v41": {
+   "config.json": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+   "preprocessor_config.json": "b2770a6d30bb9b0d1e1af33ce91a8e5da64537281d4eb9f9f5989f8ce9523999"
+  },
+  "gemma4": {
+   "config.json": "ed0c1eb3633de771906e9ba004a44cc5635bcc06ee2062077c3d2e88a50707d3",
+   "preprocessor_config.json": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+   "processor_config.json": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c"
+  },
+  "glm53_flash": {
+   "config.json": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+   "preprocessor_config.json": "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+   "processor_config.json": "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed"
+  },
+  "kimi_k25": {
+   "config.json": "acd5bb01a16f64b309599cd6ed196be056f613c99d6bc9300692b82cd10882f6",
+   "preprocessor_config.json": "0c43520fbcc076dacbffcf0273f0dfa0ee318ff9aa55537cf7f2788d906de7b2"
+  },
+  "kimi_k3": {
+   "config.json": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
+   "preprocessor_config.json": "4be333605990c53a816e586dee9d5dd545afb7a59947c17f8f7ef26b4782668e"
+  },
+  "llama4": {
+   "config.json": "4cd670eadedaff9ba7eb42e97f08ec8a384b91652198378cc67e2c32e86191ec",
+   "preprocessor_config.json": "11a1b41f43161e324bf8302299bce8d59aba671d1505137d9d01179ae9aeacde"
+  },
+  "llava_next": {
+   "config.json": "ddf45e24cea7da06747d67a2f377b8fe65e672f61180c50adae7fd9c0392ab6e",
+   "preprocessor_config.json": "ecef425c1d3ee91f5e05144c4d107389f9fefd04a424d5cbfc3fb6e0525b8c55",
+   "processor_config.json": "7cd8bff508772b8b4e6b0678550bf856a7f28abd0f8b237235ac83bfcb9b1c36"
+  },
+  "llava": {
+   "config.json": "0bde54495c54bcc346064a0d314b010d1c4d3ca7f7e583b6f711949a35352c0f",
+   "preprocessor_config.json": "a8d5e64ee5c07ff6d70142856d178ac39d0563da3612e32110fa824f5337b7a1",
+   "processor_config.json": "fef918d6ba333f72a066877965bc4a162308568ba62aa90c806caedf7b45d64e"
+  },
+  "llava with the pixtral processor": {
+   "config.json": "da97ae391681b319832fe8121f77bee3df837fdefdffd2223c772040b7d7b5cc",
+   "preprocessor_config.json": "519f21adb05f945c2d380b550eaac6e84ebbb8a9be2a6f6e72d8f9242ba9d274",
+   "processor_config.json": "4ef9d7939b2bf2aaa39af0c6e57c31186c0efc24b1948d14047b90e143e676dc"
+  },
+  "minimax_m3": {
+   "config.json": "c9c97ce1e4eece60012d5a10ea87717458bfb1f19c2c7a615a3dbff83d090c6b",
+   "preprocessor_config.json": "36785da1dc7a00324048bd7c537c24247fca97c626884818257fd0b92287de31"
+  },
+  "muse_spark": {
+   "config.json": "8bcc07adaf0f7cc09d0b6e1792bcff78471cf5cddd53f917c006a4b14425fced",
+   "preprocessor_config.json": "65e810491b301fde52eee82871fc58e6590df6437bf85895239fd5fe0606a7e9"
+  },
+  "nemotron_omni": {
+   "config.json": "59d8f791406c35ca36f44b4558ad2cb8ce8d737470fb2b05ab9d3d26b0f7c311",
+   "preprocessor_config.json": "a80b0f0decc0d5ab0c08062f9070e5a22fdd3b5d452b89160cff20558e00125b"
+  },
+  "phi3_v": {
+   "config.json": "567e28c638a3e41aba1a304ae58b283845ad07e1c60e970643b0ad8fc229b382",
+   "preprocessor_config.json": "0f3d920fcec587bb425312d30b0660e1fabaf46a75961f2b75ddbb1ff92de01c",
+   "processor_config.json": "286a9e7fb58a489eae6825b79be69f62068c2028435c29ee52c3a485d071707b"
+  },
+  "qwen3_omni": {
+   "config.json": "e6f8c637528461398ef4e11d48b6112ce73db2458a563dfea548127c2cce253f",
+   "preprocessor_config.json": "b10e27fd4542cf89ec7145942b87f3e65408d4e9f9d031a29acdd293c15fb3fc"
+  },
+  "qwen3_vl": {
+   "config.json": "5cd452860dc1e9c29dd71cc3cef7f39b338b7a40793f7a260655c2d3568f3661",
+   "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+  },
+  "qwen3_vl (second config)": {
+   "config.json": "a9b0434bf1bb5de21786cb3dc3abf95e7254a1e131557c911d7271d2fb63e476",
+   "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+  },
+  "qwen_vl": {
+   "config.json": "4745aaba24756172765cb804b86512792202df6c65ac28989355971bbb27649c",
+   "preprocessor_config.json": "b5eaad0c2815f07631535dcc58f3c462b0d73693638ad21d19f3c50820eae1cc"
+  },
+  "qwen_vl (second config)": {
+   "config.json": "77d9ec7321cc572e3579e2c84799c9cadaded63c49ce93b101733349fc330c43",
+   "preprocessor_config.json": "f2058c716eef96ccaed1cc1e2d0c08306b62586d535b28d9d08e691b2fab7ca0"
+  },
+  "step3_vl": {
+   "config.json": "d817cef5cb09412ae57de4922b4bfb20abd84899c5405ca4e2017cf37188d453",
+   "preprocessor_config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  "step3_vl (model type step5_vl)": {
+   "config.json": "e535c5c9e6385e5c39d55daf346fc0b42dd93496bf5e540ea442168b2524bb63",
+   "preprocessor_config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  }
+ },
+ "windows": {
+  "WINDOW": 600,
+  "VOID": 8,
+  "LOUD": 0,
+  "BADEXIT": 0,
+  "NOFILE": 0
+ },
+ "measured": [
+  "2026-11-20T22:23:08Z",
+  "2026-11-20T22:46:14Z"
+ ],
+ "system": "Linux",
+ "machine": "x86_64",
+ "python": "3.12.16",
+ "problems": []
+}

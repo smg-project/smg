@@ -20,7 +20,10 @@ use smg_worker::identity::{basic::Worker, error::WorkerError};
 
 use crate::routers::common::{
     request_to_value, serialize_json_sized,
-    sglang_fields::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
+    sglang_fields::{
+        is_stripped_sglang_default, may_carry_stripped_sglang_default, strip_default_sglang_fields,
+        SGLANG_FIELDS,
+    },
 };
 
 #[derive(Debug)]
@@ -64,6 +67,16 @@ fn serialize_request_body_impl<T: Serialize>(
     strip_defaults: bool,
 ) -> Result<Vec<u8>, RequestBodyError> {
     let bytes = serialize_json_sized(typed_req, raw_len).map_err(RequestBodyError::Serialize)?;
+
+    // With no alias and no worker edit only the strip can change an object:
+    // a body it would leave alone goes out unparsed.
+    if canonical_model.is_none()
+        && !worker.mutates_request()
+        && bytes.first() == Some(&b'{')
+        && !(strip_defaults && may_carry_stripped_sglang_default(&bytes))
+    {
+        return Ok(bytes);
+    }
 
     // A body the raw editor cannot parse (in practice: non-objects) takes
     // the Value pipeline rather than skipping the hooks.
@@ -480,6 +493,28 @@ mod tests {
 
         assert_eq!(body, value_path_bytes(&req, None, &worker));
         assert_eq!(body, serialize_json_sized(&req, None).unwrap());
+    }
+
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    #[test]
+    fn a_body_no_edit_applies_to_allocates_only_its_bytes() {
+        use crate::routers::grpc::testing::bytes_allocated_during;
+
+        let worker = worker();
+        let req = generate_request(json!({}));
+
+        let direct = bytes_allocated_during(|| {
+            serialize_json_sized(&req, None).unwrap();
+        });
+        let routed = bytes_allocated_during(|| {
+            serialize_request_body(&req, None, &worker, None).unwrap();
+        });
+
+        assert_eq!(routed, direct);
     }
 
     #[test]

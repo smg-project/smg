@@ -113,7 +113,7 @@ smg-rl.workspace = true
 # supplies the membership door and the holder of worker objects, and the
 # operator feature the operators' door over the document. The crate's
 # client is two targets': see the end of this file.
-smg-policy-controller = { workspace = true, features = ["operator", "worker-host"] }
+smg-policy-controller = { workspace = true, features = ["in-process", "operator", "worker-host"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -236,11 +236,6 @@ harness = false
 path = "benches/tokenizer_benchmark.rs"
 
 [[bench]]
-name = "tool_parser_benchmark"
-harness = false
-path = "benches/tool_parser_benchmark.rs"
-
-[[bench]]
 name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
@@ -324,6 +319,14 @@ path = "benches/forced_call_stream.rs"
 name = "symphony_messages_stream"
 harness = false
 path = "benches/symphony_messages_stream.rs"
+
+# One request's routing, the classic policies against the policy controller
+# in this process: a fixed count of decisions a cell, so the same binary
+# counts instructions.
+[[bench]]
+name = "decision_paths"
+harness = false
+path = "benches/decision_paths.rs"
 
 [lints]
 workspace = true

@@ -195,28 +195,75 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
                 TransformError::ShapeError(format!("Inkling2 patch allocation failed: {error}"))
             })?;
         let padding = std::array::from_fn::<_, 3, _>(|channel| Self::normalized(-1.0, channel));
+        let table: [[f32; 256]; 3] = std::array::from_fn(|channel| {
+            std::array::from_fn(|value| Self::normalized(value as f32, channel))
+        });
         for image in images {
-            let rgba = image.to_rgba8();
-            let (width, height) = (rgba.width() as usize, rgba.height() as usize);
-            let raw = rgba.as_raw();
+            // An RGB image is read where it stands: `to_rgba8` would copy it
+            // whole at four bytes a pixel.
+            let rgb = image.as_rgb8().map(|rgb| rgb.as_raw().as_chunks::<3>().0);
+            let rgba = rgb.is_none().then(|| image.to_rgba8());
+            let rgba = rgba
+                .as_ref()
+                .map_or(&[][..], |rgba| rgba.as_raw().as_chunks::<4>().0);
+            let (width, height) = (image.width() as usize, image.height() as usize);
+            let mut block = [[[0u8; 3]; PATCH_SIZE]; PATCH_SIZE];
             for patch_y in 0..height.div_ceil(PATCH_SIZE) {
                 for patch_x in 0..width.div_ceil(PATCH_SIZE) {
                     let start = output.len();
+                    // The patch's columns that lie on the image: a run of its
+                    // pixels, then padding to the patch's width.
+                    let columns = patch_x * PATCH_SIZE..((patch_x + 1) * PATCH_SIZE).min(width);
+                    // The patch's pixels are copied out first: a decoder may
+                    // leave the frame out of the cache, and these short copies
+                    // let its misses overlap.
+                    if let Some(rgb) = rgb {
+                        let rows = patch_y * PATCH_SIZE..((patch_y + 1) * PATCH_SIZE).min(height);
+                        for (row, y) in block.iter_mut().zip(rows) {
+                            row[..columns.len()].copy_from_slice(
+                                &rgb[y * width + columns.start..y * width + columns.end],
+                            );
+                        }
+                    }
                     for y in patch_y * PATCH_SIZE..(patch_y + 1) * PATCH_SIZE {
-                        for x in patch_x * PATCH_SIZE..(patch_x + 1) * PATCH_SIZE {
-                            if y >= height || x >= width {
-                                output.extend_from_slice(&padding);
-                                continue;
-                            }
-                            let pixel = &raw[(y * width + x) * 4..][..4];
-                            let alpha = u32::from(pixel[3]);
-                            let background = if (x / 8 + y / 8) % 2 == 0 { 204 } else { 153 };
-                            for (channel, value) in pixel[..3].iter().enumerate() {
-                                let value =
-                                    (u32::from(*value) * alpha + background * (255 - alpha) + 127)
-                                        / 255;
-                                output.push(Self::normalized(value as f32, channel));
-                            }
+                        let on_image = if y < height {
+                            y * width + columns.start..y * width + columns.end
+                        } else {
+                            0..0
+                        };
+                        let copied = if rgb.is_some() { on_image.len() } else { 0 };
+                        for &[red, green, blue] in &block[y - patch_y * PATCH_SIZE][..copied] {
+                            output.extend_from_slice(&[
+                                table[0][usize::from(red)],
+                                table[1][usize::from(green)],
+                                table[2][usize::from(blue)],
+                            ]);
+                        }
+                        let with_alpha = if rgb.is_none() {
+                            &rgba[on_image.clone()]
+                        } else {
+                            &[]
+                        };
+                        for (x, &[red, green, blue, alpha]) in columns.clone().zip(with_alpha) {
+                            // An opaque pixel composites to itself.
+                            let [red, green, blue] = if alpha == u8::MAX {
+                                [red, green, blue]
+                            } else {
+                                let alpha = u32::from(alpha);
+                                let background = if (x / 8 + y / 8) % 2 == 0 { 204 } else { 153 };
+                                [red, green, blue].map(|value| {
+                                    ((u32::from(value) * alpha + background * (255 - alpha) + 127)
+                                        / 255) as u8
+                                })
+                            };
+                            output.extend_from_slice(&[
+                                table[0][usize::from(red)],
+                                table[1][usize::from(green)],
+                                table[2][usize::from(blue)],
+                            ]);
+                        }
+                        for _ in on_image.len()..PATCH_SIZE {
+                            output.extend_from_slice(&padding);
                         }
                     }
                     output.extend_from_within(start..start + PATCH_VALUES / TEMPORAL_PATCH_SIZE);

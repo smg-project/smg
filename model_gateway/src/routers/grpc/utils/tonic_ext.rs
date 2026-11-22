@@ -7,7 +7,7 @@ use smg_grpc_client::{
     dial_failure_without_peer, is_constraint_failure, is_constraint_refusal, is_keep_alive_timeout,
     is_request_timeout, is_transport_failure, WorkerMediaFault,
 };
-use smg_policy_controller::tracking::lease::TransportClass;
+use smg_policy_controller::tracking::TransportClass;
 use tonic::Code;
 
 use super::metrics::mark_error_reason;

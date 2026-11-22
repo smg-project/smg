@@ -599,6 +599,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     // A bare JSON list of calls, or content; no thought.
     ("llama-xlam-2-8b-fc-r", GenerationPrompt::Plain),
+    // Command: the prompt ends at the turn opener and the model writes each part's markers itself;
+    // Command R v01's template has none of them, and its answer stands bare.
+    (
+        "command-a-reasoning-08-2025",
+        GenerationPrompt::ModelDecides,
+    ),
+    ("c4ai-command-r-v01", GenerationPrompt::Plain),
     // The Mistral list behind `[TOOL_CALLS]`; Mistral Small 3's template renders no tool call,
     // so its recorded sets hold content alone, and no thought.
     ("mistral-small-24b-instruct-2501", GenerationPrompt::Plain),
@@ -905,6 +912,7 @@ impl Recorded for Table {
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
             Self::LongCat => ("<longcat_think>", "</longcat_think>"),
+            Self::Command => ("<|START_THINKING|>", "<|END_THINKING|>"),
             Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
@@ -964,6 +972,7 @@ impl Recorded for Table {
             | Self::Inkling2
             | Self::Gemma4
             | Self::FunctionGemma
+            | Self::Command
             | Self::Mistral
             | Self::MistralV13
             | Self::LongCat

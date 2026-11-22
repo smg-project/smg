@@ -188,6 +188,7 @@ pub(crate) fn image_for_runtime(
             None,
         )
         .with_transparency(frame.transparency())
+        .with_header_orientation(frame.header_orientation)
         .with_minimax_resize()
         .with_minimax_sglang_resize(sglang),
     ))

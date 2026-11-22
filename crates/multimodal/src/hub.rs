@@ -45,6 +45,10 @@ const HUB_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Resolve a model source to a local directory containing `config.json`.
 ///
 /// If the source is already a local directory with `config.json`, returns it as-is.
+/// A source that is a file (a tokenizer file) resolves to its directory when
+/// `config.json` stands beside it.
+/// Any other source that names a path fails here as a [`LocalSourceWithoutConfig`]:
+/// the Hub is never asked for a path.
 /// Otherwise, treats the source as a HuggingFace model ID and downloads
 /// `config.json` plus the processor configs the checkpoint ships to the local
 /// HF cache. A processor config the Hub answers 404 for is one the checkpoint
@@ -61,6 +65,19 @@ async fn resolve_within(source: &str, bound: Duration) -> anyhow::Result<PathBuf
     let path = Path::new(source);
     if path.join("config.json").exists() {
         return Ok(path.to_path_buf());
+    }
+    let beside = path
+        .parent()
+        .filter(|dir| path.is_file() && dir.join("config.json").exists());
+    if let Some(dir) = beside {
+        return Ok(dir.to_path_buf());
+    }
+    if is_local_source(source) {
+        return Err(LocalSourceWithoutConfig {
+            source: source.to_string(),
+            present: path.exists(),
+        }
+        .into());
     }
 
     let hub = HubRepo::open(source)?;
@@ -110,6 +127,19 @@ async fn resolve_within(source: &str, bound: Duration) -> anyhow::Result<PathBuf
         .parent()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| anyhow::anyhow!("Invalid HF cache path for model '{source}'"))
+}
+
+/// Whether `source` names a path rather than a repository id:
+/// absolute or explicitly relative, more than one separator (a repository id
+/// is `owner/name`), or present on disk.
+fn is_local_source(source: &str) -> bool {
+    let path = Path::new(source);
+    path.is_absolute()
+        || source.starts_with("./")
+        || source.starts_with("../")
+        || source.starts_with('~')
+        || source.matches('/').count() > 1
+        || path.exists()
 }
 
 /// A checkpoint's repository on the Hub and in the local Hub cache, as this
@@ -300,6 +330,45 @@ impl fmt::Display for HubFetchError {
 }
 
 impl std::error::Error for HubFetchError {}
+
+/// A source that names a path, not a repository id, and has no `config.json`
+/// on this host: a directory here without the file, or a path this host does
+/// not have. The message names the path for the log; a client is told only
+/// that the model's local source has no `config.json`.
+#[derive(Debug)]
+pub struct LocalSourceWithoutConfig {
+    source: String,
+    present: bool,
+}
+
+impl LocalSourceWithoutConfig {
+    /// Whether `error` is, or wraps, a local source without `config.json`.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.is::<LocalSourceWithoutConfig>())
+    }
+}
+
+impl fmt::Display for LocalSourceWithoutConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.present {
+            write!(
+                f,
+                "no config.json in '{}', a path of this host: the Hub is not asked for it",
+                self.source
+            )
+        } else {
+            write!(
+                f,
+                "'{}' is not on this host: the Hub is not asked for a path",
+                self.source
+            )
+        }
+    }
+}
+
+impl std::error::Error for LocalSourceWithoutConfig {}
 
 /// `true` when the Hub answered that the file is not in the repository (HTTP
 /// 404): the expected answer of a checkpoint without that processor config.
@@ -742,5 +811,31 @@ mod tests {
             !repo.join("blobs").exists() && !repo.join("snapshots").exists(),
             "nothing of the file is in the cache"
         );
+    }
+
+    /// A tokenizer source may be a file: the model's `config.json` is the one
+    /// beside it. A file with none beside it is a local source without one.
+    #[tokio::test]
+    async fn a_source_that_is_a_file_resolves_to_its_directory() {
+        let model = tempfile::tempdir().expect("a model directory");
+        std::fs::write(model.path().join("config.json"), "{}").expect("a config");
+        let tokenizer = model.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").expect("a tokenizer file");
+
+        let resolved = resolve_within(&tokenizer.to_string_lossy(), Duration::from_secs(1))
+            .await
+            .expect("the configuration beside the file");
+
+        assert_eq!(resolved, model.path());
+
+        let lone = tempfile::tempdir().expect("a directory");
+        let tokenizer = lone.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").expect("a tokenizer file");
+
+        let failed = resolve_within(&tokenizer.to_string_lossy(), Duration::from_secs(1))
+            .await
+            .expect_err("no config.json beside the file");
+
+        assert!(super::LocalSourceWithoutConfig::is(&failed));
     }
 }
