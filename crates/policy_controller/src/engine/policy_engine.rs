@@ -176,8 +176,8 @@ pub struct PoolMembers {
     /// The pool's own word, for the picker that places over the pool by
     /// itself ([`PolicyEngine::pick`]): a rotation counts its turns here.
     /// A single request's whole decision over the list lends it to its
-    /// draw ([`PoolFacts::word`](super::view::PoolFacts::word)), so every
-    /// request over the list turns the one rotation.
+    /// draw ([`PoolFacts::word`](super::view::PoolFacts::word)), so the
+    /// pick and that draw turn the one rotation.
     rotation: OwnWord,
     /// What a whole decision reads of the list beside its workers' live
     /// state ([`Self::records`]): made with the list where its host says

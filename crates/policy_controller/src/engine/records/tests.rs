@@ -146,6 +146,23 @@ fn a_record_states_its_workers_registration_by_its_place_in_the_list() {
     assert!(!pool.fixed()[1].health.healthy);
 }
 
+/// The rows a decision writes borrow the records alone, and the pool's
+/// facts what its live facts borrow: the rows stand after the key text the
+/// live facts read is gone. A build that ties the two fails here.
+#[test]
+fn the_rows_written_outlive_what_the_live_facts_borrow() {
+    let (spec, clock) = (applied("round_robin"), DecisionClock::new());
+    let workers: Vec<Arc<dyn Worker>> = vec![ready_worker(&url(0), MODEL)];
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let mut rows = Vec::new();
+    let written = {
+        let key = String::from("key-a");
+        let live = Live::at(spec.engine(), &clock, Instant::now(), None, Some(&key));
+        pool.write(&workers, &live, &mut rows).0
+    };
+    assert_eq!(written.len(), 1);
+}
+
 #[test]
 fn a_record_states_what_its_worker_object_says_at_the_decision() {
     let spec = applied("least_load");

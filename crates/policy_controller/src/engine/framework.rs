@@ -6420,7 +6420,6 @@ impl Engine {
             return None;
         }
         let (profile, tests) = (&self.profiles[at], self.row_tests[at]);
-        let masked = tests.is_some_and(|tests| tests.masked(cx));
         let Buffers {
             kept,
             scores,
@@ -6431,19 +6430,22 @@ impl Engine {
         drawn.clear();
         // A row the draw takes passes two tests, and neither says the other.
         // The draw's own, as a request with no session value is asked it:
-        // the profile's fold and the host's mask where the build made a
-        // fold, else a call a filter. Where the pass put back the rows a
-        // soft filter refused together, or the all-vetoed rule kept rows,
-        // every survivor fails it: the draw keeps none, as that request's
-        // does, and the stages place over the survivors. And the row is one
-        // of the survivors. A filter may read what another decision moves,
-        // so a row the pass refused can pass the first test here, and the
-        // session's cap is read of the survivors alone ([`Self::respill`]).
+        // the profile's fold where the build made one, else a call a
+        // filter. Where the pass put back the rows a soft filter refused
+        // together, or the all-vetoed rule kept rows, every survivor fails
+        // it: the draw keeps none, as that request's does, and the stages
+        // place over the survivors. And the row is one of the survivors. A
+        // filter may read what another decision moves, so a row the pass
+        // refused can pass the first test here, and the session's cap is
+        // read of the survivors alone ([`Self::respill`]). The host's mask,
+        // which that request's draw asks beside the fold, is not asked
+        // again: the pass's health filter asked it under these constraints,
+        // so no survivor is under it.
         // The survivors name a row once, so as many as the rows is every row.
         let all = kept.len() == candidates.len();
         let mut keeps = |row: &Candidate| {
             let passes = match tests {
-                Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
+                Some(tests) => tests.keeps(facts, row, cx),
                 None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
             };
             let at = candidates.element_offset(row);
@@ -16152,16 +16154,23 @@ mod tests {
             ];
             for (state, (profile, pool, cx)) in refused.into_iter().enumerate() {
                 let (plain, whole) = decide(profile(), pool, cx, false);
-                let (keyed, _) = decide(profile(), pool, cx, true);
+                let (keyed, session) = decide(profile(), pool, cx, true);
                 assert!(!whole.drew_first(), "{rows} rows, state {state}");
                 assert!(!plain.is_empty(), "{rows} rows, state {state}: a pick");
                 assert_eq!(keyed, plain, "{rows} rows, state {state}");
+                // No draw answers either request, and both say the lift
+                // where every row is under the host's veto.
                 let lifted = if state == 5 {
                     LiftedVeto::Liveness
                 } else {
                     LiftedVeto::None
                 };
-                assert_eq!(whole.lifted, lifted, "{rows} rows, state {state}");
+                assert!(!session.drew_first(), "{rows} rows, state {state}");
+                assert_eq!(
+                    (whole.lifted, session.lifted),
+                    (lifted, lifted),
+                    "{rows} rows, state {state}"
+                );
             }
             // The row a filter refused at the pass is no survivor, whatever
             // the filter says of it at the turn: the turn does not take it.
