@@ -362,3 +362,37 @@ def test_every_archive_install_of_ci_goes_through_the_helper() -> None:
             and line.strip() not in KEPT.get(name, set())
         ]
     assert bare == []
+
+
+def test_strict_mirror_failure_never_refreshes_or_installs(tmp_path: Path) -> None:
+    bed = Bed(tmp_path)
+    (bed.scripts / "ci_apt_mirror.sh").write_text(
+        '#!/bin/bash\necho "$*" >> "$MIRROR_CALLS"\nexit 71\n'
+    )
+    result = bed.install("--strict-mirror", "sudo", "-y", "pkg")
+    assert result.returncode == 71, result.stderr
+    assert bed.lines("mirror_calls") == ["", "--reprobe", "--reprobe"]
+    assert bed.lines("update_calls") == []
+    assert bed.lines("install_calls") == []
+    assert bed.lines("sleeps") == ["10", "20"]
+
+
+def test_default_mirror_failure_still_uses_existing_sources(tmp_path: Path) -> None:
+    bed = Bed(tmp_path)
+    (bed.scripts / "ci_apt_mirror.sh").write_text(
+        '#!/bin/bash\necho "$*" >> "$MIRROR_CALLS"\nexit 71\n'
+    )
+    result = bed.install("sudo", "-y", "pkg")
+    assert result.returncode == 0, result.stderr
+    assert "mirror probe failed" in result.stderr
+    assert bed.lines("update_calls") == ["sudo"]
+    assert bed.lines("install_calls") == ["install -y pkg"]
+
+
+def test_strict_mirror_still_requires_packages(tmp_path: Path) -> None:
+    bed = Bed(tmp_path)
+    for arguments in (("--strict-mirror",), ("--strict-mirror", "sudo")):
+        result = bed.install(*arguments)
+        assert result.returncode == 2
+    assert bed.lines("mirror_calls") == []
+    assert bed.lines("install_calls") == []
