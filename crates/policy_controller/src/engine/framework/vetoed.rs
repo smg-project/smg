@@ -303,9 +303,16 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// does not turn on the order a document lists its filters in. The retry's
 /// tried list is set aside for those passes, as the gateway's fallback
 /// sets it aside: a worker an earlier attempt tried is taken again when it
-/// holds the fewest requests. The host's list of workers it just failed to
-/// reach stays: the soft filter passes over such a worker while another
-/// usable one stands, and takes it as the last resort.
+/// holds the fewest requests. One pass reads the list first: the one that
+/// lifts the overload veto over a chosen prefill's partners. The profile's
+/// soft filter then keeps to the partners the request has not tried while
+/// one is left, as the gateway's pair selection does. That pass stands
+/// where every partner it keeps is untried. Where it keeps a tried one or
+/// nobody, the pass with the list set aside decides. The pair presets list
+/// that filter behind the room filter, the order the gateway narrows in.
+/// The host's list of workers it just failed to reach stays in every pass:
+/// the soft filter passes over such a worker while another usable one
+/// stands, and takes it as the last resort.
 ///
 /// The overload veto is lifted under [`AllVetoed::Steer`], where it stood
 /// in the emptied pass and a row reads as over its thresholds. Under a veto
@@ -363,13 +370,24 @@ pub(super) fn emptied(
             .iter()
             .any(|row| !NotOverloaded.keep(facts, row, cx))
     {
-        let whole = RequestFacts {
-            tried: &[],
-            ..*facts
-        };
         let pass = Constraints {
             overload_lifted: true,
             ..*cx
+        };
+        // A chosen prefill's partners keep to the ones the request has not
+        // tried while one is left: their pass reads the tried list first,
+        // and stands where every partner it keeps is untried.
+        let untried = |&at: &u32| !facts.tried.contains(&candidates[at as usize].id);
+        if set.class.is_some()
+            && filter(profile, facts, &pass, buf, set.shedding()).is_none()
+            && buf.kept.iter().all(untried)
+        {
+            buf.lifted = LiftedVeto::Overload;
+            return emptied_by;
+        }
+        let whole = RequestFacts {
+            tried: &[],
+            ..*facts
         };
         match overload_pass(profile, &whole, &pass, buf, set.shedding()) {
             None => {
@@ -599,7 +617,7 @@ mod tests {
         },
         policies::{consistent_hashing::ConsistentHash, manual::Manual},
         stages::{
-            filters::{HasCapacity, HasRoom, Healthy, NotOverloaded},
+            filters::{HasCapacity, HasRoom, Healthy, NotOverloaded, NotTried},
             lifecycle::Lifecycle,
             pickers::Best,
         },
@@ -1288,8 +1306,8 @@ mod tests {
         vec![Box::new(Healthy), Box::new(NotOverloaded)]
     }
 
-    /// [`pair_engine`], its live sides filtering by `live` instead: the
-    /// prefill side's filters, then the decode side's.
+    /// [`pair_engine`] with its live sides' filters given: the prefill
+    /// side's, then the decode side's.
     fn pair_engine_of(shed: bool, [prefill, decode]: [Vec<Box<dyn Filter>>; 2]) -> Engine {
         let side = |name: &str, filters| Profile {
             name: name.into(),
@@ -1457,7 +1475,8 @@ mod tests {
     /// decodes are over their thresholds alone: one is full and its prefill
     /// free, the other has room and its prefill is at its limit. The pair is
     /// the free prefill with its full decode, whichever of the two classes
-    /// stands first among the decodes. The gateway's own pair
+    /// stands first among the decodes. Between two partners of one prefill
+    /// the one with a room takes the pair. The gateway's own pair
     /// selection makes it so: a prefill at its limit leaves before the
     /// policy picks, and the rooms are asked among the picked prefill's
     /// partners (`model_gateway/src/routers/common/placement.rs:1467-1480`,
@@ -1480,14 +1499,22 @@ mod tests {
         };
         assert_eq!(placed(0), ((0, 0), LiftedVeto::Overload));
         assert_eq!(placed(1), ((1, 1), LiftedVeto::Overload));
+        // The partner with a room, though the full one holds fewer requests.
+        let mut prefill = classed(free(0, 0), 1);
+        prefill.has_capacity = true;
+        let mut partners = [classed(over(0, 0), 1), classed(over(1, 3), 1)];
+        partners[1].has_room = true;
+        let decision = decide_pair(&engine, &[prefill], &partners);
+        assert_eq!(pair_of(&decision), (0, 1));
     }
 
     /// The pass that opens the prefills sets the retry's tried list aside,
-    /// as the rule's own pass does: a hard filter that reads the list hides
-    /// no prefill whose decode the rule then takes. The gateway's own pair
-    /// selection steps aside from a tried decode only while another partner
-    /// is left (`model_gateway/src/routers/common/placement.rs:1562-1570`),
-    /// and places this pair.
+    /// and the partners' pass does where reading the list leaves nobody: a
+    /// hard filter that reads the list hides no prefill and refuses no lone
+    /// partner. The gateway's own pair selection steps aside from a tried
+    /// decode only while another partner is left
+    /// (`model_gateway/src/routers/common/placement.rs:1562-1570`), and
+    /// places this pair.
     #[test]
     fn a_tried_decode_still_opens_its_prefill() {
         /// Refuses a worker an earlier attempt tried: a hard filter.
@@ -1504,7 +1531,9 @@ mod tests {
         let mut reads_tried = vetoes();
         reads_tried.push(Box::new(Untried));
         let engine = pair_engine_of(false, [vetoes(), reads_tried]);
-        let (prefills, decodes) = ([classed(free(0, 0), 1)], [classed(over(0, 1), 1)]);
+        let (prefills, mut decodes) = ([classed(free(0, 0), 1)], [classed(over(0, 1), 1)]);
+        // An id of its own: the tried list names the decode and no prefill.
+        decodes[0].id = WorkerId(200);
         let pools = PairPools {
             prefills: &prefills,
             decodes: &decodes,
@@ -1519,6 +1548,66 @@ mod tests {
         let decision = engine.decide_pair(&req, &pool, pools, &cx, &cx, &mut Scratch::new());
         assert_eq!(pair_of(&decision), (0, 0));
         assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+    }
+
+    /// A retry over partners all over their thresholds keeps to the ones the
+    /// request has not tried while one is left, and takes the fewest in
+    /// flight among those. With every partner tried the fewest in flight of
+    /// all takes it. A tried partner with a room stays ahead of untried ones
+    /// with none. The gateway's own pair selection orders a pick's partners
+    /// so: the rooms, the untried ones, the least loaded
+    /// (`model_gateway/src/routers/common/placement.rs:1561`, `:1568-1570`,
+    /// `:1575-1578`, `narrow_to` at `:266-282`). Where the list names every
+    /// partner but one the host just failed to reach, that one stays the
+    /// last resort: the gateway's retry keeps one list, so that answer is
+    /// the engine's own. So is a decode asked again behind its prefill,
+    /// which answers the same: the gateway asks no decode again.
+    #[test]
+    fn a_retry_keeps_to_the_untried_partners_while_one_is_left() {
+        // The decode side's filters in the pair presets' order.
+        let mut reads_tried = vetoes();
+        reads_tried.push(Box::new(HasRoom));
+        reads_tried.push(Box::new(NotTried));
+        let engine = pair_engine_of(false, [vetoes(), reads_tried]);
+        let prefills = [classed(free(0, 0), 1)];
+        let mut decodes = [over(0, 0), over(1, 1), over(2, 2)].map(|worker| classed(worker, 1));
+        for decode in &mut decodes {
+            decode.id = WorkerId(200 + u64::from(decode.position));
+        }
+        let ids = decodes.map(|decode| decode.id);
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        // The decode a first decision names among `decodes` for a request
+        // that tried `tried` and whose host just failed to reach `gone`,
+        // and the one a decode asked again behind the prefill names.
+        let placed = |decodes: &[Candidate], tried: &[WorkerId], gone: &[WorkerId]| {
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            let req = RequestFacts { tried, ..facts(1) };
+            let reached = Constraints {
+                excluded: gone,
+                ..Constraints::default()
+            };
+            let scratch = &mut Scratch::new();
+            let first = engine.decide_pair(&req, &pool, pools, &cx, &reached, scratch);
+            let held = prefills[0].id;
+            let again = engine.decide_decode(&req, &pool, pools, held, None, &reached, scratch);
+            assert_eq!(first.trace().lifted, LiftedVeto::Overload);
+            (pair_of(&first).1, pair_of(&again).1)
+        };
+        let mut roomy = decodes;
+        roomy[0].has_room = true;
+        // Where the list moves no answer: none, every partner tried, every
+        // partner but one the host failed to reach, a tried one with a room.
+        assert_eq!(placed(&decodes, &[], &[]), (0, 0));
+        assert_eq!(placed(&decodes, &ids, &[]), (0, 0));
+        assert_eq!(placed(&decodes, &ids[1..], &ids[..1]), (1, 1));
+        assert_eq!(placed(&roomy, &ids[..1], &[]), (0, 0));
+        // Where it does: the untried partners while one is left.
+        assert_eq!(placed(&decodes, &ids[..1], &[]), (1, 1));
+        assert_eq!(placed(&decodes, &ids[..2], &[]), (2, 2));
     }
 
     /// A decode asked for a held prefill is put to the rule, both its tiers.
