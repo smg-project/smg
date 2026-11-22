@@ -1655,13 +1655,24 @@ impl Router {
     /// body cut short in transit a 502 `read_response_body_failed` and one in
     /// no rerank shape a 502 `call_upstream_decode_error`, the relay's own codes
     /// for a worker body it could not read and one it could not decode.
-    async fn build_rerank_response(
+    pub(super) async fn build_rerank_response(
         req: RerankResponseSpec,
         canonical_model: Option<&str>,
         response: Response,
         max_body_bytes: usize,
     ) -> Response {
         let (parts, response_body) = response.into_parts();
+        // Each answer built here replaces the dispatch's one and keeps the
+        // worker named on it, for the client and the access log.
+        let keep_worker = |mut answer: Response| {
+            if let Some(worker) = parts.headers.get(&header_utils::HEADER_ROUTED_WORKER_ID) {
+                answer.headers_mut().insert(
+                    header_utils::HEADER_ROUTED_WORKER_ID.clone(),
+                    worker.clone(),
+                );
+            }
+            answer
+        };
         let body_bytes = match to_bytes(response_body, max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1673,16 +1684,16 @@ impl Router {
                         limit = max_body_bytes,
                         "Rerank worker response exceeded the body limit"
                     );
-                    return error::bad_gateway(
+                    return keep_worker(error::bad_gateway(
                         "upstream_response_too_large",
                         format!("Rerank response from worker exceeded {max_body_bytes} bytes"),
-                    );
+                    ));
                 }
                 error!("Failed to read rerank worker response: {e}");
-                return error::bad_gateway(
+                return keep_worker(error::bad_gateway(
                     "read_response_body_failed",
                     format!("Failed to get response body: {e}"),
-                );
+                ));
             }
         };
         let worker = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
@@ -1695,12 +1706,12 @@ impl Router {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("no content type");
                 warn!(%status, content_type, "Rerank worker response is in no rerank shape: {e}");
-                return error::bad_gateway(
+                return keep_worker(error::bad_gateway(
                     "call_upstream_decode_error",
                     format!(
                         "Rerank response from worker ({status}, {content_type}) is not a rerank answer: {e}"
                     ),
-                );
+                ));
             }
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
@@ -1715,13 +1726,13 @@ impl Router {
         if !req.return_documents {
             rerank_response.drop_documents();
         }
-        Json(rerank_response).into_response()
+        keep_worker(Json(rerank_response).into_response())
     }
 }
 
 /// Post-dispatch inputs for the rerank response builder; the request itself
 /// (documents included) is released at dispatch.
-struct RerankResponseSpec {
+pub(super) struct RerankResponseSpec {
     model: String,
     rid: Option<openai_protocol::common::StringOrArray>,
     top_k: Option<usize>,
@@ -3966,10 +3977,11 @@ mod tests {
     #[tokio::test]
     async fn a_worker_body_cut_short_in_transit_is_a_502_read_failure() {
         let req = rerank_request();
-        let upstream = Response::new(Body::from_stream(stream::iter([
+        let mut upstream = Response::new(Body::from_stream(stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"[{\"index\": 0, \"score\": 0.9}")),
             Err(std::io::Error::other("connection cut")),
         ])));
+        header_utils::insert_routed_worker_id(upstream.headers_mut(), "http://worker");
         let response = Router::build_rerank_response(
             RerankResponseSpec::from(&req),
             None,
@@ -3978,6 +3990,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()["x-smg-routed-worker-id"],
+            "http://worker"
+        );
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"

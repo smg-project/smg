@@ -102,7 +102,7 @@ use crate::{
             error_reason_for_response, error_type_for_response, error_type_from_status,
             route_to_endpoint,
         },
-        http::router::send_with_stale_conn_retry,
+        http::router::{send_with_stale_conn_retry, RerankResponseSpec, Router},
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
     },
@@ -213,6 +213,9 @@ pub struct PDRouter {
     pub policy_registry: Arc<PolicyRegistry>,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    /// The limit `Router::build_rerank_response` reads the rerank answer
+    /// under: the router configuration's `max_payload_size`.
+    max_payload_size: usize,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
     moriio_dp_turn: AtomicUsize,
@@ -519,6 +522,7 @@ impl PDRouter {
             policy_registry: Arc::clone(&ctx.policy_registry),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            max_payload_size: ctx.router_config.max_payload_size,
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
@@ -3327,7 +3331,20 @@ impl RouterTrait for PDRouter {
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, None, body, model_id).await
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let response_spec = RerankResponseSpec::from(&body);
+        let response = self.route_pd(headers, None, body, model_id).await;
+        if response.status().is_success() {
+            Router::build_rerank_response(
+                response_spec,
+                canonical_model.as_deref(),
+                response,
+                self.max_payload_size,
+            )
+            .await
+        } else {
+            response
+        }
     }
 
     fn router_type(&self) -> &'static str {
@@ -3569,6 +3586,7 @@ mod tests {
             policy_registry,
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            max_payload_size: 536_870_912,
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: None,
@@ -4803,6 +4821,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The pair shapes a rerank answer by the regular router's builder: a
+    /// client reads the same rerank object from either router, not the decode
+    /// worker's body as it came.
+    #[tokio::test]
+    async fn rerank_behind_the_pair_answers_the_gateways_rerank_object() {
+        let list =
+            r#"[{"score":0.25,"document":"a","index":0},{"score":0.75,"document":"b","index":1}]"#;
+        let (prefill_url, _) = spawn_recording_stub(list).await;
+        let (decode_url, _) = spawn_recording_stub(list).await;
+        let router = create_test_pd_router();
+        register_pd_pair(&router, prefill_url, decode_url.clone());
+
+        let rerank: RerankRequest = serde_json::from_value(json!({
+            "model": "m",
+            "query": "q",
+            "documents": ["a", "b"],
+            "top_k": 1,
+            "return_documents": false,
+            "rid": "my-rid",
+        }))
+        .expect("valid rerank request");
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let response = router
+            .route_rerank(None, &tenant, rerank, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-smg-routed-worker-id"], decode_url);
+        let answer = json_of(response).await;
+        assert_eq!(answer["object"], "rerank");
+        assert_eq!(answer["id"], "my-rid");
+        assert_eq!(answer["results"], json!([{"score": 0.75, "index": 1}]));
     }
 
     #[tokio::test]
