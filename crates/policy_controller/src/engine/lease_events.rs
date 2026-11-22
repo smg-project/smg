@@ -97,13 +97,9 @@ pub(crate) fn pair(
 ) {
     let prefill = held.lease;
     let first = held.decision.pick().and_then(|pick| pick.targets.first());
-    // The decode side as its host lends it: a lease that lends none has no
-    // decode side to tell.
-    let decode = held
-        .decode
-        .zip(first)
-        .and_then(|(side, first)| decode_as_issued(prefill, first, side.session));
-    let chosen = held.decode.is_some_and(|side| side.chosen);
+    // The decode side as its host lends it with a pair's lease.
+    let decode = first.and_then(|first| decode_as_issued(prefill, first, held.decode.session));
+    let chosen = held.decode.chosen;
     match said {
         Said::Dispatched(dispatch, at) => {
             let taken = held.target;
