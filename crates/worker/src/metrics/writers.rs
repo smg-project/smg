@@ -345,7 +345,8 @@ mod handles {
     }
 
     /// Every removal of a worker moves this on, and so does a registration
-    /// that follows a retirement (a first one makes no handle stale), and a
+    /// when a kept handle may be a no-op one (its address was retired, or the
+    /// upkeep forgot a retired address since the last registration), and a
     /// holder whose kept per-worker handles are from an earlier state (a
     /// [`super::WorkerHandles`] set, a thread's KV-event cache) drops them
     /// at its next record: a removal drops the address's series from the
@@ -354,8 +355,8 @@ mod handles {
     /// re-registration would otherwise leave in place.
     static WORKER_SET_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-    /// A worker was removed, or registered after a retirement: the kept
-    /// per-worker handles are stale.
+    /// A worker was removed, or registered while a kept handle may be a
+    /// no-op one: the kept per-worker handles are stale.
     pub(super) fn worker_set_changed() {
         WORKER_SET_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
@@ -1626,7 +1627,9 @@ impl Metrics {
 
     /// A worker registered at `worker_url`: its series record again if the
     /// address was retired by an earlier removal. Only a retirement leaves a
-    /// no-op handle kept, so a first registration drops no worker's handles.
+    /// no-op handle kept, so the kept handles go only when the store says one
+    /// may be: this address was retired, or the upkeep forgot a retired
+    /// address since the last registration.
     pub fn worker_registered(worker_url: &str) {
         if series::installed().is_some_and(|store| store.activate(worker_url)) {
             handles::worker_set_changed();

@@ -525,7 +525,8 @@ fn a_workers_handles_are_not_shared_with_another_worker_at_its_address() {
 
 /// The registry's hooks are what move the worker-set generation the kept
 /// counters are checked against: a removal, and the registration the store
-/// reports a kept no-op handle to. A first registration is not one.
+/// reports a kept no-op handle to. A first registration is one only after
+/// the upkeep forgot a retired address.
 #[test]
 fn a_removal_or_the_registration_after_it_drops_the_kept_worker_counters() {
     let store = WorkerSeries::with_exporter_quantiles();
