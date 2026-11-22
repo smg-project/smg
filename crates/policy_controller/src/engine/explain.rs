@@ -3,12 +3,12 @@
 
 use std::{collections::VecDeque, time::Instant};
 
-use super::{DecisionCall, RequestForm, Shadowed};
 use crate::{
     document::spec::PlanName,
     engine::{
         decision::{Decision, ShadowKind},
         framework::{Engine, Plan},
+        shadow::Shadowed,
         view::{fingerprint, WorkerId},
     },
     store::GatewayId,
@@ -159,13 +159,14 @@ pub(crate) struct Samples {
 impl Samples {
     /// Pushes one record, allocating the ring on its first write. A new
     /// lead starts with an empty ring. `binding` is the position of the
-    /// binding the decision ran under.
+    /// binding the decision ran under. `taken` is the instant the request
+    /// was taken, the gateway that asked and the request's id as stated.
     #[cold]
-    pub(crate) fn push<A: RequestForm>(
+    pub(crate) fn push(
         &mut self,
         term: u64,
         binding: Option<u32>,
-        taken: &DecisionCall<'_, A>,
+        (at, gateway, id): (Instant, GatewayId, &[u8]),
         decision: &Decision,
         shadow: Option<Shadowed>,
         sides: [Option<Shadowed>; 2],
@@ -191,13 +192,13 @@ impl Samples {
         self.records.push_back(DecisionRecord {
             decision: *decision,
             binding,
-            at: taken.now,
+            at,
             shadow: shadow.or(prefill).map(|said| said.kind),
             shadow_target: shadow.or(prefill).and_then(|said| said.first),
             decode_shadow: decode.map(|said| said.kind),
             decode_shadow_target: decode.and_then(|said| said.first),
-            gateway: taken.gateway,
-            request: fingerprint(taken.request.id()),
+            gateway,
+            request: fingerprint(id),
         });
     }
 
@@ -232,7 +233,6 @@ mod tests {
         engine::{
             decision::{Queue, Shed, ShedReason, Trace},
             framework::{Binding, Profile, WeightedScorer},
-            store_backed_engine::tests::GATEWAY,
         },
         stages::{
             filters::{Healthy, NotTried},
@@ -300,7 +300,7 @@ mod tests {
             shadow_target: None,
             decode_shadow: None,
             decode_shadow_target: None,
-            gateway: GATEWAY,
+            gateway: GatewayId(11),
             request: fingerprint(b"shed"),
         }
     }
