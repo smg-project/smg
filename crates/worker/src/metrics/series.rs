@@ -488,14 +488,27 @@ fn cleaned<'t>(
     }
 }
 
-/// Put `sample` with the family `name` cleans to; the cleaned name is
-/// allocated for the family's first sample alone.
+/// Whether the exporter's cleaner keeps `c` at index `i` of a family name.
+/// The three rules repeat its own (`metrics_exporter_prometheus::formatting`),
+/// which are private to it.
+fn metric_name_char(i: usize, c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || c == ':' || (i != 0 && c.is_ascii_digit())
+}
+
+/// The same for a label name.
+fn label_key_char(i: usize, c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || (i != 0 && c.is_ascii_digit())
+}
+
+/// The same for a label value: every character but the three it escapes.
+fn label_value_char(_: usize, c: char) -> bool {
+    !matches!(c, '\n' | '"' | '\\')
+}
+
+/// Put `sample` with the family `name` cleans to; a name that is clean
+/// already is allocated for the family's first sample alone.
 fn gather<V>(families: &mut BTreeMap<String, Vec<V>>, name: &str, sample: V) {
-    let name = cleaned(
-        name,
-        |i, c| c.is_ascii_alphabetic() || c == '_' || c == ':' || (i != 0 && c.is_ascii_digit()),
-        sanitize_metric_name,
-    );
+    let name = cleaned(name, metric_name_char, sanitize_metric_name);
     match families.get_mut(name.as_ref()) {
         Some(family) => family.push(sample),
         None => {
@@ -520,15 +533,11 @@ fn label_text(key: &Key) -> String {
         if !text.is_empty() {
             text.push(',');
         }
-        text.push_str(&cleaned(
-            label.key(),
-            |i, c| c.is_ascii_alphabetic() || c == '_' || (i != 0 && c.is_ascii_digit()),
-            sanitize_label_key,
-        ));
+        text.push_str(&cleaned(label.key(), label_key_char, sanitize_label_key));
         text.push_str("=\"");
         text.push_str(&cleaned(
             label.value(),
-            |_, c| !matches!(c, '\n' | '"' | '\\'),
+            label_value_char,
             sanitize_label_value,
         ));
         text.push('"');
@@ -750,9 +759,19 @@ mod tests {
     /// pairs.
     #[test]
     fn a_scrape_reads_as_the_exporters_cleaners_write_and_order_it() {
+        // A clean family name, label name and worker address are borrowed
+        // under the rules the scrape applies.
         assert!(matches!(
-            cleaned("http://w:1", |_, c| c != '"', |_| String::new()),
-            Cow::Borrowed("http://w:1")
+            cleaned("requests_total", metric_name_char, sanitize_metric_name),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            cleaned(WORKER_LABEL, label_key_char, sanitize_label_key),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            cleaned(WORKER_A, label_value_char, sanitize_label_value),
+            Cow::Borrowed(WORKER_A)
         ));
 
         // Every ASCII character and one beyond: first in a text, later in
