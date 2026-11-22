@@ -83,13 +83,13 @@ impl TokenSpeedEncoderClient {
         if let Some(pool) = cache.get(endpoint) {
             return Ok(Self::from_channel(pick(pool)));
         }
-        debug!(
-            "Connecting to TokenSpeed encoder at {} ({} conns, caching)",
-            endpoint, ENCODE_CONNS_PER_ENDPOINT
-        );
         let pool = (0..ENCODE_CONNS_PER_ENDPOINT)
             .map(|_| Channel::unconnected(endpoint, DEFAULT_CONNECT_TIMEOUT))
             .collect::<Result<Vec<_>, _>>()?;
+        debug!(
+            "pooling {ENCODE_CONNS_PER_ENDPOINT} connections to the TokenSpeed encoder at {}, each dialled on its first call",
+            pool[0].peer()
+        );
         let client = Self::from_channel(pick(&pool));
         cache.insert(endpoint.to_string(), pool);
         Ok(client)
