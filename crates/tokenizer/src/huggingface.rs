@@ -1160,6 +1160,9 @@ impl HuggingFaceTokenizer {
                     marks::marked_special_tokens(&special_tokens)
                 })
         };
+        if let Some(native) = &core.native {
+            native.rehearse(Some(core.tokenizer.get_model()));
+        }
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
@@ -1506,18 +1509,22 @@ impl HuggingFaceTokenizer {
             pieces.is_some(),
             token_texts.is_some(),
         );
+        let core = EncoderCore::new(
+            tokenizer,
+            encoders.native,
+            encoders.wordpiece,
+            encoders.unigram,
+        );
+        if let Some(native) = &core.native {
+            native.rehearse(Some(core.tokenizer.get_model()));
+        }
         HuggingFaceTokenizer {
             byte_level,
             pieces,
             token_texts,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
-            core: Arc::new(EncoderCore::new(
-                tokenizer,
-                encoders.native,
-                encoders.wordpiece,
-                encoders.unigram,
-            )),
+            core: Arc::new(core),
             special_tokens,
             chat_template: ChatTemplateState::empty(),
             response_template: None,

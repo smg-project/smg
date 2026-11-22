@@ -69,7 +69,8 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         OnceLock,
     },
-    time::Instant,
+    thread::ThreadId,
+    time::{Duration, Instant},
 };
 
 use aho_corasick::{
@@ -430,6 +431,12 @@ const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// as before (measured). It is `PARALLEL_MIN_BYTES`: the pool takes only a
 /// text that long, so a thread of the pool reads before its first unit.
 const READ_AT_ONCE_BYTES: usize = PARALLEL_MIN_BYTES;
+/// How long the read of the merge table that ends a load stands in for the
+/// loading thread's own (`NativeEncoder::load_read_holds`): the span of a
+/// process that loads and encodes at once. A thread that did anything of
+/// weight in between, the load of another tokenizer for one, is past it
+/// and reads the table itself.
+const LOAD_READ_HOLDS: Duration = Duration::from_millis(10);
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
@@ -1535,6 +1542,9 @@ pub(crate) struct NativeEncoder {
     /// at their first encode with this encoder ([`Self::thread_piece_cache`]
     /// counts them, `LEARNED_FROM_THREADS` asks for them).
     callers: AtomicUsize,
+    /// The thread that loaded this encoder, and when its rehearsal had read
+    /// the merge table through ([`Self::rehearse`]).
+    load_read: OnceLock<(ThreadId, Instant)>,
 }
 
 impl std::fmt::Debug for NativeEncoder {
@@ -1656,6 +1666,7 @@ impl NativeEncoder {
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
             callers: AtomicUsize::new(0),
+            load_read: OnceLock::new(),
         })
     }
 
@@ -1741,6 +1752,7 @@ impl NativeEncoder {
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
             callers: AtomicUsize::new(0),
+            load_read: OnceLock::new(),
         })
     }
 
@@ -2441,6 +2453,7 @@ impl NativeEncoder {
             cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
             callers: AtomicUsize::new(0),
+            load_read: OnceLock::new(),
         })
     }
 
@@ -2865,23 +2878,64 @@ impl NativeEncoder {
         }
         let mut ids = Vec::with_capacity(before.len() + text.len() / 3 + 8 + after.len());
         ids.extend_from_slice(before);
-        let mut mapped = String::new();
         let mut cache = self.piece_cache_for_text(text.len());
-        for (index, unit) in units.iter().enumerate() {
-            let marker = self.marker_before(units, index, at_start);
-            self.encode_unit(
-                model,
-                unit,
-                marker,
-                words,
-                &mut mapped,
-                &mut ids,
-                &mut cache,
-            )?;
-        }
-        self.answer_rest(&mut ids, &mut cache);
+        self.encode_serial(model, units, words, at_start, &mut ids, &mut cache)?;
         ids.extend_from_slice(after);
         Ok(ids)
+    }
+
+    /// The units of one call encoded in order onto `ids`, on `cache`: the
+    /// calling thread's for a request, one of its own for [`Self::rehearse`].
+    fn encode_serial(
+        &self,
+        model: Option<&ModelWrapper>,
+        units: &[Segment<'_>],
+        words: bool,
+        at_start: bool,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let mut mapped = String::new();
+        for (index, unit) in units.iter().enumerate() {
+            let marker = self.marker_before(units, index, at_start);
+            self.encode_unit(model, unit, marker, words, &mut mapped, ids, cache)?;
+        }
+        self.answer_rest(ids, cache);
+        Ok(())
+    }
+
+    /// The last step of a load: two short built-in texts encoded on a piece
+    /// cache of its own, which is dropped, then the merge table read through
+    /// once (`MergeTable::read_through`). The first request of a process
+    /// finds the encode path mapped and the table's lines in the caches. The
+    /// loading thread does not read the table again while this read is
+    /// fresh ([`Self::load_read_holds`]); every other thread's second call
+    /// still reads it itself ([`Self::piece_cache_for_text`]): a thread may
+    /// start long after the load. No thread's cache is made, so the loading
+    /// thread counts toward no share ([`Self::piece_cache_share`]).
+    pub(crate) fn rehearse(&self, model: Option<&ModelWrapper>) {
+        // Prose, digits, punctuation and JSON, then letters past ASCII.
+        const TEXTS: [&str; 2] = [
+            "The quick brown fox jumps over 12 lazy dogs. It's 3:45 pm, isn't it?\n\nHello, World! Please summarize the following text in one sentence: {\"key\": [1, 2.5, true]}",
+            "Caf\u{e9} na\u{ef}ve \u{4f60}\u{597d} \u{2014} the user's question: what is 2 + 2?\n",
+        ];
+        let mut cache = PieceCache::with_share(self.piece_cache_share());
+        for text in TEXTS {
+            let units = self.units(text, false, true);
+            let mut ids = Vec::with_capacity(text.len() / 3 + 8);
+            if self
+                .encode_serial(model, units.as_slice(), false, true, &mut ids, &mut cache)
+                .is_err()
+            {
+                break;
+            }
+        }
+        if let Some(merges) = &self.merges {
+            merges.read_through();
+        }
+        let _ = self
+            .load_read
+            .set((std::thread::current().id(), Instant::now()));
     }
 
     /// Room for the ids of one unit, from its bytes: about a token per three
@@ -4714,7 +4768,9 @@ impl NativeEncoder {
     /// a short first encode and only the encodes after it pay it back. A
     /// first text of [`READ_AT_ONCE_BYTES`] or more has the read before it.
     /// A call is one call of the encoder, not one prompt: a prompt encoded
-    /// by segments is several, and has the read before its second.
+    /// by segments is several, and has the read before its second. The
+    /// thread that loaded skips its read while the load's own is fresh
+    /// ([`Self::load_read_holds`]).
     fn piece_cache_for_text(&self, bytes: usize) -> RefMut<'_, PieceCache> {
         let mut cache = self.piece_cache_for_call();
         if cache.calls_to_read > 0 {
@@ -4723,13 +4779,22 @@ impl NativeEncoder {
             } else {
                 cache.calls_to_read - 1
             };
-            if cache.calls_to_read == 0 {
+            if cache.calls_to_read == 0 && !self.load_read_holds(Instant::now()) {
                 if let Some(merges) = &self.merges {
                     merges.read_through();
                 }
             }
         }
         cache
+    }
+
+    /// Whether the read that ended the load ([`Self::rehearse`]) stands in
+    /// for the calling thread's own at `now`: the thread is the one that
+    /// loaded, and the read is less than [`LOAD_READ_HOLDS`] old.
+    fn load_read_holds(&self, now: Instant) -> bool {
+        self.load_read.get().is_some_and(|&(loader, read_at)| {
+            loader == std::thread::current().id() && now.duration_since(read_at) < LOAD_READ_HOLDS
+        })
     }
 
     /// Whether a piece the thread's cache and the seed missed can still be

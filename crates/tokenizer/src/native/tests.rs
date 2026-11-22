@@ -5073,6 +5073,29 @@ fn a_thread_reads_the_merge_table_at_its_second_call_or_before_a_long_first_text
     assert_eq!(on_a_new_thread, 0, "a long first text has the read first");
 }
 
+/// A load's rehearsal encodes on a cache of its own (the loading thread,
+/// which may never encode, counts toward no thread's share), and its read
+/// of the merge table stands in for the loading thread's own while it is
+/// fresh, and for no other thread's.
+#[test]
+fn a_rehearsal_reads_for_the_loading_thread_and_makes_no_cache_of_it() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let tokenizer = tokenizer_of(&shapes()[0], &mut state);
+    let native = seeded(&tokenizer);
+    native.rehearse(Some(tokenizer.get_model()));
+    assert_eq!(native.threads.load(Ordering::Relaxed), 0);
+    let &(_, read_at) = native.load_read.get().expect("the load's stamp");
+    assert!(native.load_read_holds(read_at), "right after the load");
+    assert!(!native.load_read_holds(read_at + LOAD_READ_HOLDS), "later");
+    let elsewhere = std::thread::scope(|scope| {
+        scope
+            .spawn(|| native.load_read_holds(read_at))
+            .join()
+            .expect("a thread")
+    });
+    assert!(!elsewhere, "another thread reads the table itself");
+}
+
 /// A thread whose share fell (threads joined) since it last read it is
 /// within the new share from the start of its next encode call, with no
 /// miss in that call.
