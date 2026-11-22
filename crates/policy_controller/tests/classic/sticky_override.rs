@@ -83,10 +83,33 @@ impl Row {
         max_idle_secs: u64,
         eviction_interval_secs: u64,
     ) -> Result<PolicySpec, String> {
+        self.document(true, max_idle_secs, eviction_interval_secs)
+    }
+
+    /// The document the same settings give with the override off: the
+    /// row's policy alone.
+    fn alone(&self) -> Result<PolicySpec, String> {
+        self.document(false, 14_400, 60)
+    }
+
+    /// The settings' document for the row's policy, with every setting of
+    /// the policy at its flag's default.
+    fn document(
+        &self,
+        overridden: bool,
+        max_idle_secs: u64,
+        eviction_interval_secs: u64,
+    ) -> Result<PolicySpec, String> {
         let policy = match self.policy.as_str() {
             "random" => PolicySettings::Random,
             "power_of_two" => PolicySettings::PowerOfTwo {
                 load_metric: LoadMetricSetting::ExpectedWait,
+            },
+            "passthrough" => PolicySettings::Passthrough,
+            "bucket" => PolicySettings::Bucket {
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                bucket_adjust_interval_secs: 5,
             },
             other => return Err(format!("no settings are written here for `{other}`")),
         };
@@ -104,7 +127,7 @@ impl Row {
             worker_warmup_thin_ratio: 0.5,
             worker_warmup_divert_every: 8,
             routing_key_override: RoutingKeyOverrideSettings {
-                enabled: true,
+                enabled: overridden,
                 headers: vec![HEADER.into()],
                 eviction_interval_secs,
                 max_idle_secs,
@@ -295,8 +318,9 @@ impl Recorded for Row {
 }
 
 /// A key used again after its idle time and before the next sweep keeps
-/// its worker. The gateway's sticky map forgets an idle key at its periodic
-/// sweep alone, and a use of the key ahead of that sweep renews it
+/// its worker, and past that sweep it is placed anew. The gateway's sticky
+/// map forgets an idle key at its periodic sweep alone, and a use of the
+/// key ahead of that sweep renews it
 /// (`model_gateway/src/policies/manual.rs:395` and `:234`).
 /// No sheet records a time, so this case states the rule.
 #[test]
@@ -328,6 +352,157 @@ fn a_key_used_after_its_idle_time_and_before_the_sweep_keeps_its_worker() {
     bed.clock += 61_000_000;
     let again = bed.pick(Some("k1"), "m", 2);
     assert_eq!((first, again), (0, 0), "the key kept its worker");
+    // Past the next sweep the key is forgotten and placed anew.
+    bed.clock += 3_600_000_000;
+    assert_eq!(bed.pick(Some("k1"), "m", 3), 1, "the sweep forgot the key");
+}
+
+/// `passthrough` under the override, which no sheet of the gateway records.
+/// It is held to the gateway's rule
+/// (`model_gateway/src/policies/registry.rs`, `select_sticky`) by a twin bed
+/// that runs the policy alone, asked a request with no key wherever the
+/// gateway asks its policy:
+///
+/// - A key's first request goes where the policy sends it, and is pinned
+///   there (`:576-587`).
+/// - The key's next request follows the pin, and the policy is not asked
+///   (`:540-546`, reached from `:468-469` ahead of the policy's call at
+///   `:471`). So a request with no key takes the policy's next answer, the
+///   same on both beds, and that answer is another worker by then.
+/// - With two requests of the key on its worker the policy is asked again
+///   (`:547-555`), and the key's next request goes to its pick, a worker
+///   under that count (`:565-567`).
+///
+/// The case runs over a list of three workers and over one of sixteen. From
+/// sixteen workers on the engine draws first for a request with no key and
+/// runs the whole pass for a key with no pin, and the gateway asks one
+/// policy for both: the two must send a request to one worker.
+#[test]
+fn a_key_goes_where_its_policy_sends_it_and_then_follows_its_pin() {
+    for workers in [3, 16] {
+        let row = Row {
+            name: "passthrough".into(),
+            policy: "passthrough".into(),
+            assignment: Assignment::Delegate,
+            workers: vec![
+                WorkerState {
+                    in_flight: 0,
+                    keys: 0,
+                };
+                workers
+            ],
+            steps: Vec::new(),
+            outcome: Outcome::Sequence(Vec::new()),
+        };
+        let mut keyed = Bed::new(&row).expect("the settings' document under the override");
+        let alone = row.alone().expect("the policy's own document");
+        let mut alone = Bed::under(&row, &alone).expect("an engine");
+        // `passthrough` sends every request to the first worker that takes
+        // one: with that worker down, the key lands on the next.
+        for bed in [&mut keyed, &mut alone] {
+            bed.pool[0].health.healthy = false;
+        }
+        let pin = keyed.pick(Some("k1"), "m", 1);
+        assert_eq!(pin, alone.pick(None, "m", 1), "{workers}: a new key");
+        // The pool turns against the pinned worker.
+        for bed in [&mut keyed, &mut alone] {
+            bed.pool[0].health.healthy = true;
+            bed.pool[pin].in_flight = 200;
+        }
+        assert_eq!(keyed.pick(Some("k1"), "m", 2), pin, "{workers}: a pin");
+        let next = keyed.pick(None, "m", 3);
+        assert_eq!(next, alone.pick(None, "m", 3), "{workers}: no key");
+        assert_ne!(next, pin, "{workers}: the policy alone goes elsewhere");
+        // Two requests of the key are on its worker.
+        let mut on = vec![0; workers];
+        on[pin] = 2;
+        keyed.held.insert("k1".into(), on);
+        let moved = keyed.pick(Some("k1"), "m", 4);
+        assert_eq!(moved, alone.pick(None, "m", 4), "{workers}: at the cap");
+        assert_ne!(moved, pin, "{workers}: the policy picks another worker");
+        keyed.held.clear();
+        assert_eq!(
+            keyed.pick(Some("k1"), "m", 5),
+            moved,
+            "{workers}: the key's next request"
+        );
+    }
+}
+
+/// `bucket` under the override, where the rule plans single requests alone.
+/// The gateway's policy holds a bucket of sizes for the prefill workers of
+/// a pair alone (`model_gateway/src/policies/registry.rs:1215-1226`), and
+/// draws a healthy worker among single ones
+/// (`model_gateway/src/policies/bucket.rs:186-191`). This crate's stage
+/// places a prefill decision alone and draws for every other. So a single
+/// request's worker is a draw on both sides, and a twin bed that runs the
+/// policy alone draws the same worker for the same seed:
+///
+/// - A key's first request goes where the draw sends it.
+/// - The key's next requests follow that pin, under seeds whose draw is
+///   another worker.
+/// - With two requests of the key on its worker the draw is asked again,
+///   and the pin moves where it lands on another worker.
+///
+/// No sheet records `bucket` under the override, so this case states the
+/// rule.
+#[test]
+fn bucket_draws_for_a_key_and_then_follows_its_pin() {
+    let row = Row {
+        name: "bucket".into(),
+        policy: "bucket".into(),
+        assignment: Assignment::Delegate,
+        workers: vec![
+            WorkerState {
+                in_flight: 0,
+                keys: 0,
+            };
+            3
+        ],
+        steps: Vec::new(),
+        outcome: Outcome::Sequence(Vec::new()),
+    };
+    let alone = row.alone().expect("the policy's own document");
+    let mut pins = Vec::new();
+    for seed in 1..=8_u64 {
+        let mut keyed = Bed::new(&row).expect("the settings' document under the override");
+        let mut alone = Bed::under(&row, &alone).expect("an engine");
+        let pin = keyed.pick(Some("k1"), "m", seed);
+        assert_eq!(pin, alone.pick(None, "m", seed), "seed {seed}: a new key");
+        pins.push(pin);
+        // The pin is followed whatever the seed draws.
+        let mut elsewhere = false;
+        for next in 100..116_u64 {
+            assert_eq!(keyed.pick(Some("k1"), "m", next), pin, "seed {seed}: a pin");
+            elsewhere |= alone.pick(None, "m", next) != pin;
+        }
+        assert!(elsewhere, "seed {seed}: the draw alone goes elsewhere");
+        // Two requests of the key are on its worker: the draw is asked.
+        let mut on = vec![0; 3];
+        on[pin] = 2;
+        keyed.held.insert("k1".into(), on);
+        let moved = (200..216_u64)
+            .map(|next| {
+                let drawn = keyed.pick(Some("k1"), "m", next);
+                assert_eq!(
+                    drawn,
+                    alone.pick(None, "m", next),
+                    "seed {seed}: at the cap"
+                );
+                drawn
+            })
+            .find(|&drawn| drawn != pin)
+            .expect("a draw on another worker");
+        keyed.held.clear();
+        assert_eq!(
+            keyed.pick(Some("k1"), "m", 300),
+            moved,
+            "seed {seed}: the pin moved"
+        );
+    }
+    pins.sort_unstable();
+    pins.dedup();
+    assert!(pins.len() > 1, "the draw spreads new keys: {pins:?}");
 }
 
 /// Rows copied from the recorded sheet: a pin under the cap and under two
