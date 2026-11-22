@@ -904,6 +904,55 @@ fn the_template_value_leaves_long_media_text_out() {
     assert!(allocated < 1 << 20, "{allocated} bytes allocated");
 }
 
+/// The string format with placeholders gives long media text the value short
+/// media text gives, in either media order; without placeholders a media-only
+/// message keeps its URL, long or not.
+#[test]
+fn long_media_text_changes_no_string_format_value() {
+    let message = |url: &str, text: Option<&str>| {
+        let mut parts = Vec::new();
+        if let Some(text) = text {
+            parts.push(ContentPart::Text {
+                text: text.to_string(),
+            });
+        }
+        parts.push(ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: url.to_string().into(),
+                detail: None,
+                max_long_side_pixel: None,
+            },
+        });
+        vec![ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Parts(parts),
+            name: None,
+        }]
+    };
+    let long = format!("data:image/jpeg;base64,{}", "A".repeat(64 << 10));
+    let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
+    for order in [MediaPartOrder::MediaFirst, MediaPartOrder::Authored] {
+        let value = |url: &str| {
+            process_content_format_with_order(
+                &message(url, Some("question")),
+                ChatTemplateContentFormat::String,
+                Some(&tokens),
+                order,
+            )
+            .unwrap()
+        };
+        assert_eq!(value(&long), value("data:image/jpeg;base64,AAAA"));
+    }
+    let kept = process_content_format_with_order(
+        &message(&long, None),
+        ChatTemplateContentFormat::String,
+        None,
+        MediaPartOrder::Authored,
+    )
+    .unwrap();
+    assert!(kept[0].to_string().contains(&long));
+}
+
 // --- an assistant turn without content on the render path ----------------
 
 /// A template of the string format that tests and splits every assistant
