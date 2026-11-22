@@ -337,6 +337,13 @@ impl<G> Objects<G> {
     /// such a host mirrors ([`Self::mirror_overload`]). An object has one
     /// judge, so a holder that builds its objects with thresholds mirrors
     /// nothing.
+    ///
+    /// The two judges do not read the same thresholds. A policy document's
+    /// binding thresholds, which the store reads under a row that names
+    /// none, are not read here: `defaults` stands in their place, and with
+    /// no signal in `defaults` a row that names none has no judge at all.
+    /// The store judges an engine's ranks together, and the monitor judges
+    /// each object by its own report.
     #[must_use]
     pub fn with_overload_thresholds(mut self, defaults: OverloadThresholds) -> Self {
         self.overload_defaults = Some(defaults);
