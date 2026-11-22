@@ -409,18 +409,22 @@ fn built(store: &MemoryStore, asking: Asking, now: Instant) -> Built {
     }
 }
 
-/// How many asks over one fleet met each answer.
+/// How many asks over one fleet met each answer: held to a part of the
+/// list, handed the list whole, shed, or over no row. `decided` counts the
+/// frames of those asks that were answered a pick, eight frames an ask.
 #[derive(Debug, Default)]
 struct Met {
     narrowed: usize,
+    whole: usize,
     shed: usize,
     unreached: usize,
     decided: usize,
 }
 
 /// Over one fleet, every ask is answered the same workers both ways. The
-/// first fleet holds seven rows: two host-local, to different gateways, and
-/// wires of every kind. Vetoes stand through the door a controller writes
+/// first fleet holds seven rows: two host-local, to different gateways,
+/// workers on one wire, on the other and on both, and one that states no
+/// wire. Vetoes stand through the door a controller writes
 /// by: a held one, a doubt, one on a worker its gateway does not dial, and
 /// another gateway's. The second fleet is one gateway's alone, so the two
 /// other gateways reach no row of it. For each of three gateways, six sets
@@ -455,26 +459,28 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
         (OTHER, 0, false),
     ];
     let met = compared(&mixed, &vetoes);
-    // The fleet met asks that narrow and asks that do not, sheds and
-    // decisions. Every gateway dials a worker of it.
+    // The fleet met asks that narrow, sheds and decisions. Every gateway
+    // dials a worker of it, and none dials every worker.
     assert!(
         met.narrowed > 0 && met.shed > 0 && met.decided > 0,
         "{met:?}"
     );
-    assert_eq!(met.unreached, 0, "{met:?}");
+    assert_eq!((met.whole, met.unreached), (0, 0), "{met:?}");
 
-    // A fleet one gateway alone dials: each ask of the two others, 18 a
+    // A fleet one gateway alone dials: that gateway is handed it whole
+    // where its wires allow, and each ask of the two others, 18 a
     // gateway, is over no row.
     let locals = [local(OTHER, HTTP), local(OTHER, both)];
     let met = compared(&locals, &[(OTHER, 1, false)]);
     assert_eq!(met.unreached, 2 * 18, "{met:?}");
-    assert!(met.shed > 0 && met.decided > 0, "{met:?}");
+    assert!(met.whole > 0 && met.shed > 0 && met.decided > 0, "{met:?}");
 }
 
 /// Every ask of three gateways over `fleet`, one row a worker in its
 /// order, under `vetoes` (a gateway, the place of the worker it vetoes,
 /// whether the veto holds): the store's build against this module's
-/// places, and each ask's frames decided over the list.
+/// places, and the frames of each ask that takes places decided over the
+/// list.
 fn compared(fleet: &[Reach], vetoes: &[(GatewayId, usize, bool)]) -> Met {
     const S: Duration = Duration::from_secs(1);
     let both = HTTP.union(GRPC);
@@ -589,6 +595,7 @@ fn compared(fleet: &[Reach], vetoes: &[(GatewayId, usize, bool)]) -> Met {
                 assert_eq!(by_id(held.stalled), built.stalled, "{case}");
                 assert_eq!(by_id(held.held), built.held, "{case}");
                 met.narrowed += usize::from(held.places.is_some());
+                met.whole += usize::from(held.places.is_none());
 
                 // The ask's frames, decided over the list.
                 let free = built.rows.len() > built.stalled.len();

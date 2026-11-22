@@ -138,6 +138,8 @@ mod tests {
     const MODEL: &str = "model-a";
     const SINGLE_0: &str = "http://single-0:8000";
     const SINGLE_1: &str = "http://single-1:8000";
+    const SINGLE_2: &str = "http://single-2:8000";
+    const SINGLE_3: &str = "http://single-3:8000";
     const PREFILL: &str = "http://prefill-0:8000";
     const DECODE: &str = "http://decode-0:8000";
     const ENCODE: &str = "http://encode-0:8000";
@@ -248,6 +250,9 @@ mod tests {
         assert!(list.whole(Some(both)));
         assert!(!list.whole(Some(GRPC)));
         assert!(!list.whole(Some(WireModes::ZMQ)));
+        // The last of the sets a gateway can state: every wire.
+        let all = both.union(WireModes::ZMQ);
+        assert!(list.whole(Some(all)));
         // A gateway that states only wires this build does not know
         // states wires, and shares one with nobody.
         assert!(!list.whole(Some(WireModes::NONE)));
@@ -255,6 +260,7 @@ mod tests {
         let silent = ListReach::new([any(HTTP), any(WireModes::NONE)]);
         assert!(silent.whole(None));
         assert!(!silent.whole(Some(HTTP)));
+        assert!(!silent.whole(Some(all)));
         assert_eq!(silent.workers().len(), 2);
     }
 
@@ -269,21 +275,31 @@ mod tests {
 
     /// The holder lends the reach of each role's list beside the list: each
     /// lent worker's stated wires and who dials it, at the worker's place,
-    /// and as many as the list. A worker with no row is in neither.
+    /// and as many as the list. Two workers side by side that state the
+    /// same reach are two places, and a worker that states no wire states
+    /// none here. A worker with no row is in neither.
     #[test]
     fn each_roles_reach_states_each_lent_worker_at_its_place() {
         let replica = Replica::new();
         let both = HTTP.union(GRPC);
+        let silent = any(WireModes::NONE);
         replica.register_stray();
         replica.write(SINGLE_0, Role::Single, any(HTTP));
+        replica.write(SINGLE_1, Role::Single, any(HTTP));
         replica.write(PREFILL, Role::Prefill, local(7, GRPC));
-        replica.write(SINGLE_1, Role::Single, local(3, both));
+        replica.write(SINGLE_2, Role::Single, local(3, both));
         replica.write(DECODE, Role::Decode, any(HTTP));
+        replica.write(SINGLE_3, Role::Single, silent);
         replica.write(ENCODE, Role::Encode, any(GRPC));
         let generation = replica.generation();
-        assert_eq!(generation.members().len(), 6);
+        assert_eq!(generation.members().len(), 8);
 
-        let singles = [(SINGLE_0, any(HTTP)), (SINGLE_1, local(3, both))];
+        let singles = [
+            (SINGLE_0, any(HTTP)),
+            (SINGLE_1, any(HTTP)),
+            (SINGLE_2, local(3, both)),
+            (SINGLE_3, silent),
+        ];
         assert_eq!(replica.lent(&generation, Role::Single), singles);
         let prefills = [(PREFILL, local(7, GRPC))];
         assert_eq!(replica.lent(&generation, Role::Prefill), prefills);
@@ -311,10 +327,9 @@ mod tests {
     /// A list and its reach are cut by one pass over the generation's
     /// members, whichever is asked first, and the generation keeps both as
     /// that pass read them. So a decision that holds one generation reads
-    /// a list and a reach that agree place by place, whatever moved since:
-    /// a worker whose row left before the first ask is in neither, and a
-    /// row that moves to another gateway is stated so by the generation
-    /// its new object publishes.
+    /// a list and a reach that agree place by place, whatever left between
+    /// its two asks: a worker whose row left before the first ask is in
+    /// neither, and one whose row left behind it is in both.
     #[test]
     fn a_list_and_its_reach_are_of_one_pass_whichever_is_asked_first() {
         let replica = Replica::new();
@@ -333,12 +348,39 @@ mod tests {
         assert_eq!(replica.lent(&before, Role::Single), stood);
         assert_eq!(replica.objects.unstated(), 1, "one read of the rows");
 
+        // The other order over the next generation: the list first, then
+        // its one worker's row leaves, then the reach.
+        let next = replica.generation();
+        let list = replica.objects.lent(&next, Role::Single);
+        assert!(matches!(&**list.workers, [one] if one.url() == SINGLE_1));
+        replica.remove(SINGLE_1);
+        let reach = replica.objects.reach(&next, Role::Single);
+        assert_eq!(reach.workers(), [local(3, HTTP)]);
+        assert_eq!(replica.objects.unstated(), 1, "one read of its rows");
+    }
+
+    /// Who dials a worker moves within the worker's life. A holder that
+    /// builds its objects from the rows lays a new object at that move, so
+    /// the registry publishes another generation, whose reach names the
+    /// gateway the row then states. The generation cut before the move
+    /// keeps the reach it was cut with.
+    #[test]
+    fn a_built_holders_next_generation_states_a_reach_that_moved() {
+        let replica = Replica::new();
+        replica.write(SINGLE_0, Role::Single, local(3, HTTP));
+        let row = replica.store.by_key(SINGLE_0).expect("a row").id;
+        let before = replica.generation();
+        let stood = [(SINGLE_0, local(3, HTTP))];
+        assert_eq!(replica.lent(&before, Role::Single), stood);
+
         // The same life, dialed by another gateway alone from here on.
-        replica.write(SINGLE_1, Role::Single, local(9, HTTP));
+        replica.write(SINGLE_0, Role::Single, local(9, HTTP));
+        let moved = replica.store.by_key(SINGLE_0).expect("a row");
+        assert_eq!(moved.id, row, "the row moves in place");
         let after = replica.generation();
         assert!(!Arc::ptr_eq(&before, &after), "another generation");
-        let moved = [(SINGLE_1, local(9, HTTP))];
-        assert_eq!(replica.lent(&after, Role::Single), moved);
+        let states = [(SINGLE_0, local(9, HTTP))];
+        assert_eq!(replica.lent(&after, Role::Single), states);
         assert_eq!(replica.lent(&before, Role::Single), stood);
     }
 
