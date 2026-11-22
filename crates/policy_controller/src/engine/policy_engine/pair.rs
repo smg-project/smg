@@ -1374,7 +1374,7 @@ mod tests {
         ));
         let ids = (placement.id(), placement.decode_id());
         assert_eq!(ids, (taken.id, Some(pair.decode_id)));
-        assert_eq!(placement.profile, profile);
+        assert_eq!(placement.profile, "prefill");
         placement.sent(Side::Prefill);
         placement.sent(Side::Decode);
         placement.ended(Side::Encode, outcome(Side::Encode, WorkerId(77)));

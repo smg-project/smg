@@ -2286,10 +2286,10 @@ pub(crate) mod tests {
 
     /// A placement under no lease owes nothing and says nothing: a place's,
     /// and a whole decision's under a document no stage of which takes a
-    /// word. It names the list's own worker, counts under the profile that
-    /// picked, and takes its worker's id when it is asked, and no lease's.
-    /// The profile that picks is the document's second: a spare one of
-    /// another name stands ahead of it.
+    /// word. It names the list's own worker, names the profile that picked
+    /// by its label, and takes its worker's id when it is asked, and no
+    /// lease's. The profile that picks is the document's second: a spare
+    /// one of another name stands ahead of it.
     #[test]
     fn a_placement_under_no_lease_owes_nothing_and_says_nothing() {
         let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
@@ -2314,7 +2314,8 @@ pub(crate) mod tests {
         let pick = placed(engine, &Asks::of(request(), Some(&members)));
         assert_eq!(pick.profile, 1, "the document's second profile picked");
         let worker = &list[pick.place as usize];
-        let mut placement = crate::tracking::Placement::alone(Arc::clone(worker), pick);
+        let label = engine.label_at(pick.profile);
+        let mut placement = crate::tracking::Placement::alone(Arc::clone(worker), label);
         assert!(!placement.owes_events());
         placement.sent(Side::Single);
         placement.ended(Side::Single, ended);
@@ -2322,7 +2323,7 @@ pub(crate) mod tests {
         assert_eq!(placement.id(), worker_id(worker.as_ref()));
         assert_eq!(
             (placement.decode_id(), placement.profile),
-            (None, pick.profile)
+            (None, "round_robin")
         );
         assert!(placement.decode.is_none() && placement.routing_key.is_none());
 
@@ -2352,7 +2353,8 @@ pub(crate) mod tests {
         placement.sent(Side::Single);
         placement.ended(Side::Single, ended);
         assert!(Arc::ptr_eq(&placement.worker, worker));
-        assert_eq!((placement.id(), placement.profile), (target.id, profile));
+        let named = (placement.id(), placement.profile);
+        assert_eq!(named, (target.id, "round_robin"));
         assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
         assert_eq!((engine.faults(), engine.unheard()), (0, 0));
     }

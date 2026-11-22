@@ -975,7 +975,7 @@ pub struct Placement<'a> {               // built, see part 3
     pub worker: Arc<dyn Worker>,         // where the request goes
     pub decode: Option<Arc<dyn Worker>>, // a pair's decode worker
     pub routing_key: Option<&'a str>,    // the key the document derived, for the in-flight counters
-    pub profile: u16,                    // the profile that picked, for the host's own counts
+    pub profile: &'static str,           // the label of the profile that picked, for the host's own counts
     // private: the lease, when a stage of the document wants events
 }
 

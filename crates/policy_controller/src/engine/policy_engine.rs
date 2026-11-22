@@ -45,6 +45,7 @@
 
 pub(super) mod encode;
 mod keys;
+mod labels;
 pub mod overlap;
 pub(super) mod pair;
 pub(super) mod place;
@@ -86,7 +87,6 @@ use super::{
 };
 use crate::{
     document::spec::AppliedSpec,
-    names::intern,
     stages::Lifecycle,
     store::GatewayId,
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
@@ -135,6 +135,10 @@ pub struct PolicyEngine {
     /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
     /// and its plain requests are answered a place ([`Decided::Alone`]).
     hears: EventSet,
+    /// Each profile's name as a label that lives as long as the process,
+    /// by the profile's position in the document ([`Self::label_at`]).
+    /// Made once, here: naming the profile of a placement takes no lock.
+    labels: Box<[&'static str]>,
     /// The session table, one for the engine's life: the pins of every key
     /// a sessions rule placed. The document's engine reads and writes it
     /// through a pointer ([`AppliedSpec::share_sessions`]), so a pin
@@ -321,6 +325,7 @@ impl PolicyEngine {
         spec.share_sessions(Arc::clone(&sessions));
         Self {
             hears,
+            labels: labels::of(&spec),
             any_shadow,
             spec,
             applied: next_applied(),
@@ -509,18 +514,6 @@ impl PolicyEngine {
     #[must_use]
     pub fn place_for(&self, model: &str, phase: Phase) -> Place<'_> {
         self.spec.engine().place_for(model, phase)
-    }
-
-    /// The name of `profile` as the document writes it, as a label that
-    /// lives as long as the process: a caller that counts its picks under
-    /// the profile's name hands it to a metric. One allocation a distinct
-    /// name.
-    #[must_use]
-    pub fn profile_label(&self, profile: AloneProfile) -> &'static str {
-        let profiles = self.spec.engine().profiles();
-        profiles
-            .get(usize::from(profile.0))
-            .map_or("", |profile| intern(&profile.name))
     }
 
     /// The first place a binding of the document names whose profile the

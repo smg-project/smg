@@ -512,7 +512,7 @@ fn single<'a>(
                 stated.is_none_or(|rows| rows.ids()[pick.place as usize] == worker_id(&**worker)),
                 "a caller of `place` states no worker id of its own"
             );
-            Placement::alone(Arc::clone(worker), pick)
+            Placement::alone(Arc::clone(worker), engine.label_at(pick.profile))
         }
         Decided::Whole(decided, later) => {
             let now = dated.unwrap_or_else(Instant::now);
