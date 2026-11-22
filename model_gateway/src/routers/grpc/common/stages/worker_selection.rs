@@ -11,7 +11,6 @@ use axum::{
     response::Response,
 };
 use futures::{future::Either, FutureExt};
-use openai_protocol::common::CachePartition;
 use smg_policy_controller::{
     engine::{Phase, WireModes},
     tracking::ReleaseReason,
@@ -31,8 +30,8 @@ use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        hash_ring::HashRing, namespace_of, policy_reads_hash_ring, CacheNamespace,
-        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     policy_controller::{
         self,
@@ -451,11 +450,7 @@ impl<'a> SelectionInputs<'a> {
         // match the engine's KV-event namespace. Internal IDs stay isolated
         // too, but cannot match name-keyed events without a name mapping.
         let lora_adapter = input.request_type.lora_adapter();
-        let cache_namespace = namespace_of(&CachePartition {
-            cache_salt: None,
-            extra_key: None,
-            lora_path: lora_adapter,
-        });
+        let cache_namespace = CacheNamespace::derive(None, None, lora_adapter);
         let media = MediaDemands {
             media_refs,
             vision: needs_vision,
@@ -3049,7 +3044,8 @@ mod tests {
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use llm_tokenizer::TokenizerRegistry;
     use openai_protocol::{
-        generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+        common::CachePartition, generate::GenerateRequest, model_card::ModelCard,
+        worker::HealthCheckConfig,
     };
     use smg_grpc_client::vllm_proto as vllm;
     use smg_worker::{
@@ -3063,7 +3059,9 @@ mod tests {
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
-        policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
+        policies::{
+            namespace_of, CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind,
+        },
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
@@ -4996,8 +4994,6 @@ mod tests {
     /// from a request that may already be released, decides the key.
     #[tokio::test]
     async fn reselect_keys_affinity_under_the_retained_cache_namespace() {
-        use openai_protocol::common::CachePartition;
-
         let model_id = "namespace-retry-model";
         let worker_registry = Arc::new(WorkerRegistry::new());
         let workers: Vec<Arc<dyn Worker>> = ["grpc://127.0.0.1:9401", "grpc://127.0.0.1:9402"]
@@ -5026,13 +5022,7 @@ mod tests {
             None,
         );
         let wire = grpc_wire(RuntimeType::Vllm);
-        let namespace = |salt: &str| {
-            namespace_of(&CachePartition {
-                cache_salt: Some(salt),
-                extra_key: None,
-                lora_path: None,
-            })
-        };
+        let namespace = |salt: &str| CacheNamespace::derive(Some(salt), None, None);
         let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
             WorkerSelection::Single { worker } => worker.url().to_string(),
             WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
