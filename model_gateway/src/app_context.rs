@@ -1033,7 +1033,7 @@ impl AppContextBuilder {
 
     /// Create the KV event monitor: the streams of the gRPC workers.
     ///
-    /// A gateway has one whatever its classic policies: a worker under a
+    /// Every gateway has one, whatever its policies: a worker under a
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather

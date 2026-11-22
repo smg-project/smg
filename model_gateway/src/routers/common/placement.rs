@@ -163,7 +163,7 @@ pub(crate) enum Candidates {
 impl Candidates {
     /// `pool` whole, or its part on `wire` when a retry pins the retained
     /// plan's runtime and transport.
-    fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
+    pub(crate) fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
         match wire {
             None => Self::Shared(pool),
             Some(_) => Self::Pinned(
@@ -1674,6 +1674,7 @@ mod tests {
         },
         load::state::{one_rank_load, TestFeed},
         runtime::{RoutingState, StallReason},
+        test_support::no_health_check,
     };
     use tracing_subscriber::Layer;
 
@@ -4248,6 +4249,75 @@ mod tests {
             "http://h:9",
             "nothing else is left: the one worker takes the retry"
         );
+    }
+
+    fn fleet(workers: usize) -> (Arc<WorkerRegistry>, Vec<Arc<dyn Worker>>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let fleet: Vec<Arc<dyn Worker>> = (0..workers)
+            .map(|at| {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("http://asked-{at:03}:8000"))
+                        .model(ModelCard::new(MODEL))
+                        .health_config(no_health_check())
+                        .build(),
+                );
+                worker.set_status(WorkerStatus::Ready);
+                assert!(registry.register(Arc::clone(&worker)).is_some());
+                worker
+            })
+            .collect();
+        (registry, fleet)
+    }
+
+    /// The worker one request is placed on, by its place in `among`.
+    fn placed(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        among: &[Arc<dyn Worker>],
+        inputs: PlacementInputs<'_>,
+    ) -> Option<usize> {
+        let pool = RoutingPool::HttpRegular;
+        let worker = select_single(registry, policies, MODEL, pool, None, inputs)?;
+        among.iter().position(|member| Arc::ptr_eq(member, &worker))
+    }
+
+    /// Callers that pick at the same moment do not pile on one worker.
+    /// Four callers pick together, a barrier a round, over 256 idle
+    /// workers, 64 rounds: every worker takes exactly one request. No lock
+    /// orders the callers: a rotation is one atomic step.
+    #[test]
+    fn callers_that_pick_at_once_take_each_idle_worker_once() {
+        use std::{sync::Barrier, thread};
+
+        const CALLERS: usize = 4;
+        const ROUNDS: usize = 64;
+        let (registry, fleet) = fleet(CALLERS * ROUNDS);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let round = Barrier::new(CALLERS);
+        let taken: Vec<usize> = thread::scope(|scope| {
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let pick = |_| {
+                            round.wait();
+                            placed(&registry, &policies, &fleet, PlacementInputs::default())
+                                .expect("an idle fleet takes every request")
+                        };
+                        (0..ROUNDS).map(pick).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .flat_map(|caller| caller.join().expect("a caller ends"))
+                .collect()
+        });
+        let mut times = vec![0usize; fleet.len()];
+        for at in taken {
+            times[at] += 1;
+        }
+        let piled = times.iter().filter(|&&times| times != 1).count();
+        assert_eq!(piled, 0, "workers that took no request or more than one");
     }
 
     /// The all-unavailable 503 tells the client when to come back, like the

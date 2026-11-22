@@ -57,7 +57,7 @@ const HOST_URL: &str = "grpc://worker.invalid:53177";
 const MODEL_ID: &str = "sample-model";
 
 /// A host's connection to one engine.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HostConnection;
 
 #[async_trait]
@@ -139,7 +139,7 @@ impl EngineConnector for HostConnector {
         runtime: RuntimeType,
     ) -> Result<Arc<dyn EngineConnection>, String> {
         if url == HOST_URL {
-            return Ok(Arc::new(HostConnection::default()));
+            return Ok(Arc::new(HostConnection));
         }
         BackendConnector::shared().connect_grpc(url, runtime).await
     }
@@ -392,7 +392,7 @@ impl EngineConnection for HostLoads {
     }
 
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        HostConnection::default().get_loads().await
+        HostConnection.get_loads().await
     }
 
     async fn flush_cache(&self, timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {

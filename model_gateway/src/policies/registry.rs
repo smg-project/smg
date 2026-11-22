@@ -2694,6 +2694,22 @@ mod tests {
         }
     }
 
+    /// The registry builds a pair's side policies, from the side and the
+    /// side's settings.
+    #[test]
+    fn the_registry_builds_a_pairs_sides_from_their_settings() {
+        use crate::policies::RoundRobinPolicy;
+
+        let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        classic.set_side_policy(Side::Prefill, &PolicyConfig::RoundRobin);
+        classic.set_side_policy(Side::Decode, &PolicyConfig::Random);
+        assert!(classic
+            .get_prefill_policy()
+            .as_any()
+            .is::<RoundRobinPolicy>());
+        assert_eq!(classic.get_decode_policy().name(), "random");
+    }
+
     /// The PD/EPD policies are set after the app context wired the shared state
     /// into the registry (the KV event monitor, the load feed, and the mesh
     /// tree bridge that `MeshAdapters::start` attaches), so the policy setters

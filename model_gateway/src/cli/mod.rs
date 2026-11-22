@@ -2066,6 +2066,21 @@ mod tests {
         Cli::parse_from(argv).router_args
     }
 
+    #[test]
+    fn a_line_with_no_policy_builds_cache_aware() {
+        for (flags, threshold) in [(&[][..], 0.3), (&["--cache-threshold", "0.7"][..], 0.7)] {
+            let config = cli_args_from(flags)
+                .to_router_config(vec![], vec![])
+                .expect("the routing configuration");
+            assert!(
+                matches!(config.policy, PolicyConfig::CacheAware { cache_threshold, .. }
+                    if (cache_threshold - threshold).abs() < f32::EPSILON),
+                "{flags:?}: {:?}",
+                config.policy
+            );
+        }
+    }
+
     /// The CLI preserves independent role thresholds and rounds percentages up.
     #[test]
     fn pd_readiness_cli_flags_flow_into_router_config() {

@@ -3404,7 +3404,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn fixed_status_upstream(
+    pub(super) async fn fixed_status_upstream(
         paths: &[&str],
         status: StatusCode,
     ) -> (String, Arc<AtomicUsize>) {
@@ -4272,7 +4272,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_capture_stub(
+    pub(super) async fn spawn_capture_stub(
         content_type: &'static str,
         response_body: &'static str,
     ) -> (String, CapturedUpstreamRequest) {
@@ -4296,7 +4296,7 @@ mod tests {
         (format!("http://{addr}"), captured)
     }
 
-    fn streamed_request(chunks: &[&'static [u8]]) -> Request<Body> {
+    pub(super) fn streamed_request(chunks: &[&'static [u8]]) -> Request<Body> {
         let total: usize = chunks.iter().map(|c| c.len()).sum();
         let chunks: Vec<Result<Bytes, std::io::Error>> =
             chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect();

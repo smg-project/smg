@@ -76,8 +76,7 @@ impl RoutingPool {
     }
 
     /// Whether `worker` is a member of this pool: the one rule of
-    /// membership. The snapshot projects its pools by it, and a route asks
-    /// it of a worker handed to it from outside the snapshot.
+    /// membership. The snapshot projects its pools by it.
     pub(crate) fn matches(self, worker: &dyn Worker) -> bool {
         match self {
             Self::HttpRegular => {

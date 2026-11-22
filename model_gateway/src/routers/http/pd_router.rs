@@ -3560,7 +3560,7 @@ mod tests {
     /// hang, not a budget, since a loaded machine can take seconds.
     const ROUND_TRIP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
-    fn create_test_pd_router() -> PDRouter {
+    pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
@@ -4304,7 +4304,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_recording_stub(
+    pub(super) async fn spawn_recording_stub(
         reply: &'static str,
     ) -> (String, Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
         let seen: Arc<std::sync::Mutex<Vec<(String, Value)>>> =
@@ -4509,7 +4509,7 @@ mod tests {
     /// A server whose answer's head and first bytes leave at once and whose
     /// body then breaks off, on every path and method: a worker that dies
     /// mid-answer.
-    async fn spawn_cut_body_stub() -> String {
+    pub(super) async fn spawn_cut_body_stub() -> String {
         let app = axum::Router::new().fallback(axum::routing::any(|| async {
             let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
                 b"{\"partial\":",
@@ -5213,7 +5213,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_stub(app: axum::Router) -> String {
+    pub(super) async fn spawn_stub(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6716,11 +6716,11 @@ mod tests {
         );
     }
 
-    type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
+    pub(super) type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
 
     /// A stub that records each request body, then answers `reply` with
     /// `status` after `delay`.
-    async fn spawn_delayed_stub(
+    pub(super) async fn spawn_delayed_stub(
         status: StatusCode,
         reply: Value,
         delay: std::time::Duration,

@@ -903,6 +903,47 @@ def test_a_policy_the_launcher_does_not_take_is_refused_by_the_schema():
     assert "router.policy must be one of the following" in render_error("router.policy=fastest")
 
 
+@needs_helm
+def test_the_default_values_render_the_arguments_in_order():
+    """Keep the default arguments in order so an upgrade does not roll the pods."""
+    _, documents = render()
+    expected = """
+        --host 0.0.0.0
+        --port 30000
+        --policy cache_aware
+        --cache-threshold 0.3
+        --balance-abs-threshold 64
+        --balance-rel-threshold 1.5
+        --eviction-interval-secs 120
+        --max-tree-size 67108864
+        --block-size 16
+        --max-payload-size 536870912
+        --request-timeout-secs 1800
+        --mm-turbojpeg require
+        --shutdown-grace-period-secs 180
+        --max-concurrent-requests -1
+        --queue-size 100
+        --queue-timeout-secs 60
+        --retry-max-retries 5
+        --retry-initial-backoff-ms 50
+        --retry-max-backoff-ms 30000
+        --retry-backoff-multiplier 1.5
+        --retry-jitter-factor 0.2
+        --cb-failure-threshold 10
+        --cb-success-threshold 3
+        --cb-timeout-duration-secs 60
+        --cb-window-duration-secs 120
+        --health-failure-threshold 3
+        --health-success-threshold 2
+        --health-check-timeout-secs 5
+        --health-check-interval-secs 60
+        --health-check-endpoint /health
+        --prometheus-port 29000
+        --log-level info
+    """.split()
+    assert router_container(documents)["args"] == expected
+
+
 # Tags of digits alone, two workers whose tags are filled in as written, and
 # the policy controller's switch with the spec document the chart refuses it
 # without.

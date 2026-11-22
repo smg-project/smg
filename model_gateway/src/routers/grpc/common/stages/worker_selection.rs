@@ -6801,6 +6801,57 @@ mod tests {
         assert_eq!(snapshot.routing_text.as_deref(), Some("Hello"));
     }
 
+    /// The routing snapshot keeps the body's `rid` only where a retry reads
+    /// it: it stays where the sticky key derives from it, and a retry derives
+    /// that key from it again. Elsewhere the snapshot keeps no copy.
+    #[tokio::test]
+    async fn the_snapshot_keeps_the_rid_only_where_a_retry_reads_it() {
+        use crate::config::types::RoutingKeyOverrideConfig;
+
+        const RID: &str = "conv_t2_r1";
+        async fn kept(stage: &WorkerSelectionStage) -> Option<String> {
+            let mut ctx = prepared_ctx(Arc::clone(&stage.worker_registry), None);
+            let RequestType::Generate(request) = &mut ctx.input.request_type else {
+                panic!("a generate request");
+            };
+            Arc::make_mut(request).rid = Some(RID.to_owned());
+            stage.execute(&mut ctx).await.expect("a selection");
+            ctx.state.routing_snapshot.expect("the snapshot").rid
+        }
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8832",
+                "test-model",
+                UNLABELED,
+            ))
+            .unwrap();
+
+        let classic = regular_stage(Arc::clone(&registry));
+        assert_eq!(classic.policy_registry.derive_rid_key(Some(RID)), None);
+        assert_eq!(kept(&classic).await, None, "no retry reads it");
+
+        let sticky = WorkerSelectionStage::new(
+            registry,
+            Arc::new(PolicyRegistry::with_override(
+                PolicyConfig::RoundRobin,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..RoutingKeyOverrideConfig::default()
+                },
+            )),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let rid = kept(&sticky).await;
+        assert_eq!(rid.as_deref(), Some(RID));
+        // A retry derives the first selection's key from it.
+        assert_eq!(
+            sticky.policy_registry.derive_rid_key(rid.as_deref()),
+            Some("conv")
+        );
+    }
+
     /// The regular entry reads the context demand against its pool's kept
     /// window floor, in the snapshot its candidates come from: a request
     /// every window holds asks no worker, a window that refuses it brings the

@@ -10,7 +10,7 @@ import re
 from unittest.mock import MagicMock, patch
 
 import pytest
-from smg.launch_router import RouterArgs, launch_router
+from smg.launch_router import RouterArgs, launch_router, parse_router_args
 from smg.router import Router, build_control_plane_auth_config, policy_from_str
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
@@ -119,6 +119,18 @@ class TestRouterConfigValidation:
 
         args = RouterArgs(cache_threshold=1.0)
         assert args.cache_threshold == 1.0
+
+    def test_a_line_with_no_policy_builds_cache_aware(self, tmp_path):
+        args = parse_router_args(["--cache-threshold", "2"])
+        args.storage_hook_wasm_path = str(tmp_path / "missing.wasm")
+        with pytest.raises(ValueError, match="cache_threshold"):
+            Router.from_args(args).start()
+        with pytest.raises(ValueError, match="cache_threshold"):
+            _Router(
+                worker_urls=[],
+                cache_threshold=2,
+                storage_hook_wasm_path=args.storage_hook_wasm_path,
+            ).start()
 
     def test_balance_threshold_validation(self):
         """Test load balancing threshold validation."""
