@@ -858,6 +858,52 @@ fn test_tml_preserves_authored_multipart_order_openai() {
     assert_eq!(result[0]["content"], expected);
 }
 
+/// Long media text stays out of the template value, which the content
+/// transform writes without it: the value is the one a short URL gives, and
+/// building it allocates less than the text is long.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+#[test]
+fn the_template_value_leaves_long_media_text_out() {
+    use crate::routers::grpc::testing::bytes_allocated_during;
+
+    let url = format!("data:image/jpeg;base64,{}", "A".repeat(1 << 20));
+    let messages = vec![ChatMessage::User {
+        ext: Default::default(),
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "question".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: url.into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            },
+        ]),
+        name: None,
+    }];
+    let mut result = Vec::new();
+    let allocated = bytes_allocated_during(|| {
+        result = process_content_format_with_order(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        result[0]["content"],
+        json!([{"type": "text", "text": "question"}, {"type": "image"}])
+    );
+    assert!(allocated < 1 << 20, "{allocated} bytes allocated");
+}
+
 // --- an assistant turn without content on the render path ----------------
 
 /// A template of the string format that tests and splits every assistant
