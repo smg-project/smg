@@ -926,3 +926,9 @@ pub fn decide(
 
 #[cfg(test)]
 mod tests;
+
+// Two attributes and not one `all`: the lints take a module for a test
+// module by its own `cfg(test)`.
+#[cfg(test)]
+#[cfg(feature = "worker-host")]
+mod store_parity;
