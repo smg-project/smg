@@ -189,7 +189,8 @@ pub struct ModelWorkerSnapshot {
     /// model id it was read for (see [`Self::labels`]).
     labels: OnceLock<(Box<str>, ModelLabels)>,
     /// What the media gates read from the workers of this generation
-    /// together (see [`Self::media`]).
+    /// together (see [`Self::media`]). `MediaFacts` stays with the gates in
+    /// `routers::grpc::multimodal`, so this module depends on that one.
     media: OnceLock<MediaFacts>,
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).

@@ -36,7 +36,7 @@ use crate::routers::{common::snapshot::WorkerRegistry, error};
 /// holds its labels, its connection mode and its engine from its
 /// construction, and a request changes none of them. So a membership
 /// snapshot keeps them ([`ModelWorkerSnapshot::media`]), and a media request
-/// walks no worker for them, whatever the size of the fleet.
+/// walks no worker for them, however many workers the model has.
 ///
 /// [`ModelWorkerSnapshot::media`]: crate::routers::common::snapshot::ModelWorkerSnapshot::media
 #[derive(Debug)]
