@@ -192,8 +192,9 @@ pub enum WorkerLists<'a> {
 /// here is a single's or the prefill side's. The decode side's differs
 /// from it in its side, in the worker it books (the decode of the pick's
 /// first target where the side was issued with its prefill, the decode of
-/// the target taken where it stood chosen) and in its session
-/// ([`HeldDecode::session`]). A decode issued later is dated at its
+/// the target taken where it stood chosen), in its session
+/// ([`HeldDecode::session`]) and, behind a decode call, in its size
+/// ([`HeldDecode::tokens`]). A decode issued later is dated at its
 /// issue, the decode call's instant or its dispatch's, and its later words
 /// bear the first decision's instant, which is this lease's
 /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)).
@@ -216,8 +217,8 @@ pub struct HeldDecision<'a> {
     pub target: &'a Target,
     /// A pair's decode side, read under a pair's lease alone
     /// ([`Lease::side`] is [`Side::Prefill`]). A single's lease has none:
-    /// its handle lends no session and a side that never stood chosen,
-    /// and no reader takes them.
+    /// its handle lends no session, the lease's own size and a side that
+    /// never stood chosen, and no reader takes them.
     pub decode: HeldDecode,
 }
 
@@ -227,9 +228,14 @@ pub struct HeldDecision<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeldDecode {
     /// The pair's session under the decode phase
-    /// ([`DecideOutcome::decode_session`]): the one value of the decode
-    /// side's lease that the prefill side's does not give.
+    /// ([`DecideOutcome::decode_session`]): a value of the decode side's
+    /// lease that the prefill side's does not give.
     pub session: Session,
+    /// The prompt size the side's words state ([`Lease::tokens`]): the size
+    /// the side was issued under. That is the first decision's where the
+    /// side was issued with its prefill or goes out with no call, and a
+    /// decode call's own once one picked the side.
+    pub tokens: u32,
     /// The side stood chosen until this word: its request stated the later
     /// decode, no decode call picked it, and nothing was issued for it.
     /// The side's dispatch said under this is its issue too, dated at the

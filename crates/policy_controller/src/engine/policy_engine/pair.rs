@@ -416,7 +416,7 @@ pub(super) fn decided(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{cell::RefCell, sync::Arc, time::Duration};
 
     use parking_lot::Mutex;
     use smg_worker::{
@@ -435,6 +435,10 @@ mod tests {
             framework::{Filter, Picker, TieBand},
             records::worker_id,
             sticky_sessions::{DecodeVerdict, SessionVerdict},
+            store_backed_engine::{
+                tests::{later_request, pair_fleet, pair_request, GATEWAY},
+                StoreBackedEngine,
+            },
             view::{Health, Identity, Role, WireModes, WorkerId},
         },
         stages::{Best, HasCapacity, StageRegistry},
@@ -454,6 +458,17 @@ mod tests {
     /// served at a completion).
     type Word = (&'static str, Side, u64, u8, Session, u64, u64);
 
+    thread_local! {
+        /// The prompt size each word a stage heard on this thread stated,
+        /// beside the word and its side.
+        static SIZES: RefCell<Vec<(&'static str, Side, u32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The sizes the stages heard on this thread since the last read.
+    fn sizes() -> Vec<(&'static str, Side, u32)> {
+        SIZES.with_borrow_mut(std::mem::take)
+    }
+
     /// A picker that picks as [`Best`] and keeps every word it hears.
     #[derive(Debug)]
     struct Hears(Arc<Mutex<Vec<Word>>>);
@@ -469,6 +484,7 @@ mod tests {
                 lease.issued_micros,
                 named,
             ));
+            SIZES.with_borrow_mut(|sizes| sizes.push((word, lease.side, lease.tokens)));
         }
     }
 
@@ -1428,6 +1444,7 @@ mod tests {
             target: &taken,
             decode: HeldDecode {
                 session,
+                tokens: lease.tokens,
                 chosen: false,
             },
         };
@@ -1512,6 +1529,7 @@ mod tests {
             target: &taken,
             decode: HeldDecode {
                 session,
+                tokens: lease.tokens,
                 chosen: false,
             },
         };
@@ -1549,6 +1567,7 @@ mod tests {
             target: &taken,
             decode: HeldDecode {
                 session,
+                tokens: lease.tokens,
                 chosen: true,
             },
         };
@@ -1580,6 +1599,7 @@ mod tests {
             target: &taken,
             decode: HeldDecode {
                 session,
+                tokens: lease.tokens,
                 chosen: true,
             },
         };
@@ -1723,5 +1743,115 @@ mod tests {
                 ("completed", Side::Decode, decode, at),
             ]
         );
+    }
+
+    /// The prompt size each word of a pair states to a stage, through a
+    /// guard of `door`: the prefill side's words, then the decode side's.
+    /// The first decision is `first`'s. Behind the prefill's dispatch the
+    /// decode is decided again by `again`, or with none goes out as the
+    /// first decision left it. The decode side is then sent and ends, or is
+    /// `released` with no dispatch. The guard is dropped with its prefill
+    /// sent, so that side ends as cancelled.
+    fn sizes_by_side<D: DecisionEngine, M: RequestMaker>(
+        door: &D,
+        gateway: GatewayId,
+        first: &M,
+        again: Option<&M>,
+        released: bool,
+    ) -> [Vec<(&'static str, u32)>; 2] {
+        // Words an earlier guard said on this thread are not this one's.
+        SIZES.with_borrow_mut(Vec::clear);
+        let now = Instant::now();
+        let mut guard = DecisionGuard::decide_under(door, gateway, first, now).expect("a decision");
+        guard.dispatched(now);
+        if let Some(again) = again {
+            let picked = guard.decide_decode_under(again, now);
+            assert!(picked.is_ok_and(|decision| decision.pick().is_some()));
+        }
+        if released {
+            guard.released_decode(ReleaseReason::ClientGone, now);
+        } else {
+            let decode = target_at(guard.decision(), 0).pair.expect("a pair");
+            guard.dispatched_decode(now);
+            guard.completed(&outcome(Side::Decode, decode.decode_id), now);
+        }
+        drop(guard);
+        let heard = sizes();
+        let of = |side: Side| {
+            let words = heard.iter().filter(|word| word.1 == side);
+            words.map(|&(word, _, size)| (word, size)).collect()
+        };
+        [of(Side::Prefill), of(Side::Decode)]
+    }
+
+    /// A decode call may state another prompt size than the first decision
+    /// did. The side is issued under the call's size, and its dispatch, its
+    /// end and its release state that size too: a stage that books a size
+    /// at the issue reads the same size at every later word of the side.
+    /// The prefill side states the first decision's size behind the call
+    /// as before it. A decode that goes out with no call states the first
+    /// decision's size, issued at its own dispatch or with its prefill.
+    #[test]
+    fn a_decode_calls_side_states_the_calls_size_at_every_word() {
+        let host = Host::of(1, 2);
+        let classes = every(1, 2);
+        let first = host.asks(&classes, true);
+        let stated = first.0.facts.prompt_tokens;
+        let mut again = host.asks(&classes, true);
+        again.0.facts.prompt_tokens = stated + 7;
+        let (door, local, called) = (&host.engine, GatewayId::LOCAL, stated + 7);
+        let own = [
+            ("issued", stated),
+            ("dispatched", stated),
+            ("completed", stated),
+        ];
+        let [prefill, decode] = sizes_by_side(door, local, &first, Some(&again), false);
+        assert_eq!(prefill, own);
+        assert_eq!(
+            decode,
+            [
+                ("issued", called),
+                ("dispatched", called),
+                ("completed", called),
+            ]
+        );
+        let [_, decode] = sizes_by_side(door, local, &first, Some(&again), true);
+        assert_eq!(decode, [("issued", called), ("released", called)]);
+        let [_, decode] = sizes_by_side(door, local, &first, None, false);
+        assert_eq!(decode, own);
+        let with = host.asks(&classes, false);
+        let [_, decode] = sizes_by_side(door, local, &with, None, false);
+        assert_eq!(decode, own);
+    }
+
+    /// The engine over a store keeps a decode side's own size on its file
+    /// and tells every word of the side under it. The same sequence gives
+    /// the same sizes there as the engine over worker lists tells from what
+    /// its guard lends.
+    #[test]
+    fn the_engine_over_a_store_tells_a_decode_calls_side_under_the_calls_size() {
+        let store = pair_fleet(1, 2).expect("a pair's fleet");
+        let (spec, _) = hearing();
+        store.apply(spec).expect("a later generation");
+        let door = StoreBackedEngine::new(store);
+        let mut first = later_request(b"pair");
+        first.facts.prompt_tokens = 40;
+        let mut again = later_request(b"pair");
+        again.facts.prompt_tokens = 47;
+        let own = [("issued", 40), ("dispatched", 40), ("completed", 40)];
+        let [prefill, decode] = sizes_by_side(&door, GATEWAY, &first, Some(&again), false);
+        assert_eq!(prefill, own);
+        assert_eq!(
+            decode,
+            [("issued", 47), ("dispatched", 47), ("completed", 47)]
+        );
+        let [_, decode] = sizes_by_side(&door, GATEWAY, &first, Some(&again), true);
+        assert_eq!(decode, [("issued", 47), ("released", 47)]);
+        let [_, decode] = sizes_by_side(&door, GATEWAY, &first, None, false);
+        assert_eq!(decode, own);
+        let mut with = pair_request(b"pair");
+        with.facts.prompt_tokens = 40;
+        let [_, decode] = sizes_by_side(&door, GATEWAY, &with, None, false);
+        assert_eq!(decode, own);
     }
 }

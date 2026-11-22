@@ -161,6 +161,10 @@ pub struct DecisionGuard<D: Deref<Target: DecisionEngine>> {
     /// chosen. A decode that owes a dispatch or an end was then picked by
     /// a decode call, and was issued with its prefill otherwise.
     later: bool,
+    /// The prompt size the decode side's words state: the lease's own, and
+    /// a decode call's from the call that picks the side. Nothing reads a
+    /// single's.
+    stated: u32,
     /// The target at that index.
     target: Target,
     owed: Owed,
@@ -282,11 +286,15 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         } else {
             Owed::Nothing
         };
+        // The size the decode side's words state until a decode call picks
+        // the side: the lease's own.
+        let stated = decided.lease.map_or(0, |leased| leased.lease.tokens);
         Self {
             arm,
             decided,
             index: 0,
             later,
+            stated,
             target,
             owed,
             decode,
@@ -304,10 +312,11 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
             index: self.index,
             target: &self.target,
             // Lent as the handle keeps them, with no test of the lease's
-            // side: a single's answer names no decode session and its
-            // decode side never stands chosen.
+            // side: a single's answer names no decode session, its size is
+            // the lease's own and its decode side never stands chosen.
             decode: HeldDecode {
                 session: self.decided.decode_session,
+                tokens: self.stated,
                 chosen: matches!(self.decode, Owed::Later { .. }),
             },
         })
@@ -422,6 +431,8 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         if let Some((leased, target)) = answer.lease.zip(first) {
             self.decided.decision = answer.decision;
             self.decided.decode_session = answer.decode_session;
+            // The call issued the side under the size it stated.
+            self.stated = leased.lease.tokens;
             (self.index, self.target) = (0, *target);
             self.decode = self.decode.sent_later();
             if let Some(held) = &mut self.decided.lease {
