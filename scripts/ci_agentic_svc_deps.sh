@@ -158,7 +158,8 @@ cmd_create_postgres_db() {
     local postgres_host="${1:-postgres-db}"
     local admin_url="postgresql://postgres:postgres@${postgres_host}:5432/postgres"
 
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" sudo -y -qq postgresql-client
+    # Keep PostgreSQL setup fail-closed while sharing main's retried install unit.
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" --strict-mirror sudo -y -qq postgresql-client || return "$?"
 
     TEST_DB="$(ci_postgres_dbname)"
     echo "Creating Postgres test database: $TEST_DB"
