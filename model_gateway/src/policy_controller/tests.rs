@@ -884,6 +884,60 @@ async fn under_the_setting_many_routers_decide_typed_requests_and_leave_the_rest
     Box::pin(decided_or_classic(config)).await
 }
 
+/// Under `manual` with the setting on, no route asks a classic policy. The
+/// registry holds the policy's name alone, with no classic object behind
+/// it. With a worker registered for the model, every route of the router
+/// trait and every adapter request leaves that name unasked: a request the
+/// gateway places is placed by the engine. The worker's address answers
+/// nothing, so a placed request fails at its send, and none reads as a
+/// model with no worker.
+#[tokio::test]
+async fn under_the_manual_policy_no_route_asks_a_classic_policy() -> Case {
+    use smg_worker::health::circuit_breaker::CircuitBreakerConfig;
+
+    use crate::policies::DecidedByEngine;
+
+    let mut config = picked(quiet());
+    config.policy = PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    config.disable_retries = true;
+    let (context, gateway) = Box::pin(build(config)).await?;
+    // A worker no failed send takes out of the pool: each route's request
+    // finds it.
+    let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
+        .model(ModelCard::new("m"))
+        .status(WorkerStatus::Ready)
+        .circuit_breaker_config(CircuitBreakerConfig {
+            failure_threshold: u32::MAX,
+            ..CircuitBreakerConfig::default()
+        })
+        .build();
+    context
+        .worker_registry
+        .register(Arc::new(worker))
+        .ok_or("the worker did not register")?;
+
+    let answers = Box::pin(every_answer(gateway.as_ref())).await;
+    for placed in ["route_generate", "route_chat", "route_completion"] {
+        let (_, status, code) = answers
+            .iter()
+            .find(|(ask, _, _)| *ask == placed)
+            .ok_or("the route was not asked")?;
+        assert_ne!(*status, StatusCode::NOT_FOUND, "{placed}: {code}");
+        assert_ne!(code, BY_NAME, "{placed}");
+    }
+    let default = context.policy_registry.get_default_policy();
+    let held = default
+        .as_any()
+        .downcast_ref::<DecidedByEngine>()
+        .ok_or("a classic policy was built for `manual`")?;
+    assert!(!held.was_asked(), "a route asked the classic policy");
+    Ok(())
+}
+
 /// The router asks the policy engine for its typed requests; the router's own
 /// cases hold that.
 #[tokio::test]

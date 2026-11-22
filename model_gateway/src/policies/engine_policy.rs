@@ -20,12 +20,23 @@
 //! ([`NamedList::members`]): no table is looked up for it and no lock is
 //! taken.
 //!
+//! A place whose every request the routers ask the engine for needs no
+//! pick here. Where nothing reads its classic policy either, the registry
+//! holds the policy's name alone ([`DecidedByEngine`]).
+//!
 //! [`NamedList::members`]: super::NamedList::members
 
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use smg_policy_controller::engine::{AloneProfile, PolicyEngine};
 use smg_worker::identity::basic::Worker;
+use tracing::error;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 
@@ -85,6 +96,61 @@ impl LoadBalancingPolicy for EnginePolicy {
         // list): one read of each, and the pick among those that pass.
         self.engine
             .pick_among(self.profile, workers, |state| info.admits(state))
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// What the policy registry holds for a place whose every request the
+/// routers ask the policy engine for, once nothing reads the place's
+/// classic policy: the policy's name, and nothing else. It builds no state
+/// of the policy and starts no task of it.
+///
+/// No placement asks it: a route that places a request of the place asks
+/// the engine. One that asks all the same has asked a classic policy where
+/// the engine decides. It is handed no worker, and the first such ask is
+/// logged as an error under the policy's name.
+///
+/// This type goes with the registry's classic build for such a place, once
+/// no policy's classic object has a reader left there.
+#[derive(Debug)]
+pub struct DecidedByEngine {
+    name: &'static str,
+    asked: AtomicBool,
+}
+
+impl DecidedByEngine {
+    /// The object for the place of the classic policy `name`.
+    pub fn of(name: &'static str) -> Self {
+        Self {
+            name,
+            asked: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether a placement asked this object for a worker.
+    #[cfg(test)]
+    pub(crate) fn was_asked(&self) -> bool {
+        self.asked.load(Ordering::Relaxed)
+    }
+}
+
+impl LoadBalancingPolicy for DecidedByEngine {
+    fn select_worker(&self, _: &[Arc<dyn Worker>], _: &SelectWorkerInfo) -> Option<usize> {
+        if !self.asked.swap(true, Ordering::Relaxed) {
+            error!(
+                "Policy `{}`: a route asked the classic policy for a worker where the policy \
+                 engine decides every request, and is handed none",
+                self.name
+            );
+        }
+        None
     }
 
     fn name(&self) -> &'static str {
@@ -788,6 +854,56 @@ mod tests {
             let wrong = said("Policy `least_load` of every model (single requests): the classic");
             match (whole, classic, wrong) {
                 (1, 1, 0) => Ok(()),
+                counts => Err(format!("{counts:?} lines")),
+            }
+        });
+    }
+
+    /// Where the routers ask the engine for every request, nothing reads
+    /// the classic manual policy: the registry builds none and holds the
+    /// policy's name alone, and the log says so. A placement that asks it
+    /// all the same is handed no worker, and the first such ask is logged
+    /// as an error. Where the routers keep their classic pass the classic
+    /// manual policy is built as ever, and a policy that still has a reader
+    /// is built under both.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_registry_builds_no_classic_manual_policy_where_the_engine_decides_whole() {
+        use crate::policies::{LeastLoadPolicy, ManualPolicy};
+
+        let document = PolicySpec::preset("manual").expect("a built-in preset");
+        let whole = asking_as(&document, "manual", DocumentOrigin::Settings, true);
+        let default = whole.get_default_policy();
+        assert_eq!(default.name(), "manual");
+        let held = default
+            .as_any()
+            .downcast_ref::<DecidedByEngine>()
+            .expect("the policy's name alone");
+        assert!(!held.was_asked());
+        let (_registry, workers) = fleet(2);
+        for _ in 0..2 {
+            let picked = default.select_worker(&workers, &SelectWorkerInfo::default());
+            assert_eq!(picked, None);
+        }
+        assert!(held.was_asked());
+
+        let classic_pass = asking_as(&document, "manual", DocumentOrigin::Settings, false);
+        let default = classic_pass.get_default_policy();
+        assert!(default.as_any().is::<ManualPolicy>());
+
+        let read = PolicySpec::preset("least_load").expect("a built-in preset");
+        let whole = asking_as(&read, "least_load", DocumentOrigin::Settings, true);
+        assert!(whole.get_default_policy().as_any().is::<LeastLoadPolicy>());
+
+        logs_assert(|lines: &[&str]| {
+            let said = |words: &str| lines.iter().filter(|line| line.contains(words)).count();
+            let not_built = said(
+                "Policy `manual` of every model (single requests): the policy engine decides it \
+                 by its whole pass (the profile `manual`); no classic policy is built",
+            );
+            let asked = said("Policy `manual`: a route asked the classic policy for a worker");
+            match (not_built, asked) {
+                (1, 1) => Ok(()),
                 counts => Err(format!("{counts:?} lines")),
             }
         });

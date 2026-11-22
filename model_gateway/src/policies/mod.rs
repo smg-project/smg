@@ -66,7 +66,7 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
-pub use engine_policy::EnginePolicy;
+pub use engine_policy::{DecidedByEngine, EnginePolicy};
 pub use factory::PolicyFactory;
 pub use least_load::LeastLoadPolicy;
 pub use manual::{ManualConfig, ManualPolicy};
