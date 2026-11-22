@@ -74,8 +74,8 @@ use crate::{
     engine::{
         decision::{Decision, Target},
         decision_engine::{
-            DecideOutcome, DecisionEngine, DecisionRefused, HeldDecision, Leased, Request,
-            RequestMaker,
+            DecideOutcome, DecisionEngine, DecisionRefused, HeldDecision, HeldDecode, Leased,
+            Request, RequestMaker,
         },
         framework::{EncodeItems, EncodePlaced},
         view::WorkerId,
@@ -298,14 +298,22 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
     /// handle. `None` for a decision that picked no worker.
     fn held(&self) -> Option<HeldDecision<'_>> {
         let leased = self.decided.lease.as_ref()?;
-        Some(HeldDecision {
+        let mut held = HeldDecision {
             decision: &self.decided.decision,
             lease: &leased.lease,
-            decode_session: self.decided.decode_session,
             index: self.index,
             target: &self.target,
-            decode_chosen: matches!(self.decode, Owed::Later { .. }),
-        })
+            decode: None,
+        };
+        // A single's lease lends nothing of a pair's and reads nothing of
+        // one: a test of its side is all it pays.
+        if leased.lease.side == Side::Prefill {
+            held.decode = Some(HeldDecode {
+                session: self.decided.decode_session,
+                chosen: matches!(self.decode, Owed::Later { .. }),
+            });
+        }
+        Some(held)
     }
 
     /// The engine's decision.
@@ -1701,8 +1709,9 @@ mod tests {
     }
 
     /// What a handle lent with a word or a decode call: the word, the
-    /// index of the target taken, and whether the decode stood chosen.
-    type Lent = Mutex<Vec<(&'static str, u8, bool)>>;
+    /// index of the target taken, and whether the decode side it lent stood
+    /// chosen. `None` where it lent no decode side.
+    type Lent = Mutex<Vec<(&'static str, u8, Option<bool>)>>;
 
     /// A door that keeps what each word and each decode call was lent.
     struct Lends<'a>(&'a StoreBackedEngine, Lent);
@@ -1724,8 +1733,8 @@ mod tests {
             held: &HeldDecision<'_>,
             now: Instant,
         ) -> Result<DecideOutcome, DecisionRefused> {
-            let lent = ("decode call", held.index, held.decode_chosen);
-            self.1.lock().push(lent);
+            let chosen = held.decode.map(|side| side.chosen);
+            self.1.lock().push(("decode call", held.index, chosen));
             DecisionEngine::decide_decode_under(self.0, gateway, maker, held, now)
         }
 
@@ -1748,7 +1757,8 @@ mod tests {
                 Said::Completed(_) => "ended",
                 Said::Released(..) => "released",
             };
-            self.1.lock().push((word, held.index, held.decode_chosen));
+            let chosen = held.decode.map(|side| side.chosen);
+            self.1.lock().push((word, held.index, chosen));
             DecisionEngine::say(self.0, gateway, held, said, now);
         }
 
@@ -1787,7 +1797,8 @@ mod tests {
     /// handle. An engine with no file of its leases tells its stages from
     /// it: the index names the target taken at an end too, where the word
     /// carries none, and a decode that stood chosen is known at its
-    /// dispatch, which is its issue.
+    /// dispatch, which is its issue. A pair's handle lends its decode side
+    /// with every word, and a single's lends none.
     #[test]
     fn a_handle_lends_the_index_taken_and_whether_the_decode_stood_chosen() {
         let door = pair_door(1, 2).expect("a pair door");
@@ -1816,10 +1827,10 @@ mod tests {
         assert_eq!(
             mem::take(&mut *lends.1.lock()),
             [
-                ("sent", 1, true),
-                ("decode sent", 1, true),
-                ("decode ended", 1, false),
-                ("ended", 1, false),
+                ("sent", 1, Some(true)),
+                ("decode sent", 1, Some(true)),
+                ("decode ended", 1, Some(false)),
+                ("ended", 1, Some(false)),
             ]
         );
         // A decode call's pick issues the side and takes the call's first
@@ -1836,14 +1847,26 @@ mod tests {
         assert_eq!(
             mem::take(&mut *lends.1.lock()),
             [
-                ("sent", 1, true),
-                ("decode call", 1, true),
-                ("decode sent", 0, false),
-                ("ended", 0, false),
-                ("decode ended", 0, false),
+                ("sent", 1, Some(true)),
+                ("decode call", 1, Some(true)),
+                ("decode sent", 0, Some(false)),
+                ("ended", 0, Some(false)),
+                ("decode ended", 0, Some(false)),
             ]
         );
         let _ = words();
+        // A single's handle lends no decode side: its words carry nothing
+        // of a pair's.
+        let (door, _) = bed();
+        let lends = Lends(&door, Lent::default());
+        let mut handle =
+            DecisionGuard::decide(&lends, GATEWAY, &request(b"single", 7), now).expect("a handle");
+        handle.dispatched(now);
+        drop(handle);
+        assert_eq!(
+            mem::take(&mut *lends.1.lock()),
+            [("sent", 0, None), ("ended", 0, None)]
+        );
     }
 
     /// A decode side given up while it stood chosen takes no call. The
