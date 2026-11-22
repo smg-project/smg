@@ -14,6 +14,7 @@ pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod policy_controller;
 pub mod scripted_tokenizer;
 pub mod scripted_worker;
 pub mod sse_keepalive_support;
@@ -504,12 +505,18 @@ async fn build_test_app_context(
     // Initialize registries. The policy registry takes the configuration's
     // pairing mode, as `AppContextBuilder::from_config` gives it: without it
     // a test router pairs under the default mode whatever its configuration
-    // says.
+    // says. A run with the policy controller on takes the builder, the
+    // registry and the configuration from the gateway's own start
+    // (`policy_controller::parts`).
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(
-        PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
-            .with_pd_pairing_mode(config.pd_pairing_mode),
-    );
+    let (builder, policy_registry, config) =
+        policy_controller::parts(config, &worker_registry, |config| {
+            PolicyRegistry::with_override(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode)
+        });
 
     // Initialize storage backends (Memory for tests, unless the caller brought
     // its own: a history store that is down, for one).
@@ -523,14 +530,18 @@ async fn build_test_app_context(
         conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
     });
 
-    // Initialize load monitor
-    let worker_monitor = Some(Arc::new(WorkerMonitor::new(
+    // Initialize load monitor. Where the builder holds the engine object (a
+    // run with the policy controller on), the object reads this monitor's
+    // loads, as it reads those of the monitor a gateway's start builds.
+    let worker_monitor = Arc::new(WorkerMonitor::new(
         worker_registry.clone(),
         policy_registry.clone(),
         config.load_monitor_interval_secs,
         config.engine_metrics,
         config.disable_load_monitoring,
-    )));
+    ));
+    builder.engine_reads_loads_of(&worker_monitor);
+    let worker_monitor = Some(worker_monitor);
 
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
     let worker_job_queue = Arc::new(OnceLock::new());
@@ -538,7 +549,7 @@ async fn build_test_app_context(
     let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
     let app_context = Arc::new(
-        AppContext::builder()
+        builder
             // Building applies the configuration's liveness budgets
             // (process-wide, the first context a test binary builds sets
             // them), as it does for the server.

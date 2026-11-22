@@ -604,12 +604,27 @@ impl PolicyRegistry {
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         cache_trace::begin_selection(workers);
+        #[cfg(feature = "test-util")]
+        self.note_classic_pick(policy.as_ref());
         if let Some((sticky, key, source)) = self.sticky_for(policy.as_ref(), info) {
             return Self::select_sticky(sticky, policy, model_id, workers, info, key, source);
         }
         let selected = policy.select_worker(workers, info);
         cache_trace::selection(policy.name(), "policy", workers, selected);
         selected
+    }
+
+    /// In a test build, writes down that `policy` picks, where it is a
+    /// classic policy and this registry holds the policy engine: the
+    /// gateway runs with `--policy-controller`, and a classic policy still
+    /// decides this request ([`super::classic_picks`]). Nothing for the
+    /// object that asks the engine, and nothing in a registry that holds no
+    /// engine.
+    #[cfg(feature = "test-util")]
+    pub(crate) fn note_classic_pick(&self, policy: &dyn LoadBalancingPolicy) {
+        if self.policy_engine.is_some() && !policy.as_any().is::<EnginePolicy>() {
+            super::classic_picks::note(policy.name());
+        }
     }
 
     #[cfg(test)]

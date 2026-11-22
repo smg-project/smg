@@ -1293,6 +1293,45 @@ impl AppContextBuilder {
     }
 }
 
+/// What a test's context is built over when its test run turns the policy
+/// controller on (`SMG_TEST_POLICY_CONTROLLER=on`, read by the gateway's test
+/// harness). Built under the `test-util` feature alone, which only a test
+/// build turns on: a product build holds none of it.
+#[cfg(feature = "test-util")]
+impl AppContextBuilder {
+    /// A builder over `workers` that holds what the start's two policy
+    /// steps build under `config`, in the start's own order: the policy
+    /// controller's step, then the policy registry's (`from_config` runs
+    /// `with_policy_controller`, then `with_policy_registry`). The registry
+    /// the second step built is returned beside the builder: a test builds
+    /// its load monitor over it. A configuration the start refuses is
+    /// refused here, in the start's words.
+    pub fn with_policies_started(
+        config: &RouterConfig,
+        workers: Arc<WorkerRegistry>,
+    ) -> Result<(Self, Arc<PolicyRegistry>), String> {
+        let builder = Self::new()
+            .worker_registry(workers)
+            .with_policy_controller(config, None)?
+            .with_policy_registry(config);
+        let policies = builder
+            .policy_registry
+            .clone()
+            .ok_or_else(|| "the policy registry's step built no registry".to_string())?;
+        Ok((builder, policies))
+    }
+
+    /// Subscribes the engine object to the loads `monitor` publishes, a
+    /// load monitor the test built itself, as the start's own monitor step
+    /// subscribes it to the monitor it builds (`with_worker_monitor`).
+    /// Nothing where the policy steps built no engine object.
+    pub fn engine_reads_loads_of(&self, monitor: &WorkerMonitor) {
+        if let Some(policy_engine) = &self.policy_engine {
+            policy_engine.read_loads(monitor.subscribe());
+        }
+    }
+}
+
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()

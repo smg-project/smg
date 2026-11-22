@@ -25,6 +25,8 @@ use smg_data_connector::{
 use smg_mcp::{McpConfig, McpOrchestrator};
 use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
+use crate::policy_controller;
+
 /// Create a test Axum application using the actual server's build_app function
 #[expect(
     clippy::unwrap_used,
@@ -50,9 +52,14 @@ pub fn create_test_app(
         }
     };
 
-    // Initialize registries
+    // Initialize registries. A run with the policy controller on takes the
+    // builder, the registry and the configuration from the gateway's own
+    // start (`policy_controller::parts`).
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+    let (builder, policy_registry, router_config) =
+        policy_controller::parts(router_config.clone(), &worker_registry, |config| {
+            PolicyRegistry::new(config.policy.clone())
+        });
 
     // Initialize storage backends
     let response_storage = Arc::new(MemoryResponseStorage::new());
@@ -61,14 +68,18 @@ pub fn create_test_app(
 
     // Initialize the worker monitor with the same interval the
     // production builder uses so tests exercise the real polling
-    // cadence.
-    let worker_monitor = Some(Arc::new(WorkerMonitor::new(
+    // cadence. Where the builder holds the engine object (a run with the
+    // policy controller on), the object reads this monitor's loads, as it
+    // reads those of the monitor a gateway's start builds.
+    let worker_monitor = Arc::new(WorkerMonitor::new(
         worker_registry.clone(),
         policy_registry.clone(),
         router_config.load_monitor_interval_secs,
         router_config.engine_metrics,
         router_config.disable_load_monitoring,
-    )));
+    ));
+    builder.engine_reads_loads_of(&worker_monitor);
+    let worker_monitor = Some(worker_monitor);
 
     // Create empty OnceLock for worker job queue and workflow engines
     let worker_job_queue = Arc::new(OnceLock::new());
@@ -76,7 +87,7 @@ pub fn create_test_app(
 
     // Create AppContext using builder pattern
     let app_context = Arc::new(
-        AppContext::builder()
+        builder
             .router_config(router_config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
@@ -299,9 +310,14 @@ pub async fn create_test_app_context_with_config(router_config: &RouterConfig) -
         .expect("Failed to create MCP orchestrator");
     mcp_orchestrator_lock.set(Arc::new(mcp_orchestrator)).ok();
 
-    // Initialize registries
+    // Initialize registries. A run with the policy controller on takes the
+    // builder, the registry and the configuration from the gateway's own
+    // start (`policy_controller::parts`).
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+    let (builder, policy_registry, router_config) =
+        policy_controller::parts(router_config.clone(), &worker_registry, |config| {
+            PolicyRegistry::new(config.policy.clone())
+        });
 
     // Initialize storage backends
     let response_storage = Arc::new(MemoryResponseStorage::new());
@@ -309,8 +325,8 @@ pub async fn create_test_app_context_with_config(router_config: &RouterConfig) -
     let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
 
     Arc::new(
-        AppContext::builder()
-            .router_config(router_config.clone())
+        builder
+            .router_config(router_config)
             .client(client)
             .rate_limiter(None)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))

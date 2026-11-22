@@ -2822,6 +2822,13 @@ impl WorkerSelectionStage {
         let hash_ring = (!hashes.is_empty() && policy_reads_hash_ring(encode_policy.as_ref()))
             .then(|| self.policy_registry.hash_ring_of(model_id, &snapshot))
             .flatten();
+        // The encode side asks its policy here, not through the registry's
+        // pick: a test build writes its classic picks down from here too.
+        #[cfg(feature = "test-util")]
+        if !hashes.is_empty() {
+            self.policy_registry
+                .note_classic_pick(encode_policy.as_ref());
+        }
         let assignments = assign_encode_workers(
             &available_encode,
             hashes,
