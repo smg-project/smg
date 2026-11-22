@@ -675,10 +675,18 @@ pub trait Picker: Lifecycle + Debug {
     /// health on the worker and holds every other rule of a placement
     /// itself asks such a picker for one pick and nothing else of a
     /// decision ([`Engine::place_for`]). The default is no. The engine reads
-    /// it where such a caller asks for a place's profile, and at one
-    /// decision: a pair's decode decided again, handed the decode of the
-    /// pair's first decision ([`Profile::keeps_its_pick`]).
+    /// it where such a caller asks for a place's profile, not at a
+    /// decision.
     fn picks_alone(&self) -> bool {
+        false
+    }
+
+    /// Whether each pick takes the next turn of an order the picker keeps,
+    /// as a rotation's does: a second pick for one request spends a turn
+    /// that serves no request. The default is no. The engine reads it at
+    /// one decision: a pair's decode decided again, handed the decode of
+    /// the pair's first decision ([`Profile::keeps_its_pick`]).
+    fn takes_turns(&self) -> bool {
         false
     }
 
@@ -774,14 +782,15 @@ pub struct Profile {
 
 impl Profile {
     /// Whether a pick of this profile stands while its worker does: the
-    /// profile holds no scorer, and its picker's own rule is its whole pick
-    /// ([`Picker::picks_alone`]), which reads no row, no score and no
-    /// count. Decided again over the same workers, such a profile would
-    /// pick by nothing that moved since. So a pair's decode decided again
-    /// keeps the decode of its first decision ([`Engine::decide_decode`]).
+    /// profile holds no scorer, and each pick of its picker takes a turn
+    /// ([`Picker::takes_turns`]). Decided again, such a profile would spend
+    /// a second turn for one request, and move the request by nothing its
+    /// workers show. So a pair's decode decided again keeps the decode of
+    /// its first decision ([`Engine::decide_decode`]). Every other profile
+    /// decides again, on the workers as they stand at that call.
     #[must_use]
     pub fn keeps_its_pick(&self) -> bool {
-        self.scorers.is_empty() && self.picker.picks_alone()
+        self.scorers.is_empty() && self.picker.takes_turns()
     }
 
     /// What this profile's stages read from the host beyond the facts every
@@ -12211,6 +12220,28 @@ mod tests {
         let busy = |rows: &mut [Candidate], at: usize| rows[at].in_flight = 7;
         let (first, again) = decided_twice(&engine, &mut decodes, Some, busy);
         assert_eq!((first, again[0]), (0, 1));
+    }
+
+    /// `passthrough` takes no turn, so it decides again whatever it is
+    /// handed: the first healthy decode of the list as it stands at the
+    /// second call, with the healthy decodes behind it in the list's order.
+    /// The first decode of the list is not healthy at the pair's first
+    /// decision, which names the second, and is healthy by the second call.
+    #[test]
+    fn a_decode_decided_again_under_passthrough_is_the_lists_first() {
+        type Held = fn((WorkerId, u16)) -> Option<(WorkerId, u16)>;
+        let handed: [Held; 2] = [Some, |_| None];
+        for held in handed {
+            let engine = pair_engine(Profile {
+                picker: Box::new(Passthrough),
+                ..round_robin_profile()
+            });
+            let mut decodes = classed_rows(&[1, 1, 1]);
+            decodes[0].health.healthy = false;
+            let ahead = |rows: &mut [Candidate], _: usize| rows[0].health.healthy = true;
+            let (first, again) = decided_twice(&engine, &mut decodes, held, ahead);
+            assert_eq!((first, again), (1, vec![0, 1, 2]));
+        }
     }
 
     #[test]

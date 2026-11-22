@@ -232,6 +232,11 @@ impl Picker for RoundRobin {
         true
     }
 
+    // Each pick takes its rotation's next turn.
+    fn takes_turns(&self) -> bool {
+        true
+    }
+
     /// The pool's own turn by the pool's own word: one step of the word and
     /// one read of the worker the turn lands on. A turn that lands on a
     /// refused worker takes the pool's next turn, as many turns as the

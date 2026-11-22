@@ -6,6 +6,8 @@
 //! `policy_engine/decode_later_round_robin/{kept,picked}/<n>`: the same
 //! call under round robin, handed the decode the pair's first decision
 //! named (it is kept) and handed none (the picker turns again).
+//! `policy_engine/decode_later_passthrough/{handed,picked}/<n>`: the same
+//! two calls under `passthrough`, which decides again in both.
 //!
 //! The cells stand in a bench of their own. A bench binary is optimized
 //! whole, so the entries it links shape every cell in it: beside the pair
@@ -104,8 +106,21 @@ fn decode_later(c: &mut Criterion) {
 /// the one the first decision named, and answers it behind the profile's
 /// filters. `picked`: handed none, it asks the picker again.
 fn decode_later_round_robin(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_engine/decode_later_round_robin");
-    let engine = PolicySpec::pair_presets("round_robin", "round_robin")
+    decode_later_handed(c, "round_robin", "kept");
+}
+
+/// The second decision under `passthrough`, whose pick takes no turn: it
+/// asks the picker again, `handed` the first decision's decode or none.
+fn decode_later_passthrough(c: &mut Criterion) {
+    decode_later_handed(c, "passthrough", "handed");
+}
+
+/// The second decision under the `decode` preset, over each size: handed
+/// the decode in the middle of the decodes under the cell name `handed`,
+/// and handed none under `picked`.
+fn decode_later_handed(c: &mut Criterion, decode: &str, handed: &str) {
+    let mut group = c.benchmark_group(format!("policy_engine/decode_later_{decode}"));
+    let engine = PolicySpec::pair_presets("round_robin", decode)
         .expect("a pair spec of this build")
         .validate()
         .expect("the pair spec validates");
@@ -126,7 +141,7 @@ fn decode_later_round_robin(c: &mut Criterion) {
         let held = prefills[prefills.len() / 2].id;
         let first = &decodes[decodes.len() / 2];
         let first = Some((first.id, first.dp_rank));
-        for (name, first) in [("kept", first), ("picked", None)] {
+        for (name, first) in [(handed, first), ("picked", None)] {
             let facts = RequestFacts {
                 model: "m",
                 now_micros: 1_000_000,
@@ -150,5 +165,10 @@ fn decode_later_round_robin(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, decode_later, decode_later_round_robin);
+criterion_group!(
+    benches,
+    decode_later,
+    decode_later_round_robin,
+    decode_later_passthrough
+);
 criterion_main!(benches);
