@@ -605,6 +605,56 @@ impl PoolRecords {
         self.places.get(at).map(|&(_, place)| place)
     }
 
+    /// Whether an engine of the list holds several rows, as a data-parallel
+    /// engine holds one for each of its ranks ([`Engines`]).
+    #[must_use]
+    pub(crate) fn has_ranks(&self) -> bool {
+        !self.engine_ends.is_empty()
+    }
+
+    /// The workers of the engines a retry tried, written into `whole`:
+    /// `tried` as its host named them, and behind them the id of every
+    /// other row of the engine that holds a tried worker's row
+    /// ([`Engines`]), each once. A retry that names one rank of a
+    /// data-parallel engine so names them all: its ranks share the engine a
+    /// failed attempt reached.
+    ///
+    /// An id the list does not hold stays as it was named and adds nothing:
+    /// the list says nothing of its engine. Where two rows of the list
+    /// carry one id, no id has a place ([`Self::place_of`]) and nothing is
+    /// added.
+    ///
+    /// One binary search for each tried id, and nothing allocated once
+    /// `whole` has grown: what a retry pays, and only over a list with
+    /// such an engine ([`Self::has_ranks`]).
+    pub(crate) fn tried_engines(&self, tried: &[WorkerId], whole: &mut Vec<WorkerId>) {
+        whole.clear();
+        whole.extend_from_slice(tried);
+        for &id in tried {
+            let Some(place) = self.place_of(id) else {
+                continue;
+            };
+            let ranks = self.engine_of(place).iter();
+            for &rank in ranks.filter_map(|&row| self.ids.get(row as usize)) {
+                if !whole.contains(&rank) {
+                    whole.push(rank);
+                }
+            }
+        }
+    }
+
+    /// The rows of the engine that holds the row at `place`, that row
+    /// among them, by the engine's place the row states
+    /// ([`Candidate::engine`]), and none where no engine of the list holds
+    /// several rows.
+    fn engine_of(&self, place: u32) -> &[u32] {
+        let Some(row) = self.fixed.get(place as usize) else {
+            return &[];
+        };
+        let engines = Engines::new(self.number, &self.engine_rows, &self.engine_ends);
+        engines.rows(row.engine as usize)
+    }
+
     /// The fixed half of each worker's record, by its place in the list:
     /// its position, id, key, role, rank, wire, engine kind and labels,
     /// its engine's place among the list's engines, whether it takes
