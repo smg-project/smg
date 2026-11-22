@@ -442,7 +442,7 @@ pub mod bench_support {
     /// send to, the dispatch-time read of the chosen worker's overload
     /// veto, the dispatch's word, the worker's load guard from the send to
     /// the request's end, and the end's word. The worker the request went
-    /// to ([`placed_on`]), and `None` where it had no worker.
+    /// to (`placed_on`), and `None` where it had no worker.
     ///
     /// What [`route_classic`] does under a classic policy, with the engine
     /// deciding the whole request through the object the routers hold: no
@@ -510,7 +510,7 @@ pub mod bench_support {
     /// send to the request's end, whose drop tells the model's policy.
     /// `headers` are the request's, where it carries any: a routing key is
     /// read from them as a router reads it, for the placement and for the
-    /// load guard. The worker the request went to ([`placed_on`]), and
+    /// load guard. The worker the request went to (`placed_on`), and
     /// `None` where it had no worker.
     pub fn route_classic(
         registry: &WorkerRegistry,
@@ -545,7 +545,7 @@ pub mod bench_support {
     /// on the gRPC wire: the pair index of the model's snapshot, the pair
     /// placed over it by the registry's two side policies, and each side's
     /// load guard from the send to the request's end. The prefill worker
-    /// the request went to ([`placed_on`]), and `None` where it had no
+    /// the request went to (`placed_on`), and `None` where it had no
     /// pair.
     pub fn route_pair(
         registry: &WorkerRegistry,
@@ -628,7 +628,7 @@ pub mod bench_support {
     /// the request's end. `headers` are the request's, where it carries
     /// any: its routing key is read from them by the sources its binding
     /// names, as a router's ask reads it. The worker the request went to
-    /// ([`placed_on`]), and `None` where it had no worker.
+    /// (`placed_on`), and `None` where it had no worker.
     ///
     /// What [`route_classic`] does under a classic policy, with the engine
     /// deciding: no classic policy and no classic placement pass runs.
