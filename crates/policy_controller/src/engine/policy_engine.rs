@@ -48,6 +48,7 @@
 pub(super) mod encode;
 mod keys;
 mod labels;
+pub(super) mod membership;
 pub mod overlap;
 pub(super) mod pair;
 pub(super) mod place;
@@ -130,7 +131,8 @@ pub struct PolicyEngine {
     /// How many words of a lease and changes of membership panicked in a
     /// stage that heard them.
     unheard: AtomicU64,
-    /// How many runs of the upkeep panicked in the engine's own task
+    /// How many steps of the engine's own task panicked: a run of the
+    /// upkeep, or a step of the registry's follow
     /// ([`Self::upkeep_faults`]).
     upkeep_faults: AtomicU64,
     /// The id of the last lease issued. A pick that is issued one writes
@@ -174,6 +176,9 @@ pub struct PolicyEngine {
     /// by binding and kind. The table is allocated at the first of them: a
     /// document that names no shadow keeps none.
     shadow_counts: OnceLock<Box<ShadowCounts>>,
+    /// The host's worker registry, once it handed it
+    /// ([`Self::set_registry`]): the engine's own task follows its events.
+    members: membership::Handed,
 }
 
 /// The document's word of a binding's shadow: the binding's position, and
@@ -350,6 +355,7 @@ impl PolicyEngine {
             affinity: Affinity::default(),
             loads: task::Loads::default(),
             shadow_counts: OnceLock::new(),
+            members: membership::Handed::default(),
         }
     }
 
@@ -362,30 +368,36 @@ impl PolicyEngine {
         &self.affinity
     }
 
-    /// The worker at `address` left its pool or was replaced: the records
-    /// of sent prefixes forget it, so no later request is named a worker
-    /// that is gone, and the document's stages are told
-    /// ([`Membership::Removed`]). Both name the worker by the fingerprint
-    /// of its address: the id every decision knew it by, where its program
-    /// states none ([`FixedFacts::id`]). A stage that keeps a range, a
-    /// count or a credit of the worker drops it. The session table is not
-    /// told: a session's pin stands on a worker that is gone, however long,
-    /// and is a routable pin again once the worker is back. A host says it
-    /// at a removal, where it tells its classic policies.
+    /// The worker at `address` was removed from its host's registry, and so
+    /// from every pool: the records of sent prefixes forget it, so no later
+    /// request is named a worker that is gone, and the document's stages
+    /// are told ([`Membership::Removed`]). Both name the worker by the
+    /// fingerprint of its address: the id every decision knew it by, where
+    /// its program states none ([`FixedFacts::id`]). A stage that keeps a
+    /// range, a count or a credit of the worker drops it. A dispatch said
+    /// behind the leave enters its rank in a count of sends again. The
+    /// session table is not told: a leave takes no pin away, so a
+    /// session's pin stands on a worker that is gone until the session's
+    /// idle time or two other workers end it, and is a routable pin again
+    /// once the worker is back.
+    ///
+    /// A host says it at a removal, where it tells its classic policies,
+    /// and not where a worker leaves one model's pool or its object is
+    /// replaced at its address: both leave the worker standing. A host
+    /// that hands its registry says it nowhere ([`Self::set_registry`]),
+    /// and a program that states ids of its own hands it: this call names
+    /// a worker by its address alone.
     ///
     /// In the records a worker none of them holds costs one lookup a model.
     /// Every stage is told whatever the records hold, and one that keeps a
     /// state of workers takes its lock or copies its table for it: the call
     /// belongs at a change of membership, off a request's path.
     ///
-    /// A worker and the one that replaces it at one address share one id.
-    /// A host that replaces a worker says this first and [`Self::joined`]
-    /// behind it: said the other way round, the worker that serves is left
-    /// told gone.
+    /// A worker and one registered at its address behind its removal share
+    /// one id. A host says this first and [`Self::joined`] behind it: said
+    /// the other way round, the worker that serves is left told gone.
     pub fn forget(&self, address: &str) {
-        let id = WorkerId::from_address(address);
-        self.affinity.forget(id);
-        self.told(&Membership::Removed(id));
+        self.left(WorkerId::from_address(address));
     }
 
     /// The worker at `address` joined: the document's stages are told
@@ -393,9 +405,21 @@ impl PolicyEngine {
     /// every decision names the worker by where its program states none
     /// ([`FixedFacts::id`]). A stage that keeps a pruned worker out for a
     /// while lists a worker back at the address it left at once. A host
-    /// says it at a registration, where it tells its classic policies.
+    /// says it at a registration, where it tells its classic policies. A
+    /// host that hands its registry says it nowhere
+    /// ([`Self::set_registry`]).
     pub fn joined(&self, address: &str) {
-        let id = WorkerId::from_address(address);
+        self.came(WorkerId::from_address(address));
+    }
+
+    /// A removal by the worker's id: what [`Self::forget`] says.
+    fn left(&self, id: WorkerId) {
+        self.affinity.forget(id);
+        self.told(&Membership::Removed(id));
+    }
+
+    /// A join by the worker's id: what [`Self::joined`] says.
+    fn came(&self, id: WorkerId) {
         self.told(&Membership::Added(id));
     }
 

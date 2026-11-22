@@ -7294,10 +7294,10 @@ impl Engine {
     /// The stages' part of a change of membership
     /// ([`Lifecycle::on_membership`]): the tallies of sends and each
     /// profile's scorers and its picker hear it, and the session table does
-    /// not. The engine over a host's worker lists tells this part alone. It
-    /// names a worker by its address, so a session's pin stands on a worker
-    /// that is gone, however long, and is a routable pin again once the
-    /// worker is back.
+    /// not. The engine over a host's worker lists tells this part alone: a
+    /// leave there takes no pin away. A session's pin stands on a worker
+    /// that is gone until the session's idle time or two other workers end
+    /// it, and is a routable pin again once a worker stands under its id.
     pub(crate) fn membership_stages(&self, change: &Membership<'_>) {
         for credit in &self.sent_credits {
             credit.membership(change);

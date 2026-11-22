@@ -1,10 +1,13 @@
 //! The engine's own task: what a host of the engine no longer does by hand.
 //!
 //! A host hands the engine its load monitor's channel
-//! ([`PolicyEngine::set_loads`]) and spawns [`PolicyEngine::run`] once. The
-//! task runs the engine's upkeep once a second and keeps the newest load
-//! snapshot at hand, so a decision whose request gives none reads the
-//! engine's and never touches the channel.
+//! ([`PolicyEngine::set_loads`]) and its worker registry
+//! ([`PolicyEngine::set_registry`]), and spawns [`PolicyEngine::run`] once.
+//! The task runs the engine's upkeep once a second and keeps the newest
+//! load snapshot at hand, so a decision whose request gives none reads the
+//! engine's and never touches the channel. It tells the document's stages
+//! a worker that joined or was removed, by the registry's events and under
+//! the id the host states of the worker.
 
 use std::{
     fmt,
@@ -22,7 +25,7 @@ use parking_lot::Mutex;
 use smg_worker::load::state::{LoadReceiver, LoadSnapshot};
 use tokio::time::{self, MissedTickBehavior};
 
-use super::PolicyEngine;
+use super::{membership, PolicyEngine};
 use crate::engine::{
     decision_engine::{DecisionEngine, RequestMaker, SweepOutcome},
     framework::release,
@@ -165,17 +168,43 @@ impl PolicyEngine {
     ///   Until then, and for an engine handed no channel, a decision whose
     ///   request gives no snapshot reads no report. A monitor that ended
     ///   leaves its last snapshot standing until another is handed.
+    /// - A worker that joined or was removed told to the document's
+    ///   stages, by the events of the registry the host handed
+    ///   ([`Self::set_registry`]) and under the id the host states of the
+    ///   worker: followed from the first upkeep behind the hand-over, so
+    ///   within a second of it, with the workers that stand then told as
+    ///   joined. The registry is read whole again where its channel
+    ///   dropped events or closed. A panic of the host's own code in the
+    ///   follow is held and counted ([`Self::upkeep_faults`]): the task
+    ///   goes on, and reads the registry whole again at its next upkeep.
     pub async fn run(&self) {
         self.run_with(|now| self.sweep(now)).await;
     }
 
-    /// How many runs of the upkeep panicked in the engine's own task
-    /// ([`Self::run`]). Each was held, and the task went on. While the
-    /// count rises the upkeep does not run whole: session keys past their
-    /// end can stay on file, though every request is still answered.
+    /// How many steps of the engine's own task panicked ([`Self::run`]): a
+    /// run of the upkeep, or a step of the registry's follow in the host's
+    /// own code. Each was held, and the task went on. While the upkeep's
+    /// panics raise the count it does not run whole: session keys past
+    /// their end can stay on file, though every request is still answered.
+    /// While the follow's raise it, the stages are told no join and no
+    /// leave.
     #[must_use]
     pub fn upkeep_faults(&self) -> u64 {
         self.upkeep_faults.load(Ordering::Relaxed)
+    }
+
+    /// One step of the engine's task under the task's catch: `None` where
+    /// it panicked. The panic is held and counted
+    /// ([`Self::upkeep_faults`]), and the task goes on.
+    pub(super) fn held<R>(&self, step: impl FnOnce() -> R) -> Option<R> {
+        match catch_unwind(AssertUnwindSafe(step)) {
+            Ok(done) => Some(done),
+            Err(payload) => {
+                release(payload);
+                self.upkeep_faults.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// The task's loop. `upkeep` is the step it runs once a second under
@@ -186,19 +215,19 @@ impl PolicyEngine {
         // The host's channel while its monitor publishes, and the count of
         // the hand-over it came with.
         let (mut taken, mut feed) = (0, None);
+        // The follow of the host's registry, once it is handed.
+        let mut members = None;
         loop {
             tokio::select! {
                 _ = tick.tick() => {
                     // Dated at this run, not at the second its tick was due.
                     let now = time::Instant::now().into_std();
-                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| upkeep(now))) {
-                        release(payload);
-                        self.upkeep_faults.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _swept = self.held(|| upkeep(now));
                     if let Some(handed) = self.loads.handed_past(taken) {
                         (taken, feed) = handed;
                         self.loads.keep(feed.as_mut());
                     }
+                    self.follow_registry(&mut members);
                 }
                 went_on = published(feed.as_mut()) => {
                     if went_on {
@@ -207,6 +236,7 @@ impl PolicyEngine {
                         feed = None;
                     }
                 }
+                word = membership::next(members.as_mut()) => self.heard(members.as_mut(), word),
             }
         }
     }

@@ -897,10 +897,27 @@ At start:
 | builds the engine from the document | `PolicyEngine::new(spec)` |
 | hands its index of cache events | `engine.affinity().set_indexes(indexes)`; the host implements `CacheIndexes` and `CacheIndex` |
 | keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
-| tells the engine when a worker joins | `engine.joined(address)` |
-| tells the engine when a worker is removed | `engine.forget(address)` |
+| hands its worker registry, once | `engine.set_registry(registry)`; the host implements `Members`, and the worker crate's registry is one. The engine's task then tells the policies a worker that joined or was removed, by the registry's events (the table below) |
+| or, where it hands no registry, tells the engine itself | `engine.forget(address)` when a worker is removed and `engine.joined(address)` when one joins; a removal and a registration at one address in that order |
 | hands its load monitor's channel | `engine.set_loads(channel)`, and again where it builds another monitor; an engine whose document reads no load report and no named signal keeps none |
-| spawns the engine's own task, once | `engine.run()`: the upkeep once a second, and the newest load snapshot kept at hand |
+| spawns the engine's own task, once | `engine.run()`: the upkeep once a second, the newest load snapshot kept at hand, and the follow of the registry |
+
+What the engine's task tells the policies at each event of the registry. It names a worker by the
+id the host states of it (`Members::facts_of`), which is the id the host's lists name it by; a
+host that states none is named by the fingerprint of the worker's address.
+
+| The registry's event | The policies are told |
+|---|---|
+| `Registered` | a join |
+| `Removed` | a leave, under the id told at the worker's join |
+| `Replaced` | nothing where the host states the same id of the new object; a leave of the old id and a join of the new one where it states another |
+| `StatusChanged` | nothing: a decision reads a worker's status on its object |
+
+A worker removed and another registered at its address come as a `Removed` and a `Registered`,
+so a leave and then a join. The events are a broadcast that drops its oldest for a reader that
+falls behind: the task then reads the registry whole and tells what changed. The session table
+is told nothing: a pin on a worker that is gone stands until the session's idle time or two
+other workers end it.
 
 For each request the host implements a small trait and calls the engine. A host writes `model`
 and `make`; the other three methods have default bodies:
@@ -974,12 +991,13 @@ runtime.spawn(engine.run());         // the engine's own background task
 
 The engine lives as long as the process, so a placement holds a plain reference to it.
 
-The engine's background task does what a host did by hand. Two of its jobs are built
-(`PolicyEngine::run`): the upkeep once a second, and the newest load snapshot kept at hand,
-swapped when the monitor publishes one, so that a decision reads it without touching the
-channel. One is planned: a worker that joined or was removed told to the policies. A host that
-builds another load monitor hands its channel again (`engine.set_loads`): a channel ends with
-its monitor.
+The engine's background task does what a host did by hand. Three of its jobs are built
+(`PolicyEngine::run`): the upkeep once a second, the newest load snapshot kept at hand, and a
+worker that joined or was removed told to the policies. The snapshot is swapped when the monitor
+publishes one, so that a decision reads it without touching the channel. A join and a leave are
+read from the events of the registry the host hands (`engine.set_registry`, section 8.1). A host
+that builds another load monitor hands its channel again (`engine.set_loads`): a channel ends
+with its monitor.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
 host's `Generation` type. The engine fills the cell at the list's first decision.
