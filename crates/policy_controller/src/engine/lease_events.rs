@@ -101,8 +101,14 @@ pub(crate) fn pair(
 ) {
     let prefill = held.lease;
     let first = held.decision.pick().and_then(|pick| pick.targets.first());
-    // The decode side as its host lends it with a pair's lease.
-    let decode = first.and_then(|first| decode_as_issued(prefill, first, held.decode.session));
+    // The decode side as its host lends it with a pair's lease, under the
+    // size it was issued under.
+    let decode = first
+        .and_then(|first| decode_as_issued(prefill, first, held.decode.session))
+        .map(|issued| Lease {
+            tokens: held.decode.tokens,
+            ..issued
+        });
     let chosen = held.decode.chosen;
     match said {
         Said::Dispatched(dispatch, at) => {

@@ -3731,7 +3731,7 @@ struct Held {
 /// The decode side of a pair's lease on file, with the slot of the count
 /// it books until it ends.
 #[derive(Clone, Copy)]
-struct HeldDecode {
+struct FiledDecode {
     side: DecodeSide,
     booked: Option<WorkerSlot>,
     /// Whether the side started as chosen, kept after issue or dispatch.
@@ -3757,7 +3757,7 @@ pub(crate) struct DecodeIssue(u8);
 #[cfg(feature = "controller")]
 type Replaced = (DecodeSide, Instant);
 
-impl HeldDecode {
+impl FiledDecode {
     /// `side` as a door files it with `booked`, the slot of its worker's
     /// count. Only a live side books a count at filing.
     fn laid(side: DecodeSide, booked: Option<WorkerSlot>) -> Self {
@@ -3779,7 +3779,7 @@ impl HeldDecode {
 /// the most pairs that stood at once, and it keeps its room.
 #[derive(Default)]
 struct Decodes {
-    places: Vec<Option<(Key, HeldDecode)>>,
+    places: Vec<Option<(Key, FiledDecode)>>,
     free: Vec<u32>,
     /// What the last issue of a chosen side replaced, by the side's place
     /// and under its lease's key. A decode call's issue alone lays one: the
@@ -3791,7 +3791,7 @@ struct Decodes {
 impl Decodes {
     /// Lays `decode` for the lease under `key` in a free place and names
     /// the place.
-    fn lay(&mut self, key: Key, decode: HeldDecode) -> u32 {
+    fn lay(&mut self, key: Key, decode: FiledDecode) -> u32 {
         let laid = Some((key, decode));
         if let Some(at) = self.free.pop() {
             if let Some(place) = self.places.get_mut(at as usize) {
@@ -3809,7 +3809,7 @@ impl Decodes {
 
     /// The decode side in the place `at`, where that place is the lease's
     /// under `key`.
-    fn get(&self, at: u32, key: &Key) -> Option<&HeldDecode> {
+    fn get(&self, at: u32, key: &Key) -> Option<&FiledDecode> {
         match self.places.get(at as usize)? {
             Some((owner, decode)) if owner == key => Some(decode),
             _ => None,
@@ -3817,7 +3817,7 @@ impl Decodes {
     }
 
     /// [`Self::get`], to write.
-    fn get_mut(&mut self, at: u32, key: &Key) -> Option<&mut HeldDecode> {
+    fn get_mut(&mut self, at: u32, key: &Key) -> Option<&mut FiledDecode> {
         match self.places.get_mut(at as usize)? {
             Some((owner, decode)) if owner == key => Some(decode),
             _ => None,
@@ -3826,7 +3826,7 @@ impl Decodes {
 
     /// Takes the decode side out of the place `at`, where that place is
     /// the lease's under `key`: the place is free.
-    fn take(&mut self, at: u32, key: &Key) -> Option<HeldDecode> {
+    fn take(&mut self, at: u32, key: &Key) -> Option<FiledDecode> {
         let place = self.places.get_mut(at as usize)?;
         let (_, decode) = place.take_if(|(owner, _)| *owner == *key)?;
         self.free.push(at);
@@ -3858,7 +3858,7 @@ impl Decodes {
         at: u32,
         key: &Key,
         issue: Option<DecodeIssue>,
-    ) -> Option<(&mut HeldDecode, Replaced)> {
+    ) -> Option<(&mut FiledDecode, Replaced)> {
         let (owner, decode) = self.places.get_mut(at as usize)?.as_mut()?;
         if owner != key
             || !decode.filed_chosen
@@ -3990,7 +3990,7 @@ impl Leases {
     ) {
         self.end(&key);
         let booked = marked(&mut record, booked, &pair);
-        let side = pair.map(|(side, booked)| HeldDecode::laid(side, booked));
+        let side = pair.map(|(side, booked)| FiledDecode::laid(side, booked));
         let decode = side.map_or(0, |side| self.decodes.lay(key, side));
         // A record filed whole says nothing of its decision: it counts
         // for its key wherever it has one.
@@ -4029,7 +4029,7 @@ impl Leases {
     /// ([`keyed_decode`]), and the lease's dispatch deadline is queued for
     /// it where the record's own filing queued none: a lease takes one
     /// place of the queue.
-    fn decode_laid(&mut self, key: Key, record: &LeaseRecord, decode: &HeldDecode, counts: bool) {
+    fn decode_laid(&mut self, key: Key, record: &LeaseRecord, decode: &FiledDecode, counts: bool) {
         if let Some(booked) = decode.booked {
             self.counts.book(booked);
         }
@@ -4046,7 +4046,7 @@ impl Leases {
     /// side whose count of issues is full is none: it is refused as one
     /// that stands, so no count repeats, an undo names one issue for the
     /// lease's life, and the first pick's dispatch still books the side.
-    fn chosen_decode(&mut self, key: &Key) -> Result<(&mut Held, &mut HeldDecode), DecodeRefused> {
+    fn chosen_decode(&mut self, key: &Key) -> Result<(&mut Held, &mut FiledDecode), DecodeRefused> {
         let held = self.records.get_mut(key).ok_or(DecodeRefused::NoLease)?;
         let found = held
             .record
@@ -4119,7 +4119,7 @@ impl Leases {
         let count = found.issues.wrapping_add(1);
         decode.state = LeaseState::issued(decode.state.session_ttl_micros());
         decode.target_index = 0;
-        let laid = HeldDecode {
+        let laid = FiledDecode {
             side: decode,
             booked,
             issues: count,
@@ -4312,7 +4312,7 @@ impl Leases {
         counts: &InFlightCounts,
         sessions: &SessionTables,
         held: &mut Held,
-        decode: &mut HeldDecode,
+        decode: &mut FiledDecode,
         dispatch: Dispatch,
         at: Instant,
     ) {
@@ -4812,7 +4812,7 @@ impl MemoryStore {
             return Err(unminted);
         }
         let booked = marked(&mut record, booked, &pair);
-        let side = pair.map(|(side, booked)| HeldDecode::laid(side, booked));
+        let side = pair.map(|(side, booked)| FiledDecode::laid(side, booked));
         let on_file = &mut *leases;
         let key = loop {
             record.lease.id = on_file.mint(&self.blocks, file).ok_or(unminted)?;
