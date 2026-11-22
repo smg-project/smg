@@ -6,6 +6,8 @@ pub(crate) mod decision_guard;
 pub(crate) mod dispatch_credit;
 pub(crate) mod in_flight;
 pub(crate) mod lease;
+#[cfg(feature = "in-process")]
+pub(crate) mod placement;
 pub(crate) mod prefix_predictor;
 
 pub use decision_guard::DecisionGuard;
@@ -15,4 +17,6 @@ pub use lease::{
     Dispatch, EventKind, EventSet, Lease, LeaseId, LeaseKind, Membership, Outcome, ReleaseReason,
     Said, Side, Signal, TransportClass,
 };
+#[cfg(feature = "in-process")]
+pub use placement::Placement;
 pub use prefix_predictor::{DeepestPrefix, PrefixPredictor};

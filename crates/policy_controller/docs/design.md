@@ -882,7 +882,7 @@ status.
 That is too much. The gateway's earlier integration needs a module of its own of 19 files and
 13,856 lines (tests included) for it, and a branch in every route.
 
-### 8.2 The contract as designed **[planned]**
+### 8.2 The contract as designed **[partly]**
 
 Everything in the list above that is the same for every host moves into the crate. A host does
 three things. The names below may change; the contract may not.
@@ -937,11 +937,11 @@ impl PolicyEngine {
     pub fn place<'a>(&'static self, request: &PlaceRequest<'a>) -> Result<Placement<'a>, Unplaced>;
 }
 
-pub struct Placement<'a> {
+pub struct Placement<'a> {               // built, see part 3
     pub worker: Arc<dyn Worker>,         // where the request goes
-    pub id: WorkerId,                    // its id, for the next attempt's `tried`
     pub decode: Option<Arc<dyn Worker>>, // a pair's decode worker
     pub routing_key: Option<&'a str>,    // the key the document derived, for the in-flight counters
+    pub profile: u16,                    // the profile that picked, for the host's own counts
     // private: the lease, when a stage of the document wants events
 }
 
@@ -970,17 +970,22 @@ other fields of the request.
 **3. Keep the placement with the request.**
 
 ```rust
-// planned
+// tracking/placement.rs, behind the feature `in-process`
 impl Placement<'_> {
     pub fn sent(&mut self, side: Side);                    // one side of the request went out
     pub fn ended(&mut self, side: Side, outcome: Outcome); // one side ended
-    // one more call for a pair whose decode is chosen after its prefill has run
+    pub fn id(&self) -> WorkerId;                // the worker's id, for the next attempt's `tried`
+    pub fn decode_id(&self) -> Option<WorkerId>; // a pair's decode worker's id
+    pub fn owes_events(&self) -> bool;           // a side under a lease has not ended
+    pub fn kept(self) -> Placement<'static>;     // without the borrowed key, to keep to the end
+    // planned: one more call for a pair whose decode is chosen after its prefill has run
     // dropped with a side not ended: the engine hears a release
 }
 ```
 
 Where the document's stages want no events, the placement holds nothing and these calls do
-nothing.
+nothing. Until `place` answers with it, a host makes a placement of the answer it holds:
+`Placement::alone` for a place, `Placement::taken` for a whole decision and the target it took.
 
 Nothing else is asked of a host. In particular a host never names a policy, never looks inside a
 decision, never keeps a lease and never runs a timer for the engine.
@@ -1347,7 +1352,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing; a pair is decided without the host's load reports |
 | Encode-prefill-decode on that engine | **[planned]** | always refused today |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[planned]** | |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built over an answer its host holds; `place`, the start call and the engine's own task are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |
