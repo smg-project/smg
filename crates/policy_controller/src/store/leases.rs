@@ -9,12 +9,15 @@ use std::time::Instant;
 pub(super) use crate::tracking::in_flight::{InFlightCounts, WorkerSlot};
 use crate::{
     engine::{
-        decision::{Targets, MAX_TARGETS},
-        decision_engine::DecodeRefused,
+        decision::{
+            Decision, LiftedVeto, Pick, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+        },
+        decision_engine::{DecodeRefused, HeldDecision, HeldDecode},
+        sticky_sessions::SessionVerdict,
         view::{Session, WorkerId},
     },
     store::GatewayId,
-    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side},
+    tracking::lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side},
 };
 
 /// The state of a single's lease or of one side of a pair's lease.
@@ -321,7 +324,89 @@ impl Sides {
             told(lease);
         }
     }
+
+    /// Calls `told` with a single's lease as a host that held its decision
+    /// would lend it with `said` ([`HeldDecision`]): the view a request's
+    /// guard lends its engine, made from the record on file. `None`, and
+    /// no call, for a pair's lease, which is no single's, and for a
+    /// dispatch that names no target of the pick: it tells nothing of the
+    /// lease.
+    ///
+    /// The parts are read as they stood before the word:
+    ///
+    /// - **The lease** is the record's own as it stands: the lease as
+    ///   issued until a dispatch, and behind one the lease on the index and
+    ///   the worker the dispatch took, which every word behind a dispatch
+    ///   is told under.
+    /// - **The target** is the one the word is about. A dispatch names it
+    ///   by its frame's index. An end and a release name the one the lease
+    ///   books.
+    /// - **The pick** is one of no target: no word of a single carries its
+    ///   pick to a stage.
+    /// - **The decode side** is a single's, as a guard lends it: no
+    ///   session, the lease's own size, never chosen.
+    ///
+    /// The view is made in this call's frame and lent there: no part of it
+    /// is moved, and no pick is built.
+    #[inline]
+    pub fn with_held_single<R>(
+        &self,
+        said: Said,
+        told: impl FnOnce(&HeldDecision<'_>) -> R,
+    ) -> Option<R> {
+        if self.decode.is_some() {
+            return None;
+        }
+        let record = &self.record;
+        let own = record.lease.target_index;
+        let (index, (id, dp_rank)) = match said {
+            Said::Dispatched(dispatch, _) => {
+                let index = dispatch.target_index;
+                (index, record.target_at(index)?)
+            }
+            // An end is of the worker the lease books, whatever its index.
+            Said::Completed(_) | Said::Released(..) => {
+                let booked = record.target_at(own);
+                (own, booked.unwrap_or((record.target, 0)))
+            }
+        };
+        let lease = record.own();
+        let target = Target {
+            id,
+            dp_rank,
+            ..Target::default()
+        };
+        Some(told(&HeldDecision {
+            decision: &EMPTY_PICK,
+            lease: &lease,
+            index,
+            target: &target,
+            decode: HeldDecode {
+                session: Session::NONE,
+                tokens: lease.tokens,
+                chosen: false,
+            },
+        }))
+    }
 }
+
+/// The pick lent with a single's lease ([`Sides::with_held_single`]): no
+/// target, under no trace. A file keeps of a single's pick the workers a
+/// dispatch names by its index, and lists none of them for a word: no word
+/// of a single carries its pick to a stage.
+static EMPTY_PICK: Decision = Decision::Pick(Pick {
+    targets: Targets::new(),
+    trace: Trace {
+        profile: Trace::NO_PROFILE,
+        survivors: Survivors::counted(0),
+        top: [(WorkerId(0), 0.0); TRACE_TOP],
+        top_len: 0,
+        seed: 0,
+        generation: 0,
+        lifted: LiftedVeto::None,
+    },
+    session_verdict: SessionVerdict::None,
+});
 
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
