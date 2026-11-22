@@ -4650,8 +4650,10 @@ impl NativeEncoder {
         // its call for each piece near the end cost a short unit more than
         // its few pieces gain (counted on units between added tokens).
         const LONG_UNIT_BYTES: usize = 256;
-        if text.len() >= LONG_UNIT_BYTES {
-            return self.encode_long_sentencepiece_unit(chars, text, marker, mapped, ids, cache);
+        if text.len() >= LONG_UNIT_BYTES
+            && self.encode_long_sentencepiece_unit(chars, text, marker, mapped, ids, cache)
+        {
+            return;
         }
         let bytes = text.as_bytes();
         // A text that starts with a space or a marker has its marker already,
@@ -4681,8 +4683,10 @@ impl NativeEncoder {
     /// [`Self::encode_sentencepiece`] for a long unit: the marker's piece is
     /// encoded before the walk, which then asks no piece whether it is the
     /// first and reads a piece's key by one read of the text where sixteen
-    /// bytes stand from its start on. Out of line, so that each walk keeps
-    /// its own loop.
+    /// bytes stand from its start on. False, with nothing encoded, when a
+    /// prepended marker joins the text and no cut ends its piece near the
+    /// start: the caller's walk takes that unit. Out of line, so that each
+    /// walk keeps its own loop.
     #[inline(never)]
     fn encode_long_sentencepiece_unit(
         &self,
@@ -4692,7 +4696,10 @@ impl NativeEncoder {
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
-    ) {
+    ) -> bool {
+        // The marker piece's end is searched a byte at a time, so only this
+        // near the start: the caller's walk finds a later one by the block.
+        const FIRST_CUT_BYTES: usize = 32;
         let bytes = text.as_bytes();
         let mut rest = text;
         // A text that starts with a space or a marker has its marker already,
@@ -4703,14 +4710,15 @@ impl NativeEncoder {
         {
             // The marker's piece goes before the walk, which then tests no
             // piece for it: the marker alone when no token bridges it to the
-            // first byte, else the marker and the text up to its first cut,
-            // found a byte at a time (the whole unit when it has no cut).
+            // first byte, else the marker and the text up to its first cut.
             let first = if chars.cuts_at(&[b' ', bytes[0]], 1) {
                 0
             } else {
-                (1..bytes.len())
-                    .find(|&p| chars.cuts_at(bytes, p))
-                    .unwrap_or(bytes.len())
+                let near = FIRST_CUT_BYTES.min(bytes.len());
+                match (1..near).find(|&p| chars.cuts_at(bytes, p)) {
+                    Some(first) => first,
+                    None => return false,
+                }
             };
             self.tokenize_leading_piece(chars, &text[..first], mapped, ids, cache);
             rest = &text[first..];
@@ -4720,6 +4728,7 @@ impl NativeEncoder {
             #[inline(always)]
             |start, end| self.tokenize_raw_piece(chars, rest, start..end, mapped, ids, cache),
         );
+        true
     }
 
     /// The piece `text[piece]` of a long sentencepiece unit, compiled into
