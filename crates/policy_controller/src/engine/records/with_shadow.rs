@@ -37,6 +37,11 @@ use crate::engine::{
 /// draws is not handed the drawn workers' records alone. Its draw is made
 /// over the whole write, which gives the pick the short write gives.
 ///
+/// A standing veto stated beside the records is written into them where
+/// the live profile shows its rows to a plugin, as [`super::decide`]
+/// writes it ([`super::vetoes::written`]). Both decisions then read the
+/// same records under the same constraints.
+///
 /// A shadow profile is not run in two cases, and its decision is counted
 /// as skipped ([`ShadowKind::Skipped`]). A request with less than
 /// [`SHADOW_FLOOR`] of its stated budget left keeps that for its answer.
@@ -73,6 +78,13 @@ pub(crate) fn decide(
     with_buffers(|buffers: &mut Buffers| {
         let Buffers { rows, scratch } = buffers;
         let (rows, pool_facts) = pool.write(workers, live, rows);
+        let written;
+        let cx = if cx.stalled.is_empty() {
+            cx
+        } else {
+            written = super::vetoes::written(engine, facts.model, facts.phase, rows, cx);
+            &written
+        };
         let decided = engine.decide_keeping(facts, &pool_facts, rows, cx, scratch);
         // The request's own budget, as its host states it: none stated is
         // no floor to hold.

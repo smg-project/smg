@@ -44,11 +44,16 @@
 //! that names a shadow profile, [`with_shadow::decide`] is that decision
 //! followed by the shadow profile's, over every worker's record.
 //!
+//! A host that decides for many gateways states the asking gateway's
+//! standing vetoes beside the records. Where the decision's profile shows
+//! its rows to a plugin, they are written into the records ([`vetoes`]).
+//!
 //! One clock dates both sides ([`DecisionClock`]): a decision's instant and
 //! a report's sample instant are microseconds since one origin, so a load
 //! stage's credit of dispatches is released by a report sampled after them
 //! and by no other.
 
+pub(crate) mod vetoes;
 pub(crate) mod with_shadow;
 
 use std::{
@@ -1087,6 +1092,12 @@ thread_local! {
 /// decision ([`PoolFacts::word`]): a picker that takes turns counts a
 /// draw's turn in it.
 ///
+/// A standing veto `cx` states beside the records
+/// ([`Constraints::stalled`]) is written into them where the request's
+/// profile shows its rows to a plugin: the stalled bit, and the breaker
+/// bit where the veto holds. The engine declines such a profile over a
+/// mask beside its rows.
+///
 /// The records and the engine's scratch are the calling thread's own.
 pub fn decide(
     engine: &Engine,
@@ -1124,6 +1135,13 @@ pub fn decide(
             return decision;
         }
         let (rows, pool_facts) = pool.write(workers, live, rows);
+        let written;
+        let cx = if cx.stalled.is_empty() {
+            cx
+        } else {
+            written = vetoes::written(engine, facts.model, facts.phase, rows, cx);
+            &written
+        };
         engine.decide(facts, &pool_facts, rows, cx, scratch)
     };
     with_buffers(decide)
