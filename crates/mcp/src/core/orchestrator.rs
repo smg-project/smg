@@ -60,7 +60,7 @@ use super::{
     },
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
-    pool::{Listing, McpConnectionPool, PoolKey},
+    pool::{Listing, McpConnectionPool, PoolKey, UrlLookup},
     reconnect::ReconnectionManager,
 };
 use crate::{
@@ -414,6 +414,9 @@ struct ServerEntry {
 pub struct ConnectedServer {
     pub server_key: String,
     pub list_error: Option<String>,
+    /// The key the connection is pooled under. A binding of this server
+    /// carries it, and a tool call takes its connection by it.
+    pub pool_key: PoolKey,
 }
 
 /// Internal result type for approval-checked execution.
@@ -1653,6 +1656,23 @@ impl McpOrchestrator {
         // no other, whatever is held under the server's name; when the pool
         // holds none under the key, the call reads the server as not found.
         if let Some(key) = pool_key {
+            // The tools of an address are one list for every key pooled
+            // under it, so a call on an address pooled under more than one
+            // key stays refused.
+            if matches!(
+                self.connection_pool.get_unique_by_url(server_key),
+                UrlLookup::Ambiguous
+            ) {
+                warn!(
+                    "Refusing tool execution on '{}': multiple pooled connections share this \
+                     URL with different credentials/tenants; cannot select one safely",
+                    server_key
+                );
+                return Err(McpError::ServerAccessDenied(format!(
+                    "ambiguous MCP connection for '{server_key}': multiple credentials or \
+                     tenants are pooled for this URL"
+                )));
+            }
             let Some(client) = self.connection_pool.get(key) else {
                 return Err(McpError::ServerNotFound(server_key.to_string()));
             };
@@ -1810,6 +1830,7 @@ impl McpOrchestrator {
             return Ok(ConnectedServer {
                 server_key,
                 list_error: None,
+                pool_key,
             });
         }
         let opened = pooled.is_none();
@@ -1884,6 +1905,7 @@ impl McpOrchestrator {
         Ok(ConnectedServer {
             server_key,
             list_error,
+            pool_key,
         })
     }
 
@@ -2076,8 +2098,10 @@ pub struct McpRequestContext<'a> {
     pub tenant_ctx: TenantContext,
     pub approval_mode: ApprovalMode,
     pub forwarded_headers: HashMap<String, String>,
-    /// The pool key of the binding a call is made for (set by the session).
-    pub(crate) pool_key: Option<PoolKey>,
+    /// The pool key a call is made with: a server named by `server_url` is
+    /// called on the connection pooled under it (`ConnectedServer::pool_key`).
+    /// A session sets it from its binding; `None` calls a configured server.
+    pub pool_key: Option<PoolKey>,
     /// Dynamic tools added for this request only.
     dynamic_tools: DashMap<QualifiedToolName, ToolEntry>,
     /// Dynamic server clients for this request.
@@ -2951,10 +2975,11 @@ mod tests {
     }
 
     /// A dynamic server's tool call uses the connection pooled under its own
-    /// key: two callers of one address, each with its own token, each run
-    /// their tool; a call whose key the pool holds no more reads the server
-    /// as not found while its tool is still listed; a pooled connection that
-    /// drops starts no reconnection.
+    /// key, through a session and made directly with the key on the caller's
+    /// context; while its address is pooled under two keys it stays refused;
+    /// a call whose key the pool holds no more reads the server as not found
+    /// while its tool is still listed; a pooled connection that drops starts
+    /// no reconnection.
     #[tokio::test]
     async fn a_dynamic_call_uses_the_connection_its_own_caller_made() {
         use rmcp::{
@@ -2990,6 +3015,15 @@ mod tests {
         let mut tool = ToolEntry::from_server_tool(url, create_test_tool("whoami"));
         tool.annotations.read_only = true;
         orchestrator.tool_inventory().insert_entry(tool);
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "conf",
+                create_test_tool("whoami"),
+            ));
+        orchestrator
+            .register_alias("who", "conf", "whoami", None)
+            .unwrap();
 
         // One connection for each token; its server answers with the token.
         let mut servers = Vec::new();
@@ -3000,8 +3034,9 @@ mod tests {
             servers.push(server.unwrap());
             clients.push(client.unwrap());
         }
-        // A configured server held under the address as its name: a call made
-        // for a binding with a pool key still uses its own connection.
+        // A configured server held under the address as its name, and under a
+        // name of its own: a call made for a binding with a pool key still
+        // uses its own connection.
         let handler = Arc::new(SmgClientHandler::new(
             url,
             Arc::clone(&orchestrator.approval_manager),
@@ -3012,15 +3047,18 @@ mod tests {
             (*handler).clone().serve(client_io)
         );
         servers.push(server.unwrap());
-        orchestrator.static_servers.insert(
-            url.to_string(),
-            ServerEntry {
-                client: Arc::new(client.unwrap()),
-                handler,
-                config: sse_server(url, url),
-                list_error: None,
-            },
-        );
+        let configured = Arc::new(client.unwrap());
+        for name in [url, "conf"] {
+            orchestrator.static_servers.insert(
+                name.to_string(),
+                ServerEntry {
+                    client: Arc::clone(&configured),
+                    handler: Arc::clone(&handler),
+                    config: sse_server(name, url),
+                    list_error: None,
+                },
+            );
+        }
         // Pools the next connection as the one `token` made to `url`; the
         // binding holds that connection's key.
         let mut connect = |url: &str, token: &str| {
@@ -3063,23 +3101,61 @@ mod tests {
         };
 
         let one = connect(url, "one").await;
-        let two = connect(url, "two").await;
         let first = session(vec![one.clone()]);
+        assert_eq!(read(first.execute_tool(input()).await), "one");
+
+        // The address pooled under a second key: a call on it is refused.
+        let two = connect(url, "two").await;
+        assert_eq!(
+            first.execute_tool(input()).await.error_message,
+            Some(format!(
+                "Tool call failed: Server access denied: ambiguous MCP connection for '{url}': \
+                 multiple credentials or tenants are pooled for this URL"
+            ))
+        );
         // Two bindings of the label, of which only the second admits the
         // tool: the call uses the second's connection.
         let narrowed = McpServerBinding {
             allowed_tools: Some(vec!["other".to_string()]),
             ..one
         };
-        let second = session(vec![narrowed, two]);
-        assert_eq!(read(first.execute_tool(input()).await), "one");
-        assert_eq!(read(second.execute_tool(input()).await), "two");
+        let second = session(vec![narrowed, two.clone()]);
 
         // A third connection takes the first one's place in the pool of two.
         connect("http://other.example/mcp", "three").await;
         assert_eq!(
             first.execute_tool(input()).await.error_message,
             Some(format!("Tool call failed: Server not found: {url}"))
+        );
+        assert_eq!(read(second.execute_tool(input()).await), "two");
+        // The same call made directly: the key goes on the caller's context.
+        let mut ctx = orchestrator.create_request_context(
+            "request",
+            TenantContext::new("tenant"),
+            ApprovalMode::PolicyOnly,
+        );
+        ctx.pool_key = two.pool_key;
+        assert_eq!(
+            read(
+                orchestrator
+                    .execute_tool_resolved(input(), url, "tools", &ctx)
+                    .await
+            ),
+            "two"
+        );
+        // A key serves its own address alone: an alias whose target is
+        // another server is called there, without the key.
+        let who = ToolExecutionInput {
+            tool_name: "who".to_string(),
+            ..input()
+        };
+        assert_eq!(
+            read(
+                orchestrator
+                    .execute_tool_resolved(who, ALIAS_SERVER_KEY, "tools", &ctx)
+                    .await
+            ),
+            "configured"
         );
 
         // The second one's server goes away.

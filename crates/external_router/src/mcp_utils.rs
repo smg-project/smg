@@ -8,9 +8,7 @@ use std::{
 use axum::response::Response;
 use openai_protocol::responses::{McpAllowedTools, ResponseTool, ResponsesRequest};
 use serde_json::{json, Value};
-use smg_mcp::{
-    BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport, PoolKey,
-};
+use smg_mcp::{BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport};
 use tracing::{debug, warn};
 
 use crate::{
@@ -128,8 +126,6 @@ pub async fn connect_mcp_servers(
             };
 
             let server_key = McpOrchestrator::server_key(&server_config);
-            // The key the connect pools this server under (it connects with no tenant).
-            let pool_key = PoolKey::from_config(&server_config, None);
 
             match openai_bridge::connect_dynamic_server(
                 mcp_orchestrator,
@@ -150,7 +146,7 @@ pub async fn connect_mcp_servers(
                             server_key,
                             allowed_tools: input.allowed_tools.clone(),
                             list_error: connected.list_error,
-                            pool_key: Some(pool_key),
+                            pool_key: Some(connected.pool_key),
                         });
                     }
                 }
