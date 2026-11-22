@@ -610,7 +610,7 @@ What is not built in the engine that stays: a request that states a subset hint,
 protocols that not every worker of its list serves is refused, and the refusal names the input.
 A pair's encode items are always refused. Those inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
-names `places`, until the last change of that series lets a caller state them (5.8).
+names `places`, until the engine over worker lists honours them (5.8; Stage 1, change 4).
 
 ### 5.5 The decision **[built]**
 
