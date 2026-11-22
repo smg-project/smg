@@ -21,6 +21,7 @@ import time
 
 import httpx
 import pytest
+from infra.constants import effective_parser
 from infra.streams import collect_streamed_chat
 
 _MODEL = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
@@ -28,7 +29,15 @@ _MODEL = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
 # Short poll interval so the worker's first load report lands within seconds
 # of the class's start; the gateway default is 10 s.
 _LOAD_MONITOR_INTERVAL_SECS = 1
-_GATEWAY_ARGS = ["--load-monitor-interval", str(_LOAD_MONITOR_INTERVAL_SECS)]
+# The tool-call parser is named, as the chat suite's classes on this model
+# name it: the registry has no row for the FP8 repository, and what reads a
+# model that names no parser is the gateway's to change.
+_GATEWAY_ARGS = [
+    "--load-monitor-interval",
+    str(_LOAD_MONITOR_INTERVAL_SECS),
+    "--tool-call-parser",
+    "llama",
+]
 _REPORT_TIMEOUT_SECS = 8 * _LOAD_MONITOR_INTERVAL_SECS
 
 _ANSWER = "The capital of France is Paris."
@@ -184,15 +193,19 @@ class _SchedulerWireTurns:
         assert call.name == "add"
         assert json.loads(call.arguments) == {"a": 3, "b": 5}
 
-        # Under a named choice the legacy path constrains the engine to the
-        # function's parameters object (a json_schema in this wire's field of
-        # the request, which the mock does not enforce) and names the call
-        # itself: the scripted answer is that object. The legacy path reads
-        # this checkpoint because Symphony's registry has no table for the
-        # FP8 repository and the class names no --tool-call-parser; a table
-        # for it would constrain to the list holding the call instead (see
-        # test_function_call_specific).
-        mock_answers.enqueue(json.dumps(_ADD_CALL["parameters"]))
+        # Under a named choice the gateway constrains the engine to the call it
+        # names (in this wire's field of the request, which the mock does not
+        # enforce), and the scripted answer is what that constraint admits:
+        # Symphony's json table, which the class's --tool-call-parser names,
+        # gives the forced call its own structural tag, the list holding that
+        # one call, which the table reads; the legacy path constrains the
+        # engine to the function's parameters object and names the call itself
+        # (see test_function_call_specific).
+        mock_answers.enqueue(
+            json.dumps([_ADD_CALL])
+            if effective_parser() == "symphony"
+            else json.dumps(_ADD_CALL["parameters"])
+        )
         forced = client.chat.completions.create(
             model=model,
             messages=_TOOL_QUESTION,
