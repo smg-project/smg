@@ -1438,3 +1438,63 @@ async fn a_keyed_request_keeps_its_worker_through_the_router() -> Case {
     }
     Ok(())
 }
+
+/// A prompt sent again goes back to the worker it was sent to, where the
+/// engine of this process decides under the default policy. The route asks
+/// inside the request's lease and lends the engine the request's text: the
+/// engine walks and writes its record of sent prefixes with it, and an ask
+/// that lent no prompt would leave the forty requests to scatter.
+#[tokio::test]
+async fn a_repeated_prompt_keeps_its_worker_where_the_engine_of_this_process_places() -> Case {
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        workers.push(fixed_status_upstream(&[CHAT], StatusCode::OK).await);
+    }
+    let urls: Vec<&str> = workers.iter().map(|(url, _)| url.as_str()).collect();
+    let router = own_router("cache_aware", &urls)?;
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let prompt = "the same long prompt, ".repeat(16);
+    let request = Arc::new(serde_json::from_value(json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}]
+    }))?);
+    for _ in 0..40 {
+        let answer = router
+            .route_chat(None, &meta, Arc::clone(&request), MODEL)
+            .await;
+        assert_eq!(answer.status(), StatusCode::OK);
+    }
+    let mut hits: Vec<usize> = workers
+        .iter()
+        .map(|(_, hits)| hits.load(Ordering::SeqCst))
+        .collect();
+    hits.sort_unstable();
+    assert_eq!(hits, [0, 0, 40]);
+    Ok(())
+}
+
+/// A hinted request whose body is sent on unread goes back to the worker
+/// its hint was sent to under the default policy: the route lends the
+/// engine the hint's token ids as the prompt, as the buffered path lends
+/// the request's own.
+#[tokio::test]
+async fn a_hinted_stream_keeps_its_worker_where_the_engine_of_this_process_places() -> Case {
+    let hint: Vec<String> = (1..=64_u32).map(|id| id.to_string()).collect();
+    let hint = hint.join(",");
+    let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let router = own_router("cache_aware", &[&a, &b])?;
+    for _ in 0..16 {
+        let request = keyed(
+            streamed_request(&[GENERATE_BODY]),
+            "x-smg-routing-tokens",
+            &hint,
+        )?;
+        let (answer, _) = streamed(&router, request).await;
+        let response = answer.map_err(|_| "the router buffered a hinted request")?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let hits = [hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst)];
+    assert!(hits.contains(&16), "the hint's requests spread: {hits:?}");
+    Ok(())
+}
