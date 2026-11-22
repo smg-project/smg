@@ -24,7 +24,7 @@ use smg_worker::{
         basic::{merge_labels, worker_to_info, Worker, WorkerType},
         endpoint::Endpoint,
     },
-    jobs::WorkerJobAsker,
+    jobs::{queue::QueueJob, WorkerJobAsker},
     labels::has_control_character,
     registry::WorkerId,
     workflow::find_workers_by_url,
@@ -891,6 +891,21 @@ impl WorkerService {
                     Some(status),
                 )));
             }
+        }
+
+        // A registration that failed has released its id: the queue keeps
+        // its failed status under the id until its finished statuses age out.
+        if let Some(mut status) = job_queue
+            .get_status(worker_id.as_str())
+            .filter(|status| status.job_type == Job::REGISTRATION_TYPE)
+        {
+            // The address as the job's own lines write it.
+            status.worker_url = Endpoint::redacted_str(&status.worker_url);
+            return Ok(GetWorkerResponse(WorkerInfo::pending(
+                worker_id.as_str(),
+                status.worker_url.clone(),
+                Some(status),
+            )));
         }
 
         Err(WorkerServiceError::NotFound {

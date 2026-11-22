@@ -1,7 +1,11 @@
 //! Jobs the gateway runs through its control plane. The application context
 //! runs the workflows and handles their reservations and cancel marks.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use dashmap::DashSet;
@@ -544,6 +548,7 @@ impl JobHost for AppContext {
                 // or discovery registration of the same URL read none, so no
                 // other kind can consume a mark meant for the POST's job.
                 if take_mark(run.cancelled_before_start, run.own_id) {
+                    run.ended_by_delete.store(true, Ordering::Relaxed);
                     return Err("Registration cancelled before it started".to_string());
                 }
                 let engines = workflow_engines(context)?;
@@ -596,6 +601,9 @@ impl JobHost for AppContext {
                 let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
                 match outcome {
                     Err(failure) if create_only => {
+                        if state.status == WorkflowStatus::Cancelled {
+                            run.ended_by_delete.store(true, Ordering::Relaxed);
+                        }
                         // The registry says what this registration left in it
                         // (its workers still the entries under their URLs, by
                         // id and revision): a worker registered or replaced
@@ -1065,7 +1073,7 @@ pub(crate) fn recording_for_tests(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Weak;
+    use std::sync::{atomic::AtomicBool, Weak};
 
     use dashmap::DashMap;
     use openai_protocol::worker::JobStatus;
@@ -1098,6 +1106,7 @@ mod tests {
                 &JobRun {
                     cancelled_before_start,
                     own_id,
+                    ended_by_delete: &AtomicBool::new(false),
                 },
             )
             .await
@@ -1164,6 +1173,54 @@ mod tests {
         );
         assert!(context.worker_registry.get_url_by_id(&id).is_none());
         assert_eq!(queue.get_status(url).unwrap().status, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_registration_reads_failed_with_its_reason_at_its_id() {
+        use crate::admin::worker_service::WorkerService;
+
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let service = WorkerService::new(
+            Arc::clone(&context.worker_registry),
+            Arc::new(std::sync::OnceLock::from(Arc::clone(&queue))),
+            context.router_config.clone(),
+        );
+        let url = "http://user:pass@worker:8000";
+        let fail = || async {
+            let id = context.worker_registry.reserve_id_for_url(url);
+            let _ = queue
+                .submit_and_wait(
+                    Job::AddWorker {
+                        config: Box::new(WorkerSpec::new(url)),
+                        registration_mode: WorkerRegistrationMode::CreateOnly,
+                        asker: WorkerJobAsker::Api,
+                    },
+                    Duration::from_secs(5),
+                )
+                .await;
+            id
+        };
+
+        let id = fail().await;
+        let read = service
+            .get_worker(id.as_str())
+            .expect("the id of a failed registration answers while its status is kept")
+            .0;
+        let status = read.job_status.expect("its job status");
+        assert_eq!(status.status, "failed");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("Workflow engines not initialized")
+        );
+        // The view writes the address as the job's own lines write it.
+        assert_eq!(read.spec.url, Endpoint::redacted_str(url));
+        assert_eq!(status.worker_url, read.spec.url);
+
+        // A later failure of the same URL replaces the kept one.
+        let later = fail().await;
+        assert!(service.get_worker(later.as_str()).is_ok());
+        assert!(service.get_worker(id.as_str()).is_err());
     }
 
     #[tokio::test]

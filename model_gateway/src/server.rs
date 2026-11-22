@@ -946,7 +946,11 @@ async fn get_worker(
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(mut result) => {
-            if let Some(monitor) = state.context.worker_monitor.as_ref() {
+            // A pending view has no worker behind its id: a load under its
+            // address is another worker's.
+            let pending = Some(openai_protocol::worker::WorkerStatus::Pending);
+            let registered = result.0.status != pending;
+            if let Some(monitor) = state.context.worker_monitor.as_ref().filter(|_| registered) {
                 let snapshot = monitor.load_snapshot();
                 result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();
             }

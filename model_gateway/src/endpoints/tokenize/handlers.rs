@@ -411,9 +411,13 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
         .into_response();
     }
 
-    // Check job status (jobs are tracked by ID)
+    // Check job status (jobs are tracked by ID): a tokenizer job's alone,
+    // the queue keeps the statuses of other kinds of job under their keys.
     if let Some(job_queue) = context.worker_job_queue.get() {
-        if let Some(job_status) = job_queue.get_status(tokenizer_id) {
+        if let Some(job_status) = job_queue
+            .get_status(tokenizer_id)
+            .filter(|status| matches!(status.job_type.as_str(), "AddTokenizer" | "RemoveTokenizer"))
+        {
             return Json(AddTokenizerResponse {
                 id: tokenizer_id.to_string(),
                 status: job_status.status.clone(),
