@@ -788,6 +788,119 @@ fn a_lists_reports_are_converted_once_a_snapshot_by_the_decision_that_holds_it()
     assert_eq!(replaced.snapshot.strong_count(), 0);
 }
 
+/// A document that declares the two token counts a report offers by name,
+/// and reads no load report. Where `read`, a stage of its one profile reads
+/// both counts. Where not, no stage reads either.
+fn by_signals(read: bool) -> AppliedSpec {
+    let room = r#",{"has-room":{"used":{"signal.kv_tokens_used":1},
+                    "capacity":"signal.kv_tokens_capacity"}}"#;
+    let document = format!(
+        r#"{{"apiVersion":"smg.policy/v1",
+            "signals":{{"kv_tokens_capacity":{{"unit":"tokens"}},
+                       "kv_tokens_used":{{"unit":"tokens"}}}},
+            "profiles":{{"p":{{"filter":["healthy"{}],"pick":"random"}}}}}}"#,
+        if read { room } else { "" },
+    );
+    applied_of(serde_json::from_str(&document).expect("a well-formed document"))
+}
+
+/// A snapshot in which each worker of `used`, by position, uses that many
+/// of a thousand tokens, sampled now.
+fn counts(used: &[i32]) -> (Arc<LoadSnapshot>, Instant) {
+    let sampled_at = Instant::now();
+    let loads = used
+        .iter()
+        .enumerate()
+        .map(|(at, &used)| {
+            let mut report = one_rank_load(0, 0.1, 1_000.0);
+            report.sampled_at = Some(sampled_at);
+            for rank in &mut report.loads {
+                rank.num_used_tokens = used;
+                rank.max_total_num_tokens = 1_000;
+            }
+            (url(at), report)
+        })
+        .collect();
+    (LoadSnapshot::from_loads_for_test(loads), sampled_at)
+}
+
+/// Each row's capacity and what is used of it, as `cells` hold them for
+/// three rows under [`by_signals`]: the capacity's column stands first.
+fn counted(cells: &SignalCells) -> Vec<Option<(f64, f64)>> {
+    (0..3)
+        .map(|row| {
+            let row = cells.row(row).expect("a row of cells");
+            (!row[0].is_none()).then(|| (row[0].value, row[1].value))
+        })
+        .collect()
+}
+
+/// A conversion of a list's reports makes the list's signal cells under a
+/// document a stage of which reads a named signal: a cell a worker a
+/// signal, each value at its worker's place under its column, dated on the
+/// decision's clock. A decision is lent those cells under their snapshot.
+/// One that holds another snapshot and is not the one to convert is lent
+/// its own snapshot's, in the thread's buffer, which takes them back. One
+/// that holds no snapshot is lent none. Under a document that declares the
+/// signals and reads neither, a conversion makes no cell.
+#[test]
+fn a_conversion_makes_the_lists_signal_cells_under_a_document_that_reads_one() {
+    let spec = by_signals(true);
+    let clock = DecisionClock::new();
+    let workers = fleet(3);
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let begun = Instant::now();
+    let at = |millis: u64| begun + Duration::from_millis(millis);
+
+    // A decision that writes every record converts: the third worker has
+    // no report, and its cells hold no value.
+    let (first, sampled_at) = counts(&[100, 200]);
+    let live = Live::at(spec.engine(), &clock, at(5), Some(&first), None);
+    let _ = pool.write(&workers, &live, &mut Vec::new());
+    let converted = held(&pool).expect("the rows of the first snapshot");
+    assert!(converted.cells.fits(3) && converted.cells.signals() == 2);
+    let stated = [Some((1_000.0, 100.0)), Some((1_000.0, 200.0)), None];
+    assert_eq!(counted(&converted.cells), stated);
+    let dated = converted.cells.cells().iter().take(4);
+    assert!(dated
+        .map(|cell| cell.sampled_at_micros)
+        .eq([clock.micros(sampled_at); 4]));
+    let lent = pool.cells(&workers, &live).expect("held cells");
+    let own = ptr::eq(lent.cells().expect("cells"), &converted.cells);
+    assert!(own, "the cells the conversion left");
+
+    // A decision that began earlier and holds another snapshot leaves the
+    // list's rows in place, and reads its own snapshot's values. They
+    // stand in the thread's buffer, which has its room back afterwards.
+    let (second, _) = counts(&[700, 800, 900]);
+    let earlier = Live::at(spec.engine(), &clock, at(1), Some(&second), None);
+    let lent = pool.cells(&workers, &earlier).expect("held cells");
+    let all = [700.0, 800.0, 900.0].map(|used| Some((1_000.0, used)));
+    assert_eq!(counted(lent.cells().expect("cells")), all);
+    assert!(held(&pool).is_some_and(|rows| rows.is_of(&first)));
+    assert_eq!(CELLS.with(Cell::take).cells_mut().capacity(), 0);
+    drop(lent);
+    assert!(CELLS.with(Cell::take).cells_mut().capacity() >= 6);
+    // A later one that holds it converts, and is lent what it converted.
+    let later = Live::at(spec.engine(), &clock, at(9), Some(&second), None);
+    let lent = pool.cells(&workers, &later).expect("held cells");
+    assert_eq!(counted(lent.cells().expect("cells")), all);
+    assert!(held(&pool).is_some_and(|rows| rows.is_of(&second)));
+    assert_eq!(pool.conversions(), 2);
+    // Under no snapshot a decision is lent no cells.
+    let bare = Live::at(spec.engine(), &clock, at(10), None, None);
+    assert!(pool.cells(&workers, &bare).is_none());
+
+    // A document that declares the two signals and reads neither: the
+    // conversion makes no cell.
+    let unread = by_signals(false);
+    let pool = PoolRecords::new(&workers, &unread, &clock);
+    let live = Live::at(unread.engine(), &clock, at(5), Some(&first), None);
+    let _ = pool.write(&workers, &live, &mut Vec::new());
+    let converted = held(&pool).expect("the rows of the first snapshot");
+    assert!(converted.cells.cells().is_empty(), "no cell is made");
+}
+
 #[test]
 fn a_decision_that_holds_another_snapshot_reads_its_own_reports() {
     let spec = applied("least_load");

@@ -27,7 +27,11 @@
 //!   ([`Reported`]). Draws, which write a few records each, convert the
 //!   list's reports once they looked up as many under the snapshot as the
 //!   list holds ([`LookUps`]). A decision that holds another snapshot
-//!   never reads the rows: it reads its own snapshot's reports.
+//!   never reads the rows: it reads its own snapshot's reports. Under a
+//!   document one of whose stages reads a named signal, the same
+//!   conversion makes the list's signal cells from the same reports, and
+//!   a decision whose profile reads one is lent them
+//!   ([`PoolRecords::cells`]).
 //! - **Once a decision.** What a worker object says is read where the
 //!   gateway keeps it, at the decision's instant ([`Live`]): ready,
 //!   breaker, overload, stall, requests in flight. So is the age of the
@@ -59,7 +63,7 @@ pub(crate) mod with_shadow;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
-    ptr,
+    mem, ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
@@ -70,7 +74,11 @@ use std::{
 use arc_swap::{ArcSwapOption, Guard};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, worker::WorkerStatus};
+use smg_worker::{
+    identity::basic::Worker,
+    load::state::LoadSnapshot,
+    worker::{WorkerLoadResponse, WorkerStatus},
+};
 
 use super::{
     decision::Decision,
@@ -81,7 +89,10 @@ use super::{
         RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
     },
 };
-use crate::{document::spec::AppliedSpec, load::load_row};
+use crate::{
+    document::spec::AppliedSpec,
+    load::{load_row, signal_values, SignalCells, SignalColumn},
+};
 
 /// A worker's id in the engine's own state (a load stage's credit of
 /// dispatches, a hash ring, session pins, a stage's bookings): the
@@ -363,6 +374,11 @@ struct Reported {
     rows: Box<[Candidate]>,
     /// Whether every worker carries a report ([`PoolFacts::reported`]).
     all: bool,
+    /// The list's signal cells as the snapshot's reports state them
+    /// ([`PoolRecords::write_cells`]): one cell a worker a signal the
+    /// document declares, by position. Empty under a document none of
+    /// whose stages reads a signal.
+    cells: SignalCells,
 }
 
 impl Reported {
@@ -421,6 +437,11 @@ pub struct PoolRecords {
     /// The generation of the document the records were read under: its
     /// lists name the engine kinds and the labels.
     generation: u64,
+    /// The signals that document declares, in column order, where a stage
+    /// of it reads one: what the list's signal cells are made under
+    /// ([`Self::write_cells`]). None under a document none of whose stages
+    /// reads a signal, and a conversion then makes no cells.
+    signals: Arc<[SignalColumn]>,
     /// The list's rows with the reports of one load snapshot written
     /// ([`Reported`]), and none before a decision converted the list's
     /// reports ([`Self::convert`]).
@@ -559,6 +580,11 @@ impl PoolRecords {
             engine_ends,
             number: number as u32,
             generation: spec.generation(),
+            signals: if spec.needs().signal_cells {
+                spec.shared_signal_columns()
+            } else {
+                Arc::default()
+            },
             reported: ArcSwapOption::empty(),
             converting: Mutex::new(LookUps::default()),
             conversions: AtomicU64::new(0),
@@ -853,11 +879,18 @@ impl PoolRecords {
                 row
             })
             .collect();
+        // The list's signal cells stand with its rows: one conversion a
+        // snapshot makes both, under a document a stage of which reads one.
+        let mut cells = SignalCells::default();
+        if !self.signals.is_empty() {
+            self.write_cells(workers, loads, live.clock, &mut cells);
+        }
         let converted = Arc::new(Reported {
             snapshot: Arc::downgrade(loads),
             since_micros: live.now_micros,
             rows,
             all,
+            cells,
         });
         self.reported.store(Some(Arc::clone(&converted)));
         self.conversions.fetch_add(1, Ordering::Relaxed);
@@ -886,6 +919,149 @@ impl PoolRecords {
         Singly::new(self, workers, live).write(fixed, &mut row);
         Some(row)
     }
+
+    /// Writes into `cells` the list's signal cells as the reports of
+    /// `loads` state them: one cell a worker a signal the document
+    /// declares, by the worker's place in the list, each sample instant on
+    /// `clock`. A report's values are made by the crate's one conversion
+    /// ([`signal_values`]) and written where a decision may read them
+    /// ([`SignalCells::write`]): under the signal's own unit, and in
+    /// range. A worker the snapshot holds no report of, and a name its
+    /// report does not state, keep a cell with no value. So does a worker
+    /// whose report is of several ranks ([`several_ranks`]).
+    ///
+    /// The cells are what this snapshot's reports state and nothing more:
+    /// no value of an earlier snapshot is kept.
+    fn write_cells(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        loads: &LoadSnapshot,
+        clock: &DecisionClock,
+        cells: &mut SignalCells,
+    ) {
+        cells.blank(self.fixed.len(), self.signals.len());
+        for (fixed, worker) in self.fixed.iter().zip(workers) {
+            let Some((report, sampled_at)) = loads.report(worker.url()) else {
+                continue;
+            };
+            if several_ranks(report) {
+                continue;
+            }
+            signal_values(
+                report,
+                &self.signals,
+                sampled_at,
+                |column, unit, value, at| {
+                    cells.write(fixed.position, column, unit, value, clock.micros(at));
+                },
+            );
+        }
+    }
+
+    /// The list's signal cells for one decision, held for it: the cells of
+    /// the decision's snapshot ([`Self::write_cells`]), and `None` under no
+    /// snapshot, where every worker reads no value.
+    ///
+    /// For a decision whose profile reads a signal, under a document a
+    /// stage of which does. The cells are the list's own where the list
+    /// holds the rows of the decision's snapshot. Where it does not, this
+    /// decision converts the list's reports, as one that writes every
+    /// record does ([`Self::write`]), and the decisions behind it read
+    /// what it left. A decision that is not the one to convert (another
+    /// holds the list's claim, or this one began no later than the
+    /// decision that converted the list's rows) writes the cells of its
+    /// own snapshot into the calling thread's buffer and waits for
+    /// nothing.
+    pub(crate) fn cells(&self, workers: &[Arc<dyn Worker>], live: &Live<'_>) -> Option<HeldCells> {
+        let loads = live.loads?;
+        let held = self.reported.load();
+        if held
+            .as_deref()
+            .is_some_and(|reported| reported.is_of(loads))
+        {
+            return Some(HeldCells(Cells::Listed(held)));
+        }
+        // It reads every report: it pays the list's length.
+        let paid = self.fixed.len() as u32;
+        if let Some(converted) = self.convert(workers, loads, live, &held, paid) {
+            return Some(HeldCells(Cells::Converted(converted)));
+        }
+        let mut own = CELLS.with(Cell::take);
+        self.write_cells(workers, loads, live.clock, &mut own);
+        Some(HeldCells(Cells::Own(own)))
+    }
+}
+
+/// Whether `report` is of several ranks: it lists more than one, or it
+/// counts more than the one it lists. A reader of a snapshot cannot take
+/// such a report for one sample: it states one sample instant, and its
+/// ranks' entries may be of several. A pushed record replaces its own
+/// rank's entry and dates the whole report, so a rank that stopped
+/// reporting keeps its last values under the newest record's instant, and
+/// a maximum age would never end them. A polled answer carries the
+/// entries of the ranks that pushed while it was asked, under one instant
+/// too. A snapshot states no instant a rank.
+///
+/// The list's cells take no named value of such a report
+/// ([`PoolRecords::write_cells`]). A value is read where its report is one
+/// rank's, as the report of a worker object that is one rank is, however
+/// it arrived.
+fn several_ranks(report: &WorkerLoadResponse) -> bool {
+    report.loads.len() > 1 || report.dp_rank_count > 1
+}
+
+/// A list's signal cells as one decision holds them
+/// ([`PoolRecords::cells`]): from where it is lent them to the end of what
+/// reads its request's facts. The cells stand as long as this value does,
+/// whatever becomes of the list's rows meanwhile.
+#[derive(Debug)]
+pub(crate) struct HeldCells(Cells);
+
+/// Where the cells a decision holds stand.
+#[derive(Debug)]
+enum Cells {
+    /// In the list's rows of the decision's snapshot, as the decision read
+    /// the slot: held through the calling thread's own protection.
+    Listed(Held),
+    /// In the rows this decision converted.
+    Converted(Arc<Reported>),
+    /// The decision's own, in the calling thread's buffer, which takes it
+    /// back at this value's end.
+    Own(SignalCells),
+}
+
+impl HeldCells {
+    /// The cells held: one cell a worker a signal the document declares,
+    /// by the worker's place in the list.
+    pub(crate) fn cells(&self) -> Option<&SignalCells> {
+        match &self.0 {
+            Cells::Listed(held) => held.as_deref().map(|reported| &reported.cells),
+            Cells::Converted(converted) => Some(&converted.cells),
+            Cells::Own(own) => Some(own),
+        }
+    }
+}
+
+impl Drop for HeldCells {
+    fn drop(&mut self) {
+        if let Cells::Own(own) = &mut self.0 {
+            // The thread's buffer keeps its room for the next decision
+            // that writes its own cells. A thread that is ending has none
+            // to give it back to.
+            let _ = CELLS.try_with(|cells| cells.set(mem::take(own)));
+        }
+    }
+}
+
+thread_local! {
+    /// The calling thread's own signal cells, for a decision that reads a
+    /// signal and is not the one to convert its list's reports
+    /// ([`PoolRecords::cells`]). The decision takes them for its time and
+    /// gives them back ([`HeldCells`]), so they keep their room after a
+    /// thread's first such decision of a list's size. A decision a stage
+    /// asked for from inside its own, on this thread, finds none and makes
+    /// its own.
+    static CELLS: Cell<SignalCells> = Cell::new(SignalCells::default());
 }
 
 /// What a list's draws paid toward the conversion of its reports under one

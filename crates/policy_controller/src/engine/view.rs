@@ -1146,7 +1146,10 @@ pub struct RequestFacts<'a> {
     /// The signal cells beside the rows of this decision, by the row's
     /// position: handed by a host for a profile whose stages read a signal
     /// ([`Needs::signal_cells`](crate::document::Needs::signal_cells)), and for no
-    /// other. `None` reads as no value for every row. A pair decision takes
+    /// other. The engine over worker lists takes none from its host: it
+    /// makes a list's cells from the load snapshot its decision holds, and
+    /// cells a caller put here are not read by a single request's decision.
+    /// `None` reads as no value for every row. A pair decision takes
     /// each side's cells from its pool ([`PairPools`](crate::engine::PairPools)),
     /// and an encode pair its encoders' from theirs: cells here are not
     /// read there. One word for every signal the document declares: a

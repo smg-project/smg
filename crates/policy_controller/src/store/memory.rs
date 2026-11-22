@@ -29,7 +29,7 @@ use crate::{
         prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
         view::{LoadRow, Role, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
-    load::signals::{SignalCell, SignalColumn},
+    load::signals::{in_range, SignalCell, SignalColumn},
     stages::lifecycle::Lifecycle,
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
@@ -43,7 +43,7 @@ use crate::{
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionTables, SessionsStore},
-        signals::{SignalSink, SignalWriteOutcome, Writes, VALUE_MAGNITUDE_LIMIT},
+        signals::{SignalSink, SignalWriteOutcome, Writes},
         snapshot::{
             left_models, micros, same_cache, same_offer, Classes, EncodePairBuffers, OnFile,
             OutsideLists, PairBuffers, StaleGeneration, StoreSnapshot, ViewBuffers, ViewFacts,
@@ -3266,7 +3266,7 @@ impl MemoryStore {
             Ok(column) => column,
             Err(taken) => return taken,
         };
-        if !value.is_finite() || value.abs() > VALUE_MAGNITUDE_LIMIT {
+        if !in_range(value) {
             return SignalWriteOutcome::OutOfRange;
         }
         let mut loads = self.loads.lock();

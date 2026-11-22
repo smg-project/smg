@@ -28,6 +28,7 @@ use crate::{
         decision_engine::{DecisionEngine, Request, RequestMaker, SweepOutcome, WorkerLists},
         policy_engine::{PolicyEngine, PoolMembers},
         view::{Constraints, Identity, RequestFacts, WorkerId},
+        PlaceRequest,
     },
     store::GatewayId,
     tracking::{
@@ -258,8 +259,9 @@ async fn a_requests_own_snapshot_is_read_ahead_of_the_engines() {
     task.abort();
 }
 
-/// An engine whose document reads no load report keeps no channel and no
-/// snapshot: its draws look no report up, so its list never converts one.
+/// An engine whose document reads no load report and no named signal keeps
+/// no channel and no snapshot: its draws look no report up, so its list
+/// never converts one.
 #[tokio::test(start_paused = true)]
 async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
     let engine = preset("random");
@@ -273,6 +275,95 @@ async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
         let _ = picked(&engine, &asks(seed, &members, None));
     }
     assert_eq!(members.conversions(), 0, "no report was looked up");
+    task.abort();
+}
+
+/// The engine of a document that reads two named signals and no load
+/// report: its one rule keeps the workers whose report says they have
+/// room.
+fn by_signals_alone() -> Arc<PolicyEngine> {
+    let document: PolicySpec = serde_json::from_str(
+        r#"{"apiVersion":"smg.policy/v1","generation":1,
+            "signals":{"kv_tokens_capacity":{"unit":"tokens"},
+                       "kv_tokens_used":{"unit":"tokens"}},
+            "profiles":{"p":{"filter":["healthy",{"has-room":{
+                "used":{"signal.kv_tokens_used":1},
+                "capacity":"signal.kv_tokens_capacity"}}],"pick":"random"}}}"#,
+    )
+    .expect("a well-formed document");
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let needs = spec.needs();
+    assert!(needs.signal_cells && !needs.loads, "signals and no report");
+    Arc::new(PolicyEngine::new(spec))
+}
+
+/// One report a worker, each stating the two token counts a report offers
+/// by name: the worker at `roomy` has room, every other is full.
+fn rooms(workers: usize, roomy: usize) -> HashMap<String, WorkerLoadResponse> {
+    (0..workers)
+        .map(|at| {
+            let mut report = one_rank_load(0, 0.1, 1_000.0);
+            for rank in &mut report.loads {
+                rank.num_used_tokens = if at == roomy { 100 } else { 2_000 };
+                rank.max_total_num_tokens = 1_000;
+            }
+            (url(at), report)
+        })
+        .collect()
+}
+
+/// An engine whose document reads a named signal and no load report keeps
+/// its host's channel: a signal's values stand in the same reports. A
+/// decision whose request gives no snapshot reads them in the newest the
+/// task keeps, and one whose request gives a snapshot reads them there.
+#[tokio::test(start_paused = true)]
+async fn an_engine_whose_document_reads_a_signal_keeps_the_channel() {
+    let engine = by_signals_alone();
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let (feed, channel) = monitor(&rooms(4, 2));
+    engine.set_loads(channel);
+    let task = running(&engine).await;
+    assert!(engine.loads.newest().is_some(), "the channel is kept");
+    for seed in 0..32 {
+        let place = picked(&engine, &asks(seed, &members, None));
+        assert_eq!(place, 2, "seed {seed}: the one worker with room");
+    }
+    feed.publish(&rooms(4, 0));
+    settle().await;
+    let given = LoadSnapshot::from_loads_for_test(rooms(4, 1).into_iter().collect());
+    for seed in 0..32 {
+        let kept = picked(&engine, &asks(seed, &members, None));
+        assert_eq!(kept, 0, "seed {seed}: the one with room published last");
+        let own = picked(&engine, &asks(seed, &members, Some(Arc::clone(&given))));
+        assert_eq!(own, 1, "seed {seed}: the request's snapshot");
+    }
+    task.abort();
+}
+
+/// A request placed with the engine's one call lends no snapshot and no
+/// cells ([`PolicyEngine::place`]). Its decision reads the named values in
+/// the newest snapshot the task keeps: the one worker whose report says it
+/// has room takes every request, and the next publication moves them.
+#[tokio::test(start_paused = true)]
+async fn a_request_placed_with_one_call_reads_the_signals_the_task_keeps() {
+    let engine: &'static Arc<PolicyEngine> = Box::leak(Box::new(by_signals_alone()));
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let (feed, channel) = monitor(&rooms(4, 2));
+    engine.set_loads(channel);
+    let task = running(engine).await;
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    for turn in 0..32 {
+        let placement = engine.place(&request).expect("a placement");
+        assert!(Arc::ptr_eq(&placement.worker, &list[2]), "turn {turn}");
+    }
+    feed.publish(&rooms(4, 0));
+    settle().await;
+    for turn in 0..32 {
+        let placement = engine.place(&request).expect("a placement");
+        assert!(Arc::ptr_eq(&placement.worker, &list[0]), "turn {turn}");
+    }
     task.abort();
 }
 
