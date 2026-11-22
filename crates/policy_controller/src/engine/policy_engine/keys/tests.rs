@@ -10,7 +10,9 @@ use std::{
 use smg_worker::{identity::basic::Worker, test_support::ready_worker, worker::WorkerStatus};
 
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::spec::{
+        AppliedSpec, Assignment, KeySourceSpec, PolicySpec, Recovery, RoutingKeySpec, SessionsSpec,
+    },
     engine::{
         decision::{Decision, MAX_TARGETS},
         decision_engine::{DecisionEngine, RequestMaker, WorkerLists},
@@ -18,7 +20,7 @@ use crate::{
         records::{self, Live},
         sticky_sessions::SessionVerdict,
         store_backed_engine::{DecideOutcome, Request},
-        view::{Constraints, Identity, RequestFacts, WorkerId},
+        view::{fingerprint, Constraints, Identity, RequestFacts, WorkerId},
     },
     store::GatewayId,
     tracking::{
@@ -285,4 +287,113 @@ fn the_engines_pass_drops_the_session_keys_past_their_end() {
     assert_eq!(sessions.len(), 1, "inside the idle time");
     engine.sweep(now + Duration::from_secs(14_500));
     assert_eq!(sessions.len(), 0, "past its end");
+}
+
+/// The engine of the document the routing settings mean for round robin
+/// under the sticky override: the policy's own stages, and on its binding
+/// the session rule of two requests of a key a worker, with the key's
+/// sources under `routing_key` and the key's header in the view.
+fn sticky_override() -> PolicyEngine {
+    const HEADER: &str = "x-smg-routing-key";
+    let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+    document.generation = 1;
+    document.view.headers = vec![HEADER.to_owned()];
+    let binding = document.bindings.first_mut().expect("the preset's binding");
+    binding.routing_key = Some(RoutingKeySpec {
+        sources: vec![
+            KeySourceSpec {
+                header: Some(HEADER.to_owned()),
+                ..KeySourceSpec::default()
+            },
+            KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            },
+        ],
+        strip_lineage: true,
+    });
+    binding.sessions = Some(SessionsSpec {
+        sticky_header: String::new(),
+        headers: Vec::new(),
+        ttl_s: 14_400,
+        sweep_s: 60,
+        assignment: Assignment::Delegate,
+        inflight_cap: 2,
+        issue_session_id: false,
+        recovery: Recovery::Latest,
+    });
+    PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+}
+
+/// A request of the session key `key` as its host states it, over
+/// `members`.
+fn session<'a>(key: Identity<'a>, members: &'a PoolMembers) -> Asks<'a> {
+    Asks {
+        request: Request {
+            id: b"request",
+            facts: RequestFacts {
+                model: MODEL,
+                seed: 7,
+                session_key: key,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        },
+        members,
+    }
+}
+
+/// Under the sticky override's rule a worker carries two requests of one
+/// key, and the count is the worker object's own: what the load guard of
+/// each dispatch writes under the key's text. The engine reads it there for
+/// a request whose key comes with its text. One request of the key leaves
+/// the pin standing. At two, the stages place the next request on another
+/// worker, and its commit would front that worker. Another key's requests
+/// on the worker count for nothing. A key that comes as its fingerprint
+/// alone has no text to read a count by, and keeps its pin at any count:
+/// the document lists the key's header in its view so that it has one.
+#[test]
+fn a_capped_rule_reads_a_keys_requests_on_the_worker_object() {
+    let engine = sticky_override();
+    assert!(engine.spec().engine().needs().session_in_flight);
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let now = Instant::now();
+    let asks = session(Identity::plain("conv"), &members);
+    let mut first =
+        DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now).expect("a decision");
+    let pinned = first.take(0).expect("the first target");
+    first.dispatched(now);
+    first.completed(&served(pinned.id), now);
+    drop(first);
+    let worker = &list[pinned.position as usize];
+    let follows = |asks: &Asks<'_>| {
+        let followed = decided(&engine, asks).decision;
+        let verdict = followed.pick().expect("a pick").session_verdict;
+        (targets(&followed), verdict)
+    };
+    let on_its_pin = (vec![(pinned.position, pinned.id)], SessionVerdict::Pinned);
+
+    for _ in 0..3 {
+        worker.increment_routing_key_load("another");
+    }
+    worker.increment_routing_key_load("conv");
+    assert_eq!(follows(&asks), on_its_pin, "one request of the key");
+
+    worker.increment_routing_key_load("conv");
+    let (moved, verdict) = follows(&asks);
+    assert_eq!(verdict, SessionVerdict::Respill);
+    assert!(
+        moved.iter().all(|(_, id)| *id != pinned.id),
+        "two requests of the key: {moved:?}"
+    );
+
+    // The same key with no text: no count is read for it.
+    let hashed = Identity::hashed(fingerprint(b"conv"));
+    assert_eq!(follows(&session(hashed, &members)), on_its_pin);
+
+    // The key's requests answered, it is its pin's again.
+    worker.decrement_routing_key_load("conv");
+    worker.decrement_routing_key_load("conv");
+    assert_eq!(follows(&asks), on_its_pin);
 }

@@ -98,12 +98,9 @@ impl RouterConfig {
         };
         let RoutingKeyOverrideConfig {
             enabled,
-            // The sticky sessions' own times and assignment: no document
-            // says them, and the override is refused wherever it would place
-            // a request by that rule.
-            eviction_interval_secs: _,
-            max_idle_secs: _,
-            assignment_mode: _,
+            eviction_interval_secs,
+            max_idle_secs,
+            assignment_mode,
             headers,
         } = &self.routing_key_override;
         RoutingSettings {
@@ -129,12 +126,26 @@ impl RouterConfig {
             routing_key_override: RoutingKeyOverrideSettings {
                 enabled: *enabled,
                 headers: headers.clone(),
+                eviction_interval_secs: *eviction_interval_secs,
+                max_idle_secs: *max_idle_secs,
+                assignment_mode: assignment(*assignment_mode),
             },
             worker_overload_protection: self.worker_overload_protection,
             worker_overload_waiting_requests: self.worker_overload_waiting_requests,
             worker_overload_token_usage: self.worker_overload_token_usage,
             worker_overload_shed: self.worker_overload_shed,
         }
+    }
+}
+
+/// How a key seen for the first time picks its worker, in the policy
+/// crate's form: the manual policy's setting and the sticky override's.
+fn assignment(mode: ManualAssignmentMode) -> Assignment {
+    match mode {
+        ManualAssignmentMode::Random => Assignment::Random,
+        ManualAssignmentMode::MinLoad => Assignment::MinLoad,
+        ManualAssignmentMode::MinGroup => Assignment::MinGroup,
+        ManualAssignmentMode::Delegate => Assignment::Delegate,
     }
 }
 
@@ -223,12 +234,7 @@ fn policy_settings(policy: &PolicyConfig) -> PolicySettings {
         } => PolicySettings::Manual {
             eviction_interval_secs,
             max_idle_secs,
-            assignment_mode: match assignment_mode {
-                ManualAssignmentMode::Random => Assignment::Random,
-                ManualAssignmentMode::MinLoad => Assignment::MinLoad,
-                ManualAssignmentMode::MinGroup => Assignment::MinGroup,
-                ManualAssignmentMode::Delegate => Assignment::Delegate,
-            },
+            assignment_mode: assignment(assignment_mode),
         },
         PolicyConfig::PrefixHash {
             prefix_token_count,
@@ -400,6 +406,9 @@ mod tests {
         };
         config.routing_key_override.enabled = true;
         config.routing_key_override.headers = vec!["x-session".to_owned()];
+        config.routing_key_override.eviction_interval_secs = 15;
+        config.routing_key_override.max_idle_secs = 17;
+        config.routing_key_override.assignment_mode = ManualAssignmentMode::MinGroup;
         assert_eq!(
             config.routing_settings(),
             RoutingSettings {
@@ -418,6 +427,9 @@ mod tests {
                 routing_key_override: RoutingKeyOverrideSettings {
                     enabled: true,
                     headers: vec!["x-session".to_owned()],
+                    eviction_interval_secs: 15,
+                    max_idle_secs: 17,
+                    assignment_mode: Assignment::MinGroup,
                 },
                 worker_overload_protection: false,
                 worker_overload_waiting_requests: Some(13),
@@ -467,6 +479,9 @@ mod tests {
                 routing_key_override: RoutingKeyOverrideSettings {
                     enabled: false,
                     headers: vec!["x-smg-routing-key".to_owned()],
+                    eviction_interval_secs: 60,
+                    max_idle_secs: 14_400,
+                    assignment_mode: Assignment::Delegate,
                 },
                 worker_overload_protection: true,
                 worker_overload_waiting_requests: Some(8),

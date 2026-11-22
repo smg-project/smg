@@ -26,9 +26,13 @@ profiles:
 bindings:
   - match: { model: "*" }
     profile: least_load
+    routing_key:
+      sources:
+        - header: x-session-id
+        - header: x-smg-routing-key
+        - rid: true
+      strip_lineage: true
     sessions:
-      sticky_header: x-session-id
-      headers: [x-session-id, x-smg-routing-key]
       ttl_s: 600
       sweep_s: 120
       assignment: min_load

@@ -2455,6 +2455,8 @@ pub(crate) use ride::{BehindAnswer, Sent};
 #[cfg(test)]
 mod decode_again_tests;
 #[cfg(test)]
+mod override_key_tests;
+#[cfg(test)]
 mod own_tests;
 #[cfg(test)]
 pub(crate) mod testing;

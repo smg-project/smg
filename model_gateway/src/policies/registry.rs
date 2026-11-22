@@ -296,9 +296,21 @@ pub struct PolicyRegistry {
     /// every policy as the classic one.
     policy_engine: Option<AskedEngine>,
 
+    /// Whether the routing-key override is on: the setting, read once at the
+    /// build. The key helpers answer by it ([`Self::derive_rid_key`],
+    /// [`Self::sticky_header_key`]), whoever places the override's keyed
+    /// requests: the sticky selector below, or the policy engine where the
+    /// routers ask it for every request.
+    routing_key_override: bool,
+
     /// Shared sticky selector for the routing-key override. `Some` when the
-    /// override is enabled; consulted (instead of the configured policy) for keyed
-    /// requests via [`PolicyRegistry::select_worker_for_model`].
+    /// override is enabled and the classic placement pass places the
+    /// requests; consulted (instead of the configured policy) for keyed
+    /// requests via [`PolicyRegistry::select_worker_for_model`]. `None` too
+    /// where the routers ask the policy engine for every request
+    /// ([`Self::with_policy_engine`]): the engine's session table keeps the
+    /// override's keys there and its pass drops the idle ones, so neither
+    /// the selector's map nor its eviction task is made.
     routing_key_sticky: Option<Arc<ManualPolicy>>,
 
     /// Ordered routing-key header names, parsed once from
@@ -394,7 +406,11 @@ impl PolicyRegistry {
             EVERY_MODEL,
             Phase::Single,
         );
-        let routing_key_sticky = routing_key_override.enabled.then(|| {
+        // Where the routers ask the engine for every request no placement
+        // pass reads the override's selector.
+        let decided_by_engine = policy_engine.as_ref().is_some_and(|asked| asked.whole);
+        let placed_by_selector = routing_key_override.enabled && !decided_by_engine;
+        let routing_key_sticky = placed_by_selector.then(|| {
             Arc::new(ManualPolicy::with_config(ManualConfig {
                 eviction_interval_secs: routing_key_override.eviction_interval_secs,
                 max_idle_secs: routing_key_override.max_idle_secs,
@@ -430,6 +446,7 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             policy_engine,
+            routing_key_override: routing_key_override.enabled,
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
@@ -515,7 +532,9 @@ impl PolicyRegistry {
     /// or the key exceeds the routing-key byte cap; a rid that is nothing but
     /// suffix keys as itself.
     pub fn derive_rid_key<'a>(&self, rid: Option<&'a str>) -> Option<&'a str> {
-        self.routing_key_sticky.as_ref()?;
+        if !self.routing_key_override {
+            return None;
+        }
         let rid = rid?;
         let stripped = strip_lineage_suffixes(rid);
         let key = if stripped.is_empty() { rid } else { stripped };
@@ -553,7 +572,7 @@ impl PolicyRegistry {
     /// counts under it, so selection and accounting agree by construction.
     pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
         let raw = self.resolve_routing_key(headers)?;
-        Some(if self.routing_key_sticky.is_some() {
+        Some(if self.routing_key_override {
             Self::strip_header_key(raw)
         } else {
             raw
@@ -573,6 +592,13 @@ impl PolicyRegistry {
     /// body's `rid`, requiring automatic body-path selection to keep the body
     /// readable.
     pub(crate) fn routing_key_override_enabled(&self) -> bool {
+        self.routing_key_override
+    }
+
+    /// Whether the registry holds the override's sticky selector: the map of
+    /// pins the classic placement pass places a keyed request by.
+    #[cfg(test)]
+    pub(crate) fn holds_sticky_selector(&self) -> bool {
         self.routing_key_sticky.is_some()
     }
 
@@ -1381,7 +1407,7 @@ impl PolicyRegistry {
             return false;
         }
         let keyed_override =
-            self.routing_key_sticky.is_some() && self.resolve_routing_key(headers).is_some();
+            self.routing_key_override && self.resolve_routing_key(headers).is_some();
         TextNeeds(self.text_needs.load(Ordering::Acquire)).answer(with_tokens, keyed_override)
     }
 
@@ -2062,6 +2088,66 @@ mod tests {
         let a = reg.select_worker(&policy, &workers, &info).unwrap();
         let b = reg.select_worker(&policy, &workers, &info).unwrap();
         assert_ne!(a, b);
+    }
+
+    /// Where the routers ask the policy engine for every request, the engine
+    /// places the override's keyed requests: the registry builds no sticky
+    /// selector, so no map of pins stands behind the engine's and no task
+    /// evicts one. The key helpers answer by the setting all the same: the
+    /// load guard counts a dispatch under the key they hand, which the
+    /// engine's sessions rule reads. Where the routers keep their classic
+    /// pass the selector is built as ever, and with the override off the
+    /// helpers hand no key under either.
+    #[tokio::test]
+    async fn the_override_builds_no_sticky_selector_where_the_engine_decides_whole() {
+        use smg_policy_controller::document::AppliedSpec;
+
+        use crate::config::RouterConfig;
+
+        let asking = |enabled: bool, whole: bool| {
+            let overridden = RoutingKeyOverrideConfig {
+                enabled,
+                ..RoutingKeyOverrideConfig::default()
+            };
+            let config = RouterConfig {
+                policy_controller: true,
+                policy: PolicyConfig::RoundRobin,
+                routing_key_override: overridden.clone(),
+                ..RouterConfig::default()
+            };
+            let document = config.policy_document().expect("the settings' document");
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            PolicyRegistry::with_policy_engine(
+                PolicyConfig::RoundRobin,
+                overridden,
+                Arc::new(PolicyEngine::new(spec)),
+                DocumentOrigin::Settings,
+                whole,
+            )
+        };
+        let headers = headers_with_routing_key("session-A_t2");
+        for (enabled, whole, selector) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let reg = asking(enabled, whole);
+            let said = format!("override {enabled}, whole {whole}");
+            assert_eq!(reg.holds_sticky_selector(), selector, "{said}");
+            assert_eq!(reg.routing_key_override_enabled(), enabled, "{said}");
+            assert_eq!(
+                reg.derive_rid_key(Some("conv_t2_r1")),
+                enabled.then_some("conv"),
+                "{said}"
+            );
+            let by_header = if enabled { "session-A" } else { "session-A_t2" };
+            assert_eq!(
+                reg.sticky_key(Some(&headers), None),
+                Some(by_header),
+                "{said}"
+            );
+        }
     }
 
     fn override_with_headers(names: &[&str]) -> RoutingKeyOverrideConfig {

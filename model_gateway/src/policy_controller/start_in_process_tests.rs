@@ -855,3 +855,108 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
     );
     Ok(())
 }
+
+/// Sticky sessions beside a policy that reads no key itself are the session
+/// rule of that policy's binding, under each assignment of a key's first
+/// request. The rule's cap compares a key's own requests on a worker,
+/// which the load guard of each dispatch counts on the worker object: this
+/// process feeds it, so the engine decides the document whole and no
+/// classic policy places a request of it. Beside a policy that places by a
+/// hash ring the routers keep their classic pass, as without the override.
+///
+/// Three starts still stop by the setting's name, each in its own
+/// sentence: the prefix ring, which has no document beside the rule; a
+/// gateway of many routers, which serves pairs beside the single requests
+/// the rule places; and a pair gateway.
+#[test]
+fn sticky_sessions_are_decided_whole_beside_a_policy_that_reads_no_key() -> Case {
+    const OVERRIDE: &str = "routing_key_override.enabled = true";
+    let sticky = |policy: PolicyConfig, assignment_mode| RouterConfig {
+        policy_controller: true,
+        policy,
+        routing_key_override: RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode,
+            ..RoutingKeyOverrideConfig::default()
+        },
+        ..RouterConfig::default()
+    };
+    for policy in policies() {
+        let name = policy.name();
+        for assignment_mode in [
+            ManualAssignmentMode::Random,
+            ManualAssignmentMode::MinLoad,
+            ManualAssignmentMode::MinGroup,
+            ManualAssignmentMode::Delegate,
+        ] {
+            let sticky = sticky(policy.clone(), assignment_mode);
+            let said = format!("{name} under {assignment_mode:?}");
+            if name == "prefix_hash" {
+                assert_eq!(
+                    refusal(&sticky)?,
+                    format!(
+                        "{OVERRIDE}: no document says the sticky sessions' rule beside the \
+                         prefix ring yet"
+                    ),
+                    "{said}"
+                );
+                continue;
+            }
+            let started = start_in_process(&sticky, None)?.ok_or("an engine")?;
+            assert_eq!(
+                started.decides_whole(),
+                name != "consistent_hashing",
+                "{said}"
+            );
+            // The two policies that read the key themselves keep their own
+            // placement under the override.
+            if matches!(name, "consistent_hashing" | "manual") {
+                continue;
+            }
+            let declared = started
+                .engine
+                .spec()
+                .engine()
+                .needs_for("a-model", Phase::Single);
+            assert!(declared.session_in_flight, "{said}");
+            // The view lists the key's header so that the key keeps its
+            // text. The gateway's own ask reads that header, and no stage
+            // does: it is no feed.
+            let counts = Needs {
+                headers: false,
+                ..declared
+            };
+            assert!(declared.headers && counts.within(fed()), "{said}");
+        }
+    }
+
+    let round_robin = || sticky(PolicyConfig::RoundRobin, ManualAssignmentMode::Delegate);
+    let many_routers = RouterConfig {
+        enable_igw: true,
+        ..round_robin()
+    };
+    assert_eq!(
+        refusal(&many_routers)?,
+        format!(
+            "{OVERRIDE}: the sticky sessions' rule places single requests alone, and a gateway \
+             of many routers serves pairs beside them"
+        )
+    );
+    let pairs = RouterConfig {
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        ..round_robin()
+    };
+    assert_eq!(
+        refusal(&pairs)?,
+        format!(
+            "{OVERRIDE}: the sticky sessions' rule places single requests alone, and this plan \
+             places a pair"
+        )
+    );
+    Ok(())
+}

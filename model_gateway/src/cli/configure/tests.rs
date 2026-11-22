@@ -242,10 +242,6 @@ const OTHERS: &[(&str, Verdict)] = &[
         "21-launcher-second-spellings-sticky.md",
         Verdict::LauncherSpelling(Cow::Borrowed("--eviction-interval-secs")),
     ),
-    (
-        "22-cli-least-load-sticky-custom-headers.md",
-        Verdict::Refused("routing_key_override.enabled"),
-    ),
 ];
 
 /// The items whose document names a stage this build of the controller does
@@ -538,7 +534,7 @@ const ROUTING_FLAGS: &[Row] = &[
         &[],
         "whether a rank is a worker of its own is its registration's, not the document's",
     ),
-    refused("routing-key-override", &[], "routing_key_override.enabled"),
+    lands("routing-key-override", &[], &[]),
     lands("pd-pairing-mode", PAIR, &["strict"]),
     lands("routing-key-headers", MANUAL, &["x-session-id"]),
     kept(
@@ -723,13 +719,77 @@ fn the_print_option_answers_with_the_document_a_command_line_means() {
     );
 }
 
+/// Sticky sessions beside a policy that reads no key itself print as the
+/// policy's document with the session rule on its binding: the flags'
+/// assignment and times, two requests of a key a worker, and the key's
+/// sources, which the view lists where they are headers.
+#[test]
+fn the_print_option_says_sticky_sessions_as_the_bindings_session_rule() {
+    use smg_policy_controller::document::{Assignment, Recovery};
+
+    let answer = printed(&[
+        "smg",
+        "--policy",
+        "round_robin",
+        "--sticky-sessions",
+        "--routing-key-headers",
+        "x-session-id",
+        "--assignment-mode",
+        "min_load",
+        "--max-idle-secs",
+        "600",
+        "--eviction-interval",
+        "30",
+        "--print-policy-spec",
+    ]);
+    assert_eq!(answer.refusal(), None);
+    let document = read_back(&answer);
+    assert_eq!(document.view.headers, ["x-session-id"]);
+    let binding = document.bindings.first().expect("the binding");
+    let key = binding.routing_key.as_ref().expect("the key's sources");
+    let sources: Vec<&str> = key
+        .sources
+        .iter()
+        .map(|source| source.header.as_deref().unwrap_or("rid"))
+        .collect();
+    assert_eq!(sources, ["x-session-id", "rid"]);
+    assert!(key.strip_lineage);
+    let rule = binding.sessions.as_ref().expect("the session rule");
+    assert_eq!(
+        (rule.assignment, rule.recovery, rule.inflight_cap),
+        (Assignment::MinLoad, Recovery::Original, 2)
+    );
+    assert_eq!((rule.ttl_s, rule.sweep_s), (600, 30));
+
+    // The flag's defaults, beside the default policy.
+    let defaults = printed(&["smg", "--routing-key-override", "--print-policy-spec"]);
+    assert_eq!(defaults.refusal(), None);
+    let document = read_back(&defaults);
+    assert_eq!(document.view.headers, ["x-smg-routing-key"]);
+    let rule = document
+        .bindings
+        .first()
+        .and_then(|binding| binding.sessions.as_ref())
+        .expect("the session rule");
+    assert_eq!(
+        (rule.assignment, rule.recovery, rule.inflight_cap),
+        (Assignment::Delegate, Recovery::Latest, 2)
+    );
+}
+
 #[test]
 fn the_print_option_says_a_refusal_in_one_sentence() {
     // A setting no document says: no document, and the setting by its name.
-    let sticky = "routing_key_override.enabled = true: the controller holds no recorded form of \
-                  the sticky sessions' rule yet";
+    let sticky = "routing_key_override.enabled = true: no document says the sticky sessions' \
+                  rule beside the prefix ring yet";
     assert_eq!(
-        printed(&["smg", "--routing-key-override", "--print-policy-spec"]),
+        printed(&[
+            "smg",
+            "--policy",
+            "prefix_hash",
+            "--routing-key-override",
+            "--print-policy-spec"
+        ]),
         PolicySpecPrint::Refused(sticky.to_string())
     );
 

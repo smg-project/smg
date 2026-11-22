@@ -256,13 +256,19 @@ impl InProcess {
 /// ([`engine::PolicyEngine::read_loads`]), and a worker's count of session
 /// keys in flight on the worker object, with the rest of its record.
 ///
+/// A sessions rule's in-flight cap compares a session key's own count of
+/// requests on a worker. That count stands on the worker object too: the
+/// load guard of each dispatch writes it under the request's key, and the
+/// engine reads it under the key its own ask derived, where the key has
+/// its text. The two keys are one under the document the routing settings
+/// mean, which names the gateway's own sources in their order
+/// ([`crate::policies::PolicyRegistry::sticky_key`]).
+///
 /// Not fed yet, so a profile that reads one keeps the classic placement
 /// pass: a hash ring, a header of the request, a named signal's cells, and
 /// the media a request carries. No route states a request's media counts
 /// to the engine: a stage that declared them would read none for every
-/// request, with no error. Nor is a session key's own count of requests
-/// on a worker fed, so a sessions rule with an in-flight cap keeps that
-/// pass too.
+/// request, with no error.
 ///
 /// The hash ring of a list stands beside the list already, filled off the
 /// path of a request ([`engine::PolicyEngine::fill_rings`]). It is not
@@ -277,6 +283,7 @@ fn fed() -> Needs {
         events: true,
         sent_prefixes: true,
         active_sessions: true,
+        session_in_flight: true,
         affinity: true,
         ..Needs::default()
     }
@@ -318,7 +325,9 @@ pub(crate) fn start(config: &RouterConfig) -> Result<Option<Arc<MemoryStore>>, S
 /// it checks a later dry run over the same stages. A configuration the
 /// document cannot say, a routing setting that disagrees with a given
 /// document, and a document that check refuses, stop the start by name.
-/// None of them is served by the classic policies in silence.
+/// So does the sticky override's session rule, which no gateway runs over
+/// a store yet ([`override_over_a_store`]). None of them is served by the
+/// classic policies in silence.
 pub(crate) fn start_with(
     config: &RouterConfig,
     stages: Option<StageRegistry>,
@@ -326,6 +335,7 @@ pub(crate) fn start_with(
     let Some(document) = document_in_force(config)? else {
         return Ok(None);
     };
+    override_over_a_store(config, &document)?;
     let stages = stages.unwrap_or_else(StageRegistry::builtin);
     // A given document may hold what its YAML does not say, a `kind` line.
     // The typed check refuses it by the door's own word before the door
@@ -337,6 +347,37 @@ pub(crate) fn start_with(
     let started = hosted(config, Some(stages), &written)?;
     info!("The policy controller is picked for this gateway");
     Ok(Some(started))
+}
+
+/// Refuses a start over a store whose document holds the sticky override's
+/// session rule.
+///
+/// The routing settings write the override as a session rule beside a
+/// policy that reads no key itself. A gateway that decides in its own
+/// process runs that rule: its engine reads a key's requests on a worker
+/// where the load guard of each dispatch counts them, on the worker object
+/// ([`fed`]). Over a store the count of a key's requests is the store's own
+/// leases, and no case holds that count to the gateway's yet. So the start
+/// stops by the setting's name there, as it did before the rule had a
+/// document.
+fn override_over_a_store(config: &RouterConfig, document: &PolicySpec) -> Result<(), StartError> {
+    use crate::config::PolicyConfig;
+
+    // The manual policy states a rule of its own, under the override too.
+    let own_rule = matches!(config.policy, PolicyConfig::Manual { .. });
+    let ruled = document
+        .bindings
+        .iter()
+        .any(|binding| binding.sessions.is_some());
+    if config.routing_key_override.enabled && ruled && !own_rule {
+        return Err(RoutingSettingsError::UnsupportedSetting {
+            setting: "routing_key_override.enabled",
+            value: true.to_string(),
+            reason: "a gateway that follows a controller does not place by the sticky sessions' rule yet",
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// The start of a gateway that decides in its own process: the setting on
@@ -779,5 +820,7 @@ pub(crate) fn undecided_without(
 
 #[cfg(test)]
 mod start_in_process_tests;
+#[cfg(test)]
+mod sticky_sessions_tests;
 #[cfg(test)]
 mod tests;

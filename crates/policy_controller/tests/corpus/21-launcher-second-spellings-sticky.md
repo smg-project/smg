@@ -35,12 +35,16 @@ profiles:
 bindings:
   - match: { model: "*" }
     profile: cache_aware
+    routing_key:
+      sources:
+        - header: x-smg-routing-key
+        - rid: true
+      strip_lineage: true
     sessions:
-      sticky_header: x-smg-routing-key
-      headers: [x-smg-routing-key]
       ttl_s: 600
       sweep_s: 90
       assignment: delegate
       inflight_cap: 2
       issue_session_id: false
+      recovery: latest
 ```

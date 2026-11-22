@@ -46,14 +46,30 @@ fn the_print_is_the_document_alone_on_stdout_and_a_zero_exit() {
 
 #[test]
 fn a_setting_no_document_says_is_one_sentence_on_stderr_and_a_failing_exit() {
-    let answer = print(&["--routing-key-override"]).expect("the binary runs");
+    let answer =
+        print(&["--policy", "prefix_hash", "--routing-key-override"]).expect("the binary runs");
     assert_eq!(answer.status.code(), Some(1));
     assert_eq!(text(&answer.stdout), "");
     assert_eq!(
         text(&answer.stderr),
-        "error: routing_key_override.enabled = true: the controller holds no recorded form of \
-         the sticky sessions' rule yet\n"
+        "error: routing_key_override.enabled = true: no document says the sticky sessions' \
+         rule beside the prefix ring yet\n"
     );
+}
+
+#[test]
+fn sticky_sessions_print_as_the_session_rule_of_the_policys_binding() {
+    let answer = print(&["--policy", "round_robin", "--sticky-sessions"]).expect("the binary runs");
+    assert_eq!(answer.status.code(), Some(0), "{}", text(&answer.stderr));
+    assert_eq!(text(&answer.stderr), "");
+    let document: PolicySpec =
+        serde_yaml::from_slice(&answer.stdout).expect("stdout is a document and nothing else");
+    let binding = document.bindings.first().expect("the binding");
+    let rule = binding.sessions.as_ref().expect("the session rule");
+    assert_eq!(rule.inflight_cap, 2);
+    let key = binding.routing_key.as_ref().expect("the key's sources");
+    assert_eq!(key.sources.len(), 2);
+    assert_eq!(document.view.headers, ["x-smg-routing-key"]);
 }
 
 #[test]

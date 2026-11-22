@@ -129,7 +129,7 @@ fn a_start_whose_flags_and_document_disagree_is_refused_by_name() -> Case {
 #[test]
 fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
     let mut config = picked(RouterConfig::default());
-    config.routing_key_override.enabled = true;
+    config.dp_minimum_tokens_scheduler = true;
     for supplied in [None, Some(PolicySpec::preset("round_robin")?)] {
         config.policy_spec = supplied;
         let refusal = start(&config)
@@ -138,9 +138,40 @@ fn a_setting_no_document_says_stops_the_start_by_its_name() -> Case {
         assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
         assert_eq!(
             refusal.to_string(),
-            "routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet"
+            "dp_minimum_tokens_scheduler = true: the document has no rank policy: under the controller a rank is a candidate of the profile"
         );
     }
+    Ok(())
+}
+
+/// The sticky override beside a policy that reads no key itself has a
+/// document, a session rule on the policy's binding, and a gateway that
+/// decides in its own process runs it. A start over a store does not yet:
+/// it stops by the setting's name, where the rule is the override's. The
+/// manual policy's own rule starts there as before, under the override too.
+#[test]
+fn the_overrides_session_rule_stops_a_start_over_a_store_by_its_name() -> Case {
+    let mut config = picked(RouterConfig::default());
+    config.routing_key_override.enabled = true;
+    for policy in [PolicyConfig::RoundRobin, PolicyConfig::Random] {
+        config.policy = policy;
+        let ruled = config.policy_document_in_force()?;
+        assert!(ruled.bindings.iter().all(|b| b.sessions.is_some()));
+        let refusal = start(&config)
+            .err()
+            .ok_or("a start over a store took the override's rule")?;
+        assert!(matches!(refusal, StartError::Document(_)), "{refusal:?}");
+        assert_eq!(
+            refusal.to_string(),
+            "routing_key_override.enabled = true: a gateway that follows a controller does not place by the sticky sessions' rule yet"
+        );
+    }
+    config.policy = PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    assert!(start(&config)?.is_some());
     Ok(())
 }
 
@@ -1327,12 +1358,15 @@ async fn a_starts_context_holds_the_store_under_a_controllers_address() -> Case 
     assert_eq!(generation, Some(1));
     stop_follower(&hosted).await?;
 
-    let mut unsaid = picked(quiet());
+    // The sticky override's rule stops a start under a controller's
+    // address by the setting's name, as it did before the rule had a
+    // document.
+    let (mut unsaid, _unanswered) = followed(picked(quiet()))?;
     unsaid.routing_key_override.enabled = true;
     let refusal = AppContext::from_config(unsaid, 30, None, None).await.err();
     assert_eq!(
         refusal.as_deref(),
-        Some("routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet")
+        Some("routing_key_override.enabled = true: a gateway that follows a controller does not place by the sticky sessions' rule yet")
     );
     Ok(())
 }
