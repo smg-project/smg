@@ -1031,6 +1031,11 @@ request ──> route (HTTP or gRPC, any family)
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
 
+The change also writes again three small things that stage 0 takes out with the earlier
+integration: the gateway's two readers of its own index of cache events for the engine (about
+130 lines on main today), the pair classes read from the gateway's pair index (one file of 290
+lines), and the cell beside each published list.
+
 The bar for that change:
 
 1. It adds no file of policy logic to the gateway and no branch on a policy's name.
