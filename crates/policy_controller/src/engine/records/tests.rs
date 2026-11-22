@@ -367,6 +367,73 @@ fn the_ranks_of_one_engine_are_listed_together_and_a_plain_pool_lists_none() {
     assert_eq!(facts.engines.rows(1), [1]);
 }
 
+/// A stage tells which records are ranks of one engine by a field of the
+/// record: each states its engine's place among the list's engines, in the
+/// order each engine's first row stands in the list. Every record a decision
+/// is handed states it, written with the pool, from a converted snapshot or
+/// alone, and it is the place the list's engines are listed at.
+#[test]
+fn each_record_states_its_engines_place_among_the_lists_engines() {
+    let spec = applied("least_load");
+    let clock = DecisionClock::new();
+    let mut rows = Vec::new();
+    let live = Live::at(spec.engine(), &clock, Instant::now(), None, None);
+    let places = |rows: &[Candidate]| -> Vec<u32> { rows.iter().map(|row| row.engine).collect() };
+
+    // A pool with no engine of several rows lists none, and each record
+    // states a place of its own.
+    let plain = fleet(3);
+    let pool = PoolRecords::new(&plain, &spec, &clock);
+    assert_eq!(places(pool.fixed()), [0, 1, 2]);
+    let (written, facts) = pool.write(&plain, &live, &mut rows);
+    assert_eq!(places(written), [0, 1, 2]);
+    assert!(facts.engines.is_empty());
+
+    // Two engines of two ranks each, registered apart and out of their
+    // ranks' order, around a worker that stands alone.
+    let rank = |engine: &str, rank: usize| -> Arc<dyn Worker> {
+        Arc::new(
+            <BasicWorkerBuilder>::from_spec(WorkerSpec {
+                dp_base_url: Some(format!("grpc://{engine}:9000")),
+                dp_rank: Some(rank),
+                dp_size: Some(2),
+                ..WorkerSpec::new(format!("grpc://{engine}:9000@{rank}"))
+            })
+            .health_config(no_health_check())
+            .build(),
+        )
+    };
+    let ranked = vec![
+        rank("b", 1),
+        rank("a", 0),
+        ready_worker(&url(0), MODEL),
+        rank("a", 1),
+        rank("b", 0),
+    ];
+    let stated = [0, 1, 2, 1, 0];
+    let pool = PoolRecords::new(&ranked, &spec, &clock);
+    assert_eq!(places(pool.fixed()), stated);
+    let (written, facts) = pool.write(&ranked, &live, &mut rows);
+    assert_eq!(places(written), stated);
+    // A record's place is the place its engine is listed at.
+    assert_eq!(facts.engines.len(), 3);
+    for row in written {
+        let listed = facts.engines.rows(row.engine as usize);
+        assert!(listed.contains(&row.position), "row {}", row.position);
+    }
+    // One record read alone states it too.
+    for (position, engine) in (0u32..).zip(stated) {
+        let row = pool.read(&ranked, &live, position);
+        assert_eq!(row.map(|row| row.engine), Some(engine));
+    }
+    // And so do the rows converted under a load snapshot.
+    let (loads, _) = reports(&[10, 20, 30, 40, 50], Duration::from_millis(5));
+    let live = Live::at(spec.engine(), &clock, Instant::now(), Some(&loads), None);
+    let (written, _) = pool.write(&ranked, &live, &mut rows);
+    assert_eq!(places(written), stated);
+    assert_eq!(pool.conversions(), 1);
+}
+
 #[test]
 fn least_load_decides_over_the_records_by_the_reports_they_carry() {
     let spec = applied("least_load");

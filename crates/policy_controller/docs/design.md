@@ -549,6 +549,7 @@ pub struct Candidate {
     pub ec_compatible: bool, // usable for the encode side of an encode-prefill-decode request
     pub vision: bool,        // takes images
     pub host_local: bool,    // reachable from one gateway only
+    pub engine: u32,         // its engine's place among the list's engines; ranks share one
 
     // live: read again at every decision
     pub health: Health,      // healthy, breaker_open, stalled, draining, overloaded
@@ -566,6 +567,12 @@ pub struct Candidate {
 The identity half is filled once for a list and cached (`PoolRecords`, `engine/records.rs`). The
 live half is read from the worker object once for each decision. The load report comes from the
 load snapshot; a snapshot's reports are converted once for a list and cached.
+
+`engine` is `PolicyEngine`'s number. It writes each record its engine's place where it finds the
+list's engines, once for a list, so records that state one place are ranks of one data-parallel
+engine. The store-backed engine and a default record leave 0 on every record, which would read as
+one engine, so a stage reads the field in process alone until `PolicyEngine` is the one engine. The
+number holds within one generation of one list and is no id beyond it.
 
 ### 5.4 What a request states **[partly]**
 

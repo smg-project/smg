@@ -469,7 +469,7 @@ impl PoolRecords {
     ) -> Self {
         let lists = spec.lists();
         let mut demand_facts: Option<Box<[DemandFacts]>> = None;
-        let fixed: Box<[Candidate]> = workers
+        let mut fixed: Box<[Candidate]> = workers
             .iter()
             .zip(0u32..)
             .map(|(worker, position)| {
@@ -541,7 +541,7 @@ impl PoolRecords {
         {
             places.clear();
         }
-        let (engine_rows, engine_ends) = engines_of(workers, &fixed);
+        let (engine_rows, engine_ends) = engines_of(workers, &mut fixed);
         // The first pool is number one: an epoch of zero says no
         // membership.
         let number = clock.pools.fetch_add(1, Ordering::Relaxed) + 1;
@@ -602,8 +602,8 @@ impl PoolRecords {
 
     /// The fixed half of each worker's record, by its place in the list:
     /// its position, id, key, role, rank, wire, engine kind and labels,
-    /// whether it takes images where the program said so, and every live
-    /// field at rest.
+    /// its engine's place among the list's engines, whether it takes
+    /// images where the program said so, and every live field at rest.
     #[must_use]
     pub fn fixed(&self) -> &[Candidate] {
         &self.fixed
@@ -1013,13 +1013,20 @@ impl<'a> Singly<'a> {
 /// engine is the address its ranks share, or a worker's own. Both lists are
 /// empty where no engine of the pool holds two rows: nothing is listed, and
 /// a decision reads rows alone.
-fn engines_of(workers: &[Arc<dyn Worker>], fixed: &[Candidate]) -> (Box<[u32]>, Box<[u32]>) {
+///
+/// Each record of `fixed` is written its engine's place among the pool's
+/// engines here ([`Candidate::engine`]), in the order each engine's first
+/// row stands in the list, which is the order the engines are listed in:
+/// on every pool, also on one that lists none, where each row states a
+/// place of its own.
+fn engines_of(workers: &[Arc<dyn Worker>], fixed: &mut [Candidate]) -> (Box<[u32]>, Box<[u32]>) {
     let mut engine_of: FxHashMap<&str, usize> = FxHashMap::default();
     let mut engines: Vec<Vec<u32>> = Vec::new();
-    for (worker, position) in workers.iter().zip(0u32..) {
+    for ((worker, row), position) in workers.iter().zip(fixed.iter_mut()).zip(0u32..) {
         let spec = &worker.metadata().spec;
         let address = spec.dp_base_url.as_deref().unwrap_or(&spec.url);
         let engine = *engine_of.entry(address).or_insert(engines.len());
+        row.engine = engine as u32;
         match engines.get_mut(engine) {
             Some(rows) => rows.push(position),
             None => engines.push(vec![position]),
