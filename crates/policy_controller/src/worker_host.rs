@@ -78,6 +78,13 @@
 //! [`LoadAdapter`] writes load records and poll answers to the store. The
 //! store decides when the collector polls and keeps the overload verdict.
 //!
+//! [`load_monitor`] is the worker crate's own load monitor over the
+//! holder's registry, with no adapter under it. It publishes the workers'
+//! reports as its snapshot, which an engine that decides over its host's
+//! lists reads, and writes the overload verdict on the objects. A host
+//! runs it where its decisions read the snapshot, and writes no load to
+//! the store then.
+//!
 //! [`KvAdapter`] decodes the worker's KV events for the store's index, and
 //! [`KvHost`] gives each subscription its row in the store. Every replica
 //! runs the adapter over its own streams. The adapter keeps what a row's
@@ -130,7 +137,7 @@ pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
 pub use lead::{Lead, SoleLead};
-pub use loads::LoadAdapter;
+pub use loads::{load_monitor, LoadAdapter};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
