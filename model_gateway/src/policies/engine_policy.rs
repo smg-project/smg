@@ -691,7 +691,9 @@ mod tests {
     /// ask the engine for every request: the engine declines each request
     /// of it, and the registration's warning says that. Where the routers
     /// keep their classic pass the classic policies place such a model,
-    /// and the warning says that. The model is counted under both.
+    /// and the warning says that. The model is counted under both. Where
+    /// such a model's workers carry a `policy` label too, the label's own
+    /// line names no binding, so the two lines do not disagree.
     #[test]
     #[tracing_test::traced_test]
     fn a_model_no_binding_names_is_told_who_answers_its_requests() {
@@ -699,6 +701,7 @@ mod tests {
         document.bindings[0].matcher.model = "alpha-*".to_string();
         let whole = asking_as(&document, "round_robin", DocumentOrigin::Supplied, true);
         whole.on_worker_added("whole-unnamed", None);
+        whole.on_worker_added("whole-labelled", Some("cache_aware"));
         let pass = asking_as(&document, "round_robin", DocumentOrigin::Supplied, false);
         pass.on_worker_added("pass-unnamed", None);
 
@@ -716,8 +719,20 @@ mod tests {
                 "Model whole-unnamed: no binding of the policy document plans its single requests, \
                  the classic",
             );
-            match (declined, classic, wrong) {
-                (1, 1, 0) => Ok(()),
+            let labelled = [
+                said(
+                    "Model whole-labelled: its workers' policy label 'cache_aware' is not honored \
+                     with the policy controller on",
+                ),
+                said(
+                    "Model whole-labelled: no binding of the policy document plans its single \
+                     requests, the policy engine declines them (503 `policy_declined`)",
+                ),
+                // No line says a binding places a model that none names.
+                said("binding for it"),
+            ];
+            match (declined, classic, wrong, labelled) {
+                (1, 1, 0, [1, 1, 0]) => Ok(()),
                 counts => Err(format!("{counts:?} lines")),
             }
         });

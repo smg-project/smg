@@ -1027,10 +1027,12 @@ impl PolicyRegistry {
     /// worker it names, whether its workers stream their cache events,
     /// whether their loads are polled. So the label is not read: the model
     /// is kept as one whose workers carry none, and a warning says that
-    /// the label is not honored and what places the model. The caller runs
-    /// once for a model, so the warning is said once a model. A label that
-    /// names the policy the settings' own document was made from asks for
-    /// what the engine does, and nothing is said of it.
+    /// the label is not honored and what decides the model's requests. It
+    /// names no binding: the engine declines a model that no binding of a
+    /// supplied document names, and the caller's own line says that. The
+    /// caller runs once for a model, so the warning is said once a model.
+    /// A label that names the policy the settings' own document was made
+    /// from asks for what the engine does, and nothing is said of it.
     fn label_read<'l>(&self, model_id: &str, label: Option<&'l str>) -> Option<&'l str> {
         let (Some(asked), Some(named)) = (&self.policy_engine, label) else {
             return label;
@@ -1043,10 +1045,10 @@ impl PolicyRegistry {
         if !as_the_settings {
             warn!(
                 "Model {model_id}: its workers' policy label '{named}' is not honored with the \
-                 policy controller on. The policy engine places the model's requests by the \
-                 policy document's binding for it, which `--policy` writes where no document \
-                 is supplied. To place this model by another policy, bind it in a policy \
-                 document (`--policy-spec`), or turn the policy controller off"
+                 policy controller on. The policy engine decides the model's requests by the \
+                 policy document, which `--policy` writes where no document is supplied. To \
+                 place this model by another policy, bind it in a policy document \
+                 (`--policy-spec`), or turn the policy controller off"
             );
         }
         None
