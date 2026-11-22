@@ -342,6 +342,131 @@ fn both_sides_place_over_the_same_candidates() {
         .placed_on(line, &["http://m:1", "http://n:1"]);
 }
 
+/// The gRPC pipeline's regular route states its attempts to the one call: a
+/// first attempt over its pool as the snapshot its stage read holds it, and
+/// a retry on the wire of its retained plan, under the stage's rule and
+/// with the engines it tried. Both sides are handed the same workers and
+/// hand back the same miss.
+#[test]
+fn both_sides_place_a_grpc_attempt_over_the_same_candidates() {
+    const GRPC: RoutingPool = RoutingPool::GrpcPipelineRegular;
+    const RANKED: &str = "grpc://e:9000";
+    let rank = |rank: usize| {
+        BasicWorkerBuilder::new(RANKED)
+            .model(ModelCard::new(MODEL))
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .dp_config(rank, 2)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build()
+    };
+    let on = |url: &str, connection, runtime| worker(url, MODEL, connection, runtime);
+    let sides = Sides::over(
+        vec![
+            rank(0),
+            rank(1),
+            on("grpc://o:9000", ConnectionMode::Grpc, RuntimeType::Vllm),
+            on("grpc://s:9000", ConnectionMode::Grpc, RuntimeType::Sglang),
+            on("ipc://z.ipc", ConnectionMode::Zmq, RuntimeType::TokenSpeed),
+            http("http://h:1"),
+        ],
+        false,
+    );
+    // The pool as the registry lists it: a rank's address is its engine's
+    // with its rank.
+    let snapshot = sides.registry.get_routing_snapshot(MODEL);
+    let pool: Vec<String> = snapshot
+        .pool(GRPC)
+        .iter()
+        .map(|worker| worker.url().to_owned())
+        .collect();
+    let ranks: Vec<&str> = pool
+        .iter()
+        .filter(|url| url.starts_with(RANKED))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(ranks.len(), 2, "the two ranks of one engine: {pool:?}");
+
+    let line = "the pipeline's pool is the gRPC and the direct ZMQ workers";
+    let plain = PlacementInputs::default();
+    let whole: Vec<&str> = pool.iter().map(String::as_str).collect();
+    assert_eq!(whole.len(), 5, "{line}: {pool:?}");
+    sides
+        .agree(line, MODEL, GRPC, None, &plain)
+        .placed_on(line, &whole);
+
+    let line = "a first attempt reads the pool in the snapshot its stage read";
+    let read = PlacementInputs {
+        snapshot: Some(&snapshot),
+        ..Default::default()
+    };
+    sides
+        .agree(line, MODEL, GRPC, None, &read)
+        .placed_on(line, &whole);
+
+    let line = "a retry on its plan's wire steps aside from every rank of the engine it tried";
+    let wire = WireConstraint {
+        runtime: RuntimeType::Vllm,
+        connection: ConnectionMode::Grpc,
+        requires_media_refs: false,
+        pipeline: PipelinePin::Any,
+    };
+    let tried = vec![RANKED.to_owned()];
+    let retried = PlacementInputs {
+        tried: &tried,
+        attempt: 1,
+        snapshot: Some(&snapshot),
+        ..Default::default()
+    };
+    sides
+        .agree(line, MODEL, GRPC, Some(wire), &retried)
+        .placed_on(line, &["grpc://o:9000"]);
+
+    let line = "a retry's rule keeps out every rank of the engine that answered for good";
+    let answered = |worker: &dyn Worker| worker.base_url() != RANKED;
+    let ruled = PlacementInputs {
+        candidate_filter: Some(&answered),
+        attempt: 1,
+        snapshot: Some(&snapshot),
+        ..Default::default()
+    };
+    sides
+        .agree(line, MODEL, GRPC, Some(wire), &ruled)
+        .placed_on(line, &["grpc://o:9000"]);
+
+    let line = "a retry whose every engine on the wire was tried is placed over the wire whole";
+    let tried = vec![RANKED.to_owned(), "grpc://o:9000".to_owned()];
+    let spent = PlacementInputs {
+        tried: &tried,
+        attempt: 2,
+        snapshot: Some(&snapshot),
+        ..Default::default()
+    };
+    sides
+        .agree(line, MODEL, GRPC, Some(wire), &spent)
+        .placed_on(line, &[ranks[0], ranks[1], "grpc://o:9000"]);
+
+    let line = "a retry whose rule refuses every worker of its wire places nobody";
+    let wire = WireConstraint {
+        runtime: RuntimeType::Sglang,
+        ..wire
+    };
+    let refused = |worker: &dyn Worker| worker.url() != "grpc://s:9000";
+    let barred = PlacementInputs {
+        candidate_filter: Some(&refused),
+        attempt: 1,
+        snapshot: Some(&snapshot),
+        ..Default::default()
+    };
+    sides
+        .agree(line, MODEL, GRPC, Some(wire), &barred)
+        .placed_nobody(line);
+}
+
 /// A pool whose every worker is over its thresholds: each side steers by
 /// its own rule where the gateway does not shed, and both place nobody
 /// where it does, so the route's one judgment builds the shed.
