@@ -221,13 +221,14 @@ impl Phi4VisionProcessor {
 
     /// Dynamic preprocess: calculate target dimensions and create attention mask.
     ///
+    /// Takes the image's crop grid `(w_crops, h_crops)` from `target_crops`.
     /// Returns (processed_image, attention_mask, target_h_crops, target_w_crops)
     fn dynamic_preprocess(
         &self,
         image: &DynamicImage,
+        (target_w_crops, target_h_crops): (usize, usize),
     ) -> (DynamicImage, Array2<u32>, usize, usize) {
         let (orig_w, orig_h) = image.dimensions();
-        let (target_w_crops, target_h_crops) = self.target_crops(orig_w, orig_h);
         let target_width = self.base_resolution * target_w_crops as u32;
         let target_height = self.base_resolution * target_h_crops as u32;
 
@@ -357,11 +358,12 @@ impl Phi4VisionProcessor {
     fn process_single_image(
         &self,
         image: &DynamicImage,
+        grid: (usize, usize),
         max_crops: usize,
         values: &mut Vec<f32>,
     ) -> SingleImageResult {
         // Step 1: Dynamic preprocess (resize, pad, create attention mask)
-        let (hd_image, attention_mask, h_crops, w_crops) = self.dynamic_preprocess(image);
+        let (hd_image, attention_mask, h_crops, w_crops) = self.dynamic_preprocess(image, grid);
 
         let hd_h = hd_image.height();
         let hd_w = hd_image.width();
@@ -444,13 +446,15 @@ impl VisionPreProcessor for Phi4VisionProcessor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         TransformError::if_empty(images)?;
 
-        // Find max crops across batch for padding
-        let max_crops = images
+        // Each image's crop grid, computed once: it sizes the batch and is
+        // the grid the image is tiled to, so the two cannot part.
+        let grids: Vec<(usize, usize)> = images
             .iter()
-            .map(|image| {
-                let (w_crops, h_crops) = self.target_crops(image.width(), image.height());
-                w_crops * h_crops + 1
-            })
+            .map(|image| self.target_crops(image.width(), image.height()))
+            .collect();
+        let max_crops = grids
+            .iter()
+            .map(|&(w_crops, h_crops)| w_crops * h_crops + 1)
             .max()
             .ok_or(TransformError::EmptyBatch)?;
         let base = self.base_resolution as usize;
@@ -466,8 +470,9 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         let mut item_sizes = Vec::new();
         let mut feature_token_counts = Vec::new();
 
-        for image in images {
-            let (mask, size, tokens) = self.process_single_image(image, max_crops, &mut flat_data);
+        for (image, &grid) in images.iter().zip(&grids) {
+            let (mask, size, tokens) =
+                self.process_single_image(image, grid, max_crops, &mut flat_data);
             all_masks.push(mask);
             item_sizes.push(size);
             feature_token_counts.push(tokens);
@@ -654,10 +659,13 @@ mod tests {
     fn test_preprocess_multiple_images() {
         let processor = Phi4VisionProcessor::new();
 
-        let images = [
-            create_test_image(500, 500, Rgb([100, 100, 100])),
-            create_test_image(800, 400, Rgb([150, 150, 150])),
-        ];
+        // Gradients, so a tile in the wrong place cannot match by accident.
+        let gradient = |width, height| {
+            DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
+                Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+            }))
+        };
+        let images = [gradient(500, 500), gradient(800, 400)];
 
         let result = processor
             .preprocess(&images.iter().collect::<Vec<_>>())
@@ -666,6 +674,16 @@ mod tests {
         assert_eq!(result.batch_size(), 2);
         assert_eq!(result.item_sizes.len(), 2);
         assert_eq!(result.feature_token_counts.len(), 2);
+
+        // Each image's slot holds what the image gives alone (5 and 3 crops
+        // of the batch's 5), and the crops the second does not fill are zeros.
+        let crop = 3 * 448 * 448;
+        let batch = result.encoder_input_flat();
+        let first = processor.preprocess(&[&images[0]]).unwrap();
+        let second = processor.preprocess(&[&images[1]]).unwrap();
+        assert!(batch[..5 * crop] == first.encoder_input_flat()[..]);
+        assert!(batch[5 * crop..8 * crop] == second.encoder_input_flat()[..]);
+        assert!(batch[8 * crop..].iter().all(|&value| value == 0.0));
     }
 
     #[test]
