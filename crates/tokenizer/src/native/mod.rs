@@ -1624,7 +1624,7 @@ impl NativeEncoder {
         )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, normalizer)?;
         let merges = match MergeTable::from_model(
-            tokenizer.get_model().wrapper(),
+            tokenizer.get_model(),
             ByteTokens::Alphabet,
             tokenizer.get_model().read(),
         ) {
@@ -1730,11 +1730,8 @@ impl NativeEncoder {
                  beside it",
             ));
         }
-        let chars = CharSymbols::from_model(
-            tokenizer.get_model().wrapper(),
-            marker,
-            tokenizer.get_model().read(),
-        )?;
+        let chars =
+            CharSymbols::from_model(tokenizer.get_model(), marker, tokenizer.get_model().read())?;
         tracing::debug!(
             merges = chars.merges(),
             bytes = chars.bytes(),
@@ -2098,6 +2095,17 @@ impl NativeEncoder {
             Self::merges_every_short_piece(self.merges.as_ref(), self.seed_covers_short_entries);
     }
 
+    /// On the sentencepiece path, whose encode reads no model, the merges'
+    /// operands in rank order.
+    pub(crate) fn sentencepiece_pairs_by_rank(&self) -> Option<Vec<[u32; 2]>> {
+        self.chars.as_deref().map(CharSymbols::pairs_by_rank)
+    }
+
+    /// Whether this is the sentencepiece path.
+    pub(crate) fn is_sentencepiece(&self) -> bool {
+        self.chars.is_some()
+    }
+
     /// Whether the merge table answers, with no model, every short piece
     /// that neither a thread's table nor the seed holds: it has a token for
     /// every byte, and the whole-piece lookup `ignore_merges` asks for is
@@ -2212,7 +2220,10 @@ impl NativeEncoder {
             })();
             Some(seeded)
         };
-        let vocab_size = bpe.get_vocab_size();
+        // A listing is the whole vocabulary, and a model that was not built
+        // has no size.
+        let vocab_size =
+            listing.map_or_else(|| bpe.get_vocab_size(), |listing| listing.len() as usize);
         // The pass reads a window of ids at a time into one list of slots
         // the calling thread owns and reuses, and keeps of each window what
         // the tables are built from, packed: the key and the ids of a short
