@@ -869,6 +869,67 @@ impl GatewayRun {
 /// write builds its own gateway's run again and shares every other.
 type PoolVetoes = Arc<[GatewayRun]>;
 
+/// One gateway's vetoes on the workers of one pool, lent from a
+/// publication for one decision ([`StoreSnapshot::gateway_vetoes`]): the
+/// publication's own run, read by worker id.
+///
+/// A decision over worker lists names a worker by its id and finds the
+/// worker's place in its own list. It reads a veto by that id and by
+/// nothing of a pool's rows, so this reader can stand on the writer's own
+/// lists, which are by worker id ([`Vetoes`]), and no caller changes.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+    )
+)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GatewayVetoes<'a> {
+    vetoes: &'a [PoolVeto],
+}
+
+/// One standing veto as a decision over worker lists reads it: the vetoed
+/// worker, and whether the veto's hold stands. While the hold stands no
+/// rule lifts the veto, as none lifts an open breaker. From the hold's end
+/// to the veto's own the worker is doubted alone.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+    )
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StandingVeto {
+    pub(crate) id: WorkerId,
+    pub(crate) held: bool,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+    )
+)]
+impl<'a> GatewayVetoes<'a> {
+    /// The vetoes that stand at `now`, ascending by worker id, each once:
+    /// a veto past its end is not handed, though its publication still
+    /// holds it. The two tests are the view's own, by which it names a
+    /// row stalled and held ([`StoreSnapshot::view`],
+    /// [`StoreSnapshot::held`]).
+    pub(crate) fn standing_at(self, now: Instant) -> impl Iterator<Item = StandingVeto> + 'a {
+        self.vetoes
+            .iter()
+            .filter(move |veto| veto.ends.until > now)
+            .map(move |veto| StandingVeto {
+                id: veto.id,
+                held: veto.ends.held_at(now),
+            })
+    }
+}
+
 /// The most runs a pool holds where a build still walks to its own, past
 /// half of them at the most; above it the run is found by search. A few
 /// gateways that each hold a veto in a pool is the shape a fleet has, and
@@ -1733,6 +1794,41 @@ impl StoreSnapshot {
             rows.extend(held.map(|veto| veto.row));
         }
         rows
+    }
+
+    /// `gateway`'s vetoes on the workers of `model`'s `role` pool, lent
+    /// for one decision and read by worker id
+    /// ([`GatewayVetoes::standing_at`]): the run the view of the same ask
+    /// reads by row. Nothing is copied. Where no veto stands in the store
+    /// the answer is one test, and the model is not looked up.
+    ///
+    /// It hands every veto of the gateway on a worker of the pool. A
+    /// caller finds each worker's place in its own list and passes over a
+    /// worker that list does not hold: a pool names a worker another
+    /// gateway alone reaches, and a list can be of another membership.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a decision over worker lists reads its gateway's vetoes here once a controller makes one"
+        )
+    )]
+    pub(crate) fn gateway_vetoes(
+        &self,
+        model: &str,
+        role: Role,
+        gateway: GatewayId,
+    ) -> GatewayVetoes<'_> {
+        if self.vetoes.is_empty() {
+            return GatewayVetoes { vetoes: &[] };
+        }
+        let run = self
+            .index(model, role)
+            .and_then(|pool| self.vetoes.get(pool))
+            .and_then(|runs| run_of(runs, gateway));
+        GatewayVetoes {
+            vetoes: run.map_or(&[], |run| &run.vetoes),
+        }
     }
 
     /// Build both sides of one pair decision into `out`: the model's

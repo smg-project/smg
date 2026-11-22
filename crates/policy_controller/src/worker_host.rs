@@ -126,6 +126,8 @@ mod loads;
 mod membership_writer;
 mod object;
 mod objects;
+#[cfg(all(feature = "controller", feature = "in-process"))]
+pub(crate) mod reach;
 mod remainder;
 pub(crate) mod steps;
 
