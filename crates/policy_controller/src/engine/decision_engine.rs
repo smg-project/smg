@@ -115,7 +115,10 @@ pub trait RequestMaker {
     /// reads the newest snapshot the engine's own task keeps at hand
     /// ([`PolicyEngine::run`](super::policy_engine::PolicyEngine::run));
     /// under no snapshot a record carries no report and a signal reads no
-    /// value.
+    /// value. A host whose document holds a stage that keeps load reports
+    /// ([`Lifecycle::keeps_loads`](crate::stages::Lifecycle::keeps_loads))
+    /// hands none: the task tells such a stage a report ahead of the
+    /// snapshot it keeps, and a snapshot handed here is outside that order.
     #[cfg(feature = "in-process")]
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         None

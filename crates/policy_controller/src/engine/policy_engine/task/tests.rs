@@ -163,7 +163,9 @@ pub(in crate::engine::policy_engine) async fn spawned(
 }
 
 /// The engine's task, spawned as a host spawns it, past its first step.
-async fn running(engine: &Arc<PolicyEngine>) -> JoinHandle<()> {
+pub(in crate::engine::policy_engine) async fn running(
+    engine: &Arc<PolicyEngine>,
+) -> JoinHandle<()> {
     let engine = Arc::clone(engine);
     spawned(async move { engine.run().await }).await
 }
@@ -271,9 +273,9 @@ async fn a_requests_own_snapshot_is_read_ahead_of_the_engines() {
     task.abort();
 }
 
-/// An engine whose document reads no load report and no named signal keeps
-/// no channel and no snapshot: its draws look no report up, so its list
-/// never converts one.
+/// An engine whose document reads no load report and no named signal, and
+/// none of whose stages keeps a report, keeps no channel and no snapshot:
+/// its draws look no report up, so its list never converts one.
 #[tokio::test(start_paused = true)]
 async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
     let engine = preset("random");
@@ -282,7 +284,8 @@ async fn an_engine_whose_document_reads_no_report_keeps_no_snapshot() {
     let (_feed, channel) = monitor(&reports(32, 2));
     engine.set_loads(channel);
     let task = running(&engine).await;
-    assert!(engine.loads.newest().is_none(), "no channel is kept");
+    assert!(engine.loads.feed.lock().1.is_none(), "no channel is kept");
+    assert!(engine.loads.newest().is_none(), "and no snapshot");
     for seed in 0..256 {
         let _ = picked(&engine, &asks(seed, &members, None));
     }

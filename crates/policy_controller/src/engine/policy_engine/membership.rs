@@ -54,10 +54,12 @@
 //! the registry whole again at the task's next upkeep.
 
 use std::{
+    cell::Cell,
     fmt,
     future::pending,
     ptr,
     sync::{Arc, OnceLock, Weak},
+    time::Instant,
 };
 
 use rustc_hash::FxHashMap;
@@ -66,14 +68,18 @@ use smg_worker::{
     registry::{event::WorkerEvent, Generation, WorkerId as ObjectId, WorkerRegistry},
     runtime::WorkerRuntime,
 };
-use tokio::sync::broadcast::{error::RecvError, Receiver};
+use tokio::sync::broadcast::{
+    error::{RecvError, TryRecvError},
+    Receiver,
+};
 
 use super::PolicyEngine;
 use crate::{
     engine::{
-        records::worker_id,
-        view::{FixedFacts, WorkerId},
+        records::{stated_rank, stated_role, worker_id},
+        view::{FixedFacts, Role, WorkerId},
     },
+    stages::Lifecycle,
     tracking::lease::Membership,
 };
 
@@ -173,15 +179,47 @@ struct Held {
     id: WorkerId,
     object: Weak<dyn Worker>,
     state: Option<Weak<WorkerRuntime>>,
+    /// What a telling of load reports reads of the worker: none where the
+    /// document has no stage that keeps them, and nothing is read for it.
+    joined: Option<Joined>,
+}
+
+/// What a telling of load reports reads of a joined worker
+/// ([`Follow::joined`]): its address, and its role and its rank as a list's
+/// record states them. Read off the worker's object where the follow takes
+/// it, at the word of its join and again at a replacement and at a whole
+/// read. So a telling reads through no pointer the follow keeps: a host
+/// may hand the follow an object it keeps no longer than the call.
+#[derive(Debug)]
+pub(super) struct Joined {
+    pub(super) address: Box<str>,
+    pub(super) role: Role,
+    pub(super) dp_rank: u16,
+    /// The sample instant of the report the stages were told last of this
+    /// record: none until its first.
+    pub(super) told_at: Cell<Option<Instant>>,
+}
+
+impl Joined {
+    fn of(worker: &dyn Worker) -> Self {
+        let spec = &worker.metadata().spec;
+        Self {
+            address: worker.url().into(),
+            role: stated_role(spec),
+            dp_rank: stated_rank(spec),
+            told_at: Cell::new(None),
+        }
+    }
 }
 
 impl Held {
-    fn of(id: WorkerId, worker: &Arc<dyn Worker>) -> Self {
+    fn of(id: WorkerId, worker: &Arc<dyn Worker>, keeps_loads: bool) -> Self {
         let state = worker.runtime_state();
         Self {
             id,
             object: Arc::downgrade(worker),
             state: state.as_ref().map(Arc::downgrade),
+            joined: keeps_loads.then(|| Joined::of(worker.as_ref())),
         }
     }
 
@@ -234,6 +272,33 @@ impl Follow {
         let facts = self.registry.facts_of(worker);
         self.stating |= facts.id.is_some();
         facts.id_or(worker_id(worker.as_ref()))
+    }
+
+    /// The workers the task told the stages as joined, each with the id of
+    /// its join and what a telling of load reports reads of it: those the
+    /// follow holds alone under their id. While it holds two workers under
+    /// one id, the id's next life ahead of the earlier one's removal, it
+    /// names neither: nothing says which of the two the id is now.
+    pub(super) fn joined(&self) -> impl Iterator<Item = (WorkerId, &Joined)> + '_ {
+        let alone = |held: &&Held| self.under.get(&held.id) == Some(&1);
+        let held = self.told.values().filter(alone);
+        held.filter_map(|held| Some((held.id, held.joined.as_ref()?)))
+    }
+
+    /// How many words stand on the subscription, the dropped ones counted.
+    fn waiting(&self) -> usize {
+        self.events.as_ref().map_or(0, Receiver::len)
+    }
+
+    /// The registry's next word, where one stands ready on the
+    /// subscription.
+    fn ready(&mut self) -> Option<Result<WorkerEvent, RecvError>> {
+        match self.events.as_mut()?.try_recv() {
+            Ok(word) => Some(Ok(word)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Lagged(lost)) => Some(Err(RecvError::Lagged(lost))),
+            Err(TryRecvError::Closed) => Some(Err(RecvError::Closed)),
+        }
     }
 }
 
@@ -333,6 +398,27 @@ impl PolicyEngine {
         }
     }
 
+    /// Hears the words that stand ready on the follow's subscription,
+    /// each as the task hears it ([`Self::heard`]), ahead of the task's
+    /// next turn: at most as many as stood there when it began, so a
+    /// registry that never pauses holds no caller. A telling of load
+    /// reports asks for it first, so a report is told of a worker the
+    /// stages were told as joined. It runs no step of the follow's upkeep
+    /// ([`Self::follow_registry`]): a subscription the follow lacks, and a
+    /// whole read it owes behind a channel that closed or a panic, wait for
+    /// the next upkeep, however many snapshots come first. A word that says
+    /// the channel dropped events reads the registry whole here, as at the
+    /// task's own turn.
+    pub(super) fn follow_so_far(&self, members: &mut Option<Follow>) {
+        let ready = members.as_ref().map_or(0, Follow::waiting);
+        for _ in 0..ready {
+            let Some(word) = members.as_mut().and_then(Follow::ready) else {
+                break;
+            };
+            self.heard(members.as_mut(), word);
+        }
+    }
+
     /// One word of the registry's channel, heard by the engine's task. A
     /// channel that closed takes nothing the follow holds: the follow lets
     /// the subscription go, and owes another and a whole read at the
@@ -421,7 +507,8 @@ impl PolicyEngine {
         id: WorkerId,
         replaced: bool,
     ) {
-        if let Some(was) = follow.told.insert(object, Held::of(id, worker)) {
+        let record = Held::of(id, worker, self.spec.engine().keeps_loads());
+        if let Some(was) = follow.told.insert(object, record) {
             if was.id == id && (replaced || was.is(worker)) {
                 return;
             }

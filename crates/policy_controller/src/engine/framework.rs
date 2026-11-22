@@ -7398,7 +7398,7 @@ impl Engine {
 }
 
 impl Engine {
-    /// Tells a world's reports, each as its host shows it to decisions, to
+    /// Tells a host's reports, each as the host shows it to decisions, to
     /// every stage that keeps a number of the reports
     /// ([`Lifecycle::keeps_loads`]), and to no other stage. `reports` is
     /// run once for each such stage and hands every report to the call it

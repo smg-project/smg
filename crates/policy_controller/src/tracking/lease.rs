@@ -228,7 +228,8 @@ pub enum Membership<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     /// A load row for one rank of a worker, as the host shows it to its
-    /// decisions.
+    /// decisions. The in-process engine tells one row a worker object: the
+    /// sum of the ranks its report holds, under the rank the object states.
     Load {
         worker: WorkerId,
         dp_rank: u16,
@@ -240,7 +241,16 @@ pub enum Signal {
         slot: WorkerSlot,
         /// The sample instant of `row` on the host's clock, in microseconds
         /// since the host's origin, as the rank's row names it to a
-        /// decision. In-process only; the wire carries the row's age.
+        /// decision. In-process only; the wire carries the row's age. Each
+        /// host dates a polled report by its own rule. The policy store
+        /// states the instant it sent the poll less the age the row states
+        /// ([`LoadRow::report_age_ms`]), or the stamp the answer carries
+        /// where it carries one. The worker crate's load monitor, which the
+        /// in-process engine reads, states the instant it read the answers
+        /// of the poll's round, behind the last of them, and takes off
+        /// nothing. It dates a pushed record at its receipt less the age
+        /// the record states and a one-way margin, and a report that holds
+        /// both at the earlier.
         sampled_at_micros: u64,
     },
     Health {
