@@ -40,7 +40,6 @@ use openai_protocol::{
     UNKNOWN_MODEL_ID,
 };
 use reqwest::multipart::{Form, Part};
-use smg_policy_controller::engine::WorkerId;
 use smg_worker::{
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
@@ -70,7 +69,6 @@ use crate::{
         otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
     policies::{CacheNamespace, PolicyRegistry},
-    policy_controller::engine::{self, Ask, BehindAnswer, Placed, PolicyEngine, Prompt, Sent},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -79,7 +77,7 @@ use crate::{
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_PLACED_BY_CONTROLLER, REASON_WORKER_MUTATES_BODY,
+                REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload, placement,
@@ -124,8 +122,6 @@ use crate::{
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-const TRANSCRIPTION_REFUSAL_SITE: &str = "Router::route_multipart_transcription";
-
 /// Error code of a streamed body that broke off before it was forwarded.
 /// With the middleware's `REQUEST_BODY_STALLED` and `REQUEST_BODY_TOO_LARGE`
 /// it names an abort the client caused; the three carry no worker verdict:
@@ -145,7 +141,7 @@ struct StreamRelayMode {
 /// One dispatch attempt of a typed request: the inputs every stage of
 /// `Router::route_typed_request_once` reads. The route builds it once and
 /// every retry attempt reads the same one; the lease, the ledger and the
-/// tried lists are the state the attempts share.
+/// tried list are the state the attempts share.
 struct TypedAttempt<'a, T> {
     headers: Option<&'a HeaderMap>,
     /// The parsed request and its routing derivatives, held until the
@@ -164,26 +160,12 @@ struct TypedAttempt<'a, T> {
     /// The engines a failed attempt of this request dispatched to; a retry
     /// re-selects away from them while another available worker is left.
     tried: &'a parking_lot::Mutex<Vec<String>>,
-    /// The store rows the request's failed attempts were sent to, one an
-    /// attempt. A retry names them in its ask, and their count is the ask's
-    /// retry number. Classic policies leave it empty.
-    tried_rows: &'a parking_lot::Mutex<Vec<WorkerId>>,
-    /// The request's own id, kept where the router's policy engine asks: a
-    /// source of the request's routing key.
-    rid: Option<&'a str>,
 }
 
-/// The regular HTTP router places typed requests and multipart transcriptions
-/// through its policy engine or its injected load balancing policies.
-///
-/// Proxied GETs and realtime sessions pick their worker by no routing
-/// policy: they read the worker registry directly, with a policy engine or
-/// without.
+/// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    /// The policy engine, when it places this router's requests.
-    policy_engine: Option<Arc<PolicyEngine>>,
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
@@ -258,7 +240,6 @@ impl Router {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
-            policy_engine: ctx.policy_engine.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
             stream_stall_timeout: match ctx.router_config.stream_body_stall_timeout_secs {
@@ -496,12 +477,6 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
-        // The lease frees the parsed request at its dispatch, so the policy
-        // engine's asks read the request's own id from here.
-        let rid = self
-            .policy_engine
-            .as_ref()
-            .and_then(|_| typed_req.rid().map(str::to_owned));
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -537,8 +512,7 @@ impl Router {
             let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
             // The state the attempts share; `TypedAttempt` names each piece.
             let tried = parking_lot::Mutex::new(Vec::new());
-            let tried_rows = parking_lot::Mutex::new(Vec::new());
-            let ledger = AttemptLedger::of(self.policy_engine.is_some());
+            let ledger = AttemptLedger::default();
             let attempt = TypedAttempt {
                 headers,
                 lease: &lease,
@@ -548,8 +522,6 @@ impl Router {
                 is_stream,
                 ledger: &ledger,
                 tried: &tried,
-                tried_rows: &tried_rows,
-                rid: rid.as_deref(),
             };
 
             let response = if let Some(denied) = denial {
@@ -720,38 +692,29 @@ impl Router {
     }
 
     /// One attempt of a typed request as a sequence of named stages: the
-    /// placement or classic selection with its overload re-check, the adapter,
-    /// the dispatch, the adapter's verdict and the accounting. A successful
-    /// stream carries its placement to the body's end. Other attempts report
-    /// their status before returning.
+    /// worker, the dispatch-time overload re-check, the adapter, the
+    /// dispatch, the adapter's verdict, the accounting. Every stage reads the
+    /// same `TypedAttempt`; its lease, ledger and tried list carry what the
+    /// next attempt must know.
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
     ) -> Response {
-        let (worker, mut placed) = match &self.policy_engine {
-            None => {
-                let worker = match self.select_worker_for_attempt(attempt) {
-                    Ok(worker) => worker,
-                    Err(refusal) => return refusal,
-                };
-
-                // Dispatch-time re-check of the one chosen worker: O(1), and the only
-                // thing that closes the window between selection and dispatch in which
-                // a load report can flip the veto.
-                if let Some(shed) = overload::shed_if_worker_overloaded(
-                    worker.as_ref(),
-                    attempt.model_id,
-                    self.worker_registry.overload_shed_enabled(),
-                ) {
-                    return shed;
-                }
-                (worker, None)
-            }
-            Some(policy_engine) => match self.place_attempt(policy_engine, attempt).await {
-                Ok(placed) => Sent::of(placed),
-                Err(refusal) => return refusal,
-            },
+        let worker = match self.select_worker_for_attempt(attempt) {
+            Ok(worker) => worker,
+            Err(refusal) => return refusal,
         };
+
+        // Dispatch-time re-check of the one chosen worker: O(1), and the only
+        // thing that closes the window between selection and dispatch in which
+        // a load report can flip the veto.
+        if let Some(shed) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            attempt.model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            return shed;
+        }
 
         let mut decision_adapter =
             match Self::decision_adapter_for_attempt(attempt, worker.as_ref()) {
@@ -760,7 +723,7 @@ impl Router {
             };
 
         let response = self
-            .dispatch_attempt(attempt, &worker, &mut decision_adapter, placed.as_mut())
+            .dispatch_attempt(attempt, &worker, &mut decision_adapter)
             .await;
 
         // A streamed head's success was recorded before its relay task was
@@ -780,138 +743,7 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        let response =
-            self.account_attempt_outcome(attempt, &worker, response, head_success_recorded, || {
-                self.tried_row(&worker, placed.as_ref())
-            });
-
-        match placed {
-            None => response,
-            Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
-            Some(placed) => {
-                placed.ended_by(&response, Instant::now());
-                response
-            }
-        }
-    }
-
-    /// The row a retry names an attempt's worker by, as tried. A placement
-    /// the route kept names it. One that owed its engine nothing was not
-    /// kept ([`Sent::of`]): the policy engine names its worker
-    /// ([`PolicyEngine::row_of`]). The classic line names no row.
-    fn tried_row(&self, worker: &Arc<dyn Worker>, placed: Option<&Sent>) -> Option<WorkerId> {
-        match placed {
-            Some(sent) => Some(sent.id()),
-            None => self.policy_engine.as_ref()?.row_of(worker.as_ref()),
-        }
-    }
-
-    /// Resolve an unnamed request to the one primary model this router's
-    /// workers serve: the model a worker answers an unnamed request under.
-    /// Use the no-model id when no worker has a model, and return `None`
-    /// when the workers' primary models differ.
-    fn model_of_an_unnamed_request(&self) -> Option<String> {
-        let pool = self
-            .worker_registry
-            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
-        let mut models = pool
-            .iter()
-            .map(|worker| worker.model_id())
-            .filter(|&model| model != UNKNOWN_MODEL_ID);
-        let model = models.next().unwrap_or(UNKNOWN_MODEL_ID);
-        models.all(|other| other == model).then(|| model.to_owned())
-    }
-
-    /// The refusal of a request that names its worker, where the model's
-    /// classic policy holds it to that worker ([`placement::strict_target`]).
-    /// The policy engine reads no explicit target yet and would place the
-    /// request on another worker, so the shape is refused by name.
-    fn explicit_target_refusal(
-        &self,
-        model_id: &str,
-        headers: Option<&HeaderMap>,
-    ) -> Option<Response> {
-        // A request that names no worker pays the header's probe alone.
-        header_utils::extract_target_worker(headers)?;
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-        placement::strict_target(policy.as_ref(), headers)
-            .then(|| crate::policy_controller::refused("an explicit target worker"))
-    }
-
-    /// The attempt's placement by the policy controller, or the answer of a
-    /// request it did not place. The commit keeps to this router's own pool
-    /// ([`RoutingPool::HttpRegular`]): the router sends plain HTTP to a
-    /// regular worker's URL, so a target of another wire or role is passed
-    /// over. It also keeps to the workers the request's ledger admits: a
-    /// worker that answered the request definitively takes no later attempt,
-    /// as on the classic arm. The controller reads the tried rows softly, so
-    /// the rule is held here.
-    async fn place_attempt<T>(
-        &self,
-        policy_engine: &PolicyEngine,
-        attempt: &TypedAttempt<'_, T>,
-    ) -> Result<Placed, Response> {
-        let model = if attempt.model_id == UNKNOWN_MODEL_ID {
-            let Some(model) = self.model_of_an_unnamed_request() else {
-                return Err(self.report_refusal(
-                    "Router::route_typed_request",
-                    attempt.model_id,
-                    error::model_not_found(UNKNOWN_MODEL_ID),
-                ));
-            };
-            Cow::Owned(model)
-        } else {
-            Cow::Borrowed(attempt.model_id)
-        };
-        if self
-            .worker_registry
-            .get_routing_pool(&model, RoutingPool::HttpRegular)
-            .is_empty()
-        {
-            return Err(self.report_refusal(
-                "Router::route_typed_request",
-                attempt.model_id,
-                error::model_not_found(&model),
-            ));
-        }
-        if let Some(refusal) = self.explicit_target_refusal(&model, attempt.headers) {
-            return Err(refusal);
-        }
-        let id = engine::mark();
-        let tried = attempt.tried_rows.lock().clone();
-        // The prompt the classic arm routes by: the request's token ids
-        // where it has them, else its text.
-        let hashes = attempt.lease.with_view(|view| {
-            let prompt = Prompt {
-                text: view.text,
-                ..Prompt::of(view.tokens, view.cache_namespace)
-            };
-            policy_engine.hashes(&model, &prompt)
-        });
-        let ask = Ask {
-            streaming: attempt.is_stream,
-            headers: attempt.headers,
-            rid: attempt.rid,
-            tried: &tried,
-            hashes: Some(&hashes),
-            pool: Some(RoutingPool::HttpRegular),
-            ..Ask::of(&id, &model)
-        };
-        let ledger = attempt.ledger;
-        let placed = policy_engine
-            .place_at(
-                &ask,
-                |worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker),
-                Instant::now,
-            )
-            .await;
-        placed.map_err(|unplaced| {
-            self.report_refusal(
-                "Router::route_typed_request",
-                attempt.model_id,
-                unplaced.answer(&model),
-            )
-        })
+        self.account_attempt_outcome(attempt, &worker, response, head_success_recorded)
     }
 
     /// The worker of one attempt: selected away from the engines the request
@@ -998,15 +830,13 @@ impl Router {
 
     /// The attempt's dispatch: the worker's load guard, the request-sent
     /// event, the trace headers, the relay mode, the serialized body and the
-    /// send through the relay. Once the bytes exist the request lease frees
-    /// the parsed request when retries are disabled. The placement reports
-    /// dispatch at the send.
+    /// send through the relay. Once the bytes exist the lease frees the parsed
+    /// request when retries are disabled.
     async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
         worker: &Arc<dyn Worker>,
         decision_adapter: &mut Option<SglangDecisionAdapter>,
-        placed: Option<&mut Sent>,
     ) -> Response {
         let headers = attempt.headers;
         let lease = attempt.lease;
@@ -1048,19 +878,12 @@ impl Router {
                 if let Some(adapter) = decision_adapter.as_mut() {
                     adapter.release_request();
                 }
-                let mut source = RelaySource::new(attempt.model_id, route, Arc::clone(worker));
-                if let Some(placed) = placed {
-                    placed.dispatched(Instant::now());
-                    if attempt.is_stream {
-                        source = source.marking(placed.cut_mark());
-                    }
-                }
                 self.send_serialized_request(
                     headers,
                     body,
                     upstream_route,
                     mode,
-                    source,
+                    RelaySource::new(attempt.model_id, route, Arc::clone(worker)),
                     load_guard,
                 )
                 .await
@@ -1132,16 +955,14 @@ impl Router {
     /// The attempt's answer on the request's ledger: the worker's breaker
     /// outcome, unless a streamed head already recorded a success that the
     /// verdict kept; the retry window settled on a definitive answer; the
-    /// worker on the tried list after a replayable failure, with its row on
-    /// the controller's list where it was placed. A server error records a
-    /// worker error metric.
+    /// engine on the tried list after a replayable failure; the worker error
+    /// metric on a server error.
     fn account_attempt_outcome<T>(
         &self,
         attempt: &TypedAttempt<'_, T>,
         worker: &Arc<dyn Worker>,
         mut response: Response,
         head_success_recorded: bool,
-        row: impl FnOnce() -> Option<WorkerId>,
     ) -> Response {
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
@@ -1161,9 +982,6 @@ impl Router {
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
-            if let Some(row) = row() {
-                attempt.tried_rows.lock().push(row);
-            }
             let mut tried = attempt.tried.lock();
             if !tried.iter().any(|engine| engine == worker.base_url()) {
                 tried.push(worker.base_url().to_string());
@@ -1307,9 +1125,7 @@ impl Router {
     /// its dispatch-time overload re-check, the form's send and the relay of
     /// the worker's answer. Separate from `route_typed_request` because the
     /// endpoint is not JSON-bodied: the form is sent once (no retry could
-    /// replay it) and never passes through `prepare_request`. Under the
-    /// policy engine the worker is the engine's placement, with no
-    /// re-check, and a streamed answer carries it to the end of its body.
+    /// replay it) and never passes through `prepare_request`.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -1331,41 +1147,26 @@ impl Router {
         // exit below.
         let outcome = self.begin_route(route, model_id, is_stream);
 
-        let (worker, mut placed) = match &self.policy_engine {
-            None => {
-                let worker = match self.select_transcription_worker(headers, model_id, &routing) {
-                    Ok(worker) => worker,
-                    Err(refusal) => {
-                        outcome.pre_send_error(&refusal);
-                        return refusal;
-                    }
-                };
-
-                // Same dispatch-time re-check the regular path takes. A transcription
-                // occupies its worker for far longer than a chat completion, so a
-                // report landing in the selection→dispatch window is the one case where
-                // dispatching anyway is measurably worse.
-                if let Some(resp) = overload::shed_if_worker_overloaded(
-                    worker.as_ref(),
-                    model_id,
-                    self.worker_registry.overload_shed_enabled(),
-                ) {
-                    outcome.pre_send_error(&resp);
-                    return resp;
-                }
-                (worker, None)
+        let worker = match self.select_transcription_worker(headers, model_id, &routing) {
+            Ok(worker) => worker,
+            Err(refusal) => {
+                outcome.pre_send_error(&refusal);
+                return refusal;
             }
-            Some(policy_engine) => match self
-                .place_transcription(policy_engine, headers, body.rid(), model_id, is_stream)
-                .await
-            {
-                Ok(placed) => Sent::of(placed),
-                Err(refusal) => {
-                    outcome.pre_send_error(&refusal);
-                    return refusal;
-                }
-            },
         };
+
+        // Same dispatch-time re-check the regular path takes. A transcription
+        // occupies its worker for far longer than a chat completion, so a
+        // report landing in the selection→dispatch window is the one case where
+        // dispatching anyway is measurably worse.
+        if let Some(resp) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            outcome.pre_send_error(&resp);
+            return resp;
+        }
 
         // Streamed requests have no rid; the header is the whole sticky key.
         let load_guard = WorkerLoadGuard::with_key(
@@ -1381,19 +1182,11 @@ impl Router {
             route,
             canonical_model.as_deref(),
             &outcome,
-            placed.as_mut(),
         )
         .await
         {
             Ok(res) => res,
-            Err(response) => {
-                // A send that failed says so; a form that was never sent
-                // leaves the placement to its drop.
-                if let Some(placed) = placed {
-                    placed.ended(response.status(), false, Instant::now());
-                }
-                return response;
-            }
+            Err(response) => return response,
         };
 
         let status = res.status();
@@ -1402,7 +1195,7 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        let response = if is_stream {
+        if is_stream {
             relay_transcription_stream(res, status, &worker, load_guard, outcome, start)
         } else {
             buffer_transcription_response(
@@ -1414,75 +1207,7 @@ impl Router {
                 start,
             )
             .await
-        };
-
-        match placed {
-            None => response,
-            Some(placed) if is_stream => placed.held_to_the_end_of(response),
-            Some(placed) => {
-                placed.ended(response.status(), true, Instant::now());
-                response
-            }
         }
-    }
-
-    /// A transcription's placement by the policy controller, or its refusal.
-    /// The route cannot pin a rank, so the commit passes over a data-parallel
-    /// worker, and it keeps to this router's own pool ([`RoutingPool::HttpRegular`]).
-    async fn place_transcription(
-        &self,
-        policy_engine: &PolicyEngine,
-        headers: Option<&HeaderMap>,
-        rid: Option<&str>,
-        model_id: &str,
-        streaming: bool,
-    ) -> Result<Placed, Response> {
-        let pool = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::HttpRegular);
-        if pool.is_empty() {
-            return Err(self.report_refusal(
-                TRANSCRIPTION_REFUSAL_SITE,
-                model_id,
-                error::model_not_found(model_id),
-            ));
-        }
-        if pool.iter().all(|worker| worker.is_dp_aware()) {
-            return Err(Self::transcription_dp_not_supported());
-        }
-        if let Some(refusal) = self.explicit_target_refusal(model_id, headers) {
-            return Err(refusal);
-        }
-
-        let id = engine::mark();
-        let ask = Ask {
-            streaming,
-            headers,
-            rid,
-            pool: Some(RoutingPool::HttpRegular),
-            ..Ask::of(&id, model_id)
-        };
-        policy_engine
-            .place_at(
-                &ask,
-                |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
-                Instant::now,
-            )
-            .await
-            .map_err(|unplaced| {
-                self.report_refusal(
-                    TRANSCRIPTION_REFUSAL_SITE,
-                    model_id,
-                    unplaced.answer(model_id),
-                )
-            })
-    }
-
-    fn transcription_dp_not_supported() -> Response {
-        error::bad_request(
-            "dp_aware_not_supported",
-            "/v1/audio/transcriptions does not yet support DP-aware workers",
-        )
     }
 
     /// The worker of a transcription, or the refusal this router answers.
@@ -1504,7 +1229,7 @@ impl Router {
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
         if all_workers.is_empty() {
             return Err(self.report_refusal(
-                TRANSCRIPTION_REFUSAL_SITE,
+                "Router::route_multipart_transcription",
                 model_id,
                 error::model_not_found(model_id),
             ));
@@ -1515,7 +1240,10 @@ impl Router {
             .cloned()
             .collect();
         if non_dp_workers.is_empty() {
-            return Err(Self::transcription_dp_not_supported());
+            return Err(error::bad_request(
+                "dp_aware_not_supported",
+                "/v1/audio/transcriptions does not yet support DP-aware workers",
+            ));
         }
         let Some(worker) = placement::select_from(
             &self.worker_registry,
@@ -1556,7 +1284,11 @@ impl Router {
                     placement::no_available_workers(message)
                 }
             };
-            return Err(self.report_refusal(TRANSCRIPTION_REFUSAL_SITE, model_id, resp));
+            return Err(self.report_refusal(
+                "Router::route_multipart_transcription",
+                model_id,
+                resp,
+            ));
         };
         Ok(worker)
     }
@@ -1566,10 +1298,6 @@ impl Router {
     /// one send (the form's streamed body cannot be cloned, so the
     /// stale-connection retry never fires). A form the request cannot
     /// build or a send that fails is the finalized error answer.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the form inputs and the dispatch accounting are passed separately"
-    )]
     async fn send_transcription(
         headers: Option<&HeaderMap>,
         body: &TranscriptionRequest,
@@ -1578,7 +1306,6 @@ impl Router {
         route: &'static str,
         canonical_model: Option<&str>,
         outcome: &RouteOutcome<'_>,
-        placed: Option<&mut Sent>,
     ) -> Result<reqwest::Response, Response> {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -1610,9 +1337,6 @@ impl Router {
         );
 
         WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
-        if let Some(placed) = placed {
-            placed.dispatched(Instant::now());
-        }
         match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => Ok(res),
             Err(e) => {
@@ -1795,11 +1519,7 @@ impl Router {
                     mark_upstream_answer(&mut response);
                     response
                 }
-                // The gateway's own answer, made behind the worker's head.
-                Err(mut error_response) => {
-                    error_response.extensions_mut().insert(BehindAnswer);
-                    error_response
-                }
+                Err(error_response) => error_response,
             };
             header_utils::insert_routed_worker_id(
                 response.headers_mut(),
@@ -2510,19 +2230,9 @@ impl Router {
             .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
-            // Where the policy engine of this process places the request,
-            // the document in force says whether a placement reads the
-            // prompt. A valid tokens hint lifts the read there too.
-            policy_needs_text: match self.policy_engine.as_deref() {
-                Some(policy_engine) if policy_engine.in_process() => {
-                    policy_engine.reads_body(|| {
-                        header_utils::parse_routing_tokens_hint(Some(headers)).is_some()
-                    })
-                }
-                _ => self
-                    .policy_registry
-                    .any_policy_needs_request_text(Some(headers)),
-            },
+            policy_needs_text: self
+                .policy_registry
+                .any_policy_needs_request_text(Some(headers)),
             // A worker knows a model's canonical id alone, and only a body
             // read here has an alias in it rewritten to that id.
             model_ambiguous: self.worker_registry.model_count() > 1
@@ -2550,23 +2260,12 @@ impl Router {
     /// forward the raw body verbatim (JSON validation and normalization
     /// defer to the worker). `Err` hands the request back untouched —
     /// body unconsumed — for the buffered typed path.
-    ///
-    /// Where the policy engine of this process places requests, it places
-    /// this one from its headers ([`Self::place_streamed`]), and its lease
-    /// is told the dispatch and the end as an attempt of the buffered path
-    /// tells them. A gateway that follows a controller hands every request
-    /// back: its streamed path does not ask the controller.
     pub(crate) async fn route_streaming_request(
         &self,
         req: Request<Body>,
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
-        let policy_engine = self.policy_engine.as_deref();
-        if policy_engine.is_some_and(|policy_engine| !policy_engine.in_process()) {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PLACED_BY_CONTROLLER);
-            return Err(req);
-        }
         let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
             BodyPath::Buffer(reason) => {
                 Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
@@ -2591,47 +2290,25 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let (worker, mut placed) = match policy_engine {
-            None => {
-                let Some(worker) = self.select_worker_for_model(
-                    model_id,
-                    None,
-                    hinted_tokens.as_deref(),
-                    Some(req.headers()),
-                    None,
-                    None,
-                    None,
-                    &[],
-                ) else {
-                    Metrics::record_request_body_path(
-                        BODY_PATH_BUFFERED,
-                        REASON_NO_AVAILABLE_WORKER,
-                    );
-                    return Err(req);
-                };
-                (worker, None)
-            }
-            Some(policy_engine) => {
-                let placed = self
-                    .place_streamed(policy_engine, req.headers(), hinted_tokens.as_deref())
-                    .await;
-                match placed {
-                    Ok(placed) => Sent::of(placed),
-                    Err(Unstreamed::Refused(refusal)) => return Ok(*refusal),
-                    Err(Unstreamed::Buffered(reason)) => {
-                        Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
-                        return Err(req);
-                    }
-                }
-            }
+        let Some(worker) = self.select_worker_for_model(
+            model_id,
+            None,
+            hinted_tokens.as_deref(),
+            Some(req.headers()),
+            None,
+            None,
+            None,
+            &[],
+        ) else {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
+            return Err(req);
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
         // wrong-model selection. An alias registered after the decision is
         // not re-checked: the request named a name that did not exist when
-        // its path was decided. A placement handed back here is given up at
-        // its drop, ahead of any dispatch.
+        // its path was decided.
         if worker.mutates_request() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_WORKER_MUTATES_BODY);
             return Err(req);
@@ -2666,15 +2343,14 @@ impl Router {
         let mut headers_with_trace = parts.headers;
         inject_trace_context_http(&mut headers_with_trace);
 
-        let mut source = RelaySource::new(model_id, route, Arc::clone(&worker));
-        if let Some(placed) = placed.as_mut() {
-            placed.dispatched(Instant::now());
-            // Whether the answer is a stream is the worker's to say, behind
-            // the send: the relay of one writes a cut on this mark.
-            source = source.marking(placed.cut_mark());
-        }
         let response = self
-            .send_streamed_request(&headers_with_trace, body, route, source, load_guard)
+            .send_streamed_request(
+                &headers_with_trace,
+                body,
+                route,
+                RelaySource::new(model_id, route, Arc::clone(&worker)),
+                load_guard,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -2689,11 +2365,10 @@ impl Router {
             error_code,
             REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
         );
-        // A streamed head's success was recorded before its relay task was
-        // spawned (see `forward_worker_response`).
-        let head_success_recorded = head_success_recorded(&response);
         if !client_body_fault {
-            if !head_success_recorded {
+            // A streamed head's success was recorded before its relay task
+            // was spawned (see `forward_worker_response`).
+            if !head_success_recorded(&response) {
                 worker.record_outcome(status.as_u16());
             }
             if status.is_server_error() {
@@ -2733,73 +2408,8 @@ impl Router {
                 error_reason_from_status(status),
             );
         }
-        // A placement ends with its answer: a stream's at the end of its
-        // body, any other here.
-        Ok(match placed {
-            None => response,
-            Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
-            Some(placed) => {
-                placed.ended_by(&response, Instant::now());
-                response
-            }
-        })
+        Ok(response)
     }
-
-    /// The placement of a request whose body is not read, by the policy
-    /// engine of this process: the ask of an attempt on the buffered path
-    /// ([`Self::place_attempt`]) with what the headers alone state. The
-    /// request names no model here, so it is asked under the one model the
-    /// workers serve. A valid tokens hint is the prompt the buffered path
-    /// would hash. The request is sent once, so no ledger narrows the
-    /// commit: it keeps to this router's own pool.
-    ///
-    /// A request the engine does not place goes back to the buffered path,
-    /// which answers it with the body read, as one the classic selection
-    /// finds no worker for does. A request that names its worker where the
-    /// buffered path refuses the shape ([`Self::explicit_target_refusal`])
-    /// reads that refusal here, with no body read for it: like the version
-    /// check's, it is counted on neither body path.
-    async fn place_streamed(
-        &self,
-        policy_engine: &PolicyEngine,
-        headers: &HeaderMap,
-        hinted_tokens: Option<&[u32]>,
-    ) -> Result<Placed, Unstreamed> {
-        let Some(model) = self.model_of_an_unnamed_request() else {
-            return Err(Unstreamed::Buffered(REASON_MODEL_AMBIGUOUS));
-        };
-        if let Some(refusal) = self.explicit_target_refusal(&model, Some(headers)) {
-            return Err(Unstreamed::Refused(Box::new(refusal)));
-        }
-        let id = engine::mark();
-        let hashes = hinted_tokens
-            .map(|tokens| policy_engine.hashes(&model, &Prompt::of(Some(tokens), None)));
-        let ask = Ask {
-            headers: Some(headers),
-            hashes: hashes.as_ref(),
-            pool: Some(RoutingPool::HttpRegular),
-            ..Ask::of(&id, &model)
-        };
-        let placed = policy_engine
-            .place_at(
-                &ask,
-                |worker| RoutingPool::HttpRegular.matches(worker),
-                Instant::now,
-            )
-            .await;
-        placed.map_err(|_| Unstreamed::Buffered(REASON_NO_AVAILABLE_WORKER))
-    }
-}
-
-/// Why the policy engine placed no worker for a request whose body is not
-/// read ([`Router::place_streamed`]).
-enum Unstreamed {
-    /// The request is answered here, with this refusal. Behind a pointer:
-    /// the other answer is one word, and a placement's error rides small.
-    Refused(Box<Response>),
-    /// The request goes back to the buffered path, counted under this
-    /// reason.
-    Buffered(&'static str),
 }
 
 /// State of [`StreamBodyLayer`]: the app-level router handle (the manager in
@@ -3309,9 +2919,6 @@ impl RouterTrait for Router {
 }
 
 #[cfg(test)]
-mod placed_tests;
-
-#[cfg(test)]
 mod tests {
     use std::{
         net::SocketAddr,
@@ -3442,7 +3049,6 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
-            policy_engine: None,
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -3510,7 +3116,6 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
-            policy_engine: None,
             ..create_test_regular_router()
         };
 
@@ -3861,7 +3466,6 @@ mod tests {
         Router {
             worker_registry,
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            policy_engine: None,
             retry_config: retry,
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -3987,7 +3591,6 @@ mod tests {
             ReleasePoint::from_retry_config(&router.retry_config),
         );
         let tried = parking_lot::Mutex::new(Vec::new());
-        let tried_rows = parking_lot::Mutex::new(Vec::new());
         let ledger = AttemptLedger::default();
         let attempt = TypedAttempt {
             headers: None,
@@ -3998,8 +3601,6 @@ mod tests {
             is_stream: false,
             ledger: &ledger,
             tried: &tried,
-            tried_rows: &tried_rows,
-            rid: None,
         };
         let select = || {
             let worker = router
@@ -4634,7 +4235,6 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
-            policy_engine: None,
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -6172,7 +5772,6 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
-            policy_engine: None,
             ..create_test_regular_router()
         };
 

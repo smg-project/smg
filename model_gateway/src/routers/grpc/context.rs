@@ -21,13 +21,8 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::RequestDeadline;
-use smg_policy_controller::{
-    engine::WorkerId,
-    tracking::{ReleaseReason, TransportClass},
-};
 use smg_worker::identity::basic::{RuntimeType, Worker, WorkerLoadGuard};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
@@ -39,7 +34,7 @@ use super::{
         stages::{
             encode::EncodeDispatchPlan,
             helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
-            pd_protocol::{EncodeHandoff, PdDispatch, PdProtocol},
+            pd_protocol::{EncodeHandoff, PdProtocol},
             request_execution::EncodeWatch,
             RateLimitCell,
         },
@@ -57,21 +52,17 @@ use super::{
         symphony::{PromptReplay, Reading},
     },
     spec::{MessagesTools, ResponseSpec},
-    utils::{tonic_ext::transport_class_of, Names, ParserResolver, WorkerDecoding},
+    utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
     config::ParserChoice,
     middleware::{RequestStarted, TenantRequestMeta},
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
-    policy_controller::engine::{End, Held, Placed},
     routers::{
         common::{
-            attempt_ledger::AttemptLedger,
-            pd_admission::{self, PdAdmissionGuard},
-            prefill_admission::PrefillLoadGuard,
-            snapshot::WorkerRegistry,
-            sse::SseSender,
+            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
+            prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
         },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
@@ -356,8 +347,6 @@ pub(crate) struct ProcessingState {
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
-    /// The controller's placement, held through client acquisition and request building.
-    pub placed: Option<Placed>,
 
     /// Effective sticky key (header wins, rid-derived falls back), recorded by
     /// worker selection so load guards account keyed load identically.
@@ -390,9 +379,8 @@ pub(crate) struct RoutingSnapshot {
     /// reads request text next to them.
     pub routing_text: Option<String>,
     /// The body's `rid`, kept at first selection where a retry reads it: the
-    /// classic sticky key derives from it again, and an ask of the policy
-    /// controller states it. It stands in the derived key's place, so the
-    /// dispatch context keeps its size class.
+    /// sticky key derives from it again. It stands in the derived key's
+    /// place, so the dispatch context keeps its size class.
     pub rid: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
@@ -460,11 +448,6 @@ pub(crate) struct DispatchContext {
     /// a retry's re-selection skips them while another available worker is
     /// left (see `placement::PlacementInputs::tried`).
     pub tried: Vec<String>,
-    /// The store rows of the attempts that failed, which a retry names as
-    /// tried: one an attempt at most, and a pair's decode beside its
-    /// prefill. A boxed slice, two words: the context fills its size class,
-    /// and a failed attempt alone rebuilds it.
-    pub tried_rows: Box<[WorkerId]>,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -484,8 +467,6 @@ pub(crate) struct DispatchContext {
     pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
-    /// The attempt's placement, taken when the dispatch creates its load guards.
-    pub placed: Option<Placed>,
     pub sticky_key: Option<String>,
     pub clients: Option<ClientSelection>,
     /// Consumed by the first dispatch; a rendezvous retry re-dispatches only the
@@ -514,107 +495,6 @@ impl DispatchContext {
     /// Cached tokenizer (cheap Arc clone).
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.tokenizer.clone()
-    }
-
-    /// The placement of this dispatch, which its guards hold after a send.
-    pub(crate) fn placement(&self) -> Option<&Placement> {
-        self.load_guards.as_ref().and_then(LoadGuards::placement)
-    }
-
-    /// The dispatch's claim at the decode's admission gate, for
-    /// `sub_requests` rooms. The gate abstains for a worker that reports no
-    /// window, and a dispatch with no decode side has no gate.
-    ///
-    /// A pair the policy controller placed is committed first: both sides
-    /// say their dispatch. The gate may hold the request longer than a
-    /// booking waits for its dispatch, and a decode may follow a whole
-    /// prefill. A side left waiting would end at its dispatch deadline, and
-    /// the request would then run with no booking. A single says its send
-    /// where its guards are made.
-    ///
-    /// Both workers stay booked through the gate's wait, as the prefill's
-    /// admission slot does. A shed at the gate drops the placement: each
-    /// side ends as cancelled, on a worker that was sent nothing. By then
-    /// the stages have heard a dispatch. A span the router states runs from
-    /// the send, which the guards read after the gate. A cancelled side's
-    /// span is the lease's own, and it runs from this commit.
-    pub(crate) async fn admit(
-        &mut self,
-        sub_requests: usize,
-    ) -> Result<Option<PdAdmissionGuard>, axum::response::Response> {
-        self.commit_pair(Instant::now(), sub_requests);
-        match self
-            .workers
-            .as_ref()
-            .and_then(WorkerSelection::decode_worker)
-        {
-            Some(decode) => pd_admission::admit_decode(decode, &self.model_id, sub_requests).await,
-            None => Ok(None),
-        }
-    }
-
-    /// Both sides of a placed pair say their dispatch at `now`, but for one
-    /// decode: a decode that stands chosen on a sequential dispatch of one
-    /// request. That one is asked again behind its prefill's answer and
-    /// says its dispatch at its own send ([`Placement::decode_dispatched`]):
-    /// it holds no booking that could end ahead of that send. Every other
-    /// decode keeps the first decision's worker and is booked here: on a
-    /// dispatch that sends both sides at once, and in a batch, whose
-    /// sub-requests ride the one placement on that worker.
-    fn commit_pair(&mut self, now: Instant, sub_requests: usize) {
-        let sequential = self
-            .workers
-            .as_ref()
-            .and_then(WorkerSelection::disaggregated_runtime_type)
-            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
-            .is_some_and(|protocol| protocol.dispatch == PdDispatch::Sequential);
-        let Some(placed) = self.placed.as_mut() else {
-            return;
-        };
-        if placed.decode().is_some() {
-            placed.dispatched(now);
-            let asked_again = sequential && sub_requests <= 1 && placed.decode_waits();
-            if !asked_again {
-                placed.keep_first_decode(now);
-            }
-        }
-    }
-
-    /// A failed attempt says its end, lets its workers go and names its
-    /// rows as tried: the worker's, and a pair's decode beside it. After a
-    /// send the guards hold the placement: it is told the failure's status
-    /// and class at `now`, with no tokens, and the rows are its own. Ahead
-    /// of a send the placement is still on the context: it goes unsent and
-    /// reports itself as abandoned, and its rows are named all the same. A
-    /// pair shed at the admission gate was committed there, so each of its
-    /// sides ends as cancelled. The guards go, and with them the worker's
-    /// load and any admission claim.
-    pub(crate) fn release_attempt(&mut self, failure: &axum::response::Response, now: Instant) {
-        let rows = self
-            .placement()
-            .map(|placement| {
-                placement.ended(
-                    failure.status().as_u16(),
-                    transport_class_of(failure),
-                    0,
-                    0,
-                    now,
-                );
-                (placement.id(), placement.decode_id())
-            })
-            .or_else(|| {
-                self.placed
-                    .as_ref()
-                    .map(|placed| (placed.id(), placed.decode_id()))
-            });
-        self.load_guards = None;
-        self.placed = None;
-        if let Some((row, decode)) = rows {
-            let mut tried = std::mem::take(&mut self.tried_rows).into_vec();
-            tried.push(row);
-            tried.extend(decode);
-            self.tried_rows = tried.into_boxed_slice();
-        }
     }
 }
 
@@ -1160,226 +1040,11 @@ pub(crate) struct DispatchMetadata {
     pub weight_version: Option<String>,
 }
 
-/// A response's shared hold on the decision's lease and the worker's load.
-/// Dropping the last hold reports any end still owed.
-#[derive(Clone)]
-pub(crate) struct Placement {
-    cell: Arc<Mutex<Hold>>,
-    sent: Instant,
-    /// The ends said, kept for the cases: a closed lease leaves the store,
-    /// so no case can read its end there.
-    #[cfg(test)]
-    ends: Arc<Mutex<Vec<End>>>,
-}
-
-/// What the holds of one placement share: the lease with the worker's load,
-/// and the prefill phases of a pair's dispatch that have yet to end.
-struct Hold {
-    held: Held,
-    /// The prefill phases still running, one a sub-request of the dispatch.
-    /// The prefill's side ends with the last of them.
-    prefills: usize,
-    /// The prompt tokens the ended phases read, said with the side's end.
-    prompt_tokens: u32,
-    /// The claim at the decode's admission gate of a pair whose decode is
-    /// asked again: held here, beside the load guard, so the claim moves
-    /// with the decode ([`Placement::claim_moved`]).
-    claim: Option<PdAdmissionGuard>,
-}
-
-impl Hold {
-    fn placed(&mut self) -> &mut Placed {
-        self.held.placed()
-    }
-}
-
-impl Placement {
-    /// A hold on `held` for a dispatch sent at `sent` as `prefills`
-    /// sub-requests.
-    fn new(held: Held, sent: Instant, prefills: usize) -> Self {
-        let hold = Hold {
-            held,
-            prefills,
-            prompt_tokens: 0,
-            claim: None,
-        };
-        Self {
-            cell: Arc::new(Mutex::new(hold)),
-            sent,
-            #[cfg(test)]
-            ends: Arc::default(),
-        }
-    }
-
-    /// The store's row of the placed worker, which a retry names as tried.
-    pub(crate) fn id(&self) -> WorkerId {
-        self.cell.lock().placed().id()
-    }
-
-    /// The store's row of a placed pair's decode worker, which a retry
-    /// names as tried beside the prefill's. A single has none.
-    pub(crate) fn decode_id(&self) -> Option<WorkerId> {
-        self.cell.lock().placed().decode_id()
-    }
-
-    /// Whether the placed pair's decode stands chosen and unbooked
-    /// ([`Placed::decode_waits`]): its ask stated the later decode, and its
-    /// dispatch is said at its own send.
-    pub(crate) fn decode_waits(&self) -> bool {
-        self.cell.lock().placed().decode_waits()
-    }
-
-    /// Asks the placed pair's decode again at `now`, with the ask its stage
-    /// kept ([`Held::decode_again`]) and `holds` beside the stage's rule.
-    /// The decode the placement moved to comes back, with the load guard
-    /// moved to it, and `None` where the placement keeps the one it named.
-    pub(crate) fn decode_again(
-        &self,
-        holds: impl Fn(&Arc<dyn Worker>) -> bool,
-        now: Instant,
-    ) -> Option<Arc<dyn Worker>> {
-        self.cell.lock().held.decode_again(holds, now)
-    }
-
-    /// The pair's decode moved behind a second ask: `claim`, taken at the
-    /// moved decode's gate, takes the place of the first decode's claim,
-    /// and `None` does where the moved decode's engine reports no window.
-    /// The new claim was taken first, so for this instant the request holds
-    /// rooms at both gates. The first worker's rooms are given back here.
-    pub(crate) fn claim_moved(&self, claim: Option<PdAdmissionGuard>) {
-        let first = std::mem::replace(&mut self.cell.lock().claim, claim);
-        drop(first);
-    }
-
-    /// The placed pair's decode was sent at `now`. Said once: a decode that
-    /// said its dispatch where the dispatch began says nothing again.
-    pub(crate) fn decode_dispatched(&self, now: Instant) {
-        self.cell.lock().placed().decode_dispatched(now);
-    }
-
-    /// `selection` with the decode this placement names now, where a second
-    /// ask moved the pair's decode off the one the selection holds. `None`
-    /// where the two name one worker, and for a single.
-    pub(crate) fn moved(&self, selection: &WorkerSelection) -> Option<WorkerSelection> {
-        let decode = self.cell.lock().placed().decode().cloned()?;
-        let first = selection.decode_worker()?;
-        (!Arc::ptr_eq(first, &decode)).then(|| selection.with_decode(decode))
-    }
-
-    /// One prefill phase of a placed pair ended whole at `now`, having read
-    /// `tokens_in` of the prompt. A dispatch runs one phase a sub-request,
-    /// all on the one prefill worker, and the prefill's side ends with the
-    /// last of them: there its admission slot is freed, and the controller
-    /// reads its worker free while the decode runs. The decode's side stands
-    /// to the response's end. A single has no phase that ends here.
-    pub(crate) fn prefill_ended(&self, tokens_in: u32, now: Instant) {
-        let mut held = self.cell.lock();
-        held.prompt_tokens = held.prompt_tokens.saturating_add(tokens_in);
-        held.prefills = held.prefills.saturating_sub(1);
-        if held.prefills > 0 {
-            return;
-        }
-        let end = End {
-            status: 200,
-            class: TransportClass::Ok,
-            ttft_micros: 0,
-            tokens_in: held.prompt_tokens,
-            tokens_out: 0,
-            duration_micros: self.micros_to(now),
-        };
-        let placed = held.placed();
-        let side_ended = placed.decode().is_some();
-        if side_ended {
-            placed.completed(end, now);
-        }
-        drop(held);
-        #[cfg(test)]
-        if side_ended {
-            self.ends.lock().push(end);
-        }
-    }
-
-    /// The time from the dispatch to `now` in whole microseconds.
-    fn micros_to(&self, now: Instant) -> u32 {
-        let micros = now.saturating_duration_since(self.sent).as_micros();
-        u32::try_from(micros).unwrap_or(u32::MAX)
-    }
-
-    /// Report the dispatch's status, transport class and token counts at
-    /// `now`. The lease takes its first end. The router has no time to the
-    /// first token for this report and sends zero.
-    ///
-    /// A pair's whole answer ends both of its sides, and the prefill wrote
-    /// no token of it. A prefill that said its end at its phase boundary
-    /// ([`Self::prefill_ended`]) says none again, and the answer ends the
-    /// decode alone. Any other end of a pair names no side, so the pair is
-    /// given up: a side that was sent ends as cancelled, one that was not
-    /// is released, and neither worker is charged.
-    pub(crate) fn ended(
-        &self,
-        status: u16,
-        class: TransportClass,
-        tokens_in: u32,
-        tokens_out: u32,
-        now: Instant,
-    ) {
-        let end = End {
-            status,
-            class,
-            ttft_micros: 0,
-            tokens_in,
-            tokens_out,
-            duration_micros: self.micros_to(now),
-        };
-        let mut held = self.cell.lock();
-        let placed = held.placed();
-        if placed.decode().is_none() {
-            placed.completed(end, now);
-        } else if class == TransportClass::Ok {
-            placed.completed(
-                End {
-                    tokens_out: 0,
-                    ..end
-                },
-                now,
-            );
-            placed.decode_completed(end, now);
-        } else {
-            placed.released(ReleaseReason::Abandoned, now);
-        }
-        drop(held);
-        #[cfg(test)]
-        self.ends.lock().push(end);
-    }
-
-    /// The dispatch ended whole, with these token counts.
-    pub(crate) fn completed(&self, tokens_in: u32, tokens_out: u32) {
-        self.ended(
-            200,
-            TransportClass::Ok,
-            tokens_in,
-            tokens_out,
-            Instant::now(),
-        );
-    }
-
-    #[cfg(test)]
-    pub(super) fn ends(&self) -> Arc<Mutex<Vec<End>>> {
-        Arc::clone(&self.ends)
-    }
-}
-
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
 pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
-    },
-    /// A dispatch placed by the controller: a single worker, or a pair
-    /// with its decode's load. The pointer keeps the classic dispatch's
-    /// guard size unchanged.
-    Placed {
-        placement: Placement,
     },
     /// Disaggregated guards cover the decode side only. The Prefill load is
     /// a `PrefillLoadGuard` that drops when the Prefill phase ends.
@@ -1434,21 +1099,13 @@ impl LoadGuards {
     /// Bind an admission claim to the dispatch's guards, so the rooms it
     /// reserved outlive nothing else. `None` (the engine reports no window)
     /// returns the guards untouched.
-    ///
-    /// A placed pair whose decode is asked again holds its claim in the
-    /// placement, beside the decode's load guard: where the decode moves,
-    /// the claim moves with it ([`Placement::claim_moved`]).
     pub fn admitted(admission: Option<PdAdmissionGuard>, guards: Self) -> Self {
-        match (admission, guards) {
-            (Some(admission), Self::Placed { placement }) if placement.decode_waits() => {
-                placement.cell.lock().claim = Some(admission);
-                Self::Placed { placement }
-            }
-            (Some(admission), guards) => Self::Admitted {
+        match admission {
+            Some(admission) => Self::Admitted {
                 _admission: admission,
                 _guards: Box::new(guards),
             },
-            (None, guards) => guards,
+            None => guards,
         }
     }
 
@@ -1470,68 +1127,6 @@ impl LoadGuards {
                     .map(|_| Self::new(selection, routing_key))
                     .collect(),
             }
-        }
-    }
-
-    /// One load guard per sub-request. The first guard holds the dispatch's
-    /// one lease, so the controller counts the batch as one request.
-    pub fn placed(
-        selection: &WorkerSelection,
-        routing_key: Option<&str>,
-        count: usize,
-        placed: Placed,
-        sent: Instant,
-    ) -> Self {
-        let first = Self::Placed {
-            placement: Placement::new(
-                Held::new(placed, |worker| {
-                    WorkerLoadGuard::with_key(Arc::clone(worker), routing_key)
-                }),
-                sent,
-                count.max(1),
-            ),
-        };
-        if count <= 1 {
-            first
-        } else {
-            Self::Batch {
-                _guards: std::iter::once(first)
-                    .chain((1..count).map(|_| Self::new(selection, routing_key)))
-                    .collect(),
-            }
-        }
-    }
-
-    /// The guards of a dispatch at its send, at `now`. A placement of the
-    /// controller rides them. A single is told the send here. A pair was
-    /// committed where its dispatch began, ahead of the admission gate
-    /// ([`DispatchContext::admit`]). With no placement they are the classic
-    /// guards of [`Self::scaled`].
-    pub fn at_dispatch(
-        selection: &WorkerSelection,
-        routing_key: Option<&str>,
-        count: usize,
-        placed: Option<Placed>,
-        now: Instant,
-    ) -> Self {
-        match placed {
-            Some(mut placed) => {
-                if placed.decode().is_none() {
-                    placed.dispatched(now);
-                }
-                Self::placed(selection, routing_key, count, placed, now)
-            }
-            None => Self::scaled(selection, routing_key, count),
-        }
-    }
-
-    /// The placement these guards hold, when the controller placed the dispatch.
-    pub fn placement(&self) -> Option<&Placement> {
-        match self {
-            Self::Placed { placement } => Some(placement),
-            Self::Batch { _guards } => _guards.first().and_then(Self::placement),
-            Self::Admitted { _guards, .. } | Self::Traced { _guards, .. } => _guards.placement(),
-            Self::Single { .. } | Self::Disaggregated { .. } => None,
         }
     }
 }
@@ -1709,9 +1304,8 @@ impl RequestContext {
             cache_trace: None,
             parser,
             attempt: 0,
-            ledger: AttemptLedger::of(self.state.placed.is_some()),
+            ledger: AttemptLedger::default(),
             tried: Vec::new(),
-            tried_rows: Box::default(),
             model_id,
             dispatch_model,
             streaming,
@@ -1723,7 +1317,6 @@ impl RequestContext {
             constraint_decided_on: self.state.constraint_decided_on,
             tokenizer: self.state.tokenizer,
             workers: self.state.workers,
-            placed: self.state.placed,
             sticky_key: self.state.sticky_key,
             clients: self.state.clients,
             encode_outputs: self.state.encode_outputs,
@@ -2074,28 +1667,6 @@ impl WorkerSelection {
         }
     }
 
-    /// The selection with `decode` as its decode worker: a pair whose decode
-    /// was asked again behind its prefill's answer and moved. A single
-    /// worker's selection stands.
-    pub(crate) fn with_decode(&self, decode: Arc<dyn Worker>) -> Self {
-        match self {
-            Self::Disaggregated {
-                encode_assignments,
-                prefill,
-                runtime_type,
-                ..
-            } => Self::Disaggregated {
-                encode_assignments: encode_assignments.clone(),
-                prefill: Arc::clone(prefill),
-                decode,
-                runtime_type: *runtime_type,
-            },
-            Self::Single { worker } => Self::Single {
-                worker: Arc::clone(worker),
-            },
-        }
-    }
-
     /// Get the runtime type for disaggregated mode.
     pub fn disaggregated_runtime_type(&self) -> Option<&RuntimeType> {
         match self {
@@ -2374,698 +1945,14 @@ pub(crate) enum FinalResponse {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
-    use smg_policy_controller::{
-        document::DecodePick,
-        engine::Phase,
-        store::{GatewayId, LeasesStore, MemoryStore},
-    };
-    use smg_worker::identity::basic::ConnectionMode;
-
-    use super::*;
-    use crate::{
-        policy_controller::engine::{testing, Ask, KeptAsk},
-        routers::grpc::backend_client::BasicWorkerBuilder,
-    };
-
-    /// The two decodes of [`place_pair_waiting`].
-    pub(crate) const DECODES: [&str; 2] = ["http://decode-0:8000", "http://decode-1:8000"];
-
-    /// A pair under a document that picks the decode after the prefill, over
-    /// one prefill and two decodes whose loads name the first, with the ask
-    /// kept for its second ask as the selection stage keeps it. The
-    /// prefill's admission guard and the store come with it.
-    pub(super) async fn place_pair_waiting() -> (Placed, PrefillLoadGuard, Arc<MemoryStore>) {
-        let (policy_engine, store, _) =
-            testing::pair_bed_picking(DecodePick::AfterPrefill, &["http://prefill:8000"], &DECODES);
-        let policy_engine = Arc::new(policy_engine);
-        testing::report_loads(&store, DECODES[1], DECODES[0]);
-        let ask = Ask {
-            phase: Phase::Prefill,
-            decode_again: true,
-            ..Ask::of(b"placed", testing::MODEL)
-        };
-        let (mut placed, guard) = policy_engine
-            .place_pair(&ask, None, None)
-            .await
-            .expect("a placed pair");
-        placed.keep_ask(KeptAsk::of(&policy_engine, &ask, |_| true));
-        (placed, guard, store)
-    }
-
-    /// A sequential pair as its dispatch holds it behind its prefill's
-    /// answer, under a document that picks the decode after the prefill:
-    /// placed over one prefill and the two decodes `shaped` makes of
-    /// [`DECODES`], its ask kept, committed, and through the first decode's
-    /// admission gate. The loads have turned over since the first decision:
-    /// the first decode is deep in its queue now and the second is free.
-    /// The guards, the selection the dispatch began with and the two decode
-    /// workers come back.
-    pub(crate) async fn pair_behind_its_prefill(
-        shaped: impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder,
-    ) -> (LoadGuards, WorkerSelection, [Arc<dyn Worker>; 2]) {
-        let prefills = ["http://prefill:8000"];
-        let bed = testing::pair_bed_shaped(DecodePick::AfterPrefill, shaped, &prefills, &DECODES);
-        let (policy_engine, store, workers) = bed;
-        let policy_engine = Arc::new(policy_engine);
-        testing::report_loads(&store, DECODES[1], DECODES[0]);
-        let ask = Ask {
-            phase: Phase::Prefill,
-            decode_again: true,
-            ..Ask::of(b"placed", testing::MODEL)
-        };
-        let (mut placed, room) = policy_engine
-            .place_pair(&ask, None, None)
-            .await
-            .expect("a placed pair");
-        placed.keep_ask(KeptAsk::of(&policy_engine, &ask, |_| true));
-        let WorkerSelection::Disaggregated {
-            encode_assignments,
-            prefill,
-            decode,
-            ..
-        } = pair_selection(&placed)
-        else {
-            panic!("a pair");
-        };
-        let mut ctx = dispatch_context(placed);
-        ctx.workers = Some(WorkerSelection::Disaggregated {
-            encode_assignments,
-            prefill,
-            decode,
-            runtime_type: RuntimeType::Vllm,
-        });
-        let admission = ctx.admit(1).await.expect("no shed");
-        let selection = ctx.workers.take().expect("the pair");
-        let sent = Instant::now();
-        let guards = LoadGuards::at_dispatch(&selection, Some("pair"), 1, ctx.placed.take(), sent);
-        let guards = LoadGuards::admitted(admission, guards);
-        // The prefill phase ends ahead of the answer, and its slot goes.
-        drop(room);
-        testing::report_loads(&store, DECODES[0], DECODES[1]);
-        let [_, first, second] =
-            <[Arc<dyn Worker>; 3]>::try_from(workers).expect("one prefill and two decodes");
-        (guards, selection, [first, second])
-    }
-
-    /// A pair the controller placed over one prefill and one decode, with
-    /// the prefill's admission guard and the store.
-    pub(super) async fn place_pair() -> (Placed, PrefillLoadGuard, Arc<MemoryStore>) {
-        let (policy_engine, store, _) =
-            testing::pair_bed(&["http://prefill:8000"], &["http://decode:8000"]);
-        let ask = Ask {
-            phase: Phase::Prefill,
-            ..Ask::of(b"placed", testing::MODEL)
-        };
-        let (placed, guard) = policy_engine
-            .place_pair(&ask, None, None)
-            .await
-            .expect("a placed pair");
-        (placed, guard, store)
-    }
-
-    /// The selection of a placed pair's two workers.
-    pub(super) fn pair_selection(placed: &Placed) -> WorkerSelection {
-        WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill: Arc::clone(placed.worker()),
-            decode: Arc::clone(placed.decode().expect("the pair's decode")),
-            runtime_type: RuntimeType::Vllm,
-        }
-    }
-
-    pub(in crate::routers::grpc) async fn place_worker() -> (Placed, Arc<MemoryStore>) {
-        let (policy_engine, store, _) = testing::bed(&["http://placed:8000"]);
-        let placed = policy_engine
-            .place(&Ask::of(b"placed", testing::MODEL), Instant::now())
-            .await
-            .expect("a placement");
-        (placed, store)
-    }
-
-    pub(in crate::routers::grpc) fn dispatch_context(placed: Placed) -> DispatchContext {
-        DispatchContext {
-            root_request_id: None,
-            request_id: None,
-            cache_trace: None,
-            parser: None,
-            attempt: 0,
-            ledger: Default::default(),
-            tried: Vec::new(),
-            tried_rows: Box::default(),
-            model_id: testing::MODEL.to_string(),
-            dispatch_model: testing::MODEL.to_string(),
-            streaming: false,
-            created: 0,
-            headers: None,
-            rate_limit_cell: None,
-            routing: RoutingSnapshot {
-                context_requirements: Default::default(),
-                routing_text: None,
-                rid: None,
-                cache_namespace: None,
-                needs_vision: false,
-                decode_needs_vision: false,
-            },
-            wire: WireConstraint {
-                runtime: RuntimeType::Vllm,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            },
-            constraint_decided_on: None,
-            tokenizer: None,
-            workers: Some(WorkerSelection::Single {
-                worker: Arc::clone(placed.worker()),
-            }),
-            placed: Some(placed),
-            sticky_key: None,
-            clients: None,
-            encode_outputs: None,
-            encode_watch: None,
-            dispatch: None,
-            load_guards: None,
-            multimodal_inflight: None,
-            pd_prefill_guard: None,
-            response: ResponseState::default(),
-        }
-    }
-
-    pub(in crate::routers::grpc) fn dispatched(placed: Placed, sent: Instant) -> LoadGuards {
-        let selection = WorkerSelection::Single {
-            worker: Arc::clone(placed.worker()),
-        };
-        LoadGuards::at_dispatch(&selection, None, 1, Some(placed), sent)
-    }
-
-    pub(in crate::routers::grpc) fn assert_end(
-        ends: &Mutex<Vec<End>>,
-        store: &MemoryStore,
-        status: u16,
-        class: TransportClass,
-        tokens_in: u32,
-        tokens_out: u32,
-    ) {
-        let ends = ends.lock();
-        let [end] = ends.as_slice() else {
-            panic!("expected one end, got {ends:?}");
-        };
-        assert_eq!(
-            (
-                end.status,
-                end.class,
-                end.ttft_micros,
-                end.tokens_in,
-                end.tokens_out
-            ),
-            (status, class, 0, tokens_in, tokens_out)
-        );
-        assert_eq!(LeasesStore::live(store, GatewayId::LOCAL), 0);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use smg_grpc_client::VllmEngineClient;
-    use smg_policy_controller::{
-        store::{GatewayId, LeasesStore, MemoryStore, WorkersStore},
-        tracking::{LeaseId, Side},
+
+    use super::*;
+    use crate::routers::{
+        common::prefill_admission::test_support::select_worker,
+        grpc::{client::GrpcClient, test_engine::mock_engine},
     };
-
-    use super::{
-        test_support::{
-            dispatch_context, dispatched, pair_selection, place_pair, place_pair_waiting,
-            place_worker, DECODES,
-        },
-        *,
-    };
-    use crate::{
-        policy_controller::engine::{testing, testing::report_loads},
-        routers::{
-            common::{pd_admission::admit_decode, prefill_admission::test_support::select_worker},
-            grpc::{
-                backend_client::BasicWorkerBuilder, client::GrpcClient, test_engine::mock_engine,
-            },
-        },
-    };
-
-    #[tokio::test]
-    async fn a_placement_says_its_end_with_the_time_since_its_send() {
-        use std::time::Duration;
-
-        for (elapsed, micros) in [
-            (Duration::from_micros(347), 347),
-            (Duration::from_secs(5_000), u32::MAX),
-        ] {
-            let (placed, store) = place_worker().await;
-            let sent = Instant::now();
-            let guards = dispatched(placed, sent);
-            let placement = guards.placement().expect("the dispatch's placement");
-            placement.ended(200, TransportClass::Ok, 17, 5, sent + elapsed);
-            assert!(matches!(
-                placement.ends().lock().as_slice(),
-                [End {
-                    status: 200,
-                    class: TransportClass::Ok,
-                    ttft_micros: 0,
-                    tokens_in: 17,
-                    tokens_out: 5,
-                    duration_micros,
-                }] if *duration_micros == micros
-            ));
-            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_placed_dispatch_says_its_send() {
-        // A lease no dispatch names ends at its dispatch deadline.
-        let (placed, store) = place_worker().await;
-        let late = Instant::now() + std::time::Duration::from_secs(60);
-        assert_eq!(store.expire(late).len(), 1);
-        drop(placed);
-
-        // A dispatched lease has no such deadline, and it rides the guards.
-        let (placed, store) = place_worker().await;
-        let selection = WorkerSelection::Single {
-            worker: Arc::clone(placed.worker()),
-        };
-        let guards = LoadGuards::at_dispatch(&selection, None, 1, Some(placed), Instant::now());
-        assert!(guards.placement().is_some());
-        assert!(store.expire(late).is_empty());
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        drop(guards);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-
-        // With no placement the guards are the classic ones.
-        let guards = LoadGuards::at_dispatch(&selection, None, 1, None, Instant::now());
-        assert!(guards.placement().is_none());
-    }
-
-    #[tokio::test]
-    async fn the_guards_of_a_placed_dispatch_carry_the_placement() {
-        let (placed, store) = place_worker().await;
-        let id = placed.id();
-        let worker = Arc::clone(placed.worker());
-        let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
-        };
-        let guards = LoadGuards::placed(&selection, None, 1, placed, Instant::now());
-        assert_eq!(guards.placement().map(Placement::id), Some(id));
-
-        let guards = LoadGuards::traced(tracing::Span::none(), guards);
-        assert_eq!(guards.placement().map(Placement::id), Some(id));
-
-        let decode: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://admission:9000")
-                .label("max_running_requests", "1")
-                .build(),
-        );
-        let admission = admit_decode(&decode, "model-a", 1).await.expect("admitted");
-        assert!(admission.is_some());
-        let guards = LoadGuards::admitted(admission, guards);
-        let placement = guards
-            .placement()
-            .expect("the placement under both wrappers")
-            .clone();
-        assert_eq!(placement.id(), id);
-        drop(guards);
-        assert_eq!(
-            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
-            (1, 1)
-        );
-        drop(placement);
-        assert_eq!(
-            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
-            (0, 0)
-        );
-    }
-
-    #[tokio::test]
-    async fn a_placed_batch_holds_one_lease_beside_its_guards() {
-        let (placed, store) = place_worker().await;
-        let id = placed.id();
-        let worker = Arc::clone(placed.worker());
-        let selection = WorkerSelection::Single {
-            worker: Arc::clone(&worker),
-        };
-        let guards = LoadGuards::placed(&selection, Some("batch"), 3, placed, Instant::now());
-        assert_eq!(guards.placement().map(Placement::id), Some(id));
-        let LoadGuards::Batch { _guards: batch } = &guards else {
-            panic!("a batch of load guards");
-        };
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch.iter().filter_map(LoadGuards::placement).count(), 1);
-        assert_eq!(
-            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
-            (1, 3)
-        );
-        assert_eq!(worker.routing_key_inflight("batch"), 3);
-        drop(guards);
-        assert_eq!(
-            (LeasesStore::live(&*store, GatewayId::LOCAL), worker.load()),
-            (0, 0)
-        );
-        assert_eq!(worker.routing_key_inflight("batch"), 0);
-    }
-
-    #[tokio::test]
-    async fn the_guards_of_a_placed_pair_carry_one_placement_and_both_loads() {
-        let (placed, admission, store) = place_pair().await;
-        let rows = (placed.id(), placed.decode_id());
-        assert!(rows.1.is_some());
-        let selection = pair_selection(&placed);
-        let (Some(prefill), Some(decode)) = (selection.prefill_worker(), selection.decode_worker())
-        else {
-            panic!("a pair");
-        };
-        // The prefill's load is its admission guard's, held apart.
-        assert_eq!((prefill.load(), decode.load()), (1, 0));
-        let guards =
-            LoadGuards::at_dispatch(&selection, Some("pair"), 3, Some(placed), Instant::now());
-        let placement = guards.placement().expect("the pair's placement");
-        assert_eq!((placement.id(), placement.decode_id()), rows);
-        let LoadGuards::Batch { _guards: batch } = &guards else {
-            panic!("a batch of load guards");
-        };
-        assert_eq!(batch.iter().filter_map(LoadGuards::placement).count(), 1);
-        // One lease for the pair, and the decode's keyed load a sub-request.
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        assert_eq!((prefill.load(), decode.load()), (1, 3));
-        assert_eq!(decode.routing_key_inflight("pair"), 3);
-
-        // The prefill phase ends first: its slot goes, and the response's
-        // holds stand.
-        drop(admission);
-        assert_eq!((prefill.load(), decode.load()), (0, 3));
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        drop(guards);
-        assert_eq!((decode.load(), decode.routing_key_inflight("pair")), (0, 0));
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-    }
-
-    /// The guards of a pair whose decode stands chosen, as a dispatch of
-    /// `runtime`'s shape and of `count` sub-requests makes them at its
-    /// commit, with the selection the dispatch began with.
-    async fn committed_waiting(
-        runtime: RuntimeType,
-        count: usize,
-    ) -> (LoadGuards, WorkerSelection, Arc<MemoryStore>) {
-        let (placed, room, store) = place_pair_waiting().await;
-        let WorkerSelection::Disaggregated {
-            encode_assignments,
-            prefill,
-            decode,
-            ..
-        } = pair_selection(&placed)
-        else {
-            panic!("a pair");
-        };
-        let mut ctx = dispatch_context(placed);
-        ctx.workers = Some(WorkerSelection::Disaggregated {
-            encode_assignments,
-            prefill,
-            decode,
-            runtime_type: runtime,
-        });
-        let admission = ctx.admit(count).await.expect("no shed");
-        assert!(admission.is_none(), "no window is reported");
-        let selection = ctx.workers.take().expect("the pair");
-        let sent = Instant::now();
-        let placed = ctx.placed.take();
-        let guards = LoadGuards::at_dispatch(&selection, Some("pair"), count, placed, sent);
-        // The prefill phase ends ahead of the answer, and its slot goes.
-        drop(room);
-        (guards, selection, store)
-    }
-
-    /// Under a document that picks the decode after the prefill, a
-    /// sequential pair's commit says the prefill's dispatch alone. The
-    /// decode is asked again behind the prefill's answer and follows the
-    /// loads of that instant. Its row, its load guard and the dispatch's
-    /// selection move with it, and both sides end with the answer.
-    #[tokio::test]
-    async fn a_sequential_pairs_decode_is_asked_again_and_moves_whole() {
-        let (guards, selection, store) = committed_waiting(RuntimeType::Vllm, 1).await;
-        let placement = guards.placement().expect("the pair's placement");
-        let first = Arc::clone(selection.decode_worker().expect("the first decode"));
-        assert_eq!(first.url(), DECODES[0]);
-        assert!(
-            placement.decode_waits(),
-            "the commit said the decode's dispatch"
-        );
-        assert_eq!(first.load(), 1);
-
-        // The loads turn over while the prefill runs.
-        let answered = report_loads(&store, DECODES[0], DECODES[1]);
-        let moved = placement
-            .decode_again(|_| true, answered)
-            .expect("the decode moved");
-        assert_eq!(moved.url(), DECODES[1]);
-        let row = store.by_key(DECODES[1]).map(|row| row.id);
-        assert_eq!(placement.decode_id(), row);
-        // The load guard went with the decode, under the first guard's key.
-        assert_eq!((first.load(), moved.load()), (0, 1));
-        assert_eq!(
-            (
-                first.routing_key_inflight("pair"),
-                moved.routing_key_inflight("pair")
-            ),
-            (0, 1)
-        );
-        // The selection of the dispatch names the decode that is sent.
-        let turned = placement.moved(&selection).expect("the selection moved");
-        let sent_to = turned.decode_worker().expect("a pair's decode");
-        assert!(Arc::ptr_eq(sent_to, &moved));
-        assert!(placement.moved(&turned).is_none());
-        // A decode asked once is not asked twice.
-        assert!(placement.decode_again(|_| true, answered).is_none());
-
-        // The words in a sequential dispatch's order: the decode's dispatch,
-        // the prefill's end, the answer's end.
-        placement.decode_dispatched(answered);
-        assert!(!placement.decode_waits());
-        placement.prefill_ended(37, answered);
-        placement.completed(37, 4);
-        drop(guards);
-        assert_eq!(moved.load(), 0);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-    }
-
-    /// A dispatch that will not ask its decode again says both dispatches
-    /// at its commit, under a document that picks the decode after the
-    /// prefill too: one that sends both sides at once, and a sequential
-    /// batch. The first decision's decode is booked there, and nothing asks
-    /// it again.
-    #[tokio::test]
-    async fn a_commit_that_asks_no_second_time_says_both_dispatches() {
-        for (runtime, count) in [(RuntimeType::Sglang, 1), (RuntimeType::Vllm, 2)] {
-            let (guards, selection, store) = committed_waiting(runtime, count).await;
-            let placement = guards.placement().expect("the pair's placement");
-            assert!(!placement.decode_waits(), "{runtime:?} x{count}");
-            let answered = report_loads(&store, DECODES[0], DECODES[1]);
-            assert!(placement.decode_again(|_| true, answered).is_none());
-            assert!(placement.moved(&selection).is_none());
-            let row = store.by_key(DECODES[0]).map(|row| row.id);
-            assert_eq!(placement.decode_id(), row, "{runtime:?} x{count}");
-            placement.completed(37, 4);
-            drop(guards);
-            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-        }
-    }
-
-    /// The guards of a placed pair for `count` sub-requests, as a dispatch
-    /// makes them: the pair committed at its claim on the gate, which
-    /// abstains here, and its guards made at `sent`.
-    async fn dispatched_pair(placed: Placed, count: usize, sent: Instant) -> LoadGuards {
-        let selection = pair_selection(&placed);
-        let mut ctx = dispatch_context(placed);
-        ctx.workers = Some(selection);
-        let admission = ctx.admit(count).await.expect("no shed");
-        assert!(admission.is_none(), "no window is reported");
-        let selection = ctx.workers.as_ref().expect("the pair");
-        LoadGuards::at_dispatch(selection, None, count, ctx.placed.take(), sent)
-    }
-
-    /// Whether each side of a pair's lease still stands live in the store,
-    /// issued or dispatched: the prefill's, then the decode's.
-    fn live_sides(store: &MemoryStore, lease: LeaseId) -> (bool, bool) {
-        let sides = store.sides(GatewayId::LOCAL, lease);
-        let live = |side| {
-            sides
-                .and_then(|sides| sides.side(side))
-                .is_some_and(|(_, state)| state.is_live())
-        };
-        (live(Side::Prefill), live(Side::Decode))
-    }
-
-    #[tokio::test]
-    async fn a_placed_pair_keeps_both_bookings_through_a_wait_at_the_admission_gate() {
-        let (placed, _slot, store) = place_pair().await;
-        let lease = testing::lease_of(&placed);
-        let mut selection = pair_selection(&placed);
-        let WorkerSelection::Disaggregated { decode, .. } = &mut selection else {
-            panic!("a pair");
-        };
-        // The decode's window is one request wide, and another request
-        // holds it.
-        let gated: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://gated:9000")
-                .label("max_running_requests", "1")
-                .build(),
-        );
-        *decode = Arc::clone(&gated);
-        let holder = admit_decode(&gated, testing::MODEL, 1)
-            .await
-            .expect("no shed")
-            .expect("a claim");
-        let mut ctx = dispatch_context(placed);
-        ctx.workers = Some(selection);
-        let mut waiting = Box::pin(ctx.admit(1));
-        assert!(
-            futures::poll!(waiting.as_mut()).is_pending(),
-            "the window is full"
-        );
-        // The wait outlasts the dispatch deadline, and no side is lost.
-        let late = Instant::now() + std::time::Duration::from_secs(60);
-        assert!(store.expire(late).is_empty(), "no side waited");
-        drop(holder);
-        let admission = waiting.await.expect("no shed");
-        assert!(admission.is_some(), "the freed room is claimed");
-        assert_eq!(live_sides(&store, lease), (true, true));
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-    }
-
-    #[tokio::test]
-    async fn a_dispatch_commits_a_placed_pair_and_leaves_a_single_to_its_guards() {
-        // A decode follows a whole prefill. The pair is committed where its
-        // dispatch begins, so the prefill can run past the dispatch deadline
-        // with no decode sent.
-        let (placed, _slot, store) = place_pair().await;
-        let lease = testing::lease_of(&placed);
-        let guards = dispatched_pair(placed, 1, Instant::now()).await;
-        let late = Instant::now() + std::time::Duration::from_secs(60);
-        assert!(store.expire(late).is_empty(), "no side waited");
-        assert_eq!(live_sides(&store, lease), (true, true));
-        drop(guards);
-
-        // A single says its send where its guards are made: the claim says
-        // nothing of it, and its lease still waits for a dispatch.
-        let (placed, store) = place_worker().await;
-        let mut ctx = dispatch_context(placed);
-        assert!(ctx.admit(1).await.expect("no shed").is_none());
-        assert!(!store.expire(late).is_empty(), "the single still waited");
-    }
-
-    #[tokio::test]
-    async fn a_placed_pairs_prefill_ends_at_its_phase_boundary() {
-        let (placed, admission, store) = place_pair().await;
-        let lease = testing::lease_of(&placed);
-        let sent = Instant::now();
-        let guards = dispatched_pair(placed, 1, sent).await;
-        let placement = guards.placement().expect("the pair's placement");
-        assert_eq!(live_sides(&store, lease), (true, true));
-        // The prefill is drained: its admission guard goes, and its side
-        // ends with it. The decode's side stands for the response.
-        drop(admission);
-        placement.prefill_ended(17, sent);
-        assert_eq!(live_sides(&store, lease), (false, true));
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        // The whole answer has the decode's end alone left to say.
-        placement.completed(17, 5);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-
-        // A single has no prefill phase: the word says nothing of its lease.
-        let (placed, store) = place_worker().await;
-        let guards = dispatched(placed, sent);
-        let placement = guards.placement().expect("the dispatch's placement");
-        placement.prefill_ended(17, sent);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-    }
-
-    #[tokio::test]
-    async fn a_batched_pairs_prefill_ends_with_its_last_phase() {
-        // Three prompts of one completion run three prefill phases on the
-        // pair's one prefill worker, under one lease.
-        let (placed, _admission, store) = place_pair().await;
-        let lease = testing::lease_of(&placed);
-        let sent = Instant::now();
-        let guards = dispatched_pair(placed, 3, sent).await;
-        let placement = guards.placement().expect("the pair's placement");
-        // The first two to drain leave the worker busy with the third.
-        placement.prefill_ended(5, sent);
-        placement.prefill_ended(7, sent);
-        assert_eq!(live_sides(&store, lease), (true, true));
-        placement.prefill_ended(11, sent);
-        assert_eq!(live_sides(&store, lease), (false, true));
-        // The side's one end reports the prompt tokens of every phase.
-        let ends = placement.ends();
-        let ends = ends.lock();
-        let [end] = ends.as_slice() else {
-            panic!("expected one end, got {ends:?}");
-        };
-        assert_eq!((end.tokens_in, end.tokens_out), (23, 0));
-    }
-
-    #[tokio::test]
-    async fn a_placed_pair_leaves_no_side_on_file_at_its_end() {
-        // A whole answer ends both sides. Any other end gives both up.
-        for (status, class) in [
-            (200, TransportClass::Ok),
-            (503, TransportClass::ServerError),
-        ] {
-            let (placed, _admission, store) = place_pair().await;
-            let sent = Instant::now();
-            let guards = dispatched_pair(placed, 1, sent).await;
-            let placement = guards.placement().expect("the pair's placement");
-            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-            // The guards still stand: their drop has nothing left to say.
-            placement.ended(status, class, 17, 5, sent);
-            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-            assert_eq!(placement.ends().lock().len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_retry_names_both_rows_of_the_pair_that_failed() {
-        let failure = internal_error("attempt_failed", "Attempt failed");
-
-        // A dispatched attempt: both rows are read from the guards before
-        // they go.
-        let (placed, admission, store) = place_pair().await;
-        let rows = [placed.id(), placed.decode_id().expect("the decode's row")];
-        let selection = pair_selection(&placed);
-        let mut ctx = dispatch_context(placed);
-        ctx.pd_prefill_guard = Some(admission);
-        ctx.load_guards = Some(LoadGuards::at_dispatch(
-            &selection,
-            None,
-            1,
-            ctx.placed.take(),
-            Instant::now(),
-        ));
-        ctx.release_attempt(&failure, Instant::now());
-        assert!(ctx.load_guards.is_none());
-        assert_eq!(*ctx.tried_rows, rows);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-
-        // An attempt that failed ahead of its send: the unsent placement
-        // goes, and both rows are named from the context.
-        let (placed, _admission, store) = place_pair().await;
-        let unsent = [placed.id(), placed.decode_id().expect("the decode's row")];
-        ctx.placed = Some(placed);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        ctx.release_attempt(&failure, Instant::now());
-        assert!(ctx.placed.is_none());
-        assert_eq!(*ctx.tried_rows, [rows[0], rows[1], unsent[0], unsent[1]]);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn the_guards_keep_their_size() {
-        assert_eq!(size_of::<LoadGuards>(), 48);
-    }
 
     /// Only multimodal vLLM EPD owns EC state absent from its retained plan.
     /// The plan's kind, its media and the handoff kind each decide it

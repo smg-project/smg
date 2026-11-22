@@ -1376,7 +1376,7 @@ fn time_per_router_record_contended() {
 }
 
 /// The chat path's remaining per-request records (the selection, the
-/// cache-aware and controller decisions, the index lookup, the routing-key source, the
+/// cache-aware decision, the index lookup, the routing-key source, the
 /// admission gauges, the body path, the early release) render the same
 /// through kept handles as through a key built per record: the same
 /// series with the same values. A second pass through kept handles,
@@ -1411,24 +1411,6 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         Metrics::record_kv_index_lookup("chain", 0.000_002);
         Metrics::record_kv_index_lookup("chain", 0.000_004);
         Metrics::record_kv_index_lookup("reference", 0.000_008);
-        for (model, profile, name, outcome) in [
-            ("m1", 0, "default", "pick"),
-            ("m1", 0, "default", "pick"),
-            ("m2", 0, "default", "pick"),
-            ("m2", 0, "default", "shed"),
-            ("m1", 1, "other", "pick"),
-            ("m1", 1, "other", "queue"),
-        ] {
-            Metrics::record_policy_decision(
-                model,
-                PolicyDecision {
-                    profile: Some(profile),
-                    ..decision(1, outcome)
-                },
-                || Some(name.into()),
-                0.000_002,
-            );
-        }
         Metrics::record_routing_key_source("header");
         Metrics::record_admission_queue_entered();
         Metrics::record_admission_inflight_acquired();
@@ -1471,14 +1453,6 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         "smg_kv_index_lookup_seconds_count{index=\"chain\"} 2",
         "smg_kv_index_lookup_seconds_count{index=\"reference\"} 1",
         "smg_kv_index_lookup_seconds_sum{index=\"reference\"} 0.000008",
-        "smg_policy_decisions_total{model=\"m1\",profile=\"default\",outcome=\"pick\",mode=\"embedded\"} 2",
-        "smg_policy_decisions_total{model=\"m2\",profile=\"default\",outcome=\"pick\",mode=\"embedded\"} 1",
-        "smg_policy_decisions_total{model=\"m2\",profile=\"default\",outcome=\"shed\",mode=\"embedded\"} 1",
-        "smg_policy_decisions_total{model=\"m1\",profile=\"other\",outcome=\"pick\",mode=\"embedded\"} 1",
-        "smg_policy_decisions_total{model=\"m1\",profile=\"other\",outcome=\"queue\",mode=\"embedded\"} 1",
-        "smg_policy_decision_seconds_count{mode=\"embedded\",outcome=\"pick\"} 4",
-        "smg_policy_decision_seconds_count{mode=\"embedded\",outcome=\"shed\"} 1",
-        "smg_policy_decision_seconds_count{mode=\"embedded\",outcome=\"queue\"} 1",
         "smg_routing_key_source_total{source=\"header\"} 1",
         "smg_admission_queue_depth 1",
         "smg_admission_inflight 1",
@@ -1490,139 +1464,6 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
             kept.lines().any(|line| line == expected),
             "missing {expected} in:\n{kept}"
         );
-    }
-}
-
-fn decision(generation: u64, outcome: &'static str) -> PolicyDecision {
-    PolicyDecision {
-        generation,
-        profile: Some(0),
-        outcome,
-        mode: "embedded",
-    }
-}
-
-#[test]
-fn policy_decisions_count_and_time_each_outcome() {
-    let matcher = Matcher::Full("smg_policy_decision_seconds".into());
-    let recorder = PrometheusBuilder::new()
-        .set_buckets_for_metric(matcher.clone(), &histogram_bucket_overrides(None)[&matcher])
-        .unwrap()
-        .build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        init_metrics();
-        for outcome in ["pick", "pick", "shed"] {
-            Metrics::record_policy_decision(
-                "m1",
-                decision(1, outcome),
-                || Some("default".into()),
-                0.000_002,
-            );
-        }
-    });
-    let rendered = handle.render();
-    for family in ["smg_policy_decisions_total", "smg_policy_decision_seconds"] {
-        assert!(rendered
-            .lines()
-            .any(|line| line.starts_with(&format!("# HELP {family} "))));
-    }
-    for line in [
-        "smg_policy_decisions_total{model=\"m1\",profile=\"default\",outcome=\"pick\",mode=\"embedded\"} 2",
-        "smg_policy_decisions_total{model=\"m1\",profile=\"default\",outcome=\"shed\",mode=\"embedded\"} 1",
-        "# TYPE smg_policy_decision_seconds histogram",
-        "smg_policy_decision_seconds_count{mode=\"embedded\",outcome=\"pick\"} 2",
-        "smg_policy_decision_seconds_count{mode=\"embedded\",outcome=\"shed\"} 1",
-        "smg_policy_decision_seconds_sum{mode=\"embedded\",outcome=\"pick\"} 0.000004",
-    ] {
-        assert!(rendered.lines().any(|sample| sample == line), "{line}\n{rendered}");
-    }
-}
-
-#[test]
-fn policy_decisions_drop_old_handles_and_keep_their_counts() {
-    let rendered = render_with_recorder(|| {
-        handles::force_on_this_thread(Some(true));
-        Metrics::record_policy_decision("m1", decision(1, "pick"), || Some("old".into()), 0.0);
-        assert!(handles::POLICY_DECISIONS
-            .with_borrow(|(_, by_labels)| by_labels.keys().any(|labels| labels.generation == 1)));
-        Metrics::record_policy_decision("m1", decision(2, "pick"), || Some("new".into()), 0.0);
-        Metrics::record_policy_decision("m1", decision(1, "pick"), || Some("old".into()), 0.0);
-        handles::POLICY_DECISIONS.with_borrow(|(_, by_labels)| {
-            assert_eq!(by_labels.len(), 1);
-            assert!(by_labels.keys().all(|labels| labels.generation == 2));
-        });
-        handles::reset();
-    });
-    for (profile, count) in [("old", 2), ("new", 1)] {
-        let sample = format!(
-            "smg_policy_decisions_total{{model=\"m1\",profile=\"{profile}\",outcome=\"pick\",mode=\"embedded\"}} {count}"
-        );
-        assert!(
-            rendered.lines().any(|line| line == sample),
-            "{sample}\n{rendered}"
-        );
-    }
-}
-
-#[test]
-fn a_decision_no_profile_made_keeps_its_handle_and_asks_no_name() {
-    let rendered = render_with_recorder(|| {
-        handles::force_on_this_thread(Some(true));
-        let mut reads = 0;
-        // Two refused asks, then a shed ahead of every profile under a
-        // document's generation: one handle each, and no name asked.
-        for (generation, outcome) in [(0, "refused"), (0, "refused"), (3, "shed"), (4, "shed")] {
-            Metrics::record_policy_decision(
-                "m1",
-                PolicyDecision {
-                    profile: None,
-                    ..decision(generation, outcome)
-                },
-                || {
-                    reads += 1;
-                    None
-                },
-                0.0,
-            );
-        }
-        assert_eq!(reads, 0, "no profile decided, so no name is read");
-        handles::POLICY_DECISIONS.with_borrow(|(_, by_labels)| assert_eq!(by_labels.len(), 2));
-        handles::reset();
-    });
-    for line in [
-        "smg_policy_decisions_total{model=\"m1\",profile=\"\",outcome=\"refused\",mode=\"embedded\"} 2",
-        "smg_policy_decisions_total{model=\"m1\",profile=\"\",outcome=\"shed\",mode=\"embedded\"} 2",
-    ] {
-        assert!(rendered.lines().any(|sample| sample == line), "{line}\n{rendered}");
-    }
-}
-
-#[test]
-fn policy_decisions_read_the_profile_again_after_a_miss() {
-    let rendered = render_with_recorder(|| {
-        handles::force_on_this_thread(Some(true));
-        Metrics::record_policy_decision("m1", decision(1, "pick"), || None, 0.0);
-        let mut reads = 0;
-        for _ in 0..2 {
-            Metrics::record_policy_decision(
-                "m1",
-                decision(1, "pick"),
-                || {
-                    reads += 1;
-                    Some("default".into())
-                },
-                0.0,
-            );
-        }
-        assert_eq!(reads, 1, "the miss is retried, and the hit is kept");
-        handles::reset();
-    });
-    for line in [
-        "smg_policy_decisions_total{model=\"m1\",profile=\"\",outcome=\"pick\",mode=\"embedded\"} 1",
-        "smg_policy_decisions_total{model=\"m1\",profile=\"default\",outcome=\"pick\",mode=\"embedded\"} 2",
-    ] {
-        assert!(rendered.lines().any(|sample| sample == line), "{line}\n{rendered}");
     }
 }
 

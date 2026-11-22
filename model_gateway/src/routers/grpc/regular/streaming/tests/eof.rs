@@ -18,10 +18,6 @@ use smg_grpc_client::{
         VllmEngineClient,
     },
 };
-use smg_policy_controller::{
-    store::{GatewayId, LeasesStore, MemoryStore},
-    tracking::TransportClass,
-};
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::basic::Worker,
@@ -35,18 +31,7 @@ use super::super::*;
 use crate::routers::{
     common::{snapshot::WorkerRegistry, sse::SseReceiver},
     grpc::{
-        backend_client::BasicWorkerBuilder,
-        common::stages::ProcessStage,
-        context::test_support::{assert_end, dispatch_context, dispatched, place_worker},
-        regular::{
-            processor::ResponseProcessor,
-            stages::{
-                chat::ChatResponseProcessingStage, completion::CompletionResponseProcessingStage,
-                generate::GenerateResponseProcessingStage,
-                messages::MessageResponseProcessingStage,
-            },
-        },
-        spec::ResponseSpec,
+        backend_client::BasicWorkerBuilder, regular::processor::ResponseProcessor,
         test_engine::mock_engine,
     },
 };
@@ -3767,129 +3752,6 @@ async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
         );
         server.abort();
     }
-}
-
-pub(in crate::routers::grpc) async fn placed_stream_context(
-    stream: ProtoStream,
-    dispatch: context::DispatchMetadata,
-) -> (context::DispatchContext, Arc<MemoryStore>) {
-    let (placed, store) = place_worker().await;
-    let mut ctx = dispatch_context(placed);
-    let sent = Instant::now();
-    ctx.load_guards = Some(dispatched(ctx.placed.take().expect("a placement"), sent));
-    ctx.dispatch = Some(dispatch);
-    ctx.streaming = true;
-    ctx.tokenizer = Some(Arc::new(CharacterTokenizer::default()));
-    ctx.response.execution_result = Some(context::ExecutionResult::Single {
-        stream,
-        dispatch_start: sent,
-    });
-    (ctx, store)
-}
-
-/// A placed stream of `spec`, which asks `choices` choices, says its tokens
-/// when every choice closed and nothing when none did: the prompt once, the
-/// completion summed over the choices.
-async fn check_placed_stream(spec: ResponseSpec, choices: u32) {
-    for complete in [true, false] {
-        let mut frames: Vec<_> = (0..choices).map(|index| chunk(index, "Hi")).collect();
-        if complete {
-            frames.extend((0..choices).map(|index| complete_with_prompt(index, "stop", 11)));
-        }
-        let (stream, server) = scripted_stream(frames, "0").await;
-        let (mut ctx, store) = placed_stream_context(stream, dispatch()).await;
-        let placement = ctx
-            .load_guards
-            .as_ref()
-            .and_then(context::LoadGuards::placement)
-            .expect("the placement")
-            .clone();
-        let streaming = Arc::new(processor(false));
-        let processor = response_processor();
-        let response = match &spec {
-            ResponseSpec::Chat(_) => {
-                ChatResponseProcessingStage::new(processor, streaming)
-                    .process_result(&mut ctx, spec.clone())
-                    .await
-            }
-            ResponseSpec::Completion(_) => {
-                CompletionResponseProcessingStage::new(processor, streaming)
-                    .process(&mut ctx, spec.clone())
-                    .await
-            }
-            ResponseSpec::Generate(_) => {
-                GenerateResponseProcessingStage::new(processor, streaming)
-                    .process_result(&mut ctx, spec.clone())
-                    .await
-            }
-            ResponseSpec::Messages(_) => {
-                MessageResponseProcessingStage::new(processor, streaming)
-                    .process(&mut ctx, spec.clone())
-                    .await
-            }
-            _ => panic!("a regular streaming spec"),
-        }
-        .expect("the stage succeeded")
-        .expect("a streaming response");
-        assert_eq!(response.status(), StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .expect("the stream's body");
-        if complete {
-            assert_end(
-                &placement.ends(),
-                &store,
-                200,
-                TransportClass::Ok,
-                11,
-                2 * choices,
-            );
-        } else {
-            assert!(placement.ends().lock().is_empty());
-            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        }
-        drop(placement);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-        server.abort();
-    }
-}
-
-#[tokio::test]
-async fn a_placed_chat_stream_says_its_tokens_only_when_it_completes() {
-    // The chat spec of this file asks two choices.
-    check_placed_stream(ResponseSpec::Chat(Box::new(chat_spec(false))), 2).await;
-}
-
-#[tokio::test]
-async fn a_placed_completion_stream_says_its_tokens_only_when_it_completes() {
-    use openai_protocol::completion::CompletionRequest;
-
-    let request: CompletionRequest = serde_json::from_value(
-        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true}),
-    )
-    .expect("a completion request");
-    check_placed_stream(
-        ResponseSpec::Completion(CompletionResponseSpec::new(&request, Vec::new())),
-        1,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_placed_generate_stream_says_its_tokens_only_when_it_completes() {
-    check_placed_stream(
-        ResponseSpec::Generate(GenerateResponseSpec {
-            return_logprob: false,
-            expected_choices: 1,
-        }),
-        1,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_placed_messages_stream_says_its_tokens_only_when_it_completes() {
-    check_placed_stream(ResponseSpec::Messages(Box::new(messages_spec(false))), 1).await;
 }
 
 /// A completion stream refused before its first frame (the execution result

@@ -175,60 +175,6 @@ struct CliArgs {
     integrations: IntegrationArgs,
 }
 
-/// The routing flags a policy document replaces. `--policy-spec` conflicts
-/// with each of them, and the parser knows where a value came from: a flag
-/// typed beside a document is refused by both names, at its default value
-/// too. A flag the gateway still reads under a document is not listed, but
-/// for `grouped_dp_sticky`: the dispatch pins by the gateway's own key, and
-/// a supplied document names its own key sources.
-const DOCUMENT_REPLACES: [&str; 45] = [
-    "policy",
-    "cache_threshold",
-    "balance_abs_threshold",
-    "balance_rel_threshold",
-    "balance_prefix_margin_tokens",
-    "balance_uncached_credit",
-    "bucket_adjust_interval_secs",
-    "balance_token_usage_threshold",
-    "overload_token_usage_threshold",
-    "worker_overload_protection",
-    "disable_worker_overload_protection",
-    "worker_overload_waiting_requests",
-    "worker_overload_token_usage",
-    "worker_overload_shed",
-    "overlap_decay",
-    "selection_temperature",
-    "selection_policy",
-    "selection_accounting_ttl_ms",
-    "eviction_interval",
-    "max_tree_size",
-    "block_size",
-    "cache_boundaries",
-    "cache_index",
-    "cache_ttl_secs",
-    "max_idle_secs",
-    "assignment_mode",
-    "prefix_token_count",
-    "prefix_hash_load_factor",
-    "prefix_hash_balance_abs_threshold",
-    "least_load_kv_pressure_weight",
-    "least_load_default_throughput",
-    "least_load_mean_prefill_tokens",
-    "power_of_two_load_metric",
-    "routing_key_override",
-    "pd_pairing_mode",
-    "grouped_dp_sticky",
-    "dp_minimum_tokens_scheduler",
-    "worker_warmup_secs",
-    "worker_warmup_share",
-    "worker_warmup_blocks",
-    "worker_warmup_thin_ratio",
-    "worker_warmup_divert_every",
-    "prefill_policy",
-    "decode_policy",
-    "encode_policy",
-];
-
 #[derive(clap::Args, Debug)]
 #[group(skip)]
 struct RoutingArgs {
@@ -363,10 +309,9 @@ struct RoutingArgs {
     worker_startup_check_interval: u64,
 
     // ==================== Routing Policy ====================
-    /// Load balancing policy to use. Defaults to cache_aware. A policy
-    /// document replaces the routing flags, and --policy is refused beside one.
-    #[arg(long, value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
-    policy: Option<String>,
+    /// Load balancing policy to use
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    policy: String,
 
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
     /// pins a request to a worker already holding that prefix; below it the
@@ -494,9 +439,8 @@ struct RoutingArgs {
     /// overloaded, instead of routing it to the least-loaded one (or, for a
     /// cache-aware prefill pool or a regular request that consistent_hashing
     /// places by its routing key, by its policy); also sheds a worker that
-    /// crossed a threshold between selection and dispatch, except for a
-    /// request the policy controller placed. Off by default: steering never
-    /// turns a load signal into an outage
+    /// crossed a threshold between selection and dispatch. Off by default:
+    /// steering never turns a load signal into an outage
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     worker_overload_shed: bool,
 
@@ -716,60 +660,6 @@ struct RoutingArgs {
     /// workload where every request has a holder. 0 disables.
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
-
-    /// Choose off for the classic routing policies or on for the policy
-    /// controller. With on, the routing flags keep their meaning through a
-    /// policy document. Requests the controller cannot decide are refused
-    /// by name without using the classic policies
-    #[arg(
-        long,
-        value_parser = ["on", "off"],
-        default_value = "off",
-        help_heading = "Routing Policy"
-    )]
-    policy_controller: String,
-
-    /// Run this policy document in place of the one the routing flags mean.
-    /// The document replaces those flags. A policy name, a policy's own
-    /// setting and the overload, warm-up and pairing settings are each
-    /// refused beside it by name
-    #[arg(
-        long,
-        value_name = "FILE",
-        help_heading = "Routing Policy",
-        conflicts_with = "print_policy_spec",
-        conflicts_with_all = DOCUMENT_REPLACES
-    )]
-    policy_spec: Option<String>,
-
-    /// Print the policy document these routing flags mean, as YAML, and
-    /// exit. The routing part of the line is read and checked as a start
-    /// checks it: the routing flags, the discovery flags and the tenant
-    /// header's name. A Consul address and the Consul environment are
-    /// resolved at a start alone. A flag of a wrong shape is refused first,
-    /// as at a start. Nothing is started and no file is read, so no secret
-    /// and no key. A start checks the rest of the command line. A setting the
-    /// document cannot say yet, and a part of the document this build's
-    /// controller does not run yet, is named in one sentence on stderr, and
-    /// the exit is then a failure
-    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
-    print_policy_spec: bool,
-
-    /// Follow workers from the policy controller's gateway listener (requires --policy-controller on).
-    #[arg(long, value_name = "host:port", help_heading = "Policy Controller")]
-    policy_controller_address: Option<String>,
-
-    /// PEM certificate authority file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
-    policy_controller_tls_ca_cert: Option<String>,
-
-    /// PEM client certificate file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
-    policy_controller_tls_cert: Option<String>,
-
-    /// PEM client private key file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
-    policy_controller_tls_key: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2074,28 +1964,10 @@ fn serve(
     server::run_with(&runtime, server_config, extensions)
 }
 
-/// Says the refusal of a `--print-policy-spec` on stderr, as its type writes
-/// the sentence, and answers with the failing exit. `main`'s own error
-/// return would print the type's debug form.
-#[expect(
-    clippy::print_stderr,
-    reason = "the refusal of --print-policy-spec, said before any logger is up"
-)]
-fn refused_print(refusal: &str) -> ExitCode {
-    eprintln!("error: {refusal}");
-    ExitCode::FAILURE
-}
-
 /// The start-up sequence: parse, resolve the secrets' sources, announce,
 /// configure, serve. The version flags are answered first, before clap sees
-/// the line. `--print-policy-spec` is answered right after the parse, ahead
-/// of the secrets and the banner: its output is the document alone, it
-/// reads no secret, and nothing is started. A refusal of it is a failing
-/// exit with its sentence on stderr; every other failure is the error return.
-#[expect(
-    clippy::print_stdout,
-    reason = "the answers of the version flags and of --print-policy-spec"
-)]
+/// the line.
+#[expect(clippy::print_stdout, reason = "the version flags' answer")]
 pub(super) fn main_from_args(
     extensions: Extensions,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -2106,17 +1978,6 @@ pub(super) fn main_from_args(
     }
     let command_line = CommandLine::split(&args);
     let (mut cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
-    if cli_args.routing.print_policy_spec {
-        let (prefill, encode) = (command_line.prefill_urls, command_line.encode_urls);
-        let answer = cli_args.policy_spec_print(prefill, encode);
-        if let Some(document) = answer.document() {
-            print!("{document}");
-        }
-        return Ok(match answer.refusal() {
-            Some(refusal) => refused_print(refusal),
-            None => ExitCode::SUCCESS,
-        });
-    }
     cli_args.resolve_secret_sources(&process_env)?;
     cli_args.announce(
         igw_enabled_for_discovery,
@@ -2205,207 +2066,8 @@ mod tests {
         Cli::parse_from(argv).router_args
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn the_policy_controller_flags_reach_the_router_configuration() {
-        let cli = Cli::try_parse_from([
-            "smg",
-            "--policy-controller",
-            "on",
-            "--policy-controller-address",
-            "controller:30100",
-            "--policy-controller-tls-ca-cert",
-            "ca.pem",
-            "--policy-controller-tls-cert",
-            "cert.pem",
-            "--policy-controller-tls-key",
-            "key.pem",
-        ])
-        .unwrap();
-        let config = cli
-            .router_args
-            .configure(vec![], vec![])
-            .unwrap()
-            .router_config;
-        assert!(config.policy_controller);
-        assert_eq!(
-            config.policy_controller_address.as_deref(),
-            Some("controller:30100")
-        );
-        assert_eq!(
-            config.policy_controller_tls_ca_cert.as_deref(),
-            Some("ca.pem")
-        );
-        assert_eq!(
-            config.policy_controller_tls_cert.as_deref(),
-            Some("cert.pem")
-        );
-        assert_eq!(config.policy_controller_tls_key.as_deref(), Some("key.pem"));
-    }
-
-    #[test]
-    fn a_controller_address_refuses_worker_urls_even_outside_the_selected_mode() {
-        let cli = Cli::try_parse_from([
-            "smg",
-            "--policy-controller",
-            "on",
-            "--policy-controller-address",
-            "controller:30100",
-        ])
-        .unwrap();
-        let error = cli
-            .router_args
-            .to_router_config(vec![("http://worker:8000".to_owned(), None)], vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("--policy-controller-address") && error.contains("--prefill"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_controller_address_refuses_a_discovery_provider_before_reading_its_settings() {
-        let cli = Cli::try_parse_from([
-            "smg",
-            "--policy-controller",
-            "on",
-            "--policy-controller-address",
-            "controller:30100",
-            "--discovery-provider",
-            "file",
-        ])
-        .unwrap();
-        let error = cli
-            .router_args
-            .to_router_config(vec![], vec![])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("--policy-controller-address") && error.contains("--discovery-provider"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn the_switch_flows_into_router_config() {
-        use clap::error::ErrorKind;
-
-        for (flags, enabled) in [
-            (&[][..], false),
-            (&["--policy-controller", "on"][..], true),
-            (&["--policy-controller", "off"][..], false),
-        ] {
-            let config = cli_args_from(flags)
-                .to_router_config(vec![], vec![])
-                .expect("the routing configuration");
-            assert_eq!(config.policy_controller, enabled, "{flags:?}");
-        }
-        let refusal = Cli::try_parse_from(["smg", "--policy-controller", "other"])
-            .expect_err("the switch takes only on and off");
-        assert_eq!(refusal.kind(), ErrorKind::InvalidValue);
-        assert!(refusal.to_string().contains("--policy-controller"));
-    }
-
-    fn policy_file(
-        name: &str,
-    ) -> Result<
-        (
-            tempfile::NamedTempFile,
-            smg_policy_controller::document::PolicySpec,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let file = tempfile::NamedTempFile::new()?;
-        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
-        serde_yaml::to_writer(file.as_file(), &document)?;
-        Ok((file, document))
-    }
-
-    #[test]
-    fn the_plain_start_takes_the_document() {
-        let (file, document) = policy_file("round_robin").expect("a policy document file");
-        let path = file.path().to_str().expect("a UTF-8 path");
-        let config = cli_args_from(&["--policy-controller", "on", "--policy-spec", path])
-            .to_router_config(vec![], vec![])
-            .expect("the routing configuration");
-        assert_eq!(config.policy_spec_path.as_deref(), Some(path));
-        assert_eq!(config.policy_spec.as_ref(), Some(&document));
-        assert_eq!(config.policy_document_in_force(), Ok(document));
-    }
-
-    /// The flags under the routing policy heading a document does not
-    /// replace: the controller's own, and what the gateway reads itself.
-    const BESIDE_A_DOCUMENT: [&str; 6] = [
-        "policy_controller",
-        "policy_spec",
-        "print_policy_spec",
-        "dp_aware",
-        "routing_key_headers",
-        "enable_igw",
-    ];
-
-    #[test]
-    fn every_routing_flag_is_replaced_by_a_document_or_stays_beside_it() {
-        use clap::CommandFactory;
-
-        let command = Cli::command();
-        for arg in command.get_arguments() {
-            if arg.get_help_heading() != Some("Routing Policy") {
-                continue;
-            }
-            let id = arg.get_id().as_str();
-            assert_ne!(
-                DOCUMENT_REPLACES.contains(&id),
-                BESIDE_A_DOCUMENT.contains(&id),
-                "{id}: a routing flag stands in exactly one of the two lists"
-            );
-        }
-    }
-
-    #[test]
-    fn a_routing_flag_typed_beside_a_document_is_refused_by_both_names() {
-        use clap::{error::ErrorKind, CommandFactory};
-
-        let command = Cli::command();
-        for id in DOCUMENT_REPLACES {
-            let arg = command
-                .get_arguments()
-                .find(|arg| arg.get_id() == id)
-                .unwrap_or_else(|| panic!("{id} is no flag of the command line"));
-            let flag = format!("--{}", arg.get_long().expect("a long flag"));
-            let mut line = vec!["smg", "--policy-spec", "routing.yaml", flag.as_str()];
-            // The flag's own default where it has one: the parser refuses
-            // by where the value came from, never by the value.
-            let default = arg
-                .get_default_values()
-                .first()
-                .map(|value| value.to_string_lossy().into_owned());
-            let choice = arg
-                .get_possible_values()
-                .first()
-                .map(|value| value.get_name().to_owned());
-            let value = default.or(choice).unwrap_or_else(|| "1".to_owned());
-            if arg.get_action().takes_values() {
-                line.push(&value);
-            }
-            let refusal =
-                Cli::try_parse_from(&line).expect_err("the flag is typed beside a document");
-            assert_eq!(
-                refusal.kind(),
-                ErrorKind::ArgumentConflict,
-                "{flag}: {refusal}"
-            );
-            let message = refusal.to_string();
-            assert!(
-                message.contains("--policy-spec") && message.contains(&flag),
-                "{message}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_line_with_no_document_builds_cache_aware_as_before() {
+    fn a_line_with_no_policy_builds_cache_aware() {
         for (flags, threshold) in [(&[][..], 0.3), (&["--cache-threshold", "0.7"][..], 0.7)] {
             let config = cli_args_from(flags)
                 .to_router_config(vec![], vec![])
@@ -2417,23 +2079,6 @@ mod tests {
                 config.policy
             );
         }
-    }
-
-    #[test]
-    fn the_print_flag_refuses_a_document_beside_it() {
-        use clap::error::ErrorKind;
-
-        let line = [
-            "smg",
-            "--print-policy-spec",
-            "--policy-spec",
-            "routing.yaml",
-        ];
-        let refusal = Cli::try_parse_from(line).expect_err("the print and input flags conflict");
-        assert_eq!(refusal.kind(), ErrorKind::ArgumentConflict);
-        let message = refusal.to_string();
-        assert!(message.contains("--print-policy-spec"));
-        assert!(message.contains("--policy-spec"));
     }
 
     /// The CLI preserves independent role thresholds and rounds percentages up.

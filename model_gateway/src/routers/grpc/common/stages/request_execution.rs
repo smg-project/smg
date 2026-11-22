@@ -39,6 +39,7 @@ use crate::{
             attempt_ledger::{
                 is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
             },
+            pd_admission,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
@@ -49,8 +50,7 @@ use crate::{
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
-                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, Placement,
-                WorkerSelection,
+                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             multimodal::ec_push::PushCleanup,
             proto_wrapper::{
@@ -275,10 +275,16 @@ pub(crate) async fn execute_plan(
     // encode jobs' SHM unclaimed for the duration: under the burst this gate
     // targets, holding it would queue a second scarce resource behind the
     // decode window and throw the finished encode work away on a shed. The
-    // gate abstains when the engine reports no window. A pair the policy
-    // controller placed is committed ahead of the wait, so its bookings
-    // outlast it.
-    let admission = ctx.admit(sub_requests).await?;
+    // gate abstains when the engine reports no window.
+    let admission = match ctx
+        .workers
+        .as_ref()
+        .and_then(WorkerSelection::decode_worker)
+    {
+        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
+        None => None,
+    };
+
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers a rendezvous plan's encode jobs and
     // their SHM Drop guards here: dispatch consumes them, while an early
@@ -299,17 +305,10 @@ pub(crate) async fn execute_plan(
     // request retried on it.
     let ledger = &ctx.ledger;
 
-    let guards = LoadGuards::at_dispatch(
-        workers,
-        ctx.sticky_key.as_deref(),
-        sub_requests,
-        ctx.placed.take(),
-        Instant::now(),
-    );
-    ctx.load_guards = Some(LoadGuards::admitted(admission, guards));
-    // A sequential pair the controller placed ends its prefill's side at
-    // the phase's end: the dispatch reads the placement its guards hold.
-    let placement = ctx.load_guards.as_ref().and_then(LoadGuards::placement);
+    ctx.load_guards = Some(LoadGuards::admitted(
+        admission,
+        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
+    ));
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
     pin_grouped_dp_rank(
@@ -403,7 +402,6 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
-                    placement,
                 ))
                 .await
             }
@@ -422,7 +420,6 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
-                    placement,
                 ))
                 .await
                 .map_err(|mut response| {
@@ -444,7 +441,6 @@ pub(crate) async fn execute_plan(
                     prefill_guard,
                     ledger,
                     dispatched_at.into_std(),
-                    placement,
                 )
                 .await
             }
@@ -457,22 +453,10 @@ pub(crate) async fn execute_plan(
     let result = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
             Ok(result) => result,
-            Err(_) => {
-                // The timeout is the decode's that was waited on: the one a
-                // second ask moved the pair to, where it moved.
-                let moved = placement.and_then(|placement| placement.moved(workers));
-                let waited_on = moved.as_ref().unwrap_or(workers);
-                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
-            }
+            Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
         },
         None => dispatch.await,
     };
-    // A pair's decode that was asked again behind its prefill's answer and
-    // moved: the attempt's selection names the decode that was sent, for
-    // the response's stages and for a retry.
-    if let Some(moved) = placement.and_then(|placement| placement.moved(workers)) {
-        ctx.workers = Some(moved);
-    }
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
     // replay would send it again.
@@ -569,11 +553,6 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
-/// `placement` is the placement of a pair the policy controller placed,
-/// committed ahead of the admission gate. A sequential dispatch ends the
-/// prefill's side on it at its last drain ([`Placement::prefill_ended`]).
-/// A parallel dispatch says no prefill end yet: both sides end with the
-/// response.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
@@ -584,7 +563,6 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -620,7 +598,6 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
-                placement,
             )
             .await
         }
@@ -796,7 +773,6 @@ async fn execute_epd_dispatch(
     encode_watch: &mut Option<EncodeWatch>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
@@ -809,7 +785,6 @@ async fn execute_epd_dispatch(
         ledger,
         None,
         encode_watch.clone(),
-        placement,
     )
     .await;
     if result.is_ok() {
@@ -974,7 +949,6 @@ async fn execute_batch_dispatch(
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -1010,7 +984,6 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
-                            placement,
                         )
                         .await
                     }

@@ -6,7 +6,6 @@ use std::{
 use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
-use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
@@ -15,7 +14,6 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
-use smg_policy_controller::{engine::CacheIndexes, stages::StageRegistry, store::MemoryStore};
 use smg_worker::{
     connection::{
         engine::EngineConnector,
@@ -38,14 +36,6 @@ use crate::{
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
-    policy_controller::{
-        self,
-        engine::PolicyEngine,
-        feed::Feed,
-        follower::{Follower, Settings},
-        operators::Operators,
-        InProcess, Started,
-    },
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
@@ -142,46 +132,6 @@ pub struct AppContext {
     pub registration_settings: RegistrationSettings,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
-    /// The policy controller's store, where the controller was picked to
-    /// decide for this process; `None` under the classic policies.
-    pub policy_store: Option<Arc<MemoryStore>>,
-    /// What the control plane's policy routes read: the engine's document
-    /// and the worker registry where the gateway decides in its own
-    /// process, the operators' door over the policy store where it follows
-    /// a controller. `None` under the classic policies.
-    pub(crate) policy_operators: Option<Arc<Operators>>,
-    /// The worker watch, owned by the context until server teardown.
-    pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
-    /// The gateway's policy engine object. Routers ask it for placement
-    /// wherever it is present: over the policy store where the gateway
-    /// follows a controller, and over the engine of this process where the
-    /// gateway decides there and that engine decides every request of the
-    /// document whole.
-    pub(crate) policy_engine: Option<Arc<PolicyEngine>>,
-    /// The membership feed over [`Self::policy_store`], present wherever the store is.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the follower and the policy engine each took what they read at the build"
-        )
-    )]
-    pub(crate) policy_feed: Option<Feed>,
-    /// What the start left a gateway that decides in its own process (the
-    /// setting on and no controller's address): the policy engine the
-    /// policies of [`Self::policy_registry`] ask, and the document it
-    /// decides under as written. Nothing of a followed controller is built
-    /// there: the store, its door, its feed and the follower are a
-    /// gateway's that follows one. `None` with the setting off and under an
-    /// address.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the policy registry and the policy routes each took what they read at the build"
-        )
-    )]
-    pub(crate) in_process: Option<InProcess>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -274,17 +224,6 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
-    policy_store: Option<Arc<MemoryStore>>,
-    /// The operators' door over the store, built with it.
-    policy_operators: Option<Arc<Operators>>,
-    /// The membership feed, built with the policy store.
-    policy_feed: Option<Feed>,
-    /// The policy engine over the feed's holder, built with the feed.
-    policy_engine: Option<Arc<PolicyEngine>>,
-    policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
-    /// What a start in this process left: the policy engine the policy
-    /// registry is built with.
-    in_process: Option<InProcess>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -318,15 +257,6 @@ impl AppContext {
         AppContextBuilder::new()
     }
 
-    /// Whether a policy controller supplies this gateway's workers: the
-    /// context was built under a controller's address and holds the
-    /// follower of its watch. The start asks it at each step such a
-    /// gateway leaves to the controller: the startup registration, the
-    /// health checks and the discovery.
-    pub(crate) fn follows_controller(&self) -> bool {
-        self.policy_follower.is_some()
-    }
-
     /// Create AppContext from config with all components initialized
     /// This is the main entry point that replaces ~194 lines of initialization in server.rs
     pub fn from_config(
@@ -341,7 +271,6 @@ impl AppContext {
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
-            None,
         )
     }
 
@@ -350,7 +279,6 @@ impl AppContext {
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
-        stages: Option<StageRegistry>,
         connector: Option<Arc<dyn EngineConnector>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, String>> + Send>> {
         Box::pin(async move {
@@ -359,7 +287,6 @@ impl AppContext {
                 request_timeout_secs,
                 webrtc_bind_addr,
                 webrtc_stun_server,
-                stages,
                 connector,
             ))
             .await?
@@ -433,12 +360,6 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
-            policy_store: None,
-            policy_operators: None,
-            policy_feed: None,
-            policy_engine: None,
-            policy_follower: None,
-            in_process: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -751,12 +672,6 @@ impl AppContextBuilder {
             registration_settings,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
-            policy_store: self.policy_store,
-            policy_operators: self.policy_operators,
-            policy_follower: self.policy_follower,
-            policy_engine: self.policy_engine,
-            policy_feed: self.policy_feed,
-            in_process: self.in_process,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -778,7 +693,6 @@ impl AppContextBuilder {
             webrtc_bind_addr,
             webrtc_stun_server,
             None,
-            None,
         ))
         .await
     }
@@ -788,7 +702,6 @@ impl AppContextBuilder {
         request_timeout_secs: u64,
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
-        stages: Option<StageRegistry>,
         connector: Option<Arc<dyn EngineConnector>>,
     ) -> Result<Self, String> {
         // A served model aliased under a vendor name keeps that vendor's
@@ -811,7 +724,6 @@ impl AppContextBuilder {
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
             .with_worker_registry()
-            .with_policy_controller(&router_config, stages)?
             .with_policy_registry(&router_config)
             .with_storage(&router_config)
             .await?
@@ -986,114 +898,14 @@ impl AppContextBuilder {
         self
     }
 
-    /// Start the policy controller as the configuration picks it.
-    ///
-    /// With no controller's address the gateway decides in its own
-    /// process: the start builds the policy engine of the document in
-    /// force, and the policy registry is built with it
-    /// ([`Self::with_policy_registry`]). The store, its door, its feed and
-    /// the follower stay unset, so every site that asks for one of them
-    /// takes its classic arm: the worker registry, the health checks, the
-    /// load monitor and the worker workflows are the classic ones. Where
-    /// the engine decides every request of the document whole, the
-    /// gateway's own engine object is built over it and the registry's
-    /// lists, and the routers ask that object
-    /// ([`InProcess::decides_whole`]).
-    ///
-    /// Under a controller's address it starts the policy store with its
-    /// operators' door, its membership feed, its policy engine with the
-    /// engine's timer and the follower of that controller's workers. A
-    /// start the document's check refuses stops this one, by name.
-    fn with_policy_controller(
-        mut self,
-        config: &RouterConfig,
-        stages: Option<StageRegistry>,
-    ) -> Result<Self, String> {
-        if config.policy_controller_address.is_none() {
-            self.in_process = policy_controller::start_in_process(config, stages)
-                .map_err(|refusal| refusal.to_string())?;
-            // The control plane's policy routes read the engine's document
-            // and the worker registry.
-            if let Some(started) = &self.in_process {
-                let registry = self.worker_registry.as_ref().ok_or_else(|| {
-                    "worker_registry must be set before the policy controller".to_string()
-                })?;
-                let operators =
-                    Operators::in_process(started.clone(), config, Arc::clone(registry));
-                self.policy_operators = Some(Arc::new(operators));
-                // Where the engine decides every request of the document
-                // whole, the routers ask it through their own arms, over
-                // the registry's lists: the gateway's engine object stands
-                // on the engine of this process, and its timer runs.
-                if started.decides_whole() {
-                    let policy_engine = Arc::new(PolicyEngine::own(
-                        Arc::clone(&started.engine),
-                        Arc::clone(registry),
-                    ));
-                    let _timer = policy_controller::upkeep::start(&policy_engine);
-                    self.policy_engine = Some(policy_engine);
-                }
-            }
-            return Ok(self);
-        }
-        let started =
-            policy_controller::start_with(config, stages).map_err(|refusal| refusal.to_string())?;
-        if let Some(Started { store, door }) = started {
-            let registry = self.worker_registry.as_ref().ok_or_else(|| {
-                "worker_registry must be set before the policy controller".to_string()
-            })?;
-            let address = config.policy_controller_address.clone().ok_or_else(|| {
-                "the policy store is started under a controller's address alone".to_string()
-            })?;
-            let controller = Settings::new(address, config)?;
-            let connector = Arc::clone(&self.engine_connector);
-            let (feed, follower) =
-                policy_controller::feeds(&store, registry, connector, controller);
-            let policy_engine = Arc::new(PolicyEngine::new(
-                Arc::clone(&store),
-                Arc::clone(&feed.objects),
-            ));
-            // The door's clock runs from here on. The timer ends behind
-            // the policy engine, so its handle detaches.
-            let _timer = policy_controller::upkeep::start(&policy_engine);
-            self.policy_feed = Some(feed);
-            self.policy_engine = Some(policy_engine);
-            self.policy_follower = Some(Arc::new(Mutex::new(Some(follower))));
-            self.policy_operators = Some(Arc::new(Operators::new(Arc::clone(&store), door)));
-            self.policy_store = Some(store);
-        }
-        Ok(self)
-    }
-
-    /// Create policy registry: the classic one, whose policies ask the
-    /// policy engine where the gateway decides in its own process. The
-    /// policy controller's step comes first
-    /// ([`Self::with_policy_controller`]): it leaves the engine this
-    /// registry is built with, and a registry built ahead of it would be
-    /// built without one.
+    /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        let policy = config.policy.clone();
-        let routing_key_override = config.routing_key_override.clone();
-        let registry = match &self.in_process {
-            Some(started) => PolicyRegistry::with_policy_engine(
-                policy,
-                routing_key_override,
-                Arc::clone(&started.engine),
-                started.origin,
-                started.decides_whole(),
-            ),
-            None => PolicyRegistry::with_override(policy, routing_key_override),
-        };
-        // Where the engine of this process places the gateway's requests,
-        // the task that fills the hash rings fills the engine's.
-        let placing = self
-            .policy_engine
-            .clone()
-            .filter(|_| self.in_process.is_some());
         self.policy_registry = Some(Arc::new(
-            registry
-                .with_pd_pairing_mode(config.pd_pairing_mode)
-                .with_rings_of(placing),
+            PolicyRegistry::with_override(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode),
         ));
         self
     }
@@ -1138,10 +950,6 @@ impl AppContextBuilder {
 
     /// Create load monitor
     fn with_worker_monitor(mut self, config: &RouterConfig) -> Result<Self, String> {
-        if config.policy_controller_address.is_some() {
-            info!("Skipping worker load monitoring because --policy-controller-address is set");
-            return Ok(self);
-        }
         let policy_registry = self
             .policy_registry
             .as_ref()
@@ -1165,11 +973,6 @@ impl AppContextBuilder {
             conditional,
         ));
         policy_registry.set_load_receiver(Some(monitor.subscribe()));
-        // The engine of this process reads the same feed where it decides
-        // the requests whole.
-        if let Some(policy_engine) = &self.policy_engine {
-            policy_engine.read_loads(monitor.subscribe());
-        }
         // The overload shed advertises the poll interval as Retry-After — the
         // veto cannot clear between polls.
         overload::set_shed_retry_after_secs(config.load_monitor_interval_secs);
@@ -1230,7 +1033,7 @@ impl AppContextBuilder {
 
     /// Create the KV event monitor: the streams of the gRPC workers.
     ///
-    /// A gateway has one whatever its classic policies: a worker under a
+    /// Every gateway has one, whatever its policies: a worker under a
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather
@@ -1240,16 +1043,7 @@ impl AppContextBuilder {
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
-    ///
-    /// A gateway that follows a controller builds none: the controller
-    /// reads its workers' cache events and load records, and each reader
-    /// of this monitor takes `None`.
     fn with_kv_event_monitor(mut self) -> Self {
-        // The feed stands where the gateway follows a controller, and such
-        // a gateway reads no worker's stream itself.
-        if self.policy_feed.is_some() {
-            return self;
-        }
         let monitor = Arc::new(KvEventMonitor::new());
         debug!("Created KV event monitor for the workers' KV-event and load streams");
         // The load records on the streams are polls of the worker.
@@ -1268,12 +1062,6 @@ impl AppContextBuilder {
         // label.
         if let Some(ref registry) = self.policy_registry {
             registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
-        }
-        // The engine of this process reads the same indexes, where a
-        // profile's stages read who holds a prompt.
-        if let Some(started) = &self.in_process {
-            let indexes = Arc::clone(&monitor) as Arc<dyn CacheIndexes>;
-            started.engine.affinity().set_indexes(indexes);
         }
 
         self.kv_event_monitor = Some(monitor);
@@ -1315,7 +1103,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
-    use smg_policy_controller::document::PolicySpec;
     use smg_worker::{
         connection::engine::NO_ENGINE_CONNECTOR,
         identity::basic::{ConnectionMode, Worker, WorkerType},
@@ -1327,7 +1114,6 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::{DocumentOrigin, EnginePolicy},
         routers::{
             common::{
                 prefill_admission::{test_support::select_worker, PrefillAdmissionAttempt},
@@ -1336,229 +1122,6 @@ mod tests {
             grpc::backend_client::BasicWorkerBuilder,
         },
     };
-
-    /// With the setting on and no controller's address the gateway decides
-    /// in its own process. The context holds the policy engine and nothing
-    /// of a controller it would follow: no store, no door, no feed and no
-    /// follower. Under round robin, a document every request of which the
-    /// engine decides whole, it holds the gateway's own engine object over
-    /// that engine, which the routers ask. Its policy registry is the
-    /// classic one, and the default policy it built is the object that
-    /// asks the engine. With the setting off it holds none of them.
-    #[tokio::test]
-    async fn a_context_in_process_holds_the_policy_engine_and_nothing_else_of_the_controller() {
-        for policy_controller in [false, true] {
-            let config = RouterConfig {
-                policy_controller,
-                policy: PolicyConfig::RoundRobin,
-                ..Default::default()
-            };
-            let context = AppContext::from_config(config, 10, None, None)
-                .await
-                .unwrap();
-            assert!(context.policy_follower.is_none());
-            assert!(context.policy_store.is_none());
-            assert_eq!(context.policy_operators.is_some(), policy_controller);
-            assert!(context.policy_feed.is_none());
-            assert_eq!(context.policy_engine.is_some(), policy_controller);
-            assert!(!context.follows_controller());
-            assert_eq!(context.in_process.is_some(), policy_controller);
-            let default = context.policy_registry.get_default_policy();
-            assert_eq!(default.name(), "round_robin");
-            assert_eq!(default.as_any().is::<EnginePolicy>(), policy_controller);
-            assert!(context.worker_monitor.is_some());
-        }
-    }
-
-    /// A policy the engine does not pick by itself yet stays the classic
-    /// policy of its setting under the setting, and the start is not
-    /// refused: the document the routing settings mean has that policy
-    /// behind each place.
-    #[tokio::test]
-    async fn a_setting_the_engine_does_not_pick_yet_starts_on_its_classic_policy() {
-        let config = RouterConfig {
-            policy_controller: true,
-            policy: PolicyConfig::Random,
-            ..Default::default()
-        };
-        let context = AppContext::from_config(config, 10, None, None)
-            .await
-            .unwrap();
-        let default = context.policy_registry.get_default_policy();
-        assert_eq!(default.name(), "random");
-        assert!(!default.as_any().is::<EnginePolicy>());
-
-        // What the control plane's read of the document answers from, with
-        // no store: the engine's document under the number a gateway's
-        // first document takes, its YAML as the start wrote it, the time
-        // it took effect and the stages it was validated over.
-        let started = context
-            .in_process
-            .as_ref()
-            .expect("the start left its engine");
-        assert_eq!(started.origin, DocumentOrigin::Settings);
-        assert_eq!(started.engine.spec().generation(), 1);
-        let read: PolicySpec = serde_yaml::from_str(&started.written).expect("YAML");
-        assert!(read.profiles.contains_key("random"));
-        assert!(started.applied <= std::time::SystemTime::now());
-        assert!(Arc::strong_count(&started.stages) >= 1);
-    }
-
-    /// A document its operator supplied has no setting behind a place. One
-    /// whose every place the engine picks by itself starts, and its
-    /// bindings place the models. So does one whose place the engine
-    /// decides by its whole pass from what this process feeds it: the
-    /// routers ask the context's engine object. One that holds a place the
-    /// engine does not decide in this process yet is refused at the start,
-    /// by the profile, the stage of it that asks more, the binding and the
-    /// phase.
-    #[tokio::test]
-    async fn a_supplied_document_starts_where_the_engine_picks_each_of_its_places() {
-        // A document that names no number: the first of its gateway.
-        let supplied = |name: &str| {
-            let mut document = PolicySpec::preset(name).expect("a built-in preset");
-            document.generation = 0;
-            RouterConfig {
-                policy_controller: true,
-                policy_spec: Some(document),
-                ..Default::default()
-            }
-        };
-        let context = AppContext::from_config(supplied("round_robin"), 10, None, None)
-            .await
-            .unwrap();
-        assert!(context.policy_store.is_none());
-        let default = context.policy_registry.get_default_policy();
-        assert!(default.as_any().is::<EnginePolicy>());
-        // It takes the number 1, as at the operators' door.
-        let started = context
-            .in_process
-            .as_ref()
-            .expect("the start left its engine");
-        assert_eq!(started.origin, DocumentOrigin::Supplied);
-        assert_eq!(started.engine.spec().generation(), 1);
-
-        // A place that scores by load reports: the whole pass reads them
-        // in the load monitor's snapshot.
-        let context = AppContext::from_config(supplied("least_load"), 10, None, None)
-            .await
-            .unwrap();
-        assert!(context.policy_engine.is_some());
-
-        // A place that reads a hash ring, which this process does not feed
-        // a whole decision yet.
-        let started = AppContext::from_config(supplied("consistent_hashing"), 10, None, None).await;
-        let Err(refused) = started else {
-            panic!("the start is not refused");
-        };
-        assert!(
-            refused.contains("profile `consistent_hashing` is not decided in this process yet"),
-            "{refused}"
-        );
-        assert!(refused.contains("it holds the scorer `"), "{refused}");
-        assert!(refused.contains("(binding `*`, phase single)"), "{refused}");
-    }
-
-    /// The parts a start builds for a context or leaves out, by name, and
-    /// whether this one holds each.
-    fn parts(context: &AppContext) -> Vec<(&'static str, bool)> {
-        vec![
-            ("rate_limiter", context.rate_limiter.is_some()),
-            ("rate_limit_manager", context.rate_limit_manager.is_some()),
-            (
-                "reasoning_parser_factory",
-                context.reasoning_parser_factory.is_some(),
-            ),
-            ("tool_parser_factory", context.tool_parser_factory.is_some()),
-            ("prefill_admission", context.prefill_admission.is_some()),
-            ("gateway", context.gateway.is_some()),
-            ("worker_monitor", context.worker_monitor.is_some()),
-            ("wasm_manager", context.wasm_manager.is_some()),
-            ("kv_event_monitor", context.kv_event_monitor.is_some()),
-            ("policy_store", context.policy_store.is_some()),
-            ("policy_follower", context.policy_follower.is_some()),
-            ("policy_engine", context.policy_engine.is_some()),
-            ("policy_feed", context.policy_feed.is_some()),
-            ("rl", context.rl.is_some()),
-        ]
-    }
-
-    /// A gateway that decides in its own process is built as a gateway with
-    /// the setting off is: the same storage, and the same objects handed to
-    /// the same places. Under one configuration, the setting off against
-    /// on: the context holds and leaves out the same parts, but for what
-    /// the start left (the policy engine, the engine object the routers
-    /// ask, and what the control plane's policy routes read of its
-    /// document); and a classic policy is handed the load feed and the
-    /// cache-event monitor under both. The worker workflows read nothing
-    /// of the context: the server builds the one line of each under both.
-    #[tokio::test]
-    async fn a_context_in_process_is_built_as_with_the_setting_off() {
-        use crate::policies::as_cache_aware;
-
-        // Cache-aware is a policy the engine does not pick by itself: the
-        // registry keeps the classic policy of the setting under both,
-        // with what a context hands a classic policy. With the setting on
-        // the engine decides its requests whole, so the context holds the
-        // engine object the routers ask, and no other part besides.
-        let built = |policy_controller: bool| async move {
-            let config = RouterConfig {
-                policy_controller,
-                ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
-            };
-            AppContext::from_config(config, 10, None, None)
-                .await
-                .expect("a context")
-        };
-        let (off, on) = (built(false).await, built(true).await);
-
-        let with_the_engine_object: Vec<_> = parts(&off)
-            .into_iter()
-            .map(|(part, held)| (part, held || part == "policy_engine"))
-            .collect();
-        assert_eq!(with_the_engine_object, parts(&on));
-        assert!(off.policy_engine.is_none());
-        assert!(off.in_process.is_none());
-        assert!(on.in_process.is_some());
-        assert!(off.policy_operators.is_none());
-        assert!(on.policy_operators.is_some());
-
-        for context in [&off, &on] {
-            let policy = context.policy_registry.get_default_policy();
-            let cache_aware =
-                as_cache_aware(policy.as_ref()).expect("the classic cache-aware policy");
-            assert!(cache_aware.has_load_receiver_for_test());
-            assert!(cache_aware.kv_event_monitor_is_set_for_test());
-        }
-    }
-
-    /// The engine object is handed the load monitor's feed, the one a
-    /// classic policy reads, once the monitor is built: it keeps the feed
-    /// where its document reads load reports, and no feed under a document
-    /// that reads none.
-    #[tokio::test]
-    async fn the_engine_object_is_handed_the_load_feed_its_document_reads() {
-        let built = |policy: PolicyConfig| async move {
-            let config = RouterConfig {
-                policy_controller: true,
-                ..config_with_policy(policy)
-            };
-            AppContext::from_config(config, 10, None, None)
-                .await
-                .expect("a context")
-        };
-        let least_load = PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.15,
-            mean_prefill_tokens: 1024,
-            default_throughput: 2000.0,
-        };
-        for (policy, reads) in [(least_load, true), (PolicyConfig::RoundRobin, false)] {
-            let context = built(policy).await;
-            assert!(context.worker_monitor.is_some());
-            let policy_engine = context.policy_engine.as_ref().expect("the engine object");
-            assert_eq!(policy_engine.reads_loads(), reads);
-        }
-    }
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
     /// h2c on the same listener, mirroring a dual-protocol engine.
@@ -1828,49 +1391,6 @@ mod tests {
         let cache_aware =
             as_cache_aware(policy.as_ref()).expect("the label's policy is cache-aware");
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
-    }
-
-    /// A gateway that follows a controller builds no classic monitor: the
-    /// context holds none, and a cache-aware policy is handed none.
-    #[tokio::test]
-    async fn a_gateway_that_follows_a_controller_builds_no_cache_event_monitor() {
-        use std::net::{Ipv4Addr, SocketAddr};
-
-        use crate::policies::as_cache_aware;
-
-        // A socket that never listens: the follower dials it and tells
-        // nothing.
-        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
-        socket
-            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .expect("a free port");
-        let address = socket.local_addr().expect("the socket's address");
-        let config = RouterConfig {
-            policy_controller: true,
-            policy_controller_address: Some(address.to_string()),
-            ..config_with_policy(PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000))
-        };
-        let builder = AppContextBuilder::new()
-            .with_client(&config, 5)
-            .expect("client builds")
-            .with_worker_registry()
-            .with_policy_registry(&config)
-            .with_policy_controller(&config, None)
-            .expect("the policy controller starts")
-            .with_kv_event_monitor();
-        assert!(builder.policy_feed.is_some());
-        assert!(builder.kv_event_monitor.is_none());
-        let policy = builder
-            .policy_registry
-            .as_ref()
-            .expect("policy registry set")
-            .get_default_policy();
-        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
-        assert!(!cache_aware.kv_event_monitor_is_set_for_test());
-
-        let follower = builder.policy_follower.as_ref().expect("a follower");
-        let follower = follower.lock().take().expect("the follower stands");
-        follower.stop().await;
     }
 
     /// A dropped context lets its worker monitor go: the monitor holds the
@@ -2279,12 +1799,6 @@ pub(crate) mod testing {
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
-            policy_store: None,
-            policy_operators: None,
-            policy_follower: None,
-            policy_engine: None,
-            policy_feed: None,
-            in_process: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

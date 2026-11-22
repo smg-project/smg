@@ -253,10 +253,6 @@ mod tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
     };
-    use smg_policy_controller::{
-        document::{AppliedSpec, PolicySpec},
-        engine::PolicyEngine,
-    };
     use smg_worker::jobs::WorkerJobAsker;
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
@@ -264,11 +260,8 @@ mod tests {
     use super::*;
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
-        config::{PolicyConfig, RouterConfig, RoutingKeyOverrideConfig},
-        policies::{
-            as_cache_aware, kv_index::event_monitor::KvEventMonitor, DocumentOrigin, PolicyFactory,
-            PolicyRegistry,
-        },
+        config::{PolicyConfig, RouterConfig},
+        policies::{as_cache_aware, kv_index::event_monitor::KvEventMonitor, PolicyFactory},
         routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
@@ -309,42 +302,12 @@ mod tests {
     /// monitor, so a worker gets a stream only for its KV events, and its
     /// model an index with the first.
     fn context_over(policy: PolicyConfig) -> (Arc<AppContext>, Arc<KvEventMonitor>) {
-        context_with(policy, None)
-    }
-
-    /// [`context_over`] with a policy registry that asks the policy engine
-    /// of the document the built-in `preset` means, as a gateway that keeps
-    /// the engine in its own process does. The classic policies beside the
-    /// engine are `policy`'s.
-    fn context_asking(
-        policy: PolicyConfig,
-        preset: &str,
-    ) -> (Arc<AppContext>, Arc<KvEventMonitor>) {
-        let document = PolicySpec::preset(preset).expect("a built-in preset");
-        let spec = AppliedSpec::validate(&document).expect("the preset validates");
-        let registry = PolicyRegistry::with_policy_engine(
-            policy.clone(),
-            RoutingKeyOverrideConfig::default(),
-            Arc::new(PolicyEngine::new(spec)),
-            DocumentOrigin::Supplied,
-            false,
-        );
-        context_with(policy, Some(Arc::new(registry)))
-    }
-
-    fn context_with(
-        policy: PolicyConfig,
-        registry: Option<Arc<PolicyRegistry>>,
-    ) -> (Arc<AppContext>, Arc<KvEventMonitor>) {
         let config = RouterConfig::builder().policy(policy).build_unchecked();
         let mut context = AppContext::clone(&app_context_for_tests(
             config,
             Arc::new(WorkerRegistry::new()),
             None,
         ));
-        if let Some(registry) = registry {
-            context.policy_registry = registry;
-        }
         let monitor = Arc::new(KvEventMonitor::new());
         context
             .policy_registry
@@ -443,26 +406,6 @@ mod tests {
         .await;
 
         assert!(monitor.get_indexer(MODEL).is_some());
-        monitor.stop().await;
-    }
-
-    /// Where the gateway keeps the policy engine in its own process, the
-    /// engine's document starts a worker's stream of cache events: the
-    /// profile that decides the worker's model reads them. The classic
-    /// policy beside the engine here is round robin, which reads no index,
-    /// so nothing but the document asks for the events. Without them the
-    /// model's index stays empty and every request reads as held by nobody.
-    #[tokio::test]
-    async fn a_worker_streams_the_cache_events_the_engines_profile_reads() {
-        let (app_context, monitor) = context_asking(PolicyConfig::RoundRobin, "cache_aware");
-        register(&app_context, grpc_worker(WorkerType::Regular), &[]).await;
-        assert!(monitor.get_indexer(MODEL).is_some());
-        monitor.stop().await;
-
-        // A profile that reads none asks for none.
-        let (app_context, monitor) = context_asking(PolicyConfig::RoundRobin, "least_load");
-        register(&app_context, grpc_worker(WorkerType::Regular), &[]).await;
-        assert!(monitor.get_indexer(MODEL).is_none());
         monitor.stop().await;
     }
 

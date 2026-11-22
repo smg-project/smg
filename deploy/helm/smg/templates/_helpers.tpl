@@ -211,71 +211,6 @@ it cannot start without. Renders nothing.
 {{- end -}}
 {{- end }}
 
-{{/* The ConfigMap that supplies the router's policy document, if given. */}}
-{{- define "smg.routerPolicyConfigMapName" -}}
-{{- if .Values.router.policySpec -}}
-{{- printf "%s-policy-spec" (include "smg.fullname" .) -}}
-{{- else -}}
-{{- .Values.router.policySpecConfigMap | default "" -}}
-{{- end -}}
-{{- end }}
-
-{{/* The gateway's policy controller switch as the launcher reads it. YAML reads a bare on or off as a boolean: both forms mean the same. */}}
-{{- define "smg.routerPolicyController" -}}
-{{- $switch := .Values.router.policyController -}}
-{{- if kindIs "bool" $switch -}}
-{{- ternary "on" "off" $switch -}}
-{{- else -}}
-{{- $switch | default "off" -}}
-{{- end -}}
-{{- end }}
-
-{{/* The value for --policy, empty when a document is given. */}}
-{{- define "smg.routerPolicyArg" -}}
-{{- if .Values.router.policy -}}
-{{- .Values.router.policy -}}
-{{- else if not (include "smg.routerPolicyConfigMapName" .) -}}
-cache_aware
-{{- end -}}
-{{- end }}
-
-{{/* The policy document's file in the router pod. */}}
-{{- define "smg.routerPolicySpecPath" -}}
-/etc/smg/policy/spec.yaml
-{{- end }}
-
-{{/* The inline policy file, with its final newline, for the ConfigMap and checksum. */}}
-{{- define "smg.routerPolicySpec" -}}
-{{- toYaml .Values.router.policySpec | printf "%s\n" -}}
-{{- end }}
-
-{{/* A policy document needs the gateway's controller and one source, and no value beside it that the document replaces:
-     both launchers refuse the flag of one, and the command line refuses it at its default too. */}}
-{{- define "smg.validatePolicy" -}}
-{{- $router := .Values.router -}}
-{{- if and $router.policySpec $router.policySpecConfigMap -}}
-{{- fail "router.policySpec and router.policySpecConfigMap each supply a policy document. Use one source." -}}
-{{- end -}}
-{{- if include "smg.routerPolicyConfigMapName" . -}}
-{{- if ne (include "smg.routerPolicyController" .) "on" -}}
-{{- fail "router.policySpec and router.policySpecConfigMap require router.policyController to be on." -}}
-{{- end -}}
-{{- if $router.policy -}}
-{{- fail "router.policy is set beside a policy document. The document names the policy: set router.policy to \"\". An upgrade with --reuse-values keeps an older chart's cache_aware." -}}
-{{- end -}}
-{{- range $role := list "prefillPolicy" "decodePolicy" "encodePolicy" -}}
-{{- if index ($router.disaggregation | default dict) $role -}}
-{{- fail (printf "router.disaggregation.%s is set beside a policy document. The document names the policy of each side: leave it empty." $role) -}}
-{{- end -}}
-{{- end -}}
-{{- range $name, $default := dict "cacheThreshold" 0.3 "balanceAbsThreshold" 64 "balanceRelThreshold" 1.5 "evictionIntervalSecs" 120 "maxTreeSize" 67108864 "blockSize" 16 -}}
-{{- if ne (float64 (index $router $name)) (float64 $default) -}}
-{{- fail (printf "router.%s is set beside a policy document. The document holds the cache tuning: leave router.%s at its default, %v." $name $name $default) -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- end }}
-
 {{/*
 Consul TLS files -- the files of router.discovery.consul.tls.existingSecret
 the router pod mounts under /etc/smg/consul-tls, as a JSON list for
@@ -333,18 +268,8 @@ Called from the router Deployment template.
 - {{ . | quote }}
 {{- end }}
 {{- end }}
-{{- with include "smg.routerPolicyArg" . }}
 - "--policy"
-- {{ . | quote }}
-{{- end }}
-{{- if eq (include "smg.routerPolicyController" .) "on" }}
-- "--policy-controller"
-- "on"
-{{- end }}
-{{- if include "smg.routerPolicyConfigMapName" . }}
-- "--policy-spec"
-- {{ include "smg.routerPolicySpecPath" . | quote }}
-{{- end }}
+- {{ .Values.router.policy | quote }}
 {{- with .Values.router.disaggregation }}
 {{- $mode := .mode | default "" }}
 {{- /* The role flags of disaggregated serving, typed: a role given without
@@ -611,7 +536,6 @@ Called from the router Deployment template.
 - "--chat-template"
 - {{ .Values.router.chatTemplate | quote }}
 {{- end }}
-{{- if not (include "smg.routerPolicyConfigMapName" .) }}
 - "--cache-threshold"
 - {{ .Values.router.cacheThreshold | quote }}
 - "--balance-abs-threshold"
@@ -624,7 +548,6 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxTreeSize | quote }}
 - "--block-size"
 - {{ .Values.router.blockSize | quote }}
-{{- end }}
 - "--max-payload-size"
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"

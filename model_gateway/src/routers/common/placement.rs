@@ -28,7 +28,6 @@ use smg_worker::{
 use tracing::{debug, warn};
 
 use crate::{
-    config::{PolicyConfig, RoutingMode},
     middleware::ReportedRefusal,
     observability::{
         log_throttle::KeyedLogThrottle,
@@ -36,8 +35,8 @@ use crate::{
     },
     policies::{
         as_consistent_hashing, policy_filters_unavailable_workers, policy_reads_hash_ring,
-        CacheNamespace, ConsistentHashingPolicy, LoadBalancingPolicy, NamedList, PolicyRegistry,
-        SelectWorkerInfo, WorkerRole,
+        CacheNamespace, LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo,
+        WorkerRole,
     },
     routers::{
         common::{
@@ -102,43 +101,6 @@ impl WireConstraint {
 pub(crate) fn strict_target(policy: &dyn LoadBalancingPolicy, headers: Option<&HeaderMap>) -> bool {
     as_consistent_hashing(policy).is_some()
         && header_utils::extract_target_worker(headers).is_some()
-}
-
-/// The worker an explicit target holds a request to, among `candidates`, as
-/// the consistent hashing policy finds it
-/// ([`ConsistentHashingPolicy::target_among`]): the header's number counts
-/// the candidates that are available when the request arrives. `None` where
-/// the request names no worker, and where no candidate is available: such a
-/// pool is steered without a reading of the header. `Some(None)` is a miss,
-/// and the request moves to no other worker.
-///
-/// For a route that narrows its candidates to the target ahead of a policy
-/// engine, where [`strict_target`] holds.
-pub(crate) fn targeted(
-    candidates: &[Arc<dyn Worker>],
-    headers: Option<&HeaderMap>,
-) -> Option<Option<Arc<dyn Worker>>> {
-    header_utils::extract_target_worker(headers)?;
-    let available: Vec<Arc<dyn Worker>> = candidates
-        .iter()
-        .filter(|worker| worker.is_available())
-        .cloned()
-        .collect();
-    if available.is_empty() {
-        return None;
-    }
-    let target = ConsistentHashingPolicy::target_among(&available, headers)?;
-    Some(target.and_then(|place| available.get(place).cloned()))
-}
-
-/// The policy half of [`strict_target`] read off a pair's settings: the
-/// prefill or the decode policy, each the `main` one where unset, is
-/// consistent hashing. Under the policy controller no role policy is built,
-/// so a pair's route asks its settings what the classic would keep.
-pub(crate) fn pair_keeps_target(mode: &RoutingMode, main: &PolicyConfig) -> bool {
-    [mode.get_prefill_policy(main), mode.get_decode_policy(main)]
-        .into_iter()
-        .any(|policy| matches!(policy, PolicyConfig::ConsistentHashing))
 }
 
 /// Whether an admission pre-filter may drop full workers from a role's
@@ -294,7 +256,6 @@ impl<'a> Narrowed<'a> {
         NamedList {
             list: self.list,
             positions: Some(&self.positions),
-            members: None,
         }
     }
 
@@ -395,8 +356,7 @@ pub(crate) fn candidates(
 /// candidate is asked once.
 ///
 /// The one narrowing by a request's own rule. The selection hands its policy
-/// what is left, and a route whose policy engine decides in the gateway's
-/// own process states it as the workers that engine decides over.
+/// what is left.
 #[inline]
 pub(crate) fn accepted_by(
     candidates: &[Arc<dyn Worker>],
@@ -428,8 +388,7 @@ pub(crate) fn select_single(
 /// else from too (the pool's window floor), so that both come from one
 /// membership generation. The pool is borrowed from the snapshot: the
 /// selection takes no count of the list. It keeps its name on the way to
-/// the policy, and beside the name the snapshot's cell for what the policy
-/// engine keeps of the list ([`NamedList::members`]).
+/// the policy.
 pub(crate) fn select_single_of(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -444,7 +403,6 @@ pub(crate) fn select_single_of(
         let whole = NamedList {
             list,
             positions: None,
-            members: Some(snapshot.pool_members_cell(pool)),
         };
         return select_among(registry, policies, model_id, list, Some(whole), inputs);
     }
@@ -734,11 +692,6 @@ pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
 /// backstop of it answer under this code.
 pub(crate) const NO_MEDIA_REF_CAPABLE_WORKER_CODE: &str = "no_media_ref_capable_worker";
 
-/// The client-visible code of [`policy_declined`].
-pub(crate) const POLICY_DECLINED_CODE: &str = "policy_declined";
-
-const POLICY_DECLINED_MESSAGE: &str = "The policy declined the request for model";
-
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
 /// circuit breaker open). Terminal for the retry layer: the verdict clears at
 /// the health interval or the breaker timeout, never inside a backoff window,
@@ -790,7 +743,8 @@ pub(crate) fn no_media_ref_capable_worker(message: impl Into<String>) -> Respons
     response
 }
 
-/// The reason a refusal's line names, when the router gave one.
+/// The reason a refusal's line names, when the router gave one (a
+/// `no_available_workers` 503; a 404 names none).
 pub(crate) fn refusal_reason(response: &Response) -> Option<&str> {
     response
         .extensions()
@@ -798,24 +752,10 @@ pub(crate) fn refusal_reason(response: &Response) -> Option<&str> {
         .map(|reason| reason.0.as_str())
 }
 
-/// The 503 for a declined request. The line names where the policy
-/// declined. A retry reads the same rows, so the answer gives no retry hint.
-pub(crate) fn policy_declined(model: &str, declined_at: &str) -> Response {
-    let mut response = error::service_unavailable(
-        POLICY_DECLINED_CODE,
-        format!("{POLICY_DECLINED_MESSAGE} '{model}'"),
-    );
-    let reason = format!("the policy declined at {declined_at}");
-    response.extensions_mut().insert(RefusalReason(reason));
-    mark_non_retryable(&mut response);
-    response
-}
-
 /// The 503 for a fleet whose prefill and decode pools hold workers and no
 /// prefill of them pairs with a decode: `mismatches` are the components the
 /// pools disagree on, `prefill` and `decode` each pool's pairing keys. The
-/// verdict reads membership alone, so the classic selection and the policy
-/// engine give one answer for one fleet.
+/// verdict reads membership alone.
 pub(crate) fn no_compatible_pair(
     model: &str,
     mismatches: &[String],
@@ -870,16 +810,16 @@ fn admitted_pool(
 /// line recognises the 404 by.
 pub(crate) const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
 
-/// The reason carried on a refusal response for its log line.
+/// The reason a `no_available_workers` refusal names (the role that is down,
+/// the policy that declined), carried on the response for its log line.
 #[derive(Clone, Debug)]
 struct RefusalReason(String);
 
 /// Lines per second the gateway writes for each refusal it answers on its
 /// own: a model whose workers are all unavailable (`no_available_workers`),
-/// a model nobody serves (`model_not_found`), a model none of whose
+/// a model nobody serves (`model_not_found`) and a model none of whose
 /// workers processes the media references forwarded to it
-/// (`no_media_ref_capable_worker`), or a request the policy declined
-/// (`policy_declined`). One line per refusal, with
+/// (`no_media_ref_capable_worker`). One line per refusal, with
 /// the request id, the model and the pool's state, shows the condition and
 /// whom it hits; past this rate the lines are counted and the next one
 /// carries the count, while `smg_router_request_errors_total` keeps the
@@ -910,12 +850,6 @@ static NO_MEDIA_REF_CAPABLE_WORKER_LOG: KeyedLogThrottle = KeyedLogThrottle::new
     REFUSAL_LOG_MODELS,
 );
 
-static POLICY_DECLINED_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
-    REFUSAL_LINES_PER_SECOND,
-    Duration::from_secs(1),
-    REFUSAL_LOG_MODELS,
-);
-
 /// The router answering a refusal, as its line names it.
 #[derive(Clone, Copy)]
 pub(crate) struct RefusalSite<'a> {
@@ -938,7 +872,6 @@ enum Refusal {
     /// verdict that holds until a capable worker registers, so it is keyed
     /// and capped like the pool's 503.
     NoMediaRefCapableWorker,
-    PolicyDeclined,
 }
 
 impl Refusal {
@@ -947,7 +880,6 @@ impl Refusal {
             NO_AVAILABLE_WORKERS_CODE => Some(Self::NoAvailableWorkers),
             MODEL_NOT_FOUND_CODE => Some(Self::ModelNotFound),
             NO_MEDIA_REF_CAPABLE_WORKER_CODE => Some(Self::NoMediaRefCapableWorker),
-            POLICY_DECLINED_CODE => Some(Self::PolicyDeclined),
             _ => None,
         }
     }
@@ -957,7 +889,6 @@ impl Refusal {
             Self::NoAvailableWorkers => &NO_AVAILABLE_WORKERS_LOG,
             Self::ModelNotFound => &MODEL_NOT_FOUND_LOG,
             Self::NoMediaRefCapableWorker => &NO_MEDIA_REF_CAPABLE_WORKER_LOG,
-            Self::PolicyDeclined => &POLICY_DECLINED_LOG,
         }
     }
 
@@ -966,7 +897,6 @@ impl Refusal {
             Self::NoAvailableWorkers => "No available workers for model",
             Self::ModelNotFound => "No worker serves model",
             Self::NoMediaRefCapableWorker => "No worker processes media references for model",
-            Self::PolicyDeclined => POLICY_DECLINED_MESSAGE,
         }
     }
 
@@ -982,25 +912,19 @@ impl Refusal {
     /// shares one allowance with every other such name, for the same reason.
     fn key(self, model_id: &str, registered: bool) -> &str {
         match self {
-            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::PolicyDeclined
-                if registered =>
-            {
-                model_id
-            }
-            Self::NoAvailableWorkers
-            | Self::NoMediaRefCapableWorker
-            | Self::PolicyDeclined
-            | Self::ModelNotFound => "",
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker if registered => model_id,
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::ModelNotFound => "",
         }
     }
 }
 
 /// The log line of a refusal the gateway answers on its own, and its marker.
 ///
-/// A `no_available_workers`, `no_media_ref_capable_worker` or
-/// `policy_declined` 503, or a `model_not_found` 404, gets one WARN with
-/// the request id, the model, the state of the pools `site` draws from,
-/// and the reason the refusal names when it has one, capped at
+/// A `no_available_workers` 503, a `no_media_ref_capable_worker` 503 or a
+/// `model_not_found` 404 gets one WARN with the request id, the model and
+/// the state of the pools `site` draws from, and the reason the refusal
+/// names when it has one (the role that is down, the policy that declined,
+/// the media references no worker processes), capped at
 /// [`REFUSAL_LINES_PER_SECOND`] per model with workers for the 503s and for
 /// all unknown names together
 /// (the 404, and a 503 for a name with no workers at all; see
@@ -1054,7 +978,7 @@ pub(crate) fn report_refusal_under(
     // pool lookup per role, no walk over the workers; the 404 needs none.
     let registered = matches!(
         kind,
-        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker | Refusal::PolicyDeclined
+        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker
     ) && site
         .pools
         .iter()
@@ -1750,6 +1674,7 @@ mod tests {
         },
         load::state::{one_rank_load, TestFeed},
         runtime::{RoutingState, StallReason},
+        test_support::no_health_check,
     };
     use tracing_subscriber::Layer;
 
@@ -4243,7 +4168,6 @@ mod tests {
             let whole = pool.shared().map(|list| NamedList {
                 list,
                 positions: None,
-                members: None,
             });
             assert_eq!(
                 select_pass(&registry, &policies, MODEL, drawn, whole, inputs).err(),
@@ -4327,6 +4251,75 @@ mod tests {
         );
     }
 
+    fn fleet(workers: usize) -> (Arc<WorkerRegistry>, Vec<Arc<dyn Worker>>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let fleet: Vec<Arc<dyn Worker>> = (0..workers)
+            .map(|at| {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("http://asked-{at:03}:8000"))
+                        .model(ModelCard::new(MODEL))
+                        .health_config(no_health_check())
+                        .build(),
+                );
+                worker.set_status(WorkerStatus::Ready);
+                assert!(registry.register(Arc::clone(&worker)).is_some());
+                worker
+            })
+            .collect();
+        (registry, fleet)
+    }
+
+    /// The worker one request is placed on, by its place in `among`.
+    fn placed(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        among: &[Arc<dyn Worker>],
+        inputs: PlacementInputs<'_>,
+    ) -> Option<usize> {
+        let pool = RoutingPool::HttpRegular;
+        let worker = select_single(registry, policies, MODEL, pool, None, inputs)?;
+        among.iter().position(|member| Arc::ptr_eq(member, &worker))
+    }
+
+    /// Callers that pick at the same moment do not pile on one worker.
+    /// Four callers pick together, a barrier a round, over 256 idle
+    /// workers, 64 rounds: every worker takes exactly one request. No lock
+    /// orders the callers: a rotation is one atomic step.
+    #[test]
+    fn callers_that_pick_at_once_take_each_idle_worker_once() {
+        use std::{sync::Barrier, thread};
+
+        const CALLERS: usize = 4;
+        const ROUNDS: usize = 64;
+        let (registry, fleet) = fleet(CALLERS * ROUNDS);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let round = Barrier::new(CALLERS);
+        let taken: Vec<usize> = thread::scope(|scope| {
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let pick = |_| {
+                            round.wait();
+                            placed(&registry, &policies, &fleet, PlacementInputs::default())
+                                .expect("an idle fleet takes every request")
+                        };
+                        (0..ROUNDS).map(pick).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .flat_map(|caller| caller.join().expect("a caller ends"))
+                .collect()
+        });
+        let mut times = vec![0usize; fleet.len()];
+        for at in taken {
+            times[at] += 1;
+        }
+        let piled = times.iter().filter(|&&times| times != 1).count();
+        assert_eq!(piled, 0, "workers that took no request or more than one");
+    }
+
     /// The all-unavailable 503 tells the client when to come back, like the
     /// gateway's other refusals.
     #[test]
@@ -4373,53 +4366,6 @@ mod tests {
             event.record(&mut rendered);
             self.1.lock().unwrap().push(rendered.0);
         }
-    }
-
-    #[test]
-    fn a_declined_request_is_reported_once_as_a_refusal() {
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
-        let registry = http_registry(&["http://worker:8080"]);
-        let site = RefusalSite {
-            function: "Router::route_typed_request",
-            mode: "Regular",
-            pools: &[("regular", RoutingPool::HttpRegular)],
-        };
-        let refusal = policy_declined(MODEL, "binding");
-        let reported = report_refusal(&registry, site, None, MODEL, refusal);
-        assert!(reported.extensions().get::<ReportedRefusal>().is_some());
-        let reported = report_refusal(&registry, site, None, MODEL, reported);
-        assert!(reported.extensions().get::<ReportedRefusal>().is_some());
-        {
-            let lines = lines.lock().expect("the refusal's lines");
-            assert_eq!(lines.len(), 1, "{lines:?}");
-            assert!(lines[0].contains("message=The policy declined the request for model"));
-            assert!(lines[0].contains("reason=\"the policy declined at binding\""));
-        }
-
-        let kind = Refusal::of(&reported).expect("the reported refusal's kind");
-        for other in [
-            Refusal::NoAvailableWorkers,
-            Refusal::ModelNotFound,
-            Refusal::NoMediaRefCapableWorker,
-        ] {
-            assert!(!std::ptr::eq(kind.throttle(), other.throttle()));
-        }
-
-        let throttle = KeyedLogThrottle::new(1, Duration::from_secs(60), REFUSAL_LOG_MODELS);
-        for model in ["missing-a", "missing-b", MODEL] {
-            report_refusal_under(
-                &throttle,
-                &registry,
-                site,
-                None,
-                model,
-                policy_declined(model, "binding"),
-            );
-        }
-        let lines = lines.lock().expect("the refusal's lines");
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[2].contains(&format!("model_id=\"{MODEL}\"")));
     }
 
     /// The model in the line is the caller's own text, so it is written as a

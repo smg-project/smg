@@ -396,7 +396,6 @@ mod tests {
             named: Some(NamedList {
                 list,
                 positions: None,
-                members: None,
             }),
             ..Default::default()
         };
@@ -454,7 +453,6 @@ mod tests {
             named: Some(NamedList {
                 list: &list,
                 positions: None,
-                members: None,
             }),
             ..Default::default()
         };
@@ -482,7 +480,6 @@ mod tests {
                     named: Some(NamedList {
                         list: &list,
                         positions: Some(&positions[..]),
-                        members: None,
                     }),
                     ..Default::default()
                 };
