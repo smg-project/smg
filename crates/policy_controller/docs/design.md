@@ -403,8 +403,8 @@ can name that worker.
 | Record | What it holds | Written by | Lives in |
 |---|---|---|---|
 | A. the index of cache events | for each block of tokens, which workers hold it | the workers' own cache events | `kv-index`: `ChainIndex`, wrapped by the gateway's `KvIndex`; one for each model |
-| B. the token tree | the token prefixes this process sent to each worker | the policy, at each decision | `kv-index`: `TokenTree`, one for each model in each policy object |
-| C. the string tree | the same for text prompts | the policy, at each decision | `kv-index`: `StringTree`, one for each model in each policy object |
+| B. the token tree | the token prefixes this process sent to each worker | the policy, at each decision | `kv-index`: `TokenTree`, one for each model in the `ModelTrees` of each policy object |
+| C. the string tree | the same for text prompts | the policy, at each decision | `kv-index`: `StringTree`, one for each model in the same `ModelTrees` |
 
 A prefill-decode setup has a classic policy object for each side, so each side keeps its own
 trees.
