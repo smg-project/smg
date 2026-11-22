@@ -280,8 +280,9 @@ pub struct TiktokenTokenizer {
     tokenizer: Arc<OwnEncoder>,
     /// The crate's direct byte-level encoder over the file's ranks, when the
     /// file fits it (see [`NativeEncoder::from_ranks`]): every encode of
-    /// text goes through it, decode stays with `tokenizer`. `None` keeps
-    /// every encode in `tokenizer`. Shared as `tokenizer` is.
+    /// text goes through it; a decode reads `byte_level`, or `tokenizer`
+    /// where no table is. `None` keeps every encode in `tokenizer`. Shared
+    /// as `tokenizer` is.
     native: Option<Arc<NativeEncoder>>,
     special_tokens: SpecialTokens,
     /// The ids by their text where no `text_index` is; beside one, only the
@@ -290,10 +291,10 @@ pub struct TiktokenTokenizer {
     /// The ids by their text over `byte_level`, for a vocabulary file with
     /// that table.
     text_index: Option<TextIndex>,
-    /// The added tokens' texts by id (`added_tokens_decoder`), read before
-    /// the encoder by `id_to_token`: an added token shadows a rank sharing
-    /// its id, as `vocab` and the other backend order them. Empty for a
-    /// built-in encoding.
+    /// The added tokens' texts by id (`added_tokens_decoder`), read first
+    /// by `id_to_token`: an added token shadows a rank sharing its id, as
+    /// `vocab` and the other backend order them. Empty for a built-in
+    /// encoding.
     added_texts: HashMap<TokenIdType, String>,
     vocab_size: usize,
     chat_template: ChatTemplateState,
@@ -652,7 +653,7 @@ impl TiktokenTokenizer {
 
         // Calculate true vocab size from max token ID (handles sparse/reserved IDs),
         // build the text-to-id map (borrowing the ranks) and the added tokens' texts
-        // by id, then pass the ranks by value to CoreBPE
+        // by id, then pass the ranks by value to the file's own encoder
         let vocab_size = ranks
             .values()
             .copied()
@@ -725,9 +726,9 @@ impl TiktokenTokenizer {
                 .collect(),
             _ => HashMap::new(),
         };
-        // Counted and announced once the file's own encoder has loaded too,
-        // the point the Hugging Face path counts at as well (before the chat
-        // template is read).
+        // Counted and announced once the file's own encoder has loaded or is
+        // left for a first need, the point the Hugging Face path counts at
+        // as well (before the chat template is read).
         if native.is_some() {
             encode_path::note_load(EncodePath::Native);
             tracing::info!(path = %EncodePath::Native, "tiktoken encode path");
@@ -1196,9 +1197,10 @@ fn byte_level_ids(vocab_size: usize, skip_token_ids: &HashSet<TokenIdType>) -> O
     Some(ids_end)
 }
 
-/// The bytes every id below `ids_end` decodes to, read back from the BPE: a
-/// rank's byte string, a special token's text. `skip_token_ids` marks the
-/// ones `skip_special_tokens` strips, as `decode` strips them.
+/// The bytes every id below `ids_end` decodes to, as `bytes_of` gives them (a
+/// rank's byte string, a special token's text; `None` for an id neither
+/// holds). `skip_token_ids` marks the ones `skip_special_tokens` strips, as
+/// `decode` strips them.
 fn byte_level_table<B: AsRef<[u8]>>(
     ids_end: usize,
     skip_token_ids: &HashSet<TokenIdType>,
@@ -1583,9 +1585,10 @@ impl Decoder for TiktokenTokenizer {
     /// do: whole tokens appended as text, the other bytes converted per run,
     /// specials dropped by the table's per-id marks when asked, in place of
     /// the crate's lookup per id; bytes that are not UTF-8 render lossily and
-    /// are logged as the crate path logs its fallback. An id the table lacks,
-    /// or a vocabulary too sparse for one, takes the crate's decode below,
-    /// with its unknown-id error and its lossy fallback.
+    /// are logged as the crate path logs its fallback. An id the table lacks
+    /// is answered here with the crate's unknown-id error; a vocabulary too
+    /// sparse for a table takes the crate's decode below, with that error
+    /// and its lossy fallback.
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         if let Some((text, lossy)) = self
             .byte_level
@@ -1717,9 +1720,10 @@ impl TokenizerTrait for TiktokenTokenizer {
 
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
         // An added token first (it shadows a rank sharing its id, as the
-        // text-to-id map ordered them), then the file's encoder, which holds
-        // every rank's bytes and the special tokens; an id whose bytes are
-        // not text has no token string, as before.
+        // text-to-id map ordered them), then the decode table or, where none
+        // is, the file's encoder: each holds every rank's bytes and the
+        // special tokens; an id whose bytes are not text has no token
+        // string, as before.
         if let Some(text) = self.added_texts.get(&id) {
             return Some(text.clone());
         }
@@ -2583,7 +2587,10 @@ mod tests {
             serde_json::from_str(&tekken::testing::minimal()).unwrap();
         file["config"]["pattern"] = unshipped.into();
         let dir = tekken::testing::dir_with(&file.to_string());
-        assert!(TiktokenTokenizer::from_tekken_file(&dir.path().join(tekken::FILE_NAME)).is_err());
+        let path = dir.path().join(tekken::FILE_NAME);
+        let read = tekken::read(&path).unwrap();
+        assert!(NativeEncoder::from_ranks(&read.ranks, &read.pattern, &[]).is_ok());
+        assert!(TiktokenTokenizer::from_tekken_file(&path).is_err());
     }
 
     /// A tiktoken-file checkpoint reads the processor's legacy
