@@ -798,6 +798,33 @@ mod tests {
         assert!(moved, "a forgotten worker holds no prompt");
     }
 
+    /// The maker's prompt is asked for where a tree of sent prefixes is
+    /// walked, and nowhere else. A place one pick decides is answered ahead
+    /// of the whole pass and never asks. A whole pass whose profile reads
+    /// no record of sent prefixes never asks either. The default policy's
+    /// whole pass asks once.
+    #[test]
+    fn a_decision_that_walks_no_tree_asks_for_no_prompt() {
+        let tokens: Vec<u32> = (0..256).collect();
+        let asked_of = |name: &str| {
+            let engine = preset(name);
+            let list = pool(4);
+            let members = engine.pool_members(&list);
+            let asks = Asks {
+                prompt: Some(PromptLent {
+                    tokens: Some(&tokens),
+                    ..PromptLent::default()
+                }),
+                ..Asks::of(request(), Some(&members))
+            };
+            let alone = matches!(answered(&engine, &asks), Decided::Alone(_));
+            (alone, asks.lent.get())
+        };
+        assert_eq!(asked_of("round_robin"), (true, 0));
+        assert_eq!(asked_of("least_load"), (false, 0));
+        assert_eq!(asked_of("cache_aware"), (false, 1));
+    }
+
     /// What a stage heard of a lease: the word, the worker the lease told
     /// books (the target's own at a dispatch), and the lease's index.
     type Heard = Arc<Mutex<Vec<(&'static str, WorkerId, u8)>>>;
