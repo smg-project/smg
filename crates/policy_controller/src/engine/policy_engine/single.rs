@@ -213,7 +213,11 @@ pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
 }
 
 /// The answer for a request that states what no stage of this engine runs,
-/// under the name of the stage that would have run it.
+/// under the name of the stage that would have run it. Cold: [`decide`]'s
+/// tests are then predicted to pass. Without it, the fourth of them kept
+/// the whole pass behind them from being inlined, 43 instructions a
+/// decision.
+#[cold]
 pub(super) fn declined(own: &PolicyEngine, request: &Request<'_>, stage: &'static str) -> Decision {
     shed(own, request, ShedReason::PolicyDeclined, stage)
 }
