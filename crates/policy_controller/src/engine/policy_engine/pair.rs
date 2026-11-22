@@ -305,8 +305,13 @@ pub(super) fn issue(
 /// The decode asked again over the records of the two lists, stamped
 /// ([`stamp`]): the engine's decode entry over the partners of the prefill
 /// of `held`, the target the pair holds, handed the decode that target
-/// names. `pool` holds the decode list's facts. Over an emptied list the
-/// entry sheds on the missing prefill and is handed no decode.
+/// names. `pool` holds the decode list's facts.
+///
+/// A prefill list with no record holds no held prefill: the entry answers
+/// over no list, is handed no decode and names the prefill that left,
+/// whatever the request states. A decode list with no record is read as
+/// it stands. The entry finds the held prefill in its list and refuses
+/// the call for the partners it lacks.
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -321,7 +326,7 @@ fn decide_decode_records(
         phase: Phase::Decode,
         ..*facts
     };
-    if pools.prefills.is_empty() || pools.decodes.is_empty() {
+    if pools.prefills.is_empty() {
         let none = PoolFacts {
             generation: pool.generation,
             ..PoolFacts::default()
@@ -798,7 +803,9 @@ mod tests {
         let classes = every(2, 0);
         stamp(&mut prefills, &mut decodes, &classes, &OPEN);
         let decision = decide_over(&spec, &facts(), &prefills, &decodes, &classes);
-        assert!(matches!(decision, Decision::Shed(_)), "{decision:?}");
+        // A pair's first decision over no candidate is emptied by no stage.
+        let none = matches!(decision, Decision::Shed(shed) if shed.emptied_by == "none");
+        assert!(none, "{decision:?}");
         assert!(!prefills_full(&decision));
     }
 
@@ -1182,6 +1189,70 @@ mod tests {
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "prefill-gone"),
             other => panic!("not shed: {other:?}"),
         }
+    }
+
+    /// A decode asked again where its host lists no decode is refused for
+    /// the partners it lacks: the held prefill stands in its list. So it is
+    /// behind a target that names the decode of its first decision. A
+    /// prefill that left is still named where a list holds no record.
+    ///
+    /// The classic router places both sides of a pair in one call
+    /// (`placement.rs:1227`) and decides no decode again, so this answer
+    /// is the engine's own.
+    #[test]
+    fn a_decode_asked_again_over_no_decode_is_not_shed_as_a_prefill_that_left() {
+        let shed_under = |host: &Host, held: &Target| match host.decide_held(&OPEN, 4, Some(held)) {
+            Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+            other => panic!("not shed: {other:?}"),
+        };
+        let host = Host::of(1, 0);
+        let held = worker_id(host.prefills[0].as_ref());
+        let no_partner = (ShedReason::NoEndpoints, "partners");
+        assert_eq!(shed_under(&host, &prefill_alone(held)), no_partner);
+        let first = first_target(&Host::of(1, 1).decide(&OPEN, 3, None));
+        assert_eq!((first.id, first.pair.is_some()), (held, true));
+        assert_eq!(shed_under(&host, &first), no_partner);
+        let gone = (ShedReason::NoEndpoints, "prefill-gone");
+        let left = prefill_alone(WorkerId(held.0 ^ 1));
+        assert_eq!(shed_under(&host, &left), gone);
+        assert_eq!(shed_under(&Host::of(0, 1), &prefill_alone(held)), gone);
+    }
+
+    /// Over no decode, as over two lists with records, a request that
+    /// states a demand is shed under the demand's stage. Over no prefill
+    /// the call is shed for the prefill that left, before a demand is read.
+    /// The classic router decides no decode again (`placement.rs:1227`):
+    /// this answer is the engine's own too.
+    #[test]
+    fn a_decode_asked_again_over_no_decode_sheds_a_stated_demand_under_its_stage() {
+        let pair = decided(1);
+        let demanded = Constraints {
+            demands: Demands {
+                vision: true,
+                ..Demands::default()
+            },
+            ..Constraints::default()
+        };
+        let shed_under = |prefills: u8, decodes: u8| {
+            let classes = every(usize::from(prefills), u32::from(decodes));
+            let (mut prefills, mut decodes) = lists(u64::from(prefills), u64::from(decodes));
+            stamp(&mut prefills, &mut decodes, &classes, &OPEN);
+            let again = decide_decode_records(
+                pair.spec.engine(),
+                &facts(),
+                &demanded,
+                &pool(&decodes),
+                pools(&prefills, &decodes, &classes),
+                &prefill_alone(WorkerId(1)),
+                &mut Scratch::default(),
+            );
+            match again {
+                Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+                other => panic!("not shed: {other:?}"),
+            }
+        };
+        assert_eq!(shed_under(1, 0), (ShedReason::NoEndpoints, WIRES));
+        assert_eq!(shed_under(0, 1), (ShedReason::NoEndpoints, "prefill-gone"));
     }
 
     /// Under round robin on both sides a pair's first decision takes the
