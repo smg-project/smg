@@ -4,16 +4,17 @@
 //! engine over stored records, which cuts and masks its rows for the
 //! asking gateway (`StoreSnapshot::view` and `written` in
 //! `store/snapshot.rs`, `narrow` there, and `emptied` in
-//! `engine/store_backed_engine.rs`). The last case holds the two against
-//! each other over one fleet: the rows the store builds for an ask, and
-//! the places this module names for it.
+//! `engine/store_backed_engine.rs`). One case holds the two against each
+//! other over two fleets: the rows the store builds for an ask, and the
+//! places this module names for it. The last case asks over a list its
+//! holder lends.
 
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+use smg_worker::{identity::basic::Worker, registry::WorkerRegistry, test_support::ready_worker};
 
 use super::{Asking, GatewayPlaces, Held, Taken};
 use crate::{
@@ -35,7 +36,10 @@ use crate::{
         snapshot::{narrow, StandingVeto, ViewBuffers, ViewQuery},
         GatewayId, HealthSink, MemoryStore, Reachability, VetoWrite, WorkerFacts, WorkersStore,
     },
-    worker_host::reach::{ListReach, Reach},
+    worker_host::{
+        reach::{ListReach, Reach},
+        Members, Objects,
+    },
 };
 
 const MODEL: &str = "model-a";
@@ -405,27 +409,41 @@ fn built(store: &MemoryStore, asking: Asking, now: Instant) -> Built {
     }
 }
 
+/// How many asks over one fleet met each answer: held to a part of the
+/// list, handed the list whole, shed, or over no row. `decided` counts the
+/// frames of those asks that were answered a pick, eight frames an ask.
+#[derive(Debug, Default)]
+struct Met {
+    narrowed: usize,
+    whole: usize,
+    shed: usize,
+    unreached: usize,
+    decided: usize,
+}
+
 /// Over one fleet, every ask is answered the same workers both ways. The
-/// store holds seven rows: two host-local, to different gateways, and
-/// wires of every kind. Vetoes stand through the door a controller writes
+/// first fleet holds seven rows: two host-local, to different gateways,
+/// workers on one wire, on the other and on both, and one that states no
+/// wire. Vetoes stand through the door a controller writes
 /// by: a held one, a doubt, one on a worker its gateway does not dial, and
-/// another gateway's. For each of three gateways, six sets of wires a
-/// frame can state and three hints:
+/// another gateway's. The second fleet is one gateway's alone, so the two
+/// other gateways reach no row of it. For each of three gateways, six sets
+/// of wires a frame can state and three hints:
 ///
 /// - the places this module names are the rows the store builds for the
 ///   ask, read as worker ids, the positions held back are the rows that
 ///   build marks stalled, and those held for good the rows whose breaker
 ///   it reads open;
 /// - an ask the wires or a hint of 0 leave no row of a pool that has rows
-///   is shed under that stage, and an ask over no row is no shed here;
+///   is shed under that stage, and an ask of a gateway that reaches no
+///   row is over no worker both ways, whatever it states;
 /// - a frame of that ask, made by the maker held to those places, is
 ///   answered workers among those rows alone: never a held one, and no
 ///   stalled one while a row stands that is not.
 #[test]
 fn every_ask_takes_the_rows_the_store_builds_for_it() {
-    const S: Duration = Duration::from_secs(1);
     let both = HTTP.union(GRPC);
-    let fleet = [
+    let mixed = [
         any(HTTP),
         local(OTHER, HTTP),
         any(GRPC),
@@ -434,10 +452,42 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
         any(HTTP),
         any(WireModes::NONE),
     ];
+    let vetoes = [
+        (ASKER, 3, true),
+        (ASKER, 5, false),
+        (ASKER, 1, true),
+        (OTHER, 0, false),
+    ];
+    let met = compared(&mixed, &vetoes);
+    // The fleet met asks that narrow, sheds and decisions. Every gateway
+    // dials a worker of it, and none dials every worker.
+    assert!(
+        met.narrowed > 0 && met.shed > 0 && met.decided > 0,
+        "{met:?}"
+    );
+    assert_eq!((met.whole, met.unreached), (0, 0), "{met:?}");
+
+    // A fleet one gateway alone dials: that gateway is handed it whole
+    // where its wires allow, and each ask of the two others, 18 a
+    // gateway, is over no row.
+    let locals = [local(OTHER, HTTP), local(OTHER, both)];
+    let met = compared(&locals, &[(OTHER, 1, false)]);
+    assert_eq!(met.unreached, 2 * 18, "{met:?}");
+    assert!(met.whole > 0 && met.shed > 0 && met.decided > 0, "{met:?}");
+}
+
+/// Every ask of three gateways over `fleet`, one row a worker in its
+/// order, under `vetoes` (a gateway, the place of the worker it vetoes,
+/// whether the veto holds): the store's build against this module's
+/// places, and the frames of each ask that takes places decided over the
+/// list.
+fn compared(fleet: &[Reach], vetoes: &[(GatewayId, usize, bool)]) -> Met {
+    const S: Duration = Duration::from_secs(1);
+    let both = HTTP.union(GRPC);
     let store = MemoryStore::new();
     let t0 = Instant::now();
     let ids: Vec<WorkerId> = (0..)
-        .zip(fleet)
+        .zip(fleet.iter().copied())
         .map(|(n, reach): (u32, Reach)| {
             let key = format!("http://worker-{n}:8000");
             let stated = WorkerFacts {
@@ -451,7 +501,6 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
                 reachable_from: reach.from,
                 ..WorkerFacts::default()
             };
-            assert_eq!(Reach::of(&stated), reach);
             store.upsert(stated).id()
         })
         .collect();
@@ -471,17 +520,14 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
     });
     let records = members.records(engine.spec(), engine.clock());
     assert_eq!(records.ids(), ids.as_slice());
-    let reach = ListReach::new(fleet);
+    let reach = ListReach::new(fleet.iter().copied());
 
     let until = Some(t0 + 60 * S);
-    let veto = |gateway: GatewayId, place: usize, hold: Option<Instant>| {
+    for &(gateway, place, holds) in vetoes {
+        let hold = until.filter(|_| holds);
         let written = store.gateway_veto_noted(gateway, ids[place], until, hold, false, t0);
         assert_eq!(written, VetoWrite::Written);
-    };
-    veto(ASKER, 3, until);
-    veto(ASKER, 5, None);
-    veto(ASKER, 1, until);
-    veto(OTHER, 0, None);
+    }
 
     let by_id = |places: &[u32]| {
         let mut named: Vec<WorkerId> = places.iter().map(|&place| ids[place as usize]).collect();
@@ -491,7 +537,7 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
     let every: Vec<u32> = (0_u32..).take(fleet.len()).collect();
     let mut buffers = GatewayPlaces::default();
     let mut lists = Lists::default();
-    let (mut narrowed, mut shed, mut unreached, mut decided) = (0, 0, 0, 0);
+    let mut met = Met::default();
     // The wires a frame states, as its field carries them: none, each
     // kind, two, and a bit this build does not know.
     let stated = [HTTP, GRPC, both, WireModes::ZMQ].map(|wires| u32::from(wires.bits()));
@@ -527,7 +573,7 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
                 let held = match buffers.taken(&reach, records, asking, vetoes.into_iter()) {
                     Taken::Unreached => {
                         assert_eq!(built.reached, 0, "{case}");
-                        unreached += 1;
+                        met.unreached += 1;
                         continue;
                     }
                     Taken::Emptied(stage) => {
@@ -538,7 +584,7 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
                             WIRES
                         };
                         assert_eq!(stage, by, "{case}");
-                        shed += 1;
+                        met.shed += 1;
                         continue;
                     }
                     Taken::Held(held) => held,
@@ -548,7 +594,8 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
                 assert!(!built.rows.is_empty(), "{case}");
                 assert_eq!(by_id(held.stalled), built.stalled, "{case}");
                 assert_eq!(by_id(held.held), built.held, "{case}");
-                narrowed += usize::from(held.places.is_some());
+                met.narrowed += usize::from(held.places.is_some());
+                met.whole += usize::from(held.places.is_none());
 
                 // The ask's frames, decided over the list.
                 let free = built.rows.len() > built.stalled.len();
@@ -578,17 +625,79 @@ fn every_ask_takes_the_rows_the_store_builds_for_it() {
                             assert!(!built.stalled.contains(&target.id), "{case}: {target:?}");
                         }
                     }
-                    decided += 1;
+                    met.decided += 1;
                 }
             }
         }
     }
-    // The fleet met every answer: asks that narrow and asks that do not,
-    // sheds, a gateway with no row, and decisions.
-    assert!(
-        narrowed > 0 && shed > 0 && decided > 0,
-        "{narrowed} narrowed, {shed} shed, {unreached} unreached, {decided} decided"
-    );
+    met
+}
+
+/// Over a list its holder lends, a veto written through the door a
+/// controller writes by holds its worker's position back. The veto names
+/// its worker by the row's id, which the lent list's records state, and
+/// the reach lent beside the list is of that list's places: a worker of
+/// another role stands in neither.
+#[test]
+fn a_veto_holds_its_workers_position_back_over_a_lent_list() {
+    let store = MemoryStore::new();
+    let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
+    let t0 = Instant::now();
+    let row = |n: u32, role: Role, reach: Reach| {
+        let key = format!("http://worker-{n}:8000");
+        let stated = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            wire_modes: reach.wires,
+            reachable_from: reach.from,
+            ..WorkerFacts::default()
+        };
+        store.upsert(stated).id()
+    };
+    let first = row(0, Role::Single, any(HTTP));
+    row(1, Role::Prefill, any(HTTP));
+    let second = row(2, Role::Single, local(ASKER, HTTP));
+    let third = row(3, Role::Single, any(HTTP));
+    objects.follow(&store);
+    store.publish_now();
+
+    let registry = objects.registry();
+    let generation = registry.model_generation(MODEL).expect("a generation");
+    let engine = engine("round_robin");
+    let lent = objects.lent(&generation, Role::Single);
+    let records = engine
+        .members_of(lent)
+        .records(engine.spec(), engine.clock());
+    assert_eq!(records.ids(), [first, second, third]);
+    let reach = objects.reach(&generation, Role::Single);
+    let stated = [any(HTTP), local(ASKER, HTTP), any(HTTP)];
+    assert_eq!(reach.workers(), stated);
+
+    let until = Some(t0 + Duration::from_secs(60));
+    let holds = store.gateway_veto_noted(ASKER, third, until, until, false, t0);
+    let doubts = store.gateway_veto_noted(OTHER, first, until, None, false, t0);
+    assert_eq!((holds, doubts), (VetoWrite::Written, VetoWrite::Written));
+    let standing = |gateway: GatewayId| -> Vec<StandingVeto> {
+        store.with_snapshot(|world| {
+            world
+                .gateway_vetoes(MODEL, Role::Single, gateway)
+                .standing_at(t0)
+                .collect()
+        })
+    };
+    let mut buffers = GatewayPlaces::default();
+    // The asking gateway dials all three, and its hold stands on the third.
+    let vetoes = standing(ASKER).into_iter();
+    let asker = buffers.taken(reach, records, plain(ASKER), vetoes);
+    assert_eq!(Answer::from(asker), held(None, &[2], &[2]));
+    // Another gateway does not dial the second, and doubts the first.
+    let vetoes = standing(OTHER).into_iter();
+    let other = buffers.taken(reach, records, plain(OTHER), vetoes);
+    assert_eq!(Answer::from(other), held(Some(&[0, 2]), &[0], &[]));
 }
 
 /// A measurement for the Numbers table, not a check: what one ask costs,
