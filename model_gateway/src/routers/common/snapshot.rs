@@ -21,7 +21,10 @@ use symphony::grammar::GrammarStart;
 
 use crate::{
     policies::hash_ring::HashRing,
-    routers::common::pair_index::{PdPairIndex, PdWire},
+    routers::{
+        common::pair_index::{PdPairIndex, PdWire},
+        grpc::multimodal::MediaFacts,
+    },
 };
 
 /// Static routing pool inside a model snapshot.
@@ -185,6 +188,10 @@ pub struct ModelWorkerSnapshot {
     /// What the workers of this generation say together, kept with the
     /// model id it was read for (see [`Self::labels`]).
     labels: OnceLock<(Box<str>, ModelLabels)>,
+    /// What the media gates read from the workers of this generation
+    /// together (see [`Self::media`]). `MediaFacts` stays with the gates in
+    /// `routers::grpc::multimodal`, so this module depends on that one.
+    media: OnceLock<MediaFacts>,
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
@@ -204,6 +211,7 @@ impl ModelWorkerSnapshot {
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
+            media: OnceLock::new(),
             hash_ring: OnceLock::new(),
             pool_members: std::array::from_fn(|_| OnceLock::new()),
         }
@@ -278,6 +286,17 @@ impl ModelWorkerSnapshot {
             .labels
             .get_or_init(|| (model_id.into(), read(&self.all)));
         (**spelling == *model_id).then_some(labels)
+    }
+
+    /// What the media gates read from the snapshot's workers together:
+    /// `read` reads them on the first media request after the membership
+    /// change, every request after it reads the kept answers. They hang on
+    /// the workers' labels, connection modes and engines, which a worker
+    /// holds from its construction (see [`Self::labels`]), and on no model
+    /// id as spelled, so one snapshot keeps one value. The rules stay with
+    /// the media gates.
+    pub(crate) fn media(&self, read: impl FnOnce(&[Arc<dyn Worker>]) -> MediaFacts) -> &MediaFacts {
+        self.media.get_or_init(|| read(&self.all))
     }
 
     /// The consistent-hash ring over the URLs of this generation's members,
