@@ -30,7 +30,7 @@
 //! the pool is shed under the last of those: where a host cuts a pool one
 //! demand after another, that is the demand that took its last worker.
 
-use crate::engine::{framework, store_backed_engine, view::Role};
+use crate::engine::{decision, framework, view::Role};
 
 /// Where a request's media by reference may be processed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -219,7 +219,7 @@ impl UnmetDemand {
     #[must_use]
     pub const fn stage(self) -> &'static str {
         match self {
-            Self::Runtime => store_backed_engine::WIRES,
+            Self::Runtime => decision::WIRES,
             Self::Vision => framework::VISION,
             Self::References => REFERENCES,
             Self::Pipeline => PIPELINE,

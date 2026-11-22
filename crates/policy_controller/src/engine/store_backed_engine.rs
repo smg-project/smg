@@ -43,14 +43,21 @@ pub(crate) use crate::store::snapshot::narrow;
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::{Decision, Pair, Pick, ShadowKind, Shed, ShedReason, Target, Targets, Trace},
-        decision_engine::RequestMaker,
+        decision::{
+            shed, Decision, Pair, Pick, ShadowKind, ShedReason, Target, Targets, Trace,
+            SUBSET_HINT, WIRES,
+        },
+        decision_engine::{
+            DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Leased, Request,
+            RequestMaker, SweepOutcome,
+        },
         decision_slot::DecisionSlot,
         demands::{self, DemandFacts, Demands},
         framework::{
             release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
             KEEPS_SLOT_STATE, SAMPLES_DECISIONS, SHADOWS,
         },
+        prompt_hashes::{HashSeeds, PromptHashes},
         sticky_sessions::{SessionExpiry, SessionVerdict},
         view::{
             fingerprint, AffinityFacts, AffinityRows, Candidate, Constraints, HashKind, KeyedRow,
@@ -59,10 +66,11 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{
-        leases::DISPATCH_TTL, AffinityQuery, AffinityRowsBuffers, AtWork, DecodeIssue,
-        DecodeRefused, DecodeSide, Dispatch, EncodePairBuffers, GatewayId, Hand, HealthSink,
-        LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, PairBuffers, PickRecord,
-        Pin, Said, SessionsStore, Sides, StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
+        leases::DISPATCH_TTL, pairing::Refusal, AffinityQuery, AffinityRowsBuffers, AtWork,
+        DecodeIssue, DecodeRefused, DecodeSide, Dispatch, EncodePairBuffers, GatewayId, Hand,
+        HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, PairBuffers,
+        PickRecord, Pin, Said, SessionsStore, Sides, StoreSnapshot, ViewBuffers, ViewFacts,
+        ViewQuery,
     },
     tracking::{
         in_flight::WorkerSlot,
@@ -215,16 +223,6 @@ pub(crate) fn summed(parts: &[Part], count: impl Fn(&Part) -> &AtomicU64) -> u64
     let parts = parts.iter();
     parts.map(|part| count(part).load(Ordering::Relaxed)).sum()
 }
-
-/// The stage a decision is shed under when its pool has rows and its
-/// gateway shares a wire with none of them, or its request's runtime is
-/// none of theirs
-/// ([`UnmetDemand::Runtime`](crate::engine::demands::UnmetDemand::Runtime)).
-pub(crate) const WIRES: &str = "wires";
-
-/// The stage a decision is shed under when its gateway hints a subset of 0
-/// of a pool that has rows: a decision over no candidates, as it asked.
-pub(crate) const SUBSET_HINT: &str = "subset-hint";
 
 /// What a deciding thread keeps across decisions: the engine's run of a
 /// decision allocates only while these grow. The lists are those of the
@@ -1796,27 +1794,6 @@ fn booked_in(world: &StoreSnapshot, booking: &Booking) -> Option<WorkerSlot> {
     world.booked(&built, booking.target)
 }
 
-/// A shed the deciders say in the engine's place, in the shape of the
-/// engine's own.
-pub(crate) fn shed(
-    reason: ShedReason,
-    emptied_by: &'static str,
-    seed: u64,
-    generation: u64,
-) -> Decision {
-    Decision::Shed(Shed {
-        reason,
-        emptied_by,
-        retry_after_secs: 1,
-        wait_allowed: false,
-        trace: Trace {
-            seed,
-            generation,
-            ..Trace::default()
-        },
-    })
-}
-
 /// How a decision is made over the view [`hand`] reads, in three forms:
 /// over rows of which no stage of the profile's own reads the holdings,
 /// over rows the store named for the profile's own affinity stages, and
@@ -2770,23 +2747,6 @@ pub(crate) fn decider_of(model: &str, deciders: usize) -> usize {
     usize::try_from(fingerprint(model.as_bytes()) % deciders).unwrap_or(0)
 }
 
-/// A request and its constraints as the host holds them. A door reads
-/// these facts in process. A link carries them to the controller.
-#[derive(Clone, Copy, Debug)]
-pub struct Request<'a> {
-    /// The request's id as the host states it: its lease keeps the id's
-    /// fingerprint.
-    pub id: &'a [u8],
-    /// The request as the engine reads it. The deciding view supplies the
-    /// clock value, affinity, named rows, lease counts and the key's count
-    /// under a rule with an in-flight cap. A budget of 0 leaves a decision
-    /// in process unbounded. Over a link it says the request's time is spent.
-    pub facts: RequestFacts<'a>,
-    /// What the host alone knows. The door writes its standing vetoes and
-    /// the pins of record over the host's.
-    pub constraints: Constraints<'a>,
-}
-
 impl RequestForm for Request<'_> {
     type Lists = ();
 
@@ -2947,71 +2907,6 @@ impl<M: RequestMaker> Stated for Made<'_, M> {
         debug_assert_eq!(request.facts.model, self.0.model(), "the seat's model");
         order(&request)
     }
-}
-
-/// A decision as its host takes it.
-#[derive(Debug)]
-pub struct DecideOutcome {
-    /// The engine's decision.
-    pub decision: Decision,
-    /// The lease issued for a pick, with the target index it books. For
-    /// a pair this is the prefill side. `None` for a decision that
-    /// picks no worker.
-    pub lease: Option<Leased>,
-    /// A pair's session under the decode phase: the decode side's lease
-    /// carries it, and it cannot be told from the prefill side's. A guard
-    /// lends it back with each word
-    /// ([`HeldDecision`](super::decision_engine::HeldDecision)).
-    /// [`Session::NONE`] for a single, for a pair with no key, and from an
-    /// engine whose file of leases holds the decode side whole.
-    pub decode_session: Session,
-}
-
-impl DecideOutcome {
-    /// Whether the lease is a pair's prefill side. The decode side's
-    /// lease shares its id and dispatch span.
-    #[must_use]
-    pub fn pair(&self) -> bool {
-        self.lease
-            .is_some_and(|leased| leased.lease.side == Side::Prefill)
-    }
-}
-
-/// A pick's lease as its host receives it, with its dispatch deadline.
-#[derive(Clone, Copy, Debug)]
-pub struct Leased {
-    /// The lease issued for the pick.
-    pub lease: Lease,
-    /// When its dispatch span ends on the host's clock. The store ends
-    /// leases whose dispatch span has passed and whose dispatch is still
-    /// owed.
-    pub due: Instant,
-}
-
-/// What one pass of a door's clock ended ([`StoreBackedEngine::sweep`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SweepOutcome {
-    /// The leases past their dispatch span, ended as abandoned.
-    pub leases: usize,
-    /// The pins of record past their end, gone from their table.
-    pub pins: usize,
-}
-
-/// Why a door has no decision for a request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecisionRefused {
-    /// The request is a decode or encode side sent on its own. A pair is
-    /// asked at its prefill, and that one request decides both sides.
-    PairSide,
-    /// The store filed no lease for the pick, at the second try too: its
-    /// term mints no id, or another hand raised it under both tries.
-    Unleased,
-    /// The decision panicked. It cost this request alone: the next one
-    /// decides on new buffers.
-    Faulted,
-    /// The store takes no decode side under the lease a decode call
-    /// named, for the reason it carries.
-    Decode(DecodeRefused),
 }
 
 /// A host's engine for a decision in process: the order of a decision's
@@ -4233,6 +4128,112 @@ impl StoreBackedEngine {
             }),
             decode_session: Session::NONE,
         })
+    }
+}
+
+impl DecisionEngine for StoreBackedEngine {
+    #[inline]
+    fn decide_under(
+        &self,
+        gateway: GatewayId,
+        maker: &impl RequestMaker,
+        now: Instant,
+    ) -> Result<Decided, DecisionRefused> {
+        let (decided, later) = self.decide_under_stated(gateway, maker, now)?;
+        Ok(Decided::Whole(decided, later))
+    }
+
+    // A request stated ahead of the load pays nothing for a maker's form.
+    #[inline]
+    fn decide(
+        &self,
+        gateway: GatewayId,
+        request: &Request<'_>,
+        now: Instant,
+    ) -> Result<DecideOutcome, DecisionRefused> {
+        Self::decide(self, gateway, request, now)
+    }
+
+    // The file of the store's leases holds the prefill a lease booked.
+    #[inline]
+    fn decide_decode_under(
+        &self,
+        gateway: GatewayId,
+        maker: &impl RequestMaker,
+        held: &HeldDecision<'_>,
+        now: Instant,
+    ) -> Result<DecideOutcome, DecisionRefused> {
+        Self::decide_decode_under(self, gateway, maker, held.lease.id, now)
+    }
+
+    #[inline]
+    fn decide_decode(
+        &self,
+        gateway: GatewayId,
+        request: &Request<'_>,
+        held: &HeldDecision<'_>,
+        now: Instant,
+    ) -> Result<DecideOutcome, DecisionRefused> {
+        Self::decide_decode(self, gateway, request, held.lease.id, now)
+    }
+
+    #[inline]
+    fn decide_encode_pair(
+        &self,
+        gateway: GatewayId,
+        request: &Request<'_>,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        now: Instant,
+    ) -> Result<DecideOutcome, DecisionRefused> {
+        Self::decide_encode_pair(self, gateway, request, items, placed, now)
+    }
+
+    // The file finds the lease's record by its id, and holds whatever
+    // else the view lends. A completion is also written on the served
+    // worker's row, for the health precedence.
+    #[inline]
+    fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant) {
+        let lease = held.lease.id;
+        match said {
+            Said::Completed(outcome) => {
+                completed(self.store(), gateway, &outcome, now, |said| {
+                    self.report(gateway, lease, said);
+                });
+            }
+            Said::Dispatched(..) | Said::Released(..) => self.report(gateway, lease, said),
+        }
+    }
+
+    fn sweep(&self, now: Instant) -> SweepOutcome {
+        Self::sweep(self, now)
+    }
+
+    fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {
+        self.store().with_snapshot(|world| read(world.spec()))
+    }
+
+    fn prompt_hashes(
+        &self,
+        model: &str,
+        tokens: Option<&[u32]>,
+        text: Option<&str>,
+        seeds: HashSeeds,
+    ) -> PromptHashes {
+        self.store().prompt_hashes(model, tokens, text, seeds)
+    }
+
+    fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal> {
+        self.store()
+            .with_snapshot(|world| world.pairs(model)?.refusal(wires).cloned())
+    }
+
+    fn faults(&self) -> u64 {
+        Self::faults(self)
+    }
+
+    fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
+        Self::shadowed(self, binding, kind)
     }
 }
 
