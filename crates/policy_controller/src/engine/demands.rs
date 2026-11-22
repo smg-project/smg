@@ -198,8 +198,10 @@ impl Demands {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DemandFacts {
     /// The worker's runtime as a number its registering host names: equal
-    /// numbers are one runtime, and the crate reads no more of it. `0`
-    /// states none, and meets no demand for one.
+    /// numbers are one runtime, and the crate reads no more of it. A host
+    /// may give one number to each runtime and transport it dials: a
+    /// retry's demand ([`Demands::runtime`]) then holds the request to
+    /// both. `0` states none, and meets no demand for one.
     pub runtime: u32,
     /// Whether the worker processes media by reference.
     pub references: bool,

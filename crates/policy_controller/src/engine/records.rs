@@ -17,7 +17,8 @@
 //!   value of a worker is in it. What no worker object holds, the program
 //!   that holds it says here too, once a worker
 //!   ([`PoolRecords::with_fixed_facts`]): whether the worker takes images,
-//!   and the id it knows the worker by where it keeps ids of its own.
+//!   the id it knows the worker by where it keeps ids of its own, and
+//!   what the worker states for a request's hard demands.
 //! - **Once a load snapshot.** A snapshot is published whole and never
 //!   changed, so a worker's report reads the same at every decision that
 //!   holds the snapshot. One decision that writes every record of a list
@@ -68,6 +69,7 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, worker::Wor
 
 use super::{
     decision::Decision,
+    demands::{DemandFacts, Demands, UnmetDemand},
     framework::{Engine, Scratch},
     view::{
         fingerprint, Candidate, Constraints, Engines, FixedFacts, Health, OverloadRegime,
@@ -379,6 +381,11 @@ pub struct PoolRecords {
     fixed: Box<[Candidate]>,
     /// Each worker's id, by position.
     ids: Box<[WorkerId]>,
+    /// What each worker states for a request's hard demands, by position
+    /// ([`FixedFacts::demands`], and the rank its object registered), and
+    /// none where no worker of the list states one: such a list allocates
+    /// no column.
+    demand_facts: Option<Box<[DemandFacts]>>,
     /// The ids in their own order, each with its worker's position
     /// ([`Self::place_of`]). Empty where two rows of the list carry one
     /// id.
@@ -430,7 +437,13 @@ impl PoolRecords {
     /// object ([`FixedFacts`]): `facts_of` is asked once a worker, here, and
     /// never at a decision. Whether a worker takes images goes into its
     /// record, and so does the id its program states, in place of the
-    /// fingerprint of its address ([`worker_id`]).
+    /// fingerprint of its address ([`worker_id`]). What it states for a
+    /// request's hard demands goes into a column beside the records
+    /// ([`Self::meeting`]), which the first worker that states one makes:
+    /// a list where none does allocates nothing for it. Whether a worker
+    /// registered a data-parallel rank ([`DemandFacts::ranked`]) is read
+    /// off its object and goes into the same column, whatever the program
+    /// says of it: [`Self::new`] reads it too.
     #[must_use]
     pub fn with_fixed_facts(
         workers: &[Arc<dyn Worker>],
@@ -439,6 +452,7 @@ impl PoolRecords {
         mut facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
     ) -> Self {
         let lists = spec.lists();
+        let mut demand_facts: Option<Box<[DemandFacts]>> = None;
         let fixed: Box<[Candidate]> = workers
             .iter()
             .zip(0u32..)
@@ -464,6 +478,19 @@ impl PoolRecords {
                     Some(lists.positions(kind, None, &labels))
                 };
                 let facts = facts_of(worker);
+                // Whether the worker registered a rank is its object's to
+                // say, whatever the program said of it.
+                let demands = DemandFacts {
+                    ranked: worker.is_dp_aware(),
+                    ..facts.demands
+                };
+                if demands != DemandFacts::default() {
+                    let column = demand_facts
+                        .get_or_insert_with(|| vec![DemandFacts::default(); workers.len()].into());
+                    if let Some(entry) = column.get_mut(position as usize) {
+                        *entry = demands;
+                    }
+                }
                 Candidate {
                     position,
                     id: facts.id_or(address),
@@ -505,6 +532,7 @@ impl PoolRecords {
         Self {
             fixed,
             ids,
+            demand_facts,
             places: places.into(),
             engine_rows,
             engine_ends,
@@ -563,6 +591,50 @@ impl PoolRecords {
     #[must_use]
     pub fn fixed(&self) -> &[Candidate] {
         &self.fixed
+    }
+
+    /// The places of the list whose worker meets `demands`, written into
+    /// `kept`: of every place, in the list's order, or of `among` alone, in
+    /// its order, the places the request is already held to. A worker is
+    /// judged by its record's vision bit, by what the program said it
+    /// states and by the rank its object registered
+    /// ([`Self::with_fixed_facts`]). A list no worker of which states
+    /// anything keeps no column, and each of its workers states nothing.
+    /// The demands are judged as they are handed: a caller that judges a
+    /// prefill side's list hands them through [`Demands::held_by`].
+    ///
+    /// The answer is the last of the demands the workers left out failed
+    /// first, in the order a host answers for them ([`UnmetDemand`]): the
+    /// stage a list the demands leave nobody is shed under. `None` where
+    /// every worker judged meets them.
+    ///
+    /// One pass over the half of the records no request changes: no worker
+    /// object is read, and nothing is allocated once `kept` has grown to
+    /// the list.
+    pub fn meeting(
+        &self,
+        demands: Demands,
+        among: Option<&[u32]>,
+        kept: &mut Vec<u32>,
+    ) -> Option<UnmetDemand> {
+        kept.clear();
+        let column = self.demand_facts.as_deref().unwrap_or_default();
+        let mut unmet = None;
+        let mut judge = |place: u32| {
+            let Some(row) = self.fixed.get(place as usize) else {
+                return;
+            };
+            let stated = column.get(place as usize).copied().unwrap_or_default();
+            match demands.unmet_by(row.vision, stated) {
+                None => kept.push(place),
+                failed => unmet = unmet.max(failed),
+            }
+        };
+        match among {
+            None => (0..self.fixed.len() as u32).for_each(&mut judge),
+            Some(places) => places.iter().copied().for_each(&mut judge),
+        }
+        unmet
     }
 
     /// The generation of the document the records were read under. Records

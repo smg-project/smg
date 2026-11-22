@@ -504,10 +504,11 @@ dropped with the old list.
 
 A host that knows a fact of its workers that their objects do not hold asks through
 `PolicyEngine::pool_members_with_fixed_facts` instead. It says the fact once for each worker, at
-that call, and the engine writes it into the worker's record (5.3). Two such facts stand today:
-whether a worker takes images, and the id the host knows the worker by where it keeps ids of its
-own. That entry makes the list's records at the call, where `pool_members` leaves them to their
-first use.
+that call, and the engine writes it into the worker's record (5.3). Three such facts stand today:
+whether a worker takes images, the id the host knows the worker by where it keeps ids of its own,
+and what the worker states for a request's hard demands, which stands in a column beside the
+records. That entry makes the list's records at the call, where `pool_members` leaves them to
+their first use.
 
 ```rust
 // engine/policy_engine.rs
@@ -614,8 +615,9 @@ pub struct Constraints<'a> {
 }
 ```
 
-What is not built in the engine that stays: a request that states a subset hint, a demand, or
-protocols that not every worker of its list serves is refused, and the refusal names the input.
+What is not built in the engine that stays: a request that states a subset hint, a pair's demand,
+or protocols that not every worker of its list serves is refused. The refusal names the input,
+except a pair's demand, which is shed under the stage `wires`.
 A pair's encode items are refused at the engine's entry. `EncodeLists::decide` decides them over
 a host's three lists and no entry calls it. The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
@@ -754,7 +756,8 @@ the kept one. `GatewayId` is still defined in the store.
 
 - It honours what it refuses today: a pair held to some workers of its two lists (a single
   request states the positions of its list in `Constraints::places` and is decided, which is
-  built); demands; a pair's encode items.
+  built); a pair's demands (a single request's are kept, which is built); a pair's encode
+  items.
 - Six request fields that only the old engine's host fills leave with it (`pinned_at`,
   `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`,
   `signal_cells`), and `Constraints::pins`. One of them needs a successor: a sessions rule with
@@ -1425,7 +1428,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `shadow`, `explain.sample` | **[partly]** | the kept engine runs a single request's shadow, but not one that reads affinity rows of its own; a pair's shadows and `explain.sample` run in the old engine only (decision 7) |
 | The ten presets and the conversion from routing settings | **[built]** | |
 | The stage interfaces and a builder's own stages | **[built]** | |
-| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a demand, mixed protocols, encode items; no recorded line replays through it |
+| The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols, encode items; no recorded line replays through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
 | `cache_aware` on that engine | **[partly]** | its own record has three faults; the two trees are planned |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | the crate's ring places a routing key on another worker than classic's ring (decision 3) |
