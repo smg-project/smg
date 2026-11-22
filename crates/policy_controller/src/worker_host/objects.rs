@@ -1157,6 +1157,13 @@ impl Objects<Members> {
     /// ask is one read. A generation keeps what its first ask read for as
     /// long as it stands, and a membership change publishes another.
     ///
+    /// A fact these lists carry does not move within a row's life: every
+    /// registration path starts another life where the image bit differs,
+    /// which publishes. A raw store write that moves the bit in place is
+    /// not published where the holder keeps a handed-in object: the object
+    /// stands as it was handed in, and its generation's lists as far
+    /// behind, until the model's next membership change.
+    ///
     /// A member the holder holds no row's object for is left out of the
     /// lists and counted ([`Self::unstated`]). So every worker lent states
     /// its row's id, and a decision's target names a worker by that id and
@@ -1164,9 +1171,11 @@ impl Objects<Members> {
     ///
     /// The first ask of a generation reads the registry's id of each
     /// member, and then the holder's entry once, under its read lock and
-    /// with no other lock taken under it. So the holder asks no list and
-    /// calls nothing of the engine while it writes its entry: an ask and a
-    /// membership change never wait on each other.
+    /// with no other lock taken under it. The holder asks no list and
+    /// calls nothing of the engine while it writes its entry. So an ask
+    /// and a membership change can wait on each other for the length of
+    /// the entry's lock, and never in a cycle: neither holds a lock while
+    /// it takes the other's.
     #[must_use]
     pub fn lent<'a>(&self, generation: &'a Members, role: Role) -> LentList<'a> {
         generation.lent(role, |members| self.fixed_facts(members))
@@ -1556,6 +1565,53 @@ mod tests {
             assert_eq!(replica.told(), [("replaced", id)], "{name}");
             assert_eq!(replica.objects.unhanded(), 0, "{name}");
         }
+    }
+
+    /// The named limit of the lists a holder lends. A kept object's row
+    /// whose image bit a raw store write moves in place is restated with
+    /// no publish: the object stands as it was handed in, and its
+    /// generation keeps the bit its first ask read. No registration path
+    /// writes so: each starts another life where the bit differs. The
+    /// model's next membership change publishes a generation that reads
+    /// the row as it stands.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_kept_objects_bit_moved_in_place_stands_until_the_next_publish() {
+        use crate::engine::Role;
+
+        let (replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Precondition::Any).expect("the first write");
+        let registry = replica.objects.registry();
+        let generation = || {
+            registry
+                .model_generation("m")
+                .expect("the model's generation")
+        };
+        let bit = |generation: &Members| {
+            let list = replica.objects.lent(generation, Role::Single);
+            list.facts.expect("the holder lends facts")[0].vision
+        };
+        let before = generation();
+        assert!(!bit(&before));
+
+        let mut facts = replica.row(A).facts;
+        facts.vision = true;
+        let change = replica.store.upsert(facts);
+        assert!(matches!(change, MembershipChange::Relabelled { .. }));
+        replica.follow();
+        assert!(Arc::ptr_eq(&replica.at(A), &first), "the object is kept");
+        assert!(Arc::ptr_eq(&before, &generation()), "nothing is published");
+        assert!(
+            !bit(&before),
+            "the generation keeps what its first ask read"
+        );
+
+        let second = built(B, KEY_B);
+        registered(&replica, &door, &second, Precondition::Any).expect("a join");
+        let after = generation();
+        assert!(!Arc::ptr_eq(&before, &after), "a join publishes");
+        assert!(bit(&after), "the next generation reads the row");
     }
 
     /// A row moved by a writer that hands nothing in keeps its handed

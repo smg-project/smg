@@ -29,6 +29,7 @@ const SINGLE_0: &str = "http://single-0:8000";
 const SINGLE_1: &str = "http://single-1:8000";
 const PREFILL: &str = "http://prefill-0:8000";
 const DECODE: &str = "http://decode-0:8000";
+const ENCODE: &str = "http://encode-0:8000";
 const STRAY: &str = "http://stray-0:8000";
 
 /// A holder with the store it follows.
@@ -128,13 +129,14 @@ fn each_role_is_lent_in_the_registrys_order_with_its_rows_facts() {
     replica.write(PREFILL, Role::Prefill, false);
     replica.write(SINGLE_1, Role::Single, true);
     replica.write(DECODE, Role::Decode, true);
+    replica.write(ENCODE, Role::Encode, true);
     let generation = replica.generation();
 
     let singles = [(SINGLE_0, false), (SINGLE_1, true)];
     assert_eq!(replica.lent(&generation, Role::Single), singles);
     assert_eq!(replica.lent(&generation, Role::Prefill), [(PREFILL, false)]);
     assert_eq!(replica.lent(&generation, Role::Decode), [(DECODE, true)]);
-    assert!(replica.lent(&generation, Role::Encode).is_empty());
+    assert_eq!(replica.lent(&generation, Role::Encode), [(ENCODE, true)]);
     assert_eq!(replica.objects.unstated(), 0);
 
     let single = replica.objects.lent(&generation, Role::Single);
