@@ -287,7 +287,10 @@ policy_controller_run() {
 
     # A binary an invocation, in parts 1 and 2: a case is named by its binary and its own name, and the
     # binary's standard output alone is kept for part 3. What cargo and a case write to the standard
-    # error stays apart from it, so the line of a case's result is read whole.
+    # error stays apart from it. A binary that logs to its raw standard output can still write a line
+    # into the line of a result (the name, the result and the line's end are three writes). So part 3
+    # reads a failed case from the names the binary lists at its end as well, and holds a pick to the
+    # list before it ties it to a result: a result line that is not whole changes no verdict.
     echo "== The policy controller on, part 1 of 3: the tests of $shard, without the cases the list names as failing =="
     for target in $targets; do
         names=$(known_cases fails "$target")
@@ -341,13 +344,26 @@ mine = {key: kind for key, kind in listed.items() if key[0] in targets}
 
 
 def results(output):
-    """case -> ok, FAILED or ignored, from the standard output one test binary wrote to the file."""
+    """case -> ok, FAILED or ignored, from the standard output one test binary wrote to the file.
+
+    A failed case is read from the names the binary lists at its end too: each of those is one
+    write, where a result is three, with room for a line of the raw standard output between them."""
     found = {}
-    if output.exists():
-        for line in output.read_text().splitlines():
-            test = re.match(r"test (\S+)(?: - should panic)? \.\.\. (ok|FAILED|ignored)\b", line)
-            if test:
-                found[test.group(1)] = test.group(2)
+    if not output.exists():
+        return found
+    lines = output.read_text().splitlines()
+    for line in lines:
+        test = re.match(r"test (\S+)(?: - should panic)? \.\.\. (ok|FAILED|ignored)\b", line)
+        if test:
+            found[test.group(1)] = test.group(2)
+    lists = [number for number, line in enumerate(lines) if line == "failures:"]
+    if lists:
+        for line in lines[lists[-1] + 1 :]:
+            if line.startswith("test result:"):
+                break
+            name = re.fullmatch(r"    (\S+)", line)
+            if name:
+                found[name.group(1)] = "FAILED"
     return found
 
 
@@ -367,7 +383,7 @@ for (binary, case), kind in sorted(mine.items()):
     if result == "ok":
         problems.append(f"{binary} {case}: passes now with the policy controller on: delete its line from the list")
     elif result != "FAILED":
-        problems.append(f"{binary} {case}: listed as failing, and its binary does not run it (renamed, removed or ignored): delete or correct its line")
+        problems.append(f"{binary} {case}: listed as failing, and its run shows no failure of it (renamed, removed or ignored): delete or correct its line")
 
 # Part 3: a classic policy picks in the cases listed as classic, and in no other.
 picked = {}
@@ -380,11 +396,14 @@ for line in (work / "picks").read_text().splitlines():
     picked.setdefault((binary, fields[1]), set()).add(fields[2])
 for (binary, case), policies in sorted(picked.items()):
     names = ", ".join(sorted(policies))
-    if case not in part1.get(binary, {}):
-        # The line names its thread, and a case is known by the thread it runs on.
-        problems.append(f"{binary}: a classic policy ({names}) picks on the thread {case}, which is no case this binary ran: the pick cannot be tied to its case")
-    elif mine.get((binary, case)) != "classic":
+    # The line names its thread, and a case is known by the thread it runs on. The list comes first:
+    # a listed case needs no result line to be known.
+    if mine.get((binary, case)) == "classic":
+        continue
+    if case in part1.get(binary, {}):
         problems.append(f"{binary} {case}: a classic policy ({names}) places a request with the policy controller on, and the list does not name the case")
+    else:
+        problems.append(f"{binary}: a classic policy ({names}) picks on the thread {case}, and the run shows no result of a case of that name (a thread of no case, or a result line that is not whole): the pick cannot be tied to a listed case")
 for (binary, case), kind in sorted(mine.items()):
     if kind == "classic" and (binary, case) not in picked:
         problems.append(f"{binary} {case}: no classic policy places its requests with the policy controller on any more: delete its line from the list")
@@ -392,7 +411,7 @@ for (binary, case), kind in sorted(mine.items()):
 kinds = list(mine.values())
 failing, classic = kinds.count("fails"), kinds.count("classic")
 ran = sum(len(cases) for cases in part1.values())
-print(f"policy controller on, {shard}: {len(targets)} test binaries, {ran} cases run in part 1; the list names {failing} of their cases as failing and {classic} as placed by a classic policy")
+print(f"policy controller on, {shard}: {len(targets)} test binaries, {ran} results read in part 1; the list names {failing} of their cases as failing and {classic} as placed by a classic policy")
 for problem in problems:
     print(f"policy controller on, {shard}: PROBLEM: {problem}")
     if os.environ.get("GITHUB_ACTIONS"):

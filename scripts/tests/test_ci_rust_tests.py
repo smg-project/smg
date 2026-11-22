@@ -612,8 +612,10 @@ KNOWN = REPO / "model_gateway" / "tests" / "policy_controller_known.tsv"
 
 # A stand-in for cargo: the metadata of a gateway whose test binaries are the scenario's, and
 # `cargo test` over them as libtest answers it (--exact, --skip and names; a binary's cases one
-# line each on the standard output; cargo's own lines and a case's `stderr` text on the standard
-# error; status 101 where a case fails). A case with a `policy` writes the line of a classic
+# line each on the standard output, the names of the failed listed at its end; cargo's own lines
+# and a case's `stderr` text on the standard error; status 101 where a case fails). A result is
+# three writes, as libtest's: a case's `stdout` text is a line of the raw standard output that
+# lands between its name and its result. A case with a `policy` writes the line of a classic
 # pick to the file SMG_TEST_CLASSIC_PICKS names, as the gateway's test build does: under the
 # case's name, the name of its thread, or under the `thread` the scenario gives.
 CARGO_STUB = r"""#!/usr/bin/env python3
@@ -644,17 +646,31 @@ status = 0
 for binary in binaries:
     executable = f"{binary}-0123456789abcdef"
     print(f"     Running tests/{binary}.rs (target/debug/deps/{executable})", file=sys.stderr)
+    failed = []
     for case, facts in scenario[binary].items():
         if case in skips or (names and case not in names):
             continue
         if "stderr" in facts:
             print(facts["stderr"], file=sys.stderr, flush=True)
-        print(f"test {case} ... {facts['result']}", flush=True)
+        print(f"test {case} ... ", end="", flush=True)
+        if "stdout" in facts:
+            print(facts["stdout"], flush=True)
+        print(facts["result"], end="", flush=True)
+        print(flush=True)
         if facts["result"] == "FAILED":
-            status = 101
+            failed.append(case)
         if picks and "policy" in facts:
             with open(picks, "a") as file:
                 file.write(f"{executable}\t{facts.get('thread', case)}\t{facts['policy']}\n")
+    if failed:
+        status = 101
+        print("\nfailures:\n")
+        for case in failed:
+            print(f"---- {case} stdout ----\nwhat the case wrote\n")
+        print("\nfailures:")
+        for case in sorted(failed):
+            print(f"    {case}")
+    print(f"\ntest result: {'FAILED' if failed else 'ok'}. {len(failed)} failed", flush=True)
 sys.exit(status)
 """
 
@@ -791,7 +807,7 @@ class PolicyControllerRunTests(unittest.TestCase):
         done, _ = self.run_shard(self.changed("alpha_tests", "one::refused"))
         self.assert_red(
             done,
-            "alpha_tests one::refused: listed as failing, and its binary does not run it "
+            "alpha_tests one::refused: listed as failing, and its run shows no failure of it "
             "(renamed, removed or ignored): delete or correct its line",
         )
 
@@ -819,7 +835,44 @@ class PolicyControllerRunTests(unittest.TestCase):
         self.assert_red(
             done,
             "gamma_tests: a classic policy (manual) picks on the thread tokio-runtime-worker, "
-            "which is no case this binary ran: the pick cannot be tied to its case",
+            "and the run shows no result of a case of that name (a thread of no case, or a result "
+            "line that is not whole): the pick cannot be tied to a listed case",
+        )
+
+    # A test binary that logs to its raw standard output writes a line between a result's name
+    # and its result: the line of the result is not whole, and no verdict changes.
+    RAW = "2026-01-01T00:00:00Z DEBUG a line of the raw standard output"
+
+    def test_a_failure_whose_result_line_is_not_whole_is_named_by_the_binarys_own_list(self):
+        scenario = self.changed("gamma_tests", "plain", result="FAILED", stdout=self.RAW)
+        done, _ = self.run_shard(scenario)
+        self.assertIn(f"test plain ... {self.RAW}\nFAILED\n", done.stdout)
+        self.assert_red(
+            done,
+            "gamma_tests plain: fails with the policy controller on, and the list does not name it",
+        )
+
+    def test_a_listed_case_whose_result_line_is_not_whole_stays_green(self):
+        # The case a classic policy places, then the case listed as failing.
+        for case, facts in (
+            ("one::pair", {"result": "ok", "policy": "random"}),
+            ("one::refused", {"result": "FAILED"}),
+        ):
+            done, _ = self.run_shard(self.changed("alpha_tests", case, stdout=self.RAW, **facts))
+            self.assertIn(f"test {case} ... {self.RAW}\n{facts['result']}\n", done.stdout)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("policy controller on, gateway-1: OK", done.stdout)
+
+    def test_an_unlisted_pick_whose_result_line_is_not_whole_is_red(self):
+        scenario = self.changed(
+            "gamma_tests", "plain", result="ok", policy="manual", stdout=self.RAW
+        )
+        done, _ = self.run_shard(scenario)
+        self.assert_red(
+            done,
+            "gamma_tests: a classic policy (manual) picks on the thread plain, and the run shows "
+            "no result of a case of that name (a thread of no case, or a result line that is not "
+            "whole): the pick cannot be tied to a listed case",
         )
 
     def test_a_result_is_read_from_the_standard_output_alone(self):
