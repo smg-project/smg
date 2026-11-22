@@ -334,3 +334,131 @@ def test_qwenvl_span_observation_is_event_local_and_scan_bounded(monkeypatch, ca
     assert facts["mm_items"][0]["observed_origin_span_matches_pad"] == [True, None, None, None]
     assert all(item["observed_origin_span_matches_pad"] == [None] for item in facts["mm_items"][1:])
     assert req.origin_input_ids == saved and not any(t.data_reads for t in tensors)
+
+
+@pytest.mark.parametrize("gate", ["disabled", "exhausted"])
+def test_qwenvl_loaded_model_metadata_gate_precedes_source_reads(monkeypatch, caplog, gate):
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_MODEL_METADATA_ONCE", iter((True,)))
+    monkeypatch.setattr(
+        zmq_plugin, "_QWENVL_TRACE_SLOTS", iter(()) if gate == "exhausted" else iter(range(64))
+    )
+    if gate == "disabled":
+        monkeypatch.delenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", raising=False)
+    else:
+        monkeypatch.setenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", "1")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("metadata source I/O before diagnostic gate")
+
+    monkeypatch.setattr(zmq_plugin.os, "open", forbidden)
+    zmq_plugin._trace_qwenvl_model_once(object(), "smg-qwenvl-" + "a" * 32)
+    assert not caplog.records
+
+
+def test_qwenvl_loaded_model_metadata_is_once_bounded_and_read_only(monkeypatch, caplog, tmp_path):
+    monkeypatch.setenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", "1")
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_MODEL_METADATA_ONCE", iter((True,)))
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_TRACE_SLOTS", iter(range(64)))
+    name = "sglang.srt.test_loaded_metadata_fixture"
+    module = ModuleType(name)
+    source = tmp_path / "loaded_fixture.py"
+    content = b"# public SDK source fixture; not executed\n"
+    source.write_bytes(content)
+    module.__file__ = str(source)
+    package = ModuleType("sglang")
+    package.__file__ = str(tmp_path / "__init__.py")
+    monkeypatch.setitem(sys.modules, "sglang", package)
+    monkeypatch.setitem(sys.modules, name, module)
+
+    class Loaded:
+        def forward(self, *args, **kwargs):
+            raise AssertionError("metadata must not invoke a model")
+
+    Loaded.__module__ = name
+    vision, model, backend = Loaded(), Loaded(), Loaded()
+    model._modules = {"visual": vision}
+    config = SimpleNamespace(
+        model_type="qwen3_vl",
+        _commit_hash="abc",
+        vision_config=SimpleNamespace(
+            patch_size=16, temporal_patch_size=2, spatial_merge_size=2, out_hidden_size=4096
+        ),
+    )
+    runner = SimpleNamespace(
+        model=model, model_config=SimpleNamespace(hf_config=config), attn_backend=backend
+    )
+    worker = SimpleNamespace(model_runner=runner)
+    scheduler = SimpleNamespace(tp_worker=worker)
+    modules_before = set(sys.modules)
+    trace = "smg-qwenvl-" + "a" * 32
+    zmq_plugin._trace_qwenvl_model_once(scheduler, trace)
+    zmq_plugin._trace_qwenvl_model_once(scheduler, trace)
+    records = [r.getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1] for r in caplog.records]
+    assert len(records) == 1 and len(records[0]) <= 8192
+    facts = json.loads(records[0])["metadata"]
+    assert facts["runner_lookup"] == {"path": "tp_worker.model_runner", "status": "found"}
+    assert facts["vision_lookup"] == {"path": "model.visual", "status": "found"}
+    assert facts["hf_vision_config"]["patch_size"] == 16
+    assert facts["hf_vision_config"]["out_hidden_size"] == 4096
+    assert facts["hf_vision_config"]["num_heads"] == "unavailable"
+    assert facts["resolved_decode_backend"] == {"status": "unavailable"}
+    assert facts["source_files"][name]["sha256"] == zmq_plugin.hashlib.sha256(content).hexdigest()
+    assert facts["source_bytes_read"] == len(content)
+    assert (
+        scheduler.tp_worker is worker
+        and runner.model is model
+        and model._modules["visual"] is vision
+    )
+    assert set(sys.modules) == modules_before and source.read_bytes() == content
+
+
+def test_qwenvl_loaded_model_metadata_does_not_invoke_properties(monkeypatch, caplog):
+    monkeypatch.setenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", "1")
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_MODEL_METADATA_ONCE", iter((True,)))
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_TRACE_SLOTS", iter(range(64)))
+
+    class Scheduler:
+        @property
+        def tp_worker(self):
+            raise AssertionError("do not invoke SDK property fallback")
+
+    zmq_plugin._trace_qwenvl_model_once(Scheduler(), "smg-qwenvl-" + "a" * 32)
+    facts = json.loads(
+        caplog.records[-1].getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1]
+    )["metadata"]
+    assert facts["tp_worker"] == {"status": "unavailable"}
+    assert facts["model_runner"] == {"status": "unavailable"}
+    assert facts["source_bytes_read"] == 0
+
+
+def test_qwenvl_loaded_model_metadata_rejects_source_outside_loaded_package(
+    monkeypatch, caplog, tmp_path
+):
+    monkeypatch.setenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", "1")
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_MODEL_METADATA_ONCE", iter((True,)))
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_TRACE_SLOTS", iter(range(64)))
+    name = "sglang.srt.test_loaded_source_privacy"
+    package = ModuleType("sglang")
+    package.__file__ = str(tmp_path / "sdk" / "__init__.py")
+    module = ModuleType(name)
+    module.__file__ = str(tmp_path / "credential.py")
+    monkeypatch.setitem(sys.modules, "sglang", package)
+    monkeypatch.setitem(sys.modules, name, module)
+
+    class Loaded:
+        pass
+
+    Loaded.__module__ = name
+    scheduler = SimpleNamespace(
+        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=Loaded()))
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("must not read outside public loaded SDK package")
+
+    monkeypatch.setattr(zmq_plugin.os, "open", forbidden)
+    zmq_plugin._trace_qwenvl_model_once(scheduler, "smg-qwenvl-" + "a" * 32)
+    raw = caplog.records[-1].getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1]
+    source = json.loads(raw)["metadata"]["source_files"][name]
+    assert source == {"status": "outside_loaded_package"}
+    assert "credential.py" not in raw and "path" not in source

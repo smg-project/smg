@@ -11,6 +11,7 @@ import hashlib
 import importlib.metadata as metadata
 import json
 import os
+import re
 import resource
 import stat
 from pathlib import Path
@@ -48,7 +49,7 @@ TOTAL_EXCERPT_LIMIT = 512 * 1024
 
 
 def read_fixed(
-    path: Path, root: Path, *, internal_links: bool = False
+    path: Path, root: Path, *, internal_links: bool = False, limit: int = SOURCE_LIMIT
 ) -> tuple[dict, bytes | None]:
     """Read a bounded stable regular file beneath one fixed root; no outside links."""
     row = {"path": str(path), "status": "UNKNOWN"}
@@ -67,9 +68,10 @@ def read_fixed(
         fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_size > SOURCE_LIMIT:
+            if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
                 return dict(row, status="REJECTED_TYPE_OR_SIZE"), None
-            raw = stream.read(SOURCE_LIMIT + 1)
+            raw = stream.read(limit)
+            row["bytes_read"] = len(raw)
             after = os.fstat(stream.fileno())
 
         def identity(s):
@@ -180,6 +182,132 @@ def collect(sg_root: Path, hf_root: Path, repo: Path) -> dict:
     return result
 
 
+def collect_loaded_sources(logs: Path, output: Path, roots: dict[str, Path]) -> dict:
+    """Only metadata-observed public SDK modules, same-job SHA, bounded source bodies."""
+    result = {
+        "status": "LOADED_PUBLIC_SOURCE_CAPTURE_ONLY",
+        "logs": [],
+        "source": [],
+        "limits": {
+            "source_files": 6,
+            "source_each": SOURCE_LIMIT,
+            "source_total": 4 * 1024**2,
+            "worker_log_files": 8,
+            "worker_log_prefix_each": 2 * 1024**2,
+        },
+        "scope": "No import/model execution. Prefix logs may omit metadata; unavailable is unknown.",
+    }
+    observed, records_seen = {}, 0
+    # Exact existing Qwen worker-log filename contract; never scan other worker logs.
+    for path in sorted(logs.glob("worker-Qwen__Qwen3-VL-8B-Instruct_sglang_*.log"))[:8]:
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                raw = stream.read(2 * 1024**2)
+            result["logs"].append(
+                {
+                    "name": path.name,
+                    "prefix_bytes": len(raw),
+                    "prefix_sha256": hashlib.sha256(raw).hexdigest(),
+                    "prefix_truncated": st.st_size > len(raw),
+                }
+            )
+            for line in raw.splitlines():
+                marker = b"SMG_QWENVL_REQUEST_DIAGNOSTIC "
+                if marker not in line or len(line) > 16384:
+                    continue
+                try:
+                    record = json.loads(line.split(marker, 1)[1])
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(record, dict) or record.get("event") != "model_consumer_metadata":
+                    continue
+                fields = record.get("metadata")
+                if not isinstance(fields, dict) or records_seen >= 16:
+                    continue
+                records_seen += 1
+                files = fields.get("source_files", {})
+                if not isinstance(files, dict) or len(files) > 6:
+                    continue
+                for module, info in files.items():
+                    if (
+                        not isinstance(module, str)
+                        or len(module) > 128
+                        or not re.fullmatch(
+                            r"(?:sglang|transformers|sgl_kernel)(?:\.[A-Za-z_][A-Za-z_0-9]*)+",
+                            module,
+                        )
+                        or not isinstance(info, dict)
+                        or info.get("status") != "captured"
+                    ):
+                        continue
+                    value = (info.get("path"), info.get("sha256"))
+                    if (
+                        not all(isinstance(v, str) for v in value)
+                        or len(value[0]) > 256
+                        or not re.fullmatch(r"[0-9a-f]{64}", value[1])
+                    ):
+                        continue
+                    if module not in observed and len(observed) >= 6:
+                        continue
+                    values = observed.setdefault(module, set())
+                    if len(values) < 2:
+                        values.add(value)
+        except OSError:
+            result["logs"].append({"name": path.name, "status": "UNAVAILABLE"})
+        finally:
+            if fd is not None:
+                os.close(fd)
+    remaining, attempted = 4 * 1024**2, 0
+    for module, values in sorted(observed.items()):
+        if attempted >= 6:
+            break
+        row = {"module": module, "status": "UNAVAILABLE"}
+        result["source"].append(row)
+        if len(values) != 1:
+            row["status"] = "REJECTED_INCONSISTENT_METADATA"
+            continue
+        name, expected = next(iter(values))
+        namespace, *parts = module.split(".")
+        root = roots.get(namespace)
+        path = Path(name)
+        if root is None or not path.is_absolute() or path.suffix != ".py":
+            row["status"] = "REJECTED_MODULE_PATH"
+            continue
+        relative = Path(*parts)
+        if path not in (root / relative.with_suffix(".py"), root / relative / "__init__.py"):
+            row["status"] = "REJECTED_MODULE_PATH"
+            continue
+        attempted += 1
+        info, body = read_fixed(path, root, limit=min(SOURCE_LIMIT, remaining))
+        remaining -= info.get("bytes_read", 0)
+        row.update(info, expected_sha256=expected)
+        if body is None:
+            continue
+        if info.get("sha256") != expected:
+            row["status"] = "REJECTED_SHA_MISMATCH"
+            continue
+        target = output / (expected + ".py")
+        if not target.exists():
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(body)
+                stream.flush()
+                os.fsync(stream.fileno())
+        row["artifact_file"] = target.name
+    result["metadata_records_seen"] = records_seen
+    result["source_bytes_read"] = 4 * 1024**2 - remaining
+    result["captured"] = sum(row.get("artifact_file") is not None for row in result["source"])
+    if not result["captured"]:
+        result["status"] = "LOADED_PUBLIC_SOURCE_UNAVAILABLE"
+    result["unavailable_does_not_mean_model_or_tests_passed"] = True
+    return result
+
+
 def main() -> int:
     if os.environ.get("SMG_QWENVL_SOURCE_DIAGNOSTIC") != "1":
         return 0
@@ -194,9 +322,26 @@ def main() -> int:
         logs.mkdir(mode=0o700, exist_ok=True)
         if logs.is_symlink() or not logs.is_dir() or logs.resolve() != repo / "e2e-logs":
             raise ValueError("unsafe log directory")
-        output = logs / "qwen-vl-source-diagnostic"
+        loaded = os.environ.get("SMG_QWENVL_LOADED_SOURCE_DIAGNOSTIC") == "1"
+        output = logs / (
+            "qwen-vl-loaded-source-diagnostic" if loaded else "qwen-vl-source-diagnostic"
+        )
         output.mkdir(mode=0o700, exist_ok=False)
-        result = collect(SG_ROOT, HF_ROOT, repo)
+        if loaded:
+            roots = {"sglang": SG_ROOT.parent}
+            for namespace, distribution in (
+                ("transformers", "transformers"),
+                ("sgl_kernel", "sgl-kernel"),
+            ):
+                try:
+                    roots[namespace] = Path(
+                        metadata.distribution(distribution).locate_file(namespace)
+                    )
+                except metadata.PackageNotFoundError:
+                    pass
+            result = collect_loaded_sources(logs, output, roots)
+        else:
+            result = collect(SG_ROOT, HF_ROOT, repo)
         payload = (json.dumps(result, indent=2) + "\n").encode()
         if len(payload) > 6 * 1024**2:
             raise ValueError("bounded diagnostic output exceeded")

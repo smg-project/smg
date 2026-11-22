@@ -516,6 +516,23 @@ jobs:
           mkdir -p e2e-logs
           pytest "${pytest_args[@]}" --junitxml=e2e-logs/e2e-results.xml -o junit_logging=no
 
+      - name: Capture bounded loaded QwenVL consumer sources
+        if: >-
+          !cancelled() && inputs.final_environment_check
+          && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+          && inputs.test_dirs == 'e2e_test/chat_completions'
+        timeout-minutes: 1
+        shell: bash
+        env:
+          SMG_QWENVL_SOURCE_DIAGNOSTIC: "1"
+          SMG_QWENVL_LOADED_SOURCE_DIAGNOSTIC: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          # Reuse this job's original worker logs; never change pytest's result.
+          if ! timeout --signal=TERM --kill-after=2s 20s python3 -I -B scripts/ci_capture_qwenvl_source.py; then
+            printf '%s\n' 'Loaded QwenVL source diagnostic unavailable (non-gating).'
+          fi
+
       - name: Identify row evidence
         id: evidence-identity
         if: always()

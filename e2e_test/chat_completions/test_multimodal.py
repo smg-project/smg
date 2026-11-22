@@ -147,11 +147,13 @@ class TestMultimodalQwen3VL:
         logger.info("Single image base64 (stream=%s): %s", stream, text)
 
     @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
-    def test_single_image_url(self, model, setup_backend, stream):
+    def test_single_image_url(self, model, setup_backend, stream, request):
         """Test single image understanding with URL image."""
         _, _, client, *_ = setup_backend
 
-        response = client.chat.completions.create(
+        response = _qwenvl_diagnostic_create(
+            request,
+            client.chat.completions.create,
             model=model,
             messages=[
                 {

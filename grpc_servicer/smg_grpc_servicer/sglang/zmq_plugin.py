@@ -42,6 +42,7 @@ import logging
 import os
 import pkgutil
 import re
+import stat
 import sys
 from array import array
 from typing import Any
@@ -116,8 +117,179 @@ def attributes_grammar_aborts() -> bool:
 
 
 # Diagnostic only: correlated public CI requests; no GPU transfers or extra requests.
-_QWENVL_TRACE_SLOTS = iter(range(40))
+_QWENVL_TRACE_SLOTS = iter(range(64))
 _QWENVL_OUTPUTS = {}
+
+
+_QWENVL_MODEL_METADATA_ONCE = iter((True,))
+
+
+def _trace_qwenvl_model_once(scheduler, trace_id):
+    """Bounded loaded-object provenance only; no imports, model calls or tensor reads."""
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    if not next(_QWENVL_MODEL_METADATA_ONCE, False):
+        return
+    slot = next(_QWENVL_TRACE_SLOTS, None)
+    if slot is None:
+        return
+    try:
+        sources, remaining = {}, 4 * 1024 * 1024
+
+        def field(value, name):
+            # nn.Module children live in _modules; bypass property/model hooks.
+            if type(value) is dict:
+                return value.get(name)
+            if type(value) in (list, tuple) and name == "0":
+                return value[0] if value else None
+            try:
+                values = object.__getattribute__(value, "__dict__")
+                modules = values.get("_modules", {})
+                return values.get(name, modules.get(name) if type(modules) is dict else None)
+            except Exception:
+                return None
+
+        def identity(value):
+            nonlocal remaining
+            if value is None:
+                return {"status": "unavailable"}
+            cls = type(value)
+            module = cls.__module__
+            if not isinstance(module, str) or len(module) > 128:
+                return {"status": "unavailable"}
+            result = {"class": (module + "." + cls.__qualname__)[:160]}
+            if module in sources or len(sources) >= 6:
+                return result
+            loaded = sys.modules.get(module)
+            path = vars(loaded).get("__file__") if loaded is not None else None
+            if not module.startswith(("sglang.", "transformers.", "sgl_kernel.")):
+                return result
+            info = sources[module] = {"status": "unavailable"}
+            if not isinstance(path, str) or not os.path.isabs(path) or not path.endswith(".py"):
+                return result
+            package = sys.modules.get(module.split(".", 1)[0])
+            package_file = vars(package).get("__file__") if package is not None else None
+            if not isinstance(package_file, str) or not os.path.isabs(package_file):
+                return result
+            root, real = os.path.dirname(os.path.realpath(package_file)), os.path.realpath(path)
+            if os.path.commonpath((root, real)) != root:
+                info["status"] = "outside_loaded_package"
+                return result
+            info["path"] = path[:256]
+            fd = None
+            try:
+                limit = min(1024 * 1024, remaining)
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                before = os.fstat(fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+                    info["status"] = "over_limit_or_not_regular"
+                    return result
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    data = stream.read(limit)
+                remaining -= len(data)
+                after = os.fstat(fd)
+                stable = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                if len(data) == before.st_size and stable == (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                ):
+                    info.update(
+                        status="captured", bytes=len(data), sha256=hashlib.sha256(data).hexdigest()
+                    )
+            except (OSError, ValueError):
+                pass
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            return result
+
+        def scalars(value, names):
+            result = {}
+            for name in names:
+                item = field(value, name)
+                if type(item) in (bool, int) and (type(item) is bool or item.bit_length() <= 63):
+                    result[name] = item
+                elif type(item) is str and len(item) <= 128:
+                    result[name] = item
+                else:
+                    result[name] = "unavailable"
+            return result
+
+        worker = field(scheduler, "tp_worker")
+        runner = field(worker, "model_runner")
+        runner_path = "tp_worker.model_runner"
+        if runner is None:
+            runner = field(field(worker, "worker"), "model_runner")
+            runner_path = "tp_worker.worker.model_runner"
+        model = field(runner, "model")
+        vision = field(model, "visual")
+        vision_path = "model.visual"
+        if vision is None:
+            vision = field(field(model, "model"), "visual")
+            vision_path = "model.model.visual"
+        config = field(field(runner, "model_config"), "hf_config")
+        if config is None:
+            config = field(model, "config")
+        attention = field(field(field(vision, "blocks"), "0"), "attn")
+        objects = {
+            "scheduler": scheduler,
+            "tp_worker": worker,
+            "model_runner": runner,
+            "model": model,
+            "vision": vision,
+            "resolved_attention_backend": field(runner, "attn_backend"),
+            "resolved_prefill_backend": field(runner, "prefill_attn_backend"),
+            "resolved_decode_backend": field(runner, "decode_attn_backend"),
+            "first_vision_attention": attention,
+            "first_vision_attention_backend": field(attention, "attn_backend"),
+        }
+        facts = {name: identity(value) for name, value in objects.items()}
+        facts.update(
+            runner_lookup={
+                "path": runner_path,
+                "status": "found" if runner is not None else "unavailable",
+            },
+            vision_lookup={
+                "path": vision_path,
+                "status": "found" if vision is not None else "unavailable",
+            },
+            hf_config=scalars(config, ("model_type", "_commit_hash")),
+            hf_vision_config=scalars(
+                field(config, "vision_config"),
+                (
+                    "patch_size",
+                    "temporal_patch_size",
+                    "spatial_merge_size",
+                    "hidden_size",
+                    "out_hidden_size",
+                    "num_heads",
+                    "depth",
+                    "_attn_implementation_internal",
+                ),
+            ),
+            source_files=sources,
+            source_bytes_read=4 * 1024 * 1024 - remaining,
+            scope=(
+                "Loaded fields only; unavailable is unknown. Config is not resolved backend; "
+                "vision attention is first block only."
+            ),
+        )
+        record = json.dumps(
+            {
+                "event": "model_consumer_metadata",
+                "slot": slot,
+                "client_trace_id": trace_id,
+                "metadata": facts,
+            },
+            sort_keys=True,
+        )
+        if len(record) <= 8192:
+            logger.warning("SMG_QWENVL_REQUEST_DIAGNOSTIC %s", record)
+    except Exception:
+        # A diagnostic failure must not change the original request or its trace.
+        return
 
 
 def _trace_qwenvl(event, scheduler=None, req=None, **facts):
@@ -145,6 +317,8 @@ def _trace_qwenvl(event, scheduler=None, req=None, **facts):
         slot = next(_QWENVL_TRACE_SLOTS, None)
         if slot is None:
             return
+        if req is not None:
+            _trace_qwenvl_model_once(scheduler, facts["client_trace_id"])
         if req is not None:
 
             def ids(value):
