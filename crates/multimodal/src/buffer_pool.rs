@@ -37,7 +37,10 @@
 //! than a previous request's bytes, so a producer that left a byte unwritten
 //! shows it in every test that compares its output with a reference.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::{
+    collections::TryReserveError,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use bytes::Bytes;
 use image::DynamicImage;
@@ -153,20 +156,17 @@ impl BufferPool {
     }
 
     /// An empty buffer with room for `len` bytes, for a producer that appends
-    /// them: nothing is filled here. Outside the pooled range it has no room,
-    /// and the producer's own reserve decides.
-    pub(crate) fn take_empty(&self, len: usize) -> Vec<u8> {
-        let Some(capacity) = class_capacity(len) else {
-            return Vec::new();
-        };
-        match self.kept(capacity) {
-            Some(mut buf) => {
-                buf.clear();
-                buf
-            }
-            // Empty, so nothing to zero: the producer writes what it appends.
-            None => Vec::with_capacity(capacity),
-        }
+    /// them: nothing is filled here. A fresh one is reserved fallibly, with
+    /// the class's capacity or, outside the pooled range, `len` bytes.
+    pub(crate) fn take_empty(&self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        let class = class_capacity(len);
+        let mut buf = class
+            .and_then(|capacity| self.kept(capacity))
+            .unwrap_or_default();
+        buf.clear();
+        // Empty, so nothing to zero: the producer writes what it appends.
+        buf.try_reserve_exact(class.unwrap_or(len))?;
+        Ok(buf)
     }
 
     /// The idle buffer of the class of `capacity`, when it keeps one.
@@ -226,7 +226,7 @@ pub(crate) fn take(len: usize) -> Vec<u8> {
 }
 
 /// [`BufferPool::take_empty`] on the process's pool.
-pub(crate) fn take_empty(len: usize) -> Vec<u8> {
+pub(crate) fn take_empty(len: usize) -> Result<Vec<u8>, TryReserveError> {
     shared().take_empty(len)
 }
 
@@ -311,6 +311,17 @@ mod tests {
             (LARGEST + 1, LARGEST + 1)
         );
         assert!(pool.take(0).is_empty());
+    }
+
+    #[test]
+    fn an_empty_buffer_that_cannot_be_reserved_is_an_error() {
+        let pool = BufferPool::new();
+        // No allocator gives this length: the refusal reaches the caller.
+        assert!(pool.take_empty(usize::MAX).is_err());
+        let outside = pool.take_empty(SMALLEST - 1).unwrap();
+        assert_eq!((outside.len(), outside.capacity()), (0, SMALLEST - 1));
+        let class = pool.take_empty(SMALLEST + 1).unwrap();
+        assert_eq!((class.len(), class.capacity()), (0, 2 * SMALLEST));
     }
 
     #[test]

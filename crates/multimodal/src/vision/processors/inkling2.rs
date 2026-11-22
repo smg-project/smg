@@ -6,7 +6,7 @@
 //! cells are pixel-major RGB patches with two identical temporal slices; every
 //! cell produces one language-model token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, TryReserveError};
 
 use image::{DynamicImage, GenericImageView};
 use ndarray::{ArrayD, IxDyn};
@@ -285,6 +285,11 @@ impl Inkling2ImageProcessor {
     }
 }
 
+/// A refused reserve of the batch's storage, reported alike by both outputs.
+fn refused(error: TryReserveError) -> TransformError {
+    TransformError::ShapeError(format!("Inkling2 patch allocation failed: {error}"))
+}
+
 impl VisionPreProcessor for Inkling2ImageProcessor {
     fn default_mean(&self) -> [f64; 3] {
         super::inkling::INKLING_IMAGE_MEAN
@@ -308,9 +313,7 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
             images,
             |elements| {
                 let mut output = Vec::new();
-                output.try_reserve_exact(elements).map_err(|error| {
-                    TransformError::ShapeError(format!("Inkling2 patch allocation failed: {error}"))
-                })?;
+                output.try_reserve_exact(elements).map_err(refused)?;
                 Ok(output)
             },
             |raw, channel| [Self::normalized(raw, channel)],
@@ -345,13 +348,7 @@ impl VisionPreProcessor for Inkling2ImageProcessor {
         };
         Some(Self::batch(
             images,
-            |elements| {
-                // Cleared: the patches are appended, so no byte of a previous
-                // request can be part of the wire.
-                let mut wire = buffer_pool::take(elements);
-                wire.clear();
-                Ok(wire)
-            },
+            |elements| buffer_pool::take_empty(elements).map_err(refused),
             |raw, channel| narrow(Self::normalized(raw, channel)).to_le_bytes(),
             |wire, total| {
                 EncoderInput::wire(wire, dtype, vec![total, 2, 40, 40, 3], norm)
