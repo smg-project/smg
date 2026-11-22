@@ -977,6 +977,7 @@ The design adds no second mechanism where one exists.
 | which worker was sent a prompt | the kv-index crate's two tree types | the engine's own trees of those types |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's five placement functions | one call in each |
+| the rank inside a worker that stands for several | the load monitor's rank cache and the gateway's sticky pin, asked after the pick | nothing |
 | the lease's reporting | `DecisionGuard` | `Placement`, which holds it |
 | proof against classic | classic's recorders and their sheets | replays through the kept engine |
 
@@ -1031,6 +1032,9 @@ request ──> route (HTTP or gRPC, any family)
   already keeps to the end of the response, streamed or not (decision 4).
 - **Membership.** The gateway's value for a model's workers gets one cell for each list, which
   the engine fills.
+- **The rank.** After the engine names a worker, the gateway chooses the rank inside a worker
+  that stands for several by classic's own code, as it does after classic's pick. The earlier
+  integration asked no rank policy for a pair the engine placed. This change does.
 
 The change also writes again three small things that stage 0 takes out with the earlier
 integration: the gateway's two readers of its own index of cache events for the engine (about
@@ -1192,17 +1196,44 @@ On main: 18 sheets, 482 lines.
 | replayed through the engine that stays (`PolicyEngine`) | **0** | **0** |
 | replayed lines held to an answer of the crate's own, not classic's | | 23 |
 
-Three things follow, and they are the first work of section 16.
+A replay through `PolicyEngine` over worker objects is in work and not on main yet. Measured
+with it locally on 2026-11-22, on main (`096c0f5ea`): of the 408 lines that record a decision
+(point 1 below), the engine answers 286 as classic recorded and 28 differently, and 94 cannot
+be asked yet. Of the 94, 25 are declined because the request states a hard demand, 16 need a
+word a request cannot state, 52 are encode requests and 1 is refused at validation. Runs with
+one input left off the worker objects (the requests in flight, the load reports, the status,
+the ring) lose lines, so the replay can fail.
 
-1. **No recorded line goes through the engine that stays.** The replays call the decision
-   function over hand-built candidates, or the old engine. Each sheet has to replay through
-   `PolicyEngine` over worker objects.
+Four things follow, and they are the first work of section 16.
+
+1. **No recorded line goes through the engine that stays** in main's own tests. The replays
+   call the decision function over hand-built candidates, or the old engine. Fourteen sheets
+   (408 lines) record a decision, and each has to replay through `PolicyEngine` over worker
+   objects. The other four (74 lines: `overload` 25, `pair_index` 23, `minimum_tokens` 18,
+   `sticky_rank` 8) record an answer of the host, which the kept engine is never asked for. It
+   reads the overload verdict that the host's load monitor wrote on the worker object. It is
+   handed each prefill's partners with a pair's two lists. It names the rank a worker
+   registered, never one of the ranks behind a worker that stands for all of them. In a host's
+   own process those answers are classic's own code, which stays, so the 74 lines hold there
+   with no replay. For the two rank sheets that rests on a rule of the gateway's change
+   (section 9.2). On main the four replay through the old engine's side, and they stay there
+   until stage 4.
 2. **23 lines are held to the crate's own answer** (`minimum_tokens` 10, `overload` 6,
-   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). Each is made equal to classic or named as an
-   accepted difference.
+   `sticky_rank` 4, `prefix_hash` 2, `manual` 1). The first 20 are in the four host sheets: the
+   rules that hold them apart are the old engine's, and the kept engine has none of them. The
+   other three are the kept engine's. The 2 of `prefix_hash` differ from classic there too (a
+   key folds whole blocks), and they turn with the ring of decision 3. The 1 of `manual`
+   cannot be asked (validation refuses a sessions rule under a pair plan). Each of the 23 is
+   made equal to classic or named as an accepted difference: the 3 in stage 1, the 20 in
+   stage 4.
 3. **Five policies have no sheet over a healthy pool**: `round_robin`, `random`, `passthrough`,
    `least_load` and `consistent_hashing`. Their only recorded lines are over pools in trouble.
    New recorders are decision 2.
+4. **Two limits on "as classic recorded".** A pair's refusal names no side in the engine's
+   answer, so the pair sheet's refusals are compared by their reason alone, where classic names
+   the side. A change of stage 1 makes a pair's refusal name its side. The 12 ring lines of
+   `all_vetoed` name their workers by the key's order on the engine's own ring: they prove the
+   walk past a vetoed worker, not that a key lands on classic's worker (decision 3).
 
 Hosted CI's test of the crate does not enable the feature the kept engine is behind, so it runs
 none of that engine's own tests. Only the gateway enables that feature today, so after stage 0
@@ -1451,10 +1482,10 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 | Stage | Work | Ends when |
 |---|---|---|
 | 0 | The earlier gateway integration is taken out. | The gateway routes by classic alone; every classic test and bench cell is as before. |
-| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of section 13.1 replays through the kept engine; each difference from classic is fixed or accepted as a named difference. |
+| 1 | **The policies, proven in the crate.** Each classic policy decided by `PolicyEngine` over worker objects: its sheet replays through that engine, and its bench cell meets classic's count. | Every line of the 14 sheets that record a decision (408 of section 13.1's 482) replays through the kept engine over worker objects; each difference from classic is fixed or accepted as a named difference. |
 | 2 | **The host contract.** `place`, `Placement`, the engine's own upkeep and membership events (section 8.2). | A test host in the crate serves every plan through `place` alone. |
 | 3 | **The gateway, one change** (section 9), off by default. | The four points of section 9.2's bar; a cluster run beside classic. |
-| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone. |
+| 4 | **The controller on the one engine** (section 10.2); the old engine is deleted. | The controller's own tests pass on `PolicyEngine`; the store-backed engine is gone; each of the 74 lines of the four host sheets (section 13.1) is answered by the host's code that the controller takes from the worker crate, or by a rule of the crate's with its differences named. |
 | 5 | **A gateway under a controller** (section 11). | A cluster run: gateways under a controller beside classic, with the controller stopped and started under load. |
 
 ### Stage 1, the first changes
