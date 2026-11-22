@@ -3182,6 +3182,23 @@ pub fn resize_bicubic_torch_aa_f32(
     out_w: u32,
     out_h: u32,
 ) -> Result<Vec<f32>> {
+    resize_bicubic_torch_aa_f32_strips(data, width, height, out_w, out_h, out_h as usize, |_| ())
+}
+
+/// [`resize_bicubic_torch_aa_f32`] with its output a strip at a time: the
+/// rows are written into one buffer of `strip` rows, and `full` reads that
+/// buffer each time its rows are done. A `strip` that does not divide `out_h`
+/// is refused. The buffer is returned; it is the whole output when `strip` is
+/// `out_h`.
+pub(crate) fn resize_bicubic_torch_aa_f32_strips(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+    strip: usize,
+    full: impl FnMut(&[f32]),
+) -> Result<Vec<f32>> {
     let (in_w, in_h, out_w, out_h) = (
         width as usize,
         height as usize,
@@ -3200,14 +3217,19 @@ pub fn resize_bicubic_torch_aa_f32(
             "torch bicubic RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
         )));
     }
+    if strip == 0 || out_h % strip != 0 {
+        return Err(TransformError::ShapeError(format!(
+            "torch bicubic strip of {strip} rows must divide the output height {out_h}"
+        )));
+    }
     Ok(torch_aa_resize(
         data,
-        in_w,
-        in_h,
-        out_w,
-        out_h,
+        (in_w, in_h),
+        (out_w, out_h),
         TorchAaFilter::Bicubic,
         |_, byte| f32::from(byte),
+        strip,
+        full,
     ))
 }
 
@@ -3248,12 +3270,12 @@ pub fn resize_bilinear_torch_aa_normalized(
     }
     Ok(torch_aa_resize(
         data,
-        in_w,
-        in_h,
-        out_w,
-        out_h,
+        (in_w, in_h),
+        (out_w, out_h),
         TorchAaFilter::Bilinear,
         |channel, byte| table[channel][usize::from(byte)],
+        out_h,
+        |_| (),
     ))
 }
 
@@ -3263,12 +3285,12 @@ pub fn resize_bilinear_torch_aa_normalized(
 /// where the processor has the instruction.
 fn torch_aa_resize(
     data: &[u8],
-    in_w: usize,
-    in_h: usize,
-    out_w: usize,
-    out_h: usize,
+    (in_w, in_h): (usize, usize),
+    (out_w, out_h): (usize, usize),
     filter: TorchAaFilter,
     sample: impl Fn(usize, u8) -> f32 + Copy,
+    strip: usize,
+    full: impl FnMut(&[f32]),
 ) -> Vec<f32> {
     let (x_bounds, x_weights) = torch_aa_weights(in_w, out_w, filter);
     let (y_bounds, y_weights) = torch_aa_weights(in_h, out_h, filter);
@@ -3276,15 +3298,19 @@ fn torch_aa_resize(
         bounds: &x_bounds,
         weights: &x_weights,
     };
-    let y = TorchAaAxis {
-        bounds: &y_bounds,
-        weights: &y_weights,
+    let mut y = TorchAaRows {
+        axis: TorchAaAxis {
+            bounds: &y_bounds,
+            weights: &y_weights,
+        },
+        strip,
+        full,
     };
     #[cfg(target_arch = "x86_64")]
-    if let Some(out) = torch_aa_passes_with_fma(data, in_w, &x, &y, sample) {
+    if let Some(out) = torch_aa_passes_with_fma(data, in_w, &x, &mut y, sample) {
         return out;
     }
-    torch_aa_passes(data, in_w, &x, &y, sample)
+    torch_aa_passes(data, in_w, &x, &mut y, sample)
 }
 
 /// One axis of the torch-style resize: per output sample the first source
@@ -3294,26 +3320,42 @@ struct TorchAaAxis<'a> {
     weights: &'a [Vec<f32>],
 }
 
+/// The height axis of the torch-style resize with where its rows go: one
+/// buffer of `strip` rows, which `full` reads each time its rows are done.
+struct TorchAaRows<'a, F> {
+    axis: TorchAaAxis<'a>,
+    strip: usize,
+    full: F,
+}
+
 /// The two passes of [`resize_bicubic_torch_aa_f32`] and
 /// [`resize_bilinear_torch_aa_normalized`]: the source rows resampled along
 /// the width a band at a time into a window of rows, and each output row
 /// resampled along the height from that window once the band of its last tap
 /// is done. A source byte enters as `sample(channel, byte)`, the float the
-/// reference's tensor holds for it.
+/// reference's tensor holds for it. The output rows go into one buffer of
+/// `strip` rows, which `full` reads each time its rows are done and which is
+/// returned: the whole output when `strip` is the output height.
 /// An output's taps add in the reference's three runs: the first tap is the
 /// bare product, the next [`torch_aa_plain_until`] taps add a rounded product
 /// in a second rounding, and the rest are fused multiply-adds. Inlined into
 /// its callers so that the fused taps compile to the caller's instruction
 /// set.
 #[inline(always)]
-fn torch_aa_passes(
+fn torch_aa_passes<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Vec<f32> {
+    let &mut TorchAaRows {
+        axis: ref y,
+        strip,
+        ref mut full,
+    } = y;
     let (out_w, out_h) = (x.bounds.len(), y.bounds.len());
+    debug_assert_eq!(out_h % strip, 0, "the output is whole strips");
 
     // The width pass takes the source rows a band at a time. A tap has one
     // weight and one offset for every row, so with the rows of a band side by
@@ -3349,8 +3391,9 @@ fn torch_aa_passes(
     let mut sums = plain_f32(out_w * BAND * 4);
     let (sums, _) = sums.as_chunks_mut::<4>();
     let (sums, _) = sums.as_chunks_mut::<BAND>();
-    let mut out = plain_f32(out_h * out_w * 3);
-    let mut written = 0;
+    let mut out = plain_f32(strip * out_w * 3);
+    // The output rows done, and how many of them the strip holds.
+    let (mut written, mut in_strip) = (0, 0);
     for (index, src) in data.chunks(BAND * in_w * 3).enumerate() {
         let dst = &mut rows[(index * BAND % kept) * out_w * 3..][..src.len() / in_w * out_w];
         for (src, row) in src.chunks_exact(in_w * 3).zip(0..BAND) {
@@ -3390,14 +3433,15 @@ fn torch_aa_passes(
             }
         }
 
-        // The output rows whose last tap this band holds are written now.
+        // The output rows whose last tap this band holds are written now; a
+        // row without taps waits for no source row.
         let row = out_w * 3;
         let held = index * BAND + src.len() / (in_w * 3);
         while let Some(&(start, count)) = y.bounds.get(written) {
-            if start + count > held {
+            if count != 0 && start + count > held {
                 break;
             }
-            let dst = &mut out[written * row..][..row];
+            let dst = &mut out[in_strip * row..][..row];
             // The taps' rows run to the window's end and on from its start.
             let first = start % kept;
             let wrapped = (first + count).saturating_sub(kept);
@@ -3406,10 +3450,14 @@ fn torch_aa_passes(
                     .chunks_exact(row)
                     .chain(rows[..wrapped * row].chunks_exact(row)),
             );
-            if let Some((&weight, src)) = taps.next() {
-                for (d, &v) in dst.iter_mut().zip(src) {
-                    *d = weight * v;
+            match taps.next() {
+                Some((&weight, src)) => {
+                    for (d, &v) in dst.iter_mut().zip(src) {
+                        *d = weight * v;
+                    }
                 }
+                // A strip holds the rows of the strip before.
+                None => dst.fill(0.0),
             }
             for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
                 for (d, &v) in dst.iter_mut().zip(src) {
@@ -3422,6 +3470,11 @@ fn torch_aa_passes(
                 }
             }
             written += 1;
+            in_strip += 1;
+            if in_strip == strip {
+                full(&out);
+                in_strip = 0;
+            }
         }
     }
     debug_assert_eq!(
@@ -3438,11 +3491,11 @@ fn torch_aa_passes(
 /// such processors.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
-fn torch_aa_passes_fma(
+fn torch_aa_passes_fma<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Vec<f32> {
     torch_aa_passes(data, in_w, x, y, sample)
@@ -3456,11 +3509,11 @@ fn torch_aa_passes_fma(
     unsafe_code,
     reason = "the target-feature function runs only after this function detected its feature"
 )]
-fn torch_aa_passes_with_fma(
+fn torch_aa_passes_with_fma<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Option<Vec<f32>> {
     if !std::arch::is_x86_feature_detected!("fma") {
@@ -6078,13 +6131,17 @@ mod tests {
                 bounds: &x_bounds,
                 weights: &x_weights,
             };
-            let y = TorchAaAxis {
-                bounds: &y_bounds,
-                weights: &y_weights,
+            let mut y = TorchAaRows {
+                axis: TorchAaAxis {
+                    bounds: &y_bounds,
+                    weights: &y_weights,
+                },
+                strip: out_h as usize,
+                full: |_: &[f32]| (),
             };
             let bytes_as_floats = |_: usize, byte: u8| f32::from(byte);
             #[cfg(target_arch = "x86_64")]
-            let fma = torch_aa_passes_with_fma(&data, width as usize, &x, &y, bytes_as_floats);
+            let fma = torch_aa_passes_with_fma(&data, width as usize, &x, &mut y, bytes_as_floats);
             #[cfg(not(target_arch = "x86_64"))]
             let fma: Option<Vec<f32>> = None;
             let bodies = [
@@ -6098,7 +6155,7 @@ mod tests {
                         &data,
                         width as usize,
                         &x,
-                        &y,
+                        &mut y,
                         bytes_as_floats,
                     )),
                 ),
@@ -6123,6 +6180,17 @@ mod tests {
                     "{width}x{height} -> {out_w}x{out_h} through {body}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_torch_bicubic_strip_that_does_not_divide_the_height_is_refused() {
+        for strip in [0, 3] {
+            let got = resize_bicubic_torch_aa_f32_strips(&[0; 48], 4, 4, 2, 4, strip, |_| ());
+            assert!(
+                matches!(got, Err(TransformError::ShapeError(_))),
+                "a strip of {strip} rows"
+            );
         }
     }
 
@@ -6287,9 +6355,13 @@ mod tests {
                 bounds: &x_bounds,
                 weights: &x_weights,
             };
-            let y = TorchAaAxis {
-                bounds: &y_bounds,
-                weights: &y_weights,
+            let mut y = TorchAaRows {
+                axis: TorchAaAxis {
+                    bounds: &y_bounds,
+                    weights: &y_weights,
+                },
+                strip: out_h as usize,
+                full: |_: &[f32]| (),
             };
             let bodies = [
                 (
@@ -6299,7 +6371,7 @@ mod tests {
                 ),
                 (
                     "the generic body",
-                    torch_aa_passes(&data, width as usize, &x, &y, |channel, byte| {
+                    torch_aa_passes(&data, width as usize, &x, &mut y, |channel, byte| {
                         table[channel][usize::from(byte)]
                     }),
                 ),
