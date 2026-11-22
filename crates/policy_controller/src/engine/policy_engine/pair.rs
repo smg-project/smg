@@ -32,8 +32,8 @@
 //! the side's dispatch, and the worker it went to from there.
 //!
 //! **The answer.** The engine asks through [`decided`], for a pair's first
-//! decision and for its decode asked again: the decision, with the lease a
-//! pick issued.
+//! decision and for its decode asked again: the decision ([`decide`]), with
+//! the lease a pick issued.
 //!
 //! No function here takes a lock. A decision's records are written into
 //! buffers of the calling thread, so it allocates nothing once they have
@@ -372,6 +372,32 @@ pub(super) fn issue_decode(
     Some(decode)
 }
 
+/// One decision of a pair by `own` over the `lists` its host handed, and
+/// nothing its host hears of later: no lease is issued, no id is taken and
+/// no stage is told. With no `target` it is the pair's first decision. With
+/// the target the pair holds it is the decode decided again behind that
+/// target's prefill ([`PairLists::decide`]).
+///
+/// A request held to wires is its host's to hand lists for. Where a worker
+/// of either list is dialed on a wire the request does not state, the
+/// request is declined under the wires' name, as a single is.
+#[inline]
+pub(super) fn decide(
+    own: &PolicyEngine,
+    lists: &PairLists<'_>,
+    request: &mut Request<'_>,
+    target: Option<&Target>,
+    now: Instant,
+) -> Decision {
+    let wires = request.constraints.wire_modes;
+    let dialed = lists.prefill.wires().union(lists.decode.wires());
+    if !wires.is_empty() && !wires.contains(dialed) {
+        return single::declined(own, request, WIRES);
+    }
+    let spec = &own.spec;
+    lists.decide(spec, None, &own.clock, now, request, target)
+}
+
 /// One decision of a pair by `own`, the engine of a gateway's own process,
 /// over the `lists` its host handed, as the host takes it. With no `held`
 /// decision it is the pair's first, and a pick is issued under the engine's
@@ -380,9 +406,8 @@ pub(super) fn issue_decode(
 /// issues the decode side under the held lease, dated at this call
 /// ([`issue_decode`]). A lease's dispatch is due as a single's.
 ///
-/// A request held to wires is its host's to hand lists for. Where a worker
-/// of either list is dialed on a wire the request does not state, the
-/// request is declined under the wires' name, as a single is.
+/// The decision is the pair's alone ([`decide`]), the wires' test in it. A
+/// decision that picks no pair issues nothing.
 pub(super) fn decided(
     own: &PolicyEngine,
     lists: &PairLists<'_>,
@@ -390,18 +415,8 @@ pub(super) fn decided(
     held: Option<&HeldDecision<'_>>,
     now: Instant,
 ) -> DecideOutcome {
-    let wires = request.constraints.wire_modes;
-    let dialed = lists.prefill.wires().union(lists.decode.wires());
-    if !wires.is_empty() && !wires.contains(dialed) {
-        return DecideOutcome {
-            decision: single::declined(own, request, WIRES),
-            lease: None,
-            decode_session: Session::NONE,
-        };
-    }
     let (spec, later) = (&own.spec, request.constraints.decode_later);
-    let target = held.map(|held| held.target);
-    let decision = lists.decide(spec, None, &own.clock, now, request, target);
+    let decision = decide(own, lists, request, held.map(|held| held.target), now);
     let (engine, facts) = (spec.engine(), &request.facts);
     let issued = match held {
         // A shed writes no word that every pick shares.
@@ -1847,6 +1862,82 @@ mod tests {
             other => panic!("not shed: {other:?}"),
         }
         assert_eq!((host.engine.faults(), host.engine.unheard()), (0, 0));
+    }
+
+    /// A pair's decision alone ([`decide`]) is the decision its leasing form
+    /// makes ([`decided`]): of two engines made alike, the one asked for the
+    /// decision alone names, call by call, the pair the other issues a lease
+    /// for, and behind a held target the decode the other issues. It takes
+    /// no lease id and tells no stage. A request held to a wire no worker
+    /// of the lists is dialed on is declined under the wires' name by the
+    /// decision alone, and the leasing form answers that decline with no
+    /// lease, takes no id for it and tells no stage.
+    #[test]
+    fn a_pairs_decision_alone_is_its_leasing_forms_and_takes_no_id_and_tells_no_stage() {
+        let (alone, leasing) = (Host::of(2, 2), Host::of(2, 2));
+        let classes = every(2, 2);
+        let now = Instant::now();
+        for _ in 0..4 {
+            let mut asked = alone.asks(&classes, false);
+            let mut leased = leasing.asks(&classes, false);
+            let decision = decide(&alone.engine, &asked.1, &mut asked.0, None, now);
+            let outcome = super::decided(&leasing.engine, &leased.1, &mut leased.0, None, now);
+            assert!(outcome.lease.is_some(), "the leasing form issues its pick");
+            assert_eq!(alone.picked(&decision), leasing.picked(&outcome.decision));
+        }
+        // A pair whose decode is sent later, and that decode decided again
+        // behind the target each engine's first pick names.
+        let mut asked = alone.asks(&classes, true);
+        let mut leased = leasing.asks(&classes, true);
+        let first = decide(&alone.engine, &asked.1, &mut asked.0, None, now);
+        let outcome = super::decided(&leasing.engine, &leased.1, &mut leased.0, None, now);
+        assert_eq!(alone.picked(&first), leasing.picked(&outcome.decision));
+        let (ours, theirs) = (target_at(&first, 0), target_at(&outcome.decision, 0));
+        let lease = outcome.lease.expect("the pair's lease").lease;
+        let held = HeldDecision {
+            decision: &outcome.decision,
+            lease: &lease,
+            index: 0,
+            target: &theirs,
+            decode: HeldDecode {
+                session: outcome.decode_session,
+                tokens: lease.tokens,
+                chosen: true,
+            },
+        };
+        let call = now + Duration::from_millis(1);
+        let again = decide(&alone.engine, &asked.1, &mut asked.0, Some(&ours), call);
+        let issued = super::decided(&leasing.engine, &leased.1, &mut leased.0, Some(&held), call);
+        assert!(issued.lease.is_some(), "the leasing form issues the decode");
+        assert_eq!(alone.picked(&again), leasing.picked(&issued.decision));
+        assert_eq!(alone.picked(&again).0, alone.picked(&first).0);
+        // A request held to a wire no worker of the lists is dialed on.
+        let mut undialed = alone.asks(&classes, false);
+        undialed.0.constraints.wire_modes = WireModes::ZMQ;
+        match decide(&alone.engine, &undialed.1, &mut undialed.0, None, now) {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::PolicyDeclined, WIRES)
+            ),
+            other => panic!("not shed: {other:?}"),
+        }
+        // The leasing form answers that request the same decline, first and
+        // behind the held decision, with no lease and no session.
+        let mut refused = leasing.asks(&classes, true);
+        refused.0.constraints.wire_modes = WireModes::ZMQ;
+        for behind in [None, Some(&held)] {
+            let declined =
+                super::decided(&leasing.engine, &refused.1, &mut refused.0, behind, call);
+            assert!(matches!(&declined.decision, Decision::Shed(shed) if shed.emptied_by == WIRES));
+            assert!(declined.lease.is_none());
+            assert_eq!(declined.decode_session, Session::NONE);
+        }
+        // The leasing form took an id a pair and told each side's issue, and
+        // neither for a decline: the decision alone took none and told nobody.
+        assert_eq!(leasing.engine.leases.0.load(Ordering::Relaxed), 5);
+        assert_eq!(leasing.words().len(), 10);
+        assert_eq!(alone.engine.leases.0.load(Ordering::Relaxed), 0);
+        assert!(alone.words().is_empty(), "no stage heard a word");
     }
 
     /// A guard lends its pair's session of the decode phase with the decode
