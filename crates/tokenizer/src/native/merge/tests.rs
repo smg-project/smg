@@ -518,6 +518,10 @@ fn a_token_is_declined_when_a_pair_across_its_halves_merges_first() {
         ),
         // `bc` ranks over both halves: nothing crosses the cut first.
         ([("a", "b"), ("c", "d"), ("b", "c"), ("ab", "cd")], true),
+        // A tie of the halves' own steps: the walk meets `ab` + `ab`, and the
+        // right one formed last, so the pair before it is `ab` + `a` (`aba`,
+        // which ranks under it), not `b` + `ab`.
+        ([("ab", "a"), ("a", "b"), ("ab", "b"), ("ab", "abb")], false),
     ] {
         let ranks = ranks_of(&merges, false);
         assert_eq!(

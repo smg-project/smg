@@ -521,11 +521,11 @@ impl MergeTable {
         for &(left, right, rank) in &splits {
             table.insert(left, right, Merge::new(rank, rank));
         }
-        // A token is the merge of its bytes when two halves that are join
-        // last: their own steps run in rising rank unless a pair across the
-        // cut merges first, and such a pair is a node of the left half's
-        // right spine beside one of the right half's left spine. A token no
-        // split proves keeps the full merge below.
+        // A token is the merge of its bytes when two halves that are each the
+        // merge of their own bytes join last: their own steps run in rising
+        // rank unless a pair across the cut merges first, and such a pair is a
+        // node of the left half's right spine beside one of the right half's
+        // left spine. A token no split proves keeps the full merge below.
         for &id in &byte_ids {
             let slot = &mut root[id as usize];
             *slot = if *slot == UNSET { BYTE } else { UNPROVEN };
@@ -577,7 +577,19 @@ impl MergeTable {
         }
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
-            if token.len() < 2 || root[rank as usize] < UNSET {
+            if token.len() < 2 {
+                continue;
+            }
+            if root[rank as usize] < UNSET {
+                if cfg!(debug_assertions) {
+                    ids.clear();
+                    table.merge(token, &mut ids);
+                    debug_assert_eq!(
+                        ids,
+                        [rank],
+                        "token {rank} proven but not the merge of its bytes"
+                    );
+                }
                 continue;
             }
             ids.clear();
