@@ -38,15 +38,14 @@ use smg_worker::{load::state::LoadSnapshot, runtime::RoutingState};
 use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
-        decision::{Decision, Shed, ShedReason, Target, Trace, SUBSET_HINT, WIRES},
-        decision_engine::{AlonePick, DecideOutcome, HeldDecision, Leased, Plain, Request},
-        framework::Engine,
+        decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
+        decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request},
         records,
         sticky_sessions::SessionVerdict,
         view::{Phase, Session},
     },
     stages::Lifecycle,
-    store::{leases::DISPATCH_TTL, Said},
+    store::leases::DISPATCH_TTL,
     tracking::lease::{EventKind, EventSet, Lease, LeaseId, LeaseKind, Side},
 };
 
@@ -271,42 +270,6 @@ pub(super) fn issued(
     }
 }
 
-/// Tells `engine`'s stages one word of a single's lease, from what the
-/// request's guard lends back, as a file of leases tells it: a dispatch
-/// under the lease as issued with the index the word names, on the target
-/// taken, by its id and rank; an end under the lease moved to that target;
-/// a release under the lease as issued.
-pub(super) fn said(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
-    match said {
-        Said::Dispatched(dispatch, _) => {
-            let lease = Lease {
-                target_index: dispatch.target_index,
-                ..*held.lease
-            };
-            let target = Target {
-                id: held.target.id,
-                dp_rank: held.target.dp_rank,
-                ..Target::default()
-            };
-            engine.on_dispatched(
-                &lease,
-                &target,
-                dispatch.side,
-                dispatch.since_decision_micros,
-            );
-        }
-        Said::Completed(outcome) => {
-            let lease = Lease {
-                target_index: held.index,
-                booked: held.target.id,
-                ..*held.lease
-            };
-            engine.on_completed(&lease, &outcome);
-        }
-        Said::Released(_, reason) => engine.on_released(held.lease, reason),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, sync::Arc};
@@ -320,7 +283,7 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
         engine::{
-            decision::{LiftedVeto, Targets},
+            decision::{LiftedVeto, Target, Targets},
             decision_engine::{
                 Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
             },
