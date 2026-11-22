@@ -1102,33 +1102,45 @@ mod tests {
     /// before, and waits for the list's lock. The new times are written
     /// under that lock, and the sweep then leaves the pass due at once: its
     /// two instants do not stand over the document's.
+    ///
+    /// The sweep stores its pass ahead of the lock, so that store lands
+    /// ahead of the document's zero or behind it. A thread held at the lock
+    /// gives the first order alone, so the second form writes the sweep's
+    /// pass behind the zero by hand, under the lock.
     #[test]
     fn a_sweep_in_flight_leaves_the_pass_a_new_interval_made_due() {
-        let table = std::sync::Arc::new(SessionTable::new(1_000_000).with_shards(8));
-        table.sweep_due(10);
-        table.lookup(mixed(4), 20, &RULE);
-        let absent = table.absent.lock();
-        let sweeper = {
-            let table = std::sync::Arc::clone(&table);
-            std::thread::spawn(move || table.sweep_due(1_000_020))
-        };
-        // The sweep claimed its turn: the next one stands at its next pass.
-        while table.next_sweep_micros.load(Ordering::Relaxed) != 2_000_020 {
-            std::thread::yield_now();
+        for behind in [false, true] {
+            let table = std::sync::Arc::new(SessionTable::new(1_000_000).with_shards(8));
+            table.sweep_due(10);
+            table.lookup(mixed(4), 20, &RULE);
+            let absent = table.absent.lock();
+            let sweeper = {
+                let table = std::sync::Arc::clone(&table);
+                std::thread::spawn(move || table.sweep_due(1_000_020))
+            };
+            // The sweep claimed its turn: the next one stands at its next
+            // pass.
+            while table.next_sweep_micros.load(Ordering::Relaxed) != 2_000_020 {
+                std::thread::yield_now();
+            }
+            table.set_times_under(&absent, RULE.sweep_micros, 7_000);
+            if behind {
+                table.next_pass_micros.store(2_000_020, Ordering::Relaxed);
+            }
+            drop(absent);
+            sweeper.join().expect("the sweep ends");
+            let due = |word: &AtomicU64| word.load(Ordering::Relaxed);
+            assert_eq!(
+                (due(&table.next_sweep_micros), due(&table.next_pass_micros)),
+                (0, 0),
+                "behind: {behind}: the pass the new interval made due stands"
+            );
+            // That pass runs at the next call, and counts by the new
+            // interval.
+            table.lookup(mixed(5), 1_000_030, &RULE);
+            table.sweep_due(1_000_040);
+            assert_eq!(due(&table.next_pass_micros), 1_000_140, "behind: {behind}");
         }
-        table.set_times_under(&absent, RULE.sweep_micros, 7_000);
-        drop(absent);
-        sweeper.join().expect("the sweep ends");
-        let due = |word: &AtomicU64| word.load(Ordering::Relaxed);
-        assert_eq!(
-            (due(&table.next_sweep_micros), due(&table.next_pass_micros)),
-            (0, 0),
-            "the pass the new interval made due stands"
-        );
-        // That pass runs at the next call, and counts by the new interval.
-        table.lookup(mixed(5), 1_000_030, &RULE);
-        table.sweep_due(1_000_040);
-        assert_eq!(due(&table.next_pass_micros), 1_000_140);
     }
 
     /// A host reads a key's pins with the instant its rule forgets it, and
