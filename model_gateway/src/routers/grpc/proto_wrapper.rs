@@ -734,7 +734,7 @@ pub struct AheadStream {
 }
 
 /// A [`ProtoStream`] read on behalf of one client, whose response body is
-/// the receiving end of `client`. A reader parked on the engine (a
+/// the receiving end of the watched channel. A reader parked on the engine (a
 /// generation that stalled mid-stream, a first token still owed) would
 /// otherwise learn that the client left only when the engine next speaks,
 /// or when the request timeout ends the attempt: its send fails then, and
@@ -747,7 +747,6 @@ pub struct AheadStream {
 pub struct WatchedStream {
     /// `None` once the client left: the inner stream was dropped there.
     inner: Option<ProtoStream>,
-    client: SseSender,
     /// The wait for the client's leaving, one for the stream's whole life:
     /// built with the watch and polled only while the reader is parked on
     /// the engine (see [`ProtoStream::next`]), so it registers with the
@@ -757,9 +756,10 @@ pub struct WatchedStream {
 }
 
 /// The wait for a client's leaving that one reader keeps for its whole life
-/// (a watched stream, the relay of a Responses stream): the `closed()` of the
-/// client's channel, boxed once, and the waker it is registered for.
+/// (a watched stream, the relay of a Responses stream): the client's channel,
+/// its `closed()` boxed once, and the waker that wait is registered for.
 pub(crate) struct ClientGone {
+    client: SseSender,
     wait: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
     waker: Option<Waker>,
 }
@@ -769,17 +769,31 @@ impl ClientGone {
     pub(crate) fn of(client: &SseSender) -> Self {
         let sender = client.clone();
         Self {
+            client: client.clone(),
             wait: Box::pin(async move { sender.closed().await }),
             waker: None,
         }
     }
 
-    /// Whether the client left, for a reader that found the channel's flag
-    /// down and its source pending. Registered for the reader's waker, the
-    /// wait is not polled again: the channel raises its flag before it wakes
-    /// the wait, so the poll that wake brings meets the flag, and a
-    /// connection pulls a pending body more than once a frame.
-    pub(crate) fn poll_left(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    /// One poll of a read that ends when the client leaves: `None` is the
+    /// client's leaving, `Some` what `source` gave. The order is kept here
+    /// and not by each reader: the channel's flag first, so a busy source
+    /// cannot outrun the leaving; then the source; and only while the source
+    /// has nothing the wait, which is not polled again under the waker it is
+    /// registered for. The channel raises its flag before it wakes the wait,
+    /// so the poll that wake brings meets the flag, and a connection pulls a
+    /// pending body more than once a frame.
+    pub(crate) fn poll_read<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        source: impl FnOnce(&mut Context<'_>) -> Poll<T>,
+    ) -> Poll<Option<T>> {
+        if self.client.is_closed() {
+            return Poll::Ready(None);
+        }
+        if let Poll::Ready(item) = source(cx) {
+            return Poll::Ready(Some(item));
+        }
         if self
             .waker
             .as_ref()
@@ -788,7 +802,7 @@ impl ClientGone {
             return Poll::Pending;
         }
         if self.wait.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
+            return Poll::Ready(None);
         }
         self.waker = Some(cx.waker().clone());
         Poll::Pending
@@ -1907,15 +1921,14 @@ impl ProtoStream {
     /// line.
     #[must_use]
     pub fn until_client_gone(self, client: &SseSender, request_id: &str) -> Self {
-        self.watched(client, request_id, ClientGone::of(client))
+        self.watched(request_id, ClientGone::of(client))
     }
 
     /// [`Self::until_client_gone`] with `client_gone` as the wait for the
     /// client's leaving: the sender's own `closed()`, or a test's view of it.
-    fn watched(self, client: &SseSender, request_id: &str, client_gone: ClientGone) -> Self {
+    fn watched(self, request_id: &str, client_gone: ClientGone) -> Self {
         Self::Watched(Box::new(WatchedStream {
             inner: Some(self),
-            client: client.clone(),
             client_gone,
             request_id: request_id.to_string(),
         }))
@@ -1980,10 +1993,7 @@ impl ProtoStream {
             return item;
         };
         let WatchedStream {
-            inner,
-            client,
-            client_gone,
-            ..
+            inner, client_gone, ..
         } = &mut **watched;
         // Nothing after the client left: the inner stream went with it.
         let stream = inner.as_mut()?;
@@ -1998,16 +2008,7 @@ impl ProtoStream {
         // item or end.
         let item = {
             let mut next = std::pin::pin!(stream.next_unwatched());
-            std::future::poll_fn(|cx| {
-                if client.is_closed() {
-                    return Poll::Ready(None);
-                }
-                if let Poll::Ready(item) = next.as_mut().poll(cx) {
-                    return Poll::Ready(Some(item));
-                }
-                client_gone.poll_left(cx).map(|()| None)
-            })
-            .await
+            std::future::poll_fn(|cx| client_gone.poll_read(cx, |cx| next.as_mut().poll(cx))).await
         };
         match item {
             Some(mut item) => {
@@ -2268,13 +2269,11 @@ impl ProtoStream {
             Self::Watched(watched) => {
                 let WatchedStream {
                     inner,
-                    client,
                     client_gone,
                     request_id,
                 } = *watched;
                 Self::Watched(Box::new(WatchedStream {
                     inner: inner.map(|inner| inner.defer_abort_within(bound)),
-                    client,
                     client_gone,
                     request_id,
                 }))
@@ -3504,10 +3503,11 @@ mod watched_tests {
             }))
         };
         let client_gone = ClientGone {
+            client,
             wait: client_gone,
             waker: None,
         };
-        let mut stream = stream.watched(&client, "req-watched", client_gone);
+        let mut stream = stream.watched("req-watched", client_gone);
         for _ in 0..3 {
             assert!(matches!(stream.next().await, Some(Ok(_))));
         }

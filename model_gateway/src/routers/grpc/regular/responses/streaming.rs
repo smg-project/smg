@@ -14,7 +14,6 @@ use std::{
     marker::PhantomData,
     ops::Deref,
     sync::{Arc, OnceLock},
-    task::Poll,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -443,8 +442,8 @@ enum BodyRead {
     ClientLeft,
 }
 
-/// The next frame of the chat body `stream`, read for the client at the
-/// receiving end of `tx`'s channel. The relay that turns the chat stream
+/// The next frame of the chat body `stream`, read for the client
+/// `client_gone` waits for. The relay that turns the chat stream
 /// into the Responses stream holds the chat layer's receiver through that
 /// body: parked on a body that stalled mid-stream, it would learn that its
 /// client left only when the body next yields, and the engine request behind
@@ -452,26 +451,18 @@ enum BodyRead {
 /// client's leaving, looked at first so a busy body cannot outrun it; on
 /// [`BodyRead::ClientLeft`] the caller ends its read and drops the body,
 /// and the chat layer ends the engine request the way it does for its own
-/// clients. A background response's `tx` is the sender of its relay, which
+/// clients. A background response's wait is on the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
 /// own, and the work outlives the client as it is meant to. `client_gone`
-/// is the relay's one wait on that channel, polled only while the body has
-/// nothing, so a frame that is ready costs no registration with the channel.
-async fn next_frame(
-    stream: &mut BodyDataStream,
-    tx: &SseSender,
-    client_gone: &mut ClientGone,
-) -> BodyRead {
-    std::future::poll_fn(|cx| {
-        if tx.is_closed() {
-            return Poll::Ready(BodyRead::ClientLeft);
-        }
-        if let Poll::Ready(frame) = stream.poll_next_unpin(cx) {
-            return Poll::Ready(frame.map_or(BodyRead::End, BodyRead::Frame));
-        }
-        client_gone.poll_left(cx).map(|()| BodyRead::ClientLeft)
-    })
-    .await
+/// is the wait the relay keeps for one chat body, polled only while the body
+/// has nothing, so a frame that is ready costs no registration with the
+/// channel.
+async fn next_frame(stream: &mut BodyDataStream, client_gone: &mut ClientGone) -> BodyRead {
+    std::future::poll_fn(|cx| client_gone.poll_read(cx, |cx| stream.poll_next_unpin(cx)))
+        .await
+        .map_or(BodyRead::ClientLeft, |frame| {
+            frame.map_or(BodyRead::End, BodyRead::Frame)
+        })
 }
 
 /// The record of a stored foreground stream whose client left mid-stream, as
@@ -588,7 +579,7 @@ async fn process_and_transform_sse_stream(
     let mut client_left = false;
     // Process the stream frame by frame; a frame holds one or more SSE events.
     'frames: loop {
-        let chunk = match next_frame(&mut stream, &tx, &mut client_gone).await {
+        let chunk = match next_frame(&mut stream, &mut client_gone).await {
             BodyRead::Frame(Ok(chunk)) => chunk,
             BodyRead::Frame(Err(error)) => {
                 terminal_error = Some(stream_read_error(&error));
@@ -1325,7 +1316,7 @@ async fn convert_and_accumulate_stream(
 
     // A frame holds one or more SSE events; every one of them counts.
     'frames: loop {
-        let chunk = match next_frame(&mut stream, tx, &mut client_gone).await {
+        let chunk = match next_frame(&mut stream, &mut client_gone).await {
             BodyRead::Frame(frame) => frame.map_err(|error| stream_read_error(&error))?,
             BodyRead::End => break,
             // The chat body goes with this return, which ends the generation
@@ -1508,6 +1499,12 @@ impl ChatResponseAccumulator {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+
     use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -2463,28 +2460,42 @@ mod tests {
         );
     }
 
-    /// The relay registers its wait for the client while the body has
-    /// nothing: a reader parked in a task of its own, which nothing else
-    /// wakes, ends when the client leaves.
-    #[tokio::test(start_paused = true)]
-    #[expect(clippy::disallowed_methods, reason = "test infrastructure")]
-    async fn a_reader_parked_in_its_own_task_ends_when_the_client_leaves() {
-        let (_body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-        let body = Body::from_stream(ReceiverStream::new(body_rx));
+    /// The relay keeps one wait for the client across its reads: registered
+    /// while a read was parked on the body, it still wakes the reader when
+    /// the client leaves after that read returned its frame. A wait built
+    /// for each read is gone by then, and one never polled wakes nobody.
+    #[test]
+    fn the_wait_a_parked_read_registered_wakes_the_reader_after_that_read() {
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let mut stream = Body::from_stream(ReceiverStream::new(body_rx)).into_data_stream();
         let (tx, rx) = mpsc::channel(64);
-        let reader = tokio::spawn(async move {
-            let mut emitter =
-                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
-            convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false).await
-        });
-        // The paused clock moves only once the reader is parked on the stalled body.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut client_gone = ClientGone::of(&tx);
+        {
+            let mut read = std::pin::pin!(next_frame(&mut stream, &mut client_gone));
+            assert!(read.as_mut().poll(&mut cx).is_pending());
+            body_tx.try_send(Ok(Bytes::from_static(b"frame"))).unwrap();
+            assert!(matches!(
+                read.as_mut().poll(&mut cx),
+                Poll::Ready(BodyRead::Frame(Ok(_)))
+            ));
+        }
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "the frame's wake");
         drop(rx);
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
-            .await
-            .expect("the client's leaving wakes the parked reader")
-            .expect("the reader task ends");
-        assert_eq!(outcome.unwrap_err()["message"], "Client disconnected");
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            2,
+            "the client's leaving wakes the reader through the kept wait"
+        );
     }
 
     /// One reader for the chat stream's events: chunks, the error event as
