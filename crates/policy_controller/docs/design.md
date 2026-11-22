@@ -612,7 +612,8 @@ pub struct Constraints<'a> {
 
 What is not built in the engine that stays: a request that states a subset hint, a demand, or
 protocols that not every worker of its list serves is refused, and the refusal names the input.
-A pair's encode items are always refused. Those inputs are honoured by the old engine only.
+A pair's encode items are refused at the engine's entry. `EncodeLists::decide` decides them over
+a host's three lists and no entry calls it. The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
 names `places`, until the engine over worker lists honours them (5.8).
 
@@ -1341,7 +1342,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing; a pair is decided without the host's load reports |
-| Encode-prefill-decode on that engine | **[planned]** | always refused today |
+| Encode-prefill-decode on that engine | **[partly]** | `EncodeLists::decide` decides it over a host's three lists; the engine's entry refuses it and nothing is issued for it |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[planned]** | |
 | The crate's bench of the kept engine | **[planned]** | |
