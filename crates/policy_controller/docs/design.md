@@ -25,7 +25,7 @@ Paths without a crate name are under `crates/policy_controller/src/`.
 | Word | Meaning |
 |---|---|
 | worker | One inference engine endpoint that a request can be sent to. |
-| worker list | The workers of one model that serve one role over one protocol, in a fixed order. |
+| worker list | The workers of one model that serve one role, in a fixed order. The gateway keeps its lists by role and protocol, and the controller by role alone. |
 | classic | The gateway's routing policies of today (`--policy round_robin`, `cache_aware` and the others). |
 | policy document | A YAML or JSON file that says how workers are chosen. Section 3. |
 | profile | One way to choose: filters, then scorers, then one picker. |
@@ -342,8 +342,19 @@ new list and a new `G` for each model the worker serves, and readers get the new
 published list is never changed.
 
 The gateway's `G` holds the model's workers and its lists by role and protocol (prefill workers
-over gRPC, regular workers over HTTP, and so on). The controller's `G` holds the list alone
-today.
+over gRPC, regular workers over HTTP, and so on). The controller's `G` holds its lists by role
+alone, with the workers of every protocol in one list.
+
+The controller's holder lends each role's list with its cell and with what its rows state of each
+worker (`Objects::lent`). Beside a pair's two lists it hands their pair classes
+(`Objects::pair_classes`): each worker's class by its place in the list as lent, under the store's
+own pairing rule over what the rows state. A row's wires, engine kind and pairing descriptor can
+change under a worker object that stays, with no new list. The holder counts those changes, and the
+next ask of the classes derives them again. A controller knows no admission window of a gateway.
+So it reads a pair's admission open (`OpenAdmission`), as the rows its store builds state it, and
+the gateway that asks gates capacity when it commits. All of it stands in a build with the
+`in-process` feature, and no decision path calls it yet: the controller decides a pair over its
+store's rows today.
 
 ### 4.2 The worker object **[built]** (`smg-worker`)
 
