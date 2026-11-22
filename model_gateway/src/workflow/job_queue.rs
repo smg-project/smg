@@ -1223,7 +1223,7 @@ mod tests {
             status.message.as_deref(),
             Some("Workflow engines not initialized")
         );
-        // The view writes the address as the job's own lines write it.
+        // No plain address: the view writes it as the job's own lines write it.
         assert_eq!(read.spec.url, Endpoint::redacted_str(url));
         assert_eq!(status.worker_url, read.spec.url);
         // The tokenizer status route takes the status of a tokenizer job alone.
@@ -1240,6 +1240,24 @@ mod tests {
         assert_eq!(
             service.get_worker(held.as_str()).unwrap().0.spec.url,
             read.spec.url
+        );
+
+        // A plain address reads as registered, byte for byte.
+        let plain = "http://worker:8000/";
+        let plain_id = context.worker_registry.reserve_id_for_url(plain);
+        let _ = queue
+            .submit_and_wait(
+                Job::AddWorker {
+                    config: Box::new(WorkerSpec::new(plain)),
+                    registration_mode: WorkerRegistrationMode::CreateOnly,
+                    asker: WorkerJobAsker::Api,
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            service.get_worker(plain_id.as_str()).unwrap().0.spec.url,
+            plain
         );
     }
 
