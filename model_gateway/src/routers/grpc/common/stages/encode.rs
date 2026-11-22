@@ -856,6 +856,41 @@ mod tests {
         );
     }
 
+    /// Encode sends that reach a new endpoint together dial its pool of four
+    /// connections between them, not a pool each.
+    #[tokio::test]
+    async fn encode_sends_that_meet_a_new_endpoint_together_share_its_pool() {
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("its address"));
+        // The peer answers nothing, so each send ends at its bound.
+        let sends = futures::future::join_all((0..32).map(|_| {
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                send_tokenspeed_encode_rpc(
+                    endpoint.clone(),
+                    tokenspeed_encoder::EncodeRequest::default(),
+                ),
+            )
+        }));
+        // Every dialled connection is taken and held: one the peer closed
+        // would be dialled again.
+        let dialled = async {
+            let mut held = Vec::new();
+            while let Ok(Ok((socket, _))) =
+                tokio::time::timeout(Duration::from_millis(400), listener.accept()).await
+            {
+                held.push(socket);
+            }
+            held.len()
+        };
+        let (_, dialled) = tokio::join!(sends, dialled);
+        assert_eq!(dialled, 4);
+    }
+
     /// Real `/dev/shm` segments back the encode jobs, so these run only on
     /// Linux. They prove the encode jobs' SHM Drop guards move with the owning
     /// state: dropping it before dispatch reclaims the segment, while a
