@@ -289,7 +289,7 @@ pub(super) fn issued(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, sync::Arc};
+    use std::{cell::Cell, sync::Arc, time::Duration};
 
     use parking_lot::Mutex;
     use smg_worker::{
@@ -314,7 +314,7 @@ mod tests {
         stages::registry::StageRegistry,
         store::GatewayId,
         tracking::{
-            lease::{Outcome, ReleaseReason, TransportClass},
+            lease::{Membership, Outcome, ReleaseReason, TransportClass},
             DecisionGuard,
         },
     };
@@ -845,6 +845,16 @@ mod tests {
             let heard = ("released", lease.booked, lease.target_index);
             self.heard.lock().push(heard);
         }
+
+        fn on_membership(&self, change: &Membership<'_>) {
+            assert!(!self.panics, "this picker panics");
+            let heard = match *change {
+                Membership::Added(id) => ("joined", id, 0),
+                Membership::Removed(id) => ("left", id, 0),
+                _ => return,
+            };
+            self.heard.lock().push(heard);
+        }
     }
 
     impl Picker for Hears {
@@ -1110,5 +1120,75 @@ mod tests {
             assert_eq!(engine.faults(), faults);
         }
         assert!(heard.lock().is_empty());
+    }
+
+    /// A worker that joins or leaves is told to the document's stages under
+    /// the id a decision names it by, in the order its host says the two. A
+    /// stage that panics at the word is held and counted: the call returns.
+    #[test]
+    fn a_worker_that_joins_or_leaves_is_told_to_the_documents_stages() {
+        let list = pool(2);
+        let id = |at: usize| worker_id(list[at].as_ref());
+        let (engine, heard) = hearing(false);
+        engine.joined(list[0].url());
+        engine.forget(list[1].url());
+        assert_eq!(*heard.lock(), [("joined", id(0), 0), ("left", id(1), 0)]);
+        assert_eq!(engine.unheard(), 0);
+        let (engine, heard) = hearing(true);
+        engine.joined(list[0].url());
+        engine.forget(list[1].url());
+        assert!(heard.lock().is_empty());
+        assert_eq!(engine.unheard(), 2);
+    }
+
+    /// One request of `asks` decided at `now`, sent to its first target and
+    /// served there: that target.
+    fn served(engine: &PolicyEngine, asks: &Asks<'_>, now: Instant) -> Target {
+        let mut guard =
+            DecisionGuard::decide_under(engine, GatewayId::LOCAL, asks, now).expect("a decision");
+        let target = guard.take(0).expect("the first target");
+        guard.dispatched(now);
+        let outcome = Outcome {
+            side: Side::Single,
+            served: target.id,
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+        guard.completed(&outcome, now);
+        target
+    }
+
+    /// A worker said gone and back at its address serves its sessions
+    /// again, however long it was gone and with no join said: the session
+    /// table is not told a leave, as the classic policies' map is not. A
+    /// key is pinned on a worker that leaves, and is served by the worker
+    /// that stayed for twice the time the table holds an absent worker's
+    /// pins, a quarter of that time apart, by the engine's own number. Back
+    /// in the list, its first worker serves it again.
+    #[test]
+    fn a_worker_said_gone_and_back_at_its_address_serves_its_sessions_again() {
+        let (engine, both) = (preset("manual"), pool(2));
+        let start = Instant::now();
+        let absence = Duration::from_micros(engine.spec.engine().pins_absence_micros());
+        // The key's request over `list` in quarter `turn`: its worker.
+        let sent = |list: &Arc<[Arc<dyn Worker>]>, turn: u32| {
+            let members = engine.pool_members(list);
+            let mut keyed = request();
+            keyed.facts.session_key = Identity::hashed(1);
+            let asks = Asks::of(keyed, Some(&members));
+            served(&engine, &asks, start + absence / 4 * turn).id
+        };
+        let first = sent(&both, 0);
+        let at = usize::from(worker_id(both[1].as_ref()) == first);
+        let (gone, other) = (&both[at], Arc::from([Arc::clone(&both[1 - at])]));
+        engine.forget(gone.url());
+        for turn in 1..=8 {
+            assert_ne!(sent(&other, turn), first);
+        }
+        assert_eq!(sent(&both, 9), first, "it has its key again");
     }
 }

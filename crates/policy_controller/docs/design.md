@@ -845,6 +845,7 @@ At start:
 | hands its index of cache events | `engine.affinity().set_indexes(indexes)`; the host implements `CacheIndexes` and `CacheIndex` |
 | keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
 | builds each list's hash ring off the request path | `engine.fill_ring(..)` |
+| tells the engine when a worker joins | `engine.joined(address)` |
 | tells the engine when a worker is removed | `engine.forget(address)` |
 | runs the upkeep about once a second | `engine.sweep(now)` |
 
@@ -903,7 +904,7 @@ runtime.spawn(engine.run());         // the engine's own background task
 The engine lives as long as the process, so a placement holds a plain reference to it.
 
 The engine's background task does what a host does by hand today: the upkeep once a second; a
-removed worker dropped from what the policies remember; each list's hash ring built off the
+worker that joined or was removed told to the policies; each list's hash ring built off the
 request path; and the newest load snapshot kept at hand, swapped when the monitor publishes one,
 so that a decision reads it without touching the channel.
 
