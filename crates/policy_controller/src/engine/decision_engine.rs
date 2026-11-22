@@ -531,7 +531,9 @@ pub struct SweepOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecisionRefused {
     /// The request is a decode or encode side sent on its own. A pair is
-    /// asked at its prefill, and that one request decides both sides.
+    /// asked at its prefill, and that one request decides both sides. An
+    /// entry that files no lease answers this for a prefill too, while a
+    /// pair has no entry of that kind.
     PairSide,
     /// The store filed no lease for the pick, at the second try too: its
     /// term mints no id, or another hand raised it under both tries.
