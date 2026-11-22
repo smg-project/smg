@@ -438,7 +438,8 @@ fn tile_blocks(
 ) {
     let splitter = RgbSplitter::detect();
     let block = tile * tile;
-    let mut bytes = vec![0u8; 3 * block];
+    // A pooled buffer: a full tile covers it, a partial one clears it first.
+    let mut bytes = buffer_pool::take(3 * block);
     for tile_y in 0..rows {
         for tile_x in 0..columns {
             let left = (tile_x * tile).min(width);
@@ -459,6 +460,7 @@ fn tile_blocks(
             }
         }
     }
+    buffer_pool::recycle(bytes);
 }
 
 impl VisionPreProcessor for Llama4VisionProcessor {
@@ -823,5 +825,31 @@ mod tests {
             }
         }
         assert_eq!(got, want);
+    }
+
+    /// The block buffer of `tile_blocks` is the pool's and goes back to it,
+    /// and no byte of it reaches `run` unwritten: a debug build hands the
+    /// buffer out filled with the pool's sentinel.
+    #[test]
+    fn the_tile_blocks_buffer_goes_back_to_the_pool() {
+        static MINE: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        let tile = 336;
+        let (width, height) = (tile + 64, tile);
+        let rgb = vec![1u8; width * height * 3];
+        let mut blocks = Vec::new();
+        buffer_pool::with_pool(&MINE, || {
+            tile_blocks(&rgb, (width, height), (1, 2), tile, |_, bytes| {
+                blocks.push(bytes.to_vec());
+            });
+        });
+        // The full tile: every byte the image's.
+        assert!(blocks[..3].iter().flatten().all(|&byte| byte == 1));
+        // The partial tile: 64 image columns, then black.
+        for row in blocks[3..].iter().flat_map(|block| block.chunks(tile)) {
+            assert!(row[..64].iter().all(|&byte| byte == 1));
+            assert!(row[64..].iter().all(|&byte| byte == 0));
+        }
+        // Three channels of a 336x336 tile, 338,688 bytes: the 512 KiB class.
+        assert_eq!(MINE.held(), 512 << 10);
     }
 }
