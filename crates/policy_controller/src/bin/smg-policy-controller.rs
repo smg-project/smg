@@ -4,7 +4,7 @@
 
 use std::process::ExitCode;
 
-use smg_policy_controller::{service::controller, Catalog};
+use smg_policy_controller::{service::controller, stages::Catalog};
 
 /// The process's allocator, the one the gateway's binary registers, on the
 /// targets the gateway registers it. A burst of registrations builds the

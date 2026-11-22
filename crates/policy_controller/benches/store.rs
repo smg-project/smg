@@ -24,8 +24,9 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
+    engine::{LoadRow, Role, WorkerId},
     store::{GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
-    LoadRow, Role, TransportClass, WorkerId,
+    tracking::TransportClass,
 };
 
 const WORKERS: u64 = 64;

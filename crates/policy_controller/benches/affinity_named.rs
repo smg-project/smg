@@ -22,7 +22,7 @@ use std::hint::black_box;
 use column::build_column;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use smg_policy_controller::{
+use smg_policy_controller::engine::{
     Constraints, NamedAffinity, NamedHolder, Phase, PoolFacts, RequestFacts, Scratch,
 };
 

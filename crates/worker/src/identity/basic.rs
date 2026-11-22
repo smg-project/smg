@@ -1144,6 +1144,7 @@ impl BasicWorker {
             worker_type: self.metadata.spec.worker_type,
             handshake_address: self.metadata.spec.zmq_handshake_address.clone(),
             engine_count: self.metadata.zmq_engine_count(),
+            pinned_by_rank: self.metadata.is_dp_aware(),
             startup: self.metadata.zmq_startup_timeout,
             request_timeout: self.metadata.zmq_request_timeout,
         };

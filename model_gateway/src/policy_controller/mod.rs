@@ -45,11 +45,11 @@
 
 use std::sync::Arc;
 
-pub(crate) use smg_policy_controller::document::spec::PlanName;
+pub(crate) use smg_policy_controller::document::PlanName;
 use smg_policy_controller::{
     document::operator::{Format, SpecDoor, SpecRejected},
+    stages::Catalog,
     store::MemoryStore,
-    Catalog,
 };
 use smg_worker::connection::engine::EngineConnector;
 use tracing::info;

@@ -4,9 +4,13 @@
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 use smg_policy_controller::{
-    Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, LoadRow, Pair, PairPools,
-    Phase, PolicySpec, PoolFacts, RequestFacts, Scratch, Side, SignalCell, SignalCells, SpecError,
-    Target, WorkerId, API_VERSION,
+    document::{PolicySpec, SpecError, API_VERSION},
+    engine::{
+        Candidate, Constraints, Decision, Engine, Health, LoadRow, Pair, PairPools, Phase,
+        PoolFacts, RequestFacts, Scratch, Target, WorkerId,
+    },
+    load::{SignalCell, SignalCells},
+    tracking::{Lease, Lifecycle, Side},
 };
 
 /// The decisions' instant on the host's clock.

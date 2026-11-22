@@ -14,8 +14,14 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Engine, Lifecycle, LoadRow, PolicySpec, PoolFacts, Reports,
-    RequestFacts, Scorer, Scratch, TieBand, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Engine, LoadRow, PoolFacts, RequestFacts, Scorer, Scratch, TieBand,
+        WorkerId,
+    },
+    load::Reports,
+    stages::Catalog,
+    tracking::Lifecycle,
 };
 
 const MAX_AGE_MS: u64 = 250;

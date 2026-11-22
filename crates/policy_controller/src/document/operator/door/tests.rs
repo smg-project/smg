@@ -17,7 +17,7 @@ use crate::{
         },
         test_support::*,
     },
-    Candidate, Constraints, Filter, RequestFacts,
+    engine::{Candidate, Constraints, Filter, RequestFacts},
 };
 
 #[cfg(target_os = "linux")]
@@ -764,13 +764,13 @@ fn a_readers_refusal_names_the_field_it_refused() {
 #[derive(Debug)]
 struct Kept;
 
-impl crate::Lifecycle for Kept {
+impl crate::tracking::Lifecycle for Kept {
     fn needs_lifecycle(&self) -> bool {
         true
     }
 }
 
-impl crate::Scorer for Kept {
+impl crate::engine::Scorer for Kept {
     fn name(&self) -> &'static str {
         "kept"
     }
@@ -781,9 +781,9 @@ impl crate::Scorer for Kept {
         _: &[Candidate],
         _: &[u32],
         out: &mut [f32],
-    ) -> crate::TieBand {
+    ) -> crate::engine::TieBand {
         out.fill(1.0);
-        crate::TieBand::NORMALIZED
+        crate::engine::TieBand::NORMALIZED
     }
 }
 

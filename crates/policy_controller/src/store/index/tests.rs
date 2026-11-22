@@ -179,7 +179,7 @@ mod sent_prefixes {
     /// Each holder named: its worker, its blocks by the index and by the
     /// record.
     fn holders(named: &Named, rows: &[WorkerId]) -> Vec<(WorkerId, u32, u32)> {
-        let worker = |holder: &crate::NamedHolder| rows[holder.row as usize];
+        let worker = |holder: &crate::engine::NamedHolder| rows[holder.row as usize];
         let each = named.holders.iter();
         each.map(|holder| {
             (
@@ -2539,13 +2539,13 @@ mod named {
 
     use super::{admitted, batch, chain, publisher, stored, MODEL};
     use crate::{
+        document::{AppliedSpec, PolicySpec},
         engine::view::{Candidate, LoadRow, Role, WireModes, WorkerId},
         store::{
             index::{seam, PoolIndex},
             Ask, BatchOutcome, GatewayId, KvEventSink, LoadSink, LoadSource, MemoryStore, Named,
             Naming, Reachability, Signals, ViewBuffers, WorkerFacts, WorkerRow, WorkersStore,
         },
-        AppliedSpec, PolicySpec,
     };
 
     /// Another gateway than the one most cases decide for.

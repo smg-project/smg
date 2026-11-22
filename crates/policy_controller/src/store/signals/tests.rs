@@ -11,13 +11,19 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    engine::door::{Door, Request},
+    document::{AppliedSpec, Needs, PolicySpec, API_VERSION},
+    engine::{
+        door::{Door, Request},
+        Candidate, Constraints, LoadRow, Phase, RequestFacts, Role, Scorer, TieBand, WireModes,
+        WorkerId,
+    },
+    load::SignalColumn,
+    stages::Catalog,
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, SignalSink, Taken,
         ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Candidate, Catalog, Constraints, Lifecycle, LoadRow, Needs, Phase, PolicySpec,
-    RequestFacts, Role, Scorer, SignalColumn, TieBand, WireModes, WorkerId, API_VERSION,
+    tracking::Lifecycle,
 };
 
 const POOL: &str = "work";
@@ -243,8 +249,8 @@ fn lent(store: &MemoryStore, role: Role) -> Vec<(WorkerId, Held)> {
         let block = view.signal_cells.expect("the publication's block");
         assert!(block.fits(view.candidates.len()), "one cell a row a signal");
         let cells = block.cells().chunks(block.signals());
-        let of = |cells: &[crate::SignalCell]| {
-            let held = |cell: &crate::SignalCell| {
+        let of = |cells: &[crate::load::SignalCell]| {
+            let held = |cell: &crate::load::SignalCell| {
                 (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
             };
             cells.iter().map(held).collect()

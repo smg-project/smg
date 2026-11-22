@@ -1192,7 +1192,7 @@ impl Plugin {
 
     /// What the host must feed for the plugin's stages, as declared. Each
     /// stage the plugin is bound as carries these into its profile's needs
-    /// ([`crate::Profile::needs`]), and so into the engine's summary.
+    /// ([`crate::engine::Profile::needs`]), and so into the engine's summary.
     pub fn needs(&self) -> Needs {
         self.needs
     }

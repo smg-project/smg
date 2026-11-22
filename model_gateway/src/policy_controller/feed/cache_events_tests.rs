@@ -15,13 +15,13 @@ use smg_grpc_client::{
     TokenSpeedSchedulerClient as SchedulerClient,
 };
 use smg_policy_controller::{
-    engine::view::{Role, WireModes, WorkerId},
+    document::{AppliedSpec, PolicySpec},
+    engine::{Role, WireModes, WorkerId},
     store::{
         Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink, Maker, MemoryStore, Named, Naming,
         Signals, ViewBuffers, WorkerFacts,
     },
     worker_host::{Expect, Wrote},
-    AppliedSpec, PolicySpec,
 };
 use tokio::{
     net::TcpListener,

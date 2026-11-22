@@ -23,16 +23,16 @@ use super::{
 };
 use crate::{
     document::spec::{
-        AffinitySource, AppliedSpec, BestParams, PickStage, PolicySpec, PrefixAffinityParams,
-        ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
+        AffinitySource, AppliedSpec, Assignment, BestParams, PickStage, PolicySpec,
+        PrefixAffinityParams, ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
     },
     engine::{
         decision::{Decision, ShadowKind, Targets},
         door::{Decided, Door, ON_SHADOW, SHADOW_FLOOR},
         framework::{EncodePlaced, PairSide, Picker, TieBand},
+        sticky_sessions::SessionVerdict,
         view::{Candidate, LoadRow, Phase, RequestFacts, Role, WorkerId},
     },
-    sessions::SessionVerdict,
     stages::{builtins::target_of, catalog::Catalog},
     store::{
         BatchFacts, BatchOutcome, ContentHash, Dispatch, KvEvent, KvEventSink, LeasesStore,
@@ -40,7 +40,6 @@ use crate::{
         WorkerStatus, WorkersStore,
     },
     tracking::lease::{LeaseId, Lifecycle, Side},
-    Assignment,
 };
 
 /// What a case's picker does with a decision.
@@ -224,7 +223,7 @@ fn a_shadow_of_another_outcome_changes_nothing_of_the_live_answer() {
 /// shadow is counted.
 #[test]
 fn a_pool_a_demand_emptied_is_shed_under_the_demand_and_is_not_shadowed() {
-    use crate::{engine::decision::ShedReason, Demands, Unmet};
+    use crate::engine::{decision::ShedReason, Demands, Unmet};
 
     let (door, asked) = bed(Rule::Place(0), Rule::Place(1));
     let mut order = request(b"r-1", 7);

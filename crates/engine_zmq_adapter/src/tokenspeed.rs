@@ -22,7 +22,7 @@ use engine_zmq_client::{
     ConnectedEngine,
 };
 use futures::Stream;
-use openai_protocol::worker::WorkerType;
+use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerType};
 use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vllm};
 use tracing::warn;
 
@@ -665,6 +665,23 @@ impl RankIndices {
     pub(crate) fn index_of(&self, rank: u32) -> Option<u32> {
         self.indices.get(usize::try_from(rank).ok()?).copied()
     }
+}
+
+/// The load of each rank of `ranks` that has one, numbered by rank:
+/// `load_of` reads an engine's by its index. A rank worker reads its own
+/// rank's entry, so the entries carry the number a pin reaches the rank by.
+pub(crate) fn loads_by_rank(
+    ranks: &RankIndices,
+    load_of: impl Fn(u32) -> Option<SchedulerLoadSnapshot>,
+) -> Vec<SchedulerLoadSnapshot> {
+    (0..ranks.len())
+        .filter_map(|rank| {
+            let rank = u32::try_from(rank).ok()?;
+            let mut load = load_of(ranks.index_of(rank)?)?;
+            load.dp_rank = i32::try_from(rank).ok()?;
+            Some(load)
+        })
+        .collect()
 }
 
 /// The attention data-parallel rank a request goes to, the engine's own
@@ -1959,6 +1976,33 @@ mod tests {
         assert!(
             error.contains("data_parallel_rank must be in [0, 2)"),
             "{error}"
+        );
+    }
+
+    /// A rank's load is numbered by the rank, not by the index its engine
+    /// dialled in at, and a rank that has not reported has no entry.
+    #[test]
+    fn loads_are_numbered_by_rank_not_by_engine_index() {
+        let load_of = |index: u32| {
+            (index != 7).then(|| SchedulerLoadSnapshot {
+                dp_rank: i32::try_from(index).unwrap(),
+                num_running_reqs: i32::try_from(index).unwrap() * 10,
+                ..Default::default()
+            })
+        };
+        let running_by_rank = |ranks: RankIndices| -> Vec<(i32, i32)> {
+            loads_by_rank(&ranks, load_of)
+                .into_iter()
+                .map(|load| (load.dp_rank, load.num_running_reqs))
+                .collect()
+        };
+        assert_eq!(
+            running_by_rank(RankIndices::new(vec![1, 0])),
+            vec![(0, 10), (1, 0)]
+        );
+        assert_eq!(
+            running_by_rank(RankIndices::new(vec![4, 7, 3])),
+            vec![(0, 40), (2, 30)]
         );
     }
 

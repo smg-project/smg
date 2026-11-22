@@ -35,14 +35,16 @@ use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    load::load_report,
+    document::{AppliedSpec, PolicySpec},
+    engine::{
+        AffinityFacts, Candidate, Constraints, Decision, Engine, HashKind, Health, LoadRow, Phase,
+        PoolFacts, RequestFacts, Role, Scratch, ShedReason, SignalSource, Target, WorkerId,
+    },
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, MemoryStore, Named, Naming,
         Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AffinityFacts, AppliedSpec, Candidate, Constraints, Decision, Engine, HashKind, Health, Lease,
-    Lifecycle, LoadRow, Phase, PolicySpec, PoolFacts, RequestFacts, Role, Scratch, ShedReason,
-    Side, SignalSource, Target, TransportClass, WorkerId,
+    tracking::{Lease, Lifecycle, Side, TransportClass},
 };
 
 use crate::{same_outcome, Outcome, Recorded, Replayed};
@@ -286,7 +288,7 @@ fn wire(report: Report) -> WorkerLoadResponse {
 /// the instant it was sampled.
 fn load_row(report: Report) -> LoadRow {
     let now = Instant::now();
-    load_report::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
+    smg_policy_controller::load::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
 }
 
 /// The worker the row lists at `i`, as the view names it.
@@ -656,7 +658,7 @@ impl<'a> Bed<'a> {
         self.pool[place].in_flight -= 1;
         self.engine.on_completed(
             &lease,
-            &smg_policy_controller::Outcome {
+            &smg_policy_controller::tracking::Outcome {
                 side: Side::Single,
                 served: target.id,
                 status: 200,

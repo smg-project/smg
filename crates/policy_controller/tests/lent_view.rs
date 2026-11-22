@@ -19,14 +19,15 @@ use std::{
 };
 
 use smg_policy_controller::{
-    document::spec::{BindingSpec, OverloadSpec},
-    stages::catalog::Catalog,
+    document::{
+        AppliedSpec, BindingSpec, OverloadSpec, PolicySpec, SpecError, API_VERSION, PRESETS,
+    },
+    engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
+    stages::Catalog,
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Constraints, Engine, LoadRow, PolicySpec, RequestFacts, Role, Scratch,
-    SignalSource, SpecError, WorkerId, API_VERSION, PRESETS,
 };
 
 thread_local! {

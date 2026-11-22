@@ -429,7 +429,7 @@ mod tests {
             },
             constraints: Constraints {
                 excluded: &[WorkerId(26), WorkerId(27)],
-                wire_modes: crate::WireModes::HTTP.union(crate::WireModes::GRPC),
+                wire_modes: crate::engine::WireModes::HTTP.union(crate::engine::WireModes::GRPC),
                 overload_lifted: true,
                 subset_hint: Some(0),
                 ..Constraints::default()

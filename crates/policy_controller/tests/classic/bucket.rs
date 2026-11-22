@@ -19,8 +19,11 @@
 
 use serde::Deserialize;
 use smg_policy_controller::{
-    Candidate, Constraints, Engine, Health, Lease, Lifecycle, Membership, Phase, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, WorkerId,
+    document::PolicySpec,
+    engine::{
+        Candidate, Constraints, Engine, Health, Phase, PoolFacts, RequestFacts, Scratch, WorkerId,
+    },
+    tracking::{Lease, Lifecycle, Membership},
 };
 
 use crate::{Outcome, Recorded, Replayed};

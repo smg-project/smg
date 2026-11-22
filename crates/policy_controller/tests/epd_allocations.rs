@@ -24,8 +24,11 @@ use std::{
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
-    Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Health, Identity,
-    MediaCounts, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+    document::PolicySpec,
+    engine::{
+        Candidate, Constraints, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Health,
+        Identity, MediaCounts, PairPools, Phase, PoolFacts, RequestFacts, Role, Scratch, WorkerId,
+    },
 };
 
 #[global_allocator]

@@ -28,11 +28,11 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
+    engine::{LoadRow, Role, SignalSource},
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, WorkerFacts, WorkerStatus,
         WorkersStore, PUBLISH_WINDOW,
     },
-    LoadRow, Role, SignalSource,
 };
 
 const MODEL: &str = "m";

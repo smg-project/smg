@@ -6,21 +6,24 @@
 use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 
 use crate::{
-    affinity::{forget_judged, WarmRule},
-    document::spec::Needs,
+    document::spec::{Assignment, Needs},
     engine::{
         decision::{
             Decision, Lifted, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
             MAX_TARGETS, TRACE_TOP,
         },
+        sticky_sessions::{self, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
         view::{
             mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
             ReportCutoff, RequestFacts, WorkerId,
         },
     },
     load::signals::SignalCells,
-    sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
-    stages::builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
+    policies::{
+        cache_aware::{forget_judged, WarmRule},
+        random::Random,
+    },
+    stages::builtins::{target_of, Best, FewestSessions, LeastRequests, RowTests},
     tracking::{
         lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
         sent::SentCredit,
@@ -3420,9 +3423,9 @@ fn shortest_sweep(bindings: &[Binding]) -> u64 {
 /// rules, a rule with none counting as [`ABSENCE_MICROS`], which is the
 /// time too where no binding has a rule.
 ///
-/// [`ABSENCE_MICROS`]: crate::sessions::ABSENCE_MICROS
+/// [`ABSENCE_MICROS`]: crate::engine::sticky_sessions::ABSENCE_MICROS
 fn absence(bindings: &[Binding]) -> u64 {
-    let stated = crate::sessions::ABSENCE_MICROS;
+    let stated = sticky_sessions::ABSENCE_MICROS;
     let rules = bindings.iter().filter_map(|b| b.sessions.as_ref());
     let longest = rules.map(|rule| rule.ttl_micros.unwrap_or(stated));
     longest.max().unwrap_or(stated)
@@ -4297,7 +4300,7 @@ impl Engine {
     }
 
     /// Whether any profile of this generation holds a stage that keeps
-    /// state a decider ([`crate::engine::decider`]): a plugin's kept instance is
+    /// state a decider ([`crate::engine`]): a plugin's kept instance is
     /// its decider's, and every profile's stages hear every lease. Under
     /// such a generation a host that seats its callers by thread decides
     /// each request at its model's decider, so that state has one writer
@@ -6468,24 +6471,21 @@ mod tests {
 
     use super::*;
     use crate::{
-        affinity::{Gates, PrefixAffinity},
-        document::{
-            spec,
-            spec::{PolicySpec, PowerOfTwoMetric, PrefixAffinityParams, SpillParams},
-        },
+        document::spec::{self, PolicySpec, PrefixAffinityParams, Recovery, SpillParams},
         engine::{
-            decision,
-            decision::Pair,
-            view,
-            view::{Health, Identity, MediaCounts, Role, Session, WorkerId},
+            decision::{self, Pair},
+            view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
         },
-        sessions::Recovery,
-        stages::{
-            builtins,
-            builtins::{
-                Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried,
-                Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
-            },
+        policies::{
+            cache_aware::{Gates, PrefixAffinity},
+            manual::Manual,
+            passthrough::Passthrough,
+            power_of_two::{PowerOfTwo, PowerOfTwoCountFirst, PowerOfTwoMetric},
+            random::Random,
+            round_robin::RoundRobin,
+        },
+        stages::builtins::{
+            self, Best, CountFirst, Healthy, LeastRequests, NotOverloaded, NotTried,
         },
         tracking::counts::tests::Lent,
     };
@@ -7373,7 +7373,7 @@ mod tests {
             pin: WorkerId,
         }
 
-        impl crate::PinSource for Later {
+        impl crate::engine::PinSource for Later {
             fn pinned(&self, _: Session, _: Option<u64>) -> Option<WorkerId> {
                 (self.asked.fetch_add(1, Ordering::Relaxed) != 0).then_some(self.pin)
             }
@@ -7613,7 +7613,7 @@ mod tests {
             seen: Mutex<Option<[WorkerId; 2]>>,
         }
 
-        impl crate::PinSource for Behind<'_> {
+        impl crate::engine::PinSource for Behind<'_> {
             fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
                 let sessions = self.engine.sessions();
                 let _ = sessions.restore(key, 10, &self.rule, self.stored);
@@ -7789,7 +7789,7 @@ mod tests {
             others: [WorkerId; 2],
         }
 
-        impl crate::PinSource for TwoPins<'_> {
+        impl crate::engine::PinSource for TwoPins<'_> {
             fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
                 let sessions = self.engine.sessions();
                 sessions.lookup(key, 10, &SESSIONS);
@@ -7854,7 +7854,7 @@ mod tests {
     fn shadow_rows_lent_out_of_order_stop_a_debug_build() {
         let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
         let rows = [candidate(0, 0), candidate(1, 3)];
-        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
+        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
         let lent = [keyed(1, 2), keyed(0, 2)];
         let facts = RequestFacts {
             lent_session_in_flight: Some(&lent),
@@ -9206,7 +9206,7 @@ mod tests {
     /// column.
     #[test]
     fn a_holder_a_host_named_leads_as_the_deepest_overlap_of_a_column_does() {
-        use crate::{NamedAffinity, NamedHolder};
+        use crate::engine::{NamedAffinity, NamedHolder};
         let engine = overlap_engine(Binding {
             model: "m".into(),
             ..single_binding()
@@ -9260,7 +9260,7 @@ mod tests {
     fn rows_named_out_of_order_past_the_pool_or_beside_a_column_stop_a_debug_build() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
-        use crate::{NamedAffinity, NamedHolder};
+        use crate::engine::{NamedAffinity, NamedHolder};
         let engine = overlap_engine(Binding {
             model: "m".into(),
             ..single_binding()
@@ -9453,7 +9453,7 @@ mod tests {
     #[test]
     fn a_pair_side_reads_no_rows_named_on_the_request() {
         let (prefills, decodes) = (paired(2), paired(2));
-        let holders = [crate::NamedHolder {
+        let holders = [crate::engine::NamedHolder {
             row: 1,
             overlap_blocks: 8,
             predicted_blocks: 0,
@@ -12963,7 +12963,7 @@ mod tests {
         }
     }
 
-    impl crate::PinSource for Stored {
+    impl crate::engine::PinSource for Stored {
         fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
             self.asked.lock().expect("the case's lock").push(ttl_micros);
             (key == self.key).then_some(self.worker)
@@ -13075,7 +13075,7 @@ mod tests {
         other: WorkerId,
     }
 
-    impl crate::PinSource for Racing<'_> {
+    impl crate::engine::PinSource for Racing<'_> {
         fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
             let _ = self
                 .engine
@@ -13334,7 +13334,7 @@ mod tests {
     fn capped(
         engine: &Engine,
         pool: &[Candidate],
-        lent: Option<&[crate::KeyedRow]>,
+        lent: Option<&[crate::engine::KeyedRow]>,
     ) -> (u32, SessionVerdict) {
         let facts = RequestFacts {
             model: "m",
@@ -13367,8 +13367,8 @@ mod tests {
         // The key's worker carries the most requests from here: the stages
         // place a request of the key at its cap on the second row.
         pool[0].in_flight = 9;
-        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
-        let lent = |rows: &[crate::KeyedRow]| capped(&engine, &pool, Some(rows));
+        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
+        let lent = |rows: &[crate::engine::KeyedRow]| capped(&engine, &pool, Some(rows));
         assert_eq!(lent(&[]), (0, Pinned), "no request of the key in flight");
         assert_eq!(lent(&[keyed(0, 1)]), (0, Pinned), "under the cap");
         assert_eq!(lent(&[keyed(0, 2)]), (1, Respill), "at the cap");
@@ -13390,7 +13390,7 @@ mod tests {
     fn rows_lent_out_of_order_stop_a_debug_build() {
         let engine = session_engine(SESSIONS);
         let pool = vec![candidate(0, 0), candidate(1, 3)];
-        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
+        let keyed = |row, in_flight| crate::engine::KeyedRow { row, in_flight };
         let answer = capped(&engine, &pool, Some(&[keyed(1, 2), keyed(0, 2)]));
         panic!("a list out of order answered {answer:?}");
     }
@@ -16077,8 +16077,8 @@ mod tests {
 
     // ---- a draw the rows a host named join
 
-    fn holding(row: u32, overlap_blocks: u32) -> crate::NamedHolder {
-        crate::NamedHolder {
+    fn holding(row: u32, overlap_blocks: u32) -> crate::engine::NamedHolder {
+        crate::engine::NamedHolder {
             row,
             overlap_blocks,
             predicted_blocks: 0,
@@ -16086,7 +16086,7 @@ mod tests {
     }
 
     /// A request of sixteen blocks whose host names `holders`.
-    fn naming(seed: u64, holders: &[crate::NamedHolder]) -> RequestFacts<'_> {
+    fn naming(seed: u64, holders: &[crate::engine::NamedHolder]) -> RequestFacts<'_> {
         static HASHES: [u64; 16] = [0; 16];
         RequestFacts {
             block_hashes: &HASHES,
@@ -16201,7 +16201,8 @@ mod tests {
     #[should_panic(expected = "at or under the profile's sample")]
     fn rows_named_past_the_sample_stop_a_debug_build_where_the_picker_draws() {
         let engine = preset("cache_aware");
-        let holders: Vec<crate::NamedHolder> = (0..17).map(|row| holding(row, 12)).collect();
+        let holders: Vec<crate::engine::NamedHolder> =
+            (0..17).map(|row| holding(row, 12)).collect();
         let decision = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| false));
         panic!("seventeen rows named answered {decision:?}");
     }
@@ -16393,7 +16394,8 @@ mod tests {
         let engine = two_samples();
         assert_eq!(engine.needs().sample, 16);
         let pool = pool_of(64, |_| false);
-        let holders: Vec<crate::NamedHolder> = (0..16).map(|row| holding(row, 12)).collect();
+        let holders: Vec<crate::engine::NamedHolder> =
+            (0..16).map(|row| holding(row, 12)).collect();
         for (model, sample) in [("narrow", 4usize), ("wide", 16)] {
             let cap = engine.sample_for(model, Phase::Single) as usize;
             assert_eq!(cap, sample, "{model}");
@@ -16416,7 +16418,7 @@ mod tests {
     #[should_panic(expected = "at or under the profile's sample")]
     fn rows_capped_by_the_engines_summary_stop_a_debug_build_under_a_narrower_profile() {
         let engine = two_samples();
-        let holders: Vec<crate::NamedHolder> = (0..engine.needs().sample)
+        let holders: Vec<crate::engine::NamedHolder> = (0..engine.needs().sample)
             .map(|row| holding(row, 12))
             .collect();
         let facts = RequestFacts {
@@ -16608,7 +16610,7 @@ mod tests {
         assert_eq!(engine.needs_for("mixed", Phase::Decode).sample, 16);
         assert_eq!(engine.sample_for("mixed", Phase::Decode), 4);
         assert_eq!(engine.sample_for("nobody", Phase::Decode), 0);
-        let holders: Vec<crate::NamedHolder> = (0..4).map(|row| holding(row, 12)).collect();
+        let holders: Vec<crate::engine::NamedHolder> = (0..4).map(|row| holding(row, 12)).collect();
         let facts = RequestFacts {
             model: "mixed",
             phase: Phase::Decode,

@@ -22,13 +22,12 @@ use crate::{
     document::spec,
     engine::{
         decider::Decider,
-        decision,
-        decision::{Target, Targets},
+        decision::{self, Target, Targets},
         demands::DemandFacts,
+        sticky_sessions::{self, SessionVerdict},
         view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
     },
     service::replication::Log,
-    sessions::SessionVerdict,
     tracking::lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
 };
 
@@ -3525,8 +3524,13 @@ fn a_watch_snapshot_gives_a_new_incarnation_its_own_count() {
 #[test]
 fn a_watch_snapshot_publishes_the_cut_at_once_and_tells_the_members_once() {
     use crate::{
-        engine::view::{Candidate, RequestFacts},
-        AppliedSpec, Catalog, Lifecycle, PolicySpec, Scorer, TieBand,
+        document::{AppliedSpec, PolicySpec},
+        engine::{
+            view::{Candidate, RequestFacts},
+            Scorer, TieBand,
+        },
+        stages::Catalog,
+        tracking::Lifecycle,
     };
 
     #[derive(Debug)]
@@ -5202,7 +5206,7 @@ fn the_dispatch_deadlines_fall_due_in_their_own_order_whatever_order_they_were_f
 /// the shards' together.
 #[test]
 fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
-    let shards = crate::sessions::SHARDS;
+    let shards = sticky_sessions::SHARDS;
     let store = MemoryStore::new();
     let sessions: &dyn SessionsStore = &store;
     let now = Instant::now();

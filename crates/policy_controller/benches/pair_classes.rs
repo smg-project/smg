@@ -58,14 +58,13 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
-    document::spec::Pairing,
+    document::{AppliedSpec, Pairing, PolicySpec},
+    engine::{Constraints, LoadRow, RequestFacts, Role, Scratch, SignalSource, WireModes},
     store::{
         identity, pairing::Member, Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairClasses, PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         PUBLISH_WINDOW,
     },
-    AppliedSpec, Constraints, LoadRow, PolicySpec, RequestFacts, Role, Scratch, SignalSource,
-    WireModes,
 };
 
 const PREFILLS: usize = 128;

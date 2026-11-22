@@ -7,9 +7,13 @@
 )]
 
 use smg_policy_controller::{
-    document::spec::CostMargin, stages::builtins::score_costs, Candidate, Catalog, Constraints,
-    Engine, Health, Lease, Lifecycle, LoadRow, Pick, PolicySpec, PoolFacts, RequestFacts, Scorer,
-    Scratch, Side, SpecError, Target, TieBand, WorkerId, API_VERSION,
+    document::{CostMargin, PolicySpec, SpecError, API_VERSION},
+    engine::{
+        Candidate, Constraints, Engine, Health, LoadRow, Pick, PoolFacts, RequestFacts, Scorer,
+        Scratch, Target, TieBand, WorkerId,
+    },
+    stages::{score_costs, Catalog},
+    tracking::{Lease, Lifecycle, Side},
 };
 
 fn parse(score: &str, pick: &str) -> Result<PolicySpec, serde_yaml::Error> {

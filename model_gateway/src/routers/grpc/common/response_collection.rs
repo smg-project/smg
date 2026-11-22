@@ -12,6 +12,7 @@ use crate::{
     observability::metrics::metrics_labels,
     routers::{
         common::{
+            attempt_ledger::mark_pending_charge,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
         },
@@ -24,7 +25,9 @@ use crate::{
             },
             utils::{
                 account_pd_side_failure, dead_rendezvous_of, mark_error_reason,
-                stream_failure::UpstreamClass, tonic_ext::TonicStatusExt, DeadRendezvous,
+                stream_failure::UpstreamClass,
+                tonic_ext::{is_the_engines_own_report, TonicStatusExt},
+                DeadRendezvous,
             },
         },
     },
@@ -301,18 +304,23 @@ async fn collect_stream_responses<S: FanoutChild>(
                         "Worker stream error"
                     ),
                 }
+                let mut failure = stream_failed(side, worker_name, &status, rendezvous.as_ref());
                 // The worker's failure counts against it as a streamed
                 // answer's does; the client's status and the router-error
-                // family are the pipeline's.
+                // family are the pipeline's. The breaker's sample is taken by
+                // the dispatch loop through the request's ledger, so a replayed
+                // request charges the worker once. The engine's own report is
+                // replayed on the worker and not charged.
                 if let Some(worker) = stream.worker() {
                     UpstreamClass::account_collected_failure(worker.as_ref(), &status);
+                    if let Some(sample) = status
+                        .breaker_status()
+                        .filter(|_| !is_the_engines_own_report(&status))
+                    {
+                        mark_pending_charge(&mut failure, worker, sample);
+                    }
                 }
-                return Err(stream_failed(
-                    side,
-                    worker_name,
-                    &status,
-                    rendezvous.as_ref(),
-                ));
+                return Err(failure);
             }
         };
         if let ProtoResponseVariant::Complete(complete) = gen_response.into_response() {

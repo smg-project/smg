@@ -26,10 +26,10 @@ use std::{hint::black_box, sync::mpsc, thread, time::Instant};
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
+    engine::{Constraints, PoolFacts, RequestFacts, Scratch},
     service::elector::{
         ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord, MemoryLease, Tick, Written,
     },
-    Constraints, PoolFacts, RequestFacts, Scratch,
 };
 
 /// A holder whose fence is open, as a leader's is. It takes a lease that a

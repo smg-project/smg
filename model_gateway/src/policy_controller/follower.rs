@@ -275,7 +275,7 @@ pub(crate) mod tests {
         x509::X509,
     };
     use smg_policy_controller::{
-        engine::view::WorkerId,
+        engine::WorkerId,
         service::{
             controller::{Config, Controller, Election, Listener, Scope, State, PRINCIPAL_ENTRY},
             proto::{self, policy_controller_client::PolicyControllerClient, worker_event::Event},

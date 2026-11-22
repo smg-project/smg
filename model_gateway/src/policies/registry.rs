@@ -1228,7 +1228,6 @@ impl LoadConsumer for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-    use smg_policy_controller::document::routing_key;
     use smg_worker::{
         identity::basic::{Worker, WorkerLoadGuard, WorkerType},
         load::state::LoadSnapshot,
@@ -3152,7 +3151,7 @@ mod tests {
             &format!("conv_t2_r{padded}"),
         ] {
             assert_eq!(
-                routing_key::strip_lineage(key),
+                smg_policy_controller::document::strip_lineage(key),
                 PolicyRegistry::strip_header_key(key),
                 "{key}"
             );

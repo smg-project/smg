@@ -24,7 +24,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use smg_policy_controller::{predictor::Predictor, WorkerId};
+use smg_policy_controller::{engine::WorkerId, predictor::Predictor};
 
 /// The namespace of every request.
 const SEED: u64 = 0;

@@ -4,8 +4,14 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 
 use crate::{
-    Candidate, Catalog, Constraints, Engine, Filter, Lifecycle, LoadRow, PolicySpec, PoolFacts,
-    Reports, RequestFacts, Scorer, Scratch, TieBand, WorkerId, API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Engine, Filter, LoadRow, PoolFacts, RequestFacts, Scorer, Scratch,
+        TieBand, WorkerId,
+    },
+    load::Reports,
+    stages::Catalog,
+    tracking::Lifecycle,
 };
 
 /// The view's maximum report age in the cases' documents.

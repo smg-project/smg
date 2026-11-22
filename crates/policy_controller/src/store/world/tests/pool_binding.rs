@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 
 use super::{ask, block, facts, pressure, MODEL};
 use crate::{
-    document::spec::{BindingSpec, Match, OverloadSpec},
+    document::{
+        spec::{BindingSpec, Match, OverloadSpec},
+        AppliedSpec, PolicySpec,
+    },
     engine::view::{Phase, Role},
     store::{world::ViewBuffers, LoadSink, LoadSource, MemoryStore, WorkersStore},
-    AppliedSpec, PolicySpec,
 };
 
 /// The judge follows the decision: a pair's decode side runs under the

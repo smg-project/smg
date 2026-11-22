@@ -365,7 +365,7 @@ impl Session {
 /// What the affinity stages read of one candidate: a column beside the rows,
 /// by the candidate's index ([`RequestFacts::affinity`]). A host fills it for
 /// a profile whose stages declare it
-/// ([`Needs::affinity`](crate::Needs::affinity)) and for no other, so a
+/// ([`Needs::affinity`](crate::document::Needs::affinity)) and for no other, so a
 /// decision that reads none of it copies none of it. `Default` is nothing
 /// held by a worker just admitted, which is what every candidate reads as
 /// when the column is empty. On a wire the five are fields of the
@@ -709,7 +709,7 @@ pub struct Candidate {
     pub session_in_flight: u16,
     /// The pairing class: `0` for a worker outside any pairing. Which decode
     /// classes a prefill class pairs with is the pair table's to say
-    /// ([`PairTable`](crate::PairTable)); with no table a decode pairs with a
+    /// ([`PairTable`](crate::engine::PairTable)); with no table a decode pairs with a
     /// prefill of the same class. The store derives the classes and their
     /// table where a membership write moves a member or an offer, and again
     /// under a generation of another pairing mode
@@ -902,7 +902,7 @@ pub struct RequestFacts<'a> {
     /// Time left for the whole decision, relative to the host's receipt; a
     /// plugin's own share of it rides its frame, clamped to at most this.
     /// A host that asks in process states no budget by `0`
-    /// ([`crate::engine::door::Request`]); on the wire a frame's `0` says none is
+    /// ([`crate::engine::Request`]); on the wire a frame's `0` says none is
     /// left.
     pub budget_micros: u32,
     /// Allow-listed headers only.
@@ -954,7 +954,7 @@ pub struct RequestFacts<'a> {
     pub lent_session_in_flight: Option<&'a [KeyedRow]>,
     /// The host holds each row's count of this request's session key, the
     /// count a capped sessions rule asks for
-    /// ([`Needs::session_in_flight`](crate::Needs::session_in_flight)):
+    /// ([`Needs::session_in_flight`](crate::document::Needs::session_in_flight)):
     /// written into the rows ([`Candidate::session_in_flight`]) or lent
     /// beside them ([`RequestFacts::lent_session_in_flight`]). A sessions
     /// rule's in-flight cap reads the count either way. A key kept on its
@@ -969,11 +969,11 @@ pub struct RequestFacts<'a> {
     /// empty column is the host's word that it holds nothing, unless the
     /// host names rows in its place ([`RequestFacts::named`]): it reads as
     /// nothing held for every candidate, under a profile that declared
-    /// [`Needs::affinity`](crate::Needs::affinity) as under one that did
+    /// [`Needs::affinity`](crate::document::Needs::affinity) as under one that did
     /// not, and the engine neither refuses it nor counts it. A host that
     /// owes the column and hands none is routed by its other stages alone,
     /// with no signal. A pair decision takes each side's column from
-    /// its pool ([`PairPools`](crate::PairPools)) and none from here: a
+    /// its pool ([`PairPools`](crate::engine::PairPools)) and none from here: a
     /// non-empty column on the request of a pair decision is refused, as a
     /// column of another length is. The host keeps it readable, as it keeps
     /// the candidates, until the decision is committed. In-process only: a
@@ -997,16 +997,16 @@ pub struct RequestFacts<'a> {
     pub model_fingerprint: ModelFingerprint,
     /// The signal cells beside the rows of this decision, by the row's
     /// position: handed by a host for a profile whose stages read a signal
-    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and for no
+    /// ([`Needs::signal_cells`](crate::document::Needs::signal_cells)), and for no
     /// other. `None` reads as no value for every row. A pair decision takes
-    /// each side's cells from its pool ([`PairPools`](crate::PairPools)),
+    /// each side's cells from its pool ([`PairPools`](crate::engine::PairPools)),
     /// and an encode pair its encoders' from theirs: cells here are not
     /// read there. One word for every signal the document declares: a
     /// second signal adds none. In-process only: the contract's facts gain
     /// nothing.
     pub signal_cells: Option<&'a signals::SignalCells>,
     /// The fingerprint of the request's client key, `0` where it has none
-    /// ([`KeySources::derive_client`](crate::KeySources::derive_client)):
+    /// ([`KeySources::derive_client`](crate::document::KeySources::derive_client)):
     /// what a ring places by where the request carries no session key. It
     /// lifts no overload veto, pins no session and is counted under no key.
     /// The wire's request facts carry it to a controller, and a plugin's
@@ -1219,7 +1219,7 @@ pub struct Constraints<'a> {
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
     /// What the request demands of the worker that takes it
-    /// ([`Demands`](crate::Demands)). A door keeps the demands before any
+    /// ([`Demands`](crate::engine::Demands)). A door keeps the demands before any
     /// stage runs, where it keeps its gateway's wires, and no stage reads
     /// them: an engine handed rows by a host of its own is handed rows
     /// that meet them. A pair's sides keep none yet: a door sheds a
@@ -1227,7 +1227,7 @@ pub struct Constraints<'a> {
     /// whatever its sides state. In-process only: this protocol version
     /// states no demand, and a handle refuses a request that states one
     /// before it sends it over a link (`Handle::asked`).
-    pub demands: crate::Demands,
+    pub demands: crate::engine::Demands,
     /// The rows a standing veto of this host masks, by position, in order,
     /// where the host did not write them into the rows: a view of a
     /// publication's own rows hands them here, and a reader of a row's
@@ -1270,7 +1270,7 @@ pub struct ZoneCapacity {
 /// The engines of a pool, as its host lists them beside the rows: each
 /// engine's rows by position, the ranks of a data-parallel engine together
 /// and in their ranks' order, a single-rank worker alone. A stage that
-/// names the engine as its unit ([`Picker::unit`](crate::Picker::unit))
+/// names the engine as its unit ([`Picker::unit`](crate::engine::Picker::unit))
 /// draws over the list and reads the rows of the engine it takes, so a
 /// decision it makes does not grow with the ranks of the engines it passes
 /// by. Empty where the host lists none: a pool with no engine of several
@@ -1280,7 +1280,7 @@ pub struct ZoneCapacity {
 /// list, in the order of their ids and under a membership epoch
 /// ([`PoolFacts::membership_epoch`]), and numbers the pool
 /// ([`Engines::pool`]). A stage that finds a member's row by its id, with
-/// no pool read whole ([`Scorer::own`](crate::Scorer::own)), takes the
+/// no pool read whole ([`Scorer::own`](crate::engine::Scorer::own)), takes the
 /// list as that word.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Engines<'a> {
@@ -1360,7 +1360,7 @@ pub struct PoolFacts<'a> {
     pub reach: u64,
     /// Whether every row of the pool holds a report. A host says so where
     /// it knows it of the rows it wrote, and a decision reads it once: a
-    /// profile decided by rank ([`Scorer::spread`](crate::Scorer::spread))
+    /// profile decided by rank ([`Scorer::spread`](crate::engine::Scorer::spread))
     /// is asked by rank only where it is on, since the load stage costs a
     /// row without a report from every row that holds one. By rank the
     /// targets are the whole pass's wherever its sums tell the rows in
@@ -1372,7 +1372,7 @@ pub struct PoolFacts<'a> {
     /// decision is the one by rank. A host that says the fact of a pool
     /// that holds a row without a report is answered by what the row
     /// lacks: in front it makes the stage say that it must be asked whole
-    /// ([`Front::Whole`](crate::Front::Whole)), and the decision is the
+    /// ([`Front::Whole`](crate::engine::Front::Whole)), and the decision is the
     /// whole pass's, which paid for its ranks' reading. Behind the rows in
     /// front it is not costed where they decide alone, and the decision is
     /// the one by rank. Where they cannot, their band being wider than the

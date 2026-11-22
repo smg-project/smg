@@ -236,8 +236,8 @@ use std::{
 
 use kv_index::{request_prefix_hashes, ContentHash};
 use smg_policy_controller::{
-    document::spec::ShadowSpec,
-    engine::door::{self, Door},
+    document::{AppliedSpec, PolicySpec, ShadowSpec},
+    engine::{Constraints, Door, LoadRow, PoolFacts, RequestFacts, Role, Scratch, WorkerId},
     service::{
         controller::{Config, Controller, Election, Listener, Scope, State},
         proto::{
@@ -252,12 +252,7 @@ use smg_policy_controller::{
         LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, Picked, Said, Signals,
         StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    tracking::{
-        handle::Handle,
-        lease::{self, TransportClass},
-    },
-    AppliedSpec, Constraints, Lease, LeaseId, LoadRow, PolicySpec, PoolFacts, ReleaseReason,
-    RequestFacts, Role, Scratch, WorkerId,
+    tracking::{Handle, Lease, LeaseId, ReleaseReason, TransportClass},
 };
 use tokio::{
     runtime,
@@ -1304,7 +1299,9 @@ impl Tally {
 /// The bench's gateway as the store keys its leases: by the fingerprint of
 /// the subject its calls state.
 fn gateway() -> GatewayId {
-    GatewayId(smg_policy_controller::fingerprint(GATEWAY.as_bytes()))
+    GatewayId(smg_policy_controller::engine::fingerprint(
+        GATEWAY.as_bytes(),
+    ))
 }
 
 /// What a stream reads of a pick's answer.
@@ -2357,7 +2354,7 @@ fn named(members: u32, mode: &str, decisions: u64) -> u64 {
     let now = Instant::now();
     let ask = |seed: u64| {
         let id = seed.to_le_bytes();
-        let request = door::Request {
+        let request = smg_policy_controller::engine::Request {
             id: &id,
             facts: RequestFacts {
                 model: &name,
@@ -2412,7 +2409,7 @@ const MOVED: &str =
 fn pool_at(door: &Door, probe: u64) -> impl PartialEq + std::fmt::Debug {
     let name = model(0);
     let id = probe.to_le_bytes();
-    let request = door::Request {
+    let request = smg_policy_controller::engine::Request {
         id: &id,
         facts: RequestFacts {
             model: &name,
@@ -2447,7 +2444,7 @@ fn pool_at(door: &Door, probe: u64) -> impl PartialEq + std::fmt::Debug {
 /// released at once, as a host reports one whose client left.
 fn ask_door(door: &Door, name: &str, seed: u64) {
     let id = seed.to_le_bytes();
-    let request = door::Request {
+    let request = smg_policy_controller::engine::Request {
         id: &id,
         facts: RequestFacts {
             model: name,
@@ -2473,7 +2470,7 @@ fn ask_door(door: &Door, name: &str, seed: u64) {
 /// its completion behind it, as a host in process says a served request.
 fn ask_handle(door: &Door, name: &str, seed: u64) {
     let id = seed.to_le_bytes();
-    let request = door::Request {
+    let request = smg_policy_controller::engine::Request {
         id: &id,
         facts: RequestFacts {
             model: name,
@@ -2489,8 +2486,8 @@ fn ask_handle(door: &Door, name: &str, seed: u64) {
         .take(0)
         .expect("a pick over the fleet, with its lease");
     handle.dispatched(now);
-    let outcome = lease::Outcome {
-        side: lease::Side::Single,
+    let outcome = smg_policy_controller::tracking::Outcome {
+        side: smg_policy_controller::tracking::Side::Single,
         served: target.id,
         status: 200,
         class: TransportClass::Ok,

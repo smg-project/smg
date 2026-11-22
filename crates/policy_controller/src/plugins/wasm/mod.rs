@@ -143,7 +143,7 @@
 //! snapshot, before its first stage call. A row that lists none is never
 //! told: no call is made, and a thread that only tells makes no instance. A
 //! row that lists any has its plugin's scorer and picker say they need the
-//! lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]), so a host
+//! lifecycle's calls ([`crate::tracking::Lifecycle::needs_lifecycle`]), so a host
 //! that makes none refuses them.
 //!
 //! What a failure does: a `decline` falls back to the stage's configured

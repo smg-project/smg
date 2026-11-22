@@ -1136,7 +1136,7 @@ impl RouterConfig {
 mod tests {
     use std::collections::HashMap;
 
-    use smg_policy_controller::PolicySpec;
+    use smg_policy_controller::document::PolicySpec;
     use tempfile::tempdir;
 
     use super::*;

@@ -1471,7 +1471,7 @@ mod tests {
                 .view(MODEL, Role::Single, &ask, false, &mut out)
                 .expect("the pool");
             let block = view.signal_cells.expect("the publication's block");
-            let held = |cell: &crate::SignalCell| {
+            let held = |cell: &crate::load::SignalCell| {
                 (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
             };
             let cells = block.cells().chunks(block.signals());

@@ -41,12 +41,12 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
+    document::{PolicySpec, PRESETS},
+    engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, VetoWrite,
         ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    Constraints, Engine, LoadRow, PolicySpec, RequestFacts, Role, Scratch, SignalSource, WorkerId,
-    PRESETS,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

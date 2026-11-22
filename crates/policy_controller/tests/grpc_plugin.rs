@@ -39,6 +39,12 @@ use rcgen::{
 #[cfg(feature = "wasm")]
 use smg_policy_controller::plugins::wasm;
 use smg_policy_controller::{
+    document::Needs,
+    engine::{
+        Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
+        PairPools, Picker, Plan, PoolFacts, Profile, RequestFacts, Scorer, Scratch, ShedReason,
+        Target, Targets, TieBand, Weighted, WorkerId,
+    },
     plugins::{
         grpc::{
             Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
@@ -48,11 +54,8 @@ use smg_policy_controller::{
         shared::OpenDecisions,
     },
     service::proto,
-    stages::builtins::{Best, Healthy, LeastRequests},
-    Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity, Lease,
-    Lifecycle, Membership, Needs, PairPools, Picker, Plan, PoolFacts, Profile, ReleaseReason,
-    RequestFacts, Scorer, Scratch, ShedReason, Side, Signal, Target, Targets, TieBand, Weighted,
-    WorkerId,
+    stages::{Best, Healthy, LeastRequests},
+    tracking::{Lease, Lifecycle, Membership, ReleaseReason, Side, Signal},
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, Gate, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},

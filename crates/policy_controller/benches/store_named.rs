@@ -41,12 +41,13 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash};
 use smg_policy_controller::{
+    document::{AppliedSpec, PolicySpec},
+    engine::{Constraints, LoadRow, Phase, RequestFacts, Role, Scratch, WorkerId},
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, LoadSink, LoadSource,
         MemoryStore, Named, Naming, Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus,
         WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Constraints, LoadRow, Phase, PolicySpec, RequestFacts, Role, Scratch, WorkerId,
 };
 
 const MODEL: &str = "m";

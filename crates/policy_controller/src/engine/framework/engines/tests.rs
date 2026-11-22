@@ -6,7 +6,6 @@ use std::cell::RefCell;
 
 use super::super::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, TieBand, Weighted};
 use crate::{
-    affinity::Gates,
     document::spec::{BoundedLoadParams, Needs},
     engine::{
         decision::{Decision, Lifted, Targets, MAX_TARGETS},
@@ -14,11 +13,15 @@ use crate::{
             fingerprint, Candidate, Constraints, Engines, Health, Identity, PoolFacts,
             RequestFacts, WorkerId,
         },
+        Scratch, DRAW_BOUND,
     },
-    ring::ConsistentHash,
-    stages::builtins::{Best, CountFirst, NotOverloaded, PowerOfTwo, Random, SampledBest},
+    policies::{
+        cache_aware::Gates, consistent_hashing::ConsistentHash, power_of_two::PowerOfTwo,
+        random::Random,
+    },
+    stages::builtins::{Best, CountFirst, NotOverloaded, SampledBest},
     tracking::lease::{Lifecycle, Membership},
-    Draw, Scratch, DRAW_BOUND,
+    Draw,
 };
 
 thread_local! {

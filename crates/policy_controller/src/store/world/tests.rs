@@ -14,10 +14,16 @@ use super::{
     PoolVetoes, StaleGeneration, VetoEnds, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
-    document::spec::{BindingSpec, Match, OverloadSpec, Pairing},
-    engine::view::{
-        fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
-        WireModes, WorkerId,
+    document::{
+        spec::{BindingSpec, Match, OverloadSpec, Pairing},
+        AppliedSpec, PolicySpec,
+    },
+    engine::{
+        view::{
+            fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
+            WireModes, WorkerId,
+        },
+        PairPools, PairTable, Scorer, Scratch, Target,
     },
     stages::builtins::ResidentWork,
     store::{
@@ -29,7 +35,6 @@ use crate::{
         counts::Slot,
         lease::{Lease, Lifecycle, Side},
     },
-    AppliedSpec, PairPools, PairTable, PolicySpec, Scorer, Scratch, Target,
 };
 
 mod encode_classes;

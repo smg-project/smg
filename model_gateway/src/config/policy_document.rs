@@ -66,22 +66,24 @@
 use serde::Serialize;
 use serde_json::Value;
 use smg_policy_controller::{
-    affinity::{
-        Gates, DEFAULT_THRESHOLD, DEFAULT_WARMUP_BLOCKS, DEFAULT_WARMUP_DIVERT_EVERY,
-        DEFAULT_WARMUP_SECS, DEFAULT_WARMUP_SHARE, DEFAULT_WARMUP_THIN_RATIO,
+    document::{
+        AppliedSpec, Assignment, BestWithTemperatureParams, BindingSpec, BoundedLoadParams,
+        BucketParams, ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
+        LeastLoadParams, OverloadSpec, Pairing, PickStage, PolicySpec, PrefixAffinityParams,
+        ProfileSpec, RoutingKeySpec, ScoreSpec, ScoreStage, SessionsSpec, SpecError, SpillParams,
+        WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES, OVERLOAD_TOKEN_USAGE,
+        OVERLOAD_WAITING_REQUESTS,
     },
-    bucket,
-    document::spec::{
-        BestWithTemperatureParams, BindingSpec, BoundedLoadParams, BucketParams,
-        ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
-        LeastLoadParams, OverloadSpec, Pairing, PickStage, PrefixAffinityParams, ProfileSpec,
-        RoutingKeySpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
-        MANUAL_SESSION_HEADER, MAX_KEY_SOURCES, OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
+    engine::Phase,
+    policies::{
+        bucket,
+        cache_aware::{
+            Gates, DEFAULT_THRESHOLD, DEFAULT_WARMUP_BLOCKS, DEFAULT_WARMUP_DIVERT_EVERY,
+            DEFAULT_WARMUP_SECS, DEFAULT_WARMUP_SHARE, DEFAULT_WARMUP_THIN_RATIO,
+        },
+        power_of_two::PowerOfTwoMetric,
     },
-    stages::builtins::{
-        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
-    },
-    AppliedSpec, Assignment, Phase, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
+    stages::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT},
 };
 
 use super::{
@@ -1175,7 +1177,7 @@ fn overload(config: &RouterConfig) -> Result<Option<OverloadSpec>, PolicyDocumen
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use smg_policy_controller::PRESETS;
+    use smg_policy_controller::document::PRESETS;
 
     use super::*;
 

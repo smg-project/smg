@@ -699,7 +699,7 @@ mod tests {
             &elector,
             stood.clone(),
             (Arc::clone(&store), feed),
-            Arc::new(crate::Catalog::builtin()),
+            Arc::new(crate::stages::Catalog::builtin()),
             deciders,
         )
         .expect("the deciders start");

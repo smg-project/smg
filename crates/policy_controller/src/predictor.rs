@@ -34,7 +34,7 @@
 //! its callers' seats, with no error.
 //!
 //! What is kept. A request carries its prefix as one hash a block of its
-//! content ([`RequestFacts::block_hashes`](crate::RequestFacts::block_hashes)).
+//! content ([`RequestFacts::block_hashes`](crate::engine::RequestFacts::block_hashes)).
 //! The predictor names a block by a key folded over the hashes up to it,
 //! so one key names one prefix, and keeps one entry a block: the block
 //! before it, how many blocks follow it, and the workers sent it. The
@@ -335,7 +335,7 @@ impl Predictor {
 
     /// A request's keys into `keys`, one a block: each is the fold of the
     /// hashes up to its block under `seed`, the request's cache namespace
-    /// ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)).
+    /// ([`RequestFacts::namespace_seed`](crate::engine::RequestFacts::namespace_seed)).
     /// The same blocks under another seed are another prefix. `keys` is
     /// cleared and filled, and allocates only while it grows.
     pub fn fold_into(keys: &mut Vec<u64>, seed: u64, hashes: &[u64]) {

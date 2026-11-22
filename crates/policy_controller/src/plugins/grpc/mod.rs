@@ -84,7 +84,7 @@
 //! ([`GrpcPluginSpec::observes`]), none by default. A row that lists none is
 //! told nothing and has no `Observe` stream. A row that lists any has its
 //! plugin's scorer and picker say they need the lifecycle's calls
-//! ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
+//! ([`crate::tracking::Lifecycle::needs_lifecycle`]), so a host that makes none
 //! refuses them. One `Observe` stream per such plugin, opened once a
 //! `Decide` stream has settled, carries the events it hears (among issued,
 //! dispatched, completed, released, membership, signals) in order, each

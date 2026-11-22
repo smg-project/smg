@@ -33,9 +33,9 @@ use super::{
 use crate::{
     engine::{
         decision::{Decision, Lifted, Pick, Targets, Trace},
+        sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
     },
-    sessions::SessionVerdict,
     stages::builtins::{Best, Healthy, LeastRequests, NotOverloaded},
 };
 
@@ -576,14 +576,14 @@ mod tests {
                 tests::Stored, Binding, DecisionScope, Engine, Filter, Marks, PairPools, Picker,
                 Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_FROM, WRITTEN_ROWS,
             },
+            sticky_sessions::{SessionRule, SessionVerdict},
             view::{
                 Candidate, Constraints, Engines, Health, Identity, NamedAffinity, NamedHolder,
                 Phase, PoolFacts, RequestFacts, WorkerId,
             },
         },
-        ring::ConsistentHash,
-        sessions::{SessionRule, SessionVerdict},
-        stages::builtins::{Best, Healthy, Manual, NotOverloaded},
+        policies::{consistent_hashing::ConsistentHash, manual::Manual},
+        stages::builtins::{Best, Healthy, NotOverloaded},
         tracking::{
             counts::tests::Lent,
             lease::{Lease, Lifecycle, Side},

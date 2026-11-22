@@ -684,6 +684,7 @@ mod tests {
     use super::{bind, color_for, set, truthy, Cli, SpecSource};
     use crate::{
         document::spec::SpecError,
+        engine::{Candidate, Constraints, Filter, RequestFacts},
         service::{
             controller::{
                 membership::tests::Logged, spec_store::SpecStore, Config, ConfigError, Controller,
@@ -692,7 +693,6 @@ mod tests {
             elector::ElectionSettings,
         },
         stages::catalog::Catalog,
-        Candidate, Constraints, Filter, RequestFacts,
     };
 
     /// A spec source for a command line that names none: a start names one,
@@ -1299,13 +1299,13 @@ mod tests {
     #[derive(Debug)]
     struct Level(bool);
 
-    impl crate::Lifecycle for Level {
+    impl crate::tracking::Lifecycle for Level {
         fn needs_lifecycle(&self) -> bool {
             self.0
         }
     }
 
-    impl crate::Scorer for Level {
+    impl crate::engine::Scorer for Level {
         fn name(&self) -> &'static str {
             "level"
         }
@@ -1316,9 +1316,9 @@ mod tests {
             _: &[Candidate],
             _: &[u32],
             out: &mut [f32],
-        ) -> crate::TieBand {
+        ) -> crate::engine::TieBand {
             out.fill(1.0);
-            crate::TieBand::NORMALIZED
+            crate::engine::TieBand::NORMALIZED
         }
     }
 

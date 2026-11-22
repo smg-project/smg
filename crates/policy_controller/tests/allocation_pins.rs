@@ -25,15 +25,17 @@ use std::{
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
-    engine::door::{Door, Request},
+    document::{AppliedSpec, PolicySpec, PRESETS},
+    engine::{
+        AffinityFacts, Candidate, Constraints, Door, Engine, Health, LoadRow, NamedAffinity,
+        NamedHolder, PairPools, PoolFacts, Request, RequestFacts, Role, Scratch, SignalSource,
+        Target, WireModes, WorkerId,
+    },
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    tracking::handle::Handle,
-    AffinityFacts, AppliedSpec, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
-    NamedAffinity, NamedHolder, Outcome, PairPools, PolicySpec, PoolFacts, RequestFacts, Role,
-    Scratch, Side, SignalSource, Target, TransportClass, WireModes, WorkerId, PRESETS,
+    tracking::{Handle, Lease, Lifecycle, Outcome, Side, TransportClass},
 };
 
 #[global_allocator]
@@ -519,7 +521,7 @@ fn a_pair_decision_under_a_table_allocates_nothing_after_the_first() {
         let pools = PairPools {
             prefills: &prefills,
             decodes,
-            table: smg_policy_controller::PairTable::new(&ends, &classes),
+            table: smg_policy_controller::engine::PairTable::new(&ends, &classes),
             ..PairPools::default()
         };
         allocations_during(|| {

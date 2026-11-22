@@ -7,8 +7,8 @@ use smg_policy_controller::{
         snapshot::{told, Asked, Rows},
         Applied, Format, SpecDoor, SpecRejected, Unanswered, MAX_DOCUMENT_BYTES,
     },
+    stages::Catalog,
     store::{MemoryStore, StaleGeneration, WorkerFacts, WorkersStore},
-    Catalog,
 };
 
 const START: &[u8] = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}}}"#;

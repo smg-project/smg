@@ -2823,16 +2823,16 @@ mod tests {
             slots: u32,
         }
 
-        impl crate::Filter for MinFree {
+        impl crate::engine::Filter for MinFree {
             fn name(&self) -> &'static str {
                 "min-free"
             }
 
             fn keep(
                 &self,
-                _: &crate::RequestFacts<'_>,
-                candidate: &crate::Candidate,
-                _: &crate::Constraints<'_>,
+                _: &crate::engine::RequestFacts<'_>,
+                candidate: &crate::engine::Candidate,
+                _: &crate::engine::Constraints<'_>,
             ) -> bool {
                 candidate.in_flight.saturating_add(self.slots) <= 8
             }
@@ -2844,7 +2844,11 @@ mod tests {
             .filter_with("min-free", |build| {
                 let rule: MinFree = build.params()?;
                 if rule.slots == 0 {
-                    return Err(crate::StageError::bad("slots", rule.slots, "above zero"));
+                    return Err(crate::stages::StageError::bad(
+                        "slots",
+                        rule.slots,
+                        "above zero",
+                    ));
                 }
                 Ok(Box::new(rule))
             })

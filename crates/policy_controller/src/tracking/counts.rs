@@ -239,7 +239,7 @@ impl Counts {
 /// What the leases on file book on each row of a pool, lent to a decision
 /// beside rows that carry no count: the table and the pool's slots, a
 /// row's count found by the row's position
-/// ([`RequestFacts::in_flight`](crate::RequestFacts::in_flight)). A
+/// ([`RequestFacts::in_flight`](crate::engine::RequestFacts::in_flight)). A
 /// decision reads one count a row: the row's first read is the table's
 /// count at that call, kept in the decision's own cells, and every later
 /// read of that row returns it, whatever is booked meanwhile. A row no
@@ -284,7 +284,7 @@ impl<'a> LentCounts<'a> {
 /// field, beside a lent table it asks the table's [`LentRun`]. The
 /// request's facts are asked which once a walk, so no read tests it and
 /// the lent table's parts are found once. A walk reads what the one reader
-/// reads ([`RequestFacts::in_flight`](crate::RequestFacts::in_flight)),
+/// reads ([`RequestFacts::in_flight`](crate::engine::RequestFacts::in_flight)),
 /// and a stage that reads a row or two asks that. The form
 /// `|counts, written|` also binds `written`: true over rows that carry
 /// their counts, false beside a lent table.

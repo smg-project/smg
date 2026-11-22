@@ -1,6 +1,6 @@
 //! The formats: how each model family writes reasoning and tool calls, each a [`Format`] table
 //! the [`Engine`] runs. One module per table, named after the family that writes it; the README's
-//! models table, written by `tests/readme.rs` from the registry, lists every checkpoint each table
+//! models table, held to the registry by `tests/readme.rs`, lists every checkpoint each table
 //! reads, and `docs/tables.md` holds the notes on each table: what its template writes, what the
 //! table decides beyond the others, and what it leaves open.
 //!

@@ -25,8 +25,11 @@ use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
 use smg_policy_controller::{
-    Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, PolicySpec, PoolFacts,
-    PowerOfTwoMetric, RequestFacts, Scratch, Side, Target,
+    document::PolicySpec,
+    engine::{Candidate, Constraints, Engine, PoolFacts, RequestFacts, Scratch, Target},
+    policies::power_of_two::PowerOfTwoMetric,
+    stages::Catalog,
+    tracking::{Lease, Lifecycle, Side},
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

@@ -46,11 +46,11 @@ use std::{hint::black_box, time::Instant};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use smg_policy_controller::{
+    engine::{Role, WireModes},
     store::{
         encoding::EncodeMember, Ask, EncodeClasses, EncodeHandoff, EncodeOffer, EncodePairBuffers,
         GatewayId, MemoryStore, PairBuffers, WorkerFacts, WorkersStore,
     },
-    Role, WireModes,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];

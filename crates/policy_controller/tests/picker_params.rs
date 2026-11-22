@@ -1,9 +1,13 @@
 //! A document supplies the parameters of a picker registered by its host.
 
 use smg_policy_controller::{
-    stages::builtins::Best, Candidate, Catalog, Constraints, Health, Lifecycle, Picker, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, StageBuild, StageError, Targets, TieBand, WorkerId,
-    API_VERSION,
+    document::{PolicySpec, API_VERSION},
+    engine::{
+        Candidate, Constraints, Health, Picker, PoolFacts, RequestFacts, Scratch, Targets, TieBand,
+        WorkerId,
+    },
+    stages::{Best, Catalog, StageBuild, StageError},
+    tracking::Lifecycle,
 };
 
 /// Passes over the first `rows` of the workers the filters left and picks

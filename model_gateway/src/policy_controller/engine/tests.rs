@@ -34,22 +34,22 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::spec::{KeySourceSpec, Pairing, RoutingKeySpec},
-    engine::{
-        decision::{Decision, Shed, ShedReason, Trace},
-        door::Refused,
-        view::{
-            fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
-            WireModes, WorkerId,
-        },
+    document::{
+        AppliedSpec, DerivedKey, KeySource, KeySourceSpec, Pairing, PolicySpec, RoutingKeySpec,
     },
+    engine::{
+        fingerprint, Candidate, Decision, Identity, LoadRow, MediaCounts, Phase, Picker, Refused,
+        RequestFacts, Role, Shed, ShedReason, Target, Targets, TieBand, Trace, WireModes, WorkerId,
+    },
+    stages::Catalog,
     store::{
         Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
         LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
         WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Catalog, DerivedKey, KeySource, Lease, LeaseId, Lifecycle, Membership, Outcome,
-    Picker, PolicySpec, ReleaseReason, Side, Target, Targets, TieBand, TransportClass,
+    tracking::{
+        Lease, LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass,
+    },
 };
 use smg_worker::{
     health::circuit_breaker::CircuitBreakerConfig,

@@ -15,19 +15,18 @@ mod held {
 
     use super::super::{ask, load, member, MODEL};
     use crate::{
-        document::spec::BindingSpec,
+        document::{spec::BindingSpec, AppliedSpec, PolicySpec},
         engine::{
             decision::Targets,
             framework::{Picker, Scorer, TieBand},
             view::{Candidate, RequestFacts, Role, WorkerId},
         },
-        stages::builtins::target_of,
+        stages::{builtins::target_of, Catalog},
         store::{world::ViewBuffers, Kinds, LoadSink, LoadSource, MemoryStore},
         tracking::{
             counts::Slot,
             lease::{Lifecycle, Signal},
         },
-        AppliedSpec, Catalog, PolicySpec,
     };
 
     /// One word a stage took: the worker, the requests its report says

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use smg_policy_controller::{
     store::{GatewayId, LeasesStore},
-    tracking::lease::TransportClass,
+    tracking::TransportClass,
 };
 
 use super::super::HarmonyStreamingProcessor;

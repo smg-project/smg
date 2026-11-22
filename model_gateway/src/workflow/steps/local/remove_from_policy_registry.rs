@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::future::join_all;
 use tokio::sync::Semaphore;
 use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -72,9 +73,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             workers_to_remove.len()
         );
 
-        for worker in workers_to_remove {
-            forget_cache_events(app_context, worker.url()).await;
+        // The batch's KV cleanups start together: the monitor's own bound on
+        // index purges decides how many run at once.
+        join_all(
+            workers_to_remove
+                .iter()
+                .map(|worker| forget_cache_events(app_context, worker.url())),
+        )
+        .await;
 
+        for worker in workers_to_remove {
             // Drop the state the policies keep on the worker (a load-aware
             // policy's dispatch tally) so it does not leak under churn.
             app_context

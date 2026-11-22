@@ -269,8 +269,11 @@ pub(crate) mod tests {
         engine::{
             decision::{Pair, Target, Targets},
             framework::{Picker, TieBand},
+            sticky_sessions::{SessionRule, SessionVerdict},
             view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
+            Constraints, PoolFacts, Scratch,
         },
+        policies::random::Random,
         service::{
             controller::gateways::tests::lease,
             proto::{
@@ -279,8 +282,7 @@ pub(crate) mod tests {
                 released::{Reason, What},
             },
         },
-        sessions::{SessionRule, SessionVerdict},
-        stages::{builtins::Random, catalog::Catalog},
+        stages::catalog::Catalog,
         store::{
             DecodeSide, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
             MemoryStore, Picked, SessionsStore, WorkerFacts, WorkersStore,
@@ -288,7 +290,6 @@ pub(crate) mod tests {
         tracking::lease::{
             Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass,
         },
-        Constraints, PoolFacts, Scratch,
     };
 
     const A: GatewayId = GatewayId(11);

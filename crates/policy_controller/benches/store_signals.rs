@@ -30,12 +30,13 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
+    document::{AppliedSpec, PolicySpec, API_VERSION},
+    engine::{Constraints, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
+    stages::Catalog,
     store::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, SignalSink, Taken, ViewBuffers,
         WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, Catalog, Constraints, LoadRow, PolicySpec, RequestFacts, Role, Scratch,
-    SignalSource, WorkerId, API_VERSION,
 };
 
 use crate::reads_two::ReadsTwo;
