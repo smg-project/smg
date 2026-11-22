@@ -929,7 +929,7 @@ fn long_media_text_changes_no_string_format_value() {
             name: None,
         }]
     };
-    let long = format!("data:image/jpeg;base64,{}", "A".repeat(64 << 10));
+    let long = format!("data:image/jpeg;base64,{}", "A".repeat(MEDIA_TEXT_LEFT_OUT));
     let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
     for order in [MediaPartOrder::MediaFirst, MediaPartOrder::Authored] {
         let value = |url: &str| {
