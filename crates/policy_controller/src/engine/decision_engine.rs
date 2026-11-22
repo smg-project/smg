@@ -218,6 +218,19 @@ pub struct PromptLent<'a> {
 }
 
 #[cfg(feature = "in-process")]
+impl<'a> PromptLent<'a> {
+    /// A prompt of `tokens` under the request's cache partition, with no
+    /// text. A host that reads a text names it over this one.
+    pub const fn of(tokens: Option<&'a [u32]>, namespace: Option<CacheNamespace>) -> Self {
+        Self {
+            tokens,
+            text: None,
+            namespace,
+        }
+    }
+}
+
+#[cfg(feature = "in-process")]
 impl fmt::Debug for PromptLent<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PromptLent")

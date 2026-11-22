@@ -553,7 +553,8 @@ fn a_maker_lends_the_prompt_its_ask_states() {
 
     let printed = format!("{stated:?}");
     assert!(
-        printed.contains("Prompt { tokens: Some(3), text_bytes: Some(23), partitioned: false }"),
+        printed
+            .contains("PromptLent { tokens: Some(3), text_bytes: Some(23), partitioned: false }"),
         "{printed}"
     );
     assert!(!printed.contains("own words"), "{printed}");

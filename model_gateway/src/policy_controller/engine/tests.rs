@@ -56,7 +56,9 @@ use smg_worker::{
 };
 
 use super::{
-    elapsed_micros, left_no_worker, mark, profile_of,
+    elapsed_micros,
+    hashes::StoreHashes as _,
+    left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, record_bed, store_blocks, MODEL},
     transport_class, Ask, End, Held, Placed, PolicyEngine, Prompt, Sent, Unplaced, GATEWAY,
     NO_STAGE,
