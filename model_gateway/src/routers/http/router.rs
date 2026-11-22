@@ -4163,13 +4163,18 @@ mod tests {
     }
 
     /// The request's own timeout running out while the body is read is the
-    /// request's end: the same 504 as before the head, and as final.
+    /// request's end: the same 504 as before the head, and as final. The
+    /// timeout also covers the connect and the head, which run on the wall
+    /// clock, so it is wide; the clock is paused once the head is in, and
+    /// the read runs the timeout out with no wait.
     #[tokio::test]
     async fn read_worker_body_capped_ends_the_request_at_its_timeout() {
         let url = spawn_stalled_stream_stub("/body", "application/json", &["{\"partial\":"]).await;
-        let client = client_with_timeout(Duration::from_millis(200));
+        let client = client_with_timeout(Duration::from_secs(30));
+        let body = worker_body(&client, &url).await;
+        tokio::time::pause();
 
-        let response = Router::read_worker_body_capped(worker_body(&client, &url).await, 1 << 20)
+        let response = Router::read_worker_body_capped(body, 1 << 20)
             .await
             .unwrap_err();
 
