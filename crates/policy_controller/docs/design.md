@@ -1159,6 +1159,11 @@ Its data is one in-memory store (`store/memory.rs`):
 | cache index | a follower of each worker's cache events | an index of the store's own; `PushKvEvents` is not served |
 | sessions, leases | decisions | not replicated to a standby |
 
+The worker host lends the cache index to the engine over worker lists **[built, not yet
+called]**, through the two traits that engine reads an index by (section 4.5; `KvFeed::indexes`,
+read by `worker_host/kv_read.rs`). No second index is kept and no stream is read twice. One
+index stands for each model a worker lists first. Nothing hands it to that engine yet.
+
 The gRPC service (`crates/policy_controller/contracts/policy_controller.proto`):
 
 | Call | For | On main |

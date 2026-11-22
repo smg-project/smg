@@ -32,7 +32,11 @@ use tokio::{
     task::{JoinError, JoinSet},
 };
 
+#[cfg(feature = "in-process")]
+use super::kv_read::EventIndexes;
 use super::{KvHost, Objects};
+#[cfg(feature = "in-process")]
+use crate::engine::CacheIndexes;
 use crate::{
     engine::{view::WireModes, Engine},
     store::{index::indexed_under, snapshot::phase_of, MemoryStore, WorkerFacts, WorkersStore},
@@ -79,6 +83,20 @@ impl<G: Generation> KvFeed<G> {
     pub fn set_load_sink(&self, monitor: &Arc<WorkerMonitor<G>>) {
         self.collector.set_load_sink(monitor);
         let _ = self.loads.set(Arc::downgrade(monitor));
+    }
+
+    /// The store's indexes of cache events as an engine that decides over
+    /// its host's lists reads them: the index this feed's streams write,
+    /// lent, with no second copy of a block. A host hands them to that
+    /// engine once, at its start
+    /// ([`Affinity::set_indexes`](crate::engine::Affinity::set_indexes)).
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub fn indexes(&self) -> Arc<dyn CacheIndexes> {
+        Arc::new(EventIndexes::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.objects),
+        ))
     }
 
     /// The collector, for the stock controller's cases of the follow.

@@ -1799,6 +1799,87 @@ impl Index {
     }
 }
 
+/// One model's index, lent to a reader that keeps tables of its own: the
+/// engine over worker lists, through its host's worker objects
+/// ([`KvFeed::indexes`](crate::worker_host::KvFeed::indexes)). The chain is
+/// the one the lanes write, and nothing of it is copied.
+///
+/// Such a reader maps an index id to a worker of its list once a table,
+/// and an id is free for the next row once its row leaves. So the lending
+/// keeps the count of takes it was made at, read under the table's lock,
+/// where every take is said ([`Index::take`]). An id it hands out
+/// ([`Self::number_of`]) stood for its row at that count, and its lookup
+/// ([`Self::deepest_into`]) drops a holder whose id was taken since, behind
+/// the fence the store's own naming runs ([`PoolIndex::name`]): a block
+/// read under an id is its row's while the id's count stands. Its count of
+/// an id's blocks ([`Self::blocks`]) reads none under such an id. Where a
+/// holder is dropped the lookup is not made again: that one decision names
+/// fewer holders, and the reader's next table stands on a new lending.
+#[cfg(all(feature = "worker-host", feature = "in-process"))]
+pub(crate) struct LentIndex {
+    tables: Arc<KvTables>,
+    index: Arc<Index>,
+    /// The index's count of takes when this was made ([`Index::taken`]).
+    whole_at: u64,
+}
+
+#[cfg(all(feature = "worker-host", feature = "in-process"))]
+impl LentIndex {
+    /// The id of `row` in this index. `None` for a row with no lane, for
+    /// one whose lane writes another index (another model's, or this
+    /// model's made again behind its last lane), and for one that took its
+    /// id behind this lending.
+    pub(crate) fn number_of(&self, row: WorkerId) -> Option<u32> {
+        let table = self.tables.table.lock();
+        let entry = table.lanes.get(&row)?;
+        // The index the row's lane writes, by the lane's own model: this
+        // one, or it is another model's or one made behind this lending.
+        let held = table.indexes.get(&entry.model)?;
+        let own = Arc::ptr_eq(&held.index, &self.index)
+            && !self.index.taken_since(entry.worker, self.whole_at);
+        own.then_some(entry.worker)
+    }
+
+    /// Whether no row holds a block in the index.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.index.chain.is_empty()
+    }
+
+    /// How many blocks the index holds under `id` for the row that held it
+    /// when this lending was made: none where the id was taken since.
+    pub(crate) fn blocks(&self, id: u32) -> usize {
+        let blocks = self.index.chain.worker_block_count(id);
+        // As the lookup: the count before the fence, the ask after.
+        fence(Ordering::Acquire);
+        if self.index.taken_since(id, self.whole_at) {
+            return 0;
+        }
+        blocks
+    }
+
+    /// The deepest holders of `block_hashes` among the ids `within` names,
+    /// at most `cap`, into `kept` with their depths, the depth the cap cuts
+    /// drawn by `below` ([`ChainIndex::deepest_into`]): less each holder
+    /// whose id was taken since this lending was made.
+    pub(crate) fn deepest_into(
+        &self,
+        block_hashes: &[u64],
+        within: &[u64],
+        cap: usize,
+        below: &mut dyn FnMut(u32) -> u32,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
+        let index = &*self.index;
+        index
+            .chain
+            .deepest_into(block_hashes, |hash| *hash, within, cap, below, kept);
+        // As in the store's own naming: the lookup before the fence, the
+        // asks after.
+        fence(Ordering::Acquire);
+        kept.retain(|&(id, _)| !index.taken_since(id, self.whole_at));
+    }
+}
+
 /// One model's index, and how many lanes write it.
 struct ModelIndex {
     index: Arc<Index>,
@@ -1964,6 +2045,23 @@ impl KvTables {
             },
         );
         Some(worker)
+    }
+
+    /// The index of `model`, lent to a reader that keeps tables of its own
+    /// ([`LentIndex`]), with its count of takes of this instant, read under
+    /// the table's lock. `None` where the store holds no index of the
+    /// model: one is made with a model's first lane and goes behind its
+    /// last ([`Self::forget`]).
+    #[cfg(all(feature = "worker-host", feature = "in-process"))]
+    pub(super) fn lend(self: &Arc<Self>, model: &str) -> Option<LentIndex> {
+        let table = self.table.lock();
+        let index = Arc::clone(&table.indexes.get(model)?.index);
+        let whole_at = index.taken();
+        Some(LentIndex {
+            tables: Arc::clone(self),
+            index,
+            whole_at,
+        })
     }
 
     /// Where the pool of `rows` serving `model` stands in the model's index

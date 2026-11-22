@@ -1658,6 +1658,15 @@ impl MemoryStore {
         self.kv.counts(id, rank)
     }
 
+    /// The index of cache events of `model`, lent to the engine over worker
+    /// lists as its lanes write it ([`LentIndex`](super::index::LentIndex)).
+    /// `None` where the store holds no index of the model: one is made
+    /// with the first row indexed under the model and goes behind the last.
+    #[cfg(all(feature = "worker-host", feature = "in-process"))]
+    pub(crate) fn lend_index(&self, model: &str) -> Option<super::index::LentIndex> {
+        self.kv.lend(model)
+    }
+
     /// Rows that ask for events and hold no lane. Each was written while
     /// its model's index stood at its ceiling
     /// ([`INDEX_WORKERS`](crate::store::INDEX_WORKERS)): it holds nothing

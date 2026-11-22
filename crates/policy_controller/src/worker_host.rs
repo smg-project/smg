@@ -92,6 +92,10 @@
 //! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
 //! The module `kv` names the decode's limits.
 //!
+//! `KvFeed::indexes` lends the store's index to an engine that decides over
+//! its host's lists, through that engine's own traits: the index the streams
+//! write, with no second copy. In-process only.
+//!
 //! # The door
 //!
 //! The host hands out a [`MembershipWriter`] door. A host without election uses
@@ -121,6 +125,8 @@ mod found;
 mod health;
 mod kv;
 mod kv_feed;
+#[cfg(feature = "in-process")]
+mod kv_read;
 mod lead;
 mod loads;
 mod members;

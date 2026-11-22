@@ -92,8 +92,11 @@ fn below(draw: &mut Draw, under: u32) -> u32 {
 /// reads of it. A gateway implements it for the index its workers' event
 /// streams write.
 pub trait CacheIndex: Send + Sync {
-    /// The index's own number of the worker at `address`. `None` while no
-    /// stream of the worker's cache events was opened into the index.
+    /// The index's own number of the worker at `address`. `None` while the
+    /// index holds no number for the worker. A host may number a worker
+    /// ahead of its stream of cache events: the index holds no block of it
+    /// until the stream writes, and the record of sent prefixes speaks for
+    /// a worker with no block.
     fn worker_number(&self, address: &str) -> Option<u32>;
 
     /// How many blocks the index holds for the worker of `number`.
