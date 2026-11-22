@@ -81,7 +81,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
     policies::PolicyRegistry,
-    policy_controller::engine::{Placed, PolicyEngine},
+    policy_controller::engine::PolicyEngine,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
@@ -601,12 +601,7 @@ impl RequestPipeline {
         )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
-            acquire_clients(
-                workers,
-                &ctx.input.model_id,
-                self.rechecks_overload(ctx.state.placed.as_ref()),
-            )
-            .await
+            acquire_clients(workers, &ctx.input.model_id, self.rechecks_overload()).await
         )?);
         if let Some(encode) = &stages.encode {
             step!(encode.name(), encode.execute(ctx).await)?;
@@ -618,14 +613,15 @@ impl RequestPipeline {
     }
 
     /// Whether client acquisition re-checks the chosen workers' overload
-    /// flag: under `--worker-overload-shed`, for a selection the classic
-    /// policies made. A placement the policy engine made is not
+    /// flag: under `--worker-overload-shed`, for a selection the gateway
+    /// made in its own process, by the classic policies or by the policy
+    /// engine. A placement of a controller the gateway follows is not
     /// re-checked. There the overload veto is the controller's, read from
     /// its rows, and the flag on the object mirrors it for the gateway's
     /// other readers: a worker flagged under another pool's thresholds
     /// still takes the send the controller decided.
-    fn rechecks_overload(&self, placed: Option<&Placed>) -> bool {
-        placed.is_none() && self.worker_registry.overload_shed_enabled()
+    fn rechecks_overload(&self) -> bool {
+        !self.stages.worker_selection.waits() && self.worker_registry.overload_shed_enabled()
     }
 
     /// One dispatch attempt: (re-)selection for retries, plan stamping,
@@ -654,14 +650,8 @@ impl RequestPipeline {
                 .reselect(dctx, plan.as_ref().ok_or_else(consumed)?)
                 .await?;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
-            dctx.clients = Some(
-                acquire_clients(
-                    workers,
-                    &dctx.model_id,
-                    self.rechecks_overload(dctx.placed.as_ref()),
-                )
-                .await?,
-            );
+            dctx.clients =
+                Some(acquire_clients(workers, &dctx.model_id, self.rechecks_overload()).await?);
             let retained = plan.as_mut().ok_or_else(consumed)?;
             helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
             // The new workers' window, for the stop reason of a `length` finish.
@@ -780,7 +770,8 @@ impl RequestPipeline {
             // the dispatch phase has no field that could carry it. The built
             // plan's wire size stands in for the released buffers.
             let model_id = ctx.input.model_id.clone();
-            let mut dctx = match ctx.into_dispatch() {
+            // The ledger of the request's attempts reads who places them.
+            let mut dctx = match ctx.into_dispatch(self.stages.worker_selection.waits()) {
                 Ok(dctx) => dctx,
                 Err(response) => {
                     self.record_error(metrics_endpoint, &model_id, &response);

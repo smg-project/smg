@@ -541,21 +541,16 @@ impl Bed {
         let alike =
             |worker: &dyn Worker| decided_on.is_none_or(|decoding| decoding.decides_alike(worker));
         let admits: Option<CandidateFilter<'_>> = decided_on.is_some().then_some(&alike);
+        let inputs = PlacementInputs {
+            candidate_filter: admits,
+            ..Default::default()
+        };
         let mut placed = BTreeSet::new();
         for _ in 0..ROUNDS * self.workers.len().max(1) {
-            let Some(worker) = self.stage.select_regular(
-                MODEL,
-                context,
-                media,
-                admits,
-                None,
-                None,
-                None,
-                None,
-                None,
-                wire,
-                &[],
-            ) else {
+            let selected = self
+                .stage
+                .select_regular(MODEL, context, media, wire, &inputs);
+            let Ok(worker) = selected.map(Placed::into_worker) else {
                 assert!(placed.is_empty(), "a request placed once is placed again");
                 let refusal = self
                     .stage

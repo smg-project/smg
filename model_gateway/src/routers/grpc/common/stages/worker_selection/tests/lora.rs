@@ -80,7 +80,7 @@ async fn lora_initial_pd_and_epd_selection_cannot_choose_a_base_model_pair() {
                     }
                     WorkerSelection::Single { .. } => panic!("expected disaggregated selection"),
                 }
-                let mut dispatch = Box::new(ctx).into_dispatch().unwrap();
+                let mut dispatch = Box::new(ctx).into_dispatch(stage.waits()).unwrap();
                 stage
                     .reselect(&mut dispatch, &retained_plan(&[1, 2, 3]))
                     .await
@@ -182,7 +182,7 @@ async fn lora_initial_selection_and_retry_stay_on_sglang_in_a_mixed_pool() {
             WorkerSelection::Single { worker } => assert_eq!(worker.metadata().spec.runtime_type, RuntimeType::Sglang),
             WorkerSelection::Disaggregated { .. } => panic!("expected regular selection"),
         }
-        let mut dispatch = Box::new(ctx).into_dispatch().unwrap();
+        let mut dispatch = Box::new(ctx).into_dispatch(stage.waits()).unwrap();
         assert_eq!(dispatch.dispatch_model,
             if openai { format!("test-model:{selector}") } else { "test-model".to_string() });
         assert_eq!(dispatch.wire.runtime, RuntimeType::Sglang);

@@ -1,7 +1,9 @@
 //! Regular selection and re-selection where the policy engine of this
-//! process decides. A demand of the request narrows the workers the engine
-//! decides over, as it narrows the candidates of the selection with no
-//! policy engine, and no shape of request is refused.
+//! process decides. The stage makes the one placing call it makes with no
+//! policy engine: a demand of the request narrows the workers the engine
+//! decides over, as it narrows the candidates of a classic policy, no shape
+//! of request is refused, and a request nobody takes reads the stage's own
+//! answer.
 
 use axum::body::to_bytes;
 use openai_protocol::worker::WorkerStatus;
@@ -12,6 +14,7 @@ use smg_policy_controller::{
 };
 
 use super::*;
+use crate::config::RouterConfig;
 
 const MODEL: &str = "test-model";
 const WINDOW: u32 = 16;
@@ -34,9 +37,9 @@ fn classic_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> Worker
     )
 }
 
-/// The same stage over the round robin engine of this process. Its attempts
-/// ask that engine, and the policy registry only says what the model's own
-/// policy keeps of a request.
+/// The same stage over the round robin engine of this process, which
+/// places its attempts. The policy registry answers what the stage asks of
+/// it outside a placement, and places nothing.
 fn own_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> WorkerSelectionStage {
     own_stage_under("round_robin", registry, policy)
 }
@@ -154,7 +157,8 @@ fn single(workers: Option<&WorkerSelection>) -> &Arc<dyn Worker> {
 async fn retried(stage: &WorkerSelectionStage, ctx: &mut DispatchContext) -> Arc<dyn Worker> {
     let reselected = stage.reselect(ctx, &retained_plan(&[1, 2, 3])).await;
     reselected.expect("a worker for the retry");
-    assert!(ctx.placed.is_some(), "the engine placed the retry");
+    // A round robin place owes its engine nothing: its worker alone is kept.
+    assert!(ctx.placed.is_none(), "nothing is owed of the placement");
     Arc::clone(single(ctx.workers.as_ref()))
 }
 
@@ -186,7 +190,10 @@ async fn a_context_demand_narrows_the_workers_the_engine_decides_over() {
     for _ in 0..PLACEMENTS {
         let mut ctx = prompt_of(&registry, WINDOW as usize + 1);
         stage.execute(&mut ctx).await.expect("a window holds it");
-        assert!(ctx.state.placed.is_some(), "the engine placed it");
+        assert!(
+            ctx.state.placed.is_none(),
+            "nothing is owed of the placement"
+        );
         assert!(Arc::ptr_eq(single(ctx.state.workers.as_ref()), &large));
     }
     let mut turns = [0; 2];
@@ -255,7 +262,10 @@ async fn a_media_input_narrows_the_workers_the_engine_decides_over() {
         let mut ctx = prompt_of(&registry, 3);
         ctx.state.multimodal_intermediate = Some(image_intermediate(None));
         stage.execute(&mut ctx).await.expect("a vision encoder");
-        assert!(ctx.state.placed.is_some(), "the engine placed it");
+        assert!(
+            ctx.state.placed.is_none(),
+            "nothing is owed of the placement"
+        );
         assert!(Arc::ptr_eq(single(ctx.state.workers.as_ref()), &sees));
     }
 
@@ -330,7 +340,10 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
     for _ in 0..PLACEMENTS {
         let mut ctx = naming(&registry, "1");
         stage.execute(&mut ctx).await.expect("the worker it names");
-        assert!(ctx.state.placed.is_some(), "the engine placed it");
+        assert!(
+            ctx.state.placed.is_none(),
+            "nothing is owed of the placement"
+        );
         // The second of the two workers that are available.
         assert!(Arc::ptr_eq(single(ctx.state.workers.as_ref()), &workers[2]));
         let mut ctx = naming(&registry, "1");
@@ -430,4 +443,191 @@ async fn a_conversation_with_no_token_ids_goes_back_to_its_worker() {
         others.push(placed(&stage, &workers, asking_by_text(&registry, &prompt)).await);
     }
     assert!(others.iter().any(|&at| at != others[0]), "{others:?}");
+}
+
+/// The regular stage of a gateway over `registry` under `config`, built
+/// twice: with the policy controller off, and with it on in the gateway's
+/// own process, over the engine a start builds for those settings. The
+/// registry sheds as the settings say.
+fn flag_off_and_on(
+    registry: &Arc<WorkerRegistry>,
+    config: &RouterConfig,
+) -> [(&'static str, WorkerSelectionStage); 2] {
+    registry.set_overload_shed(config.worker_overload_shed);
+    let picked = RouterConfig {
+        policy_controller: true,
+        ..config.clone()
+    };
+    let start = crate::policy_controller::start_in_process(&picked, None);
+    let start = start.expect("the settings start").expect("a policy");
+    assert!(start.decides_whole(), "the engine decides every request");
+    let engine = PolicyEngine::own(start.engine, Arc::clone(registry));
+    let off = classic_stage(registry, config.policy.clone());
+    let on = classic_stage(registry, config.policy.clone());
+    [
+        ("off", off),
+        ("on", on.with_policy_engine(Some(Arc::new(engine)))),
+    ]
+}
+
+/// The settings of a gateway under `round_robin`.
+fn round_robin() -> RouterConfig {
+    RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        ..RouterConfig::default()
+    }
+}
+
+/// One rank of a data-parallel engine of [`MODEL`] at `base`, ready, in
+/// `registry`.
+fn dp_rank(registry: &WorkerRegistry, base: &str, rank: usize) -> Arc<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(base)
+            .model(ModelCard::new(MODEL))
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Vllm)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .dp_config(rank, 2)
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    assert!(registry.register(Arc::clone(&worker)).is_some());
+    worker
+}
+
+/// What `selecting` wrote to the gateway's counters, as a scrape shows
+/// them, beside what it returned.
+fn with_scrape<T>(selecting: impl FnOnce() -> T) -> (T, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let returned = ::metrics::with_local_recorder(&recorder, selecting);
+    (returned, handle.render())
+}
+
+/// The lines of `scrape` for the counter `name` that name [`MODEL`] or a
+/// selection stage.
+fn counter_lines(scrape: &str, name: &str) -> Vec<String> {
+    scrape
+        .lines()
+        .filter(|line| line.starts_with(name) && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A model no worker serves reads the 404 of the selection with no policy
+/// engine: the stage judges the miss, and no answer is made of an ask over
+/// an empty list.
+#[tokio::test]
+async fn a_model_no_worker_serves_reads_the_404_with_no_policy_engine() {
+    let registry = Arc::new(WorkerRegistry::new());
+    for (flag, stage) in flag_off_and_on(&registry, &round_robin()) {
+        let refused = stage.execute(&mut prompt_of(&registry, 3)).await;
+        let answer = answer_of(refused.expect_err("nobody serves the model")).await;
+        assert_eq!(answer.0, StatusCode::NOT_FOUND, "flag {flag}");
+        assert_eq!(answer.1["error"]["code"], "model_not_found", "flag {flag}");
+    }
+}
+
+/// Under `--worker-overload-shed` a pool whose every worker is over its
+/// thresholds is shed with the answer of the selection with no policy
+/// engine, and the request is counted once, as there.
+#[test]
+fn a_pool_over_its_thresholds_is_shed_and_counted_as_with_no_policy_engine() {
+    let registry = Arc::new(WorkerRegistry::new());
+    for url in ["grpc://w0:8000", "grpc://w1:8000"] {
+        let worker = listed(&registry, url, RuntimeType::Vllm, None, UNLABELED);
+        assert!(registry.set_worker_overloaded(&worker, true));
+    }
+    let shedding = RouterConfig {
+        worker_overload_shed: true,
+        ..round_robin()
+    };
+    let mut answers = Vec::new();
+    for (flag, stage) in flag_off_and_on(&registry, &shedding) {
+        let (refused, scrape) = with_scrape(|| {
+            let mut ctx = prompt_of(&registry, 3);
+            let refused = stage.execute(&mut ctx).now_or_never();
+            refused.expect("the stage answers at its first poll")
+        });
+        let Err(refused) = refused else {
+            panic!("flag {flag}: every worker is overloaded, and one was taken");
+        };
+        let sheds = counter_lines(&scrape, "smg_worker_overload_shed_total{");
+        assert_eq!(sheds.len(), 1, "flag {flag}: one shed counted: {sheds:?}");
+        assert!(sheds[0].ends_with(" 1"), "flag {flag}: {sheds:?}");
+        answers.push((
+            refused.status(),
+            error::extract_error_code_from_response(&refused).to_owned(),
+            retry_after(&refused).map(str::to_owned),
+            sheds,
+        ));
+    }
+    assert_eq!(answers[0].0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answers[0].1, "worker_overload_protection_shed");
+    assert_eq!(
+        answers[1], answers[0],
+        "the flag on answers as the flag off"
+    );
+}
+
+/// A placement of the engine is counted as a selection, as one with no
+/// policy engine is: one count a request, for the model and the wire.
+#[test]
+fn a_placement_of_the_engine_is_counted_as_a_selection() {
+    let registry = Arc::new(WorkerRegistry::new());
+    for url in ["grpc://w0:8000", "grpc://w1:8000"] {
+        listed(&registry, url, RuntimeType::Vllm, None, UNLABELED);
+    }
+    for (flag, stage) in flag_off_and_on(&registry, &round_robin()) {
+        let ((), scrape) = with_scrape(|| {
+            for _ in 0..PLACEMENTS {
+                let mut ctx = prompt_of(&registry, 3);
+                let placed = stage.execute(&mut ctx).now_or_never();
+                placed
+                    .expect("the stage answers at its first poll")
+                    .expect("a worker");
+            }
+        });
+        let counted: Vec<String> = counter_lines(&scrape, "smg_worker_selection_total{")
+            .into_iter()
+            .filter(|line| line.contains(MODEL) && line.contains("connection_mode=\"grpc\""))
+            .collect();
+        assert_eq!(counted.len(), 1, "flag {flag}: {counted:?}");
+        let all = format!(" {PLACEMENTS}");
+        assert!(counted[0].ends_with(&all), "flag {flag}: {counted:?}");
+    }
+}
+
+/// A retry steps aside from every rank of the engine its failed attempt
+/// was sent to, as with no policy engine: the ranks of a data-parallel
+/// engine share its address, and the other engine takes the retry.
+#[tokio::test]
+async fn a_retry_steps_aside_from_every_rank_of_the_engine_it_tried() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let tried = [0, 1].map(|rank| dp_rank(&registry, "grpc://tried:8000", rank));
+    let other = [0, 1].map(|rank| dp_rank(&registry, "grpc://other:8000", rank));
+    for (flag, stage) in flag_off_and_on(&registry, &round_robin()) {
+        let mut turns = [0; 2];
+        for _ in 0..4 * PLACEMENTS {
+            let mut retry = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+            // The failed attempt was sent to the first rank of one engine.
+            retry.attempt = 1;
+            retry.tried.push(tried[0].base_url().to_owned());
+            retry.tried_rows =
+                Box::new([smg_policy_controller::engine::worker_id(tried[0].as_ref())]);
+            let reselected = stage.reselect(&mut retry, &retained_plan(&[1, 2, 3])).await;
+            reselected.expect("a worker for the retry");
+            let on = Arc::clone(single(retry.workers.as_ref()));
+            let place = other.iter().position(|worker| Arc::ptr_eq(worker, &on));
+            let Some(place) = place else {
+                panic!("flag {flag}: the retry went back to {}", on.url());
+            };
+            turns[place] += 1;
+        }
+        assert!(
+            turns.iter().all(|&taken| taken > 0),
+            "flag {flag}: {turns:?}"
+        );
+    }
 }

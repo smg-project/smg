@@ -287,7 +287,9 @@ async fn a_first_attempt_under_the_policy_engine_lands_on_the_placed_worker() {
     assert_eq!(ask.headers, ctx.input.headers.as_ref());
     assert_eq!(ask.rid, Some("request-rid"));
     stage.execute(&mut ctx).await.expect("a placed worker");
-    let ctx = Box::new(ctx).into_dispatch().expect("a dispatch context");
+    let ctx = Box::new(ctx)
+        .into_dispatch(stage.waits())
+        .expect("a dispatch context");
     let placed = ctx
         .placed
         .as_ref()
@@ -858,7 +860,9 @@ async fn a_retry_under_a_binding_keyed_by_the_rid_is_placed_by_the_key() -> anyh
         Arc::make_mut(request).rid = Some(rid.clone());
         stage.execute(&mut ctx).await.expect("the first attempt");
         // The request is gone at the dispatch: a retry reads what was kept.
-        let mut ctx = Box::new(ctx).into_dispatch().expect("a dispatch context");
+        let mut ctx = Box::new(ctx)
+            .into_dispatch(stage.waits())
+            .expect("a dispatch context");
         let first_row = ctx.placed.as_ref().expect("the first placement").id();
         // The attempt fails ahead of its send, and its row is named as tried.
         let failure = error::internal_error("attempt_failed", "Attempt failed");

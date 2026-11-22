@@ -1641,8 +1641,14 @@ impl RequestContext {
     /// Both contexts are a few KiB wide, so both travel boxed: this one
     /// comes in its box, and the dispatch context leaves in the box the run
     /// keeps it in.
+    ///
+    /// `hosted` says whether a controller the gateway follows places the
+    /// request's attempts (the selection stage's `waits`): the ledger of
+    /// the attempts judges a retry's alternative by it
+    /// ([`AttemptLedger::takes`]).
     pub fn into_dispatch(
         self: Box<Self>,
+        hosted: bool,
     ) -> Result<Box<DispatchContext>, axum::response::Response> {
         // Fields leave the box one at a time: a local that bound `state`
         // whole would copy all of it to the stack first.
@@ -1709,7 +1715,7 @@ impl RequestContext {
             cache_trace: None,
             parser,
             attempt: 0,
-            ledger: AttemptLedger::of(self.state.placed.is_some()),
+            ledger: AttemptLedger::of(hosted),
             tried: Vec::new(),
             tried_rows: Box::default(),
             model_id,

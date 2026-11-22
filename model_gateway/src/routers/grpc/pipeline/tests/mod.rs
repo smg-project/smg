@@ -3329,6 +3329,137 @@ async fn a_placed_requests_definitive_failure_moves_on_past_the_overload_flag() 
     }
 }
 
+/// The deps of a gateway's pipelines over `registry` under `config`, built
+/// twice: with the policy controller off, and with it on in the gateway's
+/// own process, over the engine a start builds for those settings, which
+/// decides over `registry`'s own lists. The registry sheds as the settings
+/// say.
+fn flag_off_and_on(
+    registry: &Arc<WorkerRegistry>,
+    config: &crate::config::RouterConfig,
+) -> [(&'static str, PipelineDeps); 2] {
+    registry.set_overload_shed(config.worker_overload_shed);
+    let picked = crate::config::RouterConfig {
+        policy_controller: true,
+        ..config.clone()
+    };
+    let start = crate::policy_controller::start_in_process(&picked, None);
+    let start = start.expect("the settings start").expect("a policy");
+    assert!(start.decides_whole(), "the engine decides every request");
+    let engine = PolicyEngine::own(start.engine, Arc::clone(registry));
+    let deps = || {
+        PipelineDeps::pair(
+            Arc::clone(registry),
+            Arc::new(PolicyRegistry::new(config.policy.clone())),
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+    };
+    [
+        ("off", deps()),
+        ("on", deps().with_policy_engine(Some(Arc::new(engine)))),
+    ]
+}
+
+/// The settings of a gateway under `round_robin`.
+fn round_robin() -> crate::config::RouterConfig {
+    crate::config::RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        ..Default::default()
+    }
+}
+
+/// Under `--worker-overload-shed` client acquisition re-checks the overload
+/// flag of the worker an attempt was placed on, whoever placed it in this
+/// process. A worker that went over its thresholds between the pick and the
+/// send is shed: for a selection of the classic policies, and for a
+/// placement of the engine of this process, which reads the same verdict.
+#[tokio::test]
+async fn in_this_process_a_worker_overloaded_before_its_send_is_shed() {
+    let shedding = crate::config::RouterConfig {
+        worker_overload_shed: true,
+        ..round_robin()
+    };
+    for on in [false, true] {
+        let registry = Arc::new(WorkerRegistry::new());
+        let port = spawn_stub(GatedScheduler::default()).await;
+        let worker = register_worker(&registry, port, WorkerType::Regular);
+        let [off_deps, on_deps] = flag_off_and_on(&registry, &shedding);
+        let (flag, deps) = if on { on_deps } else { off_deps };
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(Arc::clone(&registry)).await;
+        let mut ctx = RequestContext::for_completion(
+            completion_request(false),
+            None,
+            MODEL.to_string(),
+            components,
+        );
+        let stages = &pipeline.stages;
+        let prepared = stages.preparation.execute(&mut ctx).await;
+        assert!(prepared.is_ok(), "the request is prepared");
+        let selected = stages.worker_selection.execute(&mut ctx).await;
+        assert!(selected.is_ok(), "flag {flag}: a worker");
+
+        // The worker goes over its thresholds between the pick and the send.
+        assert!(registry.set_worker_overloaded(&worker, true));
+        let workers = ctx.state.workers.as_ref().expect("the selection");
+        let shed = pipeline.rechecks_overload();
+        let refused = acquire_clients(workers, MODEL, shed).await.err();
+        let Some(refused) = refused else {
+            panic!("flag {flag}: the worker over its thresholds is sent to");
+        };
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            "worker_overload_protection_shed"
+        );
+    }
+}
+
+/// Where the engine of this process places, a definitive failure stands as
+/// the answer while the other worker is over its overload thresholds, as
+/// with no policy engine: in this process the retry window reads a worker's
+/// own verdict, and a worker over its thresholds takes no retry. One engine
+/// sees the request, once.
+#[tokio::test]
+async fn in_this_process_a_definitive_failure_is_not_retried_on_an_overloaded_worker() {
+    for on in [false, true] {
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut workers = Vec::new();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let ids = Arc::new(Mutex::new(Vec::new()));
+            let port = spawn_stub(GatedScheduler {
+                fail_internal: true,
+                seen_request_ids: Arc::clone(&ids),
+                ..Default::default()
+            })
+            .await;
+            workers.push(register_worker_with_breaker(&registry, port, 5));
+            seen.push(ids);
+        }
+        let [off_deps, on_deps] = flag_off_and_on(&registry, &round_robin());
+        let (flag, deps) = if on { on_deps } else { off_deps };
+        for worker in &workers {
+            assert!(registry.set_worker_overloaded(worker, true));
+        }
+
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(registry).await;
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "flag {flag}"
+        );
+        let calls: usize = seen.iter().map(|ids| calls_seen(ids)).sum();
+        assert_eq!(calls, 1, "flag {flag}: one engine sees the request, once");
+    }
+}
+
 #[tokio::test]
 async fn a_placed_harmony_responses_iteration_completes_its_lease() {
     let (ctx, store, row) = placed_harmony_responses_context().await;
