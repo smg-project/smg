@@ -1,7 +1,8 @@
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     cell::OnceCell,
     collections::{HashMap, HashSet},
+    hash::Hash,
     mem,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, PoisonError},
@@ -210,8 +211,57 @@ fn parse_special_tokens(config: &serde_json::Value) -> SpecialTokens {
     }
 }
 
-/// What `CoreBPE::new` takes: the ranks, the special tokens, the split pattern.
-type OwnEncoderParts = (FxHashMap<Vec<u8>, Rank>, FxHashMap<String, Rank>, String);
+/// The tokens of a rank file (a tiktoken file, a `tekken.json`) in one
+/// buffer, in the file's order: a token ends at its entry of `ends` and
+/// starts where the one before it ends. A load reads them through a map
+/// that borrows its keys here, so it asks the allocator for no block a
+/// token, and keeps nothing of them.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct RankFile {
+    pub(crate) bytes: Vec<u8>,
+    ends: Vec<u32>,
+    pub(crate) ranks: Vec<Rank>,
+}
+
+impl RankFile {
+    /// Ends the token whose bytes were appended last, under `rank`.
+    pub(crate) fn end_token(&mut self, rank: Rank) -> Result<()> {
+        self.ends.push(u32::try_from(self.bytes.len())?);
+        self.ranks.push(rank);
+        Ok(())
+    }
+
+    pub(crate) fn tokens(&self) -> impl Iterator<Item = (&[u8], Rank)> {
+        let mut start = 0;
+        self.ends.iter().zip(&self.ranks).map(move |(&end, &rank)| {
+            let token = &self.bytes[start..end as usize];
+            start = end as usize;
+            (token, rank)
+        })
+    }
+
+    /// The ranks by their token: of two lines with one token the later
+    /// stands, as in a map that owns its keys.
+    fn by_token(&self) -> FxHashMap<&[u8], Rank> {
+        let mut ranks = FxHashMap::with_capacity_and_hasher(self.ranks.len(), Default::default());
+        ranks.extend(self.tokens());
+        ranks
+    }
+}
+
+/// A waiting encoder's ranks, read back from the decode table at the first
+/// need: the bytes of every id below `ids_end` are a rank's token, but for
+/// the ids of `from_special`, where the table holds a special token's text.
+#[derive(Default)]
+struct OwnRanks {
+    table: Arc<ByteLevelTable>,
+    ids_end: usize,
+    from_special: HashSet<TokenIdType>,
+}
+
+/// What a first need builds the encoder from: the ranks, the special tokens,
+/// the split pattern.
+type OwnEncoderParts = (OwnRanks, FxHashMap<String, Rank>, String);
 
 /// The file's own encoder (the `tiktoken_rs` one). A load builds it where
 /// encodes or decodes run on it: a built-in encoding, a file the direct
@@ -242,11 +292,7 @@ impl OwnEncoder {
         }
     }
 
-    fn on_first_need(
-        ranks: FxHashMap<Vec<u8>, Rank>,
-        specials: FxHashMap<String, Rank>,
-        pattern: String,
-    ) -> Self {
+    fn on_first_need(ranks: OwnRanks, specials: FxHashMap<String, Rank>, pattern: String) -> Self {
         Self {
             built: OnceLock::new(),
             specials: specials.keys().cloned().collect(),
@@ -261,6 +307,11 @@ impl OwnEncoder {
             .get_or_init(|| {
                 let (ranks, specials, pattern) =
                     mem::take(&mut *self.parts.lock().unwrap_or_else(PoisonError::into_inner));
+                let ranks = (0..)
+                    .take(ranks.ids_end)
+                    .filter(|id| !ranks.from_special.contains(id))
+                    .filter_map(|id| Some((ranks.table.token_bytes(id)?.0.to_vec(), id)))
+                    .collect();
                 CoreBPE::new(ranks, specials, &pattern).map_err(|refused| refused.to_string())
             })
             .as_ref()
@@ -367,9 +418,9 @@ fn controls_matcher<'a>(
 /// is read: the engines are built over these; the chat template, the EOS ids
 /// and the renderer come from the directory (see
 /// [`TiktokenTokenizer::from_vocabulary`]).
-struct FileVocabulary {
+struct FileVocabulary<K> {
     /// Token bytes to id.
-    ranks: FxHashMap<Vec<u8>, Rank>,
+    ranks: FxHashMap<K, Rank>,
     /// The split pattern the ranks were trained under.
     pattern: Cow<'static, str>,
     /// Special token spellings to id: recognized in text, decoded by spelling.
@@ -508,7 +559,8 @@ impl TiktokenTokenizer {
         let tiktoken_path_str = tiktoken_path
             .to_str()
             .ok_or_else(|| Error::msg("Tiktoken file path is not valid UTF-8"))?;
-        let ranks = load_tiktoken_bpe(tiktoken_path_str)?;
+        let file = load_tiktoken_bpe(tiktoken_path_str)?;
+        let ranks = file.by_token();
 
         // 2. Parse tokenizer_config.json from the same directory
         let dir = tiktoken_path
@@ -583,7 +635,7 @@ impl TiktokenTokenizer {
         let bos = file.special(tekken::BOS);
         Self::from_vocabulary(
             FileVocabulary {
-                ranks: file.ranks,
+                ranks: tekken::by_token(&file.ranks)?,
                 pattern: Cow::Owned(file.pattern),
                 specials: file.specials,
                 skip_token_ids,
@@ -604,8 +656,8 @@ impl TiktokenTokenizer {
     /// beside it gives (the chat
     /// template from an explicit path, else the configuration's, else a file
     /// beside the vocabulary; the EOS ids; the renderer).
-    fn from_vocabulary(
-        vocabulary: FileVocabulary,
+    fn from_vocabulary<K: Borrow<[u8]> + Eq + Hash>(
+        vocabulary: FileVocabulary<K>,
         dir: &Path,
         chat_template_path: Option<&str>,
         config_chat_template: ConfigChatTemplates,
@@ -678,12 +730,13 @@ impl TiktokenTokenizer {
         // `one_token_a_rank`: no two tokens share a rank (the own encoder
         // refuses such a set with a panic).
         let mut one_token_a_rank = true;
+        let mut from_special = HashSet::new();
         let byte_level = ids_end.map(|ids_end| {
             let mut by_id: Vec<Option<&[u8]>> = vec![None; ids_end];
             for (token, &rank) in &ranks {
                 if let Some(slot) = by_id.get_mut(rank as usize) {
                     one_token_a_rank &= slot.is_none();
-                    *slot = Some(token);
+                    *slot = Some(token.borrow());
                 }
             }
             let special_by_id: FxHashMap<Rank, &str> = special_tokens_encoder
@@ -693,6 +746,7 @@ impl TiktokenTokenizer {
             for (&id, text) in &special_by_id {
                 if let Some(slot @ None) = by_id.get_mut(id as usize) {
                     *slot = Some(text.as_bytes());
+                    from_special.insert(id);
                 }
             }
             byte_level_table(ids_end, &skip_token_ids, |id| {
@@ -703,16 +757,32 @@ impl TiktokenTokenizer {
         // it. Where it waits for a first need the library compiles a split
         // pattern the crate does not ship here, as an encoder over no ranks:
         // a pattern it refuses fails the load as before.
-        let tokenizer = Arc::new(
-            if native.is_some() && byte_level.is_some() && one_token_a_rank {
+        let tokenizer = Arc::new(match byte_level.as_ref().zip(ids_end) {
+            Some((table, ids_end)) if native.is_some() && one_token_a_rank => {
                 if !SHIPPED_PATTERNS.contains(&&*pattern) {
                     CoreBPE::new(FxHashMap::default(), FxHashMap::default(), &pattern)?;
                 }
-                OwnEncoder::on_first_need(ranks, special_tokens_encoder, String::from(&*pattern))
-            } else {
+                // The table holds every rank's token: nothing of the file
+                // is kept for the first need.
+                drop(ranks);
+                OwnEncoder::on_first_need(
+                    OwnRanks {
+                        table: Arc::clone(table),
+                        ids_end,
+                        from_special,
+                    },
+                    special_tokens_encoder,
+                    String::from(&*pattern),
+                )
+            }
+            _ => {
+                let ranks = ranks
+                    .into_iter()
+                    .map(|(token, rank)| (<K as Borrow<[u8]>>::borrow(&token).to_vec(), rank))
+                    .collect();
                 OwnEncoder::built(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?)
-            },
-        );
+            }
+        });
         let text_index = byte_level.as_deref().map(TextIndex::build);
         // Beside the index the map keeps only an added token the index does
         // not answer with its own id (one whose id a rank holds in the
@@ -889,8 +959,8 @@ impl TiktokenTokenizer {
     /// it (see [`NativeEncoder::from_ranks`]); the choice is logged once and
     /// counted with the Hugging Face loads ([`encode_path::encode_path_loads`]).
     /// A file it declines keeps its own encoder for every encode.
-    fn native_encoder(
-        ranks: &FxHashMap<Vec<u8>, Rank>,
+    fn native_encoder<K: Borrow<[u8]> + Eq + Hash>(
+        ranks: &FxHashMap<K, Rank>,
         pattern: &str,
         specials: &[(String, TokenIdType)],
     ) -> Option<Arc<NativeEncoder>> {
@@ -1093,25 +1163,35 @@ impl TiktokenTokenizer {
 /// Parse a .tiktoken / tiktoken.model file into a BPE encoder.
 ///
 /// Format: each line is `<base64-encoded-token-bytes> <rank>`
-fn load_tiktoken_bpe(path: &str) -> Result<FxHashMap<Vec<u8>, Rank>> {
+fn load_tiktoken_bpe(path: &str) -> Result<RankFile> {
     let content = std::fs::read_to_string(path)?;
     // As many as `lines()` counts: one a line feed, and a last line without one.
     let lines = content.bytes().filter(|&byte| byte == b'\n').count()
         + usize::from(!content.is_empty() && !content.ends_with('\n'));
-    let mut encoder = FxHashMap::with_capacity_and_hasher(lines, Default::default());
+    let mut file = RankFile {
+        // Four characters of a line decode to three bytes at the most.
+        bytes: Vec::with_capacity(content.len() / 4 * 3),
+        ends: Vec::with_capacity(lines),
+        ranks: Vec::with_capacity(lines),
+    };
     for line in content.lines() {
         if line.is_empty() {
             continue;
         }
+        let start = file.bytes.len();
         // The format's line has ONE space between its two fields; a line
         // that does not read so takes the general split, errors included.
         let direct = line
             .split_once(' ')
             .filter(|(token, _)| !token.is_empty())
-            .and_then(|(token, rank)| Some((STANDARD.decode(token).ok()?, rank.parse().ok()?)));
-        let (token_bytes, rank): (Vec<u8>, Rank) = match direct {
-            Some(entry) => entry,
+            .and_then(|(token, rank)| {
+                STANDARD.decode_vec(token, &mut file.bytes).ok()?;
+                rank.parse().ok()
+            });
+        let rank: Rank = match direct {
+            Some(rank) => rank,
             None => {
+                file.bytes.truncate(start);
                 let mut parts = line.split_whitespace();
                 let token_b64 = parts
                     .next()
@@ -1119,12 +1199,14 @@ fn load_tiktoken_bpe(path: &str) -> Result<FxHashMap<Vec<u8>, Rank>> {
                 let rank_str = parts
                     .next()
                     .ok_or_else(|| Error::msg("missing rank in tiktoken file"))?;
-                (STANDARD.decode(token_b64)?, rank_str.parse()?)
+                STANDARD.decode_vec(token_b64, &mut file.bytes)?;
+                rank_str.parse()?
             }
         };
-        encoder.insert(token_bytes, rank);
+        file.end_token(rank)?;
     }
-    Ok(encoder)
+    file.bytes.shrink_to_fit();
+    Ok(file)
 }
 
 /// The id of `text`. Without an index, the map's. With one, the map's too
@@ -1152,13 +1234,13 @@ fn text_id(
 /// entry), the added tokens with them. The other direction, an id's text,
 /// is read from the file's own encoder (`id_to_token`), which holds every
 /// rank's bytes and the special tokens already.
-fn build_vocab_map(
-    encoder: &FxHashMap<Vec<u8>, Rank>,
+fn build_vocab_map<K: Borrow<[u8]>>(
+    encoder: &FxHashMap<K, Rank>,
     added_tokens: &HashMap<String, TokenIdType>,
 ) -> HashMap<String, TokenIdType> {
     let mut vocab = HashMap::with_capacity(encoder.len() + added_tokens.len());
     for (token_bytes, &rank) in encoder {
-        if let Ok(token_str) = std::str::from_utf8(token_bytes) {
+        if let Ok(token_str) = std::str::from_utf8(token_bytes.borrow()) {
             vocab.insert(token_str.to_string(), rank);
         }
     }
@@ -2277,10 +2359,11 @@ mod tests {
         writeln!(f, "IQ== 0").unwrap();
         writeln!(f, "Ig== 1").unwrap();
 
-        let encoder = load_tiktoken_bpe(file_path.to_str().unwrap()).unwrap();
+        let file = load_tiktoken_bpe(file_path.to_str().unwrap()).unwrap();
+        let encoder = file.by_token();
         assert_eq!(encoder.len(), 2);
-        assert_eq!(encoder.get(&vec![0x21u8]), Some(&0));
-        assert_eq!(encoder.get(&vec![0x22u8]), Some(&1));
+        assert_eq!(encoder.get(&[0x21u8][..]), Some(&0));
+        assert_eq!(encoder.get(&[0x22u8][..]), Some(&1));
     }
 
     #[test]
@@ -2288,10 +2371,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.tiktoken");
         std::fs::write(&path, "IQ==\t0\nIg==  1\nIw== 2 extra\n").unwrap();
-        let encoder = load_tiktoken_bpe(path.to_str().unwrap()).unwrap();
-        assert_eq!(encoder.get(&vec![0x21u8]), Some(&0));
-        assert_eq!(encoder.get(&vec![0x22u8]), Some(&1));
-        assert_eq!(encoder.get(&vec![0x23u8]), Some(&2));
+        let file = load_tiktoken_bpe(path.to_str().unwrap()).unwrap();
+        let encoder = file.by_token();
+        assert_eq!(encoder.get(&[0x21u8][..]), Some(&0));
+        assert_eq!(encoder.get(&[0x22u8][..]), Some(&1));
+        assert_eq!(encoder.get(&[0x23u8][..]), Some(&2));
 
         std::fs::write(&path, " 0\n").unwrap();
         let error = load_tiktoken_bpe(path.to_str().unwrap()).unwrap_err();
@@ -2591,7 +2675,12 @@ mod tests {
         let read = tekken::read(&path).unwrap();
         let mut specials: Vec<_> = read.specials.into_iter().collect();
         specials.sort();
-        assert!(NativeEncoder::from_ranks(&read.ranks, &read.pattern, &specials).is_ok());
+        assert!(NativeEncoder::from_ranks(
+            &tekken::by_token(&read.ranks).unwrap(),
+            &read.pattern,
+            &specials
+        )
+        .is_ok());
         assert!(TiktokenTokenizer::from_tekken_file(&path).is_err());
     }
 
