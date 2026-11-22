@@ -42,6 +42,7 @@ use crate::{
         framework::{Picker, ShadowRows, TieBand},
         policy_engine::{PolicyEngine, PoolMembers},
         prompt_hashes::HashSeeds,
+        records::worker_id,
         shadow::{Shadowed, SHADOW_FLOOR},
         sticky_sessions::SessionVerdict,
         view::{Candidate, Identity, Phase, RequestFacts, WorkerId},
@@ -396,27 +397,115 @@ fn a_decision_whose_issue_panics_counts_no_shadow() {
 }
 
 /// The entry that issues no lease runs a binding's shadow behind the live
-/// decision, as the leasing entry does, and answers the live profile's
-/// whole decision. What the shadow said is dropped there: no shadow
-/// decision is counted, no id is taken and no stage hears an issue. The
-/// leasing entry of an engine made alike gives the same decision and
-/// counts its shadow.
+/// decision, as the leasing entry does, and answers what the shadow said
+/// beside the live profile's whole decision: its binding, how it compares
+/// and its first target. No id is taken and no stage hears an issue. The
+/// leasing entry of an engine made alike gives the same decision.
 #[test]
-fn a_decision_without_a_lease_runs_its_shadow_and_counts_none() {
+fn a_decision_without_a_lease_answers_what_its_shadow_said() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
     let members = engine.pool_members(&list);
     let asks = Asks::of(request(7), Some(&members));
-    let alone = engine.decide_without_lease(&asks, Instant::now());
-    let alone = alone.expect("a decision");
+    let answer = engine.decide_without_lease(&asks, Instant::now());
+    let (alone, said) = answer.expect("a decision");
     assert_eq!(seen.shadows(), 1, "the shadow profile ran");
-    assert_eq!(kinds(&engine), [0; 4], "nothing is counted");
+    // The shadow's picker takes the row behind the live pick's: the live
+    // pick's alternate.
+    let pick = alone.pick().expect("a pick");
+    let alternate = pick.targets.as_slice().get(1).expect("an alternate").id;
+    let said_of = Shadowed {
+        binding: 0,
+        kind: ShadowKind::OtherTarget,
+        first: Some(alternate),
+    };
+    assert_eq!(said, Some(said_of));
     assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
     assert!(seen.heard.lock().is_empty(), "no lease, no issue");
 
     let (leasing, _) = bed(Rule::Place(0), Rule::Place(1));
     assert_eq!(placed(&leasing, &list, request(7)), alone);
-    assert_eq!(kinds(&leasing), [0, 1, 0, 0]);
+}
+
+/// What a shadow said beside a decision with no lease is counted when the
+/// entry's caller says so, and not before: the caller counts behind its own
+/// filing of the lease, as the leasing entry counts behind its issue. One
+/// call counts one shadow decision, and a caller whose filing failed calls
+/// nothing. A decision that had no shadow hands none back, and counting
+/// that allocates no table.
+#[test]
+fn a_shadow_beside_a_decision_without_a_lease_is_counted_by_its_caller() {
+    let list = pool(3);
+    let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
+    let members = engine.pool_members(&list);
+    let asks = Asks::of(request(7), Some(&members));
+    let answer = engine.decide_without_lease(&asks, Instant::now());
+    let (_, said) = answer.expect("a decision");
+    assert!(said.is_some(), "the shadow's word");
+    assert!(engine.shadow_counts.get().is_none(), "nothing counted yet");
+    assert_eq!(kinds(&engine), [0; 4]);
+    engine.count_shadow(said);
+    assert_eq!(kinds(&engine), [0, 1, 0, 0]);
+
+    // A filing that failed: the word is dropped, and nothing more counts.
+    let answer = engine.decide_without_lease(&asks, Instant::now());
+    let (_, dropped) = answer.expect("a decision");
+    assert!(dropped.is_some(), "the shadow's word");
+    assert_eq!(seen.shadows(), 2);
+    assert_eq!(kinds(&engine), [0, 1, 0, 0]);
+
+    let (unshadowed, seen) = bed_of("random", Rule::Place(0), None, |_| {});
+    let members = unshadowed.pool_members(&list);
+    let asks = Asks::of(request(7), Some(&members));
+    let answer = unshadowed.decide_without_lease(&asks, Instant::now());
+    let (_, none) = answer.expect("a decision");
+    assert_eq!(none, None);
+    unshadowed.count_shadow(none);
+    assert_eq!(seen.shadows(), 0);
+    assert!(unshadowed.shadow_counts.get().is_none());
+}
+
+/// A live decision that sheds files no lease, and the entry still answers
+/// what its shadow said beside the shed: another outcome, with the shadow's
+/// own first target. Its caller counts that all the same, as the leasing
+/// entry counts a live shed's shadow.
+#[test]
+fn a_shed_without_a_lease_answers_its_shadows_word_for_the_count() {
+    let list = pool(3);
+    let (engine, seen) = bed(Rule::Nobody, Rule::Place(0));
+    let members = engine.pool_members(&list);
+    let asks = Asks::of(request(7), Some(&members));
+    let answer = engine.decide_without_lease(&asks, Instant::now());
+    let (shed, said) = answer.expect("a decision");
+    assert!(matches!(shed, Decision::Shed(_)), "{shed:?}");
+    assert_eq!(seen.shadows(), 1);
+    let said = said.expect("the shadow's word");
+    assert_eq!((said.binding, said.kind), (0, ShadowKind::OtherOutcome));
+    assert!(said.first.is_some(), "the shadow's own pick");
+    assert_eq!(kinds(&engine), [0; 4]);
+    engine.count_shadow(Some(said));
+    assert_eq!(kinds(&engine), [0, 0, 1, 0]);
+
+    let (leasing, _) = bed(Rule::Nobody, Rule::Place(0));
+    assert_eq!(placed(&leasing, &list, request(7)), shed);
+    assert_eq!(kinds(&leasing), [0, 0, 1, 0]);
+}
+
+/// A shadow profile decides under its request's own constraints: a worker
+/// the host just failed to reach is no pick of the shadow's either. So a
+/// shadow that takes the place the live profile takes agrees with it.
+#[test]
+fn a_shadow_decides_under_its_requests_constraints() {
+    let list = pool(3);
+    let (engine, seen) = bed(Rule::Place(0), Rule::Place(0));
+    let members = engine.pool_members(&list);
+    let unreached = [worker_id(list[0].as_ref())];
+    let mut asked = request(7);
+    asked.constraints.excluded = &unreached;
+    let answer = decided(&engine, &Asks::of(asked, Some(&members)));
+    assert_eq!(first(&answer.decision), 1, "the worker behind the first");
+    assert_eq!(seen.shadows(), 1);
+    assert_eq!(kinds(&engine), [1, 0, 0, 0], "the shadow agrees");
 }
 
 /// What a shadow said is handed to the caller that counts it: its

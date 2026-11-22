@@ -23,8 +23,13 @@
 //! is caught where it ran: the live answer is returned as decided, and the
 //! panic is counted with the engine's faults.
 //!
-//! **The counts.** A shadow decision is counted after its live decision's
-//! lease is issued, in the engine's one table ([`ShadowCounts`]).
+//! **The counts.** A shadow decision is counted in the engine's one table
+//! ([`ShadowCounts`]), behind the issue of its live decision: a pick's
+//! lease is issued first, and a live shed, which issues none, counts its
+//! shadow too. The entry that issues a lease counts by itself ([`issued`]).
+//! The entry that issues none answers what the shadow said, and its caller
+//! counts it behind its own filing ([`PolicyEngine::count_shadow`]). Under
+//! either, a decision whose issue fails counts none.
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -91,6 +96,29 @@ pub(super) fn issued(
     let decided = single::issued(own, decision, request, now);
     count(own, said);
     decided
+}
+
+impl PolicyEngine {
+    /// Counts what a binding's shadow said beside a decision of the entry
+    /// that issues no lease ([`Self::decide_without_lease`]). It is that
+    /// entry's caller's one call, made once its own filing of the
+    /// decision's lease stands, as the leasing entry counts behind its own
+    /// issue ([`issued`]). A shed files no lease, and its shadow is counted
+    /// all the same, as the leasing entry counts a live shed's. A caller
+    /// whose filing fails calls nothing, so that decision's shadow counts
+    /// none. A decision that had no shadow counts nothing.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the controller's service calls it once it decides by this engine"
+        )
+    )]
+    pub(crate) fn count_shadow(&self, said: Option<Shadowed>) {
+        if let Some(said) = said {
+            count(self, said);
+        }
+    }
 }
 
 /// The live decision of one single request, and what its binding's shadow

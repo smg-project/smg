@@ -1392,7 +1392,7 @@ pub(crate) mod tests {
         let mut last = None;
         for _ in 0..8 {
             let decision = engine.decide_without_lease(&asks, Instant::now());
-            let decision = decision.expect("a decision");
+            let (decision, _) = decision.expect("a decision");
             let pick = decision.pick().expect("a pick");
             assert_eq!(pick.targets.len(), 4, "the pick and its alternates");
             for target in pick.targets.iter() {
@@ -1470,7 +1470,7 @@ pub(crate) mod tests {
                     let whole = places(&decided.expect("a whole decision").0.decision);
                     assert!(!whole.is_empty(), "{policy}, seed {seed}: a pick");
                     let alone = bare.decide_without_lease(&asked(&ours), Instant::now());
-                    let alone = places(&alone.expect("a decision"));
+                    let alone = places(&alone.expect("a decision").0);
                     assert_eq!(alone, whole, "{policy}, seed {seed}");
                     if policy == "least_load" && loads.is_some() {
                         assert_eq!(alone[0], 5, "seed {seed}: the shortest queue");
@@ -1512,7 +1512,7 @@ pub(crate) mod tests {
         };
         let named = |engine: &PolicyEngine, asks: &Asks<'_>| {
             let decision = engine.decide_without_lease(asks, Instant::now());
-            let decision = decision.expect("a decision");
+            let (decision, _) = decision.expect("a decision");
             let first = decision.pick().and_then(|pick| pick.targets.first());
             first.map(|target| target.id).expect("a pick")
         };
@@ -1548,7 +1548,7 @@ pub(crate) mod tests {
         ] {
             let listed = members.is_some();
             let shed = engine.decide_without_lease(&stating(phase, members), Instant::now());
-            let Ok(Decision::Shed(shed)) = shed else {
+            let Ok((Decision::Shed(shed), None)) = shed else {
                 panic!("{phase:?}, {listed}: a shed, not {shed:?}");
             };
             assert_eq!((shed.reason, shed.emptied_by), none, "{phase:?}, {listed}");
