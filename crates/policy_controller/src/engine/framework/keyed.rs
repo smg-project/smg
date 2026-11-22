@@ -90,7 +90,9 @@ impl Engine {
     /// - **A session's pin.** Under a binding's sessions rule, a request
     ///   whose key holds a pin goes to the pin's worker: the first of the
     ///   key's pins whose row every filter of the profile keeps, where that
-    ///   row is under the rule's cap. One row is read for a pin.
+    ///   row is under the rule's cap. One row is read for a pin, whatever
+    ///   the profile's scorers are: the whole decision takes a standing
+    ///   pin behind its filters and asks no scorer.
     /// - **A ring's walk.** Under a profile whose one scorer places a keyed
     ///   request by itself ([`Scorer::own_by_place`]), the request goes to
     ///   its key's owner and the members behind it, over the ring of the
@@ -111,9 +113,17 @@ impl Engine {
     /// whole decision says whether the veto left the pool nobody), a
     /// binding with a shadow, a profile that opens a scope or draws, a
     /// profile whose filters cannot be asked of one row alone
-    /// ([`Filter::row_wise`]) or whose scorer states what its pick holds
-    /// of the request ([`Self::decide_stated`]), a request that carries an
-    /// affinity column, and every plan but the single one.
+    /// ([`Filter::row_wise`]), a ring's walk under a scorer that states
+    /// what its pick holds of the request ([`Self::decide_stated`]), a
+    /// request that carries an affinity column, and every plan but the
+    /// single one.
+    ///
+    /// A pick made here states no holding, as [`Self::decide`]'s states
+    /// none. A host that feeds a scorer the request's holders, and keeps
+    /// for each pick the worker a prompt was sent to, does both around the
+    /// whole decision: for a pin followed here it names no holder and
+    /// keeps nothing, as a gateway's own sticky map keeps a pinned request
+    /// from its policy.
     ///
     /// The session table is read as the whole decision reads it: a pin
     /// followed renews its key's idle time, and a request not decided here
@@ -160,10 +170,9 @@ impl Engine {
         }
         let at = usize::from(index);
         let marks = self.marks[at];
-        // A shadow reads the rows its live decision was handed, a stage's
-        // scope is opened over them, and a scorer that states what its
-        // pick holds reads them for it: the whole decision's, each one.
-        if shadow.is_some() || marks.scoped() || self.stating[at].is_some() {
+        // A shadow reads the rows its live decision was handed, and a
+        // stage's scope is opened over them: the whole decision's, each.
+        if shadow.is_some() || marks.scoped() {
             return None;
         }
         let facts = &*facts;
@@ -171,6 +180,11 @@ impl Engine {
             if !facts.session_key.is_none() {
                 return self.follow_pin(index, rule, facts, rows, cx);
             }
+        }
+        // A scorer that states what its pick holds reads the rows for it:
+        // its ring's walk is the whole decision's.
+        if self.stating[at].is_some() {
+            return None;
         }
         // No rule governs the key. A picker that leaves the placement to
         // its rule's assignment places over every row, and so does a

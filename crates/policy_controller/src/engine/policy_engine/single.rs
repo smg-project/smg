@@ -299,7 +299,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::spec::{AppliedSpec, Assignment, PolicySpec},
         engine::{
             decision::{LiftedVeto, Target, Targets},
             decision_engine::{
@@ -804,6 +804,112 @@ mod tests {
         });
         assert!(moved, "a forgotten worker holds no prompt");
         assert_eq!(engine.affinity().left_out(), 0);
+    }
+
+    /// The default policy under a sessions rule. A key's first request is
+    /// placed by the whole pass, and its dispatch makes the key's pin. The
+    /// key's next request follows that pin by one worker's record: no pass
+    /// over the list runs and nobody is named its prompt's holder, so the
+    /// prompt of a pinned request is recorded for no worker, as a gateway's
+    /// own sticky map keeps a pinned request from its policy. A request of
+    /// that prompt that carries no key is then placed by the policy, and
+    /// not held to the pin's worker. A pinned worker that is not ready
+    /// gives the key back to the whole pass.
+    #[test]
+    fn the_default_policy_follows_a_sessions_pin_by_one_record() {
+        // The stock sessions rule over the default policy's profile, a
+        // new key placed by the profile's own stages.
+        let engine = {
+            let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+            let default = PolicySpec::preset("cache_aware").expect("a built-in preset");
+            document.profiles = default.profiles;
+            let binding = &mut document.bindings[0];
+            binding.profile = Some("cache_aware".into());
+            let rule = binding.sessions.as_mut().expect("the stock rule");
+            rule.assignment = Assignment::Delegate;
+            document.generation = 1;
+            PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+        };
+        let list = pool(8);
+        let members = engine.pool_members(&list);
+        let prompt = |first: u32| (first..first + 1_024).collect::<Vec<u32>>();
+        // One request of `tokens` under the session key `key`, with no key
+        // where it is `0`, sent to its first target and served there: the
+        // place it went to, what the decision did with its key, and
+        // whether no pass over the list ran.
+        let sent = |tokens: &[u32], key: u64, seed: u64| {
+            let hashes = engine.prompt_hashes(MODEL, Some(tokens), None, HashSeeds::PLAIN);
+            let mut asked = request();
+            asked.facts.seed = seed;
+            asked.facts.session_key = Identity::hashed(key);
+            hashes.write_to(&mut asked.facts);
+            let asks = Asks::of(asked, Some(&members));
+            let now = Instant::now();
+            let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                .expect("a decision");
+            let pick = *guard.decision().pick().expect("a pick");
+            let target = guard.take(0).expect("the first target");
+            guard.dispatched(now);
+            guard.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: target.id,
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    duration_micros: 0,
+                },
+                now,
+            );
+            (
+                target.position,
+                pick.session_verdict,
+                pick.trace.drew_first(),
+            )
+        };
+        let fresh = |key: u32| prompt(key * 100_000 + 50_000);
+        let (mut pins, mut passed) = (Vec::new(), Vec::new());
+        for key in 1..=6_u32 {
+            // The key's first request: the whole pass places it by its
+            // seed, over idle workers, and claims it.
+            let seed = u64::from(key);
+            let (pin, verdict, unpassed) = sent(&prompt(key * 100_000), seed, seed);
+            assert!(matches!(verdict, SessionVerdict::Claimed(_)), "key {key}");
+            assert!(!unpassed, "key {key}: the whole pass places a new key");
+            // Its next request, of a prompt nobody was sent: the pin.
+            let (went, verdict, unpassed) = sent(&fresh(key), seed, 1);
+            assert_eq!((went, verdict), (pin, SessionVerdict::Pinned), "key {key}");
+            if !unpassed {
+                passed.push(key);
+            }
+            pins.push(pin);
+        }
+        assert!(
+            pins.iter().any(|pin| *pin != pins[0]),
+            "the keys are pinned to more workers than one: {pins:?}"
+        );
+        // The pinned requests' prompts were recorded for nobody: a request
+        // of one that carries no key is placed by its seed, over idle
+        // workers, and not held to the pin's worker.
+        let elsewhere = (1..=6_u32)
+            .filter(|&key| sent(&fresh(key), 0, u64::from(key) + 40).0 != pins[key as usize - 1])
+            .count();
+        assert!(
+            elsewhere > 0,
+            "each of six prompts went back to its pin's worker: {pins:?}"
+        );
+        // Each pin was followed by its one worker's record.
+        assert!(
+            passed.is_empty(),
+            "a pass over the list ran for the pinned requests of keys {passed:?}"
+        );
+        // A pin whose worker is not ready is the whole pass's to place anew.
+        list[pins[0] as usize].set_status(WorkerStatus::NotReady);
+        let (moved, _, unpassed) = sent(&prompt(100_000), 1, 3);
+        assert!(!unpassed, "the whole pass places the key anew");
+        assert_ne!(moved, pins[0]);
     }
 
     /// What a stage heard of a lease: the word, the worker the lease told

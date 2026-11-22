@@ -12,7 +12,7 @@ use super::{
 use crate::{
     document::spec::{AppliedSpec, Assignment, Needs, OverloadSpec, PolicySpec, Recovery},
     engine::{
-        decision::{Decision, MAX_TARGETS},
+        decision::{Decision, Overlap, MAX_TARGETS},
         sticky_sessions::{SessionRule, SessionVerdict},
         view::{
             AffinityFacts, Candidate, Constraints, Health, Identity, PoolFacts, RequestFacts,
@@ -21,7 +21,7 @@ use crate::{
         Scratch, DRAW_BOUND,
     },
     policies::consistent_hashing::{ConsistentHash, PoolRing},
-    stages::{lifecycle::Lifecycle, pickers::Best},
+    stages::{filters::Healthy, lifecycle::Lifecycle, pickers::Best},
     tracking::lease::{Lease, Side},
     Draw,
 };
@@ -179,9 +179,9 @@ fn facts_of(pool: &[Candidate]) -> PoolFacts<'static> {
 }
 
 /// What two decisions must agree on: the targets in their order, what the
-/// decision did with its key, the veto its trace says was lifted and the
-/// profile that decided.
-type Answer = (Vec<(u32, WorkerId)>, SessionVerdict, u8, u16);
+/// decision did with its key, the veto its trace says was lifted, the
+/// profile that decided and the holding the pick states.
+type Answer = (Vec<(u32, WorkerId)>, SessionVerdict, u8, u16, Overlap);
 
 fn answer(decision: &Decision) -> Option<Answer> {
     let pick = decision.pick()?;
@@ -195,6 +195,7 @@ fn answer(decision: &Decision) -> Option<Answer> {
         pick.session_verdict,
         pick.trace.lifted as u8,
         pick.trace.profile,
+        pick.overlap(),
     ))
 }
 
@@ -559,14 +560,22 @@ fn a_request_the_key_does_not_decide_is_left_whole_to_the_whole_decision() {
     assert_eq!(listed.read(), 0);
 }
 
-/// A scorer that scores every row alike, and states what its pick holds of
-/// the request where it is told to.
+/// A scorer that scores every row alike. Where it is told to, it states
+/// what its pick holds of the request, it places a keyed request by
+/// itself, on the list's first row, and it holds a scope.
 #[derive(Debug)]
 struct Alike {
     states: bool,
+    owns: bool,
+    scoped: bool,
 }
 
 impl Lifecycle for Alike {}
+
+impl super::super::DecisionScope for Alike {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+    fn close(&self) {}
+}
 
 impl Scorer for Alike {
     fn name(&self) -> &'static str {
@@ -578,8 +587,34 @@ impl Scorer for Alike {
         TieBand::NORMALIZED
     }
 
+    fn owns(&self) -> bool {
+        self.owns
+    }
+
+    fn own_by_place(
+        &self,
+        _: &RequestFacts<'_>,
+        _: usize,
+        keep: &mut dyn FnMut(u32) -> bool,
+        out: &mut [u32; MAX_TARGETS],
+    ) -> usize {
+        out[0] = 0;
+        usize::from(self.owns && keep(0))
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            ring: self.owns,
+            ..Needs::default()
+        }
+    }
+
     fn states_overlap(&self) -> bool {
         self.states
+    }
+
+    fn scope(&self) -> Option<&dyn super::super::DecisionScope> {
+        self.scoped.then_some(self as _)
     }
 }
 
@@ -607,7 +642,14 @@ fn a_shadowed_binding_is_lent_the_ring_and_left_to_the_whole_decision() {
     let listed = Listed::of(&rows, &ring);
     let cx = Constraints::default();
     let by_ring = || profile_of("ring", Box::new(ConsistentHash::new(None)));
-    let plain = || profile_of("plain", Box::new(Alike { states: false }));
+    let plain = || {
+        let stage = Alike {
+            states: false,
+            owns: false,
+            scoped: false,
+        };
+        profile_of("plain", Box::new(stage))
+    };
     let shadowed = Binding {
         shadow: Some(1),
         ..single(None)
@@ -639,12 +681,13 @@ fn a_shadowed_binding_is_lent_the_ring_and_left_to_the_whole_decision() {
     assert!(alone.decide_keyed(&mut facts, &listed, &cx).is_some());
 }
 
-/// A profile whose scorer states what its pick holds of the request is the
-/// whole decision's, which reads the rows for that word: its key's pin is
-/// not followed here, where the same rule over a scorer that states nothing
-/// follows it by one row.
+/// A session's pin is followed by one row whatever the profile's scorers
+/// are: under a scorer that states what its pick holds of the request, and
+/// under one that states nothing. The whole decision takes a standing pin
+/// behind its filters and asks no scorer, and the pick made here is its
+/// answer, with no holding stated.
 #[test]
-fn a_pin_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_decision() {
+fn a_pin_is_followed_under_a_scorer_that_states_its_picks_holding() {
     let rows = pool(16, 61, 0, 0);
     let ring = ring_of(&rows);
     let listed = Listed::of(&rows, &ring);
@@ -657,7 +700,12 @@ fn a_pin_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_decis
         recovery: Recovery::Original,
     };
     for states in [true, false] {
-        let profile = profile_of("alike", Box::new(Alike { states }));
+        let stage = Alike {
+            states,
+            owns: false,
+            scoped: false,
+        };
+        let profile = profile_of("alike", Box::new(stage));
         let engine = Engine::new(vec![profile], vec![single(Some(rule))], 1, Needs::default());
         let request = RequestFacts {
             model: "m",
@@ -681,15 +729,90 @@ fn a_pin_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_decis
         };
         engine.on_dispatched(&lease, &pick.targets.as_slice()[0], Side::Single, 0);
         listed.read();
+        let followed = engine
+            .decide_keyed(&mut { request }, &listed, &cx)
+            .expect("the pin is followed");
+        let whole = engine.decide(&request, &facts_of(&rows), &rows, &cx, &mut Scratch::new());
+        assert_eq!(answer(&followed), answer(&whole), "states: {states}");
+        assert_eq!(listed.read(), 1, "a pin is one row");
+        let stated = followed.pick().map(|pick| pick.overlap());
+        assert_eq!(stated, Some(Overlap::NONE), "no holding is stated");
+    }
+}
+
+/// A walk is the whole decision's under a scorer that states what its pick
+/// holds of the request: that decision reads the rows for the word. A keyed
+/// request no rule pins is not placed here then, and no row is read. The
+/// same scorer with nothing to state places it by the one row it reads.
+#[test]
+fn a_walk_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_decision() {
+    let rows = pool(16, 61, 0, 0);
+    let ring = ring_of(&rows);
+    let listed = Listed::of(&rows, &ring);
+    let cx = Constraints::default();
+    for states in [true, false] {
+        let stage = Alike {
+            states,
+            owns: true,
+            scoped: false,
+        };
+        let profile = profile_of("alike", Box::new(stage));
+        let engine = Engine::new(vec![profile], vec![single(None)], 1, Needs::default());
+        let mut request = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(9),
+            ..RequestFacts::default()
+        };
+        let walked = engine.decide_keyed(&mut request, &listed, &cx);
+        assert_eq!(walked.is_none(), states, "states: {states}");
+        assert_eq!(listed.read(), u32::from(!states), "states: {states}");
+    }
+}
+
+/// A standing pin is the whole decision's under a profile one of whose
+/// stages opens a scope, and under a binding with a shadow: no row is read
+/// here for it. Under neither, the same pin is followed by its one row.
+#[test]
+fn a_pin_under_a_scope_or_a_shadow_is_left_to_the_whole_decision() {
+    let rows = pool(16, 61, 0, 0);
+    let ring = ring_of(&rows);
+    let listed = Listed::of(&rows, &ring);
+    let cx = Constraints::default();
+    let rule = SessionRule {
+        assignment: Assignment::Delegate,
+        inflight_cap: 0,
+        ttl_micros: Some(60_000_000),
+        sweep_micros: 60_000_000,
+        recovery: Recovery::Original,
+    };
+    for (scoped, shadow) in [(false, None), (true, None), (false, Some(1))] {
+        let alike = || {
+            let stage = Alike {
+                states: false,
+                owns: false,
+                scoped,
+            };
+            let mut profile = profile_of("alike", Box::new(stage));
+            // A filter the engine holds itself: a row is asked under a scope too.
+            profile.filters = vec![Box::new(Healthy)];
+            profile
+        };
+        let binding = Binding {
+            shadow,
+            ..single(Some(rule))
+        };
+        let engine = Engine::new(vec![alike(), alike()], vec![binding], 1, Needs::default());
+        let request = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(9),
+            now_micros: 1_000,
+            ..RequestFacts::default()
+        };
+        let table = engine.sessions();
+        let _ = table.restore(request.session(), 1_000, &rule, rows[0].id);
         let followed = engine.decide_keyed(&mut { request }, &listed, &cx);
-        if states {
-            assert!(followed.is_none(), "the whole decision states the holding");
-            assert_eq!(listed.read(), 0);
-        } else {
-            let followed = followed.expect("the pin is followed");
-            let whole = engine.decide(&request, &facts_of(&rows), &rows, &cx, &mut Scratch::new());
-            assert_eq!(answer(&followed), answer(&whole));
-            assert_eq!(listed.read(), 1, "a pin is one row");
-        }
+        let left = scoped || shadow.is_some();
+        assert_eq!(followed.is_none(), left, "{scoped} {shadow:?}");
+        assert_eq!(listed.read(), u32::from(!left), "{scoped} {shadow:?}");
     }
 }
