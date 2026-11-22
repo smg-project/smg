@@ -6441,7 +6441,9 @@ impl Engine {
     /// filters then keep opens its prefills. A prefill is chosen among them
     /// by its own profile, its partners go to the one of them that holds the
     /// fewest requests, and the pair's trace says the lifted veto
-    /// ([`LiftedVeto::Overload`]). Under a binding that sheds, such a pool is
+    /// ([`LiftedVeto::Overload`]). On a retry the profile's soft filter keeps
+    /// that pick to the partners the request has not tried while one is
+    /// left. Under a binding that sheds, such a pool is
     /// shed as saturated. A decode pool the liveness veto refuses stays
     /// refused here, and so does a prefill pool refused whole: the prefill
     /// side is put to no rule.
@@ -6856,7 +6858,9 @@ impl Engine {
     /// of the decode pool, where the profile places. Partners that are all
     /// over their thresholds, or doubted, are put to the binding's all-vetoed
     /// rule, both its tiers: the rule picks afresh among them, whatever
-    /// decode the first decision named. A pair's first decision lifts the
+    /// decode the first decision named. Over partners all over their
+    /// thresholds it keeps to the ones the request has not tried while one
+    /// is left, as a first decision does. A pair's first decision lifts the
     /// overload veto alone ([`Self::decide_pair`]). Here the prefill has
     /// run, and a refusal fails its request.
     ///
