@@ -22,7 +22,9 @@ use smg_worker::{
 use tracing::warn;
 
 #[cfg(feature = "in-process")]
-use super::members::Members;
+use super::members::{Members, Stated};
+#[cfg(feature = "in-process")]
+use super::reach::{ListReach, Reach};
 use super::{
     credentials::Credentials,
     found::facts,
@@ -1181,6 +1183,32 @@ impl Objects<Members> {
         generation.lent(role, |members| self.fixed_facts(members))
     }
 
+    /// Who can dial each worker of the list [`Self::lent`] lends for
+    /// `role`: the wires the worker's row states and the gateways that
+    /// dial it, at the worker's place in that list. A host that decides
+    /// for one gateway reads it for the places that gateway may take.
+    ///
+    /// The reach is cut with the generation's lists, by the same pass and
+    /// the same read of the holder's rows, at the generation's first ask
+    /// of either. So it holds as many workers as the list lent, in the
+    /// list's order, and a decision that takes both of one generation
+    /// reads the two as one pass saw them.
+    ///
+    /// Who dials a worker moves within a row's life. Where the holder
+    /// keeps a handed-in object that move publishes nothing, and the
+    /// generation's reach stands as it was cut until the model's next
+    /// membership change, as its lists do.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a controller's deciding thread asks it once it decides by the engine over worker lists"
+        )
+    )]
+    pub(crate) fn reach<'a>(&self, generation: &'a Members, role: Role) -> &'a ListReach {
+        generation.reach(role, |members| self.fixed_facts(members))
+    }
+
     /// How many members were left out of the lists so far: a worker
     /// another writer registered, or one whose row's object was replaced
     /// or dropped between its generation's publish and that generation's
@@ -1190,9 +1218,10 @@ impl Objects<Members> {
     }
 
     /// What the holder's rows say of each of `members`, in their order:
-    /// whether the worker takes images, and the row's id. `None` for a
-    /// member the holder holds no row's object for, which is counted.
-    fn fixed_facts(&self, members: &[Arc<dyn Worker>]) -> Box<[Option<FixedFacts>]> {
+    /// whether the worker takes images, the row's id, and who can dial the
+    /// worker. `None` for a member the holder holds no row's object for,
+    /// which is counted.
+    fn fixed_facts(&self, members: &[Arc<dyn Worker>]) -> Box<[Option<Stated>]> {
         // The registry's ids first: the entry's lock is not held across a
         // read of the registry.
         let id_of = |member: &Arc<dyn Worker>| self.registry.get_id_by_url(member.url());
@@ -1204,10 +1233,13 @@ impl Objects<Members> {
             if laid.is_none() {
                 self.unstated.fetch_add(1, Relaxed);
             }
-            laid.map(|laid| FixedFacts {
-                vision: laid.remainder.vision,
-                id: Some(laid.remainder.standing.row),
-                ..FixedFacts::default()
+            laid.map(|laid| Stated {
+                facts: FixedFacts {
+                    vision: laid.remainder.vision,
+                    id: Some(laid.remainder.standing.row),
+                    ..FixedFacts::default()
+                },
+                reach: Reach::of(&laid.remainder),
             })
         });
         stated.collect()
