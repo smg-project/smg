@@ -1294,6 +1294,121 @@ mod tests {
         assert_eq!((engine.faults(), engine.unheard()), (0, 0));
     }
 
+    /// [`Hears`] as a stage that also keeps the outcome of each end it is
+    /// told.
+    #[derive(Debug)]
+    struct Ends(Hears, Arc<Mutex<Vec<Outcome>>>);
+
+    impl Lifecycle for Ends {
+        fn hears(&self) -> EventSet {
+            EventSet::LEASE
+        }
+
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.0.on_decision_issued(lease, decision);
+        }
+
+        fn on_dispatched(&self, lease: &Lease, target: &Target, side: Side, since: u32) {
+            self.0.on_dispatched(lease, target, side, since);
+        }
+
+        fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+            self.0.on_completed(lease, outcome);
+            self.1.lock().push(*outcome);
+        }
+    }
+
+    impl Picker for Ends {
+        fn name(&self) -> &'static str {
+            "ends"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// An encode side's end says nothing through a placement, as its send
+    /// says nothing: no lease stands for such a side. A single request's
+    /// placement is told one before the request is sent and one behind its
+    /// send. No stage hears a word of either, and the request is still
+    /// owed its end. Its own end behind them is said once, under the
+    /// request's side and the worker of the target taken, whatever its
+    /// host wrote there.
+    #[test]
+    fn an_encode_sides_end_through_a_placement_says_nothing() {
+        let (heard, ends) = (Heard::default(), Arc::new(Mutex::new(Vec::new())));
+        let kept = (Arc::clone(&heard), Arc::clone(&ends));
+        let engine = picked_by("ends", move || {
+            let hears = Hears {
+                heard: Arc::clone(&kept.0),
+                panics: false,
+                alone: false,
+                takes: EventSet::LEASE,
+            };
+            Box::new(Ends(hears, Arc::clone(&kept.1)))
+        });
+        let engine: &'static PolicyEngine = Box::leak(Box::new(engine));
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let asks = Asks::of(request(), Some(&members));
+        let (decided, later) = answered(engine, &asks).whole().expect("a whole decision");
+        let first = decided
+            .decision
+            .pick()
+            .and_then(|pick| pick.targets.first().copied());
+        let first = first.expect("a target");
+        let worker = Arc::clone(&list[first.position as usize]);
+        let now = Instant::now();
+        let placement =
+            crate::tracking::Placement::taken(engine, decided, later, now, 0, worker, None);
+        let mut placement = placement.expect("a placement");
+        let ended = |side: Side| Outcome {
+            side,
+            served: WorkerId(77),
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+        let words = || std::mem::take(&mut *heard.lock());
+        assert_eq!(words(), [("issued", first.id, 0)]);
+        // Unsent: no dispatch is said for it, and no end.
+        placement.ended(Side::Encode, ended(Side::Encode));
+        assert!(placement.owes_events(), "the request has not ended");
+        assert!(words().is_empty(), "an encode side's end is no word");
+        placement.sent(Side::Single);
+        assert_eq!(words(), [("dispatched", first.id, 0)]);
+        // Sent: the request's lease stands.
+        placement.ended(Side::Encode, ended(Side::Encode));
+        assert!(placement.owes_events(), "the request has not ended");
+        assert!(words().is_empty(), "an encode side's end is no word");
+        assert!(ends.lock().is_empty());
+        // The request's own end. Its host wrote another side there.
+        placement.ended(Side::Single, ended(Side::Decode));
+        assert!(!placement.owes_events());
+        assert_eq!(words(), [("completed", first.id, 0)]);
+        let told = Outcome {
+            side: Side::Single,
+            served: first.id,
+            ..ended(Side::Decode)
+        };
+        assert_eq!(*ends.lock(), [told]);
+        drop(placement);
+        assert!(words().is_empty(), "the drop says nothing more");
+        assert_eq!((engine.faults(), engine.unheard()), (0, 0));
+    }
+
     /// A placement under no lease owes nothing and says nothing: a place's,
     /// and a whole decision's under a document no stage of which takes a
     /// word. It names the list's own worker, counts under the profile that

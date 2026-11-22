@@ -4,12 +4,13 @@
 //! The engine of a gateway's own process answers a request in two shapes
 //! ([`Decided`](crate::engine::Decided)): a place of which nothing is owed,
 //! or a whole decision, whose pick is leased where a stage of the document
-//! takes a word of a request. A [`Placement`] is the one value for both. It
-//! names the worker the request goes to, and a pair's decode worker, as the
-//! host's own worker objects. Where the pick is leased it holds the lease
-//! behind a [`DecisionGuard`], and its host says two things of the request:
-//! [`Placement::sent`] and [`Placement::ended`]. Where no lease stands the
-//! two calls say nothing and read no clock.
+//! takes a word of a request, and always for a pair. A [`Placement`] is the
+//! one value for both. It names the worker the request goes to, and a
+//! pair's decode worker, as the host's own worker objects. Where the pick
+//! is leased it holds the lease behind a [`DecisionGuard`], and its host
+//! says two things of the request: [`Placement::sent`] and
+//! [`Placement::ended`]. Where no lease stands the two calls say nothing
+//! and read no clock.
 //!
 //! **Who makes one.** The host contract has one call for a request, which
 //! answers a placement (the design's section 8.2). That call is not built.
@@ -66,8 +67,9 @@ pub struct Placement<'a> {
     /// The profile whose picker picked, by its place in the document: what
     /// a host counts the decision under.
     pub profile: u16,
-    /// The pick's lease, where a stage of the document takes a word of a
-    /// request. `None` for an answer of which nothing is owed.
+    /// The pick's lease: a pair's always, a single request's where a stage
+    /// of the document takes a word of a request. `None` for an answer of
+    /// which nothing is owed.
     held: Option<DecisionGuard<&'static PolicyEngine>>,
 }
 
@@ -200,15 +202,16 @@ impl Placement<'_> {
     /// ([`DecisionGuard::completed`]). The placement writes into it the
     /// side and the worker that served, whatever its host wrote there: the
     /// worker of the target taken, or that target's decode worker for a
-    /// pair's decode side. It holds no encode worker, so an encode side's
-    /// outcome keeps the one its host named.
+    /// pair's decode side. No lease stands for an encode side, so its end
+    /// says nothing, as its send says nothing: it ends no side of the
+    /// request.
     pub fn ended(&mut self, side: Side, outcome: Outcome) {
         let Some(held) = &mut self.held else {
             return;
         };
         let target = *held.target();
         let served = match (side, target.pair) {
-            (Side::Encode, _) => outcome.served,
+            (Side::Encode, _) => return,
             (Side::Decode, Some(pair)) => pair.decode_id,
             _ => target.id,
         };

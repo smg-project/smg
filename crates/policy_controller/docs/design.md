@@ -979,13 +979,15 @@ impl Placement<'_> {
     pub fn owes_events(&self) -> bool;           // a side under a lease has not ended
     pub fn kept(self) -> Placement<'static>;     // without the borrowed key, to keep to the end
     // planned: one more call for a pair whose decode is chosen after its prefill has run
-    // dropped with a side not ended: the engine hears a release
+    // dropped with a side not ended: the engine hears a release before the side went out,
+    // and an end of class cancelled after it
 }
 ```
 
-Where the document's stages want no events, the placement holds nothing and these calls do
-nothing. Until `place` answers with it, a host makes a placement of the answer it holds:
-`Placement::alone` for a place, `Placement::taken` for a whole decision and the target it took.
+Where the document's stages want no events, a single request's placement holds nothing and
+these calls do nothing. A pair's placement always holds a lease (section 6). Until `place`
+answers with it, a host makes a placement of the answer it holds: `Placement::alone` for a
+place, `Placement::taken` for a whole decision and the target it took.
 
 Nothing else is asked of a host. In particular a host never names a policy, never looks inside a
 decision, never keeps a lease and never runs a timer for the engine.
@@ -1352,7 +1354,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing; a pair is decided without the host's load reports |
 | Encode-prefill-decode on that engine | **[planned]** | always refused today |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built over an answer its host holds; `place`, the start call and the engine's own task are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built over an answer its host holds; `place` and the start call are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |

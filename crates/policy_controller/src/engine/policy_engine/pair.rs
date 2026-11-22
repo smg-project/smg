@@ -1150,8 +1150,9 @@ mod tests {
     /// taken. It writes into each end the worker that served, from that
     /// target, whatever its host wrote there. Its two workers are the
     /// lists' own objects at the target's places. An encode side's send
-    /// says nothing: a pair whose host said that alone and let go is
-    /// released whole, as a guard dropped unsent.
+    /// and end say nothing. A pair told such an end behind its two sends
+    /// still owes both sides. A pair whose host said those two alone and
+    /// let go is released whole, as a guard dropped unsent.
     #[test]
     fn a_placement_says_a_pairs_words_and_names_the_workers_that_served() {
         let host: &'static Host = Box::leak(Box::new(Host::of(1, 2)));
@@ -1202,6 +1203,7 @@ mod tests {
         assert_eq!(placement.profile, profile);
         placement.sent(Side::Prefill);
         placement.sent(Side::Decode);
+        placement.ended(Side::Encode, outcome(Side::Encode, WorkerId(77)));
         // Its host names no worker and another side in each outcome.
         placement.ended(Side::Prefill, outcome(Side::Single, WorkerId(0)));
         assert!(placement.owes_events(), "the decode side has not ended");
@@ -1220,6 +1222,7 @@ mod tests {
         );
         let mut unsent = unsent.expect("a placement");
         unsent.sent(Side::Encode);
+        unsent.ended(Side::Encode, outcome(Side::Encode, WorkerId(77)));
         drop(unsent);
         let (through_placements, served) = words();
         let named = [(Side::Prefill, taken.id), (Side::Decode, pair.decode_id)];
