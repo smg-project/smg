@@ -74,7 +74,7 @@ pub use inkling2::inkling2;
 pub use iquest::iquest;
 pub use json::json;
 pub use k2_horizon::k2_horizon;
-pub use kimi_k2::kimi_k2;
+pub use kimi_k2::{kimi, kimi_k2};
 pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;

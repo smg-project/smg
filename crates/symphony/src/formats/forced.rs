@@ -1018,8 +1018,8 @@ mod tests {
     /// table has a tag but three: a table that reads no calls (`plain`), and the Inkling tables
     /// (`inkling`, `inkling2`) with the prompt's thought open where the grammar starts at the
     /// first token. A request whose every tool the table's syntax cannot write leaves that table
-    /// without a tag in every cell: a name with a space, a quote or a newline on `kimi_k2`; a
-    /// name or a required key with a quote and a bracket, or an empty required key, on
+    /// without a tag in every cell: a name with a space, a quote or a newline on `kimi_k2` and
+    /// `kimi`; a name or a required key with a quote and a bracket, or an empty required key, on
     /// `muse_spark`; a tool with no name on every table. One tool the syntax writes keeps the
     /// tag. A table that gains or loses a tag moves this list, and with it the outputs the
     /// variant reads.
@@ -1082,17 +1082,17 @@ mod tests {
             (
                 "a name with a space",
                 vec![tool("look up", city())],
-                &["kimi_k2"],
+                &["kimi_k2", "kimi"],
             ),
             (
                 "a name with a newline",
                 vec![tool("look\nup", city())],
-                &["kimi_k2"],
+                &["kimi_k2", "kimi"],
             ),
             (
                 "a name with a quote and a bracket",
                 vec![tool("look\"up<", city())],
-                &["kimi_k2", "muse_spark"],
+                &["kimi_k2", "kimi", "muse_spark"],
             ),
             (
                 "a name with a space beside a tool every syntax writes",
