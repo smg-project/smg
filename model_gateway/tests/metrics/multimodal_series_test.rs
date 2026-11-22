@@ -175,3 +175,54 @@ fn the_media_pipeline_families_render_as_histograms_with_their_values() {
         bytes.join("\n")
     );
 }
+
+/// The images-per-request family renders as a histogram on its own buckets,
+/// not as a summary, with one series per source class; a request without
+/// media is the 0 its first bucket holds.
+#[test]
+fn the_request_images_family_renders_as_a_histogram_by_source_class() {
+    let handle = recorder();
+    Metrics::record_mm_request_images("mm-images-model", "none", 0);
+    Metrics::record_mm_request_images("mm-images-model", "inline", 2);
+    Metrics::record_mm_request_images("mm-images-model", "remote", 3);
+    Metrics::record_mm_request_images("mm-images-model", "hybrid", 5);
+    let body = handle.render();
+
+    let lines = family(&body, "smg_mm_request_images");
+    let type_line = "# TYPE smg_mm_request_images histogram";
+    assert!(
+        lines.contains(&type_line),
+        "smg_mm_request_images is not a histogram:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("quantile=")),
+        "smg_mm_request_images renders as a summary:\n{}",
+        lines.join("\n")
+    );
+
+    let model = "model=\"mm-images-model\"";
+    // A request without media observes 0, which the le="0" bucket carries.
+    assert_eq!(
+        sample(
+            &lines,
+            &["_bucket", model, "source_class=\"none\"", "le=\"0\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &lines,
+            &["_bucket", model, "source_class=\"inline\"", "le=\"2\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(&lines, &["_count", model, "source_class=\"remote\""]),
+        1.0
+    );
+    assert_eq!(
+        sample(&lines, &["_sum", model, "source_class=\"hybrid\""]),
+        5.0
+    );
+}

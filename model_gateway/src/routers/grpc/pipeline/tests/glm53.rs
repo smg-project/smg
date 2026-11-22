@@ -382,6 +382,25 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
         Some(1.0),
         "{body}"
     );
+    // The request's one image, under the class of a `data:` URL.
+    assert_eq!(
+        sample(
+            &body,
+            "smg_mm_request_images_sum",
+            &[model.as_str(), "source_class=\"inline\""]
+        ),
+        Some(1.0),
+        "{body}"
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_mm_request_images_count",
+            &[model.as_str(), "source_class=\"inline\""]
+        ),
+        Some(1.0),
+        "{body}"
+    );
 }
 
 /// Chat preparation renders a `medium` effort on a GLM-5.3 model as
