@@ -4645,33 +4645,67 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) {
         let bytes = text.as_bytes();
+        let mut rest = text;
         // A text that starts with a space or a marker has its marker already,
         // unless the normalizer prepends one regardless.
-        let mut leading = marker
+        if marker
             && (chars.prepends_to_a_marked_text()
-                || !(text.starts_with(' ') || text.starts_with(WORD_MARKER)));
-        if leading && chars.cuts_at(&[b' ', bytes[0]], 1) {
-            self.tokenize_leading_piece(chars, "", mapped, ids, cache);
-            leading = false;
+                || !(text.starts_with(' ') || text.starts_with(WORD_MARKER)))
+        {
+            // The marker's piece goes before the walk, which then tests no
+            // piece for it: the marker alone when no token bridges it to the
+            // first byte, else the marker and the text up to its first cut.
+            let first = if chars.cuts_at(&[b' ', bytes[0]], 1) {
+                0
+            } else {
+                (1..bytes.len())
+                    .find(|&p| chars.cuts_at(bytes, p))
+                    .unwrap_or(bytes.len())
+            };
+            self.tokenize_leading_piece(chars, &text[..first], mapped, ids, cache);
+            rest = &text[first..];
         }
         chars.pieces(
-            bytes,
+            rest.as_bytes(),
             #[inline(always)]
-            |start, end| {
-                if leading {
-                    leading = false;
-                    self.tokenize_leading_piece(chars, &text[start..end], mapped, ids, cache);
-                } else {
-                    self.tokenize_raw_piece(chars, text, start..end, mapped, ids, cache);
-                }
-            },
+            |start, end| self.tokenize_raw_piece(chars, rest, start..end, mapped, ids, cache),
         );
     }
 
-    /// The piece `text[piece]` of a sentencepiece unit: the key read from
-    /// the text around it and the packed table's probe; the rest out of line.
+    /// The piece `text[piece]` of a sentencepiece unit, compiled into the
+    /// walk's loop as [`Self::tokenize_piece_in_place`] is into its own: the
+    /// key by its one read of the text, the packed table's probe, an entry's
+    /// inline ids. Every other piece leaves the loop by a call.
     #[inline(always)]
     fn tokenize_raw_piece(
+        &self,
+        chars: &CharSymbols,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let vacancy = match ShortPieceKey::in_window(text.as_bytes(), piece.start, piece.end) {
+            Some(key) => match cache.packed.lookup(key, ids) {
+                None => return,
+                Some(vacancy) if self.seeded_raw(vacancy, ids, cache) => return,
+                vacancy => vacancy,
+            },
+            None if piece.len() > SHORT_PIECE_MAX_BYTES => None,
+            None => {
+                return self.tokenize_raw_piece_off_loop(chars, text, piece, mapped, ids, cache)
+            }
+        };
+        self.tokenize_raw_piece_slow(chars, &text[piece], vacancy, mapped, ids, cache);
+    }
+
+    /// [`Self::tokenize_raw_piece`] for the short pieces its loop does not
+    /// answer by the one read: a piece near the end of the text, whose key
+    /// is read on its own, and one whose ids are in the spill.
+    #[cold]
+    #[inline(never)]
+    fn tokenize_raw_piece_off_loop(
         &self,
         chars: &CharSymbols,
         text: &str,
