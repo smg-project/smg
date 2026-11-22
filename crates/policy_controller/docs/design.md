@@ -742,8 +742,7 @@ calls. The switch is made whole, in one change, after the kept engine is proven 
 The two engines still share types. `Request`, `DecideOutcome`, `DecisionRefused`, `DecodeRefused`
 and `SweepOutcome` are defined in the trait's file, and `Said` (section 6) beside `Lease`. They
 were moved there with no behaviour change, because deleting the old engine would otherwise break
-the kept one. `GatewayId` and `pairing::Refusal`, the answer of `pair_refusal`, are still defined
-in the store.
+the kept one. `GatewayId` is still defined in the store.
 
 ### 5.8 What changes in the kept engine **[planned]**
 
@@ -754,7 +753,8 @@ in the store.
   `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`,
   `signal_cells`), and `Constraints::pins`. One of them needs a successor: a sessions rule with
   a cap asks `session_counted` of its host today.
-- The trait's three methods that the kept engine answers with a constant are built or removed.
+- The trait's two methods that the kept engine answers with a constant, `decide_encode_pair` and
+  `shadowed`, are built or removed.
 - The record of sent prefixes becomes the two trees (section 4.5).
 
 ## 6. The lease and its events **[built]**

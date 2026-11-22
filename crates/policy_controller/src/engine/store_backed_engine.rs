@@ -68,10 +68,10 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{
-        pairing::Refusal, AffinityQuery, AffinityRowsBuffers, AtWork, DecodeIssue, DecodeSide,
-        EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
-        LeasesStore, MemoryStore, PairBuffers, PickRecord, Pin, SessionsStore, Sides,
-        StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
+        AffinityQuery, AffinityRowsBuffers, AtWork, DecodeIssue, DecodeSide, EncodePairBuffers,
+        GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore,
+        MemoryStore, PairBuffers, PickRecord, Pin, SessionsStore, Sides, StoreSnapshot,
+        ViewBuffers, ViewFacts, ViewQuery,
     },
     tracking::{
         in_flight::WorkerSlot,
@@ -4156,11 +4156,6 @@ impl DecisionEngine for StoreBackedEngine {
         seeds: HashSeeds,
     ) -> PromptHashes {
         self.store().prompt_hashes(model, tokens, text, seeds)
-    }
-
-    fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal> {
-        self.store()
-            .with_snapshot(|world| world.pairs(model)?.refusal(wires).cloned())
     }
 
     fn faults(&self) -> u64 {

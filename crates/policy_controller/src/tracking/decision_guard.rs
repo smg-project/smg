@@ -830,14 +830,11 @@ mod tests {
                 },
                 StoreBackedEngine,
             },
-            view::{Candidate, Identity, RequestFacts, Session, WireModes, WorkerId},
+            view::{Candidate, Identity, RequestFacts, Session, WorkerId},
         },
         policies::random::Random,
         stages::lifecycle::Lifecycle,
-        store::{
-            pairing::Refusal, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
-            WorkersStore,
-        },
+        store::{GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, WorkersStore},
         tracking::lease::{
             Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
         },
@@ -1808,10 +1805,6 @@ mod tests {
             seeds: HashSeeds,
         ) -> PromptHashes {
             DecisionEngine::prompt_hashes(self.0, model, tokens, text, seeds)
-        }
-
-        fn pair_refusal(&self, model: &str, wires: WireModes) -> Option<Refusal> {
-            DecisionEngine::pair_refusal(self.0, model, wires)
         }
 
         fn faults(&self) -> u64 {
