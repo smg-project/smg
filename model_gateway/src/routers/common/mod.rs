@@ -435,6 +435,18 @@ pub mod bench_support {
                 .get()
                 .map_or(0, |members| members.conversions())
         }
+
+        /// [`Self::conversions`] over the two lists a pair of `model` is
+        /// placed over on the gRPC wire.
+        pub fn pair_conversions(registry: &WorkerRegistry, model: &str) -> u64 {
+            let snapshot = registry.get_routing_snapshot(model);
+            let (prefill, decode) = PdWire::Grpc.pools();
+            let converted = |pool| {
+                let members = snapshot.pool_members_cell(pool).get();
+                members.map_or(0, |members| members.conversions())
+            };
+            converted(prefill) + converted(decode)
+        }
     }
 
     /// One request's routing by the gateway's engine object on `route`, as
@@ -566,6 +578,58 @@ pub mod bench_support {
         let prefill = WorkerLoadGuard::with_key(pair.prefill, policies.sticky_key(None, None));
         let decode = WorkerLoadGuard::with_key(pair.decode, policies.sticky_key(None, None));
         drop((prefill, decode));
+        Some(went)
+    }
+
+    /// One request's routing by the gateway's engine object as a pair
+    /// router's arm runs it on the gRPC wire: the prompt's hashes, the
+    /// pair's ask at its prefill over the registry's two lists and the
+    /// commit of the first pair the gateway can send to, each side's
+    /// dispatch word, each side's load guard from the send to the request's
+    /// end, and each side's end word. No prefill limit is held. The prefill
+    /// worker the request went to (`placed_on`), and `None` where it had
+    /// no pair.
+    ///
+    /// What [`route_pair`] does under the classic policies, with the engine
+    /// deciding the whole pair through the object the routers hold.
+    pub fn route_engine_pair(
+        object: &EngineObject,
+        model: &str,
+        tokens: Option<&[u32]>,
+    ) -> Option<usize> {
+        let hashes = object.0.hashes(model, &Prompt::of(tokens, None));
+        let id = mark();
+        let ask = Ask {
+            phase: Phase::Prefill,
+            decode_again: true,
+            wires: WireModes::GRPC.union(WireModes::ZMQ),
+            hashes: Some(&hashes),
+            ..Ask::of(&id, model)
+        };
+        // With no prefill limit the arm's future is ready at its first poll.
+        let placing = pin!(object.0.place_pair(&ask, None, None));
+        let Poll::Ready(Ok((mut placed, prefill))) =
+            placing.poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            return None;
+        };
+        let decode = placed.decode().map(Arc::clone)?;
+        let went = placed_on(placed.worker());
+        let now = Instant::now();
+        placed.dispatched(now);
+        placed.decode_dispatched(now);
+        let decode = WorkerLoadGuard::with_key(decode, None);
+        drop((prefill, decode));
+        let end = End {
+            status: 200,
+            class: TransportClass::Ok,
+            ttft_micros: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: 0,
+        };
+        placed.completed(end, now);
+        placed.decode_completed(end, now);
         Some(went)
     }
 

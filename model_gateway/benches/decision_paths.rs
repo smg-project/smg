@@ -45,6 +45,8 @@
 //! size of prefill workers and as many decode workers, on the gRPC wire,
 //! and a request is placed as a pair by the classic pair placement, its
 //! two side policies the classic ones or the objects that ask the engine.
+//! On the `engine` path the gateway's engine object places the pair, as a
+//! pair router's arm asks it: one decision over the registry's two lists.
 //! `--not-ready` and `--ready` then hold for each side.
 //!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
@@ -125,9 +127,9 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, route_engine, route_pair,
-                route_records, set_pair_sides, thread_allocated_bytes, EngineObject,
-                EngineOverRecords, Route,
+                attach_loads, policies_asking_the_engine, route_classic, route_engine,
+                route_engine_pair, route_pair, route_records, set_pair_sides,
+                thread_allocated_bytes, EngineObject, EngineOverRecords, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -538,10 +540,11 @@ fn build(cell: &Cell) -> Built {
             Some(Arc::new(policies))
         }
         "object" => Some(Arc::new(policies_asking_the_engine(&config).unwrap())),
-        "records" | "engine" => {
+        "records" => {
             assert!(!cell.pair, "this path places single requests");
             None
         }
+        "engine" => None,
         other => panic!("no path {other}"),
     };
     let models = model_ids(cell.models);
@@ -598,11 +601,15 @@ fn build(cell: &Cell) -> Built {
     let conversions: Box<dyn Fn() -> u64 + Send + Sync> = {
         let (decider, registry, models) =
             (Arc::clone(&decider), Arc::clone(&registry), models.clone());
-        let route = cell.route;
+        let (route, cell_pair) = (cell.route, cell.pair);
         Box::new(move || match &*decider {
             Decider::Records(engine) => models
                 .iter()
                 .map(|model| engine.conversions(&registry, model, route))
+                .sum(),
+            Decider::Engine(_) if cell_pair => models
+                .iter()
+                .map(|model| EngineObject::pair_conversions(&registry, model))
                 .sum(),
             Decider::Engine(_) => models
                 .iter()
@@ -637,6 +644,7 @@ fn build(cell: &Cell) -> Built {
             Decider::Records(engine) => {
                 route_records(&registry, engine, model, route, Some(tokens), headers)
             }
+            Decider::Engine(object) if pair => route_engine_pair(object, model, Some(tokens)),
             Decider::Engine(object) => route_engine(&registry, object, model, route, Some(tokens)),
         }
     });
