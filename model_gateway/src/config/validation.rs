@@ -466,7 +466,15 @@ impl ConfigValidator {
         let retry_cfg = config.effective_retry_config();
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
-        Self::validate_circuit_breaker(&cb_cfg)?;
+        Self::validate_circuit_breaker(
+            [
+                "circuit_breaker.failure_threshold",
+                "circuit_breaker.success_threshold",
+                "circuit_breaker.timeout_duration_secs",
+                "circuit_breaker.window_duration_secs",
+            ],
+            &cb_cfg,
+        )?;
         Self::validate_health_check(&config.health_check)?;
 
         if config.history_backend == HistoryBackend::Oracle {
@@ -1722,29 +1730,30 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
+    /// The floors of the breaker's settings. The four names are the failure
+    /// threshold, the success threshold, the open time and the failure
+    /// window as the caller's input spells them: the global settings, or a
+    /// worker's overrides at registration.
+    pub(crate) fn validate_circuit_breaker(
+        [failure_threshold, success_threshold, timeout, window]: [&str; 4],
+        cb: &CircuitBreakerConfig,
+    ) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
             return Err(ConfigError::invalid_value(
-                "circuit_breaker.failure_threshold",
+                failure_threshold,
                 cb.failure_threshold,
                 "Must be >= 1 (set to u32::MAX to effectively disable CB)",
             ));
         }
         if cb.success_threshold < 1 {
             return Err(ConfigError::invalid_value(
-                "circuit_breaker.success_threshold",
+                success_threshold,
                 cb.success_threshold,
                 "Must be >= 1",
             ));
         }
-        require_positive(
-            "circuit_breaker.timeout_duration_secs",
-            cb.timeout_duration_secs,
-        )?;
-        require_positive(
-            "circuit_breaker.window_duration_secs",
-            cb.window_duration_secs,
-        )?;
+        require_positive(timeout, cb.timeout_duration_secs)?;
+        require_positive(window, cb.window_duration_secs)?;
         Ok(())
     }
 

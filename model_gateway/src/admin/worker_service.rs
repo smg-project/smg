@@ -32,7 +32,10 @@ use smg_worker::{
 use tracing::warn;
 
 use crate::{
-    config::{unused_credentials_warning, validate_worker_url, RouterConfig},
+    config::{
+        unused_credentials_warning, validate_worker_url, validation::ConfigValidator,
+        CircuitBreakerConfig, RouterConfig,
+    },
     routers::{common::snapshot::WorkerRegistry, provider_support},
     workflow::{job_queue::cancel_registration, Job, JobQueue, WorkerRegistrationMode},
 };
@@ -107,8 +110,9 @@ pub(crate) fn control_character_refusal<'a>(
 /// reserved for discovery; the fields the routers rely on (a positive,
 /// finite cost; a KV block size and a data-parallel size of at least 1; a
 /// rank only with a size and below it; a bootstrap port that is a port); a
-/// probe interval and a probe timeout the health schedule can hold. A
-/// violation is a `400 Bad Request` naming the field.
+/// probe interval and a probe timeout the health schedule can hold; breaker
+/// overrides at the floors of the global settings. A violation is a
+/// `400 Bad Request` naming the field.
 fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
         return Err(bad_request(format!(
@@ -126,6 +130,24 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;
     validate_health(&spec.health)?;
+    // The start checks the effective settings; here a given zero is refused
+    // whatever the breaker's switches say, and an override left out passes.
+    let breaker = &spec.resilience;
+    ConfigValidator::validate_circuit_breaker(
+        [
+            "resilience.cb_failure_threshold",
+            "resilience.cb_success_threshold",
+            "resilience.cb_timeout_secs",
+            "resilience.cb_window_secs",
+        ],
+        &CircuitBreakerConfig {
+            failure_threshold: breaker.cb_failure_threshold.unwrap_or(1),
+            success_threshold: breaker.cb_success_threshold.unwrap_or(1),
+            timeout_duration_secs: breaker.cb_timeout_secs.unwrap_or(1),
+            window_duration_secs: breaker.cb_window_secs.unwrap_or(1),
+        },
+    )
+    .map_err(|e| bad_request(e.to_string()))?;
     if spec.kv_block_size == Some(0) {
         return Err(bad_request(
             "kv_block_size must be at least 1 (tokens per KV block)".to_string(),
@@ -1767,6 +1789,22 @@ mod tests {
             (json!({"url": url, "dp_rank": 2, "dp_size": 2}), "dp_rank"),
             (json!({"url": url, "bootstrap_port": 0}), "bootstrap_port"),
             (
+                json!({"url": url, "resilience": {"cb_failure_threshold": 0}}),
+                "'resilience.cb_failure_threshold': 0 - Must be >= 1 (set to u32::MAX to effectively disable CB)",
+            ),
+            (
+                json!({"url": url, "resilience": {"cb_success_threshold": 0}}),
+                "'resilience.cb_success_threshold': 0 - Must be >= 1",
+            ),
+            (
+                json!({"url": url, "resilience": {"cb_timeout_secs": 0}}),
+                "'resilience.cb_timeout_secs': 0 - Must be > 0",
+            ),
+            (
+                json!({"url": url, "resilience": {"cb_window_secs": 0}}),
+                "'resilience.cb_window_secs': 0 - Must be > 0",
+            ),
+            (
                 json!({"url": format!("grpc://{}:1", "a".repeat(2049))}),
                 "url",
             ),
@@ -1789,6 +1827,7 @@ mod tests {
         // every dp-aware rank worker; only a discovered one is divided per rank.
         let spec: WorkerSpec = serde_json::from_value(json!({
             "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
+            "resilience": {"cb_failure_threshold": 1, "cb_success_threshold": 1, "cb_timeout_secs": 1, "cb_window_secs": 1},
             "labels": {
                 "max_running_requests": "256", "max_num_seqs": "70000",
                 "supports_vision": "true", "served_model_name": "m"
