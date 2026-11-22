@@ -6,7 +6,10 @@
 
 use std::fmt;
 
-use crate::engine::{sticky_sessions::SessionVerdict, view::WorkerId};
+use crate::engine::{
+    sticky_sessions::{DecodeVerdict, SessionVerdict},
+    view::WorkerId,
+};
 #[cfg(feature = "controller")]
 use crate::service::proto;
 
@@ -35,6 +38,11 @@ pub struct Pair {
     pub decode_position: u32,
     pub decode_id: WorkerId,
     pub decode_dp_rank: u16,
+    /// What the decision did with the decode side's session key, as the
+    /// pair of a pick's first target states it: a claim names that pair's
+    /// decode. The pick's own verdict ([`Pick::session_verdict`]) is the
+    /// prefill side's. It is one byte the pair had spare.
+    pub decode_verdict: DecodeVerdict,
 }
 
 /// The ordered targets of a pick: the best first. For a pair the list reads
@@ -101,9 +109,10 @@ impl Targets {
 
     /// Turns a decode side's targets into a pair's where they stand: each
     /// names `prefill` with the decode it held, in the order they had.
-    /// Nothing is stated of a pair's first target ([`Pick::overlap`]). The
-    /// entries past the count are not rewritten, as [`Self::clear`] leaves
-    /// them. No accessor goes past the count.
+    /// Nothing is stated of a pair's first target ([`Pick::overlap`]), and
+    /// no pair states a verdict of its decode side. The entries past the
+    /// count are not rewritten, as [`Self::clear`] leaves them. No accessor
+    /// goes past the count.
     pub(crate) fn pair_under(&mut self, prefill: &Target) {
         for target in &mut self.items[..usize::from(self.len)] {
             *target = Target {
@@ -114,6 +123,7 @@ impl Targets {
                     decode_position: target.position,
                     decode_id: target.id,
                     decode_dp_rank: target.dp_rank,
+                    decode_verdict: DecodeVerdict::NONE,
                 }),
             };
         }
@@ -747,6 +757,17 @@ mod tests {
         assert_eq!(pick.overlap(), Overlap::NONE);
     }
 
+    /// The decode side's verdict costs a pair no byte: it sits in one the
+    /// pair had spare. A target and a pick are the size they were, and a
+    /// pair no decision spoke of reads none.
+    #[test]
+    fn the_decode_sides_verdict_costs_the_pair_no_byte() {
+        assert_eq!(size_of::<DecodeVerdict>(), 1);
+        assert_eq!((size_of::<Pair>(), size_of::<Target>()), (16, 40));
+        assert_eq!(size_of::<Pick>(), 256);
+        assert_eq!(Pair::default().decode_verdict, DecodeVerdict::NONE);
+    }
+
     #[test]
     fn targets_keep_order_and_refuse_a_fifth() {
         let mut targets = Targets::new();
@@ -915,6 +936,7 @@ mod tests {
                     decode_position: position,
                     decode_id: decode(position).id,
                     decode_dp_rank: decode(position).dp_rank,
+                    ..Pair::default()
                 }),
                 ..prefill
             });

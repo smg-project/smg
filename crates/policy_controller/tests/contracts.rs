@@ -292,7 +292,8 @@ fn pair_record() -> &'static [&'static str] {
         Pair {
             decode_position,
             decode_id,
-            decode_dp_rank
+            decode_dp_rank,
+            decode_verdict
         }
     )
 }
@@ -758,7 +759,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Pair",
             record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             wire_only: &[],
             wire: &[
                 ("decode_id", Type::Fixed64),
@@ -947,7 +948,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
-            host_only: &["decode_position"],
+            host_only: &["decode_position", "decode_verdict"],
             before: &[],
             beside: &[],
         },

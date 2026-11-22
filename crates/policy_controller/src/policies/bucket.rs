@@ -2251,7 +2251,7 @@ mod tests {
             pair: Some(Pair {
                 decode_position: decode,
                 decode_id: pool[decode as usize].id,
-                decode_dp_rank: 0,
+                ..Pair::default()
             }),
         };
         let mut targets = Targets::new();
@@ -2379,6 +2379,7 @@ mod tests {
                     decode_position: 1,
                     decode_id: pool[1].id,
                     decode_dp_rank: rank,
+                    ..Pair::default()
                 }),
             });
         }
@@ -2438,7 +2439,7 @@ mod tests {
                 pair: Some(Pair {
                     decode_position,
                     decode_id,
-                    decode_dp_rank: 0,
+                    ..Pair::default()
                 }),
             });
             Decision::Pick(Pick {

@@ -6,7 +6,8 @@
 //! a struct's declaration order binding nothing). The host-only fields (a load row's
 //! resident-count flag, a candidate's position and
 //! sample instant, a request's host clock, affinity column and model fingerprint, a lease's
-//! issue instant and session verdict, a target's and a pair's positions) are named as such.
+//! issue instant and session verdict, a target's and a pair's positions, a pair's decode
+//! verdict) are named as such.
 //! A `candidate` is tied to two structs, the engine's row and its entry of
 //! the request's affinity column: each is destructured whole, and the
 //! record's order, which neither struct holds, is named beside them.
@@ -16,7 +17,7 @@
 use crate::{
     engine::{
         decision::{Pair, Target},
-        sticky_sessions::SessionVerdict,
+        sticky_sessions::{DecodeVerdict, SessionVerdict},
         view::{
             AffinityFacts, AffinityRows, Candidate, Engines, HashKind, Header, Health, Identity,
             LoadRow, MediaCounts, ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts,
@@ -73,9 +74,11 @@ wit! {
     Option<Pair> => "option<pair>",
     // A session crosses as its value.
     Session => "u64",
-    // Host-only: a lease's session verdict never reaches a guest, and a
-    // request's model crosses as its name, never as the host's fingerprint.
+    // Host-only: a lease's session verdict and a pair's decode side's never
+    // reach a guest, and a request's model crosses as its name, never as
+    // the host's fingerprint.
     SessionVerdict => "host-only",
+    DecodeVerdict => "host-only",
     ModelFingerprint => "host-only",
     // Host-only: a guest reads the request's affinity column as five fields
     // of each candidate.
@@ -240,7 +243,9 @@ pub(crate) fn all() -> Vec<Probe> {
             id, kind, side, target_index, booked, generation, session as "session-key",
             session_verdict, issued_micros, tokens,
         } host [booked, session_verdict, issued_micros], &lease),
-        probe!("pair", before [], Pair { decode_position, decode_id, decode_dp_rank } host [decode_position], &pair),
+        probe!("pair", before [], Pair {
+            decode_position, decode_id, decode_dp_rank, decode_verdict,
+        } host [decode_position, decode_verdict], &pair),
         probe!("target", before [], Target { position, id, dp_rank, pair } host [position], &target),
         probe!("completed", before ["lease": "lease"], Outcome {
             side, served, status, class, ttft_micros, tokens_in, tokens_out, duration_micros,

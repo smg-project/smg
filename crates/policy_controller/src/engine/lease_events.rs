@@ -52,14 +52,18 @@ pub(crate) fn single(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
 }
 
 /// The decode side's lease as issued beside `prefill`, the prefill side's:
-/// it books the decode of `first`, the pick's first target. `None` where
-/// that target names no pair.
+/// it books the decode of `first`, the pick's first target, and states the
+/// decode side's own session verdict, which that target's pair keeps
+/// ([`Pair::decode_verdict`](super::decision::Pair::decode_verdict)).
+/// `None` where that target names no pair.
 pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session) -> Option<Lease> {
+    let pair = first.pair?;
     Some(Lease {
         side: Side::Decode,
         target_index: 0,
-        booked: first.pair?.decode_id,
+        booked: pair.decode_id,
         session,
+        session_verdict: pair.decode_verdict.on(pair.decode_id),
         ..*prefill
     })
 }

@@ -185,12 +185,12 @@ fn targets(told: &[proto::Target]) -> Result<Targets, Unread> {
             .pair
             .map(|pair| {
                 Ok(Pair {
-                    decode_position: 0,
                     decode_id: WorkerId(pair.decode_id),
                     decode_dp_rank: narrow(
                         pair.decode_dp_rank,
                         "pick.targets.pair.decode_dp_rank",
                     )?,
+                    ..Pair::default()
                 })
             })
             .transpose()?;
