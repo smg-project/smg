@@ -2108,7 +2108,14 @@ impl WorkerSelectionStage {
             return Err(no_worker());
         }
 
-        let prompt = engine::Prompt::of(inputs.tokens, inputs.cache_namespace);
+        // A request with no token ids is kept by its text, as the classic
+        // policy keeps it: the engine of this process is stated the text
+        // beside the ids, and the ids win where both stand. A followed
+        // controller is stated the ids alone, as before.
+        let prompt = engine::Prompt {
+            text: inputs.text.filter(|_| snapshot.is_some()),
+            ..engine::Prompt::of(inputs.tokens, inputs.cache_namespace)
+        };
         let hashes = policy_engine.hashes(model_id, &prompt);
         let id = engine::mark();
         let rule = on_route(RoutingPool::GrpcPipelineRegular, wire, attempt.ledger());
