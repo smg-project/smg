@@ -106,7 +106,7 @@ fn turn(policy_engine: &PolicyEngine, series: &mut Series, now: Instant) {
 /// shutdown waits for no turn but one that has begun.
 #[expect(
     clippy::disallowed_methods,
-    reason = "a turn writes this process's store and series alone and the task ends behind its policy engine: a shutdown waits for neither"
+    reason = "a turn writes this process's store and series alone and the task ends behind its policy engine: a shutdown has to wait for neither"
 )]
 pub(crate) fn start(policy_engine: &Arc<PolicyEngine>) -> JoinHandle<()> {
     let policy_engine = Arc::downgrade(policy_engine);
