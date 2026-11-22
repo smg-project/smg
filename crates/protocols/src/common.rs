@@ -147,23 +147,14 @@ where
 /// cache salt, an extra classification key, and the LoRA adapter. Two
 /// requests that share a prompt but differ in any of these can never share
 /// cached blocks on the engine, so routing derives its cache namespace from
-/// this projection. All fields absent means the request is unpartitioned.
+/// this projection. All fields absent means the request is unpartitioned,
+/// and an empty string is a field absent: routing's derivation of the
+/// namespace owns that rule.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CachePartition<'a> {
     pub cache_salt: Option<&'a str>,
     pub extra_key: Option<&'a str>,
     pub lora_path: Option<&'a str>,
-}
-
-impl CachePartition<'_> {
-    /// True when no partitioning field is set. An empty string is "unset":
-    /// engines treat an empty salt or adapter as absent, so it must not
-    /// split the request off from the shared unpartitioned cache.
-    pub fn is_empty(&self) -> bool {
-        [self.cache_salt, self.extra_key, self.lora_path]
-            .iter()
-            .all(|field| field.is_none_or(str::is_empty))
-    }
 }
 
 /// Trait for unified access to generation request properties

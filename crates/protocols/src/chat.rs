@@ -2099,7 +2099,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap();
-        assert!(bare.cache_partition().is_empty());
+        assert_eq!(bare.cache_partition(), Default::default());
     }
 
     #[test]
