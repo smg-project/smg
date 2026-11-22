@@ -49,6 +49,8 @@
 
 #[path = "../tests/common/counting_alloc.rs"]
 mod counting_alloc;
+#[path = "in_process/pair.rs"]
+mod pair;
 
 #[cfg(any(target_env = "msvc", target_env = "musl"))]
 use std::alloc::System as Allocator;
@@ -123,7 +125,7 @@ type Cell = (
 );
 
 /// The cells. A change that moves a policy's cost adds its entry here.
-const CELLS: [Cell; 8] = [
+const CELLS: [Cell; 11] = [
     ("round_robin", || preset("round_robin"), plain, |_| ()),
     ("random", || preset("random"), plain, |_| ()),
     ("passthrough", || preset("passthrough"), plain, |_| ()),
@@ -140,6 +142,24 @@ const CELLS: [Cell; 8] = [
         "consistent_hashing",
         || preset("consistent_hashing"),
         keyed,
+        |_| (),
+    ),
+    (
+        "pair_least_load",
+        || pair::of("least_load"),
+        pair::request,
+        |_| (),
+    ),
+    (
+        "pair_round_robin",
+        || pair::of("round_robin"),
+        pair::request,
+        |_| (),
+    ),
+    (
+        "pair_round_robin_later",
+        || pair::of("round_robin"),
+        pair::later,
         |_| (),
     ),
 ];
@@ -433,7 +453,11 @@ impl Host {
 
 fn main() {
     let run = run();
-    let (name, document, request, behind) = run.cell;
+    // A pair's cell hands two lists: its run is its file's.
+    if pair::runs(&run) {
+        return;
+    }
+    let (_, document, request, behind) = run.cell;
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
         .collect();
@@ -484,14 +508,31 @@ fn main() {
         request,
         plain: request(0).plain(),
     };
-    let decide = |seed: u64| host.place(seed);
+    let (publish, converted) = (|| feed.publish(&loads), || host.members.conversions());
+    measure(&run, engine, upkeep, publish, converted, |seed| {
+        host.place(seed)
+    });
+}
+
+/// The run's decisions, each made by `decide`, and the run's one line.
+/// `upkeep` is the runtime the task of `engine` was spawned on. `publish`
+/// publishes the reports again, as a new snapshot, and `converted` says how
+/// many times the cell's lists had their reports converted so far.
+fn measure(
+    run: &Run,
+    engine: &PolicyEngine,
+    upkeep: tokio::runtime::Runtime,
+    publish: impl Fn() + Sync,
+    converted: impl Fn() -> u64,
+    decide: impl Fn(u64) -> Option<u32> + Sync,
+) {
     // The task's first step is taken ahead of the list's first requests:
     // the runtime is turned for it, then requests are made until one reads
     // the engine's snapshot, each try a request of its own. A list converts
     // its reports once its requests have looked up as many as it holds, so
     // the tries follow the list's length. A thread of its own turns the
     // runtime from then on.
-    let read = || !engine.spec().needs().loads || host.members.conversions() > 0;
+    let read = || !engine.spec().needs().loads || converted() > 0;
     for probe in 0..1_000 + run.workers as u64 {
         if read() {
             break;
@@ -513,7 +554,7 @@ fn main() {
     let (busy_nanos, placed, allocations) =
         (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let (publications, left, end) = (AtomicU64::new(0), Mutex::new(run.callers), Condvar::new());
-    let converted_before = host.members.conversions();
+    let converted_before = converted();
     let wall = thread::scope(|scope| {
         let one_caller = |caller: u64| {
             let seed = |turn: u64| mix(caller << 40 | turn);
@@ -542,7 +583,7 @@ fn main() {
             scope.spawn(|| {
                 let (gap, mut left) = (Duration::from_millis(run.publish_ms), left.lock());
                 while end.wait_while_for(&mut left, |n| *n > 0, gap).timed_out() && *left > 0 {
-                    feed.publish(&loads);
+                    publish();
                     publications.fetch_add(1, Ordering::Relaxed);
                 }
             });
@@ -556,13 +597,13 @@ fn main() {
     assert_eq!(placed.into_inner(), total, "a worker takes it");
     println!(
         "cell={} workers={} callers={} overloaded={} publish_ms={} publications={} conversions={} allocations_per_decision={:.4} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
-        name,
+        run.cell.0,
         run.workers,
         run.callers,
         run.overloaded,
         run.publish_ms,
         publications.into_inner(),
-        host.members.conversions() - converted_before,
+        converted() - converted_before,
         allocations.into_inner() as f64 / total as f64,
         total,
         wall.as_secs_f64(),

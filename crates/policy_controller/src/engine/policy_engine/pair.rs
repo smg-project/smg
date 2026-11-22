@@ -35,10 +35,15 @@
 //! decision and for its decode asked again: the decision ([`decide`]), with
 //! the lease a pick issued.
 //!
-//! No function here takes a lock. A decision's records are written into
+//! No function here waits for a lock. A decision's records are written into
 //! buffers of the calling thread, so it allocates nothing once they have
-//! grown to the lists. A stage that hears a word takes what it takes of
-//! its own state.
+//! grown to the lists. The one exception stands under a snapshot of load
+//! reports: one decision converts a list's reports, at most once a
+//! published snapshot a list. It allocates the converted rows, under the
+//! list's claim, which is tried and never waited for
+//! ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)). A
+//! stage takes what it takes of its own state, where it scores a record by
+//! its report and where it hears a word.
 
 use std::{
     cell::RefCell,
@@ -376,7 +381,8 @@ pub(super) fn issue_decode(
 /// nothing its host hears of later: no lease is issued, no id is taken and
 /// no stage is told. With no `target` it is the pair's first decision. With
 /// the target the pair holds it is the decode decided again behind that
-/// target's prefill ([`PairLists::decide`]).
+/// target's prefill ([`PairLists::decide`]). Both lists' records read their
+/// workers' reports in `loads`, as a single's do.
 ///
 /// A request held to wires is its host's to hand lists for. Where a worker
 /// of either list is dialed on a wire the request does not state, the
@@ -388,6 +394,7 @@ pub(super) fn decide(
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     target: Option<&Target>,
+    loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> Decision {
     let wires = request.constraints.wire_modes;
@@ -396,7 +403,7 @@ pub(super) fn decide(
         return single::declined(own, request, WIRES);
     }
     let spec = &own.spec;
-    lists.decide(spec, None, &own.clock, now, request, target)
+    lists.decide(spec, loads, &own.clock, now, request, target)
 }
 
 /// One decision of a pair by `own`, the engine of a gateway's own process,
@@ -407,17 +414,21 @@ pub(super) fn decide(
 /// issues the decode side under the held lease, dated at this call
 /// ([`issue_decode`]). A lease's dispatch is due as a single's.
 ///
-/// The decision is the pair's alone ([`decide`]), the wires' test in it. A
-/// decision that picks no pair issues nothing.
+/// The decision is the pair's alone ([`decide`]), the wires' test in it. It
+/// reads the reports in `loads`: the snapshot the request gives for this
+/// call, or the newest the engine's own task keeps at hand. A decision that
+/// picks no pair issues nothing.
 pub(super) fn decided(
     own: &PolicyEngine,
     lists: &PairLists<'_>,
     request: &mut Request<'_>,
     held: Option<&HeldDecision<'_>>,
+    loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
 ) -> DecideOutcome {
     let (spec, later) = (&own.spec, request.constraints.decode_later);
-    let decision = decide(own, lists, request, held.map(|held| held.target), now);
+    let target = held.map(|held| held.target);
+    let decision = decide(own, lists, request, target, loads, now);
     let (engine, facts) = (spec.engine(), &request.facts);
     let issued = match held {
         // A shed writes no word that every pick shares.
@@ -445,8 +456,9 @@ mod tests {
     use parking_lot::Mutex;
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
+        load::state::{one_rank_load, TestFeed},
         test_support::no_health_check,
-        worker::{ConnectionMode, WorkerSpec, WorkerStatus, WorkerType},
+        worker::{ConnectionMode, WorkerLoadResponse, WorkerSpec, WorkerStatus, WorkerType},
     };
 
     use super::*;
@@ -1030,8 +1042,9 @@ mod tests {
         members: [PoolMembers; 2],
     }
 
-    /// A pair's request stated ahead, with the lists its host hands for it.
-    struct Asks<'a>(Request<'a>, PairLists<'a>);
+    /// A pair's request stated ahead, with the lists its host hands for it
+    /// and its snapshot of the workers' reports, where it lends one.
+    struct Asks<'a>(Request<'a>, PairLists<'a>, Option<Arc<LoadSnapshot>>);
 
     impl RequestMaker for Asks<'_> {
         fn model(&self) -> &str {
@@ -1044,6 +1057,10 @@ mod tests {
 
         fn workers(&self) -> WorkerLists<'_> {
             WorkerLists::Pair(self.1)
+        }
+
+        fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
+            self.2.as_ref()
         }
     }
 
@@ -1108,7 +1125,7 @@ mod tests {
                 facts: keyed(),
                 constraints,
             };
-            Asks(request, lists)
+            Asks(request, lists, None)
         }
 
         /// What the stages heard since the last call: each word, its side
@@ -1185,6 +1202,33 @@ mod tests {
             assert_eq!(worker_id(self.prefills[prefill].as_ref()), first.id);
             assert_eq!(worker_id(self.decodes[decode].as_ref()), pair.decode_id);
             (prefill, decode)
+        }
+
+        /// [`Self::asks`] drawing by `seed`, with the snapshot of the
+        /// workers' reports its host lends for the call.
+        fn asks_by<'a>(
+            &'a self,
+            classes: &'a PartnerClasses,
+            (seed, later): (u64, bool),
+            loads: Option<Arc<LoadSnapshot>>,
+        ) -> Asks<'a> {
+            let mut stated = self.asks(classes, later);
+            stated.0.facts = RequestFacts { seed, ..facts() };
+            stated.2 = loads;
+            stated
+        }
+
+        /// The places of the pair `stated` is first decided to, by the
+        /// engine's entry for a whole decision.
+        fn first(&self, stated: &Asks<'_>) -> (usize, usize) {
+            let decided = self
+                .engine
+                .decide_under(GatewayId::LOCAL, stated, Instant::now());
+            let (outcome, _) = decided
+                .expect("an answer")
+                .whole()
+                .expect("a whole decision");
+            self.picked(&outcome.decision)
         }
     }
 
@@ -1943,8 +1987,9 @@ mod tests {
         for _ in 0..4 {
             let mut asked = alone.asks(&classes, false);
             let mut leased = leasing.asks(&classes, false);
-            let decision = decide(&alone.engine, &asked.1, &mut asked.0, None, now);
-            let outcome = super::decided(&leasing.engine, &leased.1, &mut leased.0, None, now);
+            let decision = decide(&alone.engine, &asked.1, &mut asked.0, None, None, now);
+            let outcome =
+                super::decided(&leasing.engine, &leased.1, &mut leased.0, None, None, now);
             assert!(outcome.lease.is_some(), "the leasing form issues its pick");
             assert_eq!(alone.picked(&decision), leasing.picked(&outcome.decision));
         }
@@ -1952,8 +1997,8 @@ mod tests {
         // behind the target each engine's first pick names.
         let mut asked = alone.asks(&classes, true);
         let mut leased = leasing.asks(&classes, true);
-        let first = decide(&alone.engine, &asked.1, &mut asked.0, None, now);
-        let outcome = super::decided(&leasing.engine, &leased.1, &mut leased.0, None, now);
+        let first = decide(&alone.engine, &asked.1, &mut asked.0, None, None, now);
+        let outcome = super::decided(&leasing.engine, &leased.1, &mut leased.0, None, None, now);
         assert_eq!(alone.picked(&first), leasing.picked(&outcome.decision));
         let (ours, theirs) = (target_at(&first, 0), target_at(&outcome.decision, 0));
         let lease = outcome.lease.expect("the pair's lease").lease;
@@ -1969,15 +2014,29 @@ mod tests {
             },
         };
         let call = now + Duration::from_millis(1);
-        let again = decide(&alone.engine, &asked.1, &mut asked.0, Some(&ours), call);
-        let issued = super::decided(&leasing.engine, &leased.1, &mut leased.0, Some(&held), call);
+        let again = decide(
+            &alone.engine,
+            &asked.1,
+            &mut asked.0,
+            Some(&ours),
+            None,
+            call,
+        );
+        let issued = super::decided(
+            &leasing.engine,
+            &leased.1,
+            &mut leased.0,
+            Some(&held),
+            None,
+            call,
+        );
         assert!(issued.lease.is_some(), "the leasing form issues the decode");
         assert_eq!(alone.picked(&again), leasing.picked(&issued.decision));
         assert_eq!(alone.picked(&again).0, alone.picked(&first).0);
         // A request held to a wire no worker of the lists is dialed on.
         let mut undialed = alone.asks(&classes, false);
         undialed.0.constraints.wire_modes = WireModes::ZMQ;
-        match decide(&alone.engine, &undialed.1, &mut undialed.0, None, now) {
+        match decide(&alone.engine, &undialed.1, &mut undialed.0, None, None, now) {
             Decision::Shed(shed) => assert_eq!(
                 (shed.reason, shed.emptied_by),
                 (ShedReason::PolicyDeclined, WIRES)
@@ -1989,8 +2048,14 @@ mod tests {
         let mut refused = leasing.asks(&classes, true);
         refused.0.constraints.wire_modes = WireModes::ZMQ;
         for behind in [None, Some(&held)] {
-            let declined =
-                super::decided(&leasing.engine, &refused.1, &mut refused.0, behind, call);
+            let declined = super::decided(
+                &leasing.engine,
+                &refused.1,
+                &mut refused.0,
+                behind,
+                None,
+                call,
+            );
             assert!(matches!(&declined.decision, Decision::Shed(shed) if shed.emptied_by == WIRES));
             assert!(declined.lease.is_none());
             assert_eq!(declined.decode_session, Session::NONE);
@@ -2383,5 +2448,187 @@ mod tests {
         with.facts.prompt_tokens = 40;
         let [_, decode] = sizes_by_side(&door, GATEWAY, &with, None, false);
         assert_eq!(decode, own);
+    }
+
+    /// Four prefills and four decodes under the pair document of the two
+    /// presets, every pair open.
+    fn of_presets(prefill: &str, decode: &str) -> (Host, PartnerClasses) {
+        let mut document = PolicySpec::pair_presets(prefill, decode).expect("presets");
+        document.generation = 3;
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        (Host::under((spec, Arc::default()), 4, 4), every(4, 4))
+    }
+
+    /// Those workers' reports: every worker of a side waits on a long queue
+    /// but the one at the place named for its side.
+    fn reports(prefill: usize, decode: usize) -> Vec<(String, WorkerLoadResponse)> {
+        let side = |side: &'static str, idle: usize| {
+            (0..4).map(move |at| {
+                let queued = if at == idle { 0 } else { 90_000 };
+                let url = format!("grpc://{side}-{at}:9000");
+                (url, one_rank_load(queued, 0.1, 1_000.0))
+            })
+        };
+        let both = side("prefill", prefill).chain(side("decode", decode));
+        both.collect()
+    }
+
+    /// A snapshot of those reports, as a request gives one.
+    fn queues(prefill: usize, decode: usize) -> Arc<LoadSnapshot> {
+        LoadSnapshot::from_loads_for_test(reports(prefill, decode))
+    }
+
+    /// The engine's own task, turned once: it takes what stands ready for
+    /// it, here the newest snapshot on the channel its host handed.
+    async fn turned(engine: &PolicyEngine) {
+        let step = Duration::from_millis(1);
+        assert!(tokio::time::timeout(step, engine.run()).await.is_err());
+    }
+
+    /// Each side of a pair that scores by load reads its workers' reports in
+    /// the snapshot its host hands for the call: the prefill and the decode
+    /// whose queue is empty are picked at every seed. The decode decided
+    /// again behind its prefill reads the snapshot of its own call, and
+    /// keeps the prefill that was sent whatever that snapshot says of the
+    /// prefills. Handed no snapshot, the same engine reads no report: no
+    /// worker here holds a request in flight, so each scores alike and the
+    /// picks spread over both lists. The gateway's classic router reads the
+    /// reports where a side's policy has workers to choose between: each
+    /// side of a pair asks its policy
+    /// (`model_gateway/src/routers/common/placement.rs:1521` and `:1583`),
+    /// and `least_load` reads its snapshot and each worker's report in it
+    /// (`model_gateway/src/policies/least_load.rs:918` and `:450`, at main
+    /// `ddd8a44cb`), behind its answer for a side's one healthy worker
+    /// (`:1119-1120`). A decode pool all over its overload thresholds is not
+    /// asked of its policy there: its pick is the least loaded partner
+    /// (`placement.rs:1575-1578`). No worker of this case is over one.
+    #[test]
+    fn a_pair_that_scores_by_load_reads_the_reports_its_host_hands() {
+        let (host, classes) = of_presets("least_load", "least_load");
+        let mut unread = [[0_u32; 4]; 2];
+        for seed in 0..64 {
+            let fed = host.asks_by(&classes, (seed, false), Some(queues(2, 1)));
+            assert_eq!(host.first(&fed), (2, 1), "seed {seed}");
+            let (prefill, decode) = host.first(&host.asks_by(&classes, (seed, false), None));
+            unread[0][prefill] += 1;
+            unread[1][decode] += 1;
+        }
+        assert!(
+            unread.iter().flatten().all(|&picks| picks > 0),
+            "{unread:?}"
+        );
+        // The decode decided again: in its call's snapshot another decode
+        // has the empty queue, and another prefill too. The prefill that
+        // was sent stays the pair's.
+        for seed in 0..16 {
+            let now = Instant::now();
+            let sent = host.asks_by(&classes, (seed, true), Some(queues(2, 1)));
+            let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &sent, now)
+                .expect("a decision");
+            assert_eq!(host.picked(guard.decision()), (2, 1), "seed {seed}");
+            guard.dispatched(now);
+            let call = host.asks_by(&classes, (seed, true), Some(queues(0, 3)));
+            let again = *guard.decide_decode_under(&call, now).expect("a decision");
+            assert_eq!(host.picked(&again), (2, 3), "seed {seed}");
+        }
+    }
+
+    /// The snapshot reaches a side that scores by load beside a side that
+    /// reads no report. With round robin prefills the decode whose queue is
+    /// empty is picked at every seed, and with round robin decodes the
+    /// prefill whose queue is empty.
+    #[test]
+    fn a_side_that_scores_by_load_reads_the_reports_beside_a_side_that_reads_none() {
+        for (prefill, decode) in [("round_robin", "least_load"), ("least_load", "round_robin")] {
+            let (host, classes) = of_presets(prefill, decode);
+            for seed in 0..64 {
+                let fed = host.asks_by(&classes, (seed, false), Some(queues(2, 1)));
+                let picked = host.first(&fed);
+                if decode == "least_load" {
+                    assert_eq!(picked.1, 1, "the decode at seed {seed}");
+                } else {
+                    assert_eq!(picked.0, 2, "the prefill at seed {seed}");
+                }
+            }
+        }
+    }
+
+    /// A pair whose request gives no snapshot reads the newest the engine's
+    /// own task keeps at hand, as a single request does. At its first
+    /// decision and at its decode decided again, the worker whose queue is
+    /// empty in the reports the load monitor published last is picked at
+    /// every seed. Until the task has read the channel the engine holds no
+    /// snapshot, and the picks spread. A snapshot the request gives is read
+    /// in place of the engine's.
+    #[tokio::test(start_paused = true)]
+    async fn a_pair_whose_request_gives_no_snapshot_reads_the_engines_newest() {
+        let (host, classes) = of_presets("least_load", "least_load");
+        let mut channel = None;
+        let feed = TestFeed::attached_to(|loads| channel = loads);
+        // The load monitor's side: the reports published again.
+        let publish = |prefill, decode| {
+            let published = reports(prefill, decode);
+            feed.publish(&published.into_iter().collect());
+        };
+        publish(2, 1);
+        host.engine.set_loads(channel.expect("the feed's channel"));
+        let bare = |seed, later| host.asks_by(&classes, (seed, later), None);
+        let mut unread = [[0_u32; 4]; 2];
+        for seed in 0..64 {
+            let (prefill, decode) = host.first(&bare(seed, false));
+            unread[0][prefill] += 1;
+            unread[1][decode] += 1;
+        }
+        assert!(
+            unread.iter().flatten().all(|&picks| picks > 0),
+            "{unread:?}"
+        );
+        turned(&host.engine).await;
+        for seed in 0..32 {
+            assert_eq!(host.first(&bare(seed, false)), (2, 1), "seed {seed}");
+            let given = host.asks_by(&classes, (seed, false), Some(queues(0, 3)));
+            assert_eq!(host.first(&given), (0, 3), "seed {seed}");
+        }
+        // The decode decided again reads what the monitor published since
+        // the first decision, and keeps the prefill that was sent.
+        for seed in 0..16 {
+            publish(2, 1);
+            turned(&host.engine).await;
+            let now = Instant::now();
+            let sent = bare(seed, true);
+            let mut guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &sent, now)
+                .expect("a decision");
+            assert_eq!(host.picked(guard.decision()), (2, 1), "seed {seed}");
+            guard.dispatched(now);
+            publish(0, 3);
+            turned(&host.engine).await;
+            let call = bare(seed, true);
+            let again = *guard.decide_decode_under(&call, now).expect("a decision");
+            assert_eq!(host.picked(&again), (2, 3), "seed {seed}");
+        }
+    }
+
+    /// The entries that issue no lease read the reports as the leasing
+    /// entries do ([`PolicyEngine::decide_without_lease`],
+    /// [`PolicyEngine::decide_decode_without_lease`]). At every seed a
+    /// pair's first decision picks the two workers whose queues are empty
+    /// in the snapshot its request gives. Its decode decided again picks
+    /// the decode whose queue is empty in the snapshot of its own call,
+    /// behind the prefill the first decision named.
+    #[test]
+    fn a_pair_decided_without_a_lease_reads_the_reports_its_host_hands() {
+        let (host, classes) = of_presets("least_load", "least_load");
+        let now = Instant::now();
+        for seed in 0..32 {
+            let asks = host.asks_by(&classes, (seed, true), Some(queues(2, 1)));
+            let first = host.engine.decide_without_lease(&asks, now);
+            let first = first.expect("a decision");
+            assert_eq!(host.picked(&first), (2, 1), "seed {seed}");
+            let held = target_at(&first, 0);
+            let call = host.asks_by(&classes, (seed, true), Some(queues(0, 3)));
+            let again = host.engine.decide_decode_without_lease(&call, &held, now);
+            let again = again.expect("a decision");
+            assert_eq!(host.picked(&again), (2, 3), "seed {seed}");
+        }
     }
 }

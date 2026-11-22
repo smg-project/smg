@@ -869,7 +869,7 @@ pub trait RequestMaker {
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w>; // builds the request
     fn plain(&self) -> Option<Plain>;                 // what a plain request states, if it is plain
     fn workers(&self) -> WorkerLists<'_>;             // the worker list, or a pair's two lists
-    fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a single request's snapshot of the host's own; without one the engine reads its own
+    fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
 }
 
 pub enum WorkerLists<'a> {
@@ -1449,7 +1449,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | the crate's ring places a routing key on another worker than classic's ring (decision 3) |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
-| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing; a pair is decided without the host's load reports |
+| Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing |
 | Encode-prefill-decode on that engine | **[partly]** | `EncodeLists::decide` decides it over a host's three lists; the engine's entry refuses it and nothing is issued for it |
 | The lease and its events; the guard | **[built]** | |
 | The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built over an answer its host holds; `place` and the start call are not |
