@@ -64,6 +64,14 @@ pub enum DocumentOrigin {
     Supplied,
 }
 
+/// The function a test build calls, with the policy's name, each time a
+/// classic policy picks for a registry that holds the policy engine
+/// ([`PolicyRegistry::on_classic_pick`]). A process names one only where a
+/// test run asks for those picks: in every other process a pick reads that
+/// none is named, and goes on.
+#[cfg(feature = "test-util")]
+static CLASSIC_PICK: OnceLock<fn(&'static str)> = OnceLock::new();
+
 /// A side of a pair deployment: the place of one of the registry's side
 /// policies ([`PolicyRegistry::set_side_policy`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,16 +622,31 @@ impl PolicyRegistry {
         selected
     }
 
-    /// In a test build, writes down that `policy` picks, where it is a
-    /// classic policy and this registry holds the policy engine: the
-    /// gateway runs with `--policy-controller`, and a classic policy still
-    /// decides this request ([`super::classic_picks`]). Nothing for the
-    /// object that asks the engine, and nothing in a registry that holds no
-    /// engine.
+    /// Names the function a test build calls at each pick a classic policy
+    /// makes for a registry that holds the policy engine, with the
+    /// policy's name: the gateway runs with `--policy-controller`, and a
+    /// classic policy still decides that request. The gateway's test
+    /// harness names one for the test run with the policy controller on.
+    /// The first function named stands for the process.
     #[cfg(feature = "test-util")]
+    pub fn on_classic_pick(called: fn(&'static str)) {
+        let _ = CLASSIC_PICK.set(called);
+    }
+
+    /// In a test build, tells the function [`Self::on_classic_pick`] named
+    /// that `policy` picks, where it is a classic policy and this registry
+    /// holds the policy engine. Whether a function is named is read first:
+    /// a build that holds this and names none (a bench's) pays that one
+    /// read at a pick. Nothing for the object that asks the engine, and
+    /// nothing in a registry that holds no engine.
+    #[cfg(feature = "test-util")]
+    #[inline]
     pub(crate) fn note_classic_pick(&self, policy: &dyn LoadBalancingPolicy) {
+        let Some(called) = CLASSIC_PICK.get() else {
+            return;
+        };
         if self.policy_engine.is_some() && !policy.as_any().is::<EnginePolicy>() {
-            super::classic_picks::note(policy.name());
+            called(policy.name());
         }
     }
 

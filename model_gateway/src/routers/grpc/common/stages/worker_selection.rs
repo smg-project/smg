@@ -2823,7 +2823,7 @@ impl WorkerSelectionStage {
             .then(|| self.policy_registry.hash_ring_of(model_id, &snapshot))
             .flatten();
         // The encode side asks its policy here, not through the registry's
-        // pick: a test build writes its classic picks down from here too.
+        // pick: a test build is told of its classic picks from here too.
         #[cfg(feature = "test-util")]
         if !hashes.is_empty() {
             self.policy_registry

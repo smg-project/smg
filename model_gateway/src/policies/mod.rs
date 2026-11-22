@@ -28,8 +28,6 @@ mod classic_cache_aware_rows;
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
 mod classic_manual_rows;
-#[cfg(feature = "test-util")]
-mod classic_picks;
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
 mod classic_prefix_hash_rows;

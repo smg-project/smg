@@ -1295,8 +1295,8 @@ impl AppContextBuilder {
 
 /// What a test's context is built over when its test run turns the policy
 /// controller on (`SMG_TEST_POLICY_CONTROLLER=on`, read by the gateway's test
-/// harness). Built under the `test-util` feature alone, which only a test
-/// build turns on: a product build holds none of it.
+/// harness). Built under the `test-util` feature alone, which the gateway's
+/// test and bench builds turn on: a product build holds none of it.
 #[cfg(feature = "test-util")]
 impl AppContextBuilder {
     /// A builder over `workers` that holds what the start's two policy
@@ -1597,6 +1597,123 @@ mod tests {
             let policy_engine = context.policy_engine.as_ref().expect("the engine object");
             assert_eq!(policy_engine.reads_loads(), reads);
         }
+    }
+
+    /// What a test's context is built over under the test run's switch
+    /// (`with_policies_started`, then `engine_reads_loads_of` over the
+    /// monitor the test builds) is what the start builds. Policy by policy,
+    /// with the setting on: the builder holds the policy parts a context
+    /// of `from_config` holds, its registry hands out the same default
+    /// policy, and the engine object reads loads where the start's does. A
+    /// configuration the start refuses is refused in the same words. A
+    /// policy step the start gains and this entry does not fails here.
+    #[tokio::test]
+    async fn the_test_entry_builds_the_policy_parts_the_start_builds() {
+        use crate::config::types::RoutingKeyOverrideConfig;
+
+        let named = |name: &str| -> PolicyConfig {
+            serde_json::from_value(serde_json::json!({ "type": name })).expect("a policy's name")
+        };
+        let mut configs: Vec<RouterConfig> = [
+            named("random"),
+            named("round_robin"),
+            named("passthrough"),
+            named("power_of_two"),
+            named("least_load"),
+            named("manual"),
+            named("consistent_hashing"),
+            named("prefix_hash"),
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
+            PolicyConfig::Bucket {
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                bucket_adjust_interval_secs: 5,
+            },
+        ]
+        .into_iter()
+        .map(|policy| RouterConfig {
+            policy_controller: true,
+            ..config_with_policy(policy)
+        })
+        .collect();
+        // One the start refuses: no policy document says the routing-key
+        // override yet.
+        configs.push(RouterConfig {
+            policy_controller: true,
+            routing_key_override: RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut refused = 0;
+        for config in configs {
+            let name = config.policy.name();
+            let started = AppContext::from_config(config.clone(), 10, None, None).await;
+            let workers = Arc::new(WorkerRegistry::new());
+            let entry = AppContextBuilder::with_policies_started(&config, Arc::clone(&workers));
+            let (started, (builder, policies)) = match (started, entry) {
+                (Ok(started), Ok(entry)) => (started, entry),
+                (Err(start), Err(entry)) => {
+                    assert_eq!(start, entry, "{name}");
+                    refused += 1;
+                    continue;
+                }
+                (started, entry) => panic!(
+                    "{name}: the start {} and the entry {}",
+                    if started.is_ok() { "builds" } else { "refuses" },
+                    if entry.is_ok() { "builds" } else { "refuses" },
+                ),
+            };
+            let monitor = WorkerMonitor::new(
+                workers,
+                Arc::clone(&policies),
+                config.load_monitor_interval_secs,
+                config.engine_metrics,
+                config.disable_load_monitoring,
+            );
+            builder.engine_reads_loads_of(&monitor);
+
+            assert_eq!(
+                [
+                    builder.in_process.is_some(),
+                    builder.policy_engine.is_some(),
+                    builder.policy_operators.is_some(),
+                    builder.policy_store.is_some(),
+                    builder.policy_feed.is_some(),
+                    builder.policy_follower.is_some(),
+                ],
+                [
+                    started.in_process.is_some(),
+                    started.policy_engine.is_some(),
+                    started.policy_operators.is_some(),
+                    started.policy_store.is_some(),
+                    started.policy_feed.is_some(),
+                    started.policy_follower.is_some(),
+                ],
+                "{name}: the engine, the engine object, the operators, the store, the feed, the follower"
+            );
+            let (ours, theirs) = (
+                policies.get_default_policy(),
+                started.policy_registry.get_default_policy(),
+            );
+            assert_eq!(ours.name(), theirs.name(), "{name}");
+            assert_eq!(
+                ours.as_any().type_id(),
+                theirs.as_any().type_id(),
+                "{name}: {ours:?} against {theirs:?}"
+            );
+            let reads = |engine: &Option<Arc<PolicyEngine>>| {
+                engine.as_ref().map(|engine| engine.reads_loads())
+            };
+            assert_eq!(
+                reads(&builder.policy_engine),
+                reads(&started.policy_engine),
+                "{name}: the engine object reads loads"
+            );
+        }
+        assert_eq!(refused, 1, "the override alone is refused");
     }
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
