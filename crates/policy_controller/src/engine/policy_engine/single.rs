@@ -358,8 +358,8 @@ fn shed(
 /// on the calling thread and inside the decision's own catch. From the
 /// answer the lease is its guard's: nothing of it is filed.
 ///
-/// A pick the binding's sessions rule placed alone is issued too, and no
-/// stage hears its issue ([`lease_events::stages_hear`]).
+/// A pick the binding's sessions rule keeps from the profile is issued
+/// too, and no stage hears its issue ([`lease_events::stages_hear`]).
 ///
 /// Under a document that takes no word a pick has no lease: no id is
 /// taken, and its guard owes the engine nothing.
@@ -387,9 +387,13 @@ pub(super) fn issued(
             tokens: facts.prompt_tokens,
         })
     });
-    let issue = own.hears.contains(EventKind::Issued) && lease_events::stages_hear(&decision);
+    let issue = own.hears.contains(EventKind::Issued);
     if let Some(lease) = lease.as_ref().filter(|_| issue) {
-        own.spec.engine().on_decision_issued(lease, &decision);
+        // Asked behind the document's own word: a document whose stages
+        // take no issue reads nothing of the pick here.
+        if lease_events::stages_hear(&decision) {
+            own.spec.engine().on_decision_issued(lease, &decision);
+        }
     }
     DecideOutcome {
         decision,

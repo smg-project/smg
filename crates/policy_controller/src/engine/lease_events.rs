@@ -7,13 +7,14 @@
 //! is told under: [`single`] for a single request and [`pair`] for a pair,
 //! a side at a time. They take no lock and keep nothing.
 //!
-//! A single request the binding's sessions rule placed alone is told to
-//! the session table and to no stage ([`stages_hear`]).
+//! A single request its binding's sessions rule keeps from the profile is
+//! told to the session table at its dispatch, and to no stage ahead of its
+//! end ([`stages_hear`]).
 
 use std::time::Instant;
 
 use super::{
-    decision::{Decision, PlacedBy, Target},
+    decision::{Decision, Target},
     decision_engine::HeldDecision,
     framework::Engine,
     view::Session,
@@ -24,23 +25,28 @@ use crate::{
 };
 
 /// Whether the stages hear the issue and the dispatch of a single
-/// request's `decision`: of every pick but one the binding's sessions rule
-/// placed alone ([`PlacedBy::Rule`]), a pin of the key followed or the
-/// rule's own assignment.
+/// request's `decision`, and the profile counts the request among its
+/// sends: of every pick but one its binding's sessions rule placed alone
+/// and keeps from the profile ([`RulePlaced::Untold`]). The rule places a
+/// request alone where it follows a pin of the key, and where its own
+/// assignment places the key.
 ///
-/// No stage placed such a request, so none counts it among its sends: the
-/// session table hears its dispatch, where the key's pin moves, and no
-/// stage hears a word of it ahead of its end. A gateway's sticky map keeps
-/// a request it places from the gateway's policy in the same way. A stage
-/// that prices what it sent a worker still reads such a request in the
-/// count of requests its host holds on that worker.
+/// Under that word no stage placed such a request, and none counts it
+/// among its sends: the session table hears its dispatch, where the key's
+/// pin moves, and no stage hears a word of it ahead of its end. A
+/// gateway's sticky map keeps a request it places from the gateway's
+/// policy in the same way. A stage that prices what it sent a worker
+/// still reads such a request in the count of requests its host holds on
+/// that worker. Under the rule's other word, the default, the request is
+/// the profile's own and every word of it is told.
 ///
 /// A pair's sides are not read here: each side keeps a verdict of its own,
 /// and a pick's one word does not say which side the rule placed.
+///
+/// [`RulePlaced::Untold`]: crate::document::spec::RulePlaced::Untold
+#[inline]
 pub(crate) fn stages_hear(decision: &Decision) -> bool {
-    decision
-        .pick()
-        .is_none_or(|pick| pick.placed_by() == PlacedBy::Stages)
+    decision.pick().is_none_or(|pick| !pick.untold())
 }
 
 /// Tells `engine`'s stages one word of a single's lease, from what the
@@ -48,8 +54,8 @@ pub(crate) fn stages_hear(decision: &Decision) -> bool {
 /// under the lease as issued with the index the word names, on the target
 /// taken, by its id and rank; an end under the lease moved to that target;
 /// a release under the lease as issued. The dispatch of a pick its
-/// sessions rule placed alone is told to the session table and to no stage
-/// ([`stages_hear`]).
+/// sessions rule keeps from the profile is told to the session table and
+/// to no stage ([`stages_hear`]).
 pub(crate) fn single(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
     match said {
         Said::Dispatched(dispatch, _) => {

@@ -734,7 +734,7 @@ shadow. On main two pickers say so: round robin and `passthrough`.
    document's weights. The picker orders up to four targets. No target is a refusal,
    `PolicyDeclined`, naming the picker.
 10. **The lease.** If a stage needs lease events and the decision is a pick, the engine issues a
-    lease (section 6) and tells the stages.
+    lease (section 6) and tells the stages, unless a sessions rule keeps the pick from them.
 11. The answer is the decision with its lease.
 
 A decision that panics is caught, counted and answered as refused. It never takes the host down.
@@ -825,9 +825,20 @@ What an event does:
 
 | Event | What the stages do with it |
 |---|---|
-| Dispatched | the session's pin follows the worker the request went to; each profile counts what it sent since the worker's last load report; scorers and pickers that asked hear it |
+| Dispatched | the session's pin follows the worker the request went to; each profile counts what it sent since the worker's last load report; scorers and pickers that asked hear it. A pick a sessions rule keeps from the profile moves the pin alone |
 | Completed | scorers and pickers that asked hear the outcome (status, time to first token, tokens in and out, duration) |
 | Released | the same stages hear the reason |
+
+A sessions rule places some requests alone, with no stage asked: it follows a pin of the request's
+key, or its own assignment places the key. The rule says whether such a request is the profile's
+own (`rule_placed`). Under `told`, the default, it is: the stages hear its issue and its dispatch,
+and the profile counts it among its sends. Under `untold` it is kept from the profile: no stage
+hears its issue or its dispatch, and no profile counts it. The session's pin still follows its
+dispatch, and its completion and its release are told as any request's, so a stage matches an end
+by the lease's id. The routing settings write `untold` for the sticky override's rule alone: a
+gateway's sticky map keeps a request it places from the gateway's policy. The kept engine keeps
+the word on the pick. A controller that tells a dispatch off a lease on file has no such word
+yet: it takes the document, and its stages hear such a request as any other.
 
 Upkeep, about once a second (`sweep`): expired session keys are removed, and the record of sent
 prefixes gets a bounded step of clean-up.

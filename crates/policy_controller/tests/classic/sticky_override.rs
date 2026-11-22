@@ -703,11 +703,13 @@ pub const INLINE: &str = r#"{
 /// The policies that count what they sent a worker, under the override,
 /// through the engine over a gateway's worker objects. There a request's
 /// guard says its dispatch, and no stage hears the dispatch of a request
-/// the sessions rule placed. The beds above run the engine's rows, where a
-/// host says every dispatch whole.
+/// the override's rule placed: the rule keeps it from the profile. The
+/// beds above run the engine's rows, where a host says every dispatch
+/// whole.
 #[cfg(feature = "in-process")]
 mod sends {
     use std::{
+        collections::VecDeque,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -719,7 +721,7 @@ mod sends {
             RequestMaker, WorkerLists,
         },
         store::GatewayId,
-        tracking::DecisionGuard,
+        tracking::{self, DecisionGuard, TransportClass},
     };
     use smg_worker::{
         identity::basic::Worker,
@@ -776,6 +778,10 @@ mod sends {
     /// and who placed it.
     type Decided<'e> = (DecisionGuard<&'e PolicyEngine>, usize, PlacedBy);
 
+    /// A request in flight: the guards of the engines that decided it, the
+    /// place it went to and its key.
+    type Sent<'e> = (Vec<DecisionGuard<&'e PolicyEngine>>, usize, &'static str);
+
     /// A gateway's side of its engines: one list of worker objects, the
     /// reports a decision reads of them, and the requests in flight.
     struct Host<'e> {
@@ -785,7 +791,7 @@ mod sends {
         /// decided and sent `nth + 1` milliseconds behind it, so no report
         /// reflects a send.
         start: Instant,
-        held: Vec<DecisionGuard<&'e PolicyEngine>>,
+        held: VecDeque<Sent<'e>>,
     }
 
     impl<'e> Host<'e> {
@@ -803,7 +809,7 @@ mod sends {
                 list,
                 loads: Self::reports(start, queued),
                 start,
-                held: Vec::new(),
+                held: VecDeque::new(),
             }
         }
 
@@ -857,20 +863,24 @@ mod sends {
             (guard, place, by)
         }
 
-        /// The dispatch of a decided request `nth` is said to its engine,
-        /// and the request stays in flight.
-        fn say(&mut self, mut guard: DecisionGuard<&'e PolicyEngine>, nth: u32) {
-            guard.dispatched(self.at(nth));
-            self.held.push(guard);
-        }
-
-        /// The gateway's own counts of a request sent to `place` under
-        /// `key`: the worker object's requests, and its requests of the key.
-        fn count(&self, place: usize, key: &str) {
+        /// The request `nth` goes to `place` under `key`: its dispatch is
+        /// said to each engine that decided it, by `guards`, and the
+        /// gateway counts it once: the worker object's requests, and its
+        /// requests of the key. The request stays in flight.
+        fn sent(
+            &mut self,
+            mut guards: Vec<DecisionGuard<&'e PolicyEngine>>,
+            (key, nth): (&'static str, u32),
+            place: usize,
+        ) {
+            for guard in &mut guards {
+                guard.dispatched(self.at(nth));
+            }
             self.list[place].increment_load();
             if !key.is_empty() {
                 self.list[place].increment_routing_key_load(key);
             }
+            self.held.push_back((guards, place, key));
         }
 
         /// One request decided by `engine` and sent: the place it went to
@@ -882,9 +892,27 @@ mod sends {
             asked: (&'static str, u32, u32),
         ) -> (usize, PlacedBy) {
             let (guard, place, by) = self.decide(engine, members, asked);
-            self.say(guard, asked.2);
-            self.count(place, asked.0);
+            self.sent(vec![guard], (asked.0, asked.2), place);
             (place, by)
+        }
+
+        /// A request in flight ends at the instant of the request `nth`:
+        /// each engine that decided it hears its completion, and the
+        /// gateway takes it off the worker object's counts.
+        fn ended(&mut self, (mut guards, place, key): Sent<'e>, nth: u32) {
+            let worker = &self.list[place];
+            for guard in &mut guards {
+                let pick = guard.decision().pick().expect("a pick");
+                let outcome = tracking::Outcome {
+                    served: pick.targets.first().expect("a target").id,
+                    ..tracking::Outcome::reported(200, TransportClass::Ok)
+                };
+                guard.completed(&outcome, self.at(nth));
+            }
+            worker.decrement_load();
+            if !key.is_empty() {
+                worker.decrement_routing_key_load(key);
+            }
         }
     }
 
@@ -902,7 +930,9 @@ mod sends {
     ///
     /// The pinned request still weighs what a request in flight weighs:
     /// with 1,500 tokens waiting on the second worker, 2,524 in all, the
-    /// request with no key goes there.
+    /// request with no key goes there. Once the pinned request ends it
+    /// weighs nothing: the first worker stands at 2,024, and the request
+    /// with no key goes back to it.
     ///
     /// The gateway's policy hears of no request its sticky map placed
     /// (`model_gateway/src/policies/registry.rs:543-546`), and prices a
@@ -933,6 +963,10 @@ mod sends {
                 place, 1,
                 "{policy}: the pinned request weighs as one in flight"
             );
+            let pinned = host.held.pop_back().expect("the pinned request");
+            host.ended(pinned, 4);
+            let (_, place, _) = host.decide(&engine, &members, ("", 1_000, 4));
+            assert_eq!(place, 0, "{policy}: an ended pinned request weighs nothing");
         }
     }
 
@@ -946,7 +980,10 @@ mod sends {
     /// asked at a pinned request and hears of none. So the two engines
     /// hold one count of sends, and each request the policy places goes to
     /// one worker under both, behind pinned requests of 500 to 20,000
-    /// tokens. Over three workers and over sixteen.
+    /// tokens. From the ninth request on the oldest request in flight ends
+    /// ahead of every second decision, a pinned one or one the policy
+    /// placed, so the two engines agree behind ends too, and a key still
+    /// meets its cap. Over three workers and over sixteen.
     #[test]
     fn least_load_places_under_the_override_as_the_policy_alone_places() {
         for workers in [3, 16] {
@@ -955,11 +992,17 @@ mod sends {
             let mut host = Host::new(&queued);
             let members = keyed.pool_members(&host.list);
             let twin = alone.pool_members(&host.list);
-            let (mut pinned, mut behind) = (0, 0);
+            let (mut pinned, mut behind, mut ended) = (0, 0, 0);
             for nth in 0..48_u32 {
+                if nth >= 8 && nth % 2 == 0 {
+                    let oldest = host.held.pop_front().expect("a request in flight");
+                    ended += u32::from(oldest.0.len() == 1);
+                    host.ended(oldest, nth);
+                }
                 let key = ["k0", "k1", "k2", "k3", "k4", ""][nth as usize % 6];
                 let tokens = [1_000, 12_000, 3_000, 20_000, 500][nth as usize % 5];
                 let (guard, place, by) = host.decide(&keyed, &members, (key, tokens, nth));
+                let mut guards = vec![guard];
                 if by == PlacedBy::Rule {
                     pinned += 1;
                 } else {
@@ -968,15 +1011,15 @@ mod sends {
                         place, twin_place,
                         "{workers} workers: request {nth}, {key:?}"
                     );
-                    host.say(asked, nth);
+                    guards.push(asked);
                     behind += u32::from(pinned > 0);
                 }
-                host.say(guard, nth);
-                host.count(place, key);
+                host.sent(guards, (key, nth), place);
             }
             assert!(
-                pinned >= 8 && behind >= 8,
-                "{workers} workers: {pinned} pinned requests, {behind} placed behind one"
+                pinned >= 8 && behind >= 8 && ended >= 8,
+                "{workers} workers: {pinned} pinned requests, {behind} placed behind one, \
+                 {ended} pinned requests ended"
             );
         }
     }

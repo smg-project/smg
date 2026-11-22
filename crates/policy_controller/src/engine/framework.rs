@@ -6016,7 +6016,7 @@ impl Engine {
                 pair: None,
             });
             // The rule's pin placed the request: no stage was asked.
-            targets.by_rule();
+            targets.by_rule(rule.rule_placed);
             let mut trace = Trace {
                 profile: index,
                 survivors: Survivors::counted(buf.kept.len() as u32),
@@ -6075,7 +6075,7 @@ impl Engine {
             // Under any assignment but `delegate` the rule's own stage
             // placed the key: no stage of the profile was asked.
             if placing != Assignment::Delegate {
-                pick.targets.by_rule();
+                pick.targets.by_rule(rule.rule_placed);
             }
             if WRITE_SESSIONS {
                 pick.session_verdict = SessionVerdict::Pinned;
@@ -6297,7 +6297,7 @@ impl Engine {
         if let Decision::Pick(pick) = &mut decision {
             // As a key with no pin: the rule's own stage placed it.
             if placing != Assignment::Delegate {
-                pick.targets.by_rule();
+                pick.targets.by_rule(rule.rule_placed);
             }
             let taken = pick.targets.first().map(|target| target.id);
             let under_the_cap = |id: WorkerId| {
@@ -7339,7 +7339,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        document::spec::{self, PolicySpec, PrefixAffinityParams, Recovery, SpillParams},
+        document::spec::{
+            self, PolicySpec, PrefixAffinityParams, Recovery, RulePlaced, SpillParams,
+        },
         engine::{
             decision::{self, Pair},
             view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
@@ -13962,6 +13964,7 @@ mod tests {
         ttl_micros: None,
         sweep_micros: 0,
         recovery: Recovery::Latest,
+        rule_placed: RulePlaced::Told,
     };
 
     /// The least-requests profile under a sessions rule.
@@ -15030,6 +15033,7 @@ mod tests {
             ttl_micros,
             sweep_micros,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         let bound = |model: &str, sessions| Binding {
             model: model.into(),

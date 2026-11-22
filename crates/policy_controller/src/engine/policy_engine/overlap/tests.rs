@@ -11,7 +11,7 @@ use smg_worker::test_support::ready_worker;
 
 use super::*;
 use crate::{
-    document::spec::{PolicySpec, ScoreStage, ShadowSpec, WarmupSliceParams},
+    document::spec::{PolicySpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams},
     engine::{
         decision::{Pick, Shed, ShedReason, Target, Targets, Trace},
         framework::Scratch,
@@ -442,7 +442,7 @@ fn a_pick_the_sessions_rule_placed_is_recorded_at_neither_write() {
         let by_rule = || {
             let mut decision = by_stages();
             if let Decision::Pick(pick) = &mut decision {
-                pick.targets.by_rule();
+                pick.targets.by_rule(RulePlaced::Told);
             }
             decision
         };

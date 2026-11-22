@@ -6,12 +6,15 @@
 
 use std::fmt;
 
-use crate::engine::{
-    sticky_sessions::{DecodeVerdict, SessionVerdict},
-    view::WorkerId,
-};
 #[cfg(feature = "controller")]
 use crate::service::proto;
+use crate::{
+    document::spec::RulePlaced,
+    engine::{
+        sticky_sessions::{DecodeVerdict, SessionVerdict},
+        view::WorkerId,
+    },
+};
 
 /// Targets a decision carries at most: the pick and its alternates.
 pub const MAX_TARGETS: usize = 4;
@@ -52,9 +55,10 @@ pub struct Pair {
 pub struct Targets {
     items: [Target; MAX_TARGETS],
     len: u8,
-    /// Who placed the pick ([`Pick::placed_by`]), in the byte the count
-    /// and the overlap left spare between them.
-    placed_by: PlacedBy,
+    /// Who placed the pick ([`Pick::placed_by`]) and, of a rule's pick,
+    /// whether the rule keeps it from the profile (`Pick::untold`), in
+    /// the byte the count and the overlap left spare between them.
+    placing: Placing,
     /// What the profile's prefix stage says of the first target
     /// ([`Pick::overlap`]), in the bytes the count left spare.
     overlap: Overlap,
@@ -65,7 +69,7 @@ pub struct Targets {
 /// [`Targets::clear`] leaves them as they stood.
 impl PartialEq for Targets {
     fn eq(&self, other: &Self) -> bool {
-        self.placed_by == other.placed_by
+        self.placing == other.placing
             && self.overlap == other.overlap
             && self.as_slice() == other.as_slice()
     }
@@ -79,7 +83,7 @@ impl fmt::Debug for Targets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Targets")
             .field("items", &self.as_slice())
-            .field("placed_by", &self.placed_by)
+            .field("placing", &self.placing)
             .field("overlap", &self.overlap)
             .finish()
     }
@@ -95,7 +99,7 @@ impl Targets {
                 pair: None,
             }; MAX_TARGETS],
             len: 0,
-            placed_by: PlacedBy::Stages,
+            placing: Placing::Stages,
             overlap: Overlap::NONE,
         }
     }
@@ -107,11 +111,15 @@ impl Targets {
     }
 
     /// States that the binding's sessions rule placed the pick, with no
-    /// stage of the profile asked ([`PlacedBy::Rule`]). The word is the
-    /// decision's: a list led anew, emptied or turned into a pair's keeps
-    /// it.
-    pub(crate) fn by_rule(&mut self) {
-        self.placed_by = PlacedBy::Rule;
+    /// stage of the profile asked ([`PlacedBy::Rule`]), and whether that
+    /// rule keeps what it places from the profile (`kept`, the rule's own
+    /// word). Both are the decision's: a list led anew, emptied or turned
+    /// into a pair's keeps them.
+    pub(crate) fn by_rule(&mut self, kept: RulePlaced) {
+        self.placing = match kept {
+            RulePlaced::Told => Placing::Rule,
+            RulePlaced::Untold => Placing::RuleUntold,
+        };
     }
 
     /// Append a target; a list already full keeps what it has.
@@ -157,7 +165,7 @@ impl Targets {
     /// list is full.
     pub fn lead(&mut self, target: Target) {
         let mut led = Self::new();
-        led.placed_by = self.placed_by;
+        led.placing = self.placing;
         led.push(target);
         for t in self.as_slice() {
             if *t != target {
@@ -452,16 +460,18 @@ impl Overlap {
 /// gateway's policy.
 ///
 /// A third tells a single request's lease to the stages in a gateway's own
-/// process (`lease_events::stages_hear`): no stage hears the issue or the
-/// dispatch of a pick the rule placed, and the session table hears the
-/// dispatch.
+/// process (`lease_events::stages_hear`). It reads the rule's own word
+/// beside this one ([`RulePlaced`]): under `untold` no stage hears the
+/// issue or the dispatch of a pick the rule placed, and under `told`, the
+/// default, the stages hear both. The session table hears the dispatch
+/// under either.
 ///
 /// The word does not cross the crate's frame: no wire message carries it,
 /// since the record is written where the decision is made.
 ///
-/// One byte, in the one a pick's targets had spare between their count and
-/// what is stated of the first: a pick is no larger for it
-/// ([`Pick::placed_by`]).
+/// It shares one byte with the rule's word (`Pick::untold`), the one a
+/// pick's targets had spare between their count and what is stated of the
+/// first: a pick is no larger for it ([`Pick::placed_by`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PlacedBy {
@@ -472,6 +482,18 @@ pub enum PlacedBy {
     /// The binding's sessions rule alone: a pin of the key followed, or the
     /// rule's own assignment.
     Rule,
+}
+
+/// A pick's one byte of its placing: who placed it ([`PlacedBy`]), and of
+/// a pick the binding's sessions rule placed, whether that rule keeps it
+/// from the profile ([`RulePlaced::Untold`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+enum Placing {
+    #[default]
+    Stages,
+    Rule,
+    RuleUntold,
 }
 
 /// A pick: ordered targets, the trace, and what a sessions rule did with
@@ -496,7 +518,19 @@ impl Pick {
     /// Who placed the pick ([`PlacedBy`]): the profile's stages, unless the
     /// binding's sessions rule placed it alone.
     pub const fn placed_by(&self) -> PlacedBy {
-        self.targets.placed_by
+        match self.targets.placing {
+            Placing::Stages => PlacedBy::Stages,
+            Placing::Rule | Placing::RuleUntold => PlacedBy::Rule,
+        }
+    }
+
+    /// Whether the pick is kept from the profile: the binding's sessions
+    /// rule placed it alone, and the rule says such a request is none of
+    /// the profile's own ([`RulePlaced::Untold`]). Its one reader tells a
+    /// lease's words in a gateway's own process.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) const fn untold(&self) -> bool {
+        matches!(self.targets.placing, Placing::RuleUntold)
     }
 }
 
@@ -814,12 +848,13 @@ mod tests {
     }
 
     /// The word of who placed a pick costs the pick no byte: it sits in the
-    /// one a list's count and overlap left spare between them. A pick no
-    /// rule placed reads the stages. The word is the decision's: a list led
-    /// anew, turned into a pair's or emptied keeps it.
+    /// one a list's count and overlap left spare between them, with the
+    /// rule's own word of a pick it placed. A pick no rule placed reads the
+    /// stages, and is not kept from them. Both words are the decision's: a
+    /// list led anew, turned into a pair's or emptied keeps them.
     #[test]
     fn the_word_of_who_placed_a_pick_costs_the_pick_no_byte() {
-        assert_eq!(size_of::<PlacedBy>(), 1);
+        assert_eq!(size_of::<Placing>(), 1);
         assert_eq!(size_of::<Targets>(), MAX_TARGETS * size_of::<Target>() + 8);
         assert_eq!(size_of::<Pick>(), 256);
         assert_eq!(Pick::default().placed_by(), PlacedBy::Stages);
@@ -833,15 +868,25 @@ mod tests {
         pick.targets.push(target(0));
         pick.targets.push(target(1));
         let by_stages = pick;
-        pick.targets.by_rule();
-        assert_eq!(pick.placed_by(), PlacedBy::Rule);
-        assert_ne!(pick, by_stages);
-        pick.targets.lead(target(1));
-        assert_eq!(pick.placed_by(), PlacedBy::Rule);
-        pick.targets.pair_under(&target(2));
-        assert_eq!(pick.placed_by(), PlacedBy::Rule);
-        pick.targets.clear();
-        assert_eq!(pick.placed_by(), PlacedBy::Rule);
+        assert!(!by_stages.untold());
+        for kept in [RulePlaced::Told, RulePlaced::Untold] {
+            let untold = kept == RulePlaced::Untold;
+            let mut pick = by_stages;
+            pick.targets.by_rule(kept);
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+            assert_ne!(pick, by_stages);
+            pick.targets.lead(target(1));
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+            pick.targets.pair_under(&target(2));
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+            pick.targets.clear();
+            assert_eq!((pick.placed_by(), pick.untold()), (PlacedBy::Rule, untold));
+        }
+        // The two words of a rule's pick are two picks.
+        let (mut told, mut kept) = (by_stages, by_stages);
+        told.targets.by_rule(RulePlaced::Told);
+        kept.targets.by_rule(RulePlaced::Untold);
+        assert_ne!(told, kept);
     }
 
     /// The decode side's verdict costs a pair no byte: it sits in one the

@@ -178,7 +178,7 @@ impl Engine {
         // engine over worker lists writes no record behind this entry's
         // answer: the word is here so a followed pin says the same on both
         // paths.
-        targets.by_rule();
+        targets.by_rule(rule.rule_placed);
         Some(Decision::Pick(Pick {
             targets,
             trace: trace(index, facts, rows.generation(), [(pinned.id, 1.0)]),

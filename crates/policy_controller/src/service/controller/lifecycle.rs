@@ -276,7 +276,7 @@ pub(crate) mod tests {
         class, completed, dispatch, dispatched, open, outcome, reason, release, released, side,
     };
     use crate::{
-        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery},
+        document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
         engine::{
             decision::{Pair, Target, Targets},
             framework::{Picker, TieBand},
@@ -936,6 +936,7 @@ pub(crate) mod tests {
             ttl_micros,
             sweep_micros: 0,
             recovery: Recovery::Original,
+            rule_placed: RulePlaced::Told,
         };
         store.with_snapshot(|world| {
             let table = world.spec().engine().sessions();

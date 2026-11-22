@@ -25,13 +25,17 @@ use crate::{
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 ///
-/// In a gateway's own process a stage hears neither the issue nor the
-/// dispatch of a single request the binding's sessions rule placed alone:
-/// a pin of the request's key followed, or the rule's own assignment. No
-/// stage placed that request, as a gateway's sticky map keeps a request it
-/// places from the gateway's policy. Its completion and its release are
-/// told as any request's. A host that tells a lease's words off its file
-/// tells every word of such a request too.
+/// Under a sessions rule that says so (`rule_placed: untold`), a stage in
+/// a gateway's own process hears neither the issue nor the dispatch of a
+/// single request the rule placed alone: a pin of the request's key
+/// followed, or the rule's own assignment. No stage placed that request,
+/// as a gateway's sticky map keeps a request it places from the gateway's
+/// policy. Its completion and its release are told as any request's, so a
+/// stage hears an end whose issue and dispatch it did not hear: a stage
+/// matches an end by the lease's id ([`Lease::id`]), and moves no count by
+/// an end it cannot match. A host that tells a lease's words off its file
+/// keeps no word of who placed a request: it tells such a request as it
+/// tells any other.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. Its host filed the
     /// lease as it issued it, in process as behind a served controller:
@@ -115,7 +119,8 @@ pub trait Lifecycle: Send + Sync {
     /// leave, and not yet of the end of a lease whose gateway was let go: it
     /// refuses a document that names such a stage as not in this build
     /// ([`crate::document::SpecError::NotInBuild`]). A host that embeds the engine
-    /// makes every call but the two the trait's own note names. `false` by
+    /// makes every call, and under a sessions rule that says so it leaves
+    /// out the two the trait's own note names. `false` by
     /// default: a stage that takes a call to shed state early decides the
     /// same without it.
     fn needs_lifecycle(&self) -> bool {

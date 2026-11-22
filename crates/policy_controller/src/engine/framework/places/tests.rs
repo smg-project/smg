@@ -9,7 +9,7 @@ use super::super::{
     Binding, Engine, Picker, Plan, PoolRows, Profile, Scorer, WeightedScorer, DRAW_FROM,
 };
 use crate::{
-    document::spec::{Assignment, Needs, PolicySpec, Recovery, PRESETS},
+    document::spec::{Assignment, Needs, PolicySpec, Recovery, RulePlaced, PRESETS},
     engine::{
         decision::{Decision, LiftedVeto, MAX_TARGETS},
         sticky_sessions::{SessionRule, SessionVerdict},
@@ -575,6 +575,7 @@ fn a_pin_outside_the_places_stands_and_the_worker_picked_is_claimed_beside_it() 
             // seconds of its idle time's end.
             sweep_micros: 10_000_000,
             recovery,
+            rule_placed: RulePlaced::Told,
         };
         let profile = bare("random", vec![], Box::new(Random));
         let binding = Binding {

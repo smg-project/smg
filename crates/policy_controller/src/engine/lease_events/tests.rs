@@ -1,6 +1,7 @@
 //! The cases of a single request's words under a sessions rule: what a
-//! stage hears of a pick by who placed it, asked through the engine's own
-//! entry over a list of worker objects.
+//! stage hears of a pick by who placed it and by the rule's word of what it
+//! places, asked through the engine's own entry over a list of worker
+//! objects.
 
 use std::{
     sync::{
@@ -13,7 +14,7 @@ use std::{
 use smg_worker::{identity::basic::Worker, test_support::ready_worker};
 
 use crate::{
-    document::spec::{AppliedSpec, Assignment, PolicySpec},
+    document::spec::{AppliedSpec, Assignment, PolicySpec, RulePlaced},
     engine::{
         decision::{Decision, PlacedBy, Target, Targets},
         decision_engine::{Request, RequestMaker, WorkerLists},
@@ -21,11 +22,11 @@ use crate::{
         policy_engine::{PolicyEngine, PoolMembers},
         view::{Candidate, Constraints, Identity, RequestFacts},
     },
-    policies::random::Random,
+    policies::{power_of_two::PowerOfTwoMetric, random::Random},
     stages::{registry::StageRegistry, Lifecycle},
     store::GatewayId,
     tracking::{
-        lease::{EventSet, Lease, Side},
+        lease::{EventSet, Lease, Outcome, ReleaseReason, Side, TransportClass},
         DecisionGuard,
     },
 };
@@ -82,25 +83,35 @@ impl Picker for Hears {
     }
 }
 
-/// The engine of the `manual` preset's sessions rule under `assignment`,
-/// with a cap of two requests of a key on a worker, beside a profile that
-/// picks with [`Hears`].
-fn hearing(assignment: Assignment, heard: &Arc<Heard>) -> PolicyEngine {
-    let mut stages = StageRegistry::builtin();
-    let kept = Arc::clone(heard);
-    let added = stages.picker("hears", move || Box::new(Hears(Arc::clone(&kept))));
-    added.expect("a free name");
+/// The `manual` preset's document with the profiles of `stock` in place of
+/// its own, bound under the preset's sessions rule: `assignment`, a cap of
+/// two requests of a key on a worker, and `kept`, the rule's word of a
+/// request it places.
+fn ruled(stock: PolicySpec, assignment: Assignment, kept: RulePlaced) -> PolicySpec {
     let mut document = PolicySpec::preset("manual").expect("a built-in preset");
-    let random = PolicySpec::preset("random").expect("a built-in preset");
-    document.profiles = random.profiles;
-    let profile = document.profiles.get_mut("random");
-    profile.expect("the preset's profile").pick = "hears".into();
+    let name = stock.profiles.keys().next().expect("a profile").clone();
+    document.profiles = stock.profiles;
     let binding = &mut document.bindings[0];
-    binding.profile = Some("random".into());
+    binding.profile = Some(name);
     let rule = binding.sessions.as_mut().expect("the stock rule");
     rule.assignment = assignment;
     rule.inflight_cap = 2;
+    rule.rule_placed = kept;
     document.generation = 1;
+    document
+}
+
+/// The engine of [`ruled`] over the `random` profile, picking with
+/// [`Hears`].
+fn hearing(assignment: Assignment, kept: RulePlaced, heard: &Arc<Heard>) -> PolicyEngine {
+    let mut stages = StageRegistry::builtin();
+    let counted = Arc::clone(heard);
+    let added = stages.picker("hears", move || Box::new(Hears(Arc::clone(&counted))));
+    added.expect("a free name");
+    let random = PolicySpec::preset("random").expect("a built-in preset");
+    let mut document = ruled(random, assignment, kept);
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the preset's profile").pick = "hears".into();
     let spec = AppliedSpec::validate_in(&document, &stages, &[]);
     PolicyEngine::new(spec.expect("the stages hold the picker"))
 }
@@ -128,15 +139,15 @@ impl RequestMaker for Asks<'_> {
 /// The requests a case holds in flight.
 type Held<'e> = Vec<DecisionGuard<&'e PolicyEngine>>;
 
-/// One request of `key`, with no key where it is empty, sent to its first
-/// target as its host sends it: the dispatch is said, and the worker object
-/// counts the request and its key. The request stays in flight in `held`.
-/// The place it went to, and who placed it.
+/// One request of `key`, with no key where it is empty, sent to the target
+/// at `take` of its pick as its host sends it: the dispatch is said, and
+/// the worker object counts the request and its key. The request stays in
+/// flight in `held`. The place it went to, and who placed it.
 fn sent<'e>(
     engine: &'e PolicyEngine,
     list: &[Arc<dyn Worker>],
     members: &PoolMembers,
-    key: &'static str,
+    (key, take): (&'static str, usize),
     held: &mut Held<'e>,
 ) -> (usize, PlacedBy) {
     let session_key = match key {
@@ -149,6 +160,7 @@ fn sent<'e>(
             facts: RequestFacts {
                 model: MODEL,
                 seed: held.len() as u64,
+                prompt_tokens: 1_000,
                 session_key,
                 ..RequestFacts::default()
             },
@@ -160,7 +172,7 @@ fn sent<'e>(
     let mut guard =
         DecisionGuard::decide_under(engine, GatewayId::LOCAL, &asks, now).expect("a decision");
     let by = guard.decision().pick().expect("a pick").placed_by();
-    let target = guard.take(0).expect("the first target");
+    let target = guard.take(take).expect("the target the host takes");
     guard.dispatched(now);
     let place = target.position as usize;
     list[place].increment_load();
@@ -171,66 +183,153 @@ fn sent<'e>(
     (place, by)
 }
 
-/// A stage hears the issue and the dispatch of a request it placed, and
-/// neither of one the binding's sessions rule placed alone: a pin of the
-/// key followed, a key the rule's own assignment places, and a pin at its
-/// cap that assignment places again. The session table hears each of
-/// those dispatches: the key's next request follows the worker the
-/// dispatch went to, also where that dispatch moved the pin.
+/// Three workers that take requests.
+fn three_workers() -> Arc<[Arc<dyn Worker>]> {
+    (0..3)
+        .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
+        .collect()
+}
+
+/// Under a rule that keeps what it places from the profile, a stage hears
+/// the issue and the dispatch of a request it placed, and neither of one
+/// the rule placed alone: a pin of the key followed, a key the rule's own
+/// assignment places, a pin at its cap that assignment places again, and a
+/// second target of such a pick that its host takes. Under the rule's
+/// default word the stage hears every one of those. The session table
+/// hears each dispatch under either word: the key's next request follows
+/// the worker the dispatch went to, also where that dispatch moved the pin.
 ///
 /// A gateway's sticky map keeps a request it places from the gateway's
 /// policy in the same way (`model_gateway/src/policies/registry.rs`, lines
-/// 543 to 546 for a pin, and 562 and 589 for the map's own assignment).
+/// 543 to 546 for a pin, and 563 and 589 for the map's own assignment).
 #[test]
-fn a_stage_hears_no_issue_and_no_dispatch_of_a_request_its_sessions_rule_placed() {
-    for assignment in [Assignment::Delegate, Assignment::MinLoad] {
+fn a_stage_hears_no_issue_and_no_dispatch_of_a_request_its_rule_keeps_from_it() {
+    let words = [RulePlaced::Untold, RulePlaced::Told];
+    let assignments = [Assignment::Delegate, Assignment::MinLoad];
+    for (kept, assignment) in words.into_iter().flat_map(|w| assignments.map(|a| (w, a))) {
+        let case = format!("{kept:?}, {assignment:?}");
         let heard = Arc::new(Heard::default());
-        let engine = hearing(assignment, &heard);
-        let list: Arc<[Arc<dyn Worker>]> = (0..3)
-            .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
-            .collect();
+        let engine = hearing(assignment, kept, &heard);
+        let list = three_workers();
         let members = engine.pool_members(&list);
         let mut held = Held::new();
-        let mut send = |key| sent(&engine, &list, &members, key, &mut held);
+        // What the stage has heard by now: a request it placed, and under
+        // the rule's default word every request.
+        let mut told = (0, 0);
+        let mut send = |asked: (&'static str, usize), placed: PlacedBy, what: &str| {
+            let (place, by) = sent(&engine, &list, &members, asked, &mut held);
+            assert_eq!(by, placed, "{case}: {what}");
+            if by == PlacedBy::Stages || kept == RulePlaced::Told {
+                told = (told.0 + 1, told.1 + 1);
+            }
+            assert_eq!(heard.words(), told, "{case}: {what}");
+            place
+        };
         // The key's first request: the stages place it under `delegate`,
         // and the rule's own assignment places it otherwise.
         let own = assignment != Assignment::Delegate;
-        let (first, by) = send("a-key");
-        if own {
-            assert_eq!(
-                (by, heard.words()),
-                (PlacedBy::Rule, (0, 0)),
-                "{assignment:?}"
-            );
+        let placed = if own {
+            PlacedBy::Rule
         } else {
-            assert_eq!(
-                (by, heard.words()),
-                (PlacedBy::Stages, (1, 1)),
-                "{assignment:?}"
-            );
-        }
-        // The key's pin is followed: no stage hears of that request.
-        let before = heard.words();
-        assert_eq!(send("a-key"), (first, PlacedBy::Rule), "{assignment:?}");
-        assert_eq!(heard.words(), before, "{assignment:?}: a pin followed");
+            PlacedBy::Stages
+        };
+        let first = send(("a-key", 0), placed, "a new key");
+        // The key's pin is followed.
+        assert_eq!(
+            send(("a-key", 0), PlacedBy::Rule, "its pin"),
+            first,
+            "{case}"
+        );
         if own {
             // Two requests of the key stand on its worker, the rule's cap:
             // the rule's own assignment places the next on another worker,
             // and that dispatch moves the pin there.
-            let (second, by) = send("a-key");
-            assert_ne!(second, first, "{assignment:?}: at the cap");
-            assert_eq!(by, PlacedBy::Rule, "{assignment:?}: at the cap");
-            assert_eq!(send("a-key"), (second, PlacedBy::Rule), "{assignment:?}");
-            assert_eq!(heard.words(), before, "{assignment:?}: placed at the cap");
+            let second = send(("a-key", 0), PlacedBy::Rule, "at the cap");
+            assert_ne!(second, first, "{case}: at the cap");
+            let next = send(("a-key", 0), PlacedBy::Rule, "the moved pin");
+            assert_eq!(next, second, "{case}");
+            // The host takes the second target of a key the rule's
+            // assignment places: the request is the rule's as the first
+            // target's is, and its dispatch pins the key where it went.
+            let taken = send(("b-key", 1), PlacedBy::Rule, "a second target");
+            let next = send(("b-key", 0), PlacedBy::Rule, "the pin it made");
+            assert_eq!(next, taken, "{case}");
         }
         // A request with no key is the stages'.
-        let (_, by) = send("");
-        assert_eq!(by, PlacedBy::Stages, "{assignment:?}: no key");
-        let heard = heard.words();
-        assert_eq!(
-            heard,
-            (before.0 + 1, before.1 + 1),
-            "{assignment:?}: no key"
+        send(("", 0), PlacedBy::Stages, "no key");
+    }
+}
+
+/// The end of a request moves no count of a stock stage, so the end of one
+/// its rule kept from the profile moves none: a stage hears that end with
+/// no issue and no dispatch ahead of it. Of the stock stages three count
+/// by a request's own words: the tally of sends the `least-load` scorer
+/// reads, the bookings of `bucket`, and the credit `resident-work` keeps.
+/// The tally and the credit move at a request the stages placed.
+/// `bucket` books a worker a pair's partition lists, and a document
+/// under the single plan alone has none: nothing of it moves at any word.
+/// No count of the three moves at a completion or at a release, of a
+/// request the profile was told of or of one it was not.
+#[test]
+fn the_end_of_a_request_kept_from_the_profile_moves_no_count_of_a_stock_stage() {
+    let resident = PowerOfTwoMetric::ResidentTokens {
+        request_tokens: 256,
+    };
+    let stock = [
+        ("least_load", PolicySpec::preset("least_load"), true),
+        ("bucket", PolicySpec::preset("bucket"), false),
+        ("resident-work", PolicySpec::power_of_two(resident), true),
+    ];
+    for (name, document, counts_singles) in stock {
+        let document = ruled(
+            document.expect("a built-in preset"),
+            Assignment::Delegate,
+            RulePlaced::Untold,
         );
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let engine = PolicyEngine::new(spec);
+        let list = three_workers();
+        let members = engine.pool_members(&list);
+        let mut held = Held::new();
+        // What every stage and every tally of the engine holds, with the
+        // session table: a request with no key leaves the table alone.
+        let counts = || format!("{:?}", engine.spec().engine());
+        let before = counts();
+        let (_, by) = sent(&engine, &list, &members, ("", 0), &mut held);
+        assert_eq!(by, PlacedBy::Stages, "{name}");
+        let moved = counts() != before;
+        assert_eq!(moved, counts_singles, "{name}: a request the stages placed");
+        // Three keys: the first request of each is the stages', and its
+        // next follows the pin, which the rule keeps from the profile.
+        for key in ["a-key", "b-key", "c-key"] {
+            for placed in [PlacedBy::Stages, PlacedBy::Rule] {
+                let (_, by) = sent(&engine, &list, &members, (key, 0), &mut held);
+                assert_eq!(by, placed, "{name}: {key}");
+            }
+        }
+        let standing = counts();
+        let now = Instant::now();
+        // The ends, newest first, so a kept request and one the profile
+        // was told of take turns. The first and each fourth from it
+        // complete with the one before them, and the others are released:
+        // both kinds end both ways.
+        for (nth, mut guard) in held.drain(..).rev().enumerate() {
+            let served = {
+                let pick = guard.decision().pick().expect("a pick");
+                pick.targets.first().expect("a target").id
+            };
+            if matches!(nth % 4, 0 | 3) {
+                let outcome = Outcome {
+                    served,
+                    tokens_in: 1_000,
+                    tokens_out: 64,
+                    ..Outcome::reported(200, TransportClass::Ok)
+                };
+                guard.completed(&outcome, now);
+            } else {
+                guard.released(ReleaseReason::ClientGone, now);
+            }
+            assert_eq!(counts(), standing, "{name}: end {nth}");
+        }
     }
 }

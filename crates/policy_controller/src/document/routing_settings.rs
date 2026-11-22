@@ -10,8 +10,8 @@ use crate::{
         Assignment, BestWithTemperatureParams, BindingSpec, BoundedLoadParams, BucketParams,
         ConsistentHashParams, IndexKind, IndexSpec, KeySourceSpec, KvPressureParams,
         LeastLoadParams, OverloadSpec, Pairing, PickStage, PolicySpec, PrefixAffinityParams,
-        ProfileSpec, Recovery, RoutingKeySpec, ScoreSpec, ScoreStage, SessionsSpec, SpecError,
-        SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
+        ProfileSpec, Recovery, RoutingKeySpec, RulePlaced, ScoreSpec, ScoreStage, SessionsSpec,
+        SpecError, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
         OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
     },
     engine::view::Phase,
@@ -1265,7 +1265,11 @@ impl Bound {
         )?;
         view_headers.clone_from(&headers);
         // A pair of presets names no rule: the manual preset's own is the
-        // one the settings are written into.
+        // one the settings are written into. It keeps the preset's word of
+        // a request the rule places, the profile's own: the gateway's
+        // `manual` policy places a keyed request itself
+        // (`model_gateway/src/policies/registry.rs:450`), and no stage
+        // counts under its picker.
         let preset = match binding.sessions.take() {
             Some(rule) => Some(rule),
             None => PolicySpec::preset("manual")?
@@ -1464,16 +1468,16 @@ fn key_sources(
 /// lacks ([`unplaced`]).
 ///
 /// - `random` draws.
-/// - `power_of_two` draws two workers and `least_load` reads every worker.
-///   Both score a worker by its report and by the requests the policy
-///   placed on it since. A request the rule placed is none of those: in a
-///   gateway's own process no stage hears its dispatch
-///   (`lease_events::stages_hear`), as the gateway's policy hears of no
-///   request its sticky map placed
+/// - `power_of_two` and `least_load` compare workers by load. Both score
+///   a worker by its report and by the requests the policy placed on it
+///   since. A request the rule placed is none of those: the rule keeps it
+///   from the profile ([`override_rule`]), so in a gateway's own process
+///   no stage hears its dispatch (`lease_events::stages_hear`), as the
+///   gateway's policy hears of no request its sticky map placed
 ///   (`model_gateway/src/policies/registry.rs:543-546`). Both read such a
 ///   request in the count of requests the gateway holds on the worker. A
 ///   host that tells a dispatch off a lease on file keeps no word of who
-///   placed it, and its stages count every dispatch.
+///   placed it, and its stages count every dispatch it is told.
 /// - `passthrough` sends every request to the first worker that takes one.
 /// - `bucket` draws for a single request, and the rule plans single
 ///   requests alone. Its stage places a prefill decision by the sizes it
@@ -1555,6 +1559,11 @@ const OVERRIDE_INFLIGHT_CAP: u16 = 2;
 /// - An idle key is forgotten after the override's idle time, at its
 ///   sweep, and never where either time is zero ([`pin_times`]): the
 ///   override keeps its keys in the manual policy's own map.
+/// - A request the rule places alone is kept from the profile
+///   ([`RulePlaced::Untold`]): the gateway's policy hears of no request
+///   its sticky map placed
+///   (`model_gateway/src/policies/registry.rs:543-546`). No other rule
+///   these settings write says so.
 ///
 /// The rule names no header: the binding's `routing_key` block lists the
 /// key's sources ([`key_sources`]).
@@ -1579,6 +1588,7 @@ fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettin
             Assignment::Delegate => Recovery::Latest,
             Assignment::Random | Assignment::MinLoad | Assignment::MinGroup => Recovery::Original,
         },
+        rule_placed: RulePlaced::Untold,
     })
 }
 
@@ -2471,7 +2481,8 @@ mod tests {
                     "sweep_s": 60,
                     "assignment": "delegate",
                     "inflight_cap": 2,
-                    "recovery": "latest"
+                    "recovery": "latest",
+                    "rule_placed": "untold"
                 });
             });
             assert_eq!(sticky(name).policy_document().as_ref(), Ok(&expected));
