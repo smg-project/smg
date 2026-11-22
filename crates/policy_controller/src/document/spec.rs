@@ -5273,6 +5273,9 @@ pub struct AppliedSpec {
     /// The document's `plans.pd-pair.decode`.
     decode_pick: DecodePick,
     lists: ViewLists,
+    /// The document's `view.headers`, in their order
+    /// ([`AppliedSpec::view_headers`]).
+    view_headers: Box<[Box<str>]>,
     /// Each binding's routing key sources, by the binding's place in the
     /// document; none where a binding names none
     /// ([`AppliedSpec::key_sources_for`]).
@@ -5350,6 +5353,12 @@ impl AppliedSpec {
             pairing: document.plans.pd_pair.pairing,
             decode_pick: document.plans.pd_pair.decode,
             lists: ViewLists::of(&document.view),
+            view_headers: document
+                .view
+                .headers
+                .iter()
+                .map(|name| name.as_str().into())
+                .collect(),
             key_sources: document
                 .bindings
                 .iter()
@@ -5377,6 +5386,7 @@ impl AppliedSpec {
             pairing: Pairing::default(),
             decode_pick: DecodePick::default(),
             lists: ViewLists::default(),
+            view_headers: Box::default(),
             key_sources: Box::default(),
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
@@ -5548,6 +5558,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn lists(&self) -> &ViewLists {
         &self.lists
+    }
+
+    /// The request headers a stage may read (`view.headers`), in the
+    /// document's order. A host states each one a request carries as a
+    /// [`Header`](crate::engine::view::Header), which names its header by
+    /// its place here.
+    pub fn view_headers(&self) -> impl Iterator<Item = &str> {
+        self.view_headers.iter().map(|name| &**name)
     }
 }
 

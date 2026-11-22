@@ -68,6 +68,8 @@ pub use policy_engine::overlap::{
 #[cfg(feature = "in-process")]
 pub use policy_engine::pair::{prefills_full, PairAdmission, PairLists};
 #[cfg(feature = "in-process")]
+pub use policy_engine::place::{HeaderRead, PlaceRequest, Prompt, Unplaced};
+#[cfg(feature = "in-process")]
 pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]

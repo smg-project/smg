@@ -14,8 +14,8 @@
 //!   made from, for as long as that list stands. No worker is read for it
 //!   and nothing of a worker is copied.
 //! - **Once a place.** The gateway builds one policy for each place it
-//!   places for: a model and a phase. [`PolicyEngine::place`] finds the
-//!   place's profile by the document's own bindings, there and at no
+//!   places for: a model and a phase. [`PolicyEngine::place_for`] finds
+//!   the place's profile by the document's own bindings, there and at no
 //!   request.
 //! - **Once a request.** [`PolicyEngine::pick`] asks for one pick over the
 //!   pool, under a profile the engine picks by its picker alone
@@ -47,6 +47,7 @@ pub(super) mod encode;
 mod keys;
 pub mod overlap;
 pub(super) mod pair;
+pub(super) mod place;
 mod single;
 mod task;
 mod with_shadow;
@@ -506,7 +507,7 @@ impl PolicyEngine {
     ///
     /// [`Engine::place_for`]: super::framework::Engine::place_for
     #[must_use]
-    pub fn place(&self, model: &str, phase: Phase) -> Place<'_> {
+    pub fn place_for(&self, model: &str, phase: Phase) -> Place<'_> {
         self.spec.engine().place_for(model, phase)
     }
 
@@ -1087,7 +1088,7 @@ mod tests {
     /// The profile of the model's single placements, which the engine picks
     /// alone.
     fn alone(engine: &PolicyEngine) -> AloneProfile {
-        match engine.place(MODEL, Phase::Single) {
+        match engine.place_for(MODEL, Phase::Single) {
             Place::Alone(profile) => profile,
             other => panic!("not picked alone: {other:?}"),
         }
@@ -1168,18 +1169,21 @@ mod tests {
         document.bindings[0].matcher.model = "served-*".to_string();
         let engine = engine_of(&document);
         assert!(matches!(
-            engine.place("served-a", Phase::Single),
+            engine.place_for("served-a", Phase::Single),
             Place::Alone(_)
         ));
-        assert_eq!(engine.place("other", Phase::Single), Place::Unbound);
-        assert_eq!(engine.place("", Phase::Single), Place::Unbound);
+        assert_eq!(engine.place_for("other", Phase::Single), Place::Unbound);
+        assert_eq!(engine.place_for("", Phase::Single), Place::Unbound);
         // The preset binds every model, the empty id among them.
         let every = preset("round_robin");
         assert_eq!(
-            every.place("", Phase::Single),
-            every.place(MODEL, Phase::Single)
+            every.place_for("", Phase::Single),
+            every.place_for(MODEL, Phase::Single)
         );
-        assert!(matches!(every.place("", Phase::Single), Place::Alone(_)));
+        assert!(matches!(
+            every.place_for("", Phase::Single),
+            Place::Alone(_)
+        ));
     }
 
     /// The places one pick decides: the picker places by itself, no stage
@@ -1189,7 +1193,7 @@ mod tests {
     #[test]
     fn a_place_is_picked_alone_where_its_picker_decides_by_itself() {
         for engine in [preset("round_robin"), preset("passthrough")] {
-            let place = engine.place(MODEL, Phase::Single);
+            let place = engine.place_for(MODEL, Phase::Single);
             assert!(matches!(place, Place::Alone(_)), "{place:?}");
         }
         for name in [
@@ -1203,21 +1207,21 @@ mod tests {
             "bucket",
         ] {
             let engine = preset(name);
-            let Place::NotAlone { profile, stage } = engine.place(MODEL, Phase::Single) else {
+            let Place::NotAlone { profile, stage } = engine.place_for(MODEL, Phase::Single) else {
                 panic!("{name} is picked alone");
             };
             assert_eq!(profile, name);
             assert!(!stage.to_string().is_empty(), "{name}: {stage}");
         }
         assert_eq!(
-            preset("random").place(MODEL, Phase::Single),
+            preset("random").place_for(MODEL, Phase::Single),
             Place::NotAlone {
                 profile: "random",
                 stage: InTheWay::Picker("random"),
             }
         );
         assert!(matches!(
-            preset("least_load").place(MODEL, Phase::Single),
+            preset("least_load").place_for(MODEL, Phase::Single),
             Place::NotAlone {
                 stage: InTheWay::Scorer(_),
                 ..
@@ -1237,18 +1241,18 @@ mod tests {
         document.generation = 1;
         let engine = engine_of(&document);
         assert!(matches!(
-            engine.place(MODEL, Phase::Prefill),
+            engine.place_for(MODEL, Phase::Prefill),
             Place::Alone(_)
         ));
         assert!(matches!(
-            engine.place(MODEL, Phase::Decode),
+            engine.place_for(MODEL, Phase::Decode),
             Place::Alone(_)
         ));
         // The pair plan has no side for a single request, and none for an
         // encode one: a binding names the model, so the place is not
         // unbound.
-        assert_eq!(engine.place(MODEL, Phase::Single), Place::NoSide);
-        assert_eq!(engine.place(MODEL, Phase::Encode), Place::NoSide);
+        assert_eq!(engine.place_for(MODEL, Phase::Single), Place::NoSide);
+        assert_eq!(engine.place_for(MODEL, Phase::Encode), Place::NoSide);
 
         for (filter, own) in [
             ("has-capacity", Phase::Prefill),
@@ -1256,7 +1260,7 @@ mod tests {
         ] {
             let engine = round_robin_with(filter);
             for phase in [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode] {
-                let place = engine.place(MODEL, phase);
+                let place = engine.place_for(MODEL, phase);
                 if phase == own {
                     assert!(matches!(place, Place::Alone(_)), "{filter} at {phase:?}");
                 } else {
@@ -1330,7 +1334,7 @@ mod tests {
             let stage = InTheWay::NoFilter(left_out);
             let profile = "round_robin";
             assert_eq!(
-                engine_of(&document).place(MODEL, Phase::Single),
+                engine_of(&document).place_for(MODEL, Phase::Single),
                 Place::NotAlone { profile, stage }
             );
         }

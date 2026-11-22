@@ -848,8 +848,10 @@ Whether each preset gives classic's answer is section 13.
 
 ## 8. What a host does
 
-This is the contract between the engine and the program that embeds it. It is the same for the
-gateway and for the controller.
+This is the contract between the engine and the program that embeds it. Its start is the same
+for the gateway and for the controller. For each request the two differ. The gateway makes the
+one call of section 8.2 and keeps the placement. A controller states worker ids of its own and
+keeps no placement: it calls the entry that issues nothing and files its own record.
 
 ### 8.1 On main today **[built]**
 
@@ -892,7 +894,10 @@ pub enum Decided {
 
 Then the host itself has to: derive the routing key by the document's rule and hash the prompt
 into blocks, inside `make`; try the targets in order, checking each worker's health again; keep
-the decision's lease and report each event; turn a refusal into a status.
+the decision's lease and report each event; turn a refusal into a status. For a single request
+`place` of section 8.2 now derives the key, hashes the prompt and tries the targets, and its
+`Placement` keeps the lease. The host still says the two events and turns a refusal into a
+status.
 
 That is too much. The gateway's earlier integration needs a module of its own of 19 files and
 13,856 lines (tests included) for it, and a branch in every route.
@@ -941,11 +946,11 @@ host's `Generation` type. The engine fills the cell at the list's first decision
 **2. For each request, one call.**
 
 ```rust
-// planned
+// engine/policy_engine/place.rs, behind the feature `in-process`: built for a single request
 pub struct PlaceRequest<'a> {
     pub model: &'a str,
     pub lists: WorkerLists<'a>,       // one list, or a pair's two lists with their pair classes
-    pub prompt: Prompt<'a>,           // token ids or text, and the entry named under its partition
+    pub prompt: Prompt<'a>,           // token ids or text, and the seeds of its cache partition
     pub headers: &'a dyn HeaderRead,  // the engine reads the headers the document names
     pub request_id: Option<&'a str>,
     pub tenant: Option<&'a str>,
@@ -954,10 +959,12 @@ pub struct PlaceRequest<'a> {
     pub max_output_tokens: u32,
     pub media: MediaCounts,
     pub demands: Demands,             // what the request needs of its worker
+    pub encode: Option<EncodeItems<'a>>, // the items of an encode request
     pub attempt: u8,
     pub tried: &'a [WorkerId],        // workers earlier attempts used
     pub budget_micros: u32,           // time left for the decision
-    pub admits: Option<&'a dyn Fn(&dyn Worker) -> bool>, // the route's own rule, asked of the pick
+    pub decode_again: bool,           // the caller asks a pair's decode again behind its prefill
+    // planned: `admits`, the route's own rule, asked of the pick
 }
 
 impl PolicyEngine {
@@ -974,7 +981,9 @@ pub struct Placement<'a> {               // built, see part 3
 
 pub enum Unplaced {
     Shed { reason: ShedReason, emptied_by: &'static str, retry_after_secs: u16 },
+    Queued,
     NoWorkers,
+    Refused(DecisionRefused),
 }
 ```
 
@@ -982,6 +991,12 @@ Inside `place` the crate derives the routing key, hashes the prompt, decides, an
 targets best first: health and circuit breaker are read again, and the route's rule is asked of
 the picked worker. If none holds, it decides again over what is left. The host sees a worker or a
 reason.
+
+Built so far, for a single request: the key, the hashes, one decision, and its targets tried
+best first by health and circuit breaker. Where none holds the request has no worker
+(`NoWorkers`), and a lease the pick was issued is given up at once. Planned: the route's rule,
+the decision made again over what is left, a pair's two lists and an encode request. `place`
+declines the last two by name until then.
 
 A retry stays on its wire by its demand alone. The host gives one number to each runtime and
 transport it dials. It writes that number as each worker's fact and as the retry's demand, and
@@ -1012,12 +1027,11 @@ impl Placement<'_> {
 ```
 
 Where the document's stages want no events, a single request's placement holds nothing and
-these calls do nothing. A pair's placement always holds a lease (section 6). Until `place`
-answers with it, a host makes a placement of the answer it holds: `Placement::alone` for a
-place, `Placement::taken` for a whole decision and the target it took.
+these calls do nothing. A pair's placement always holds a lease (section 6). `place` answers
+a single request with a placement, and no host makes one itself.
 
-Nothing else is asked of a host. In particular a host never names a policy, never looks inside a
-decision, never keeps a lease and never runs a timer for the engine.
+Nothing else is asked of a host that makes this call. In particular it never names a policy,
+never looks inside a decision, never keeps a lease and never runs a timer for the engine.
 
 ### 8.3 What is reused and what is added
 
@@ -1169,7 +1183,7 @@ the worker crate's structures, and the one engine.
 | cache events | an index of the store's own | the kv-index crate's index, filled by the worker crate's collector |
 | sessions | the store's tables | the engine's session table |
 | leases | the store's lease tables, in memory, one for each deciding thread | stay: a controller must remember what it issued to gateways |
-| decisions | the store-backed engine | `PolicyEngine::place` over the registry's lists |
+| decisions | the store-backed engine | `PolicyEngine::decide_without_lease` over the registry's lists |
 | discovery | not registering | the discovery crate through its host interface, registering through the worker crate's job queue |
 
 What leaves the crate with that switch: the store-backed engine, the store's copies of the worker
@@ -1267,7 +1281,7 @@ gateway                                           controller (leader)
    │── Session: accepted, or refused ─────────────>│
    │                                               │
    │  for each request:                            │
-   │── Decide: request facts ─────────────────────>│  PolicyEngine::place over its own lists
+   │── Decide: request facts ─────────────────────>│  PolicyEngine::decide_without_lease over its own lists
    │<──────────────── decision and lease ──────────│
    │── (the gateway sends the request to the worker)
    │── Session: dispatched ───────────────────────>│
@@ -1458,7 +1472,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing |
 | Encode-prefill-decode on that engine | **[partly]** | `EncodeLists::decide` decides it over a host's three lists; the engine's entry refuses it and nothing is issued for it |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built over an answer its host holds; `place` and the start call are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, and `place` for a single request with one decision; `place` for a pair and for an encode request, the decision made again and the start call are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |

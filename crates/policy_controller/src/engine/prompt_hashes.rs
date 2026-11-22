@@ -90,7 +90,7 @@ impl PromptHashes {
             kind: HashKind::Token,
             block_size,
             namespace_seed: seeds.partition,
-            prompt_tokens: prompt_token_count(tokens.len()),
+            prompt_tokens: prompt_tokens_of(Some(tokens), None),
         }
     }
 
@@ -111,7 +111,7 @@ impl PromptHashes {
             kind: HashKind::Text,
             block_size: window,
             namespace_seed: seeds.partition,
-            prompt_tokens: prompt_token_count(bytes.len() / TEXT_BYTES_PER_TOKEN as usize),
+            prompt_tokens: prompt_tokens_of(None, Some(text)),
         }
     }
 
@@ -212,6 +212,18 @@ pub(crate) fn block_size_and_depth(
 
 fn prompt_token_count(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// The size in tokens of a prompt its caller holds as `tokens` or as
+/// `text`, with no hash made: the ids counted, else the text's bytes at
+/// [`TEXT_BYTES_PER_TOKEN`] a token. Token ids win, as they do where the
+/// prompt is hashed, and [`PromptHashes`] keeps this count of it.
+pub(crate) fn prompt_tokens_of(tokens: Option<&[u32]>, text: Option<&str>) -> u32 {
+    match (tokens, text) {
+        (Some(tokens), _) => prompt_token_count(tokens.len()),
+        (None, Some(text)) => prompt_token_count(text.len() / TEXT_BYTES_PER_TOKEN as usize),
+        (None, None) => 0,
+    }
 }
 
 #[cfg(test)]
