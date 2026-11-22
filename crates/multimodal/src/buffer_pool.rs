@@ -39,6 +39,7 @@
 
 use std::{
     collections::TryReserveError,
+    convert::Infallible,
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
@@ -124,6 +125,18 @@ fn class_index(capacity: usize) -> Option<usize> {
         .then(|| (capacity / SMALLEST).trailing_zeros() as usize)
 }
 
+/// A zeroed buffer of `len` bytes, or the allocator's refusal.
+fn zeroed(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    bytemuck::try_zeroed_vec(len).or_else(|()| {
+        // That refusal carries no value: the reserve asks again and gives
+        // the error, or the buffer after all.
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len)?;
+        buf.resize(len, 0);
+        Ok(buf)
+    })
+}
+
 impl BufferPool {
     pub(crate) const fn new() -> Self {
         Self {
@@ -142,17 +155,36 @@ impl BufferPool {
     /// Its bytes are a previous request's (the [`SENTINEL`] in a debug
     /// build), zeros only when it is fresh or outside the pooled range.
     pub(crate) fn take(&self, len: usize) -> Vec<u8> {
+        // A refused allocation ends the process, as before.
+        let Ok(buf) = self.sized(len, |len| Ok::<_, Infallible>(vec![0u8; len]));
+        buf
+    }
+
+    /// [`Self::take`] for a producer that reports a refused allocation.
+    pub(crate) fn try_take(&self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        self.sized(len, zeroed)
+    }
+
+    /// The buffer of both takes; `fresh` allocates a zeroed one.
+    fn sized<E>(
+        &self,
+        len: usize,
+        fresh: impl Fn(usize) -> Result<Vec<u8>, E>,
+    ) -> Result<Vec<u8>, E> {
         let Some(capacity) = class_capacity(len) else {
-            return vec![0u8; len];
+            return fresh(len);
         };
         // A fresh buffer is a zeroed allocation of the whole class: the pages
         // past `len` stay untouched, the ones below it are faulted in by the
         // producer's first write, once in the buffer's life.
-        let mut buf = self.kept(capacity).unwrap_or_else(|| vec![0u8; capacity]);
+        let mut buf = match self.kept(capacity) {
+            Some(buf) => buf,
+            None => fresh(capacity)?,
+        };
         buf.resize(len, 0);
         #[cfg(debug_assertions)]
         buf.fill(SENTINEL);
-        buf
+        Ok(buf)
     }
 
     /// An empty buffer with room for `len` bytes, for a producer that appends
@@ -223,6 +255,11 @@ impl BufferPool {
 /// [`BufferPool::take`] on the process's pool.
 pub(crate) fn take(len: usize) -> Vec<u8> {
     shared().take(len)
+}
+
+/// [`BufferPool::try_take`] on the process's pool.
+pub(crate) fn try_take(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    shared().try_take(len)
 }
 
 /// [`BufferPool::take_empty`] on the process's pool.
@@ -393,6 +430,12 @@ mod tests {
         pool.recycle(Vec::with_capacity(SMALLEST / 2));
         pool.recycle(Vec::with_capacity(2 * LARGEST));
         assert_eq!(pool.held(), 0);
+    }
+
+    #[test]
+    fn a_length_no_allocation_can_hold_is_refused() {
+        let pool = BufferPool::new();
+        assert!(pool.try_take(usize::MAX).is_err());
     }
 
     #[test]
