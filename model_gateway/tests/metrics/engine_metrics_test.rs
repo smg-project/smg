@@ -43,7 +43,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
         }],
         ..Default::default()
     };
-    let worker = <BasicWorkerBuilder>::new(WORKER).build();
+    let worker = BasicWorkerBuilder::new(WORKER).build();
     Metrics::record_engine_load(&worker, "test-model", "null", &response);
 
     let body = smg::server::http_client()
