@@ -484,7 +484,7 @@ The engine is in `engine/`.
 ### 5.1 The engine object **[built]**
 
 A process has one engine object. It is built once from the policy document and holds the
-document's stages and what they remember. It holds no worker.
+document's stages and what they remember. It holds no worker of its own: the registry its host hands it (section 8.1) holds them.
 
 ```rust
 // engine/policy_engine.rs
@@ -498,7 +498,7 @@ pub struct PolicyEngine {
     epochs: AtomicU64,    // how many list values were made
     faults: AtomicU64,    // decisions that panicked
     unheard: AtomicU64,   // lease events that panicked inside a stage
-    upkeep_faults: AtomicU64, // runs of the upkeep that panicked in the engine's own task
+    upkeep_faults: AtomicU64, // steps of the engine's own task that panicked: the upkeep, the registry's follow
     loads: task::Loads,   // the host's load channel, once handed, and the newest load snapshot
                           // the engine's own task keeps at hand
 }
@@ -904,7 +904,7 @@ At start:
 
 What the engine's task tells the policies at each event of the registry. It names a worker by the
 id the host states of it (`Members::facts_of`), which is the id the host's lists name it by; a
-host that states none is named by the fingerprint of the worker's address.
+worker whose host states none is named by the fingerprint of its address.
 
 | The registry's event | The policies are told |
 |---|---|
@@ -915,7 +915,9 @@ host that states none is named by the fingerprint of the worker's address.
 
 A worker removed and another registered at its address come as a `Removed` and a `Registered`,
 so a leave and then a join. Where the registration is heard first, the worker is read as its
-id's next life: a leave and a join of the id, and the removal then tells nothing. The events
+id's next life: a leave and a join of the id, and the removal then tells nothing. That holds
+under the registry's own id of a worker too: a removal tells a leave only of the object the
+task holds. The events
 are a broadcast that drops its oldest for a reader that falls behind: the task then reads the
 registry whole, tells what changed, and last tells the ids that stand, so a policy keeps
 nothing of a worker whose whole life the channel dropped. It does the same behind a channel

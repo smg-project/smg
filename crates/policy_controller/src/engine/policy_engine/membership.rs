@@ -11,7 +11,10 @@
 //! ([`Members::facts_of`], [`FixedFacts::id_or`]). The follow keeps the id
 //! it told each worker as joined under, by the registry's own id of the
 //! worker ([`Follow`]): a leave names the id told at the join, and the
-//! host is not asked of a worker that is gone.
+//! host is not asked of a worker that is gone. Beside the id it keeps a
+//! weak pointer to the worker's object: each event carries the object it
+//! speaks of, and the follow reads by it which life of the registry's id
+//! the event is of.
 //!
 //! The events are a broadcast, and a reader that falls behind loses the
 //! oldest. So the follow reads the registry whole at its start and where
@@ -22,11 +25,15 @@
 //! list, and a stage drops there what requests left under it.
 //!
 //! The events the channel kept come behind that read and may be older than
-//! it. So an id is told as left only once the follow holds no worker under
-//! it: the removal of an earlier worker at an address, heard behind a read
-//! that found the next one there, tells nothing. A worker registered under
-//! an id that another worker is held under is the id's next life: a leave
-//! and a join of the id.
+//! it, and a registry can say a registration ahead of the removal it
+//! follows. So a removal tells a leave only where it names the object the
+//! follow holds under the registry's id, and an id is told as left only
+//! once the follow holds no worker under it: the removal of an earlier
+//! worker, heard behind a read or a registration that found the next one,
+//! tells nothing. A worker registered under an id that another worker is
+//! held under is the id's next life: a leave and a join of the id. So is
+//! another object registered, or found by a whole read, under a registry
+//! id the follow holds.
 //!
 //! A channel that closed takes nothing the follow holds. The follow
 //! subscribes again at the task's next upkeep and reads the registry whole
@@ -39,7 +46,8 @@
 use std::{
     fmt,
     future::pending,
-    sync::{Arc, OnceLock},
+    ptr,
+    sync::{Arc, OnceLock, Weak},
 };
 
 use rustc_hash::FxHashMap;
@@ -62,6 +70,9 @@ use crate::{
 /// the workers that stand, and what the host says of a worker beside its
 /// object. The worker crate's registry is one, of a host that states no id
 /// of its own.
+///
+/// The engine's own task calls all three. A call that waits holds back the
+/// task's other work: the upkeep, and the newest load snapshot.
 pub trait Members: Send + Sync {
     /// A subscription to the registry's events from this call on.
     fn events(&self) -> Receiver<WorkerEvent>;
@@ -105,23 +116,47 @@ impl<G: Generation> Members for WorkerRegistry<G> {
 #[derive(Default)]
 pub(super) struct Handed(OnceLock<Arc<dyn Members>>);
 
+impl Handed {
+    /// The registry the host handed: none until it hands one.
+    pub(super) fn get(&self) -> Option<&Arc<dyn Members>> {
+        self.0.get()
+    }
+}
+
 impl fmt::Debug for Handed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Handed")
-            .field("registry", &self.0.get().is_some())
+            .field("registry", &self.get().is_some())
             .finish()
     }
 }
 
-/// The engine's follow of its host's registry: the subscription, and the id
-/// each worker was told as joined under, by the registry's own id of the
-/// worker. It holds no worker.
+/// What the follow told of one worker: the id it told the worker as joined
+/// under, and the worker's object. The pointer is a weak one: it names the
+/// object, and keeps its address from another's use while the follow holds
+/// it.
+struct Held {
+    id: WorkerId,
+    object: Weak<dyn Worker>,
+}
+
+impl Held {
+    /// Whether `worker` is the object held.
+    fn is(&self, worker: &Arc<dyn Worker>) -> bool {
+        ptr::addr_eq(self.object.as_ptr(), Arc::as_ptr(worker))
+    }
+}
+
+/// The engine's follow of its host's registry: the registry, the
+/// subscription, and what it told of each worker, by the registry's own id
+/// of the worker. Of a worker it keeps a weak pointer alone: the registry
+/// holds the workers.
 pub(super) struct Follow {
     registry: Arc<dyn Members>,
     /// The subscription. None at the follow's start and behind a channel
     /// that closed, until the task's next upkeep takes one.
     events: Option<Receiver<WorkerEvent>>,
-    told: FxHashMap<ObjectId, WorkerId>,
+    told: FxHashMap<ObjectId, Held>,
     /// How many workers the follow holds under each id it told: the ids
     /// that stand.
     under: FxHashMap<WorkerId, u32>,
@@ -174,14 +209,18 @@ impl PolicyEngine {
     /// An id names one worker. A worker registered under an id that
     /// another worker is held under is read as the id's next life: a leave
     /// and a join of the id, and the earlier worker's removal then tells
-    /// nothing. A registry can say a registration at an address ahead of
-    /// the removal it follows.
+    /// nothing. So is another object registered under the registry's own
+    /// id of a worker that is held. A registry can say a registration
+    /// ahead of the removal it follows, and a removal tells a leave only
+    /// of the object the follow holds.
     ///
     /// The events are a broadcast, and a reader that falls behind loses
     /// the oldest: the task then reads the registry whole and tells what
     /// changed, and last the ids that stand ([`Membership::Snapshot`]),
     /// so a stage keeps nothing of a worker whose whole life the channel
-    /// dropped. It does the same behind a channel that closed, on another
+    /// dropped. A read cannot tell an object the registry replaced from a
+    /// worker it registered again: it tells both as the worker's next
+    /// life. It does the same behind a channel that closed, on another
     /// subscription, once a second for as long as the host hands a closed
     /// one. The engine keeps the registry for as long as it stands, and
     /// reads it off a request's path alone.
@@ -203,7 +242,7 @@ impl PolicyEngine {
         let follow = match members {
             Some(follow) => follow,
             None => {
-                let Some(registry) = self.members.0.get() else {
+                let Some(registry) = self.members.get() else {
                     return;
                 };
                 members.insert(Follow {
@@ -250,13 +289,15 @@ impl PolicyEngine {
         match word {
             Ok(WorkerEvent::Registered { worker_id, worker }) => {
                 let id = follow.id_of(&worker);
-                self.stands(follow, worker_id, id);
+                self.stands(follow, worker_id, &worker, id, false);
             }
             Ok(WorkerEvent::Replaced { worker_id, new, .. }) => {
                 let id = follow.id_of(&new);
-                self.stands(follow, worker_id, id);
+                self.stands(follow, worker_id, &new, id, true);
             }
-            Ok(WorkerEvent::Removed { worker_id, .. }) => self.gone(follow, &worker_id),
+            Ok(WorkerEvent::Removed { worker_id, worker }) => {
+                self.gone(follow, &worker_id, Some(&worker));
+            }
             Ok(WorkerEvent::StatusChanged { .. }) => {}
             Err(RecvError::Lagged(_)) => self.read_whole(follow),
             Err(RecvError::Closed) => return false,
@@ -264,20 +305,33 @@ impl PolicyEngine {
         true
     }
 
-    /// The worker the registry knows as `object` stands, and its host
-    /// names it `id`: nothing where the follow holds it under that id.
-    /// Else a join of `id`, behind a leave of the id it was held under.
-    /// Where another worker is held under `id`, this one is the id's next
-    /// life, heard ahead of the earlier one's removal: a leave of `id`
-    /// comes ahead of its join, so the stages keep nothing of the earlier
-    /// life.
-    fn stands(&self, follow: &mut Follow, object: ObjectId, id: WorkerId) {
-        let was = follow.told.insert(object, id);
-        if was == Some(id) {
-            return;
-        }
-        if let Some(was) = was {
-            self.unnamed(follow, was);
+    /// The registry knows `worker` as `object`, and its host names it
+    /// `id`. Nothing where the follow holds that object under that id, and
+    /// nothing where the registry says `worker` replaces the object held
+    /// (`replaced`) and the id stands. Else a join of `id`, behind a leave
+    /// of the id the follow held under `object`: another object under a
+    /// registry id that is held, with no word of a replacement, is the
+    /// worker's next life, heard ahead of the earlier one's removal or
+    /// found by a whole read. Where another worker is held under `id`,
+    /// this one is the id's next life too: a leave of `id` comes ahead of
+    /// its join, so the stages keep nothing of the earlier life.
+    fn stands(
+        &self,
+        follow: &mut Follow,
+        object: ObjectId,
+        worker: &Arc<dyn Worker>,
+        id: WorkerId,
+        replaced: bool,
+    ) {
+        let now = Held {
+            id,
+            object: Arc::downgrade(worker),
+        };
+        if let Some(was) = follow.told.insert(object, now) {
+            if was.id == id && (replaced || was.is(worker)) {
+                return;
+            }
+            self.unnamed(follow, was.id);
         }
         let held = follow.under.entry(id).or_insert(0);
         *held += 1;
@@ -288,10 +342,18 @@ impl PolicyEngine {
     }
 
     /// The worker the registry knew as `object` stands no more: a leave of
-    /// the id it was held under, and nothing where the follow held none.
-    fn gone(&self, follow: &mut Follow, object: &ObjectId) {
+    /// the id it was held under, and nothing where the follow held none. A
+    /// removal names the object it removed (`removed`): where the follow
+    /// holds another under `object`, the removal is of an earlier life,
+    /// and tells nothing. A whole read names none: what the follow holds
+    /// and the read found no more is gone.
+    fn gone(&self, follow: &mut Follow, object: &ObjectId, removed: Option<&Arc<dyn Worker>>) {
+        let earlier = |held: &Held| removed.is_some_and(|removed| !held.is(removed));
+        if follow.told.get(object).is_some_and(earlier) {
+            return;
+        }
         if let Some(was) = follow.told.remove(object) {
-            self.unnamed(follow, was);
+            self.unnamed(follow, was.id);
         }
     }
 
@@ -313,12 +375,14 @@ impl PolicyEngine {
     /// ([`Membership::Snapshot`]): a worker whose whole life the channel
     /// dropped is in neither list, and a stage drops there what requests
     /// left under it. The records of sent prefixes are told the single
-    /// leaves alone. The host is asked of every worker ahead of the first
-    /// word.
+    /// leaves alone. A worker found as another object under a registry id
+    /// the follow holds is told as the worker's next life: the read cannot
+    /// tell an object the registry replaced from a worker it registered
+    /// again. The host is asked of every worker ahead of the first word.
     fn read_whole(&self, follow: &mut Follow) {
         let standing = follow.registry.standing().into_iter();
-        let stands: FxHashMap<ObjectId, WorkerId> = standing
-            .map(|(object, worker)| (object, follow.id_of(&worker)))
+        let stands: FxHashMap<ObjectId, (WorkerId, Arc<dyn Worker>)> = standing
+            .map(|(object, worker)| (object, (follow.id_of(&worker), worker)))
             .collect();
         let held = follow.told.keys();
         let gone: Vec<ObjectId> = held
@@ -326,10 +390,10 @@ impl PolicyEngine {
             .cloned()
             .collect();
         for object in &gone {
-            self.gone(follow, object);
+            self.gone(follow, object, None);
         }
-        for (object, id) in stands {
-            self.stands(follow, object, id);
+        for (object, (id, worker)) in stands {
+            self.stands(follow, object, &worker, id, false);
         }
         let standing: Vec<WorkerId> = follow.under.keys().copied().collect();
         self.told(&Membership::Snapshot(&standing));

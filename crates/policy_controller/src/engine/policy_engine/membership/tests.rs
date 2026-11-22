@@ -158,7 +158,7 @@ fn sorted(mut ids: Vec<WorkerId>) -> Vec<WorkerId> {
 
 /// The ids the follow holds as told, in their order.
 fn held(follow: &Follow) -> Vec<WorkerId> {
-    sorted(follow.told.values().copied().collect())
+    sorted(follow.told.values().map(|held| held.id).collect())
 }
 
 /// Every word that waits on the follow's subscription, told as the
@@ -176,6 +176,24 @@ fn drain(engine: &PolicyEngine, follow: &mut Follow) {
             return;
         }
     }
+}
+
+/// The registry's word of a registration of `worker` under its id
+/// `object`, as the engine's task hears it.
+fn registered(object: &ObjectId, worker: &Arc<dyn Worker>) -> Result<WorkerEvent, RecvError> {
+    Ok(WorkerEvent::Registered {
+        worker_id: object.clone(),
+        worker: Arc::clone(worker),
+    })
+}
+
+/// The registry's word of the removal of `worker`, which it knew as
+/// `object`.
+fn removed(object: &ObjectId, worker: &Arc<dyn Worker>) -> Result<WorkerEvent, RecvError> {
+    Ok(WorkerEvent::Removed {
+        worker_id: object.clone(),
+        worker: Arc::clone(worker),
+    })
 }
 
 /// `registry` as a host hands it to the engine.
@@ -216,7 +234,8 @@ async fn settle() {
 }
 
 /// A host that keeps ids of its own: its registry, and the id it states of
-/// the worker at each address. `panics` makes its answer panic.
+/// the worker at each address. `panics` makes its answer panic, and its
+/// hand-over of a subscription.
 struct Stating {
     registry: Arc<Registry>,
     ids: Mutex<FxHashMap<String, WorkerId>>,
@@ -240,6 +259,7 @@ impl Stating {
 
 impl Members for Stating {
     fn events(&self) -> Receiver<WorkerEvent> {
+        assert!(!self.panics.load(Ordering::Relaxed), "the host's own code");
         self.registry.subscribe_events()
     }
 
@@ -286,8 +306,7 @@ fn a_registration_and_a_removal_of_the_registry_are_told_to_the_stages() {
 /// stages nothing, and neither does a change of a worker's status: the
 /// worker stands under its id, and the follow still holds it. Classic's
 /// policies hear a removal in the removal workflow alone
-/// (`model_gateway/src/workflow/steps/local/remove_from_policy_registry.rs`),
-/// and nothing at a replacement.
+/// (`model_gateway/src/workflow/steps/local/remove_from_policy_registry.rs`).
 #[test]
 fn a_replaced_object_and_a_status_change_tell_the_stages_nothing() {
     let registry = registry(2);
@@ -415,27 +434,118 @@ fn a_registration_heard_ahead_of_the_removal_it_follows_is_the_ids_next_life() {
     let registry = registry(0);
     let (engine, heard, mut follow) = following(&registry);
     let (first, next) = (ObjectId::new(), ObjectId::new());
-    let registered = |object: &ObjectId| WorkerEvent::Registered {
-        worker_id: object.clone(),
-        worker: ready_worker(&url(0), MODEL),
-    };
-    let removed = |object: &ObjectId| WorkerEvent::Removed {
-        worker_id: object.clone(),
-        worker: ready_worker(&url(0), MODEL),
-    };
+    let (earlier, later) = (ready_worker(&url(0), MODEL), ready_worker(&url(0), MODEL));
 
-    assert!(engine.tells(&mut follow, Ok(registered(&first))));
+    assert!(engine.tells(&mut follow, registered(&first, &earlier)));
     assert_eq!(told(&heard), [("joined", id(0))]);
 
-    assert!(engine.tells(&mut follow, Ok(registered(&next))));
+    assert!(engine.tells(&mut follow, registered(&next, &later)));
     assert_eq!(told(&heard), [("left", id(0)), ("joined", id(0))]);
 
-    assert!(engine.tells(&mut follow, Ok(removed(&first))));
+    assert!(engine.tells(&mut follow, removed(&first, &earlier)));
     assert_eq!(told(&heard), [], "the id's next life stands");
 
-    assert!(engine.tells(&mut follow, Ok(removed(&next))));
+    assert!(engine.tells(&mut follow, removed(&next, &later)));
     assert_eq!(told(&heard), [("left", id(0))]);
     assert_eq!(held(&follow), []);
+}
+
+/// A registry can say a registration under its own id of a worker ahead of
+/// that worker's removal: it frees the id ahead of the removal's word.
+/// Another object registered under a registry id the follow holds is the
+/// worker's next life, a leave and a join. The earlier object's removal
+/// then tells nothing and the worker stands in the follow: a removal tells
+/// a leave only of the object held. The object held, registered again,
+/// tells nothing.
+#[test]
+fn a_registry_id_registered_again_ahead_of_its_removal_is_the_workers_next_life() {
+    let registry = registry(0);
+    let (engine, heard, mut follow) = following(&registry);
+    let object = ObjectId::new();
+    let (earlier, later) = (ready_worker(&url(0), MODEL), ready_worker(&url(0), MODEL));
+
+    assert!(engine.tells(&mut follow, registered(&object, &earlier)));
+    assert_eq!(told(&heard), [("joined", id(0))]);
+
+    assert!(engine.tells(&mut follow, registered(&object, &later)));
+    assert_eq!(told(&heard), [("left", id(0)), ("joined", id(0))]);
+    assert!(engine.tells(&mut follow, registered(&object, &later)));
+    assert_eq!(told(&heard), [], "the object held, said again");
+
+    assert!(engine.tells(&mut follow, removed(&object, &earlier)));
+    assert_eq!(told(&heard), [], "the removal of the earlier life");
+    assert_eq!(held(&follow), [id(0)]);
+
+    assert!(engine.tells(&mut follow, removed(&object, &later)));
+    assert_eq!(told(&heard), [("left", id(0))]);
+    assert_eq!(held(&follow), []);
+}
+
+/// The registration of a worker a whole read found is heard behind the
+/// read where the channel kept it. It names the object the follow holds,
+/// so it tells nothing, and the worker's own removal is then its leave.
+#[test]
+fn a_registration_heard_behind_the_read_that_found_its_worker_tells_nothing() {
+    let registry = registry(1);
+    let (engine, heard, mut follow) = following(&registry);
+    let _ = told(&heard);
+
+    // The channel keeps its newest events: the registration, behind the flood.
+    flood(&registry, 0);
+    register(&registry, 1);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("joined", id(1))], "told by the read alone");
+
+    remove(&registry, 1);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("left", id(1))]);
+    assert_eq!(held(&follow), [id(0)]);
+}
+
+/// A whole read cannot tell an object the registry replaced inside the
+/// dropped events from a worker it registered again under its id. Another
+/// object under a registry id the follow holds is told as the worker's
+/// next life: a leave and a join.
+#[test]
+fn a_whole_read_tells_another_object_under_a_held_registry_id_as_its_next_life() {
+    let registry = registry(2);
+    let (engine, heard, mut follow) = following(&registry);
+    let _ = told(&heard);
+
+    replace(&registry, 0);
+    flood(&registry, 1);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("left", id(0)), ("joined", id(0))]);
+    assert_eq!(held(&follow), sorted(vec![id(0), id(1)]));
+}
+
+/// Two workers stand under one stated id, and the host gives one of them
+/// another: the id still names the other worker, so no leave of it is
+/// told. The other worker's removal is the id's leave.
+#[test]
+fn a_worker_given_another_id_leaves_the_id_it_shared_standing() {
+    let registry = registry(2);
+    let host = Stating::over(&registry);
+    host.state(0, 7);
+    host.state(1, 7);
+    let (engine, heard, mut follow) = following(&host);
+    let one_id = WorkerId(7);
+    let shared = [("joined", one_id), ("left", one_id), ("joined", one_id)];
+    assert_eq!(
+        told(&heard),
+        shared,
+        "the second worker is the id's next life"
+    );
+
+    host.state(0, 8);
+    replace(&registry, 0);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("joined", WorkerId(8))]);
+
+    remove(&registry, 1);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("left", one_id)]);
+    assert_eq!(held(&follow), [WorkerId(8)]);
 }
 
 /// The engine's own task follows the registry its host handed: the workers
@@ -463,11 +573,13 @@ async fn the_engines_task_tells_the_stages_what_the_registry_says() {
     task.abort();
 }
 
-/// A panic of the host's own code at a word is held and counted: the task
-/// goes on. The word is lost, so the task reads the registry whole at its
-/// next upkeep, and at the one behind it where the host's code panics
-/// again. Once the host answers, the worker whose registration was lost is
-/// told as joined, and no other worker is told again.
+/// A panic of the host's own code is held and counted, and the task goes
+/// on: where the follow takes its subscription, which it takes again at
+/// the next upkeep, and at a word. The word is lost, so the task reads the
+/// registry whole at its next upkeep, and at the one behind it where the
+/// host's code panics again. Once the host answers, the worker whose
+/// registration was lost is told as joined, and no other worker is told
+/// again.
 #[tokio::test(start_paused = true)]
 async fn a_panic_of_the_hosts_code_does_not_end_the_engines_task() {
     let registry = registry(1);
@@ -475,27 +587,35 @@ async fn a_panic_of_the_hosts_code_does_not_end_the_engines_task() {
     host.state(0, 7);
     let (engine, heard) = hearing(false);
     let engine = Arc::new(engine);
+    host.panics.store(true, Ordering::Relaxed);
     engine.set_registry(handed(&host));
     let task = running(&engine);
     settle().await;
+    assert_eq!(told(&heard), [], "the host handed no subscription");
+    assert_eq!(engine.upkeep_faults(), 1);
+    assert!(!task.is_finished(), "the task goes on");
+
+    host.panics.store(false, Ordering::Relaxed);
+    sleep(Duration::from_secs(1)).await;
     assert_eq!(told(&heard), [("joined", WorkerId(7))]);
+    assert_eq!(engine.upkeep_faults(), 1);
 
     host.panics.store(true, Ordering::Relaxed);
     register(&registry, 1);
     settle().await;
     assert_eq!(told(&heard), [], "the host's answer panicked");
-    assert_eq!(engine.upkeep_faults(), 1);
+    assert_eq!(engine.upkeep_faults(), 2);
 
     // The read owed at the next upkeep panics too, and is owed again.
     sleep(Duration::from_secs(1)).await;
-    assert_eq!(engine.upkeep_faults(), 2);
+    assert_eq!(engine.upkeep_faults(), 3);
     assert!(!task.is_finished(), "the task goes on");
 
     host.panics.store(false, Ordering::Relaxed);
     host.state(1, 8);
     sleep(Duration::from_secs(1)).await;
     assert_eq!(told(&heard), [("joined", WorkerId(8))]);
-    assert_eq!(engine.upkeep_faults(), 2);
+    assert_eq!(engine.upkeep_faults(), 3);
     assert_eq!(engine.faults(), 0, "no decision panicked");
     task.abort();
 }
