@@ -4,7 +4,11 @@
 use std::sync::Arc;
 
 use smg_grpc_client::engine_port::GrpcConnector;
-use smg_worker::{connection::engine::EngineConnector, registry::WorkerRegistry};
+use smg_worker::{
+    connection::engine::EngineConnector,
+    health::overload::{OverloadThresholds, DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+    registry::WorkerRegistry,
+};
 use tokio::sync::watch;
 
 use super::ObjectsWake;
@@ -13,12 +17,34 @@ use crate::{
     worker_host::{Members, Objects},
 };
 
+/// The overload thresholds an object states for each signal its row names
+/// none for: the worker crate's two default numbers, which a gateway hands
+/// its workers too. They are the policy document's two default numbers
+/// ([`OVERLOAD_WAITING_REQUESTS`](crate::document::spec::OVERLOAD_WAITING_REQUESTS),
+/// [`OVERLOAD_TOKEN_USAGE`](crate::document::spec::OVERLOAD_TOKEN_USAGE)).
+/// One set a worker: a registration's own values, each over these.
+///
+/// The usage is the worker crate's 64-bit number, as an engine reports it.
+/// The document's constant is 32 bits wide: widened, it reads just above
+/// the 0.8 an engine reports, and a worker at the threshold would not be
+/// over it.
+const OVERLOAD_DEFAULTS: OverloadThresholds = OverloadThresholds {
+    waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
+    token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
+};
+
 /// The replica's worker objects: their holder, the store it follows and the
 /// wake of its one task. The registry is built here, and the holder alone
 /// writes it. Each object connects to its engine through the engine clients'
 /// gRPC connector, so a worker of the host-local wire has no connection
 /// here. The replica cannot dial a row that one gateway alone reaches: such
 /// a row's object is built with its checks off, and no probe is sent to it.
+///
+/// Each object states its row's overload thresholds over the program's
+/// default ([`OVERLOAD_DEFAULTS`]): what a load monitor over the registry
+/// judges the worker by ([`load_monitor`](crate::worker_host::load_monitor)).
+/// The service runs no such monitor yet, so no verdict is written on an
+/// object.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,
@@ -44,7 +70,8 @@ impl WorkerObjects {
             objects: Arc::new(
                 Objects::new(Arc::new(WorkerRegistry::new()))
                     .with_connector(connector)
-                    .with_host_local_unchecked(),
+                    .with_host_local_unchecked()
+                    .with_overload_thresholds(OVERLOAD_DEFAULTS),
             ),
             wake,
         }
@@ -99,6 +126,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        document::spec::{OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS},
         engine::view::{WireModes, WorkerId},
         service::{
             controller::{
@@ -109,7 +137,7 @@ mod tests {
             replication::Log,
         },
         store::{
-            JournalKinds, LeasesStore, Position, WorkerFacts, WorkerPatch, WorkerStatus,
+            JournalKinds, LeasesStore, Overload, Position, WorkerFacts, WorkerPatch, WorkerStatus,
             WorkersStore,
         },
     };
@@ -240,6 +268,49 @@ mod tests {
                 assert_eq!(follower.apply(&batch, now), Ok(()), "{entry:?}");
             }
         }
+    }
+
+    /// A replica's object states its row's overload thresholds, each over
+    /// the program's default: the worker crate's two default numbers, which
+    /// are the document's. The default's usage is the 64-bit 0.8 an engine
+    /// reports: the document's 32-bit constant is the same number, and
+    /// widened it reads above it.
+    #[tokio::test(start_paused = true)]
+    async fn an_object_states_its_rows_thresholds_over_the_programs_default() {
+        const STRICT: &str = "http://strict:8000";
+        let defaults = OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        };
+        assert_eq!(OVERLOAD_DEFAULTS, defaults);
+        assert_eq!(OVERLOAD_WAITING_REQUESTS, 8);
+        assert_eq!(0.8_f64 as f32, OVERLOAD_TOKEN_USAGE);
+        assert!(f64::from(OVERLOAD_TOKEN_USAGE) > 0.8, "widened, it is over");
+
+        let replica = Replica::new();
+        replica.store.upsert(facts(1, 1));
+        replica.store.upsert(WorkerFacts {
+            key: STRICT.to_string(),
+            engine: STRICT.to_string(),
+            overload: Overload {
+                kv_usage_permille: None,
+                waiting_requests: Some(2),
+            },
+            ..facts(1, 1)
+        });
+        replica.caught_up("two registrations").await;
+        let stated = |url: &str| {
+            let registry = replica.workers.objects.registry();
+            let object = registry.get_by_url(url).expect("the row's object");
+            object.metadata().overload
+        };
+        assert_eq!(stated(URL), defaults);
+        let own = OverloadThresholds {
+            waiting_requests: Some(2),
+            ..defaults
+        };
+        assert_eq!(stated(STRICT), own);
+        replica.stopped().await;
     }
 
     /// The six membership changes, one write each on the leader. Each
