@@ -118,6 +118,8 @@ impl RequestMaker for StatedPair<'_> {
             decode: &self.decodes.members,
             classes: &self.decodes.classes,
             admission: &Open,
+            prefill_places: None,
+            decode_places: None,
         })
     }
 }

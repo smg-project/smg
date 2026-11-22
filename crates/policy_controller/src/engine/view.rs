@@ -1419,10 +1419,12 @@ pub struct Constraints<'a> {
     /// decision's staged pass opens its set with these places and hands no
     /// target outside them. A pass that draws from the pool leaves such a
     /// request to it, and so does a keyed request's read of a row by its
-    /// place. They are places of the one list a single request is decided
-    /// over, and one set of places cannot hold a pair's two lists: the
-    /// engine over worker lists declines a pair that states any, by name,
-    /// and the served controller states none.
+    /// place. They are places of the one list a set is opened over: a
+    /// single request's, or one side's of a pair, whose entry takes one
+    /// set of constraints a side. A pair's host states each side's places
+    /// beside its two lists. A pair's request that states places of its
+    /// own is declined by the engine over worker lists, by name, and the
+    /// served controller states none.
     ///
     /// A request held to places whose every worker it already tried is
     /// handed one of them again, not refused: the filter of tried

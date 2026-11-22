@@ -626,6 +626,11 @@ A request that states places of its list (`Constraints::places`) is refused too,
 names `places`, where the request is a pair: one list of places cannot hold a pair's two lists
 (5.8). A single request that states places is decided among them.
 
+A pair's host states each list's places beside its two lists (`PairLists::prefill_places`,
+`PairLists::decode_places`), and each side is decided among its own. `EncodeLists::decide` refuses
+lists whose pair states places, under the same name: the encode pass decides its pair over the
+workers it admits for the items and reads no place.
+
 ### 5.5 The decision **[built]**
 
 ```rust
@@ -712,7 +717,7 @@ shadow. On main two pickers say so: round robin and `passthrough`.
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
-   No draw is made for a request held to places: every worker's record is written.
+   For a request held to places no worker is drawn first: every worker's record is written.
    Under a binding that names a shadow every worker's record is written, for the two decisions.
 8. **Filters.** Each filter removes records. If a filter leaves nothing, the binding's rule for a
    list wholly over its thresholds may still pick among the workers the overload filter removed.
@@ -756,7 +761,8 @@ the kept one. `GatewayId` is still defined in the store.
 
 ### 5.8 What changes in the kept engine **[planned]**
 
-- It honours what it refuses today: a pair held to some workers of its two lists (a single
+- It honours what it refuses today: an encode request's pair held to some workers of its two
+  lists (`PairLists::decide` keeps a pair to the positions its host states, and a single
   request states the positions of its list in `Constraints::places` and is decided, which is
   built); a pair's demands (a single request's are kept, which is built); a pair's encode
   items.
@@ -1214,7 +1220,7 @@ controller's service reads either yet. Of the 24 facts a registration states:
 | the wire modes | the one protocol the object speaks | the other protocols of the set |
 | the engine's kind | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
 | the health policy | the checks in whole seconds, off where the controller cannot dial the worker | a part of a second, and the policy of a worker built with its checks off |
-| the overload thresholds | none on a controller's objects today; where a program asks for them, the worker's own over the program's defaults | which of them the worker stated |
+| the overload thresholds | where a program asks for them, as the controller's does, the worker's own over the program's defaults | which of them the worker stated |
 | the drain window | the window in force | a window stated equal to the object's default, which reads back as none |
 
 - Ten are not carried to the worker object: the incarnation, the zone, the pairing facts, the

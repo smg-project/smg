@@ -45,7 +45,8 @@ impl PairAdmission for Gates {
 /// says otherwise, under the stock encode document.
 /// `loads` is the snapshot of load reports the host hands with a decision.
 /// `images` says the request states an image. `excluded` are the workers
-/// the host says it just failed to reach.
+/// the host says it just failed to reach. `places` are the places of the
+/// prefill list and of the decode list the host holds the request to.
 struct Host {
     engine: PolicyEngine,
     members: [PoolMembers; 3],
@@ -54,6 +55,7 @@ struct Host {
     loads: Option<Arc<LoadSnapshot>>,
     images: bool,
     excluded: Vec<WorkerId>,
+    places: [Option<Vec<u32>>; 2],
 }
 
 /// Where the worker at `place` of a host's list `list` answers.
@@ -131,6 +133,7 @@ impl Host {
             loads: None,
             images: false,
             excluded: Vec::new(),
+            places: [None, None],
         }
     }
 
@@ -157,6 +160,8 @@ impl Host {
             decode,
             classes: &self.partners,
             admission: &self.gates,
+            prefill_places: self.places[0].as_deref(),
+            decode_places: self.places[1].as_deref(),
         };
         let lists = EncodeLists {
             pair,
@@ -280,6 +285,39 @@ fn a_request_that_states_a_subset_hint_is_shed_as_its_pair_and_places_no_key() {
     assert_eq!((prefill, encoders), (Some(0), vec![0]));
     let (decision, _, encoders) = host.decide(said, &keys, Some(0), &mut placed);
     assert_eq!((gap(&decision), encoders.len()), (Some(SUBSET_HINT), 0));
+}
+
+/// An encode request's pair is held to no places of its two lists: the
+/// engine decides that pair over the workers it admits for the items. A
+/// host that states places for either list is declined under the places'
+/// name, and what an earlier decision placed is emptied. A pair's own
+/// decision is held to them ([`PairLists::decide`]). The gateway's classic
+/// router holds an encode request's pair to no rule of the request's own:
+/// it selects that pair under its own test of the workers an encoder can
+/// hand to, which stands where the request's rule would
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2213-2229`
+/// at main `9f303447f`).
+#[test]
+fn an_encode_request_whose_pair_is_held_to_places_is_declined_by_name() {
+    let mut host = Host::of(2, 2, 1);
+    let said = (&[of(1)][..], &[1, 1][..]);
+    let keys = [Identity::plain("item")];
+    let mut placed = EncodePlaced::new();
+    for held in [[Some(vec![0]), None], [None, Some(vec![1])]] {
+        host.places = [None, None];
+        let (_, prefill, encoders) = host.decide(said, &keys, None, &mut placed);
+        assert_eq!((prefill.is_some(), encoders), (true, vec![0]));
+        host.places = held;
+        let (decision, _, encoders) = host.decide(said, &keys, None, &mut placed);
+        match decision {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::PolicyDeclined, "places")
+            ),
+            other => panic!("not declined: {other:?}"),
+        }
+        assert!(encoders.is_empty());
+    }
 }
 
 /// The request's constraints reach each of the three sides: a worker its
