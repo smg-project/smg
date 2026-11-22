@@ -2174,14 +2174,41 @@ mod tests {
     /// never be removed.
     #[tokio::test]
     async fn a_link_is_written_only_for_an_item_the_store_holds() {
-        let store = MemoryConversationItemStorage::new();
+        let config = MemoryConfig {
+            max_responses: 10,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryConversationItemStorage::with_config(&config);
         let conversation: ConversationId = "conv_a".into();
-        let id: ConversationItemId = "msg_1".into();
-        store
-            .link_items(&conversation, &[(id.clone(), Utc::now())])
+        let first = store
+            .create_item(make_item("message", Some("user"), json!([])))
             .await
             .unwrap();
-        assert!(!store.is_item_linked(&conversation, &id).await.unwrap());
+        // The second create drops the first: the bound is one item.
+        let second = store
+            .create_item(make_item("message", Some("user"), json!([])))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .link_items(
+                &conversation,
+                &[
+                    (first.id.clone(), now),
+                    (second.id.clone(), now + TimeDelta::microseconds(1)),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .is_item_linked(&conversation, &first.id)
+            .await
+            .unwrap());
+        assert!(store
+            .is_item_linked(&conversation, &second.id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
