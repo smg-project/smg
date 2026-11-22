@@ -1662,6 +1662,17 @@ impl Router {
         max_body_bytes: usize,
     ) -> Response {
         let (parts, response_body) = response.into_parts();
+        // Each answer built here replaces the dispatch's one and keeps the
+        // worker named on it, for the client and the access log.
+        let keep_worker = |mut answer: Response| {
+            if let Some(worker) = parts.headers.get(&header_utils::HEADER_ROUTED_WORKER_ID) {
+                answer.headers_mut().insert(
+                    header_utils::HEADER_ROUTED_WORKER_ID.clone(),
+                    worker.clone(),
+                );
+            }
+            answer
+        };
         let body_bytes = match to_bytes(response_body, max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1673,16 +1684,16 @@ impl Router {
                         limit = max_body_bytes,
                         "Rerank worker response exceeded the body limit"
                     );
-                    return error::bad_gateway(
+                    return keep_worker(error::bad_gateway(
                         "upstream_response_too_large",
                         format!("Rerank response from worker exceeded {max_body_bytes} bytes"),
-                    );
+                    ));
                 }
                 error!("Failed to read rerank worker response: {e}");
-                return error::bad_gateway(
+                return keep_worker(error::bad_gateway(
                     "read_response_body_failed",
                     format!("Failed to get response body: {e}"),
-                );
+                ));
             }
         };
         let worker = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
@@ -1695,12 +1706,12 @@ impl Router {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("no content type");
                 warn!(%status, content_type, "Rerank worker response is in no rerank shape: {e}");
-                return error::bad_gateway(
+                return keep_worker(error::bad_gateway(
                     "call_upstream_decode_error",
                     format!(
                         "Rerank response from worker ({status}, {content_type}) is not a rerank answer: {e}"
                     ),
-                );
+                ));
             }
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
@@ -1715,7 +1726,7 @@ impl Router {
         if !req.return_documents {
             rerank_response.drop_documents();
         }
-        Json(rerank_response).into_response()
+        keep_worker(Json(rerank_response).into_response())
     }
 }
 

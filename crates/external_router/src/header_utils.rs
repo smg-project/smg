@@ -14,7 +14,8 @@ static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 static HEADER_ROUTING_TOKENS: HeaderName = HeaderName::from_static("x-smg-routing-tokens");
 static HEADER_MCP: HeaderName = HeaderName::from_static("x-smg-mcp");
-static HEADER_ROUTED_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-routed-worker-id");
+/// The response header [`insert_routed_worker_id`] stamps.
+pub static HEADER_ROUTED_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-routed-worker-id");
 
 /// `x-smg-routing-tokens` hard caps: token id count and header-value bytes.
 pub const ROUTING_TOKENS_HINT_MAX_IDS: usize = 512;

@@ -213,7 +213,8 @@ pub struct PDRouter {
     pub policy_registry: Arc<PolicyRegistry>,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
-    /// Cap on buffered worker response bodies, mirroring the ingress limit.
+    /// The limit `Router::build_rerank_response` reads the rerank answer
+    /// under: the router configuration's `max_payload_size`.
     max_payload_size: usize,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
@@ -4849,6 +4850,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("x-smg-routed-worker-id"));
         let answer = json_of(response).await;
         assert_eq!(answer["object"], "rerank");
         assert_eq!(answer["id"], "my-rid");
