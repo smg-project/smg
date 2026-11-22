@@ -1,28 +1,12 @@
-//! One request's routing, head to head, over one fleet of workers a model,
-//! every one ready unless the cell says otherwise. Four paths:
+//! One request's routing under the classic policies, over one fleet of
+//! workers a model, every one ready unless the cell says otherwise.
 //!
-//! - `classic`: the classic policies over the worker registry.
-//! - `object`: the policy engine asked where the classic placement's pass
-//!   asks its policy. Everything is built as `classic` builds it (the
-//!   registry, the policies a registration leaves, each worker's completion
-//!   sink, the load feed) and the request runs the same function, pass and
-//!   all; the one difference is the policy the registry hands the pass,
-//!   which asks the engine.
-//! - `records`: the policy engine's whole decision over records written for
-//!   that one decision from the gateway's own data: the registry's list, the
-//!   worker objects and the load feed. No classic policy is built and no
-//!   classic placement pass runs: the engine of the document the routing
-//!   settings give for the policy decides, and its stages are told the
-//!   request's issue, its dispatch and its end. Every policy the `--policy`
-//!   flag accepts is asked by its name.
-//! - `engine`: the gateway's own engine object, which a router's arm asks
-//!   for the whole decision where the gateway decides in its own process:
-//!   the ask over the route's pool, the commit, the lease's guard with its
-//!   dispatch and its end. What a served request runs under the setting,
-//!   for a policy the engine decides whole.
+//! `--path classic`, the default, is the one path: the classic policies
+//! over the worker registry. The paths `object`, `records` and `engine`
+//! are refused by name: they are no longer part of this bench.
 //!
-//! A cell is one path, one route, one policy, one fleet size and one count
-//! of callers. Each caller routes requests back to back: the placement, the
+//! A cell is one route, one policy, one fleet size and one count of
+//! callers. Each caller routes requests back to back: the placement, the
 //! worker's load guard and what its drop tells the model's policy.
 //! The cell prints its decisions a second over every caller and one caller's
 //! time a decision. The callers are threads that stand for the whole cell,
@@ -43,13 +27,13 @@
 //!
 //! `--pair true` makes the cell a pair gateway's: the fleet is the cell's
 //! size of prefill workers and as many decode workers, on the gRPC wire,
-//! and a request is placed as a pair by the classic pair placement, its
-//! two side policies the classic ones or the objects that ask the engine.
-//! `--not-ready` and `--ready` then hold for each side.
+//! and a request is placed as a pair by the classic pair placement over
+//! its two side policies. `--not-ready` and `--ready` then hold for each
+//! side.
 //!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
-//! header `x-smg-routing-key`: a policy that places by a key places by it,
-//! on both paths. `0`, the default, sends no key.
+//! header `x-smg-routing-key`: a policy that places by a key places by it.
+//! `0`, the default, sends no key.
 //!
 //! `--prompts N` gives each request one of `N` prompts in turn, each of
 //! 1,024 tokens: the first 32 are the same in every prompt, as a chat
@@ -72,9 +56,7 @@
 //! snapshot, every `N` milliseconds while the callers run: the load monitor
 //! publishes pushed reports at most once in 20 milliseconds. `0`, the
 //! default, publishes once before the first request. The result line counts
-//! the snapshots published while the callers ran (`publications`), and on
-//! the `records` and `engine` paths the times the engine converted a pool's
-//! reports (`conversions`: at most one a snapshot a pool).
+//! the snapshots published while the callers ran (`publications`).
 //!
 //! The result line's `alloc_bytes_per_decision` is what the callers'
 //! threads allocated in their timed decisions, by the allocator's own count
@@ -125,9 +107,8 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, route_engine, route_pair,
-                route_records, set_pair_sides, thread_allocated_bytes, EngineObject,
-                EngineOverRecords, Route,
+                attach_loads, route_classic, route_pair, set_pair_sides, thread_allocated_bytes,
+                Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -481,43 +462,27 @@ impl Conversation {
     }
 }
 
-/// Who decides a cell's requests: the classic placement over a registry's
-/// policies (the classic ones, or the objects that ask the engine), the
-/// policy engine's whole decision over records, or the gateway's own engine
-/// object, which the routers ask for the whole decision.
-enum Decider {
-    Policies(Arc<PolicyRegistry>),
-    Records(EngineOverRecords),
-    Engine(EngineObject),
-}
-
 /// The load feed of a cell and the reports it publishes: one a worker.
 struct Feed {
     feed: TestFeed,
     loads: HashMap<String, WorkerLoadResponse>,
 }
 
-/// A cell's path as `build` leaves it: the routing call, the load feed
-/// where the cell publishes reports, and the count of the times the engine
-/// converted a pool's reports so far (zero on a path with no engine over
-/// records).
+/// A cell's path as `build` leaves it: the routing call, and the load feed
+/// where the cell publishes reports.
 struct Built {
     routing: Routing,
     feed: Option<Feed>,
-    conversions: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 /// A cell's path, built: a registry with the fleet, the policies a
 /// registration leaves (the model's policy and each worker's completion
-/// sink), and the load feed the monitor would publish. On the `object` path
-/// the registry's policies ask the policy engine of the same policy. A
-/// pair cell's registry holds the two side policies a pair gateway's start
-/// sets, and each model's fleet is its two sides. On the `records` path no
-/// policy registry is built: the engine reads the feed itself.
+/// sink), and the load feed the monitor would publish. A pair cell's
+/// registry holds the two side policies a pair gateway's start sets, and
+/// each model's fleet is its two sides.
 fn build(cell: &Cell) -> Built {
     let registry = Arc::new(WorkerRegistry::new());
     let mut config = RouterConfig {
-        policy_controller: true,
         policy: policy_config(&cell.policy),
         ..RouterConfig::default()
     };
@@ -535,12 +500,10 @@ fn build(cell: &Cell) -> Built {
             if cell.pair {
                 set_pair_sides(&policies, &config);
             }
-            Some(Arc::new(policies))
+            Arc::new(policies)
         }
-        "object" => Some(Arc::new(policies_asking_the_engine(&config).unwrap())),
-        "records" | "engine" => {
-            assert!(!cell.pair, "this path places single requests");
-            None
+        gone @ ("object" | "records" | "engine") => {
+            panic!("the path {gone} was removed from this bench: it runs the classic path only")
         }
         other => panic!("no path {other}"),
     };
@@ -558,10 +521,8 @@ fn build(cell: &Cell) -> Built {
         for fleet in fleets {
             for worker in &fleet {
                 registry.register(Arc::clone(worker)).unwrap();
-                if let Some(policies) = &policies {
-                    policies.on_worker_added(model, None);
-                    worker.set_completion_sink(Some(policies.completion_sink()));
-                }
+                policies.on_worker_added(model, None);
+                worker.set_completion_sink(Some(policies.completion_sink()));
             }
             leave_not_ready(&fleet, cell.not_ready);
             leave_ready(&fleet, cell.ready);
@@ -571,8 +532,7 @@ fn build(cell: &Cell) -> Built {
             every.extend(fleet);
         }
     }
-    // The feed's receiver goes to whoever decides: the registry's policies,
-    // or the engine.
+    // The feed's receiver goes to the registry's policies.
     let mut receiver = None;
     let feed = cell.reports.then(|| {
         let feed = TestFeed::attached_to(|rx| receiver = rx);
@@ -583,34 +543,9 @@ fn build(cell: &Cell) -> Built {
         feed.publish(&loads);
         Feed { feed, loads }
     });
-    let decider = Arc::new(match policies {
-        Some(policies) => {
-            if cell.reports {
-                attach_loads(&policies, receiver);
-            }
-            Decider::Policies(policies)
-        }
-        None if cell.path == "engine" => {
-            Decider::Engine(EngineObject::of(&config, &registry, receiver).unwrap())
-        }
-        None => Decider::Records(EngineOverRecords::of(&config, receiver).unwrap()),
-    });
-    let conversions: Box<dyn Fn() -> u64 + Send + Sync> = {
-        let (decider, registry, models) =
-            (Arc::clone(&decider), Arc::clone(&registry), models.clone());
-        let route = cell.route;
-        Box::new(move || match &*decider {
-            Decider::Records(engine) => models
-                .iter()
-                .map(|model| engine.conversions(&registry, model, route))
-                .sum(),
-            Decider::Engine(_) => models
-                .iter()
-                .map(|model| EngineObject::conversions(&registry, model, route))
-                .sum(),
-            Decider::Policies(_) => 0,
-        })
-    };
+    if cell.reports {
+        attach_loads(&policies, receiver);
+    }
     let (route, pair) = (cell.route, cell.pair);
     assert!(
         !(pair && cell.keys != 0),
@@ -627,24 +562,13 @@ fn build(cell: &Cell) -> Built {
             0 => None,
             count => keys.get((turn % count as u64) as usize),
         };
-        match &*decider {
-            Decider::Policies(policies) if pair => {
-                route_pair(&registry, policies, model, Some(tokens))
-            }
-            Decider::Policies(policies) => {
-                route_classic(&registry, policies, model, route, Some(tokens), headers)
-            }
-            Decider::Records(engine) => {
-                route_records(&registry, engine, model, route, Some(tokens), headers)
-            }
-            Decider::Engine(object) => route_engine(&registry, object, model, route, Some(tokens)),
+        if pair {
+            route_pair(&registry, &policies, model, Some(tokens))
+        } else {
+            route_classic(&registry, &policies, model, route, Some(tokens), headers)
         }
     });
-    Built {
-        routing,
-        feed,
-        conversions,
-    }
+    Built { routing, feed }
 }
 
 fn main() {
@@ -652,11 +576,7 @@ fn main() {
     let recorder = start_prometheus(PrometheusConfig::default());
     let prompts = prompts(cell.prompts);
     let tokens_at = |turn: u64| &prompts[(turn % prompts.len() as u64) as usize][..];
-    let Built {
-        routing,
-        feed,
-        conversions,
-    } = build(&cell);
+    let Built { routing, feed } = build(&cell);
     // The path's first sight of the pool, untimed: what a registration and
     // the first request after it build once.
     let warm = (cell.workers as u64 * 8).max(4_096) * cell.models.max(1) as u64;
@@ -682,7 +602,6 @@ fn main() {
     let published = AtomicBool::new(false);
     let callers = AtomicU32::new(0);
     let (turns, returned) = (AtomicU64::new(0), AtomicU64::new(0));
-    let converted_before = conversions();
     let mut wall = Duration::ZERO;
     thread::scope(|scope| {
         // The monitor's side: the fleet's reports published again as a new
@@ -780,7 +699,7 @@ fn main() {
         returned as f64 / turns as f64
     };
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -800,7 +719,6 @@ fn main() {
         return_rate,
         cell.publish_ms,
         publications.into_inner(),
-        conversions() - converted_before,
         allocated_each,
         total,
         wall.as_secs_f64(),

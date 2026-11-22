@@ -26,7 +26,9 @@
 //! **What is refused by name.** The list a host hands is its request's own:
 //! every worker of it is dialed on a wire the request states. A list that is
 //! not, a subset hint and a hard demand are declined under the stage that
-//! would have run them.
+//! would have run them. So is a request held to places of its list
+//! ([`PLACES`]): the engine's draws and its keyed reads do not ask the
+//! places yet.
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -38,22 +40,27 @@ use smg_worker::{load::state::LoadSnapshot, runtime::RoutingState};
 use super::{keys, overlap, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
-        decision::{Decision, Shed, ShedReason, Target, Trace},
-        decision_engine::{AlonePick, HeldDecision, Plain},
-        framework::Engine,
+        decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
+        decision_engine::{AlonePick, DecideOutcome, Leased, Plain, Request},
         records,
         sticky_sessions::SessionVerdict,
-        store_backed_engine::{DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
         view::{Phase, Session},
     },
     stages::Lifecycle,
-    store::{leases::DISPATCH_TTL, Said},
+    store::leases::DISPATCH_TTL,
     tracking::lease::{EventKind, EventSet, Lease, LeaseId, LeaseKind, Side},
 };
 
 /// The stage a request that states a hard demand is declined under: no
 /// stage of this engine reads a worker's facts for one.
 const DEMANDS: &str = "demands";
+
+/// The stage a request held to places of its list is declined under
+/// ([`Constraints::places`](crate::engine::view::Constraints::places)),
+/// single or pair. The staged pass holds a request to its places. The
+/// engine's draws and its keyed reads do not ask them yet, so no caller
+/// is answered a worker outside them.
+pub(super) const PLACES: &str = "places";
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
 const NO_STAGE: &str = "none";
@@ -162,6 +169,9 @@ pub(super) fn decide<'r>(
     if !cx.demands.is_none() {
         return declined(own, request, DEMANDS);
     }
+    if cx.places.is_some() {
+        return declined(own, request, PLACES);
+    }
     if !cx.wire_modes.is_empty() && !cx.wire_modes.contains(members.wires()) {
         return declined(own, request, WIRES);
     }
@@ -201,7 +211,11 @@ pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
 }
 
 /// The answer for a request that states what no stage of this engine runs,
-/// under the name of the stage that would have run it.
+/// under the name of the stage that would have run it. Cold: [`decide`]'s
+/// tests are then predicted to pass. Without it, the fourth of them kept
+/// the whole pass behind them from being inlined, 43 instructions a
+/// decision.
+#[cold]
 pub(super) fn declined(own: &PolicyEngine, request: &Request<'_>, stage: &'static str) -> Decision {
     shed(own, request, ShedReason::PolicyDeclined, stage)
 }
@@ -272,42 +286,6 @@ pub(super) fn issued(
     }
 }
 
-/// Tells `engine`'s stages one word of a single's lease, from what the
-/// request's guard lends back, as a file of leases tells it: a dispatch
-/// under the lease as issued with the index the word names, on the target
-/// taken, by its id and rank; an end under the lease moved to that target;
-/// a release under the lease as issued.
-pub(super) fn said(engine: &Engine, held: &HeldDecision<'_>, said: Said) {
-    match said {
-        Said::Dispatched(dispatch, _) => {
-            let lease = Lease {
-                target_index: dispatch.target_index,
-                ..*held.lease
-            };
-            let target = Target {
-                id: held.target.id,
-                dp_rank: held.target.dp_rank,
-                ..Target::default()
-            };
-            engine.on_dispatched(
-                &lease,
-                &target,
-                dispatch.side,
-                dispatch.since_decision_micros,
-            );
-        }
-        Said::Completed(outcome) => {
-            let lease = Lease {
-                target_index: held.index,
-                booked: held.target.id,
-                ..*held.lease
-            };
-            engine.on_completed(&lease, &outcome);
-        }
-        Said::Released(_, reason) => engine.on_released(held.lease, reason),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, sync::Arc};
@@ -315,18 +293,20 @@ mod tests {
     use parking_lot::Mutex;
     use smg_worker::{
         identity::basic::Worker, load::state::one_rank_load, test_support::ready_worker,
+        worker::WorkerStatus,
     };
 
     use super::*;
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
         engine::{
-            decision::{LiftedVeto, Targets},
-            decision_engine::{Decided, DecisionEngine, RequestMaker, WorkerLists},
+            decision::{LiftedVeto, Target, Targets},
+            decision_engine::{
+                Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
+            },
             framework::{Picker, Place, PoolWord, TieBand},
             prompt_hashes::HashSeeds,
             records::worker_id,
-            store_backed_engine::DecisionRefused,
             view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
         },
         policies::random::Random,
@@ -459,6 +439,39 @@ mod tests {
         }
         assert_eq!(seen, [2; 4], "every worker takes its turn");
         assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+        assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
+    }
+
+    /// Passthrough's plain single request is answered as a place: the first
+    /// worker of the list its host's test admits. That is the gateway's
+    /// classic rule, the position of the first worker whose routing state
+    /// the selection admits (`model_gateway/src/policies/passthrough.rs:48`
+    /// at main `882be6f4f`). No pass over the pool ran, no request was made
+    /// and no lease took an id. A list that admits no worker is the whole
+    /// decision's: the request is made once.
+    #[test]
+    fn passthrough_is_the_first_admitted_worker_answered_as_a_place() {
+        let engine = preset("passthrough");
+        for workers in [1, 2, 8, 64] {
+            let list = pool(workers);
+            let members = engine.pool_members(&list);
+            let asks = Asks::of(request(), Some(&members));
+            for refused in 0..workers.min(12) {
+                // Classic's rule, asked of the same worker objects.
+                let classic = list.iter().position(|w| w.routing_state().eligible());
+                assert_eq!(classic, Some(refused));
+                let place = placed(&engine, &asks).place;
+                assert_eq!(place as usize, refused, "{workers} workers");
+                // The first is refused by its status alone, the others by overload.
+                list[refused].set_overloaded(refused > 0);
+                list[0].set_status(WorkerStatus::NotReady);
+            }
+            assert_eq!(asks.made.get(), 0, "the pick read no fact of a request");
+            if workers <= 12 {
+                let _ = decided(&engine, &asks);
+                assert_eq!(asks.made.get(), 1, "no worker is admitted: made once");
+            }
+        }
         assert_eq!(engine.leases.0.load(Ordering::Relaxed), 0, "no id taken");
     }
 
@@ -653,7 +666,9 @@ mod tests {
         later.constraints.decode_later = true;
         let mut masked = request();
         masked.constraints.stalled = &rows;
-        for request in [retried, missed, hinted, lifted, later, masked] {
+        let mut held = request();
+        held.constraints.places = Some(&rows);
+        for request in [retried, missed, hinted, lifted, later, masked, held] {
             assert_eq!(request.plain(), None);
         }
     }
@@ -708,6 +723,14 @@ mod tests {
         assert_eq!(
             shed(hinted, Some(&members)),
             (ShedReason::PolicyDeclined, SUBSET_HINT)
+        );
+        // Held to a place of the list: the one turn does not answer it, and
+        // no pass that does not ask the places yet is run for it.
+        let mut held = request();
+        held.constraints.places = Some(&[1]);
+        assert_eq!(
+            shed(held, Some(&members)),
+            (ShedReason::PolicyDeclined, PLACES)
         );
         // The list's workers are dialed over HTTP.
         let mut dialed = request();

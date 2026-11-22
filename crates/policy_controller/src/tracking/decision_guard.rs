@@ -73,9 +73,11 @@ use crate::service::client::{wire, DecisionUnavailable, Error, Link};
 use crate::{
     engine::{
         decision::{Decision, Target},
-        decision_engine::{DecisionEngine, HeldDecision, RequestMaker},
+        decision_engine::{
+            DecideOutcome, DecisionEngine, DecisionRefused, HeldDecision, Leased, Request,
+            RequestMaker,
+        },
         framework::{EncodeItems, EncodePlaced},
-        store_backed_engine::{DecideOutcome, DecisionRefused, Leased, Request},
         view::WorkerId,
     },
     store::{DecodeRefused, Dispatch, GatewayId, Said},
@@ -782,7 +784,10 @@ mod tests {
         document::spec::AppliedSpec,
         engine::{
             decision::{Decision, ShadowKind, Target, Targets},
-            decision_engine::{Decided, DecisionEngine, HeldDecision, RequestMaker},
+            decision_engine::{
+                DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
+                RequestMaker, SweepOutcome,
+            },
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
             prompt_hashes::{HashSeeds, PromptHashes},
             store_backed_engine::{
@@ -791,7 +796,7 @@ mod tests {
                     pair_fleet, pair_request, picking, push_fleet, request, Ends, GATEWAY,
                     PATIENCE,
                 },
-                DecideOutcome, DecisionRefused, Request, StoreBackedEngine, SweepOutcome,
+                StoreBackedEngine,
             },
             view::{Candidate, Identity, RequestFacts, WireModes, WorkerId},
         },

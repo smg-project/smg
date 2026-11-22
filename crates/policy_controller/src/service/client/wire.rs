@@ -11,7 +11,7 @@ use crate::{
             Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
             Trace, MAX_TARGETS, TRACE_TOP,
         },
-        store_backed_engine::{self, Leased},
+        decision_engine::{DecideOutcome, Leased, Request},
         view::{HashKind, Identity, Phase, Session, WorkerId},
     },
     service::{
@@ -35,7 +35,7 @@ use crate::{
 /// frame to its size from the list's tail, so a longer copy would wait in
 /// the link's queue for nothing. The link counts the hashes left out with
 /// its own cut.
-pub(crate) fn request(request: &store_backed_engine::Request<'_>) -> (proto::DecideRequest, usize) {
+pub(crate) fn request(request: &Request<'_>) -> (proto::DecideRequest, usize) {
     let (facts, constraints) = (&request.facts, &request.constraints);
     let held = facts.block_hashes.len().min(MAX_HASHES);
     let asked = proto::DecideRequest {
@@ -133,10 +133,7 @@ fn narrow<T: TryFrom<u32>>(number: u32, path: &'static str) -> Result<T, Unread>
 /// The controller's decision as the door's own record, told at `now`.
 /// A pair gives the handle a prefill and a decode to report, under the
 /// one id and dispatch span the door keeps in its prefill lease.
-pub(crate) fn decided(
-    told: &proto::Decision,
-    now: Instant,
-) -> Result<store_backed_engine::DecideOutcome, Unread> {
+pub(crate) fn decided(told: &proto::Decision, now: Instant) -> Result<DecideOutcome, Unread> {
     let trace = told
         .trace
         .as_ref()
@@ -172,7 +169,7 @@ pub(crate) fn decided(
         None => return Err(unread("leases", "only a pick carries a lease")),
     };
     // A controller's file of leases holds the decode side whole.
-    Ok(store_backed_engine::DecideOutcome {
+    Ok(DecideOutcome {
         decision,
         lease,
         decode_session: Session::NONE,
@@ -375,6 +372,7 @@ mod tests {
                 Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,
                 Targets, Trace,
             },
+            decision_engine::Request,
             store_backed_engine, view,
             view::{
                 Constraints, HashKind, Header, Identity, MediaCounts, Phase, RequestFacts, WorkerId,
@@ -397,7 +395,7 @@ mod tests {
 
     #[test]
     fn the_controller_reads_every_request_field_as_the_host_stated_it() {
-        let mut asked = store_backed_engine::Request {
+        let mut asked = Request {
             id: b"a request",
             facts: RequestFacts {
                 model: "model-a",
@@ -547,7 +545,7 @@ mod tests {
     #[test]
     fn a_request_copies_no_more_hashes_than_a_frame_holds() {
         let blocks = vec![7; MAX_HASHES + 1_000];
-        let asked = store_backed_engine::Request {
+        let asked = Request {
             id: b"a request",
             facts: RequestFacts {
                 model: "model-a",
@@ -568,7 +566,7 @@ mod tests {
     /// the controller decides over the same tenant and session.
     #[test]
     fn an_empty_plain_key_reads_over_the_link_as_the_key_it_is() {
-        let asked = store_backed_engine::Request {
+        let asked = Request {
             id: b"a request",
             facts: RequestFacts {
                 model: "model-a",
@@ -767,7 +765,7 @@ mod tests {
     #[test]
     fn a_shed_made_ahead_of_every_profile_names_none_over_a_link() {
         let now = Instant::now();
-        let ahead = store_backed_engine::shed(ShedReason::NoEndpoints, "wires", 0, 6);
+        let ahead = decision::shed(ShedReason::NoEndpoints, "wires", 0, 6);
         let wire = told(ahead, None);
         let sent = wire.trace.as_ref().expect("a trace");
         assert!(sent.no_profile);

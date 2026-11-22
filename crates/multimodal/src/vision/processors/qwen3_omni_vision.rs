@@ -199,6 +199,11 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
         self.inner.calculate_num_tokens(width, height)
     }
 
+    /// Number of stored patch elements for one image.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
+    }
+
     fn model_name(&self) -> &'static str {
         self.inner.model_name()
     }
@@ -327,5 +332,17 @@ mod tests {
                 "sampled at {sampled_fps}"
             );
         }
+    }
+
+    #[test]
+    fn the_element_estimate_of_an_image_is_the_bases() {
+        let omni = Qwen3OmniVisionProcessor::new();
+        // 4096x3136 is exactly the default max_pixels and a multiple of the
+        // 32-pixel factor, so it is kept as is: 3136 * 4096 * 3 * 2.
+        assert_eq!(omni.image_input_elements(4096, 3136), Some(77_070_336));
+        assert_eq!(
+            omni.image_input_elements(4096, 3136),
+            omni.inner.image_input_elements(4096, 3136)
+        );
     }
 }

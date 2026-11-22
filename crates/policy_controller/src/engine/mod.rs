@@ -18,6 +18,8 @@ pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
 pub(crate) mod framework;
+#[cfg(feature = "in-process")]
+pub(crate) mod lease_events;
 pub(crate) mod pair_classes;
 #[cfg(feature = "in-process")]
 pub(crate) mod policy_engine;
@@ -36,7 +38,10 @@ pub use decision::{
 };
 #[cfg(feature = "in-process")]
 pub use decision_engine::WorkerLists;
-pub use decision_engine::{AlonePick, Decided, DecisionEngine, HeldDecision, Plain, RequestMaker};
+pub use decision_engine::{
+    AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Leased,
+    Plain, Request, RequestMaker, SweepOutcome,
+};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{
@@ -63,8 +68,7 @@ pub use sticky_sessions::{
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
 pub use store_backed_engine::{
-    DecideOutcome, DecisionExplanation, DecisionNames, DecisionRecord, DecisionRefused, Leased,
-    Request, StoreBackedEngine, SweepOutcome, SHADOW_ROWS,
+    DecisionExplanation, DecisionNames, DecisionRecord, StoreBackedEngine, SHADOW_ROWS,
 };
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,

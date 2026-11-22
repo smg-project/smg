@@ -376,7 +376,17 @@ fn patchify_group(
                             &mut slot[channel * channel_block..(channel + 1) * channel_block];
                         for (y, line) in block.chunks_exact_mut(patch).enumerate() {
                             let start = (top + y) * width + left;
-                            line.copy_from_slice(&plane[start..start + patch]);
+                            let source = &plane[start..start + patch];
+                            // The released patch size is known here, so its line
+                            // is copied by two moves and not by a call.
+                            if let (Ok(line), Ok(source)) = (
+                                <&mut [u8; DEFAULT_PATCH_SIZE]>::try_from(&mut *line),
+                                <&[u8; DEFAULT_PATCH_SIZE]>::try_from(source),
+                            ) {
+                                *line = *source;
+                            } else {
+                                line.copy_from_slice(source);
+                            }
                         }
                     }
                 }
@@ -972,6 +982,27 @@ mod tests {
             } else {
                 assert!(r < 0.0 && b > 0.0, "row {index}");
             }
+        }
+    }
+
+    #[test]
+    fn another_patch_size_keeps_the_reading_order() {
+        // Patch 16 is not the released size, so its lines take the plain copy.
+        // 64x32: four patch columns, the left half red and the right half blue.
+        let image = RgbImage::from_fn(64, 32, |x, _| {
+            Rgb(if x < 32 { [200, 0, 0] } else { [0, 0, 200] })
+        });
+        let config = PreProcessorConfig::from_json(r#"{"patch_size": 16}"#).unwrap();
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&config)
+            .preprocess(&[&DynamicImage::ImageRgb8(image)])
+            .unwrap();
+        assert_eq!(output.encoder_input.shape(), &[8, 1536]);
+        let values = output.encoder_input.as_f32().into_owned();
+        for index in 0..8 {
+            // The end of the last patch line of the red and of the blue plane.
+            let (r, b) = (values[[index, 255]], values[[index, 767]]);
+            let red = index % 4 < 2;
+            assert_eq!((r > 0.0, b > 0.0), (red, !red), "row {index}");
         }
     }
 

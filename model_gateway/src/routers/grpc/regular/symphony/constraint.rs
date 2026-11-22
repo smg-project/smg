@@ -17,7 +17,6 @@ use symphony::{
     grammar::{GrammarStart, Options},
     Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
 };
-use tool_parser::ToolConstraint;
 
 #[cfg(test)]
 use super::names::reading;
@@ -887,6 +886,44 @@ pub(super) fn auto_tag(
             },
         )
         .and_then(|grammar| structural_tag(grammar, vocabulary).ok())
+}
+
+/// A constraint an engine decodes under: a JSON schema, or a structural tag. The request builders
+/// take it as its wire pair ([`Self::to_tuple`]).
+#[derive(Debug, Clone)]
+pub(crate) enum ToolConstraint {
+    /// A JSON schema the engine holds the output to, from the first token or once the model's
+    /// thought is over, by where the worker starts the grammar. The kind does not pick the
+    /// reader: a table reads a schema it built, and a forced call's schema it did not build
+    /// where it reads the response; the generic JSON parser reads one only on the legacy path
+    /// (`regular::stages::reading::Prepared::json_schema`, `regular::symphony::assign_for`).
+    JsonSchema(String),
+    /// A structural tag: the answer carries the model's own framing, read by the model's parser.
+    StructuralTag(String),
+}
+
+impl ToolConstraint {
+    /// The kind and the text, as the request builders take them.
+    pub(crate) fn to_tuple(&self) -> (String, String) {
+        match self {
+            Self::JsonSchema(schema) => ("json_schema".to_string(), schema.clone()),
+            Self::StructuralTag(tag) => ("structural_tag".to_string(), tag.clone()),
+        }
+    }
+
+    pub(crate) fn is_json_schema(&self) -> bool {
+        matches!(self, Self::JsonSchema(_))
+    }
+}
+
+impl From<tool_parser::ToolConstraint> for ToolConstraint {
+    /// The older registry's constraint, kind for kind.
+    fn from(constraint: tool_parser::ToolConstraint) -> Self {
+        match constraint {
+            tool_parser::ToolConstraint::JsonSchema(schema) => Self::JsonSchema(schema),
+            tool_parser::ToolConstraint::StructuralTag(tag) => Self::StructuralTag(tag),
+        }
+    }
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known

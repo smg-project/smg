@@ -651,6 +651,39 @@ pub(super) fn has_stretch(text: &[u8]) -> bool {
     })
 }
 
+/// The punctuation pieces after which the lean scan of an all-ASCII text
+/// leaves for the pass, when they end within [`HEAD`] bytes of the text.
+pub(super) const MARKS: u32 = 2;
+
+/// How far into a text the lean scan looks for its [`MARKS`].
+pub(super) const HEAD: usize = 4 * BLOCK;
+
+/// A text under this many bytes that a thread reads again is one whose
+/// branches the lean scan no longer misses: the pass has to beat a scan at
+/// its best there, which takes more pieces a block.
+pub(super) const SHORT_TEXT: usize = 32 * BLOCK;
+
+/// Whether the all-ASCII `text` opens as short pieces: one byte in eight
+/// of its first two blocks is no letter, three in sixteen in a text under
+/// [`SHORT_TEXT`]. Read once a text, off the scan's loop.
+#[inline(never)]
+pub(super) fn is_broken(text: &[u8]) -> bool {
+    text.first_chunk::<{ 2 * BLOCK }>().is_some_and(|head| {
+        // Counted in a byte, so the loop is byte compares: two blocks are
+        // fewer than 256 bytes.
+        let mut no_letter = 0u8;
+        for &byte in head {
+            no_letter += u8::from(!is_letter(byte));
+        }
+        let bar = if text.len() < SHORT_TEXT {
+            3 * BLOCK / 8
+        } else {
+            2 * BLOCK / 8
+        };
+        usize::from(no_letter) >= bar
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -693,7 +693,7 @@ mod tests {
         since, since_of, Answer, Invalid, FILTER, PICK, SCORE,
     };
     use crate::{
-        engine::{store_backed_engine, view::WorkerId},
+        engine::{decision, view::WorkerId},
         tracking::lease::Membership,
     };
 
@@ -1249,7 +1249,7 @@ mod tests {
             engine::decision::ShedReason, plugins::shared::config::Exposure, tracking::lease::Lease,
         };
 
-        let shed = store_backed_engine::shed(ShedReason::NoEndpoints, "wires", 0, 0);
+        let shed = decision::shed(ShedReason::NoEndpoints, "wires", 0, 0);
         let decision = super::decision(&shed, &Lease::default(), &Exposure::default());
         assert_eq!(
             decision.trace.expect("a trace").encode_to_vec(),

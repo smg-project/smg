@@ -5888,7 +5888,6 @@ fn a_build_for_a_new_list_leaves_a_running_rebuild_its_flag() {
     let name = NamedList {
         list: &list,
         positions: None,
-        members: None,
     };
     let indexer = Arc::new(KvIndex::chain());
     let now = liveness::now_ms();
@@ -5969,7 +5968,6 @@ fn route_named(
                 named: Some(NamedList {
                     list,
                     positions: Some(positions),
-                    members: None,
                 }),
                 ..Default::default()
             },
@@ -6073,7 +6071,6 @@ fn positions_that_do_not_match_their_workers_lose_the_holder_and_are_counted() {
                 named: Some(NamedList {
                     list: &list,
                     positions: Some(&[0, 1, 2]),
-                    members: None,
                 }),
                 ..Default::default()
             },
@@ -6221,7 +6218,6 @@ fn a_stale_table_is_rebuilt_by_one_decision_while_the_others_read_it() {
     let name = NamedList {
         list: &list,
         positions: None,
-        members: None,
     };
     for named in [None, Some(&name)] {
         let first = policy.pool_table(&workers, named, &indexer, now);

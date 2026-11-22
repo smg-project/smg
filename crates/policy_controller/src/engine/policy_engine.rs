@@ -62,14 +62,15 @@ use self::overlap::{Affinity, PoolAffinity};
 use super::{
     decision::ShadowKind,
     decision_engine::{
-        AlonePick, Decided, DecisionEngine, HeldDecision, RequestMaker, WorkerLists,
+        AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
+        RequestMaker, SweepOutcome, WorkerLists,
     },
     framework::{
         release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
     },
+    lease_events,
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
-    store_backed_engine::{DecideOutcome, DecisionRefused, Request, SweepOutcome},
     view::{fingerprint, Phase, WireModes, WorkerId},
 };
 use crate::{
@@ -662,9 +663,9 @@ impl DecisionEngine for PolicyEngine {
         }
         let engine = self.spec.engine();
         let tell = || match held.lease.side {
-            Side::Single => single::said(engine, held, said),
+            Side::Single => lease_events::single(engine, held, said),
             // A pair's guard holds its prefill side's lease.
-            Side::Prefill => pair::said(engine, held, said, |at| self.clock.micros(at)),
+            Side::Prefill => lease_events::pair(engine, held, said, |at| self.clock.micros(at)),
             // No lease is issued for a side on its own.
             Side::Decode | Side::Encode => {}
         };
@@ -925,17 +926,16 @@ mod tests {
 
     /// The places one pick decides: the picker places by itself, no stage
     /// scores, and the filters are the two tests of a worker's health.
-    /// Round robin's preset is one. No other preset is one yet, and each
-    /// names its own profile and the stage of it that asks more.
+    /// Round robin's preset is one, and passthrough's. No other preset is
+    /// one, and each names its own profile and the stage of it that asks more.
     #[test]
     fn a_place_is_picked_alone_where_its_picker_decides_by_itself() {
-        assert!(matches!(
-            preset("round_robin").place(MODEL, Phase::Single),
-            Place::Alone(_)
-        ));
+        for engine in [preset("round_robin"), preset("passthrough")] {
+            let place = engine.place(MODEL, Phase::Single);
+            assert!(matches!(place, Place::Alone(_)), "{place:?}");
+        }
         for name in [
             "random",
-            "passthrough",
             "power_of_two",
             "least_load",
             "consistent_hashing",

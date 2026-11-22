@@ -19,7 +19,6 @@ use openai_protocol::{
     profile::ProviderProfile,
 };
 use smg_worker::identity::basic::Worker;
-use tool_parser::ToolConstraint;
 use tracing::{debug, error};
 
 use crate::{
@@ -32,6 +31,7 @@ use crate::{
             context::RequestContext,
             regular::symphony::{
                 self, Asks, Assignment, AutoRequest, PreparedConstraint, PromptReplay, Reading,
+                ToolConstraint,
             },
             utils::{self, Names},
         },
@@ -215,7 +215,9 @@ pub(crate) fn prepare(
                         format!("Invalid tool configuration: {e}"),
                     )
                 })?;
-            Ok(symphony::Prepared::from(constraint))
+            Ok(symphony::Prepared::from(
+                constraint.map(ToolConstraint::from),
+            ))
         }
         (prepared, _) => prepared,
     };

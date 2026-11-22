@@ -2985,6 +2985,9 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
 
 #[test]
 fn fixed_texts_match_tokenizers_for_every_shape() {
+    // One all-ASCII unit that opens as short pieces: the lean scan leaves it
+    // at a piece's end and the encoder hands the rest to the block pass.
+    let handed = "let x = a[1]; // one, two\n".repeat(64);
     let texts = [
         "",
         " ",
@@ -3008,6 +3011,7 @@ fn fixed_texts_match_tokenizers_for_every_shape() {
         "a\tb\u{A0}c\u{3000}d\u{2028}e",
         "<｜begin▁of▁sentence｜>hello<｜User｜>q<｜tool▁call▁begin｜>x<｜fim▁hole｜>",
         "[e~[hello]~b] and [e~ half",
+        handed.as_str(),
     ];
     let mut state = 0x7777_1111_2222_3333u64;
     for shape in shapes() {
@@ -7174,7 +7178,7 @@ pub(super) fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
 
 /// Holds the scanner of each of `patterns` against the pattern's program:
 /// the same match ranges on every fixture text, on the fuzz inputs and on
-/// two all-ASCII forms of each fuzz input.
+/// three all-ASCII forms of each fuzz input.
 fn scanner_differential(patterns: &[&str]) {
     let fixtures = fixture_texts();
     let rounds = fuzz_rounds();
@@ -7192,16 +7196,27 @@ fn scanner_differential(patterns: &[&str]) {
             );
             for words in [false, true] {
                 let mut each = Vec::new();
-                parsed
+                let stopped = parsed
                     .for_each_match::<false, _>(text, words, |start, end| each.push((start, end)));
                 assert_eq!(
-                    each, expected,
+                    (&each, stopped),
+                    (&expected, text.len()),
                     "for_each_match words={words}: pattern {pattern:?} text {text:?}"
                 );
             }
             if text.is_ascii() {
                 let mut each = Vec::new();
-                parsed.for_each_match::<true, _>(text, false, |start, end| each.push((start, end)));
+                let stopped = parsed
+                    .for_each_match::<true, _>(text, false, |start, end| each.push((start, end)));
+                // Where the lean scan left, the block pass reads the rest,
+                // as the encoder does.
+                if stopped < text.len() {
+                    let rest = &text[stopped..];
+                    let reader = parsed.by_blocks(rest).expect("a reader by blocks");
+                    reader.for_each_match(rest, false, |start, end| {
+                        each.push((stopped + start, stopped + end));
+                    });
+                }
                 assert_eq!(
                     each, expected,
                     "for_each_match of an all-ASCII text: pattern {pattern:?} text {text:?}"
@@ -7226,6 +7241,12 @@ fn scanner_differential(patterns: &[&str]) {
                 .flat_map(|c| std::iter::repeat_n(c, 1 + pseudo_random(&mut state) as usize % 12))
                 .collect();
             check(&runs);
+            // Long enough that the lean scan may leave for the block pass
+            // anywhere in its head (`block::MIN_BYTES` bytes past `block::HEAD`).
+            if !ascii.is_empty() {
+                let long = block::HEAD + block::MIN_BYTES;
+                check(&ascii.repeat(1 + long / ascii.len()));
+            }
         }
     }
 }
