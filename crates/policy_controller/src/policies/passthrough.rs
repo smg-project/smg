@@ -43,6 +43,11 @@ impl Picker for Passthrough {
         true
     }
 
+    // The host's order is its whole rule.
+    fn reads_no_worker_state(&self) -> bool {
+        true
+    }
+
     /// The pick is the first row every filter keeps, in the host's order,
     /// and the walk goes on to the last target: the whole pass's targets,
     /// row for row. A walk that meets [`DRAW_BOUND`] refused rows stops

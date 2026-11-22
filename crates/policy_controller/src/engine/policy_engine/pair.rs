@@ -14,6 +14,11 @@
 //! record for each worker of the prefill list and of the decode list, each
 //! in its list's order, as the workers stand at that call
 //! ([`PoolRecords::write`](crate::engine::records::PoolRecords::write)).
+//! The decode asked again writes one prefill record, its held prefill's,
+//! and is handed the decode its pair's first decision named: a decode
+//! profile whose pick reads nothing of a worker's state keeps that decode
+//! while its filters do
+//! ([`Engine::decide_decode`](crate::engine::framework::Engine::decide_decode)).
 //!
 //! **The records.** [`stamp`] writes on them what a pair reads beside a
 //! single: each record's pair class, and its side's admission bit as the
@@ -55,7 +60,7 @@ use crate::{
         pair_classes::PartnerClasses,
         records::{DecisionClock, Live},
         store_backed_engine::{shed, DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
-        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
+        view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session},
     },
     stages::Lifecycle,
     store::{leases::DISPATCH_TTL, Said},
@@ -112,9 +117,18 @@ impl PairLists<'_> {
     /// both lists' worker objects and from `loads`, the host's snapshot of
     /// its workers' reports, with each record's pair class and its side's
     /// admission bit as the host reads it at this call. With no `held`
-    /// prefill it is the pair's first decision: the engine's pair entry.
-    /// With one it is the decode decided again behind that prefill's
-    /// dispatch: the engine's decode entry over its partners.
+    /// target it is the pair's first decision: the engine's pair entry.
+    /// With one, the target the pair's guard holds, it is the decode
+    /// decided again behind that target's prefill: the engine's decode
+    /// entry over the prefill's partners, handed the decode the target
+    /// names, which a profile whose pick reads nothing of a worker's state
+    /// keeps. That entry reads one prefill record, the held prefill's, so
+    /// that record alone is written of the prefill list: found by its id
+    /// with no walk of the list
+    /// ([`PoolRecords::place_of`](crate::engine::records::PoolRecords::place_of)).
+    /// Where the list holds no such worker, or two of its workers carry
+    /// the id, every prefill's record is written and the entry looks for
+    /// the id among them.
     ///
     /// `request` is the pair's, as its host made it for the prefill phase.
     /// This call's instant is written into its facts: `now` on `clock`, the
@@ -129,7 +143,7 @@ impl PairLists<'_> {
         clock: &DecisionClock,
         now: Instant,
         request: &mut Request<'_>,
-        held: Option<WorkerId>,
+        held: Option<&Target>,
     ) -> Decision {
         // One value for both lists' records: this call's instant on the
         // clock and the host's snapshot, as the host holds it. No session
@@ -141,7 +155,18 @@ impl PairLists<'_> {
         let decide = |buffers: &mut Buffers| {
             let [prefills, decodes] = &mut buffers.rows;
             let (workers, records) = (self.prefill.workers(), self.prefill.records(spec, clock));
-            let (prefills, prefill_facts) = records.write(workers, &live, prefills);
+            let one = held
+                .and_then(|held| records.place_of(held.id))
+                .and_then(|place| records.read(workers, &live, place));
+            let (prefills, prefill_facts) = match one {
+                // The decode entry reads no fact of the prefill list.
+                Some(record) => {
+                    prefills.clear();
+                    prefills.push(record);
+                    (prefills.as_mut_slice(), PoolFacts::default())
+                }
+                None => records.write(workers, &live, prefills),
+            };
             let (workers, records) = (self.decode.workers(), self.decode.records(spec, clock));
             let (decodes, decode_facts) = records.write(workers, &live, decodes);
             stamp(prefills, decodes, self.classes, self.admission);
@@ -184,8 +209,11 @@ thread_local! {
 
 /// Writes on the two lists' records what a pair's decision reads beside a
 /// single's: each record's pair class, a prefill's capacity bit and a
-/// decode's room bit, as `admission` reads them now. A record past the
-/// classes takes class `0`, which pairs with nobody.
+/// decode's room bit, as `admission` reads them now. A record is asked for
+/// by its place in its list ([`Candidate::position`]), so the records
+/// handed may be a part of a list: the one prefill a decode decided again
+/// is held by. A record past the classes takes class `0`, which pairs with
+/// nobody.
 pub(super) fn stamp(
     prefills: &mut [Candidate],
     decodes: &mut [Candidate],
@@ -193,11 +221,13 @@ pub(super) fn stamp(
     admission: &dyn PairAdmission,
 ) {
     let class = |classes: &[u32], at: usize| classes.get(at).copied().unwrap_or(0);
-    for (at, row) in prefills.iter_mut().enumerate() {
+    for row in prefills {
+        let at = row.position as usize;
         row.pair_class = class(classes.prefills(), at);
         row.has_capacity = admission.has_capacity(at);
     }
-    for (at, row) in decodes.iter_mut().enumerate() {
+    for row in decodes {
+        let at = row.position as usize;
         row.pair_class = class(classes.decodes(), at);
         row.has_room = admission.has_room(at);
     }
@@ -308,17 +338,19 @@ pub(super) fn issue(
 }
 
 /// The decode asked again over the records of the two lists, stamped
-/// ([`stamp`]): the engine's decode entry over the partners of the held
-/// `prefill`. `pool` holds the decode list's facts.
+/// ([`stamp`]): the engine's decode entry over the partners of the prefill
+/// of `held`, the target the pair holds, handed the decode that target
+/// names. `pool` holds the decode list's facts.
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
     cx: &Constraints<'_>,
     pool: &PoolFacts<'_>,
     pools: PairPools<'_>,
-    prefill: WorkerId,
+    held: &Target,
     scratch: &mut Scratch,
 ) -> Decision {
+    let (prefill, first) = (held.id, held.pair);
     let facts = RequestFacts {
         phase: Phase::Decode,
         ..*facts
@@ -328,12 +360,13 @@ fn decide_decode_records(
             generation: pool.generation,
             ..PoolFacts::default()
         };
-        return engine.decide_decode(&facts, &none, PairPools::default(), prefill, cx, scratch);
+        let none_listed = PairPools::default();
+        return engine.decide_decode(&facts, &none, none_listed, prefill, first, cx, scratch);
     }
     if let Some((reason, stage)) = not_narrowed_by(cx) {
         return shed(reason, stage, facts.seed, pool.generation);
     }
-    engine.decide_decode(&facts, pool, pools, prefill, cx, scratch)
+    engine.decide_decode(&facts, pool, pools, prefill, first, cx, scratch)
 }
 
 /// What a pick of the decode decided again ([`PairLists::decide`] behind a
@@ -395,8 +428,8 @@ pub(super) fn decided(
         };
     }
     let (spec, later) = (&own.spec, request.constraints.decode_later);
-    let prefill = held.map(|held| held.target.id);
-    let decision = lists.decide(spec, loads, &own.clock, now, request, prefill);
+    let target = held.map(|held| held.target);
+    let decision = lists.decide(spec, loads, &own.clock, now, request, target);
     let (engine, facts) = (spec.engine(), &request.facts);
     let issued = match held {
         // A shed writes no word that every pick shares.
@@ -549,7 +582,7 @@ mod tests {
             demands::Demands,
             framework::{Filter, Picker, TieBand},
             records::worker_id,
-            view::{Health, Identity, Role, WireModes},
+            view::{Health, Identity, Role, WireModes, WorkerId},
         },
         stages::{Best, HasCapacity, StageRegistry},
         store::{Dispatch, GatewayId},
@@ -1022,7 +1055,7 @@ mod tests {
             &Constraints::default(),
             &pool(&decodes),
             pools(&prefills, &decodes, &classes),
-            WorkerId(1),
+            &prefill_alone(WorkerId(1)),
             &mut Scratch::default(),
         );
         assert_eq!(picked(&again), (1, 102));
@@ -1054,7 +1087,7 @@ mod tests {
             &Constraints::default(),
             &pool(&decodes),
             pools(&prefills, &decodes, &classes),
-            WorkerId(5),
+            &prefill_alone(WorkerId(5)),
             &mut Scratch::default(),
         );
         match again {
@@ -1073,6 +1106,15 @@ mod tests {
         .build();
         worker.set_status(WorkerStatus::Ready);
         Arc::new(worker)
+    }
+
+    /// A held target that names its prefill alone: no decode of a first
+    /// decision is handed with it.
+    fn prefill_alone(prefill: WorkerId) -> Target {
+        Target {
+            id: prefill,
+            ..Target::default()
+        }
     }
 
     /// A host's two lists of ready workers with the engine's value of each,
@@ -1105,11 +1147,20 @@ mod tests {
 
     impl Host {
         fn of(prefills: usize, decodes: usize) -> Self {
+            Self::under(hearing(), prefills, decodes)
+        }
+
+        /// [`Self::of`] under the document `spec`, with the words its
+        /// stages keep.
+        fn under(
+            (spec, heard): (AppliedSpec, Arc<Mutex<Vec<Word>>>),
+            prefills: usize,
+            decodes: usize,
+        ) -> Self {
             let side = |name: &str, worker_type, count| -> Arc<[Arc<dyn Worker>]> {
                 let url = |at: usize| format!("grpc://{name}-{at}:9000");
                 (0..count).map(|at| worker(url(at), worker_type)).collect()
             };
-            let (spec, heard) = hearing();
             let engine = PolicyEngine::new(spec);
             let prefills = side("prefill", WorkerType::Prefill, prefills);
             let decodes = side("decode", WorkerType::Decode, decodes);
@@ -1159,12 +1210,24 @@ mod tests {
 
         /// One decision over the lists as they stand now, every pair open,
         /// drawing by `seed`: the pair's first, or the decode's again
-        /// behind the `held` prefill.
+        /// behind the `held` prefill, with no decode handed.
         fn decide(
             &self,
             admission: &dyn PairAdmission,
             seed: u64,
             held: Option<WorkerId>,
+        ) -> Decision {
+            let held = held.map(prefill_alone);
+            self.decide_held(admission, seed, held.as_ref())
+        }
+
+        /// [`Self::decide`] behind the `held` target: its prefill, and the
+        /// decode it names.
+        fn decide_held(
+            &self,
+            admission: &dyn PairAdmission,
+            seed: u64,
+            held: Option<&Target>,
         ) -> Decision {
             let [prefill, decode] = &self.members;
             let classes = every(self.prefills.len(), self.decodes.len() as u32);
@@ -1235,6 +1298,105 @@ mod tests {
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "prefill-gone"),
             other => panic!("not shed: {other:?}"),
         }
+    }
+
+    /// The decode asked again writes one prefill record, its held
+    /// prefill's, and that record carries the class of the prefill's own
+    /// place in its list. So the decode is one of that prefill's partners,
+    /// wherever the prefill stands: here each prefill pairs with the decode
+    /// at its own place and with no other.
+    #[test]
+    fn the_decode_asked_again_is_a_partner_of_its_held_prefill_at_any_place() {
+        let host = Host::of(2, 2);
+        let classes = PartnerClasses::number(2, [&[0u32][..], &[1][..]]);
+        let [prefill, decode] = &host.members;
+        let lists = PairLists {
+            prefill,
+            decode,
+            classes: &classes,
+            admission: &OPEN,
+        };
+        for held in 0..2 {
+            let id = worker_id(host.prefills[held].as_ref());
+            for seed in 0..4 {
+                let mut request = Request {
+                    id: b"",
+                    facts: RequestFacts { seed, ..facts() },
+                    constraints: Constraints::default(),
+                };
+                let (spec, now) = (host.engine.spec(), Instant::now());
+                let target = prefill_alone(id);
+                let again = lists.decide(spec, None, &host.clock, now, &mut request, Some(&target));
+                assert_eq!(host.picked(&again), (held, held), "seed {seed}");
+            }
+        }
+    }
+
+    /// An open admission that keeps the places of the prefills it was
+    /// asked of.
+    #[derive(Debug, Default)]
+    struct PrefillsAsked(Mutex<Vec<usize>>);
+
+    impl PairAdmission for PrefillsAsked {
+        fn has_capacity(&self, prefill: usize) -> bool {
+            self.0.lock().push(prefill);
+            true
+        }
+
+        fn has_room(&self, _: usize) -> bool {
+            true
+        }
+    }
+
+    /// A first decision reads the host's prefill limit of every prefill.
+    /// The decode asked again reads it of its held prefill alone, at that
+    /// prefill's own place: it writes that one record of the prefill list.
+    #[test]
+    fn the_decode_asked_again_reads_its_held_prefill_alone() {
+        let host = Host::of(3, 2);
+        let asked = PrefillsAsked::default();
+        host.decide(&asked, 1, None);
+        assert_eq!(std::mem::take(&mut *asked.0.lock()), [0, 1, 2]);
+        let held = worker_id(host.prefills[2].as_ref());
+        let again = host.decide(&asked, 2, Some(held));
+        assert_eq!(host.picked(&again).0, 2);
+        assert_eq!(*asked.0.lock(), [2]);
+    }
+
+    /// Under round robin on both sides a pair's first decision takes the
+    /// decode rotation's turn, and the decode asked again is handed the
+    /// decode that decision named and keeps it. So requests that come one
+    /// at a time reach every decode, and each second answer is its first.
+    /// A first decode that stopped being ready is left for another.
+    #[test]
+    fn the_decode_asked_again_keeps_the_decode_of_its_first_decision_under_round_robin() {
+        let document = PolicySpec::pair_presets("round_robin", "round_robin");
+        let mut document = document.expect("the pair presets");
+        document.generation = 3;
+        let spec = AppliedSpec::validate(&document).expect("a valid document");
+        let host = Host::under((spec, Arc::default()), 1, 2);
+        let first_target = |decision: &Decision| {
+            let first = decision
+                .pick()
+                .and_then(|pick| pick.targets.first().copied());
+            first.expect("a target")
+        };
+        let mut first = [0; 2];
+        for seed in 0..8 {
+            let decision = host.decide(&OPEN, seed, None);
+            let named = host.picked(&decision).1;
+            first[named] += 1;
+            let held = first_target(&decision);
+            let again = host.decide_held(&OPEN, seed, Some(&held));
+            assert_eq!(host.picked(&again).1, named, "seed {seed}");
+        }
+        assert_eq!(first, [4; 2]);
+        let decision = host.decide(&OPEN, 9, None);
+        let named = host.picked(&decision).1;
+        let held = first_target(&decision);
+        host.decodes[named].set_status(WorkerStatus::NotReady);
+        let again = host.decide_held(&OPEN, 9, Some(&held));
+        assert_eq!(host.picked(&again).1, 1 - named);
     }
 
     fn dispatched(side: Side, index: u8) -> Said {

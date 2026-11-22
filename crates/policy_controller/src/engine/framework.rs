@@ -14,8 +14,8 @@ use crate::{
     document::spec::{Assignment, Needs, PlanName},
     engine::{
         decision::{
-            Decision, LiftedVeto, Overlap, Pick, Shed, ShedReason, Survivors, Target, Targets,
-            Trace, MAX_TARGETS, TRACE_TOP,
+            Decision, LiftedVeto, Overlap, Pair, Pick, Shed, ShedReason, Survivors, Target,
+            Targets, Trace, MAX_TARGETS, TRACE_TOP,
         },
         prefix_pass::forget_prefix_pass,
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
@@ -680,6 +680,20 @@ pub trait Picker: Lifecycle + Debug {
         false
     }
 
+    /// Whether the pick reads nothing of a worker's state: the picker's own
+    /// rule names the worker (a rotation's turn, a draw by the seed, the
+    /// host's order), and no row's load, score or count moves it. Asked
+    /// again over the same workers, such a picker spends a turn or a draw
+    /// and learns nothing. So a pair's decode decided again under a profile
+    /// of such a picker, with no scorer, keeps the decode its first
+    /// decision named while the profile's filters keep that worker
+    /// ([`Engine::decide_decode`]). The default is [`Self::picks_alone`]'s
+    /// answer: a picker whose own rule is its whole pick reads none. A
+    /// picker that says neither is asked again.
+    fn reads_no_worker_state(&self) -> bool {
+        self.picks_alone()
+    }
+
     /// One pick over `pool` by the picker's own rule alone
     /// ([`Picker::picks_alone`]). `keep` asks the caller's test of the
     /// worker at a position of the pool: one read of that worker. `Some`
@@ -761,6 +775,17 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Whether a pick of this profile stands while its worker does: the
+    /// profile holds no scorer, and its picker reads nothing of a worker's
+    /// state ([`Picker::reads_no_worker_state`]). Decided again over the
+    /// same workers it would pick by nothing that moved since, so a pair's
+    /// decode decided again keeps the decode of its first decision
+    /// ([`Engine::decide_decode`]).
+    #[must_use]
+    pub fn keeps_its_pick(&self) -> bool {
+        self.scorers.is_empty() && self.picker.reads_no_worker_state()
+    }
+
     /// What this profile's stages read from the host beyond the facts every
     /// view carries: every stage of every kind, so a stage that reads the
     /// affinity column as a filter or as the picker counts as one that
@@ -2222,6 +2247,40 @@ fn run_profile(
         );
     }
     score_survivors(profile, index, facts, pool, candidates, buf)
+}
+
+/// The scoring half of a pair's decode decided again under a profile that
+/// keeps its pick ([`Profile::keeps_its_pick`]), over the survivors its
+/// filter half left in `buf.kept`. Where `first`, the decode the pair's
+/// first decision named, is one of them, it is the one target and the
+/// picker is not asked: the trace is a pick's under no scorer. Where it is
+/// not, the picker picks among the survivors ([`score_survivors`]).
+fn keep_or_pick(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    buf: &mut Buffers,
+    first: Pair,
+) -> Decision {
+    let named = (first.decode_id, first.decode_dp_rank);
+    let stands = buf.kept.iter().copied().find(|&row| {
+        let row = &candidates[row as usize];
+        (row.id, row.dp_rank) == named
+    });
+    let Some(row) = stands else {
+        return score_survivors(profile, index, facts, pool, candidates, buf);
+    };
+    let mut targets = Targets::new();
+    targets.push(target_of(&candidates[row as usize]));
+    buf.scores.clear();
+    buf.scores.resize(buf.kept.len(), 0.0);
+    Decision::Pick(Pick {
+        targets,
+        trace: trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores),
+        session_verdict: SessionVerdict::None,
+    })
 }
 
 /// The staged pass of the single plan over `set` (an `epd` plan's encode
@@ -6690,12 +6749,28 @@ impl Engine {
     /// A missing prefill is shed under `prefill-gone`. A shed made once the
     /// decode profile resolves names that profile. `pool` holds the facts
     /// of the decode pool, where the profile places.
+    ///
+    /// `first_decode` is the decode side of the target the pair's first
+    /// decision named, where the caller holds it. Under a decode profile
+    /// whose pick reads nothing of a worker's state
+    /// ([`Profile::keeps_its_pick`]) the call answers that decode alone
+    /// while the profile's filters keep it, and the picker is not asked: a
+    /// second pick would turn a rotation or draw again, and move the
+    /// request for no reason. Where a filter refuses that decode, or none
+    /// of the partners is its worker, the picker picks among the decodes
+    /// the filters keep. So it does under every other profile, and for a
+    /// caller that hands none.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request and the pair's pools, beside the pair the call is held by"
+    )]
     pub fn decide_decode(
         &self,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
         pools: PairPools<'_>,
         prefill: WorkerId,
+        first_decode: Option<Pair>,
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
@@ -6732,15 +6807,29 @@ impl Engine {
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
         let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
-        let mut decision = run_profile(
-            profile,
-            index,
-            &decode_facts,
-            pool,
-            Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None),
-            decode_cx,
-            &mut scratch.decode,
-        );
+        let partners = Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None);
+        let buf = &mut scratch.decode;
+        let mut decision = match first_decode.filter(|_| profile.keeps_its_pick()) {
+            None => run_profile(
+                profile,
+                index,
+                &decode_facts,
+                pool,
+                partners,
+                decode_cx,
+                buf,
+            ),
+            // The filter half as every run of a side makes it, then the
+            // first decode where it stands.
+            Some(first) => match filter(profile, &decode_facts, decode_cx, buf, partners) {
+                Some(emptied_by) => shed(
+                    reason_of(emptied_by),
+                    emptied_by,
+                    trace_of(index, &decode_facts, pool, decodes, &[], &[]),
+                ),
+                None => keep_or_pick(profile, index, &decode_facts, pool, decodes, buf, first),
+            },
+        };
         // Each target names the held prefill with one decode, as the
         // targets of a pair's first decision do. They are turned where the
         // decision stands, and its trace and its verdict stay the decode's:
@@ -11906,6 +11995,7 @@ mod tests {
                 ..PairPools::default()
             },
             prefills[1].id,
+            None,
             &Constraints::default(),
             &mut Scratch::new(),
         );
@@ -11962,11 +12052,200 @@ mod tests {
                 ..PairPools::default()
             },
             prefills[0].id,
+            None,
             &cx,
             &mut scratch,
         );
         assert_eq!(first_decode(&new), Some(1));
         assert_eq!(new.trace().seed, facts.seed);
+    }
+
+    /// The engine of one pair profile, on both sides: `picker` over the two
+    /// health tests, with no scorer.
+    fn pair_engine_picking(picker: Box<dyn Picker>) -> Engine {
+        let profile = Profile {
+            name: "picked".into(),
+            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+            scorers: vec![],
+            picker,
+        };
+        Engine::new(vec![profile], vec![pair_binding()], 1, Needs::default())
+    }
+
+    /// One request's two decisions over one prefill and `decodes`: the
+    /// pair's first, then its decode decided again on a draw of its own,
+    /// handed the decode the first decision named where `handed`. The
+    /// decode positions the two name.
+    fn decided_twice(
+        engine: &Engine,
+        decodes: &[Candidate],
+        seed: u64,
+        handed: bool,
+    ) -> (u32, u32) {
+        let prefills = classed_rows(&[1]);
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes,
+            ..PairPools::default()
+        };
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let first = engine.decide_pair(&request(seed), &pool, pools, &cx, &cx, &mut scratch);
+        let target = first.pick().and_then(|pick| pick.targets.first().copied());
+        let target = target.expect("a pair");
+        let named = target.pair.expect("a decode");
+        let again = engine.decide_decode(
+            &request(seed + 1_000),
+            &pool,
+            pools,
+            target.id,
+            handed.then_some(named),
+            &cx,
+            &mut scratch,
+        );
+        let again = first_decode(&again).expect("a decode decided again");
+        (named.decode_position, again)
+    }
+
+    /// A rotation is turned once a request where the decode decided again
+    /// is handed the decode of its first decision: one request at a time
+    /// over two decodes, the first decisions reach both evenly and each
+    /// second answer is its first. With none handed, the call turns the
+    /// rotation the first decision turned, so every first decision names
+    /// one decode and every second the other.
+    #[test]
+    fn a_decode_decided_again_under_a_rotation_keeps_its_first_decode() {
+        let decodes = classed_rows(&[1, 1]);
+        let engine = pair_engine_picking(Box::new(RoundRobin::new()));
+        let mut first = [0; 2];
+        for seed in 0..8 {
+            let (named, again) = decided_twice(&engine, &decodes, seed, true);
+            assert_eq!(again, named, "seed {seed}");
+            first[named as usize] += 1;
+        }
+        assert_eq!(first, [4, 4]);
+
+        let engine = pair_engine_picking(Box::new(RoundRobin::new()));
+        let mut first = [0; 2];
+        for seed in 0..8 {
+            let (named, again) = decided_twice(&engine, &decodes, seed, false);
+            assert_ne!(again, named, "seed {seed}");
+            first[named as usize] += 1;
+        }
+        assert!(first.contains(&8), "{first:?}");
+    }
+
+    /// A first decode that a filter refuses at the second call is not
+    /// kept: the picker picks among the decodes the filters keep, one turn
+    /// of their rotation. Over three decodes, each request's first decode
+    /// stops being healthy behind its first decision: the first decisions
+    /// still reach every decode evenly, and so do the second, each turn
+    /// landing on a decode that is kept.
+    #[test]
+    fn a_first_decode_a_filter_refuses_is_decided_again_by_one_turn() {
+        let engine = pair_engine_picking(Box::new(RoundRobin::new()));
+        let prefills = classed_rows(&[1]);
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let (mut first, mut second) = ([0; 3], [0; 3]);
+        for seed in 0..6 {
+            let mut decodes = classed_rows(&[1, 1, 1]);
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            };
+            let decision = engine.decide_pair(&request(seed), &pool, pools, &cx, &cx, &mut scratch);
+            let target = decision
+                .pick()
+                .and_then(|pick| pick.targets.first().copied());
+            let target = target.expect("a pair");
+            let named = target.pair.expect("a decode");
+            first[named.decode_position as usize] += 1;
+            decodes[named.decode_position as usize].health.healthy = false;
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            };
+            let handed = Some(named);
+            let again = engine.decide_decode(
+                &request(seed),
+                &pool,
+                pools,
+                target.id,
+                handed,
+                &cx,
+                &mut scratch,
+            );
+            let again = first_decode(&again).expect("another decode");
+            assert_ne!(again, named.decode_position, "seed {seed}");
+            second[again as usize] += 1;
+        }
+        assert_eq!((first, second), ([2; 3], [2; 3]));
+    }
+
+    /// A draw is made once a request too: under random the second answer
+    /// is the first, on whatever draw the second call is made. With none
+    /// handed the call draws again.
+    #[test]
+    fn a_decode_decided_again_under_a_draw_keeps_its_first_decode() {
+        let decodes = classed_rows(&[1, 1, 1, 1]);
+        let engine = pair_engine_picking(Box::new(Random));
+        let mut drew_another = 0;
+        for seed in 0..32 {
+            let (named, again) = decided_twice(&engine, &decodes, seed, true);
+            assert_eq!(again, named, "seed {seed}");
+            let (named, again) = decided_twice(&engine, &decodes, seed, false);
+            drew_another += u32::from(again != named);
+        }
+        assert!(drew_another > 0);
+    }
+
+    /// A profile that scores its workers decides again, whatever it is
+    /// handed: under least requests the second answer follows the counts
+    /// of its own instant, away from a first decode that is still kept.
+    #[test]
+    fn a_decode_decided_again_under_a_scorer_follows_the_loads() {
+        let engine = Engine::new(
+            vec![least_requests_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let prefills = classed_rows(&[1]);
+        let mut decodes = classed_rows(&[1, 1]);
+        decodes[1].in_flight = 3;
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let facts = request(7);
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let decision = engine.decide_pair(&facts, &pool, pools, &cx, &cx, &mut scratch);
+        let target = decision
+            .pick()
+            .and_then(|pick| pick.targets.first().copied());
+        let target = target.expect("a pair");
+        let named = target.pair.expect("a decode");
+        assert_eq!(named.decode_position, 0);
+        // Nothing moved: the second answer is the first.
+        let handed = Some(named);
+        let again =
+            engine.decide_decode(&facts, &pool, pools, target.id, handed, &cx, &mut scratch);
+        assert_eq!(first_decode(&again), Some(0));
+        // The first decode took requests meanwhile and is still healthy.
+        decodes[0].in_flight = 7;
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let again =
+            engine.decide_decode(&facts, &pool, pools, target.id, handed, &cx, &mut scratch);
+        assert_eq!(first_decode(&again), Some(1));
     }
 
     #[test]
@@ -11987,6 +12266,7 @@ mod tests {
                 ..PairPools::default()
             },
             WorkerId(987),
+            None,
             &Constraints::default(),
             &mut Scratch::new(),
         );
@@ -12032,6 +12312,7 @@ mod tests {
                 ..PairPools::default()
             },
             prefills[0].id,
+            None,
             &Constraints::default(),
             &mut Scratch::new(),
         );
@@ -12099,6 +12380,7 @@ mod tests {
                 &PoolFacts::default(),
                 pools,
                 prefills[0].id,
+                None,
                 cx,
                 &mut Scratch::new(),
             )

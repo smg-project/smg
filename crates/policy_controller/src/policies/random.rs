@@ -48,6 +48,11 @@ impl Picker for Random {
         true
     }
 
+    // Its draw is its whole rule.
+    fn reads_no_worker_state(&self) -> bool {
+        true
+    }
+
     /// The pick is a uniform draw over the pool, drawn again while its row
     /// is refused: a uniform draw over the rows the whole pass keeps. Each
     /// alternate is one further draw among the rows not drawn yet, handed

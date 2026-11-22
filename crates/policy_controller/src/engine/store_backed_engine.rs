@@ -1690,7 +1690,9 @@ where
                     phase: Phase::Decode,
                     ..*facts
                 };
-                engine.decide_decode(&facts, pool, pair.pools(), prefill, cx, scratch)
+                // No first decode is handed here: this call decides the
+                // decode again under every profile.
+                engine.decide_decode(&facts, pool, pair.pools(), prefill, None, cx, scratch)
             },
             |facts, decision, built, _| {
                 let (pick, (_, decodes)) = decision.pick().zip(built)?;

@@ -86,6 +86,7 @@ fn decode_later(c: &mut Criterion) {
                     &pool,
                     black_box(pools),
                     held,
+                    None,
                     &cx,
                     &mut scratch,
                 )
