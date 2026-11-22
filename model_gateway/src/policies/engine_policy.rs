@@ -100,6 +100,7 @@ impl LoadBalancingPolicy for EnginePolicy {
 mod tests {
     use std::{collections::HashMap, sync::Barrier, thread, time::Duration};
 
+    use axum::http::HeaderMap;
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_policy_controller::document::{AppliedSpec, PolicySpec};
     use smg_worker::{
@@ -117,7 +118,7 @@ mod tests {
         routers::{
             common::{
                 pair_index::PdWire,
-                placement::{select_pair, select_single, PlacementInputs},
+                placement::{select_pair, select_single, strict_target, PlacementInputs},
                 prefill_admission::{
                     PrefillAdmission, PrefillAdmissionAttempt, PrefillSelectionContext,
                 },
@@ -604,6 +605,122 @@ mod tests {
         let plain = settings.on_worker_added("alpha-2", None);
         assert!(plain.as_any().is::<EnginePolicy>());
         assert_eq!(plain.name(), "least_load");
+    }
+
+    /// Where the routers ask the engine for every request, the engine
+    /// places a model by its document's binding, and a worker's `policy`
+    /// label is not honored. The registry builds no classic policy for the
+    /// label: the model is kept as one whose workers carry none, so no
+    /// route reads a policy that decides nothing (a request that names its
+    /// worker is not held under a `consistent_hashing` label). One warning
+    /// a model says so, and none where the label names the policy the
+    /// settings' own document was made from. Where the routers keep their
+    /// classic pass the label chooses the model's policy, as ever.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_policy_label_is_not_honored_where_the_routers_ask_the_engine_for_every_request() {
+        let mut named = HeaderMap::new();
+        named.insert("x-smg-target-worker", "0".parse().expect("a header value"));
+
+        // A place the whole pass decides: the default policy itself.
+        let scored = PolicySpec::preset("least_load").expect("a built-in preset");
+        let whole = asking_as(&scored, "least_load", DocumentOrigin::Settings, true);
+        let default = whole.get_default_policy();
+        let labelled = whole.on_worker_added("whole-hashed", Some("consistent_hashing"));
+        assert!(Arc::ptr_eq(&labelled, &default), "{}", labelled.name());
+        assert!(!strict_target(labelled.as_ref(), Some(&named)));
+        // A later worker of the model finds its policy in place.
+        whole.on_worker_added("whole-hashed", Some("consistent_hashing"));
+        // The settings' own policy, by either spelling: what the engine
+        // does, with nothing to say.
+        for (model, label) in [("whole-same", "least_load"), ("whole-alias", "LeastLoad")] {
+            let same = whole.on_worker_added(model, Some(label));
+            assert!(Arc::ptr_eq(&same, &default), "{label}");
+        }
+
+        // A place one pick decides: the object that asks the engine, as
+        // for a model whose workers carry no label.
+        let turned = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let whole = asking_as(&turned, "round_robin", DocumentOrigin::Settings, true);
+        let labelled = whole.on_worker_added("whole-turned", Some("random"));
+        assert!(labelled.as_any().is::<EnginePolicy>());
+        assert_eq!(labelled.name(), "round_robin");
+
+        // A supplied document: its binding places the model, and the
+        // settings' policy names nothing of it.
+        let whole = asking_as(
+            &two_bindings(),
+            "least_load",
+            DocumentOrigin::Supplied,
+            true,
+        );
+        let default = whole.get_default_policy();
+        let labelled = whole.on_worker_added("beta-1", Some("least_load"));
+        assert!(Arc::ptr_eq(&labelled, &default));
+
+        // The classic pass: the label chooses, and a named worker is held.
+        let pass = asking_as(&scored, "least_load", DocumentOrigin::Settings, false);
+        let chosen = pass.on_worker_added("pass-hashed", Some("consistent_hashing"));
+        assert_eq!(chosen.name(), "consistent_hashing");
+        assert!(strict_target(chosen.as_ref(), Some(&named)));
+
+        logs_assert(|lines: &[&str]| {
+            let said = |words: &str| lines.iter().filter(|line| line.contains(words)).count();
+            let not_honored = |model: &str, label: &str| {
+                said(&format!(
+                    "Model {model}: its workers' policy label '{label}' is not honored with the \
+                     policy controller on"
+                ))
+            };
+            let counts = [
+                not_honored("whole-hashed", "consistent_hashing"),
+                not_honored("whole-turned", "random"),
+                not_honored("beta-1", "least_load"),
+                said("is not honored with the policy controller on"),
+                // The classic pass alone says a label's policy decides.
+                said("the classic policy decides it, its workers' policy label names it"),
+            ];
+            match counts {
+                [1, 1, 1, 3, 1] => Ok(()),
+                counts => Err(format!("{counts:?} lines")),
+            }
+        });
+    }
+
+    /// A model no binding of a supplied document names, where the routers
+    /// ask the engine for every request: the engine declines each request
+    /// of it, and the registration's warning says that. Where the routers
+    /// keep their classic pass the classic policies place such a model,
+    /// and the warning says that. The model is counted under both.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_model_no_binding_names_is_told_who_answers_its_requests() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        document.bindings[0].matcher.model = "alpha-*".to_string();
+        let whole = asking_as(&document, "round_robin", DocumentOrigin::Supplied, true);
+        whole.on_worker_added("whole-unnamed", None);
+        let pass = asking_as(&document, "round_robin", DocumentOrigin::Supplied, false);
+        pass.on_worker_added("pass-unnamed", None);
+
+        logs_assert(|lines: &[&str]| {
+            let said = |words: &str| lines.iter().filter(|line| line.contains(words)).count();
+            let declined = said(
+                "Model whole-unnamed: no binding of the policy document plans its single requests, \
+                 the policy engine declines them (503 `policy_declined`)",
+            );
+            let classic = said(
+                "Model pass-unnamed: no binding of the policy document plans its single requests, \
+                 the classic policies place them",
+            );
+            let wrong = said(
+                "Model whole-unnamed: no binding of the policy document plans its single requests, \
+                 the classic",
+            );
+            match (declined, classic, wrong) {
+                (1, 1, 0) => Ok(()),
+                counts => Err(format!("{counts:?} lines")),
+            }
+        });
     }
 
     /// A profile's name is a label and nothing reads it as a classic

@@ -511,6 +511,50 @@ async fn a_pool_with_no_ready_worker_leaves_the_attempt_none() {
     }
 }
 
+/// A document whose bindings name some models serves those models. A
+/// request of a model none of them names is declined by the engine of this
+/// process at the binding, with a ready worker of the model in the
+/// registry's list: no classic policy stands behind the object to place it.
+/// A model a binding names is placed.
+#[tokio::test]
+async fn a_request_of_a_model_no_binding_names_is_declined_at_the_binding() {
+    let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+    document.generation = 1;
+    document.bindings[0].matcher.model = "other-*".to_owned();
+    let unnamed = AppliedSpec::validate(&document).expect("the document validates");
+    document.bindings[0].matcher.model = "model-*".to_owned();
+    let named = AppliedSpec::validate(&document).expect("the document validates");
+
+    for (spec, placed) in [(unnamed, false), (named, true)] {
+        let registry = Arc::new(WorkerRegistry::new());
+        joined(&registry, 0, ConnectionMode::Http);
+        let policy_engine = PolicyEngine::own(Arc::new(OwnEngine::new(spec)), registry);
+        let id = mark();
+        let ask = Ask {
+            pool: Some(RoutingPool::HttpRegular),
+            ..Ask::of(&id, MODEL)
+        };
+        let answer = policy_engine.place(&ask, Instant::now()).await;
+        if placed {
+            assert!(answer.is_ok(), "a binding names the model: {answer:?}");
+            continue;
+        }
+        let unplaced = answer.err();
+        assert!(
+            matches!(
+                unplaced,
+                Some(Unplaced::Shed {
+                    reason: ShedReason::PolicyDeclined,
+                    emptied_by: "binding",
+                    ..
+                })
+            ),
+            "{unplaced:?}"
+        );
+        assert_eq!(policy_engine.faults(), 0);
+    }
+}
+
 /// The place in `workers` of the worker a regular attempt with the prompt
 /// `tokens` is placed on.
 async fn placed_on(

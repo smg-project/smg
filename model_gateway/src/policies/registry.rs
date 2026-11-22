@@ -891,7 +891,9 @@ impl PolicyRegistry {
     /// worker (from `policy_hint`, its `policy` label) and returned as it is
     /// for every later one, until no worker of this node serves the model
     /// ([`Self::on_model_unserved`]). Registering or replacing a worker of
-    /// the model calls this as often as it likes.
+    /// the model calls this as often as it likes. Where the routers ask the
+    /// policy engine for every request, the label is not read
+    /// (`label_read`).
     pub fn on_worker_added(
         &self,
         model_id: &str,
@@ -1014,19 +1016,56 @@ impl PolicyRegistry {
         out
     }
 
+    /// The `policy` label of a model's workers as this registry reads it:
+    /// the label, but for a registry whose routers ask the policy engine
+    /// for every request ([`AskedEngine::whole`]).
+    ///
+    /// There the engine places the model by its document's binding, and no
+    /// policy this registry holds places a request. A classic policy built
+    /// for the label would decide nothing, and the gateway would still ask
+    /// it what it asks a model's policy: whether it holds a request to a
+    /// worker it names, whether its workers stream their cache events,
+    /// whether their loads are polled. So the label is not read: the model
+    /// is kept as one whose workers carry none, and a warning says that
+    /// the label is not honored and what places the model. The caller runs
+    /// once for a model, so the warning is said once a model. A label that
+    /// names the policy the settings' own document was made from asks for
+    /// what the engine does, and nothing is said of it.
+    fn label_read<'l>(&self, model_id: &str, label: Option<&'l str>) -> Option<&'l str> {
+        let (Some(asked), Some(named)) = (&self.policy_engine, label) else {
+            return label;
+        };
+        if !asked.whole {
+            return label;
+        }
+        let as_the_settings = asked.origin == DocumentOrigin::Settings
+            && Self::hint_matches_config(named, self.default_policy_config.name());
+        if !as_the_settings {
+            warn!(
+                "Model {model_id}: its workers' policy label '{named}' is not honored with the \
+                 policy controller on. The policy engine places the model's requests by the \
+                 policy document's binding for it, which `--policy` writes where no document \
+                 is supplied. To place this model by another policy, bind it in a policy \
+                 document (`--policy-spec`), or turn the policy controller off"
+            );
+        }
+        None
+    }
+
     /// Determine policy for a new model
     fn determine_policy_for_model(
         &self,
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
+        let policy_hint = self.label_read(model_id, policy_hint);
         // The model's own place, where a policy engine is asked. This runs
         // once for a model, until no worker serves it.
         if let Some(asked) = &self.policy_engine {
             let supplied = asked.origin == DocumentOrigin::Supplied;
             match (asked.engine.place(model_id, Phase::Single), policy_hint) {
                 // The document the settings make says what they say: a
-                // label chooses the model's policy, as ever.
+                // label that is read chooses the model's policy, as ever.
                 (Place::Alone(_), Some(_)) if !supplied => {}
                 (Place::Alone(profile), label) => {
                     // A supplied document's binding places the model,
@@ -1045,9 +1084,17 @@ impl PolicyRegistry {
                     return Self::engine_object(asked, profile, name, &place);
                 }
                 (Place::Unbound, _) if supplied => {
+                    // Where the routers ask the engine for every request,
+                    // no classic policy places one: the engine declines a
+                    // request no binding of its document names.
+                    let then = if asked.whole {
+                        "the policy engine declines them (503 `policy_declined`)"
+                    } else {
+                        "the classic policies place them"
+                    };
                     warn!(
                         "Model {model_id}: no binding of the policy document plans its single requests, \
-                         the classic policies place them"
+                         {then}"
                     );
                     Metrics::record_policy_unbound_model();
                 }

@@ -67,7 +67,7 @@ use smg_policy_controller::{
     store::MemoryStore,
 };
 use smg_worker::connection::engine::EngineConnector;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     app_context::AppContext,
@@ -345,13 +345,59 @@ pub(crate) fn start_in_process(
     stages: Option<StageRegistry>,
 ) -> Result<Option<InProcess>, StartError> {
     let started = engine_for(config, stages.map(Arc::new))?;
-    if started.is_some() {
+    if let Some(started) = &started {
         info!(
             "The policy controller is picked for this gateway and runs in this process, over the gateway's own worker data: \
              the policy engine decides each policy whose line says so"
         );
+        if let Some(bound) = bound_alone(config, started) {
+            warn!(
+                "The policy document binds the single requests of the models {bound} and of no other: \
+                 with the policy controller on, a request for any other model is declined \
+                 (503 `policy_declined`). A binding of `*` serves every model"
+            );
+        }
     }
     Ok(started)
+}
+
+/// The model patterns a supplied document binds single requests of, where
+/// none of its bindings covers every model (`*`) and the routers ask the
+/// engine for every request ([`InProcess::decides_whole`]). `None`
+/// elsewhere.
+///
+/// A document that binds some models serves those models: the engine
+/// declines a request no binding names, and no classic policy stands
+/// behind it. That is the document's meaning and no fault of it, and the
+/// start cannot know which models will register, so it is said once here
+/// and nothing is refused. The document the routing settings mean binds
+/// every model. Where the routers keep their classic pass, the classic
+/// policies place a model no binding names, and each such model says so
+/// where its first worker registers.
+fn bound_alone(config: &RouterConfig, started: &InProcess) -> Option<String> {
+    use smg_policy_controller::engine::Phase;
+
+    if !started.decides_whole() {
+        return None;
+    }
+    let document = config.policy_spec.as_ref()?;
+    // A list that names no phase covers every phase.
+    let models: Vec<&str> = document
+        .bindings
+        .iter()
+        .filter(|binding| {
+            let phases = &binding.matcher.phase;
+            phases.is_empty() || phases.contains(&Phase::Single)
+        })
+        .map(|binding| binding.matcher.model.as_str())
+        .collect();
+    // A document that states no binding has one profile, and that profile
+    // serves every model: there is nothing to name.
+    if models.is_empty() || models.contains(&"*") {
+        return None;
+    }
+    let named: Vec<String> = models.iter().map(|model| format!("`{model}`")).collect();
+    Some(named.join(", "))
 }
 
 /// Whether a start of this gateway in its own process would run

@@ -320,14 +320,25 @@ mod tests {
         policy: PolicyConfig,
         preset: &str,
     ) -> (Arc<AppContext>, Arc<KvEventMonitor>) {
+        context_asking_as(policy, preset, DocumentOrigin::Supplied, false)
+    }
+
+    /// [`context_asking`] under a document of `origin`, with whether the
+    /// routers ask the engine for each request's whole decision.
+    fn context_asking_as(
+        policy: PolicyConfig,
+        preset: &str,
+        origin: DocumentOrigin,
+        whole: bool,
+    ) -> (Arc<AppContext>, Arc<KvEventMonitor>) {
         let document = PolicySpec::preset(preset).expect("a built-in preset");
         let spec = AppliedSpec::validate(&document).expect("the preset validates");
         let registry = PolicyRegistry::with_policy_engine(
             policy.clone(),
             RoutingKeyOverrideConfig::default(),
             Arc::new(PolicyEngine::new(spec)),
-            DocumentOrigin::Supplied,
-            false,
+            origin,
+            whole,
         );
         context_with(policy, Some(Arc::new(registry)))
     }
@@ -462,6 +473,31 @@ mod tests {
         // A profile that reads none asks for none.
         let (app_context, monitor) = context_asking(PolicyConfig::RoundRobin, "least_load");
         register(&app_context, grpc_worker(WorkerType::Regular), &[]).await;
+        assert!(monitor.get_indexer(MODEL).is_none());
+        monitor.stop().await;
+    }
+
+    /// Where the routers ask the engine for every request, a worker's
+    /// `policy` label is not read, so it starts no stream and stops none:
+    /// the engine's document alone says whether a worker's cache events are
+    /// read. Under a profile that reads them a worker labelled
+    /// `round_robin` streams them. Under one that reads none a worker
+    /// labelled `cache_aware` streams none: no classic policy is built for
+    /// the label to ask for events nobody reads.
+    #[tokio::test]
+    async fn a_policy_label_moves_no_stream_where_the_routers_ask_the_engine_for_every_request() {
+        let settings = DocumentOrigin::Settings;
+        let (app_context, monitor) =
+            context_asking_as(cache_aware(), "cache_aware", settings, true);
+        let labels = [("policy", "round_robin")];
+        register(&app_context, grpc_worker(WorkerType::Regular), &labels).await;
+        assert!(monitor.get_indexer(MODEL).is_some());
+        monitor.stop().await;
+
+        let turns = PolicyConfig::RoundRobin;
+        let (app_context, monitor) = context_asking_as(turns, "round_robin", settings, true);
+        let labels = [("policy", "cache_aware")];
+        register(&app_context, grpc_worker(WorkerType::Regular), &labels).await;
         assert!(monitor.get_indexer(MODEL).is_none());
         monitor.stop().await;
     }

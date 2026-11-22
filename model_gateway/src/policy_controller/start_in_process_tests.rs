@@ -119,6 +119,45 @@ fn a_supplied_bindings_own_rules_stop_the_start_by_binding_and_field() -> Case {
     Ok(())
 }
 
+/// A supplied document that binds some models serves those models: the
+/// engine declines a request no binding names, and nothing else places it.
+/// The start takes such a document and says once which models it binds. A
+/// document that binds every model says nothing, and neither does one of a
+/// lone profile and no binding, which serves every model, nor the routing
+/// settings' own.
+#[test]
+#[tracing_test::traced_test]
+fn a_document_that_binds_some_models_starts_and_says_which() -> Case {
+    const SAID: &str = "a request for any other model is declined";
+    let mut document = PolicySpec::preset("round_robin")?;
+    assert!(start_in_process(&supplied(document.clone()), None)?.is_some());
+    let mut lone = document.clone();
+    lone.bindings.clear();
+    let started = start_in_process(&supplied(lone), None)?.ok_or("no engine was built")?;
+    assert!(started.decides_whole());
+    let settings = RouterConfig {
+        policy_controller: true,
+        ..RouterConfig::default()
+    };
+    assert!(start_in_process(&settings, None)?.is_some());
+    assert!(!logs_contain(SAID));
+
+    document.bindings[0].matcher.model = "alpha-*".to_owned();
+    let mut second = document.bindings[0].clone();
+    second.matcher.model = "beta-1".to_owned();
+    document.bindings.push(second);
+    let started = start_in_process(&supplied(document), None)?.ok_or("no engine was built")?;
+    assert!(started.decides_whole());
+    logs_assert(|lines: &[&str]| {
+        let said: Vec<_> = lines.iter().filter(|line| line.contains(SAID)).collect();
+        match said.as_slice() {
+            [line] if line.contains("the models `alpha-*`, `beta-1` and of no other") => Ok(()),
+            said => Err(format!("{said:?}")),
+        }
+    });
+    Ok(())
+}
+
 /// A rule the routing settings state too is the one the placement runs: a
 /// supplied document that says what the settings say starts.
 #[test]
