@@ -362,8 +362,9 @@ impl PolicyEngine {
     /// [`Self::pool_members`], for a program that knows anything of its
     /// workers beside their objects ([`FixedFacts`]): whether a worker
     /// takes images. Such a program calls this one for every list.
-    /// `facts_of` is asked once a worker, here, and never at a decision:
-    /// every fact a program says of a worker is a field of that one answer.
+    /// `facts_of` is asked once a worker, in the list's order, here, and
+    /// never at a decision: every fact a program says of a worker is a
+    /// field of that one answer.
     ///
     /// The list's records are made of the answers at this call, and not at
     /// the list's first whole decision: a list's records are also made
