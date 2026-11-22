@@ -719,8 +719,20 @@ impl ResponseStreamEventEmitter {
                 req.previous_response_id.as_ref(),
             );
             Self::add_optional_field(&mut response_obj, "reasoning", req.reasoning.as_ref());
-            Self::add_optional_field(&mut response_obj, "temperature", req.temperature.as_ref());
-            Self::add_optional_field(&mut response_obj, "top_p", req.top_p.as_ref());
+            // Written as the 32-bit number and read back, the text on the
+            // stack: a tree holds the number widened to 64 bits and wrote
+            // `0.7` as `0.699999988079071`.
+            for (key, value) in [("temperature", req.temperature), ("top_p", req.top_p)] {
+                let Some(value) = value else { continue };
+                let mut text = [0u8; 32];
+                let mut rest = &mut text[..];
+                if serde_json::to_writer(&mut rest, &value).is_ok() {
+                    let left = rest.len();
+                    if let Ok(value) = serde_json::from_slice(&text[..text.len() - left]) {
+                        response_obj[key] = value;
+                    }
+                }
+            }
             Self::add_optional_field(&mut response_obj, "truncation", req.truncation.as_ref());
             Self::add_optional_field(&mut response_obj, "user", req.user.as_ref());
 
@@ -2850,6 +2862,32 @@ mod tests {
             )
         );
         assert!(rx.recv().await.is_none(), "nothing follows the error event");
+    }
+
+    /// The terminal event echoes the request's sampling numbers as the
+    /// request wrote them, the text a response that does not stream gives.
+    #[tokio::test]
+    async fn the_terminal_event_echoes_the_request_numbers_as_written() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter.set_original_request(
+            serde_json::from_value(json!({
+                "model": "test-model",
+                "input": "hi",
+                "temperature": 0.7,
+                "top_p": 0.9
+            }))
+            .unwrap(),
+        );
+        let (tx, mut rx) = sse_channel();
+        emitter.emit_terminal(None, None, &tx).await.unwrap();
+        let frame = rx
+            .recv()
+            .await
+            .expect("the terminal frame")
+            .expect("a frame");
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(text.contains(r#""temperature":0.7,"top_p":0.9,"#), "{text}");
     }
 
     #[test]
