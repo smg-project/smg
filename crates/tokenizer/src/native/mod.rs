@@ -712,10 +712,10 @@ impl PieceCache {
     /// work in between reads as well.
     fn reads_back(&mut self, now: Instant, bytes: usize) -> bool {
         let last = self.last_long.replace((now, bytes));
-        last.is_some_and(|(then, bytes)| {
+        last.is_some_and(|(then, last_bytes)| {
             let gap = now.saturating_duration_since(then);
-            let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
-            gap > READ_BACK_BASE + READ_BACK_PER_BYTE.saturating_mul(bytes)
+            let last_bytes = u32::try_from(last_bytes).unwrap_or(u32::MAX);
+            gap > READ_BACK_BASE + READ_BACK_PER_BYTE.saturating_mul(last_bytes)
                 && gap < READ_BACK_WITHIN
         })
     }
