@@ -1,7 +1,8 @@
 //! A counting global allocator for the tests that read how many times a path
 //! allocated. The binary that measures declares it as its allocator
-//! (`#[global_allocator] static GLOBAL: Counting = Counting;`) and reads the
-//! calls its thread made.
+//! (`#[global_allocator] static GLOBAL: Counting = Counting(System);`) and
+//! reads the calls its thread made. It counts over the allocator it is
+//! handed: a bench hands it the one a gateway's binary registers.
 
 #![expect(
     unsafe_code,
@@ -29,23 +30,31 @@ fn count_call() {
     CALLS.with(|calls| calls.set(calls.get() + 1));
 }
 
-pub struct Counting;
+pub struct Counting<A = System>(pub A);
 
-unsafe impl GlobalAlloc for Counting {
+unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count_call();
-        // SAFETY: the same layout contract as the caller's, forwarded to the system allocator.
-        unsafe { System.alloc(layout) }
+        // SAFETY: the same layout contract as the caller's, forwarded to the allocator counted over.
+        unsafe { self.0.alloc(layout) }
+    }
+
+    // Forwarded, not left to the default: the allocator counted over may
+    // zero more cheaply than an allocation and a fill.
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        count_call();
+        // SAFETY: the same layout contract as the caller's.
+        unsafe { self.0.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: `ptr` came from `alloc` with this layout.
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { self.0.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         count_call();
         // SAFETY: `ptr` came from `alloc` with this layout; the caller upholds `new_size`.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { self.0.realloc(ptr, layout, new_size) }
     }
 }
