@@ -619,7 +619,8 @@ protocols that not every worker of its list serves is refused, and the refusal n
 A pair's encode items are refused at the engine's entry. `EncodeLists::decide` decides them over
 a host's three lists and no entry calls it. The other inputs are honoured by the old engine only.
 A request that states places of its list (`Constraints::places`) is refused too, and the refusal
-names `places`, until the engine over worker lists honours them (5.8).
+names `places`, where the request is a pair: one list of places cannot hold a pair's two lists
+(5.8). A single request that states places is decided among them.
 
 ### 5.5 The decision **[built]**
 
@@ -677,10 +678,10 @@ sent prefixes). A decision that meets the one build of a list's `records`, `wire
 waits for it (5.2).
 
 **The short path.** A request is *plain* when it names no tried or excluded worker and states no
-hint, no demand, no lifted overload veto, no later decode and no held-back worker. A profile is
-decided by *one pick* when its picker needs nothing of the request, it has no scorer and no
-filter beyond the health tests, and its binding has no sessions rule. On main two pickers say so:
-round robin and `passthrough`.
+hint, no demand, no lifted overload veto, no later decode, no held-back worker and no places of its
+list. A profile is decided by *one pick* when its picker needs nothing of the request, it has no
+scorer and no filter beyond the health tests, and its binding has no sessions rule. On main two
+pickers say so: round robin and `passthrough`.
 
 1. The engine asks `maker.plain()`. If the request is plain and a single one, the host handed one
    list, every worker of the list serves the protocols the request states, and the list's model
@@ -707,6 +708,7 @@ round robin and `passthrough`.
 7. **Records.** One `Candidate` for each worker is written into the thread's buffer. Over a list
    of 16 workers or more, a profile whose picker draws first (`random`, `round-robin`,
    `passthrough`, power of two, `best` with a sample) has only the drawn workers' records written.
+   No draw is made for a request held to places: every worker's record is written.
 8. **Filters.** Each filter removes records. If a filter leaves nothing, the binding's rule for a
    list wholly over its thresholds may still pick among the workers the overload filter removed.
    Otherwise the decision is a refusal that names the filter: `Saturated` for the overload filter,
@@ -749,9 +751,9 @@ the kept one. `GatewayId` is still defined in the store.
 
 ### 5.8 What changes in the kept engine **[planned]**
 
-- It honours what it refuses today: a request held to some workers of its list states their
-  positions (`Constraints::places`, which is built), in place of a list made for one request
-  (`PoolMembers::part`, which is removed); demands; a pair's encode items.
+- It honours what it refuses today: a pair held to some workers of its two lists (a single
+  request states the positions of its list in `Constraints::places` and is decided, which is
+  built); demands; a pair's encode items.
 - Six request fields that only the old engine's host fills leave with it (`pinned_at`,
   `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`,
   `signal_cells`), and `Constraints::pins`. One of them needs a successor: a sessions rule with

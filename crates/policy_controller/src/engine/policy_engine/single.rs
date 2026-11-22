@@ -27,9 +27,13 @@
 //! **What is refused by name.** The list a host hands is its request's own:
 //! every worker of it is dialed on a wire the request states. A list that is
 //! not, a subset hint and a hard demand are declined under the stage that
-//! would have run them. So is a request held to places of its list
-//! ([`PLACES`]): the engine's draws and its keyed reads do not ask the
-//! places yet.
+//! would have run them.
+//!
+//! **A request held to places of its list**
+//! ([`Constraints::places`](crate::engine::view::Constraints::places)) is
+//! made and decided over the list's own records: it is not plain, the
+//! keyed decision leaves it to the whole pass, and that pass opens with
+//! the places. A pair that states places is declined ([`PLACES`]).
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -55,11 +59,9 @@ use crate::{
 /// stage of this engine reads a worker's facts for one.
 const DEMANDS: &str = "demands";
 
-/// The stage a request held to places of its list is declined under
-/// ([`Constraints::places`](crate::engine::view::Constraints::places)),
-/// single or pair. The staged pass holds a request to its places. The
-/// engine's draws and its keyed reads do not ask them yet, so no caller
-/// is answered a worker outside them.
+/// The stage a pair held to places is declined under
+/// ([`Constraints::places`](crate::engine::view::Constraints::places)):
+/// one set of places cannot hold a pair's two lists.
 pub(super) const PLACES: &str = "places";
 
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
@@ -168,9 +170,6 @@ pub(super) fn decide(
     if !cx.demands.is_none() {
         return declined(own, request, DEMANDS);
     }
-    if cx.places.is_some() {
-        return declined(own, request, PLACES);
-    }
     if !cx.wire_modes.is_empty() && !cx.wire_modes.contains(members.wires()) {
         return declined(own, request, WIRES);
     }
@@ -210,8 +209,8 @@ pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
 
 /// The answer for a request that states what no stage of this engine runs,
 /// under the name of the stage that would have run it. Cold: [`decide`]'s
-/// tests are then predicted to pass. Without it, the fourth of them kept
-/// the whole pass behind them from being inlined, 43 instructions a
+/// tests are then predicted to pass. Without it, one test more in front
+/// of the whole pass kept the pass from being inlined, 43 instructions a
 /// decision.
 #[cold]
 pub(super) fn declined(own: &PolicyEngine, request: &Request<'_>, stage: &'static str) -> Decision {
@@ -298,7 +297,7 @@ mod tests {
     use crate::{
         document::spec::{AppliedSpec, Assignment, PolicySpec},
         engine::{
-            decision::{LiftedVeto, Target, Targets},
+            decision::{LiftedVeto, Target, Targets, MAX_TARGETS},
             decision_engine::{
                 Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
             },
@@ -321,6 +320,17 @@ mod tests {
     fn preset(name: &str) -> PolicyEngine {
         let mut document = PolicySpec::preset(name).expect("a built-in preset");
         document.generation = 1;
+        PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+    }
+
+    /// The preset `name` with no filter in any of its profiles: a valid
+    /// document that weighs no worker's health.
+    fn unfiltered(name: &str) -> PolicyEngine {
+        let mut document = PolicySpec::preset(name).expect("a built-in preset");
+        document.generation = 1;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
         PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
     }
 
@@ -821,14 +831,6 @@ mod tests {
             shed(hinted, Some(&members)),
             (ShedReason::PolicyDeclined, SUBSET_HINT)
         );
-        // Held to a place of the list: the one turn does not answer it, and
-        // no pass that does not ask the places yet is run for it.
-        let mut held = request();
-        held.constraints.places = Some(&[1]);
-        assert_eq!(
-            shed(held, Some(&members)),
-            (ShedReason::PolicyDeclined, PLACES)
-        );
         // The list's workers are dialed over HTTP.
         let mut dialed = request();
         dialed.constraints.wire_modes = WireModes::GRPC;
@@ -848,6 +850,132 @@ mod tests {
                 .err(),
             Some(DecisionRefused::PairSide)
         );
+    }
+
+    /// A request its host holds to places of its list is made and decided
+    /// over the list's own records: every target stands at one of the
+    /// places, and each of them takes requests. Under a rotation, two draws
+    /// and a profile that scores, each as it ships and with no filter, over
+    /// a list under the draw's floor and one over it.
+    #[test]
+    fn a_request_held_to_places_is_handed_no_other_place_under_any_document() {
+        for name in ["round_robin", "random", "power_of_two", "least_load"] {
+            for bare in [false, true] {
+                let engine = if bare { unfiltered(name) } else { preset(name) };
+                for workers in [8, 32] {
+                    let list = pool(workers);
+                    let members = engine.pool_members(&list);
+                    let mut asks = Asks::of(request(), Some(&members));
+                    asks.request.constraints.places = Some(&[3, 6]);
+                    let mut first = [0_u32; 8];
+                    for seed in 0..32 {
+                        asks.request.facts.seed = seed;
+                        let decided = decided(&engine, &asks);
+                        let pick = decided.decision.pick().expect("a pick");
+                        let mut places = pick.targets.iter().map(|target| target.position);
+                        assert!(places.all(|place| place == 3 || place == 6), "{name}");
+                        let lead = pick.targets.first().expect("a target").position;
+                        first[lead as usize] += 1;
+                    }
+                    assert!(first[3] > 0 && first[6] > 0, "{name}: {first:?}");
+                    assert_eq!(first[3] + first[6], 32, "{name}: {first:?}");
+                    assert_eq!(asks.made.get(), 32, "{name}: such a request is made");
+                }
+            }
+        }
+    }
+
+    /// A keyed request held to places is handed the next members of the
+    /// stock ring. Held to every member but its key's owner, it is handed
+    /// the members a request held to nothing is named behind the owner, in
+    /// that order: as many targets, and never the owner.
+    #[test]
+    fn a_keyed_request_held_to_places_takes_the_rings_next_members() {
+        for engine in [
+            preset("consistent_hashing"),
+            unfiltered("consistent_hashing"),
+        ] {
+            let list = pool(16);
+            let members = engine.pool_members(&list);
+            let places = |decided: &DecideOutcome| -> Vec<u32> {
+                let pick = decided.decision.pick().expect("a pick");
+                pick.targets.iter().map(|target| target.position).collect()
+            };
+            for key in 1..=40 {
+                let mut keyed = request();
+                keyed.facts.seed = key;
+                keyed.facts.session_key = Identity::hashed(key);
+                let whole = places(&decided(&engine, &Asks::of(keyed, Some(&members))));
+                assert_eq!(whole.len(), MAX_TARGETS, "key {key}");
+                let others: Vec<u32> = (0..16).filter(|&place| place != whole[0]).collect();
+                let mut held = Asks::of(keyed, Some(&members));
+                held.request.constraints.places = Some(&others);
+                let part = places(&decided(&engine, &held));
+                assert_eq!(part.len(), MAX_TARGETS, "key {key}");
+                assert_eq!(part[..MAX_TARGETS - 1], whole[1..], "key {key}");
+                assert!(!part.contains(&whole[0]), "key {key}: the owner is handed");
+            }
+        }
+    }
+
+    /// The default policy holds a request to its places ahead of its
+    /// prompt's holder. A prompt is sent to a worker, and the same prompt
+    /// held to places that worker is outside of is handed none but them,
+    /// as a request with no prompt is: over a list under the draw's floor
+    /// and one over it.
+    #[test]
+    fn a_prompts_holder_outside_the_places_is_not_handed() {
+        for workers in [8_u32, 32] {
+            let engine = preset("cache_aware");
+            let list = pool(workers as usize);
+            let members = engine.pool_members(&list);
+            let tokens: Vec<u32> = (0..1_024).collect();
+            let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+            let sent = |places: Option<&[u32]>, seed: u64, prompted: bool| {
+                let mut asked = request();
+                asked.facts.seed = seed;
+                asked.constraints.places = places;
+                if prompted {
+                    hashes.write_to(&mut asked.facts);
+                }
+                let decided = decided(&engine, &Asks::of(asked, Some(&members)));
+                let pick = decided.decision.pick().expect("a pick");
+                let places = pick.targets.iter().map(|target| target.position);
+                places.collect::<Vec<u32>>()
+            };
+            let holder = sent(None, 0, true)[0];
+            let others: Vec<u32> = (0..workers)
+                .filter(|&place| place != holder)
+                .take(2)
+                .collect();
+            for seed in 1..32 {
+                for prompted in [true, false] {
+                    let named = sent(Some(&others), seed, prompted);
+                    assert!(
+                        named.iter().all(|place| others.contains(place)),
+                        "{workers} workers, seed {seed}: {named:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The rule for a list whose every worker is refused steers a held
+    /// request among its places. Held to a worker over its thresholds, it
+    /// is handed that worker with the veto lifted, beside free workers
+    /// outside its places.
+    #[test]
+    fn a_held_request_over_its_thresholds_everywhere_is_steered_among_its_places() {
+        let engine = preset("round_robin");
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        list[1].set_overloaded(true);
+        let mut held = request();
+        held.constraints.places = Some(&[1]);
+        let decided = decided(&engine, &Asks::of(held, Some(&members)));
+        let pick = decided.decision.pick().expect("a pick");
+        assert_eq!(pick.trace.lifted, LiftedVeto::Overload);
+        assert!(pick.targets.iter().all(|target| target.position == 1));
     }
 
     /// The default policy's single request is named the worker its prompt

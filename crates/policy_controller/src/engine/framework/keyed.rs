@@ -14,7 +14,7 @@
 //! and the host asks the whole decision, which reads every row. No request
 //! is refused here and none is shed.
 
-use super::{shadow_index, slot, trace_ordered, Engine, Plan};
+use super::{places, shadow_index, slot, trace_ordered, Engine, Plan};
 use crate::{
     engine::{
         decision::{Decision, Pick, Targets, Trace},
@@ -71,7 +71,12 @@ impl Engine {
     /// that stands, a pin at its cap, a binding with a shadow, a profile
     /// that opens a scope, a profile whose filters cannot be asked of one
     /// row alone ([`Filter::row_wise`]), a request that carries an affinity
-    /// column, and every plan but the single one.
+    /// column, a request its host holds to places of the pool
+    /// ([`Constraints::places`]), and every plan but the single one.
+    ///
+    /// A pin is read here by its place, whatever places the request may
+    /// take. The whole decision opens its set with those places, so a
+    /// request held to any is its to answer.
     ///
     /// A pick made here states no holding, as [`Self::decide`]'s states
     /// none. A host that feeds a scorer the request's holders, and keeps
@@ -114,6 +119,11 @@ impl Engine {
         // A shadow reads the rows its live decision was handed, and a
         // stage's scope is opened over them: the whole decision's, each.
         if shadow.is_some() || marks.scoped() {
+            return None;
+        }
+        // A request held to places is the whole decision's, which opens
+        // its set with them: no row is read by its place here.
+        if places::stated(cx) {
             return None;
         }
         if let Some(rule) = &binding.sessions {
