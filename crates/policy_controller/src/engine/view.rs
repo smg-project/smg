@@ -1185,8 +1185,9 @@ pub struct RequestFacts<'a> {
     /// nothing to place by, and the lent ring is then not asked. A caller
     /// states a key's position with every ring it lends, an empty ring
     /// too. The list stands as long as the request does: a caller that
-    /// finds a position while it makes the request keeps it beside the
-    /// request. In-process only: no frame carries it.
+    /// finds a position while it makes the request, with the request's
+    /// keys ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)),
+    /// keeps it beside the request. In-process only: no frame carries it.
     pub ring_positions: &'a [u64],
 }
 

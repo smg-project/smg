@@ -9,7 +9,9 @@
 //!
 //! - the routing value and the client's value come from the sources the
 //!   document's binding names, read in the caller's headers and in the
-//!   request's own id ([`AppliedSpec::key_sources_for`]);
+//!   request's own id ([`AppliedSpec::key_sources_for`]), with where the
+//!   value stands on the hash ring the caller lends
+//!   ([`PlaceRequest::ring`]);
 //! - the seed is one no other request of the thread was given
 //!   ([`fresh_seed`]);
 //! - the prompt's blocks are hashed under its cache partition, at the first
@@ -39,7 +41,10 @@ use smg_worker::identity::basic::Worker;
 
 use super::{PolicyEngine, PoolMembers};
 use crate::{
-    document::spec::{AppliedSpec, DecodePick},
+    document::{
+        spec::{AppliedSpec, DecodePick},
+        DerivedKeys,
+    },
     engine::{
         decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
@@ -54,6 +59,7 @@ use crate::{
             Constraints, Header, Identity, MediaCounts, Phase, RequestFacts, WireModes, WorkerId,
         },
     },
+    policies::consistent_hashing::LentRing,
     store::GatewayId,
     tracking::{lease::ReleaseReason, DecisionGuard, Placement},
     Draw,
@@ -181,12 +187,22 @@ pub struct PlaceRequest<'a> {
     /// under every document. The word is a pair's: over one list it asks
     /// nothing, and a first attempt that carries it is plain still.
     pub decode_again: bool,
+    /// The hash ring the caller keeps of the model's workers, lent to the
+    /// request's decision ([`LentRing`]): one ring for a pair's two lists,
+    /// and no part of a list. Under a document whose ring stage places a
+    /// routing value by its own text, the value goes to the worker this
+    /// ring's walk reaches, where the caller's own ring policy puts it:
+    /// the engine reads the value's place on the ring with the request's
+    /// keys. Under any other document the ring is asked nothing. `None`
+    /// from a caller that keeps no ring: the stage places by its own.
+    pub ring: Option<&'a dyn LentRing>,
 }
 
 impl<'a> PlaceRequest<'a> {
     /// A first attempt for `model` over `lists` that states no other fact:
     /// no prompt, no header, no id, no tenant, no media, no demand, no
-    /// encode item, nothing tried, no budget and no second ask of a decode.
+    /// encode item, nothing tried, no budget, no second ask of a decode
+    /// and no ring.
     #[must_use]
     pub fn of(model: &'a str, lists: WorkerLists<'a>) -> Self {
         Self {
@@ -206,6 +222,7 @@ impl<'a> PlaceRequest<'a> {
             tried: &[],
             budget_micros: 0,
             decode_again: false,
+            ring: None,
         }
     }
 
@@ -257,6 +274,10 @@ pub(super) struct Made<'r, 'a> {
     /// The request's routing value in the clear, as the last making
     /// derived it ([`Made::key`]).
     key: Cell<Option<&'a str>>,
+    /// Where the request's key stands on the ring its caller lends, taken
+    /// at the request's first making and borrowed by each one after it:
+    /// none where the request carries no key or is lent no ring.
+    place: OnceCell<Option<u64>>,
 }
 
 impl<'r, 'a> Made<'r, 'a> {
@@ -273,6 +294,7 @@ impl<'r, 'a> Made<'r, 'a> {
             hashes: OnceCell::new(),
             headers: OnceCell::new(),
             key: Cell::new(None),
+            place: OnceCell::new(),
         }
     }
 
@@ -284,22 +306,35 @@ impl<'r, 'a> Made<'r, 'a> {
     }
 
     /// The request's routing value and its client's value, by the sources
-    /// its binding names in the engine's document. The routing value is
-    /// the first source that holds one; none where the binding names no
-    /// source or none holds a value. The client's value is read only where
-    /// the request has no routing value: it places where no session does.
-    fn keys(&self) -> (Identity<'a>, u64) {
+    /// its binding names in the engine's document, with where the value a
+    /// ring places it by stands on `ring`
+    /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
+    /// The routing value is the first source that holds one; none where
+    /// the binding names no source or none holds a value. The client's
+    /// value is read only where the request has no routing value: it
+    /// places where no session does.
+    fn keys(&self, ring: Option<&dyn LentRing>) -> DerivedKeys<'a> {
         let request = self.request;
         let spec = self.engine.spec();
         let Some(sources) = spec.key_sources_for(request.model, request.phase()) else {
-            return (Identity::NONE, 0);
+            return DerivedKeys::default();
         };
         let headers = request.headers;
         let header = move |name: &str| headers.header(name);
-        match sources.derive(header, request.request_id) {
-            Some(derived) => (derived.key, 0),
-            None => (Identity::NONE, sources.derive_client(header)),
-        }
+        sources.derive_keys(header, request.request_id, ring)
+    }
+
+    /// The ring the request's caller lends, where a stage of the profile
+    /// that decides the request places a routing value by its own text
+    /// ([`Engine::states_key_place`](crate::engine::Engine::states_key_place)),
+    /// and none under any other profile. The prefix form of the ring is
+    /// asked for another text, whose place this maker does not state: such
+    /// a request is lent no ring, and its stage places by its own.
+    fn ring(&self) -> Option<&'a dyn LentRing> {
+        let request = self.request;
+        let engine = self.engine.spec().engine();
+        let ring = request.ring;
+        ring.filter(|_| engine.states_key_place(request.model, request.phase()))
     }
 }
 
@@ -312,7 +347,12 @@ impl RequestMaker for Made<'_, '_> {
         let request = self.request;
         // The engine decides under its one document, the one it hands here.
         debug_assert!(std::ptr::eq(spec, self.engine.spec()));
-        let (session_key, client_key) = self.keys();
+        let ring = self.ring();
+        // The key's place is taken at the first making: a later one hands
+        // the keys' reader no ring, and nothing is hashed again.
+        let keys = self.keys(ring.filter(|_| self.place.get().is_none()));
+        let place = self.place.get_or_init(|| keys.ring_position);
+        let session_key = keys.session.map_or(Identity::NONE, |derived| derived.key);
         self.key.set(session_key.plain);
         // The headers the document's view shows a stage, each named by its
         // place in that list. A value that is not text is passed over.
@@ -338,7 +378,9 @@ impl RequestMaker for Made<'_, '_> {
             // count a capped sessions rule reads off the list's records.
             session_counted: session_key.plain.is_some(),
             session_key,
-            client_key,
+            client_key: keys.client_key,
+            ring,
+            ring_positions: place.as_slice(),
             attempt: request.attempt,
             tried: request.tried,
             budget_micros: request.budget_micros,

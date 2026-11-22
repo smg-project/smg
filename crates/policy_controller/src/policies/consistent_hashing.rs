@@ -4,7 +4,8 @@
 //! The consistent-hash scorer and the ring it owns: the ring
 //! owner of a decision's key scores first and the ring's next members after
 //! it, so a commit that misses the owner falls to the member the key would
-//! walk to. The ring is the engine's. Its members are the worker ids the
+//! walk to. The ring is the engine's, unless the request's caller lends
+//! its own ([`LentRing`]). Its members are the worker ids the
 //! membership feed names (added, replaced, a snapshot) and, until every host
 //! path feeds additions, the ids a decision's candidates carry: a candidate
 //! the ring does not know joins at its first decision. Each member stands at
@@ -1005,6 +1006,12 @@ impl Scorer for ConsistentHash {
         false
     }
 
+    // The ring keyed by no prefix is asked where the routing value's own
+    // text stands. The prefix form is asked for another text.
+    fn places_by_key_text(&self) -> bool {
+        self.prefix.is_none()
+    }
+
     /// The ring places a request that carries a routing key by its walk
     /// alone: under the prefix form too, where a routing key leads the
     /// prefix. The bounded-load rule reads every survivor's count, and a
@@ -1036,9 +1043,9 @@ impl Scorer for ConsistentHash {
     /// passes it by one slot, so a pool is walked whatever its share of
     /// the ring.
     ///
-    /// `false` too where the request's caller lent its own ring
-    /// ([`RequestFacts::ring`]): the whole pass places by it, and this
-    /// stage's ring is not read.
+    /// `false` too where the stage places by the ring the request's caller
+    /// lent ([`RequestFacts::ring`]): the whole pass places by that ring,
+    /// and this stage's ring is not read.
     fn own(
         &self,
         facts: &RequestFacts<'_>,
@@ -1146,6 +1153,8 @@ impl Scorer for ConsistentHash {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{self, AtomicU32};
+
     use super::*;
     use crate::{
         engine::{
@@ -2510,5 +2519,65 @@ mod tests {
             }
         }
         assert!(scorer.ring().is_empty(), "no member learned");
+    }
+
+    /// [`InOrder`], with a count of the workers its walks named.
+    #[derive(Debug)]
+    struct Counted(InOrder, AtomicU32);
+
+    impl LentRing for Counted {
+        fn position(&self, key: &str) -> u64 {
+            self.0.position(key)
+        }
+
+        fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+            self.0.walk(position, &mut |address| {
+                self.1.fetch_add(1, atomic::Ordering::Relaxed);
+                take(address)
+            });
+        }
+    }
+
+    /// A lent ring's walk is asked no further than its answer needs. It
+    /// ends at the last survivor it ranks, four at most, and over no
+    /// survivor at the first worker the ring names. With either stop gone
+    /// no score moves: the walk names one worker past its answer, or goes
+    /// round the whole ring for nobody.
+    #[test]
+    fn a_lent_rings_walk_ends_where_its_answer_stands() {
+        let rows = addressed(8);
+        let ring = Counted(reaches(&[5, 9, 2, 0, 7, 3, 1, 6, 4]), AtomicU32::new(0));
+        let named = |kept: &[u32]| {
+            ring.1.store(0, atomic::Ordering::Relaxed);
+            let facts = RequestFacts {
+                ring: Some(&ring),
+                ring_positions: &[0],
+                ..keyed(7)
+            };
+            scored_among(&ConsistentHash::new(None), &facts, &rows, kept);
+            ring.1.load(atomic::Ordering::Relaxed)
+        };
+        // The fourth survivor is the ring's fifth worker: `w9` is no row.
+        assert_eq!(named(&[0, 1, 2, 3, 4, 5, 6, 7]), 5);
+        // Two survivors, the ring's first and third workers.
+        assert_eq!(named(&[2, 5]), 3);
+        // Two survivors the ring names last: the walk goes round once.
+        assert_eq!(named(&[4, 6]), 9);
+        assert_eq!(named(&[]), 1, "nobody to rank");
+    }
+
+    /// A ring stage that has placed keys by its own ring asks a lent ring
+    /// all the same: what it learned of the rows names no worker for a
+    /// request whose caller lends its ring.
+    #[test]
+    fn a_stage_that_placed_by_its_own_ring_places_by_a_lent_one() {
+        let rows = addressed(8);
+        let scorer = ConsistentHash::new(None);
+        scored(&scorer, &keyed(7), &rows);
+        assert_eq!(scorer.ring().len(), 8, "its own ring holds the rows");
+        let ring = reaches(&[5, 9, 2, 0, 7, 3, 1, 6, 4]);
+        let scores = scored(&scorer, &lent(&ring, &[0]), &rows);
+        let steps = (scores[5], scores[2], scores[0], scores[7]);
+        assert_eq!(steps, (1.0, 0.75, 0.5, 0.25));
     }
 }

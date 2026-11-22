@@ -83,7 +83,7 @@ use super::{
     records::{DecisionClock, PoolRecords},
     shadow::{Counted, ShadowCounts, Shadowed},
     sticky_sessions::{shards_for_this_host, SessionTable},
-    view::{fingerprint, FixedFacts, Phase, WireModes, WorkerId},
+    view::{FixedFacts, Phase, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
@@ -372,7 +372,7 @@ impl PolicyEngine {
     /// behind it: said the other way round, the worker that serves is left
     /// told gone.
     pub fn forget(&self, address: &str) {
-        let id = WorkerId(fingerprint(address.as_bytes()));
+        let id = WorkerId::from_address(address);
         self.affinity.forget(id);
         self.told(&Membership::Removed(id));
     }
@@ -384,7 +384,7 @@ impl PolicyEngine {
     /// while lists a worker back at the address it left at once. A host
     /// says it at a registration, where it tells its classic policies.
     pub fn joined(&self, address: &str) {
-        let id = WorkerId(fingerprint(address.as_bytes()));
+        let id = WorkerId::from_address(address);
         self.told(&Membership::Added(id));
     }
 
