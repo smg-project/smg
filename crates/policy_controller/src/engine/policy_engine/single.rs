@@ -346,12 +346,13 @@ mod tests {
     }
 
     /// A request stated ahead, with the list its host hands for it, and how
-    /// many times the engine made it.
+    /// many times the engine made it and asked whether it is plain.
     struct Asks<'a> {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
         loads: Option<Arc<LoadSnapshot>>,
         made: Cell<u32>,
+        asked: Cell<u32>,
     }
 
     impl<'a> Asks<'a> {
@@ -361,6 +362,7 @@ mod tests {
                 members,
                 loads: None,
                 made: Cell::new(0),
+                asked: Cell::new(0),
             }
         }
     }
@@ -376,6 +378,7 @@ mod tests {
         }
 
         fn plain(&self) -> Option<Plain> {
+            self.asked.set(self.asked.get() + 1);
             self.request.plain()
         }
 
@@ -602,6 +605,95 @@ mod tests {
             assert!(decided(&engine, &asks).decision.pick().is_some());
             assert_eq!(asks.made.get(), made);
         }
+    }
+
+    /// The engine asks a request whether it is plain under a document that
+    /// binds a single request to a profile one pick decides, and under no
+    /// other: not where the profile scores, not where the binding of one
+    /// pick's profile states a sessions rule, and not where that binding
+    /// covers no single request. Under such a document it asks every
+    /// request, whichever model it names: with one model bound ahead to a
+    /// profile that scores, another model's plain request is decided with
+    /// none made, and the scored model's is made once.
+    #[test]
+    fn a_request_is_asked_whether_it_is_plain_where_one_pick_decides_a_place() {
+        let list = pool(4);
+        // How often a plain request of `model` was asked, and how often made.
+        let asked = |document: &PolicySpec, model: &'static str| {
+            let mut document = document.clone();
+            document.generation = 1;
+            let valid = AppliedSpec::validate(&document).expect("the document validates");
+            let engine = PolicyEngine::new(valid);
+            let members = engine.pool_members(&list);
+            let mut stated = request();
+            stated.facts.model = model;
+            let asks = Asks::of(stated, Some(&members));
+            let _ = answered(&engine, &asks);
+            (asks.asked.get(), asks.made.get())
+        };
+        let round_robin = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let scored = PolicySpec::preset("least_load").expect("a built-in preset");
+        assert_eq!(asked(&round_robin, MODEL), (1, 0));
+        assert_eq!(asked(&scored, MODEL), (0, 1), "no place is one pick's");
+
+        // One pick's profile under a sessions rule: a key's pin comes first.
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        let mut ruled = round_robin.clone();
+        ruled.view.headers = manual.view.headers.clone();
+        let rule = manual
+            .bindings
+            .first()
+            .and_then(|binding| binding.sessions.clone());
+        let binding = ruled.bindings.first_mut().expect("the preset's binding");
+        binding.sessions = Some(rule.expect("the manual preset's rule"));
+        assert_eq!(
+            asked(&ruled, MODEL),
+            (0, 1),
+            "a sessions rule is in the way"
+        );
+
+        // Both kinds: one model bound ahead of the wildcard to the profile
+        // that scores.
+        let mut both = round_robin.clone();
+        let profile = scored.profiles["least_load"].clone();
+        both.profiles.insert("least_load".into(), profile);
+        let mut binding = both
+            .bindings
+            .first()
+            .cloned()
+            .expect("the preset's binding");
+        binding.matcher.model = "scored".into();
+        binding.profile = Some("least_load".into());
+        both.bindings.insert(0, binding);
+        assert_eq!(
+            asked(&both, MODEL),
+            (1, 0),
+            "one pick decides the wildcard's place"
+        );
+        assert_eq!(
+            asked(&both, "scored"),
+            (1, 1),
+            "asked, and made for its whole decision"
+        );
+
+        // One pick's profile bound for the prefill phase alone, ahead of the
+        // wildcard that scores: no single request reaches it.
+        let mut apart = scored.clone();
+        let profile = round_robin.profiles["round_robin"].clone();
+        apart.profiles.insert("round_robin".into(), profile);
+        let mut binding = apart
+            .bindings
+            .first()
+            .cloned()
+            .expect("the preset's binding");
+        binding.matcher.phase = vec![Phase::Prefill];
+        binding.profile = Some("round_robin".into());
+        apart.bindings.insert(0, binding);
+        assert_eq!(
+            asked(&apart, MODEL),
+            (0, 1),
+            "no single request reaches one pick's binding"
+        );
     }
 
     /// A place that scores by load reads each worker's report in the

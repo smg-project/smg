@@ -140,6 +140,32 @@ impl Engine {
         })
     }
 
+    /// The profile one pick of its picker decides `binding`'s single
+    /// requests under, or none: the binding's single place is decided so
+    /// ([`Self::place_for`]) and the binding states no sessions rule, which
+    /// pins a keyed request ahead of the profile. None too under a plan
+    /// with no single side and for a profile that is missing, which
+    /// `place_for` names apart. A list asks it of its model's binding and
+    /// the engine of every binding, so the two agree.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn single_alone(&self, binding: &Binding) -> Option<AloneProfile> {
+        let index = profile_index(binding, Phase::Single)?;
+        let profile = self.profiles.get(usize::from(index))?;
+        let alone = self.in_the_way(index, profile, Phase::Single).is_none();
+        (binding.sessions.is_none() && alone).then_some(AloneProfile(index))
+    }
+
+    /// Whether one pick decides the single requests of any binding
+    /// ([`Self::single_alone`]). Where it decides none's, no single request
+    /// is answered by one pick, whatever its model.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn any_single_alone(&self) -> bool {
+        self.bindings.iter().any(|entry| {
+            let binding = &entry.binding;
+            binding.covers(Phase::Single) && self.single_alone(binding).is_some()
+        })
+    }
+
     /// Every place a binding of the document names, with its profile and
     /// the profile's place in the document: each binding in the document's
     /// order, at each phase it covers and its plan has a side for.

@@ -110,6 +110,10 @@ pub struct PolicyEngine {
     /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
     /// and its plain requests are answered a place ([`Decided::Alone`]).
     hears: EventSet,
+    /// Whether one pick decides the single requests of any binding
+    /// (`Engine::any_single_alone`), read once, here. Under a document
+    /// with no such binding no request is asked whether it is plain.
+    alone: bool,
     /// What the affinity stages read across decisions: the host's indexes
     /// of cache events, once it handed them, and the engine's record of the
     /// prefixes it sent, one a model ([`Self::affinity`]).
@@ -234,14 +238,10 @@ impl PoolMembers {
     /// gateway's list is one model's. Another model's request is answered
     /// by the document at its call.
     fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
+        // The document's one test, which the engine asks of every binding.
         let find = || {
             let engine = spec.engine();
-            let Place::Alone(profile) = engine.place_for(model, Phase::Single) else {
-                return None;
-            };
-            // A sessions rule pins a keyed request ahead of the profile.
-            let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
-            (!ruled).then_some(profile)
+            engine.single_alone(engine.binding(model, Phase::Single)?)
         };
         let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
         if **named == *model {
@@ -256,9 +256,10 @@ impl PolicyEngine {
     /// The engine of `spec`, the document in force.
     #[must_use]
     pub fn new(spec: AppliedSpec) -> Self {
-        let hears = spec.engine().hears();
+        let (hears, alone) = (spec.engine().hears(), spec.engine().any_single_alone());
         Self {
             hears,
+            alone,
             spec,
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
@@ -542,9 +543,11 @@ impl PolicyEngine {
         whole: &mut Option<(DecideOutcome, bool)>,
     ) -> Result<Option<AlonePick>, DecisionRefused> {
         // A plain request of a place one pick decides is decided ahead
-        // of its making: the pick reads no fact of it.
+        // of its making: the pick reads no fact of it. A document with no
+        // such place asks no request whether it is plain.
         let mut picked = None;
-        if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
+        let asked = self.alone.then(|| (maker.plain(), maker.workers()));
+        if let Some((Some(plain), WorkerLists::Single(members))) = asked {
             if let Some(pick) = single::alone(self, maker.model(), plain, members) {
                 // No stage takes a word of the request: the place is
                 // the whole answer.

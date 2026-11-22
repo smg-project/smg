@@ -679,7 +679,8 @@ decided by *one pick* when its picker needs nothing of the request, it has no sc
 filter beyond the health tests, and its binding has no sessions rule. On main two pickers say so:
 round robin and `passthrough`.
 
-1. The engine asks `maker.plain()`. If the request is plain and a single one, the host handed one
+1. Under a document that binds any single request to a profile one pick decides, the engine asks
+   `maker.plain()`. If the request is plain and a single one, the host handed one
    list, every worker of the list serves the protocols the request states, and the list's model
    is bound to a profile that one pick decides, the picker names a worker by its own rule and the
    engine answers with its position. Round robin adds one to the list's counter and takes the

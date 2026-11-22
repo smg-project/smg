@@ -75,10 +75,11 @@ pub trait RequestMaker {
     /// every other request, and from a maker that does not say.
     ///
     /// An engine that decides over its host's lists asks this ahead of
-    /// [`RequestMaker::make`]. A place one pick of a picker decides reads
-    /// no fact of a request, so a plain request of such a place is decided
-    /// with none made: its routing key is not derived and no seed is drawn
-    /// for it. The answer is cheap: it reads the document nowhere.
+    /// [`RequestMaker::make`], under a document with a place of single
+    /// requests that one pick of a picker decides. Such a place reads no
+    /// fact of a request, so a plain request of it is decided with none
+    /// made: its routing key is not derived and no seed is drawn for it.
+    /// The answer is cheap: it reads the document nowhere.
     ///
     /// A request held to places of its list
     /// ([`Constraints::places`](super::view::Constraints::places)) is not
