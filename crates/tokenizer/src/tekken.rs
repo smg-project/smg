@@ -141,11 +141,223 @@ pub(crate) fn read(path: &Path) -> Result<Vocabulary> {
     // One UTF-8 check of the whole file in place of one a string; a file
     // that is not UTF-8 in a place the reader skips is read as before.
     let file: File = match std::str::from_utf8(&bytes) {
-        Ok(text) => serde_json::from_str(text),
+        Ok(text) => match written_layout(text) {
+            Some(file) => Ok(file),
+            None => serde_json::from_str(text),
+        },
         Err(_) => serde_json::from_slice(&bytes),
     }
     .with_context(|| format!("{} is not a tekken vocabulary file", path.display()))?;
     vocabulary(file).with_context(|| format!("{} is not a valid tekken vocabulary", path.display()))
+}
+
+/// The file whose ranked tokens are written as the reference writer writes
+/// them: objects of `rank` (a plain integer), `token_bytes` (a string
+/// without an escape) and `token_str` (a string or null), in that order.
+/// The array is walked here, at a fraction of the JSON reader's pass over
+/// it; the text around it goes through the JSON reader with an empty array
+/// in its place. `None` for any other shape and for a text the JSON reader
+/// would refuse: the caller hands it the whole file, so every file reads as
+/// before and every error keeps its text.
+fn written_layout(text: &str) -> Option<File<'_>> {
+    let mut walk = Walk { text, at: 0 };
+    walk.take(b"{")?;
+    loop {
+        walk.take(b"\"")?;
+        let key = walk.plain_string()?;
+        walk.take(b":")?;
+        walk.space();
+        if key == "vocab" {
+            break;
+        }
+        walk.skip_value()?;
+        walk.take(b",")?;
+    }
+    let start = walk.at;
+    walk.take(b"[")?;
+    let mut vocab = Vec::new();
+    if walk.take(b"]").is_none() {
+        // A writer repeats the text between two values byte for byte: it is
+        // walked token by token once and compared after that.
+        let mut seams = [None; 3];
+        walk.take(b"{")?;
+        walk.take(b"\"rank\"")?;
+        walk.take(b":")?;
+        loop {
+            let rank = walk.integer()?;
+            walk.seam(&mut seams[0], |walk| {
+                walk.take(b",")?;
+                walk.take(b"\"token_bytes\"")?;
+                walk.take(b":")?;
+                walk.take(b"\"")
+            })?;
+            let token_bytes = Cow::Borrowed(walk.plain_string()?);
+            walk.seam(&mut seams[1], |walk| {
+                walk.take(b",")?;
+                walk.take(b"\"token_str\"")?;
+                walk.take(b":")
+            })?;
+            if walk.take(b"\"").is_some() {
+                walk.skipped_string()?;
+            } else {
+                walk.take(b"null")?;
+            }
+            vocab.push(Token { rank, token_bytes });
+            let next = walk.seam(&mut seams[2], |walk| {
+                walk.take(b"}")?;
+                walk.take(b",")?;
+                walk.take(b"{")?;
+                walk.take(b"\"rank\"")?;
+                walk.take(b":")
+            });
+            if next.is_none() {
+                break;
+            }
+        }
+        walk.take(b"}")?;
+        walk.take(b"]")?;
+    }
+    let around = [text.get(..start)?, "[]", text.get(walk.at..)?].concat();
+    let File {
+        config,
+        special_tokens,
+        ..
+    } = serde_json::from_str(&around).ok()?;
+    Some(File {
+        config,
+        vocab,
+        special_tokens,
+    })
+}
+
+/// A position in the file's text for [`written_layout`]. Every method
+/// answers `None` where the JSON reader would refuse the text, or might.
+struct Walk<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl<'a> Walk<'a> {
+    fn rest(&self) -> &'a [u8] {
+        self.text.as_bytes().get(self.at..).unwrap_or_default()
+    }
+
+    fn space(&mut self) {
+        let space = |byte: &&u8| matches!(byte, b' ' | b'\n' | b'\r' | b'\t');
+        self.at += self.rest().iter().take_while(space).count();
+    }
+
+    /// Passes `token` and the white space in front of it.
+    fn take(&mut self, token: &[u8]) -> Option<()> {
+        self.space();
+        self.rest()
+            .starts_with(token)
+            .then(|| self.at += token.len())
+    }
+
+    /// Passes the text between two values: by a compare where `seam`, the
+    /// text `tokens` passed at this place last, stands here again, else by
+    /// `tokens`.
+    fn seam(
+        &mut self,
+        seam: &mut Option<&'a [u8]>,
+        tokens: impl Fn(&mut Self) -> Option<()>,
+    ) -> Option<()> {
+        let (from, rest) = (self.at, self.rest());
+        match *seam {
+            Some(seam) if rest.starts_with(seam) => self.at += seam.len(),
+            _ => {
+                if tokens(self).is_none() {
+                    self.at = from;
+                    return None;
+                }
+                *seam = rest.get(..self.at - from);
+            }
+        }
+        Some(())
+    }
+
+    /// The rest of a string that has no escape; ends past its quote.
+    fn plain_string(&mut self) -> Option<&'a str> {
+        let rest = self.rest();
+        let len = rest
+            .iter()
+            .position(|byte| matches!(byte, b'"' | b'\\' | 0..=0x1f))?;
+        let string = self.text.get(self.at..self.at + len)?;
+        (rest.get(len) == Some(&b'"')).then(|| {
+            self.at += len + 1;
+            string
+        })
+    }
+
+    /// Passes the rest of a string that is not read, its escapes checked as
+    /// the JSON reader checks them.
+    fn skipped_string(&mut self) -> Option<()> {
+        let bytes = self.text.as_bytes();
+        let mut at = self.at;
+        loop {
+            match *bytes.get(at)? {
+                b'"' => break,
+                b'\\' => match *bytes.get(at + 1)? {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => at += 2,
+                    b'u' => {
+                        let hex = bytes.get(at + 2..at + 6)?;
+                        // Whether half a surrogate pair is an error is the
+                        // JSON reader's rule and changed between its
+                        // versions.
+                        let surrogate = matches!(
+                            hex,
+                            [b'd' | b'D', b'8' | b'9' | b'a'..=b'f' | b'A'..=b'F', ..]
+                        );
+                        if surrogate || !hex.iter().all(u8::is_ascii_hexdigit) {
+                            return None;
+                        }
+                        at += 6;
+                    }
+                    _ => return None,
+                },
+                0..=0x1f => return None,
+                _ => at += 1,
+            }
+        }
+        self.at = at + 1;
+        Some(())
+    }
+
+    /// A number of digits alone, without a leading zero, that fits a rank.
+    fn integer(&mut self) -> Option<u32> {
+        self.space();
+        let rest = self.rest();
+        let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        let number = rest.get(..digits)?;
+        if number.is_empty() || (digits > 1 && number.first() == Some(&b'0')) {
+            return None;
+        }
+        self.at += digits;
+        number.iter().try_fold(0u32, |value, digit| {
+            value.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
+        })
+    }
+
+    /// Passes a value in front of the array; the JSON reader checks it
+    /// when it reads the text around the array.
+    fn skip_value(&mut self) -> Option<()> {
+        let mut depth = 0usize;
+        loop {
+            match *self.rest().first()? {
+                b',' | b'}' | b']' if depth == 0 => return Some(()),
+                b'"' => {
+                    self.at += 1;
+                    self.skipped_string()?;
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                _ => {}
+            }
+            self.at += 1;
+        }
+    }
 }
 
 /// The vocabulary of a parsed file, checked as the reference reader checks
@@ -552,6 +764,29 @@ mod tests {
             format!("{error:#}").contains("is not a tekken vocabulary file"),
             "{error:#}"
         );
+    }
+
+    /// The walk over the ranked tokens reads the vocabulary the JSON reader
+    /// reads; a token written any other way sends the file to the JSON
+    /// reader.
+    #[test]
+    fn the_walk_reads_the_ranked_tokens_as_the_json_reader_does() {
+        let text = testing::minimal();
+        let parsed = vocabulary(serde_json::from_str(&text).unwrap()).unwrap();
+        let reordered = text.replacen(
+            "\"rank\":7,\"token_bytes\":\"Bw==\"",
+            "\"token_bytes\":\"Bw==\",\"rank\":7",
+            1,
+        );
+        assert!(written_layout(&text).is_some());
+        assert!(reordered != text && written_layout(&reordered).is_none());
+        for text in [text, reordered] {
+            let dir = testing::dir_with(&text);
+            let loaded = read(&dir.path().join(FILE_NAME)).unwrap();
+            assert_eq!(loaded.ranks, parsed.ranks);
+            assert_eq!(loaded.specials, parsed.specials);
+            assert_eq!(loaded.pattern, parsed.pattern);
+        }
     }
 
     #[test]
