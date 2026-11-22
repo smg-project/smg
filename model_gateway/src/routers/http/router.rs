@@ -341,6 +341,7 @@ impl Router {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        rid: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
@@ -358,6 +359,7 @@ impl Router {
                 tokens,
                 headers,
                 rid_key,
+                rid,
                 cache_namespace,
                 candidate_filter,
                 tried,
@@ -752,7 +754,7 @@ impl Router {
     /// The worker of one attempt: selected away from the engines the request
     /// already tried and from those whose answer was definitive, or the
     /// refusal this router answers when the pool has none to give.
-    fn select_worker_for_attempt<T>(
+    fn select_worker_for_attempt<T: GenerationRequest>(
         &self,
         attempt: &TypedAttempt<'_, T>,
     ) -> Result<Arc<dyn Worker>, Response> {
@@ -771,6 +773,7 @@ impl Router {
                     view.tokens,
                     attempt.headers,
                     view.rid_key,
+                    view.request.rid(),
                     view.cache_namespace,
                     candidate_filter,
                     &tried,
@@ -1161,7 +1164,8 @@ impl Router {
         // exit below.
         let outcome = self.begin_route(route, model_id, is_stream);
 
-        let worker = match self.select_transcription_worker(headers, model_id, &routing) {
+        let worker = match self.select_transcription_worker(headers, model_id, &routing, body.rid())
+        {
             Ok(worker) => worker,
             Err(refusal) => {
                 outcome.pre_send_error(&refusal);
@@ -1237,6 +1241,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         model_id: &str,
         routing: &RoutingDerivatives,
+        rid: Option<&str>,
     ) -> Result<Arc<dyn Worker>, Response> {
         let all_workers = self
             .worker_registry
@@ -1269,6 +1274,7 @@ impl Router {
                 tokens: routing.tokens.as_deref(),
                 headers,
                 rid_key: routing.rid_key.as_deref(),
+                rid,
                 cache_namespace: routing.cache_namespace,
                 candidate_filter: None,
                 tried: &[],
@@ -2355,6 +2361,7 @@ impl Router {
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
+            None,
             None,
             None,
             None,
@@ -3507,7 +3514,17 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
+            .select_worker_for_model(
+                UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .unwrap();
         assert!(selected.is_available());
 
@@ -3515,7 +3532,17 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
+            .select_worker_for_model(
+                UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .is_none());
     }
 

@@ -199,7 +199,7 @@ impl Bed {
         for _ in 0..ROUNDS * self.workers.len().max(1) {
             match self
                 .router
-                .select_transcription_worker(None, MODEL, &routing)
+                .select_transcription_worker(None, MODEL, &routing, None)
             {
                 Ok(worker) => {
                     let at = self

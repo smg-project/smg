@@ -127,6 +127,12 @@ pub(crate) struct PlacementInputs<'a> {
     pub headers: Option<&'a HeaderMap>,
     /// Session key derived from the body's `rid`.
     pub rid_key: Option<&'a str>,
+    /// The body's `rid` as the request states it, its retry and turn
+    /// suffixes with it: the request's own id. No classic policy reads it.
+    /// The policy engine is handed it and derives the routing value by its
+    /// document's own rule, so it is stated whether or not the sticky
+    /// override derives a key.
+    pub rid: Option<&'a str>,
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
     /// Extra per-request candidate predicate; a worker it rejects is never
@@ -1174,7 +1180,7 @@ fn relaxed_pair(
 /// Whether `worker`'s engine (its base URL, which the ranks of a DP-aware
 /// worker share) is one a failed attempt of the request already dispatched
 /// to ([`PlacementInputs::tried`]).
-fn was_tried(worker: &dyn Worker, tried: &[String]) -> bool {
+pub(super) fn was_tried(worker: &dyn Worker, tried: &[String]) -> bool {
     tried.iter().any(|engine| engine == worker.base_url())
 }
 

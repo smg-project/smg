@@ -67,6 +67,7 @@ pub(crate) mod pair_index;
 pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
+pub(crate) mod place_request;
 pub(crate) mod placement;
 pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
