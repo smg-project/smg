@@ -21,7 +21,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::{Display, Write as _},
-    sync::{atomic::Ordering, Arc, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock, Weak,
+    },
 };
 
 use metrics::{
@@ -123,6 +126,9 @@ pub struct WorkerSeries {
     /// series is created for an address between its retirement and the drop
     /// of its series.
     addresses: RwLock<HashMap<String, Address>>,
+    /// The upkeep forgot a retired address since the last registration: a
+    /// thread may still keep a no-op handle it built for that address.
+    forgot_retired: AtomicBool,
     registry: Registry<Key, WorkerStorage>,
     /// Descriptions by sanitized metric name, for the `# HELP` lines.
     descriptions: RwLock<HashMap<String, SharedString>>,
@@ -136,6 +142,7 @@ impl WorkerSeries {
     pub fn new(distribution_builder: DistributionBuilder) -> Self {
         Self {
             addresses: RwLock::new(HashMap::new()),
+            forgot_retired: AtomicBool::new(false),
             registry: Registry::new(WorkerStorage),
             descriptions: RwLock::new(HashMap::new()),
             distribution_builder,
@@ -145,16 +152,21 @@ impl WorkerSeries {
 
     /// A worker registered at `url`: its series record (again). The workers
     /// that served the address before stay known while a handle holds one.
-    pub(crate) fn activate(&self, url: &str) {
+    /// Says whether a kept handle may be a no-op one, built while an address
+    /// was retired: this address until now, or one the upkeep forgot since
+    /// the last registration.
+    pub(crate) fn activate(&self, url: &str) -> bool {
         let mut addresses = self.addresses.write();
+        let mut noop_kept = self.forgot_retired.swap(false, Ordering::AcqRel);
         let Some(address) = addresses.get_mut(url) else {
-            return;
+            return noop_kept;
         };
-        address.retired = false;
+        noop_kept |= std::mem::take(&mut address.retired);
         let nothing_to_keep = address.writers.is_empty();
         if nothing_to_keep {
             addresses.remove(url);
         }
+        noop_kept
     }
 
     /// `worker`, replaced at `url` by another instance, may still write for
@@ -248,7 +260,11 @@ impl WorkerSeries {
     pub fn run_upkeep(&self) {
         self.addresses.write().retain(|_, address| {
             address.writers.retain(|writer| writer.strong_count() > 0);
-            !address.writers.is_empty()
+            let referenced = !address.writers.is_empty();
+            if address.retired && !referenced {
+                self.forgot_retired.store(true, Ordering::Release);
+            }
+            referenced
         });
         let mut distributions = self.distributions.lock();
         self.registry.visit_histograms(|key, samples| {
