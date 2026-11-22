@@ -331,7 +331,7 @@ fn main() {
     let start = Barrier::new(run.callers + 1);
     let (busy_nanos, placed, allocations) =
         (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
-    let (publications, done, ended) = (AtomicU64::new(0), Mutex::new(false), Condvar::new());
+    let (publications, left, end) = (AtomicU64::new(0), Mutex::new(run.callers), Condvar::new());
     let converted_before = host.members.conversions();
     let wall = thread::scope(|scope| {
         let one_caller = |caller: u64| {
@@ -348,17 +348,19 @@ fn main() {
             busy_nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             allocations.fetch_add((calls() - allocated) as u64, Ordering::Relaxed);
             placed.fetch_add(took, Ordering::Relaxed);
+            *left.lock() -= 1;
+            end.notify_one();
         };
         let callers: Vec<_> = (0..run.callers as u64)
             .map(|caller| scope.spawn(move || one_caller(caller)))
             .collect();
         start.wait();
         let started = Instant::now();
-        // The monitor's side while callers run: the reports as a new snapshot.
+        // The monitor's side, under the lock: none after the last caller's end.
         if run.publish_ms > 0 {
             scope.spawn(|| {
-                let wait = |every| ended.wait_while_for(&mut done.lock(), |done| !*done, every);
-                while wait(Duration::from_millis(run.publish_ms)).timed_out() {
+                let (gap, mut left) = (Duration::from_millis(run.publish_ms), left.lock());
+                while end.wait_while_for(&mut left, |n| *n > 0, gap).timed_out() && *left > 0 {
                     feed.publish(&loads);
                     publications.fetch_add(1, Ordering::Relaxed);
                 }
@@ -367,8 +369,6 @@ fn main() {
         for caller in callers {
             caller.join().expect("a caller that ends");
         }
-        *done.lock() = true;
-        ended.notify_one();
         started.elapsed()
     });
     let total = run.decisions * run.callers as u64;
