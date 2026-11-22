@@ -53,6 +53,8 @@ pub use framework::{
 };
 pub use pair_classes::PartnerClasses;
 #[cfg(feature = "in-process")]
+pub use policy_engine::encode::EncodeLists;
+#[cfg(feature = "in-process")]
 pub use policy_engine::overlap::{
     self, Affinity, CacheIndex, CacheIndexes, PoolAffinity, PrefixRead,
 };

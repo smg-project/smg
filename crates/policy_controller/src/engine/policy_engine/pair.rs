@@ -169,17 +169,20 @@ impl PairLists<'_> {
 }
 
 /// What one thread keeps for its pair decisions: each list's records, the
-/// prefills' first, and the engine's scratch.
+/// prefills' first, and the engine's scratch. An encode request's decision
+/// keeps its encoders' records here too ([`super::encode`]): a pair's
+/// leaves them as they were.
 #[derive(Debug, Default)]
-struct Buffers {
-    rows: [Vec<Candidate>; 2],
-    scratch: Scratch,
+pub(super) struct Buffers {
+    pub(super) rows: [Vec<Candidate>; 2],
+    pub(super) encoders: Vec<Candidate>,
+    pub(super) scratch: Scratch,
 }
 
 thread_local! {
     /// The calling thread's own buffers, so a pair's decision allocates
     /// nothing after a thread's first decisions over lists of a size.
-    static BUFFERS: RefCell<Buffers> = RefCell::new(Buffers::default());
+    pub(super) static BUFFERS: RefCell<Buffers> = RefCell::new(Buffers::default());
 }
 
 /// Writes on the two lists' records what a pair's decision reads beside a
@@ -209,7 +212,7 @@ pub(super) fn stamp(
 /// such a request is shed and never placed past its demand. A hint of some
 /// records is declined: no stage here takes a part of a list. So are
 /// places ([`single::PLACES`]): a pair's sides do not read them.
-fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
+pub(super) fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
     match cx.subset_hint {
         Some(0) => Some((ShedReason::NoEndpoints, SUBSET_HINT)),
         Some(_) => Some((ShedReason::PolicyDeclined, SUBSET_HINT)),

@@ -39,6 +39,7 @@
 //! that read who holds a prompt, the record of the prefixes it sent
 //! ([`overlap`]).
 
+pub(super) mod encode;
 mod keys;
 pub mod overlap;
 pub(super) mod pair;
