@@ -6342,9 +6342,11 @@ mod tests {
             assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().text_hashes, hashes, "{name}");
             assert!(!engine.needs().text, "{name}");
-            // The request's size is counted where a stage places by it: a
-            // host that sends a request on unread reads it for that stage.
-            assert_eq!(engine.needs().prompt_size, name == "bucket", "{name}");
+            // The request's size is counted where a stage places by it or
+            // takes a share of it: a host that sends a request on unread
+            // reads it for that stage.
+            let sized = ["bucket", "cache_aware"].contains(&name);
+            assert_eq!(engine.needs().prompt_size, sized, "{name}");
             // The affinity stage's source is left out: it reads each worker
             // by what it has, its cache events or the prefixes sent to it.
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
