@@ -1,16 +1,21 @@
 //! The cases of a request held to places of its pool, for the passes that
-//! hold it: the staged pass hands no row outside the places, under a
-//! profile that lists no filter and under the crate's presets as they ship.
+//! hold it: the staged pass and each pass that opens a set of its own hand
+//! no row outside the places, under profiles that list no filter and under
+//! the crate's presets as they ship.
 
-use super::super::{Binding, Engine, Plan, Profile};
+use super::super::{Binding, Engine, Picker, Plan, Profile, Scorer, WeightedScorer, DRAW_FROM};
 use crate::{
     document::spec::{Needs, PolicySpec, PRESETS},
     engine::{
-        decision::{Decision, LiftedVeto},
-        view::{Candidate, Constraints, Health, PoolFacts, RequestFacts, WorkerId},
+        decision::{Decision, LiftedVeto, MAX_TARGETS},
+        view::{
+            AffinityHolder, AffinityRows, Candidate, Constraints, Engines, Health, Identity,
+            PoolFacts, RequestFacts, WorkerId,
+        },
         Scratch,
     },
-    policies::random::Random,
+    policies::{consistent_hashing::ConsistentHash, power_of_two::PowerOfTwo, random::Random},
+    stages::{pickers::Best, scorers::LeastRequests},
 };
 
 /// A ready row at `position`, under an id and a stable key of its own.
@@ -81,14 +86,51 @@ fn named(decision: &Decision) -> Vec<u32> {
         .collect()
 }
 
-/// Every preset, with its filters and with none, over a pool under the
-/// draw's floor, for a request with no key: no target stands outside the
+/// A profile of no filter: `scorers` under `picker`.
+fn bare(name: &str, scorers: Vec<Box<dyn Scorer>>, picker: Box<dyn Picker>) -> Profile {
+    let scorers = scorers
+        .into_iter()
+        .map(|scorer| WeightedScorer {
+            scorer,
+            weight: 1.0,
+        })
+        .collect();
+    Profile {
+        name: name.into(),
+        filters: vec![],
+        scorers,
+        picker,
+    }
+}
+
+/// The single plan over the first profile, for every model.
+fn single(shadow: Option<u16>) -> Binding {
+    Binding {
+        model: "*".into(),
+        phases: vec![],
+        plan: Plan::Single,
+        profile: 0,
+        decode_profile: None,
+        shadow,
+        decode_shadow: None,
+        sessions: None,
+        overload: None,
+    }
+}
+
+/// Whether the whole pass decided: its trace counts the survivors of its
+/// filters, where a draw's and a walk's count none.
+fn by_the_pass(decision: &Decision) -> Option<u32> {
+    decision.pick()?.trace.survivors.get()
+}
+
+/// Every preset, with its filters and with none, over a pool of `rows`
+/// rows, for a request with no key: no target stands outside the
 /// places, and the presets that place a request by its pool alone place
 /// every one. A preset with its filters folds them into one test of a row,
 /// asked in one pass (`keep_folded`): that pass steps aside for a request
 /// held to places, and the staged pass decides.
-#[test]
-fn no_preset_hands_a_target_outside_the_places_under_the_draws_floor() {
+fn no_preset_hands_a_target_outside_the_places(rows: u32) {
     let places = [2, 5];
     let by_pool = [
         "random",
@@ -98,7 +140,7 @@ fn no_preset_hands_a_target_outside_the_places_under_the_draws_floor() {
         "least_load",
         "consistent_hashing",
     ];
-    let rows = pool(8);
+    let rows = pool(rows);
     for name in PRESETS {
         for bare in [false, true] {
             let engine = stock(name, bare);
@@ -117,6 +159,17 @@ fn no_preset_hands_a_target_outside_the_places_under_the_draws_floor() {
             }
         }
     }
+}
+
+#[test]
+fn no_preset_hands_a_target_outside_the_places_under_the_draws_floor() {
+    no_preset_hands_a_target_outside_the_places(8);
+}
+
+/// Over the draw's floor each pass that draws steps aside for it.
+#[test]
+fn no_preset_hands_a_target_outside_the_places_over_the_draws_floor() {
+    no_preset_hands_a_target_outside_the_places(4 * DRAW_FROM as u32);
 }
 
 /// The filter half: a profile of no filter over a pool under the draw's
@@ -165,6 +218,17 @@ fn the_filter_half_opens_with_the_places_under_a_profile_of_no_filter() {
     assert!(none.pick().is_none());
 }
 
+/// A host states each place once, ascending: a debug build stops at a
+/// place stated twice, which the whole pass would name twice.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "the places are ascending, each once")]
+fn a_place_stated_twice_stops_a_debug_build() {
+    let (engine, rows) = (stock("round_robin", true), pool(8));
+    let (cx, mut scratch) = (stating(&[5, 5]), Scratch::new());
+    let _ = engine.decide(&facts(1), &of(&rows), &rows, &cx, &mut scratch);
+}
+
 /// A pool whose every worker is over its thresholds is steered among the
 /// places: the fewest requests in flight of the workers kept, whatever the
 /// workers left out hold.
@@ -184,6 +248,244 @@ fn a_pool_over_its_thresholds_is_steered_among_the_places() {
         assert_eq!(named(&decision), [4, 6, 1], "seed {seed}");
         let pick = decision.pick().expect("a pick");
         assert_eq!(pick.trace.lifted, LiftedVeto::Overload);
+    }
+}
+
+/// The draw steps aside: a profile that draws first, with no filter, over
+/// a pool above the draw's floor. Held to nothing the decision is the
+/// draw's, which counts no survivor. Held to places it is the whole
+/// pass's, and no target stands outside them.
+#[test]
+fn the_draw_steps_aside_for_a_request_held_to_places() {
+    let places = [3, 40];
+    for name in ["random", "power_of_two"] {
+        let engine = stock(name, true);
+        let rows = pool(4 * DRAW_FROM as u32);
+        for seed in 0..32 {
+            let mut scratch = Scratch::new();
+            let free = Constraints::default();
+            let drawn = engine.decide(&facts(seed), &of(&rows), &rows, &free, &mut scratch);
+            assert!(drawn.pick().is_some(), "{name}");
+            assert_eq!(by_the_pass(&drawn), None, "{name}: a draw decides");
+            let cx = stating(&places);
+            let decision = engine.decide(&facts(seed), &of(&rows), &rows, &cx, &mut scratch);
+            assert_eq!(by_the_pass(&decision), Some(2), "{name}, seed {seed}");
+            let named = named(&decision);
+            assert!(
+                named.iter().all(|place| places.contains(place)),
+                "{name}: {named:?}"
+            );
+        }
+    }
+}
+
+/// The draw over rows written when asked steps aside too: handed a
+/// request held to places, it draws nothing, every row is written once and
+/// the whole pass decides among the places.
+#[cfg(feature = "in-process")]
+#[test]
+fn the_written_draw_steps_aside_for_a_request_held_to_places() {
+    let engine = stock("random", true);
+    let fixed = pool(4 * DRAW_FROM as u32);
+    let places = [3, 40];
+    for seed in 0..16 {
+        let request = facts(seed);
+        let unsaid = of(&fixed);
+        let drawn = engine
+            .drawn_for(&request, &unsaid, fixed.len())
+            .expect("a draw's decision");
+        let mut rows = vec![Candidate::default(); fixed.len()];
+        let mut written = 0_usize;
+        let mut write = |fixed: &Candidate, row: &mut Candidate| {
+            written += 1;
+            *row = *fixed;
+        };
+        let (cx, mut scratch) = (stating(&places), Scratch::new());
+        let decision = engine.decide_drawn(
+            drawn,
+            &request,
+            &unsaid,
+            &fixed,
+            &mut rows,
+            &mut write,
+            &cx,
+            &mut scratch,
+        );
+        assert_eq!(written, fixed.len(), "the whole pass reads every row");
+        assert_eq!(by_the_pass(&decision), Some(2), "seed {seed}");
+        let named = named(&decision);
+        assert!(
+            named.iter().all(|place| places.contains(place)),
+            "{named:?}"
+        );
+    }
+}
+
+/// A pool of `engines` engines of `ranks` rows each, listed engine after
+/// engine: the rows, the list and each engine's end.
+fn ranked(engines: u32, ranks: u32) -> (Vec<Candidate>, Vec<u32>, Vec<u32>) {
+    let mut rows = pool(engines * ranks);
+    for row in &mut rows {
+        row.dp_rank = (row.position % ranks) as u16;
+        row.dp_size = ranks as u16;
+    }
+    let listed = (0..engines * ranks).collect();
+    let ends = (1..=engines).map(|engine| engine * ranks).collect();
+    (rows, listed, ends)
+}
+
+/// The draw over a pool's engines steps aside: `power_of_two`, whose
+/// picker's unit is the engine and whose scorer answers row by row, with
+/// no filter, over a pool that lists its engines. Held to nothing the
+/// decision is the draw's over engines. Held to places it is the staged
+/// pass's, and no target stands outside them.
+#[test]
+fn the_draw_over_engines_steps_aside_for_a_request_held_to_places() {
+    let engine = stock("power_of_two", true);
+    let (rows, listed, ends) = ranked(6, 4);
+    let pool = PoolFacts {
+        engines: Engines::new(0, &listed, &ends),
+        ..of(&rows)
+    };
+    let places = [1, 13];
+    for seed in 0..32 {
+        let mut scratch = Scratch::new();
+        let free = Constraints::default();
+        let drawn = engine.decide(&facts(seed), &pool, &rows, &free, &mut scratch);
+        assert!(drawn.pick().is_some());
+        assert_eq!(by_the_pass(&drawn), None, "the draw over engines decides");
+        let cx = stating(&places);
+        let decision = engine.decide(&facts(seed), &pool, &rows, &cx, &mut scratch);
+        assert_eq!(by_the_pass(&decision), Some(2), "seed {seed}");
+        let named = named(&decision);
+        assert!(
+            named.iter().all(|place| places.contains(place)),
+            "{named:?}"
+        );
+    }
+}
+
+/// A scorer's own walk steps aside: the ring alone under `best`, with no
+/// filter, over a pool that lists its engines, for a keyed request. Held
+/// to nothing the walk decides. Held to every place but its key's owner,
+/// the pass decides, and the request is handed the members the walk names
+/// behind the owner, in the walk's order.
+#[test]
+fn a_scorers_own_walk_steps_aside_for_a_request_held_to_places() {
+    let profile = bare(
+        "ring",
+        vec![Box::new(ConsistentHash::new(None))],
+        Box::new(Best),
+    );
+    let engine = Engine::new(vec![profile], vec![single(None)], 1, Needs::default());
+    let (rows, listed, ends) = ranked(8, 2);
+    let pool = PoolFacts {
+        membership_epoch: 1,
+        engines: Engines::new(0, &listed, &ends),
+        ..of(&rows)
+    };
+    for key in 1..=24 {
+        let request = RequestFacts {
+            session_key: Identity::hashed(key),
+            ..facts(key)
+        };
+        let mut scratch = Scratch::new();
+        let free = Constraints::default();
+        let walked = engine.decide(&request, &pool, &rows, &free, &mut scratch);
+        assert_eq!(by_the_pass(&walked), None, "key {key}: the walk decides");
+        let whole = named(&walked);
+        assert_eq!(whole.len(), MAX_TARGETS, "key {key}");
+        let others: Vec<u32> = (0..rows.len() as u32)
+            .filter(|&place| place != whole[0])
+            .collect();
+        let cx = stating(&others);
+        let decision = engine.decide(&request, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(
+            by_the_pass(&decision),
+            Some(others.len() as u32),
+            "key {key}"
+        );
+        let part = named(&decision);
+        assert_eq!(part.len(), MAX_TARGETS, "key {key}");
+        assert_eq!(part[..MAX_TARGETS - 1], whole[1..], "key {key}");
+    }
+}
+
+/// A shadow is held to the places of its live decision: both profiles list
+/// no filter, and neither is handed a row outside them.
+#[test]
+fn a_shadow_is_held_to_the_places_of_its_live_decision() {
+    let profiles = vec![
+        bare("live", vec![], Box::new(Random)),
+        bare(
+            "beside",
+            vec![Box::new(LeastRequests)],
+            Box::new(PowerOfTwo),
+        ),
+    ];
+    let engine = Engine::new(profiles, vec![single(Some(1))], 1, Needs::default());
+    let places = [3, 40];
+    let rows = pool(4 * DRAW_FROM as u32);
+    for seed in 0..32 {
+        let (cx, mut scratch) = (stating(&places), Scratch::new());
+        let live = engine.decide_keeping(&facts(seed), &of(&rows), &rows, &cx, &mut scratch);
+        let beside = engine
+            .shadow(&facts(seed), &of(&rows), &rows, &cx, &mut scratch)
+            .expect("the binding's shadow");
+        for decision in [&live, &beside] {
+            let named = named(decision);
+            assert!(!named.is_empty(), "seed {seed}");
+            assert!(
+                named.iter().all(|place| places.contains(place)),
+                "{named:?}"
+            );
+        }
+    }
+}
+
+/// A profile that reads who holds the prompt, over a pool above the draw's
+/// floor, for a request whose record names a holder outside its places.
+/// Held to nothing, the holder leads. Held to places, the draw that joins
+/// the named rows steps aside and the holder is not handed.
+#[test]
+fn a_holder_named_outside_the_places_is_not_handed() {
+    let engine = stock("cache_aware", false);
+    let rows = pool(4 * DRAW_FROM as u32);
+    let places = [2, 5];
+    let hashes = [0_u64; 16];
+    let holders = [AffinityHolder {
+        row: 40,
+        overlap_blocks: 16,
+        predicted_blocks: 0,
+    }];
+    for seed in 0..24 {
+        let request = RequestFacts {
+            block_hashes: &hashes,
+            prompt_tokens: 256,
+            named: Some(AffinityRows {
+                holders: &holders,
+                warming: &[],
+                thin: false,
+                mean_in_flight: None,
+            }),
+            ..facts(seed)
+        };
+        let mut scratch = Scratch::new();
+        let free = Constraints::default();
+        let led = engine.decide(&request, &of(&rows), &rows, &free, &mut scratch);
+        assert_eq!(
+            named(&led).first(),
+            Some(&40),
+            "seed {seed}: the holder leads"
+        );
+        let cx = stating(&places);
+        let decision = engine.decide(&request, &of(&rows), &rows, &cx, &mut scratch);
+        let named = named(&decision);
+        assert!(!named.is_empty(), "seed {seed}");
+        assert!(
+            named.iter().all(|place| places.contains(place)),
+            "seed {seed}: {named:?}"
+        );
     }
 }
 

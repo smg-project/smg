@@ -8,23 +8,26 @@
 //! request can be sent to. So the rule is the engine's own, whatever a
 //! profile lists, and no health bit of a record says a narrowing.
 //!
-//! Two ways a decision opens a set hold the rule:
+//! Every way a decision opens a set but the keyed one holds the rule, in one
+//! of two forms:
 //!
 //! - **The filter half opens with the places** ([`open`]). Every staged
 //!   pass of a single request goes through it: the whole pass's stages,
 //!   the sessions rule and the placing assignment, the walk under a lifted
 //!   veto, each pass of the all-vetoed rule and the ranks. So the rule for
 //!   a pool whose every worker is vetoed steers among the places.
-//! - **The one pass that asks a profile's filters as one test of a row
-//!   steps aside** ([`stated`]): it says nothing of such a request, and the
-//!   staged pass decides.
+//! - **What opens a set of its own steps aside** ([`stated`]): the one pass
+//!   that asks a profile's filters as one test of a row, the draw, the
+//!   draw over a pool's engines and a scorer's own walk over them. Each
+//!   says nothing of such a request, inside itself, and the staged pass
+//!   decides, as it does under the draw's floor and behind a draw that
+//!   keeps nobody.
 //!
-//! Not held to the places yet: a draw (over a pool's rows, over its
-//! engines, a scorer's own walk over them), a row read by its place in
-//! the keyed decision (a key's pin, the members of a ring's walk), and the
-//! pick of a plain request, which reads no constraint. So a request that
-//! states places is not plain, and until each of the others asks, the
-//! engine over worker lists declines it by name.
+//! Not held to the places yet: a row read by its place in the keyed
+//! decision (a key's pin, the members of a ring's walk), and the pick of a
+//! plain request, which reads no constraint. So a request that states
+//! places is not plain, and until the keyed reads ask, the engine over
+//! worker lists declines it by name.
 //!
 //! The places are those of the one list a single request is decided over,
 //! and one set of places cannot hold a pair's two lists. A prefill side, a
