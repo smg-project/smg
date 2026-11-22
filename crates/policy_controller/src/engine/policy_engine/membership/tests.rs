@@ -180,20 +180,20 @@ fn drain(engine: &PolicyEngine, follow: &mut Follow) {
 
 /// The registry's word of a registration of `worker` under its id
 /// `object`, as the engine's task hears it.
-fn registered(object: &ObjectId, worker: &Arc<dyn Worker>) -> Result<WorkerEvent, RecvError> {
-    Ok(WorkerEvent::Registered {
+fn registered(object: &ObjectId, worker: &Arc<dyn Worker>) -> WorkerEvent {
+    WorkerEvent::Registered {
         worker_id: object.clone(),
         worker: Arc::clone(worker),
-    })
+    }
 }
 
 /// The registry's word of the removal of `worker`, which it knew as
 /// `object`.
-fn removed(object: &ObjectId, worker: &Arc<dyn Worker>) -> Result<WorkerEvent, RecvError> {
-    Ok(WorkerEvent::Removed {
+fn removed(object: &ObjectId, worker: &Arc<dyn Worker>) -> WorkerEvent {
+    WorkerEvent::Removed {
         worker_id: object.clone(),
         worker: Arc::clone(worker),
-    })
+    }
 }
 
 /// `registry` as a host hands it to the engine.
@@ -436,16 +436,16 @@ fn a_registration_heard_ahead_of_the_removal_it_follows_is_the_ids_next_life() {
     let (first, next) = (ObjectId::new(), ObjectId::new());
     let (earlier, later) = (ready_worker(&url(0), MODEL), ready_worker(&url(0), MODEL));
 
-    assert!(engine.tells(&mut follow, registered(&first, &earlier)));
+    assert!(engine.tells(&mut follow, Ok(registered(&first, &earlier))));
     assert_eq!(told(&heard), [("joined", id(0))]);
 
-    assert!(engine.tells(&mut follow, registered(&next, &later)));
+    assert!(engine.tells(&mut follow, Ok(registered(&next, &later))));
     assert_eq!(told(&heard), [("left", id(0)), ("joined", id(0))]);
 
-    assert!(engine.tells(&mut follow, removed(&first, &earlier)));
+    assert!(engine.tells(&mut follow, Ok(removed(&first, &earlier))));
     assert_eq!(told(&heard), [], "the id's next life stands");
 
-    assert!(engine.tells(&mut follow, removed(&next, &later)));
+    assert!(engine.tells(&mut follow, Ok(removed(&next, &later))));
     assert_eq!(told(&heard), [("left", id(0))]);
     assert_eq!(held(&follow), []);
 }
@@ -464,19 +464,19 @@ fn a_registry_id_registered_again_ahead_of_its_removal_is_the_workers_next_life(
     let object = ObjectId::new();
     let (earlier, later) = (ready_worker(&url(0), MODEL), ready_worker(&url(0), MODEL));
 
-    assert!(engine.tells(&mut follow, registered(&object, &earlier)));
+    assert!(engine.tells(&mut follow, Ok(registered(&object, &earlier))));
     assert_eq!(told(&heard), [("joined", id(0))]);
 
-    assert!(engine.tells(&mut follow, registered(&object, &later)));
+    assert!(engine.tells(&mut follow, Ok(registered(&object, &later))));
     assert_eq!(told(&heard), [("left", id(0)), ("joined", id(0))]);
-    assert!(engine.tells(&mut follow, registered(&object, &later)));
+    assert!(engine.tells(&mut follow, Ok(registered(&object, &later))));
     assert_eq!(told(&heard), [], "the object held, said again");
 
-    assert!(engine.tells(&mut follow, removed(&object, &earlier)));
+    assert!(engine.tells(&mut follow, Ok(removed(&object, &earlier))));
     assert_eq!(told(&heard), [], "the removal of the earlier life");
     assert_eq!(held(&follow), [id(0)]);
 
-    assert!(engine.tells(&mut follow, removed(&object, &later)));
+    assert!(engine.tells(&mut follow, Ok(removed(&object, &later))));
     assert_eq!(told(&heard), [("left", id(0))]);
     assert_eq!(held(&follow), []);
 }
