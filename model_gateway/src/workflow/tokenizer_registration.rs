@@ -565,7 +565,10 @@ async fn fetch_tokenizer_from_worker(
 
     // A failed job keeps this error, so it names the first failure alone: a
     // fleet that cannot serve the tokenizer would name every worker in each.
+    // For the same reason a fetch warns of its first bundle that fails to
+    // load, not of each.
     let mut first_failure: Option<String> = None;
+    let mut load_warned = false;
     let mut keep_first = |failure: String| {
         if first_failure.is_none() {
             first_failure = Some(failure);
@@ -600,11 +603,11 @@ async fn fetch_tokenizer_from_worker(
         ) {
             Ok(tokenizer) => return Ok(tokenizer),
             Err(e) => {
-                let failure = format!(
-                    "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
-                    worker.redacted_url(),
-                );
-                warn!("Tokenizer fetch for model '{model_id}': {failure}");
+                let failure = format!("worker {} (runtime: {runtime}) {e}", worker.redacted_url());
+                if !load_warned {
+                    load_warned = true;
+                    warn!("Tokenizer fetch for model '{model_id}': {failure}");
+                }
                 keep_first(failure);
             }
         };
