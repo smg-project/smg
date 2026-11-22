@@ -1010,6 +1010,7 @@ pub struct Placement<'a> {               // built, see part 3
     pub decode: Option<Arc<dyn Worker>>, // a pair's decode worker
     pub routing_key: Option<&'a str>,    // the key the document derived, for the in-flight counters
     pub profile: &'static str,           // the label of the profile that picked, for the host's own counts
+    pub decode_profile: Option<&'static str>, // a pair's decode side's profile, by its label
     // private: the lease, when a stage of the document wants events
 }
 
@@ -1066,6 +1067,28 @@ impl Placement<'_> {
 Where the document's stages want no events, a single request's placement holds nothing and
 these calls do nothing. A pair's placement always holds a lease (section 6). `place` answers
 a single request and a pair with a placement, and no host makes one itself.
+
+A host that keeps a value with each send, as a gateway keeps a worker's load guard, takes a
+kept placement apart into its sides. A side says its dispatch by one call and its end at its
+drop, with no outcome:
+
+```rust
+// tracking/placement_side.rs, behind the feature `in-process`
+impl Placement<'static> {
+    // a single request's one side; a pair's prefill and its decode
+    pub fn sides(self) -> (PlacementSide, Option<PlacementSide>);
+}
+impl PlacementSide {
+    pub fn sent(&mut self); // this side of the request went out
+    pub fn profile(&self) -> &'static str; // the label of the profile that picked this side
+    // dropped: a release where the side never went out, an end of class cancelled where it did
+}
+```
+
+A pair's two sides share the pair's one placement behind a lock of that one request. The
+crate keeps the order of a pair's words itself: a prefill side dropped while the decode still
+stands chosen holds its end back until the decode side speaks, and says it then with the
+instant of its own drop.
 
 Nothing else is asked of a host that makes this call. In particular it never names a policy,
 never looks inside a decision, never keeps a lease and never runs a timer for the engine.

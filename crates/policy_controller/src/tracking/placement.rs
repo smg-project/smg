@@ -24,6 +24,11 @@
 //! guard says there: a release before the side went out, an end of class
 //! cancelled after it. Its host states no reason.
 //!
+//! **Its sides.** A host that keeps a value with each send, as a gateway
+//! keeps a worker's load guard, takes a kept placement apart
+//! ([`Placement::sides`]): each side then says its own dispatch, and its
+//! end at its drop.
+//!
 //! **The ids.** A placement keeps no id of its own. Under a lease it
 //! answers the ids of the target its guard holds, and so follows a target
 //! taken later. With no lease it takes a worker's id from the worker when
@@ -69,10 +74,16 @@ pub struct Placement<'a> {
     /// decided, whatever document is in force later. The empty label for a
     /// decision made ahead of every profile.
     pub profile: &'static str,
+    /// The label of the profile that picks a pair's decode side: the
+    /// binding's decode profile, and its one profile where it names no
+    /// other. What a host counts the decode side under. `None` for a single
+    /// request. Neither constructor reads one: the call that places a pair
+    /// writes it, under the document it decided with.
+    pub decode_profile: Option<&'static str>,
     /// The pick's lease: a pair's always, a single request's where a stage
     /// of the document takes a word of a request. `None` for an answer of
     /// which nothing is owed.
-    held: Option<DecisionGuard<&'static PolicyEngine>>,
+    pub(super) held: Option<DecisionGuard<&'static PolicyEngine>>,
 }
 
 impl Placement<'_> {
@@ -90,6 +101,7 @@ impl Placement<'_> {
             decode: None,
             routing_key: None,
             profile,
+            decode_profile: None,
             held: None,
         }
     }
@@ -145,6 +157,7 @@ impl Placement<'_> {
             decode,
             routing_key: None,
             profile,
+            decode_profile: None,
             held,
         })
     }
@@ -160,6 +173,7 @@ impl Placement<'_> {
             decode: self.decode,
             routing_key: None,
             profile: self.profile,
+            decode_profile: self.decode_profile,
             held: self.held,
         }
     }

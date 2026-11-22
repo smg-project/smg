@@ -680,6 +680,29 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         self.decode = self.release(self.decode, reason, now);
     }
 
+    /// Gives up the prefill side alone, a single's one side, as
+    /// [`Self::released_decode`] gives up the decode's. A sent prefill
+    /// completes as cancelled on the worker it was sent to, with the span
+    /// from its dispatch to `now`. An issued prefill is released by name
+    /// under `reason`. A decode that still stands chosen leaves with it,
+    /// as it leaves with the prefill's end ([`Self::completed`]).
+    #[cfg(feature = "in-process")]
+    pub(crate) fn released_prefill(&mut self, reason: ReleaseReason, now: Instant) {
+        self.owed = self.release(self.owed, reason, now);
+        if self.decode_chosen() {
+            self.decode = Owed::Nothing;
+        }
+    }
+
+    /// Whether the prefill's end would take the pair's decode with it: the
+    /// prefill went out, and the decode still stands chosen
+    /// ([`Self::decode_chosen`]).
+    #[cfg(feature = "in-process")]
+    #[must_use]
+    pub(crate) fn end_takes_decode(&self) -> bool {
+        matches!(self.owed, Owed::Completion { .. }) && self.decode_chosen()
+    }
+
     fn release(&self, owed: Owed, reason: ReleaseReason, now: Instant) -> Owed {
         match owed {
             Owed::Nothing | Owed::Later { .. } => {}
@@ -955,9 +978,10 @@ mod tests {
         assert_eq!(size_of::<DecisionGuard<Arc<StoreBackedEngine>>>(), HELD);
         assert_eq!(size_of::<DecisionGuard<&StoreBackedEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
-        // two worker pointers, the routing key and the profile's label.
+        // two worker pointers, the routing key, the profile's label and the
+        // label of a pair's decode side.
         #[cfg(feature = "in-process")]
-        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 64);
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 80);
     }
 
     /// A request that is served: its lease is booked at the issue, moves
