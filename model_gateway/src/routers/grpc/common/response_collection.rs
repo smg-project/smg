@@ -146,8 +146,9 @@ async fn collect_prefill_decode(
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     // The side's worker, when its stream is tracked (the parallel dispatch
     // books the side on it and leaves the side's breaker sample to its reader):
-    // a failure met here is the worker's, sampled on its breaker and counted
-    // once, as a streamed answer's reader does it.
+    // a failure met here is the worker's, counted once; its breaker sample is
+    // the dispatch loop's to take through the request's ledger, so a replayed
+    // request charges the worker once.
     let prefill_worker = prefill.worker().cloned();
     let mut prefill_responses = Vec::new();
     let prefill_cached_tokens = drain_prefill(&mut prefill, prefill_guards, false, |complete| {
@@ -155,13 +156,14 @@ async fn collect_prefill_decode(
     })
     .await
     .map_err(|status| {
+        let mut failure = stream_failed(Some(PdSide::Prefill), "Prefill", &status, None);
         if let Some(worker) = &prefill_worker {
             if let Some(sample) = UpstreamClass::of(&status).breaker_sample {
-                worker.record_outcome(sample);
+                mark_pending_charge(&mut failure, worker, sample);
             }
             UpstreamClass::account_collected_failure(worker.as_ref(), &status);
         }
-        stream_failed(Some(PdSide::Prefill), "Prefill", &status, None)
+        failure
     })?;
 
     // The client's prompt-side usage is the prefill side's.
@@ -347,6 +349,7 @@ mod tests {
     use axum::http::StatusCode;
     use smg_grpc_client::{sglang_proto as sglang, RequestDeadline};
     use smg_worker::{
+        health::circuit_breaker::CircuitBreakerConfig,
         identity::basic::{ConnectionMode, WorkerType},
         test_support::RefusedAddress,
     };
@@ -354,10 +357,11 @@ mod tests {
 
     use super::*;
     use crate::routers::{
-        common::retry::is_retryable_response,
+        common::{attempt_ledger::AttemptLedger, retry::is_retryable_response},
         grpc::{
             backend_client::BasicWorkerBuilder,
-            proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+            proto_wrapper::{FanoutStream, ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+            regular::streaming::tests::eof::scripted_stream,
         },
     };
 
@@ -811,6 +815,51 @@ mod tests {
                 .unwrap_or_else(|| panic!("{error_type} is counted:\n{rendered}"));
             assert!(line.ends_with(count), "{line}");
         }
+    }
+
+    /// Two attempts of one request each lose the prefill side's stream while
+    /// it is drained: the failures are that request's one word on the prefill
+    /// worker, so a breaker set to two stays closed.
+    #[tokio::test]
+    async fn the_prefill_streams_one_request_loses_charge_one_breaker_failure() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30001")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let ledger = AttemptLedger::default();
+        for _attempt in 0..2 {
+            // The stream opens and ends UNAVAILABLE before any response.
+            let (stream, _server) = scripted_stream(Vec::new(), "14").await;
+            let Err(failure) = collect_prefill_decode(
+                stream.tracked_prefill_side_booked(Arc::clone(&prefill), None),
+                ProtoStream::Fanout(FanoutStream::new(Vec::new())),
+                vec![None],
+                false,
+            )
+            .await
+            else {
+                panic!("the prefill stream failed");
+            };
+            // The dispatch loop charges an attempt's failure before its retry.
+            ledger.charge_pending(&failure);
+        }
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "one request charges the prefill worker once, however many attempts lost its stream"
+        );
+        // ...and it did charge it: the next request's failure is the second
+        // one the breaker counts, and opens it.
+        AttemptLedger::default().record_outcome(prefill.as_ref(), 503);
+        assert!(
+            !prefill.circuit_breaker_can_execute(),
+            "the request's one charge reached the prefill worker's breaker"
+        );
     }
 
     #[tokio::test]
