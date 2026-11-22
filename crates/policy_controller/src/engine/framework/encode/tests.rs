@@ -14,7 +14,7 @@ use crate::{
     engine::{
         framework::{self, PairTable},
         view::{Health, MediaCounts, Role, WorkerId},
-        Pick,
+        LiftedVeto, Pick,
     },
     load::signals::{SignalCell, SignalCells, SignalColumn},
     tracking::in_flight::tests::Lent,
@@ -405,7 +405,7 @@ fn overloaded(row: Candidate) -> Candidate {
 
 /// Encoders the overload veto left none of are a saturated fleet: the shed
 /// names the veto's stage and its reason is saturation, as a pair's side
-/// sheds its own rows. A stage ahead of the veto that leaves none is a
+/// sheds if its binding sheds. A stage ahead of the veto that leaves none is a
 /// missing endpoint as before, and so is one behind it that refuses an
 /// encoder the veto kept. An encoder that does not take the request is not
 /// counted, and under a veto its host lifted the encoders serve.
@@ -426,10 +426,13 @@ fn encoders_the_veto_left_none_of_shed_as_saturation() {
     // The veto is a stage of the encode profile, and the trace says so.
     assert_eq!(shed.trace().made_under(), encode_profile(&stock));
     assert!(shed.trace().made_under().is_some());
-    // A pair's side says the same of its own rows.
+    // A pair's decode side says the same of its own rows under a binding
+    // that sheds. One that steers picks among them.
+    let mut shedding = engine();
+    shedding.shed_when_all_vetoed(0);
     let mut side = Bed::new();
     side.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
-    assert_eq!(shed_of(&side.pair(&stock)), saturated);
+    assert_eq!(shed_of(&side.pair(&shedding)), saturated);
     // The host lifted the veto on the encode side: the item is placed.
     let (facts, _) = bed.asked();
     let cx = Constraints::default();
@@ -552,7 +555,7 @@ fn the_pairs_own_answers_read_the_same_through_both_entries() {
         shed.pair(&engine)
     );
     assert!(
-        matches!(vetoed.pair(&engine), Decision::Shed(shed) if shed.reason == ShedReason::Saturated),
+        matches!(vetoed.pair(&engine), Decision::Pick(pick) if pick.trace.lifted == LiftedVeto::Overload),
         "{:?}",
         vetoed.pair(&engine)
     );

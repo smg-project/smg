@@ -1900,8 +1900,8 @@ fn single_survivors(
 /// left the rows it kept in `buf.kept` ([`vetoed::steered`]). Every path of
 /// the plan ends here when a stage leaves nobody, a plain request
 /// ([`run_single`]) and the two a sessions rule or an assignment places
-/// ([`single_survivors`]): what the plan asks of an emptied pool has this
-/// one home.
+/// ([`single_survivors`]), and so does a side of a pair ([`run_side`]):
+/// what a plan asks of an emptied pool has this one home.
 ///
 /// Cold and out of line, its arguments in the order the shed takes them: a
 /// pass that keeps a row sets up nothing for this call.
@@ -2167,8 +2167,10 @@ impl<'a> Set<'a> {
 
     /// One side of a pair: `candidates` narrowed by the classes a chosen
     /// prefill pairs with or by the partnered list. A side is put to no rule
-    /// ([`AllVetoed::Unasked`]): the pair plan does not enter the all-vetoed
-    /// rule, and a pool a veto empties there is shed.
+    /// ([`AllVetoed::Unasked`]) until its caller says its binding's word
+    /// ([`Self::ruled`]), as a live decode side does. A prefill side says
+    /// none, nor does a pass that only names a shed's stage, a shadow's run
+    /// or an encode item's: a pool a veto empties there is shed.
     const fn side(
         candidates: &'a [Candidate],
         class: Option<&'a [u32]>,
@@ -2194,6 +2196,14 @@ impl<'a> Set<'a> {
             vetoed: AllVetoed::Unasked,
             ..self
         }
+    }
+
+    /// The same rows put to their binding's all-vetoed rule by its word
+    /// (`vetoed`): a pair's live decode side. Where a soft veto leaves such
+    /// a side nobody, the rule steers it or sheds it as it does the single
+    /// plan's pool ([`vetoed::emptied`]), over the side's own rows.
+    const fn ruled(self, vetoed: AllVetoed) -> Self {
+        Self { vetoed, ..self }
     }
 }
 
@@ -2247,6 +2257,10 @@ fn score_survivors(
 /// One profile over one side of a pair: the filter half of its run, then
 /// the scoring half. The pair plans run their sides through here; the single
 /// plan runs the same two halves from its own opening ([`run_single`]).
+/// A side its filters emptied ends where the single plan's pool does
+/// ([`single_emptied`]): in the all-vetoed rule's pick where the side's set
+/// carries its binding's word ([`Set::ruled`]) and the rule kept rows, else
+/// in the shed that names the stage.
 fn run_profile(
     profile: &Profile,
     index: u16,
@@ -2281,11 +2295,7 @@ fn run_side(
 ) -> Decision {
     let candidates = set.candidates;
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        return shed(
-            reason_of(emptied_by),
-            emptied_by,
-            trace_of(index, facts, pool, candidates, &[], &[]),
-        );
+        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
@@ -4849,8 +4859,15 @@ impl Engine {
     /// of a pair decision run under it ([`Self::decide_pair`]), whatever
     /// binding covers the decode phase first.
     fn pair_binding(&self, model: &str) -> Option<&Binding> {
-        self.binding(model, Phase::Prefill)
-            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
+        self.pair_entry(model).map(|entry| &entry.binding)
+    }
+
+    /// [`Self::pair_binding`] as the engine holds it: the binding beside
+    /// its word for a pool a soft veto empties, which both sides of its
+    /// pairs are put to the all-vetoed rule by.
+    fn pair_entry(&self, model: &str) -> Option<&Entry> {
+        self.entry(model, Phase::Prefill)
+            .filter(|entry| matches!(entry.binding.plan, Plan::PdPair | Plan::Epd { .. }))
     }
 
     /// The binding a `phase` pool of `model` is decided under, whose
@@ -6427,6 +6444,17 @@ impl Engine {
     /// side's rows ([`Constraints::stalled`]) is declined under the stage
     /// name `written-rows` before either scope opens, as [`Self::decide`]
     /// declines it. A pair side carries no pin.
+    ///
+    /// The decode side is put to its binding's all-vetoed rule for the
+    /// overload veto, as the pool of a single request is ([`Self::decide`]).
+    /// Where no decode is open and some are over their thresholds alone, the
+    /// rule says once which decodes it keeps. A prefill is chosen for them
+    /// by its own profile, its partners go to the one of them that holds the
+    /// fewest requests, and the pair's trace says the lifted veto
+    /// ([`LiftedVeto::Overload`]). Under a binding that sheds, such a pool is
+    /// shed as saturated. A decode pool the liveness veto refuses stays
+    /// refused here, and so does a prefill pool refused whole: the prefill
+    /// side is put to no rule.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -6457,9 +6485,12 @@ impl Engine {
         // One binding for both sides: the prefill's lookup, whose decode
         // profile is the pair's decode side. A binding of the single plan
         // declines a pair decision: the host and the spec disagree.
-        let Some(binding) = self.pair_binding(facts.model) else {
+        let Some(entry) = self.pair_entry(facts.model) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
+        // The binding's word for a pool a soft veto empties: the live
+        // decode side is put to the all-vetoed rule by it ([`Set::ruled`]).
+        let (binding, vetoed) = (&entry.binding, entry.vetoed);
         let decode_index = binding.decode_profile.unwrap_or(binding.profile);
         let (Some(prefill_profile), Some(decode_profile)) = (
             self.profiles.get(usize::from(binding.profile)),
@@ -6519,6 +6550,24 @@ impl Engine {
         pools
             .table
             .partnered(open, &mut scratch.classes, &mut scratch.marks);
+        // No prefill class has an open decode. The decode pool is put to
+        // the binding's all-vetoed rule once: where the overload veto alone
+        // left it nobody, the decodes the rule keeps are the open ones. The
+        // decode run of the chosen prefill then meets its partners emptied
+        // the same way, and the rule picks among them. Decodes the rule
+        // keeps past a doubt open no prefill: that pool stays refused.
+        if scratch.classes.is_empty() {
+            let whole = Set::side(decodes, None, None).ruled(vetoed);
+            let buf = &mut scratch.decode;
+            let emptied = filter(decode_profile, &decode_facts, decode_cx, buf, whole);
+            let lifted = !buf.kept.is_empty() && buf.lifted == LiftedVeto::Overload;
+            if emptied.is_some() && lifted {
+                let steered = buf.kept.iter().map(|&row| decodes[row as usize].pair_class);
+                pools
+                    .table
+                    .partnered(steered, &mut scratch.classes, &mut scratch.marks);
+            }
+        }
         let prefill = run_profile(
             prefill_profile,
             binding.profile,
@@ -6610,7 +6659,7 @@ impl Engine {
                 decode_index,
                 &decode_facts,
                 pool,
-                Set::side(decodes, Some(pools.table.of(&class)), None),
+                Set::side(decodes, Some(pools.table.of(&class)), None).ruled(vetoed),
                 decode_cx,
                 &mut scratch.decode,
             );
@@ -6628,7 +6677,11 @@ impl Engine {
                         session_verdict,
                     } = paired;
                     targets.pair_under(prefill_target);
+                    // The pair's trace is the prefill's, with the mark of
+                    // the veto the rule lifted for the decode side.
+                    let lifted = trace.lifted;
                     *trace = prefill_pick.trace;
+                    trace.lifted = lifted;
                     *session_verdict = SessionVerdict::None;
                     return decision;
                 }
@@ -6674,7 +6727,11 @@ impl Engine {
     /// `None` where the binding names no shadow for the side, where the
     /// build did not find that profile free to run beside the live one
     /// ([`side_shadows`]), and where it would be handed another column
-    /// than the live side's pool carries ([`Self::side_apart`]).
+    /// than the live side's pool carries ([`Self::side_apart`]). `None`
+    /// too for the decode's shadow beside a pair the binding's all-vetoed
+    /// rule placed, which `live`'s trace says: that shadow's run is put to
+    /// no rule, and would shed the partners its live side was steered
+    /// among.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's entry and its inputs, beside the side and the live pick"
@@ -6717,6 +6774,9 @@ impl Engine {
                 )
             }
             PairSide::Decode => {
+                if live.trace.lifted != LiftedVeto::None {
+                    return None;
+                }
                 // The partners of the live pair's prefill.
                 let prefill = live.targets.first()?;
                 let class = prefills.get(prefill.position as usize)?.pair_class;
@@ -6742,7 +6802,9 @@ impl Engine {
     /// nothing a commit reads.
     ///
     /// `None` where [`Self::shadow_side`] says none for the decode side,
-    /// and where the held prefill left the rows.
+    /// and where the held prefill left the rows. The same beside a decode
+    /// the binding's all-vetoed rule placed, which the trace of `live`,
+    /// that call's pick, says.
     #[expect(
         clippy::too_many_arguments,
         reason = "the decode entry and its inputs, beside the binding"
@@ -6754,12 +6816,13 @@ impl Engine {
         pool: &PoolFacts<'_>,
         pools: PairPools<'_>,
         prefill: WorkerId,
+        live: &Pick,
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Option<Decision> {
         let side = PairSide::Decode;
         let index = self.shadow_sides.get(at as usize)?[side.index()]?;
-        if self.side_apart(at, side) {
+        if self.side_apart(at, side) || live.trace.lifted != LiftedVeto::None {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
@@ -6783,7 +6846,12 @@ impl Engine {
     /// Each picked target names the held prefill and one of those decodes.
     /// A missing prefill is shed under `prefill-gone`. A shed made once the
     /// decode profile resolves names that profile. `pool` holds the facts
-    /// of the decode pool, where the profile places.
+    /// of the decode pool, where the profile places. Partners that are all
+    /// over their thresholds, or doubted, are put to the binding's all-vetoed
+    /// rule, both its tiers: the rule picks afresh among them, whatever
+    /// decode the first decision named. A pair's first decision lifts the
+    /// overload veto alone ([`Self::decide_pair`]). Here the prefill has
+    /// run, and a refusal fails its request.
     ///
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode
@@ -6820,9 +6888,10 @@ impl Engine {
         let Some((decodes, mut decode_facts)) = pools.side(PairSide::Decode, facts) else {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         };
-        let Some(binding) = self.pair_binding(facts.model) else {
+        let Some(entry) = self.pair_entry(facts.model) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
+        let binding = &entry.binding;
         let index = binding.decode_profile.unwrap_or(binding.profile);
         let Some(profile) = self.profiles.get(usize::from(index)) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
@@ -6842,12 +6911,15 @@ impl Engine {
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
         let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
+        // The held prefill's partners are put to the binding's all-vetoed
+        // rule, its liveness tier included.
+        let partners = Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None);
         let mut decision = run_side(
             profile,
             index,
             &decode_facts,
             pool,
-            Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None),
+            partners.ruled(entry.vetoed),
             decode_cx,
             &mut scratch.decode,
             first_decode.filter(|_| profile.keeps_its_pick()),
@@ -10760,12 +10832,13 @@ mod tests {
 
     #[test]
     fn a_saturated_decode_fleet_sheds_as_saturated() {
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             vec![strict_profile()],
             vec![pair_binding()],
             1,
             Needs::default(),
         );
+        engine.shed_when_all_vetoed(0);
         let mut prefills = [candidate(0, 0)];
         prefills[0].pair_class = 7;
         let mut decodes = [candidate(0, 0), candidate(1, 0)];
@@ -12745,7 +12818,10 @@ mod tests {
             Some((ShedReason::Saturated, "not-overloaded"))
         );
         // By number the routable prefill's partner is the decode of its own
-        // class, whatever the number: an overloaded one is saturation.
+        // class, whatever the number: an overloaded one is saturation under
+        // a binding that sheds.
+        let mut engine = engine;
+        engine.shed_when_all_vetoed(0);
         let prefills = classed_rows(&[100]);
         let mut decodes = classed_rows(&[100]);
         decodes[0].health.overloaded = true;
@@ -12934,7 +13010,7 @@ mod tests {
         };
         let mut later = |engine: &Engine, held: WorkerId| {
             let shadow =
-                engine.shadow_decode_later(0, &call, &pool, pools, held, &cx, &mut scratch);
+                engine.shadow_decode_later(0, &call, &pool, pools, held, pick, &cx, &mut scratch);
             shadow.map(|shadow| lead(&shadow))
         };
         assert_eq!(later(&both, prefills[0].id), Some(Some(1)));

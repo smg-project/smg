@@ -419,8 +419,7 @@ impl Engine {
     /// (`decode-vision`). With an encoder registered and none open the stage
     /// is `encoders`. Where the overload veto is the stage that left none
     /// open, the encoders are saturated: the shed names `not-overloaded` and
-    /// its reason is saturation, as a pair's side sheds its own rows. This
-    /// entry does not enter the all-vetoed rule, as the pair entry does not.
+    /// its reason is saturation. No encoder enters the all-vetoed rule here.
     ///
     /// The items are placed by the binding's encode profile over the open
     /// encoders of the chosen prefill's class that take the media, each
@@ -613,8 +612,7 @@ impl Engine {
             }
             if !any_open {
                 // Encoders the overload veto left none of are a saturated
-                // fleet, and the shed says so as a pair's side says it of
-                // its own rows.
+                // fleet, and the shed says so.
                 if let Some(stage) =
                     saturation(profile, &encode_facts, encode_cx, &encode, &items, images)
                 {
