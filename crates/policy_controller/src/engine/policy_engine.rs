@@ -926,17 +926,16 @@ mod tests {
 
     /// The places one pick decides: the picker places by itself, no stage
     /// scores, and the filters are the two tests of a worker's health.
-    /// Round robin's preset is one. No other preset is one yet, and each
-    /// names its own profile and the stage of it that asks more.
+    /// Round robin's preset is one, and passthrough's. No other preset is
+    /// one, and each names its own profile and the stage of it that asks more.
     #[test]
     fn a_place_is_picked_alone_where_its_picker_decides_by_itself() {
-        assert!(matches!(
-            preset("round_robin").place(MODEL, Phase::Single),
-            Place::Alone(_)
-        ));
+        for engine in [preset("round_robin"), preset("passthrough")] {
+            let place = engine.place(MODEL, Phase::Single);
+            assert!(matches!(place, Place::Alone(_)), "{place:?}");
+        }
         for name in [
             "random",
-            "passthrough",
             "power_of_two",
             "least_load",
             "consistent_hashing",
