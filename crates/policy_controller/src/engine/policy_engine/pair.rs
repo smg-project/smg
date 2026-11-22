@@ -380,7 +380,8 @@ pub(super) fn issue_decode(
 ///
 /// A request held to wires is its host's to hand lists for. Where a worker
 /// of either list is dialed on a wire the request does not state, the
-/// request is declined under the wires' name, as a single is.
+/// request is declined under the wires' name, ahead of every test the
+/// lists' own decision makes.
 #[inline]
 pub(super) fn decide(
     own: &PolicyEngine,
@@ -445,7 +446,7 @@ mod tests {
     use smg_worker::{
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         test_support::no_health_check,
-        worker::{WorkerSpec, WorkerStatus, WorkerType},
+        worker::{ConnectionMode, WorkerSpec, WorkerStatus, WorkerType},
     };
 
     use super::*;
@@ -1938,6 +1939,202 @@ mod tests {
         assert_eq!(leasing.words().len(), 10);
         assert_eq!(alone.engine.leases.0.load(Ordering::Relaxed), 0);
         assert!(alone.words().is_empty(), "no stage heard a word");
+    }
+
+    /// The whole decision the leasing entry answers a host's request.
+    fn leased(host: &Host, maker: &impl RequestMaker, now: Instant) -> DecideOutcome {
+        let decided = host.engine.decide_under(GatewayId::LOCAL, maker, now);
+        decided.expect("an answer").whole().expect("no place").0
+    }
+
+    /// The targets a decision names, in their order: none for a shed.
+    fn named(decision: &Decision) -> &[Target] {
+        decision.pick().map_or(&[], |pick| pick.targets.as_slice())
+    }
+
+    /// What a decision that picks nothing is shed for, and under which
+    /// stage's name.
+    fn shed_for(decision: &Decision) -> (ShedReason, &'static str) {
+        match decision {
+            Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+            other => panic!("not shed: {other:?}"),
+        }
+    }
+
+    /// The entry that issues no lease decides a pair as the leasing entry
+    /// does ([`PolicyEngine::decide_without_lease`]). Of two engines made
+    /// alike it names, call by call, the targets the other issues a lease
+    /// for, and it takes no lease id and tells no stage. The decode asked
+    /// again behind the target a first decision names
+    /// ([`PolicyEngine::decide_decode_without_lease`]) is the decode the
+    /// leasing entry answers a guard, over the lists as they stand at the
+    /// call: the decode the first decision named is not ready by then.
+    #[test]
+    fn a_pair_without_a_lease_is_decided_as_the_leasing_entry_decides_it() {
+        let (bare, leasing) = (Host::of(2, 3), Host::of(2, 3));
+        let classes = every(2, 3);
+        let now = Instant::now();
+        for call in 0..6 {
+            let asks = bare.asks(&classes, false);
+            let decision = bare.engine.decide_without_lease(&asks, now);
+            let decision = decision.expect("a decision");
+            let outcome = leased(&leasing, &leasing.asks(&classes, false), now);
+            assert!(outcome.lease.is_some(), "the leasing entry issues its pick");
+            assert!(!named(&decision).is_empty(), "call {call}: a pick");
+            assert_eq!(named(&decision), named(&outcome.decision), "call {call}");
+        }
+        // A pair whose decode is sent later, then that decode decided again
+        // behind the target each engine's first decision names.
+        let asks = bare.asks(&classes, true);
+        let first = bare.engine.decide_without_lease(&asks, now);
+        let first = first.expect("a decision");
+        let theirs = leasing.asks(&classes, true);
+        let outcome = leased(&leasing, &theirs, now);
+        assert_eq!(named(&first), named(&outcome.decision));
+        let (prefill, chosen) = bare.picked(&first);
+        for host in [&bare, &leasing] {
+            host.decodes[chosen].set_status(WorkerStatus::NotReady);
+        }
+        let (ours, target) = (target_at(&first, 0), target_at(&outcome.decision, 0));
+        let lease = outcome.lease.expect("the pair's lease").lease;
+        let held = HeldDecision {
+            decision: &outcome.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: outcome.decode_session,
+                tokens: lease.tokens,
+                chosen: true,
+            },
+        };
+        let call = now + Duration::from_millis(1);
+        let again = bare.engine.decide_decode_without_lease(&asks, &ours, call);
+        let again = again.expect("a decision");
+        let issued = leasing
+            .engine
+            .decide_decode_under(GatewayId::LOCAL, &theirs, &held, call);
+        let issued = issued.expect("a decision");
+        assert!(
+            issued.lease.is_some(),
+            "the leasing entry issues the decode"
+        );
+        assert_eq!(named(&again), named(&issued.decision));
+        let (kept, decode) = bare.picked(&again);
+        assert_eq!(kept, prefill, "the held prefill");
+        assert_ne!(decode, chosen, "a decode that is ready at the call");
+        // The leasing entry took an id a pair and told each side's issue.
+        // The other took none and told nobody.
+        assert_eq!(leasing.engine.leases.0.load(Ordering::Relaxed), 7);
+        assert_eq!(leasing.words().len(), 14);
+        assert_eq!(bare.engine.leases.0.load(Ordering::Relaxed), 0);
+        assert!(bare.words().is_empty(), "no stage heard a word");
+    }
+
+    /// The entry that issues no lease keeps the test of a request's wires
+    /// that a pair's decision makes ([`decide`]), at the pair's first
+    /// decision and at its decode's behind a held target. The prefills
+    /// here are dialed on one wire and the decodes on another. A request
+    /// that states one of the two is declined under the wires' name: a
+    /// worker of the other list is dialed on a wire it does not state. A
+    /// request that states both is decided, and so is one that states a
+    /// third beside them and one that states none. The leasing entry
+    /// answers each request alike.
+    #[test]
+    fn a_pair_without_a_lease_keeps_the_test_of_its_wires() {
+        let dialed = |name: &str, worker_type, mode| -> Arc<[Arc<dyn Worker>]> {
+            let spec = |at: usize| WorkerSpec {
+                worker_type,
+                connection_mode: mode,
+                ..WorkerSpec::new(format!("http://{name}-{at}:9000"))
+            };
+            let ready = |at| {
+                let worker = <BasicWorkerBuilder>::from_spec(spec(at))
+                    .health_config(no_health_check())
+                    .build();
+                worker.set_status(WorkerStatus::Ready);
+                Arc::new(worker) as Arc<dyn Worker>
+            };
+            (0..2).map(ready).collect()
+        };
+        let host = Host::over(
+            hearing(),
+            dialed("prefill", WorkerType::Prefill, ConnectionMode::Http),
+            dialed("decode", WorkerType::Decode, ConnectionMode::Grpc),
+        );
+        let [prefills, decodes] = &host.members;
+        assert_eq!(
+            (prefills.wires(), decodes.wires()),
+            (WireModes::HTTP, WireModes::GRPC)
+        );
+        let classes = every(2, 2);
+        let now = Instant::now();
+        let stating = |wires: WireModes| {
+            let mut asks = host.asks(&classes, true);
+            asks.0.constraints.wire_modes = wires;
+            asks
+        };
+        let both = WireModes::HTTP.union(WireModes::GRPC);
+        let first = host.engine.decide_without_lease(&stating(both), now);
+        let held = target_at(&first.expect("a decision"), 0);
+        for wires in [WireModes::NONE, both, both.union(WireModes::ZMQ)] {
+            let asks = stating(wires);
+            let decision = host.engine.decide_without_lease(&asks, now);
+            let decision = decision.expect("a decision");
+            assert!(decision.pick().is_some(), "{wires:?}: {decision:?}");
+            let again = host.engine.decide_decode_without_lease(&asks, &held, now);
+            let again = again.expect("a decision");
+            assert!(again.pick().is_some(), "{wires:?} again: {again:?}");
+            assert!(leased(&host, &asks, now).decision.pick().is_some());
+        }
+        let declined = (ShedReason::PolicyDeclined, WIRES);
+        for wires in [WireModes::HTTP, WireModes::GRPC, WireModes::ZMQ] {
+            let asks = stating(wires);
+            let decision = host.engine.decide_without_lease(&asks, now);
+            assert_eq!(shed_for(&decision.expect("a decision")), declined);
+            let again = host.engine.decide_decode_without_lease(&asks, &held, now);
+            assert_eq!(shed_for(&again.expect("a decision")), declined);
+            assert_eq!(shed_for(&leased(&host, &asks, now).decision), declined);
+        }
+    }
+
+    /// A request that hands no pair's lists is decided over no worker by
+    /// the entries that issue no lease, as the leasing entries answer it: a
+    /// pair's prefill, and its decode asked again behind a held target.
+    #[test]
+    fn a_pair_without_a_lease_that_hands_no_lists_is_decided_over_no_worker() {
+        let host = Host::of(1, 1);
+        let classes = every(1, 1);
+        let now = Instant::now();
+        let asks = host.asks(&classes, true);
+        let outcome = leased(&host, &asks, now);
+        let target = target_at(&outcome.decision, 0);
+        let lease = outcome.lease.expect("the pair's lease").lease;
+        let held = HeldDecision {
+            decision: &outcome.decision,
+            lease: &lease,
+            index: 0,
+            target: &target,
+            decode: HeldDecode {
+                session: outcome.decode_session,
+                tokens: lease.tokens,
+                chosen: true,
+            },
+        };
+        // The request by itself is a maker that hands no list.
+        let alone: &Request<'_> = &asks.0;
+        let none = (ShedReason::NoEndpoints, "none");
+        let prefill = host.engine.decide_without_lease(alone, now);
+        assert_eq!(shed_for(&prefill.expect("a decision")), none);
+        assert_eq!(shed_for(&leased(&host, alone, now).decision), none);
+        let again = host.engine.decide_decode_without_lease(alone, &target, now);
+        assert_eq!(shed_for(&again.expect("a decision")), none);
+        let issued = host
+            .engine
+            .decide_decode_under(GatewayId::LOCAL, alone, &held, now);
+        let issued = issued.expect("an answer");
+        assert_eq!(shed_for(&issued.decision), none);
+        assert!(issued.lease.is_none(), "a shed issues nothing");
     }
 
     /// A guard lends its pair's session of the decode phase with the decode

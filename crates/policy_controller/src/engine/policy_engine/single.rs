@@ -1421,25 +1421,42 @@ pub(crate) mod tests {
         assert!(record.1.get().is_none(), "the record is not asked");
     }
 
-    /// A single request with no list is decided over no worker, as the one
-    /// entry decides it. A request of any phase but `Single` is refused,
-    /// a prefill too: a pair has no entry of this kind yet.
+    /// A request that hands no list of its kind is decided over no worker,
+    /// as the one entry decides it: a single with no list, a pair's prefill
+    /// with none, and a prefill over a single's list. A decode or an encode
+    /// request sent on its own is refused.
     #[test]
-    fn a_decision_without_a_lease_is_a_single_requests() {
+    fn a_decision_without_a_lease_over_no_list_names_no_worker() {
         let engine = preset("round_robin");
-        let asks = Asks::of(request(), None);
-        let none = engine.decide_without_lease(&asks, Instant::now());
-        let Ok(Decision::Shed(shed)) = none else {
-            panic!("a shed, not {none:?}");
+        let list = pool(2);
+        let members = engine.pool_members(&list);
+        let stating = |phase, members| {
+            let mut stated = request();
+            stated.facts.phase = phase;
+            Asks::of(stated, members)
         };
-        assert_eq!(
-            (shed.reason, shed.emptied_by),
-            (ShedReason::NoEndpoints, "none")
-        );
-        for phase in [Phase::Prefill, Phase::Decode, Phase::Encode] {
-            let mut side = request();
-            side.facts.phase = phase;
-            let asks = Asks::of(side, None);
+        let none = (ShedReason::NoEndpoints, "none");
+        for (phase, members) in [
+            (Phase::Single, None),
+            (Phase::Prefill, None),
+            (Phase::Prefill, Some(&members)),
+        ] {
+            let listed = members.is_some();
+            let shed = engine.decide_without_lease(&stating(phase, members), Instant::now());
+            let Ok(Decision::Shed(shed)) = shed else {
+                panic!("{phase:?}, {listed}: a shed, not {shed:?}");
+            };
+            assert_eq!((shed.reason, shed.emptied_by), none, "{phase:?}, {listed}");
+            let whole = Whole(stating(phase, members));
+            let leased = engine.decide_under(GatewayId::LOCAL, &whole, Instant::now());
+            let leased = leased.expect("an answer").whole().expect("no place").0;
+            let Decision::Shed(theirs) = leased.decision else {
+                panic!("{phase:?}, {listed}: the one entry picks");
+            };
+            assert_eq!((theirs.reason, theirs.emptied_by), none);
+        }
+        for phase in [Phase::Decode, Phase::Encode] {
+            let asks = stating(phase, None);
             let refused = engine.decide_without_lease(&asks, Instant::now());
             assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
         }
