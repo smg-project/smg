@@ -7,6 +7,7 @@ use ndarray::Array2;
 
 use super::qwen_vl_base::pixel_norm;
 use crate::{
+    buffer_pool,
     encoder_inputs::{EncoderDtype, EncoderInput, ModelSpecificValue, PixelNorm},
     types::{Modality, RgbFrameRef},
     vision::{
@@ -377,7 +378,8 @@ fn prepare<'a, F: RgbSource>(
 }
 
 /// Append resized RGB frames to `values` as merged patch rows with temporal
-/// padding. After an error `values` holds a partial append.
+/// padding; a `values` with no allocation yet takes a pooled buffer first.
+/// After an error `values` holds a partial append.
 fn encode<F: RgbSource>(
     frames: &[F],
     budget_frames: usize,
@@ -407,6 +409,9 @@ fn encode<F: RgbSource>(
         "GLM features",
     )?;
     let expected = product(&[count, features], "GLM patch output size")?;
+    if values.capacity() == 0 {
+        *values = buffer_pool::take_empty(expected);
+    }
     values
         .try_reserve_exact(expected)
         .map_err(|error| shape(format!("cannot reserve GLM patch output: {error}")))?;
@@ -678,7 +683,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
                 .checked_add(self.image_elements(image.width(), image.height())?)
                 .ok_or_else(|| shape("GLM image batch size overflow"))
         })?;
-        let mut values = Vec::new();
+        let mut values = buffer_pool::take_empty(expected);
         values
             .try_reserve_exact(expected)
             .map_err(|error| shape(format!("cannot reserve GLM image batch: {error}")))?;
@@ -1029,6 +1034,45 @@ mod tests {
             .as_f32()
             .iter()
             .any(|value| (*value - padding).abs() < 1e-5));
+    }
+
+    /// A batch's and a clip's patch buffer is the pool's: written out, it
+    /// goes back to its class, and the next run writes the same bytes into it.
+    #[test]
+    fn a_batch_and_a_clip_write_their_patches_into_a_pooled_buffer() {
+        use crate::buffer_pool::{self, BufferPool};
+
+        static BATCH: BufferPool = BufferPool::new();
+        static CLIP: BufferPool = BufferPool::new();
+        let frame = DynamicImage::ImageRgb8(RgbImage::from_fn(400, 200, |x, y| {
+            Rgb([x as u8, y as u8, (x ^ y) as u8])
+        }));
+        let frames = [frame.clone(), frame.clone()];
+        let image =
+            Glm53FlashProcessor::from_config_for(&config(MAX_IMAGE_TOKENS), Modality::Image)
+                .unwrap();
+        let video = Glm53FlashProcessor::from_config_for(&video_config(), Modality::Video).unwrap();
+        let clip = VideoClipOptions::sampled_at(2.0);
+        let bytes = |output: Result<PreprocessedEncoderInputs, TransformError>| {
+            output
+                .unwrap()
+                .encoder_input
+                .into_bytes_as(EncoderDtype::Uint8)
+                .unwrap()
+        };
+        let reused = |pool: &'static BufferPool, run: &dyn Fn() -> Vec<u8>| {
+            buffer_pool::with_pool(pool, || {
+                let first = run();
+                assert_eq!(
+                    pool.held(),
+                    buffer_pool::allocation_capacity(first.len()),
+                    "the patch buffer went back to its class"
+                );
+                assert!(run() == first, "the bytes differ on the reused buffer");
+            });
+        };
+        reused(&BATCH, &|| bytes(image.preprocess(&[&frame])));
+        reused(&CLIP, &|| bytes(video.preprocess_video(&frames, &clip)));
     }
 
     #[test]

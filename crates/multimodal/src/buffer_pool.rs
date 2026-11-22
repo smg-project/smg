@@ -142,23 +142,42 @@ impl BufferPool {
         let Some(capacity) = class_capacity(len) else {
             return vec![0u8; len];
         };
-        let index = (capacity / SMALLEST).trailing_zeros() as usize;
-        let kept = {
-            let mut idle = self.idle();
-            let kept = idle.classes[index].pop();
-            if kept.is_some() && capacity != LARGEST {
-                idle.held -= capacity;
-            }
-            kept
-        };
         // A fresh buffer is a zeroed allocation of the whole class: the pages
         // past `len` stay untouched, the ones below it are faulted in by the
         // producer's first write, once in the buffer's life.
-        let mut buf = kept.unwrap_or_else(|| vec![0u8; capacity]);
+        let mut buf = self.kept(capacity).unwrap_or_else(|| vec![0u8; capacity]);
         buf.resize(len, 0);
         #[cfg(debug_assertions)]
         buf.fill(SENTINEL);
         buf
+    }
+
+    /// An empty buffer with room for `len` bytes, for a producer that appends
+    /// them: nothing is filled here. Outside the pooled range it has no room,
+    /// and the producer's own reserve decides.
+    pub(crate) fn take_empty(&self, len: usize) -> Vec<u8> {
+        let Some(capacity) = class_capacity(len) else {
+            return Vec::new();
+        };
+        match self.kept(capacity) {
+            Some(mut buf) => {
+                buf.clear();
+                buf
+            }
+            // Empty, so nothing to zero: the producer writes what it appends.
+            None => Vec::with_capacity(capacity),
+        }
+    }
+
+    /// The idle buffer of the class of `capacity`, when it keeps one.
+    fn kept(&self, capacity: usize) -> Option<Vec<u8>> {
+        let index = (capacity / SMALLEST).trailing_zeros() as usize;
+        let mut idle = self.idle();
+        let kept = idle.classes[index].pop();
+        if kept.is_some() && capacity != LARGEST {
+            idle.held -= capacity;
+        }
+        kept
     }
 
     /// `buf` back for the next request: kept when it is a class's buffer and
@@ -204,6 +223,11 @@ impl BufferPool {
 /// [`BufferPool::take`] on the process's pool.
 pub(crate) fn take(len: usize) -> Vec<u8> {
     shared().take(len)
+}
+
+/// [`BufferPool::take_empty`] on the process's pool.
+pub(crate) fn take_empty(len: usize) -> Vec<u8> {
+    shared().take_empty(len)
 }
 
 /// A buffer back to the process's pool: kept for the next request of its
