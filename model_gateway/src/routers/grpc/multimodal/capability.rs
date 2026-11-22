@@ -12,6 +12,8 @@
 //! message; and lets assembly assert against the same matrix as defense in
 //! depth.
 
+use std::{collections::HashMap, sync::Arc};
+
 use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
@@ -20,8 +22,74 @@ use smg_worker::{
     labels::SUPPORTS_VISION_LABEL,
 };
 
-use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
+use super::{
+    encoder_budget::encoder_budget_over,
+    item_limits::{item_limits_over, EngineItemLimit},
+    plan::MediaPlan,
+    refs::worker_accepts_media_refs,
+    MultimodalIntermediate,
+};
 use crate::routers::{common::snapshot::WorkerRegistry, error};
+
+/// What the media gates read from a model's workers together, before one of
+/// them is selected. The answers depend on the membership alone: a worker
+/// holds its labels, its connection mode and its engine from its
+/// construction, and a request changes none of them. So a membership
+/// snapshot keeps them ([`ModelWorkerSnapshot::media`]), and a media request
+/// walks no worker for them, whatever the size of the fleet.
+///
+/// [`ModelWorkerSnapshot::media`]: crate::routers::common::snapshot::ModelWorkerSnapshot::media
+#[derive(Debug)]
+pub(crate) struct MediaFacts {
+    /// The smallest encoder budget a worker advertises.
+    pub(super) encoder_budget: Option<usize>,
+    /// Per modality, the smallest item limit a worker advertises.
+    pub(super) item_limits: HashMap<Modality, EngineItemLimit>,
+    /// Every worker runs without a vision encoder.
+    language_model_only: bool,
+    /// The engines of the gRPC-pipeline workers, sorted, each once.
+    pipeline_engines: Vec<RuntimeType>,
+    /// A gRPC-pipeline worker processes media references itself.
+    pipeline_takes_refs: bool,
+}
+
+/// The answers a snapshot keeps, read from its members.
+fn read_media_facts(workers: &[Arc<dyn Worker>]) -> MediaFacts {
+    let pool = || {
+        workers
+            .iter()
+            .filter(|worker| worker.connection_mode().uses_grpc_pipeline())
+    };
+    let mut pipeline_engines: Vec<RuntimeType> = pool()
+        .map(|worker| worker.metadata().spec.runtime_type)
+        .collect();
+    pipeline_engines.sort_by_key(|runtime| runtime.as_str());
+    pipeline_engines.dedup();
+    MediaFacts {
+        encoder_budget: encoder_budget_over(workers),
+        item_limits: item_limits_over(workers),
+        language_model_only: !workers.is_empty()
+            && workers
+                .iter()
+                .all(|worker| worker_language_model_only(worker.as_ref())),
+        pipeline_engines,
+        pipeline_takes_refs: pool().any(|worker| worker_accepts_media_refs(worker.as_ref())),
+    }
+}
+
+/// `read` over what the generation of `model_id` keeps for the media gates
+/// ([`MediaFacts`]). A model no worker serves reads the answers of an empty
+/// membership.
+pub(super) fn media_facts<T>(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    read: impl FnOnce(&MediaFacts) -> T,
+) -> T {
+    match registry.model_generation(model_id) {
+        Some(snapshot) => read(snapshot.media(read_media_facts)),
+        None => read(&read_media_facts(&[])),
+    }
+}
 
 /// Whether the worker's engine runs without a vision encoder (a vLLM
 /// `--language-model-only` worker), so no pixel payload may reach it. Absent
@@ -48,11 +116,7 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
 /// keeps them off the workers without the encoder ([`request_needs_vision`]
 /// is the demand) and refuses them the same way once no candidate has one.
 fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
-    let workers = registry.get_by_model(model_id);
-    !workers.is_empty()
-        && workers
-            .iter()
-            .all(|worker| worker_language_model_only(worker.as_ref()))
+    media_facts(registry, model_id, |facts| facts.language_model_only)
 }
 
 /// The modalities of `plan` that need a vision encoder: the pixel payloads
@@ -121,9 +185,13 @@ pub(crate) fn ensure_model_accepts_media(
 }
 
 /// The matrix rule of [`ensure_model_accepts_media`]: every modality of
-/// `plan` has a registered pipeline worker of `model_id` that takes it
-/// ([`worker_takes_modality`]); otherwise the refusal names the pool's
-/// engines and the modality. HTTP workers of the model sit in another
+/// `plan` has a registered pipeline worker of `model_id` that takes it;
+/// otherwise the refusal names the pool's engines and the modality. A worker
+/// takes a modality when its engine does by the matrix, or when it processes
+/// media references itself and the reference gates decide, unless the
+/// gateway processes the media and hands the worker no reference
+/// (`router_processes`: the router mode, or a request another mode placed
+/// on the gateway's own pipeline). HTTP workers of the model sit in another
 /// router's pool and never receive the gateway's media.
 fn ensure_pool_takes_modalities(
     registry: &WorkerRegistry,
@@ -131,44 +199,25 @@ fn ensure_pool_takes_modalities(
     plan: &MediaPlan,
     router_processes: bool,
 ) -> Result<(), Response> {
-    let workers = registry.get_by_model(model_id);
-    let pool: Vec<&dyn Worker> = workers
-        .iter()
-        .filter(|worker| worker.connection_mode().uses_grpc_pipeline())
-        .map(|worker| worker.as_ref())
-        .collect();
-    if pool.is_empty() {
-        return Ok(());
-    }
-    for &modality in plan.modalities() {
-        if pool
-            .iter()
-            .any(|worker| worker_takes_modality(*worker, modality, router_processes))
-        {
-            continue;
+    media_facts(registry, model_id, |facts| {
+        let engines = &facts.pipeline_engines;
+        if engines.is_empty() || (!router_processes && facts.pipeline_takes_refs) {
+            return Ok(());
         }
-        let mut runtimes: Vec<RuntimeType> = pool
-            .iter()
-            .map(|worker| worker.metadata().spec.runtime_type)
-            .collect();
-        runtimes.sort_by_key(|runtime| runtime.as_str());
-        runtimes.dedup();
-        return Err(error::bad_request(
-            "multimodal_not_supported",
-            unsupported_modality_message(&runtimes, modality),
-        ));
-    }
-    Ok(())
-}
-
-/// Whether `worker` may take `modality`: its engine does by the matrix, or
-/// it processes media references itself and the reference gates decide,
-/// unless the gateway processes the media and hands the worker no reference
-/// (`router_processes`: the router mode, or a request another mode placed
-/// on the gateway's own pipeline).
-fn worker_takes_modality(worker: &dyn Worker, modality: Modality, router_processes: bool) -> bool {
-    runtime_supports_modality(worker.metadata().spec.runtime_type, modality)
-        || (!router_processes && worker_accepts_media_refs(worker))
+        for &modality in plan.modalities() {
+            if engines
+                .iter()
+                .any(|&engine| runtime_supports_modality(engine, modality))
+            {
+                continue;
+            }
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                unsupported_modality_message(engines, modality),
+            ));
+        }
+        Ok(())
+    })
 }
 
 /// The sentence an (engine, modality) refusal carries, the same in
@@ -234,11 +283,12 @@ pub(crate) fn fleet_reads_format(
     model_id: &str,
     format: EncoderInputFormat,
 ) -> bool {
-    registry
-        .get_by_model(model_id)
-        .iter()
-        .filter(|worker| worker.connection_mode().uses_grpc_pipeline())
-        .all(|worker| runtime_reads_format(worker.metadata().spec.runtime_type, format))
+    media_facts(registry, model_id, |facts| {
+        facts
+            .pipeline_engines
+            .iter()
+            .all(|&engine| runtime_reads_format(engine, format))
+    })
 }
 
 /// Reject an unsupported (backend, modality) pair at worker selection, once
@@ -790,6 +840,29 @@ mod tests {
                 tokenspeed("grpc://10.0.0.1:1"),
                 http
             ])));
+        }
+
+        /// The answers a membership snapshot keeps are read again once the
+        /// membership changes: a worker registered after a request has read
+        /// them moves each one.
+        #[test]
+        fn a_worker_registered_after_the_first_read_moves_the_kept_answers() {
+            let packed = |registry: &WorkerRegistry| {
+                fleet_reads_format(registry, MODEL, EncoderInputFormat::Packed)
+            };
+            let registry = registry_with(vec![worker_of(
+                "grpc://10.0.0.1:1",
+                RuntimeType::TokenSpeed,
+                &[(SUPPORTS_VISION_LABEL, "false")],
+            )]);
+            assert!(model_workers_language_model_only(&registry, MODEL));
+            assert!(packed(&registry));
+
+            assert!(registry
+                .register(worker("grpc://10.0.0.2:1", &[]))
+                .is_some());
+            assert!(!model_workers_language_model_only(&registry, MODEL));
+            assert!(!packed(&registry));
         }
 
         /// Media to a language-model-only pool is a 400 naming the modality
