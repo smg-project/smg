@@ -73,13 +73,15 @@ use crate::service::client::{wire, DecisionUnavailable, Error, Link};
 use crate::{
     engine::{
         decision::{Decision, Target},
-        decision_engine::{DecisionEngine, HeldDecision, RequestMaker},
+        decision_engine::{
+            DecideOutcome, DecisionEngine, DecisionRefused, DecodeRefused, HeldDecision,
+            HeldDecode, Leased, Request, RequestMaker,
+        },
         framework::{EncodeItems, EncodePlaced},
-        store_backed_engine::{DecideOutcome, DecisionRefused, Leased, Request},
         view::WorkerId,
     },
-    store::{DecodeRefused, Dispatch, GatewayId, Said},
-    tracking::lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    store::GatewayId,
+    tracking::lease::{Dispatch, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass},
 };
 
 /// Where a handle's decision came from, and where its reports go.
@@ -299,10 +301,15 @@ impl<D: Deref<Target: DecisionEngine>> DecisionGuard<D> {
         Some(HeldDecision {
             decision: &self.decided.decision,
             lease: &leased.lease,
-            decode_session: self.decided.decode_session,
             index: self.index,
             target: &self.target,
-            decode_chosen: matches!(self.decode, Owed::Later { .. }),
+            // Lent as the handle keeps them, with no test of the lease's
+            // side: a single's answer names no decode session and its
+            // decode side never stands chosen.
+            decode: HeldDecode {
+                session: self.decided.decode_session,
+                chosen: matches!(self.decode, Owed::Later { .. }),
+            },
         })
     }
 
@@ -782,7 +789,10 @@ mod tests {
         document::spec::AppliedSpec,
         engine::{
             decision::{Decision, ShadowKind, Target, Targets},
-            decision_engine::{Decided, DecisionEngine, HeldDecision, RequestMaker},
+            decision_engine::{
+                DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
+                HeldDecision, Request, RequestMaker, SweepOutcome,
+            },
             framework::{EncodeItems, EncodePlaced, Picker, TieBand},
             prompt_hashes::{HashSeeds, PromptHashes},
             store_backed_engine::{
@@ -791,17 +801,19 @@ mod tests {
                     pair_fleet, pair_request, picking, push_fleet, request, Ends, GATEWAY,
                     PATIENCE,
                 },
-                DecideOutcome, DecisionRefused, Request, StoreBackedEngine, SweepOutcome,
+                StoreBackedEngine,
             },
-            view::{Candidate, Identity, RequestFacts, WireModes, WorkerId},
+            view::{Candidate, Identity, RequestFacts, Session, WireModes, WorkerId},
         },
         policies::random::Random,
         stages::lifecycle::Lifecycle,
         store::{
-            pairing::Refusal, DecodeRefused, Dispatch, GatewayId, HealthSink, LeaseState,
-            LeasesStore, MemoryStore, Said, WorkersStore,
+            pairing::Refusal, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
+            WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        tracking::lease::{
+            Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Said, Side, TransportClass,
+        },
     };
 
     /// What a stage heard of a lease.
@@ -1696,7 +1708,8 @@ mod tests {
     }
 
     /// What a handle lent with a word or a decode call: the word, the
-    /// index of the target taken, and whether the decode stood chosen.
+    /// index of the target taken, and whether the decode side it lent stood
+    /// chosen.
     type Lent = Mutex<Vec<(&'static str, u8, bool)>>;
 
     /// A door that keeps what each word and each decode call was lent.
@@ -1719,8 +1732,8 @@ mod tests {
             held: &HeldDecision<'_>,
             now: Instant,
         ) -> Result<DecideOutcome, DecisionRefused> {
-            let lent = ("decode call", held.index, held.decode_chosen);
-            self.1.lock().push(lent);
+            let chosen = held.decode.chosen;
+            self.1.lock().push(("decode call", held.index, chosen));
             DecisionEngine::decide_decode_under(self.0, gateway, maker, held, now)
         }
 
@@ -1743,7 +1756,8 @@ mod tests {
                 Said::Completed(_) => "ended",
                 Said::Released(..) => "released",
             };
-            self.1.lock().push((word, held.index, held.decode_chosen));
+            let chosen = held.decode.chosen;
+            self.1.lock().push((word, held.index, chosen));
             DecisionEngine::say(self.0, gateway, held, said, now);
         }
 
@@ -1782,7 +1796,9 @@ mod tests {
     /// handle. An engine with no file of its leases tells its stages from
     /// it: the index names the target taken at an end too, where the word
     /// carries none, and a decode that stood chosen is known at its
-    /// dispatch, which is its issue.
+    /// dispatch, which is its issue. A handle lends its decode side with
+    /// every word: a single's lends no session and a side that never stood
+    /// chosen.
     #[test]
     fn a_handle_lends_the_index_taken_and_whether_the_decode_stood_chosen() {
         let door = pair_door(1, 2).expect("a pair door");
@@ -1839,6 +1855,20 @@ mod tests {
             ]
         );
         let _ = words();
+        // A single's handle lends no session and a side that never stood
+        // chosen: its words carry nothing of a pair's.
+        let (door, _) = bed();
+        let lends = Lends(&door, Lent::default());
+        let mut handle =
+            DecisionGuard::decide(&lends, GATEWAY, &request(b"single", 7), now).expect("a handle");
+        let lent = handle.held().expect("a leased decision").decode;
+        assert_eq!((lent.session, lent.chosen), (Session::NONE, false));
+        handle.dispatched(now);
+        drop(handle);
+        assert_eq!(
+            mem::take(&mut *lends.1.lock()),
+            [("sent", 0, false), ("ended", 0, false)]
+        );
     }
 
     /// A decode side given up while it stood chosen takes no call. The

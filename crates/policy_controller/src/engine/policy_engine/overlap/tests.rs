@@ -496,7 +496,9 @@ fn a_lists_table_stands_for_a_second() {
 }
 
 /// A profile whose stages read no affinity is named no row: its decision
-/// is handed the request as it stands, and the host is asked nothing.
+/// is handed the request as it stands, and the host is asked nothing. Under
+/// a document none of whose bindings reads affinity, its list keeps no
+/// table.
 #[test]
 fn a_profile_that_reads_no_affinity_is_named_no_row() {
     let (affinity, host, _) = hosted(true);
@@ -504,6 +506,51 @@ fn a_profile_that_reads_no_affinity_is_named_no_row() {
     let asked = prompt(1_000, 4);
     assert_eq!(bed.decide(&request(&asked, 7, NOW), Some(1)), None);
     assert_eq!(host.asked.load(Ordering::Relaxed), 0);
+    assert!(bed.pool.table.load().is_none(), "no table is read");
+}
+
+/// Under a document where one model's profile reads affinity in the single
+/// phase and every other place reads none, each request is decided as under
+/// a document of its own. A request of a phase that reads none is named no
+/// row, and its list keeps no table. Another model's request of the
+/// reader's phase is named none behind its list's table. The reader is
+/// named its rows.
+#[test]
+fn a_profile_that_reads_affinity_is_named_its_rows_beside_one_that_reads_none() {
+    let mut document = PolicySpec::preset("least_load").expect("the preset");
+    let reader = PolicySpec::preset("cache_aware").expect("the preset");
+    let mut binding = reader.bindings[0].clone();
+    binding.matcher.model = MODEL.into();
+    binding.matcher.phase = vec![Phase::Single];
+    document.bindings.insert(0, binding);
+    document.profiles.extend(reader.profiles);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = spec.engine();
+    assert!(engine.needs_for(MODEL, Phase::Single).affinity);
+    assert!(!engine.needs_for("model-b", Phase::Single).affinity);
+    assert!(!engine.needs_for_phase(Phase::Decode).affinity);
+    let (affinity, _, index) = hosted(true);
+    let index = index.expect("the index");
+    let asked = prompt(1_000, 4);
+    store(&index, 2, &hashes_of(&asked));
+    let bed = Bed::new(affinity, spec, 4);
+    // The phase asked is the request's own: no binding of this one reads
+    // affinity, so no table is read.
+    let decode = RequestFacts {
+        phase: Phase::Decode,
+        ..request(&asked, 7, NOW)
+    };
+    assert_eq!(bed.decide(&decode, Some(1)), None);
+    assert!(bed.pool.table.load().is_none(), "no table is read");
+    // In the reader's phase the other model's profile reads none: its
+    // list's table is what says so.
+    let other = RequestFacts {
+        model: "model-b",
+        ..request(&asked, 7, NOW)
+    };
+    assert_eq!(bed.decide(&other, Some(1)), None);
+    assert!(bed.pool.table.load().is_some(), "the list's table says so");
+    assert_eq!(bed.holders(&asked, NOW), [(2, 4, 0)]);
 }
 
 /// The records of `count` ready workers, as a host writes them.

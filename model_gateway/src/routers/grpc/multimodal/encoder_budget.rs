@@ -27,6 +27,7 @@ use llm_multimodal::{
 };
 use smg_worker::identity::basic::Worker;
 
+use super::capability::media_facts;
 use crate::routers::common::snapshot::WorkerRegistry;
 
 /// Worker label carrying the engine's encoder budget in feature tokens: the
@@ -52,10 +53,15 @@ fn worker_encoder_budget(worker: &dyn Worker) -> Option<usize> {
 /// The smallest encoder budget any registered worker of `model_id`
 /// advertises (healthy or not: a health flap must not move a model's bound
 /// request to request); `None` when none advertises one, which leaves an
-/// item's size to the engine, as before.
+/// item's size to the engine, as before. The model's membership snapshot
+/// keeps the answer ([`media_facts`]).
 pub(crate) fn engine_encoder_budget(registry: &WorkerRegistry, model_id: &str) -> Option<usize> {
-    registry
-        .get_by_model(model_id)
+    media_facts(registry, model_id, |facts| facts.encoder_budget)
+}
+
+/// The rule of [`engine_encoder_budget`] over the members of one snapshot.
+pub(super) fn encoder_budget_over(workers: &[Arc<dyn Worker>]) -> Option<usize> {
+    workers
         .iter()
         .filter_map(|worker| worker_encoder_budget(worker.as_ref()))
         .min()

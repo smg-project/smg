@@ -5,7 +5,7 @@ mod forget_cache_events;
 mod rediscover_labels;
 mod release_tokenizer;
 mod remove_from_policy_registry;
-mod submit_tokenizer_job;
+pub(crate) mod submit_tokenizer_job;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod update_policies_for_worker;

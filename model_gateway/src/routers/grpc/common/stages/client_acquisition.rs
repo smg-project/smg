@@ -18,11 +18,10 @@ use crate::routers::{
     },
 };
 
-/// Acquire backend clients for the selected workers. Where `shed` is set
-/// the call re-checks overload at dispatch: one relaxed atomic read per
-/// already-chosen worker, closing the window between selection and dispatch
-/// in which a load report can flip the veto. The caller sets `shed` for a
-/// selection the classic policies made, under `--worker-overload-shed`.
+/// Acquire backend clients for the selected workers, with a dispatch-time
+/// overload re-check: one relaxed atomic read per already-chosen worker,
+/// closing the window between selection and dispatch in which a load report
+/// can flip the veto.
 pub(crate) async fn acquire_clients(
     workers: &WorkerSelection,
     model_id: &str,

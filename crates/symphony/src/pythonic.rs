@@ -30,7 +30,7 @@
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{CallEnd, DropReason, Event, Events, MalformedReason, Text},
     ids::CallIds,
     tagged::{
         assembler::push_escaped,
@@ -136,6 +136,10 @@ pub struct Assembler {
     /// keeps as written; before it, whitespace is held, the template's wrapping if nothing
     /// follows.
     prose_after: bool,
+    /// Between calls: whether the word before the name now held left as text, a word another
+    /// word followed after whitespace on its line. The name is then a word of the same prose,
+    /// not a lone name.
+    in_prose: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +376,7 @@ impl Assembler {
             bare: false,
             begun: false,
             prose_after: false,
+            in_prose: false,
         }
     }
 
@@ -432,7 +437,10 @@ impl Assembler {
             Stage::Prose | Stage::Opening { .. } | Stage::Holding(_) => self.release_content(out),
             Stage::After => self.release_after(out),
             Stage::Between => self.drop_carried(out),
-            Stage::Name { .. } => self.report(MalformedReason::NameWithoutACall, out),
+            Stage::Name { .. } => {
+                let why = self.reason_of_a_name(false);
+                self.report(why, out);
+            }
             Stage::Arguments | Stage::Key { .. } | Stage::Value { .. } => {
                 end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
             }
@@ -600,6 +608,7 @@ impl Assembler {
                 '(' => {
                     let source = std::mem::take(&mut self.carried);
                     let name = source.trim_end().to_string();
+                    self.in_prose = false;
                     self.index = self.next_index;
                     self.next_index += 1;
                     self.written = 0;
@@ -614,8 +623,13 @@ impl Assembler {
                 }
                 c => {
                     // Not a call after all: the name's bytes are reported, and the character is
-                    // read where a call could begin.
-                    self.report(MalformedReason::NameWithoutACall, out);
+                    // read where a call could begin. A name another word follows after whitespace
+                    // on its line is a word of prose, and so is the last word of such a row. A row
+                    // of one word (`get_weather:`, the `I` of `I'm`) stays a lone name, so that a
+                    // tool named and not called keeps its reason.
+                    let word_follows = *spaced && starts_a_name(c) && !self.carried.contains('\n');
+                    let why = self.reason_of_a_name(word_follows);
+                    self.report(why, out);
                     self.stage = Stage::Between;
                     self.take(c, declared, out);
                 }
@@ -845,6 +859,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::uncounted(")"),
+            ended: CallEnd::Closed,
         });
     }
 
@@ -855,6 +870,17 @@ impl Assembler {
     #[inline(never)]
     fn skip_member_without_a_value(&mut self, out: &mut Events) {
         self.report(MalformedReason::KeyWithoutAValue, out);
+    }
+
+    /// The reason of a name no `(` followed: text between calls for a word of prose (another
+    /// word follows it after whitespace on its line, or the word before it was one), a lone
+    /// name otherwise.
+    fn reason_of_a_name(&mut self, word_follows: bool) -> MalformedReason {
+        if std::mem::replace(&mut self.in_prose, word_follows) || word_follows {
+            MalformedReason::TextBetweenCalls
+        } else {
+            MalformedReason::NameWithoutACall
+        }
     }
 
     fn report(&mut self, why: MalformedReason, out: &mut Events) {
@@ -1488,7 +1514,7 @@ mod tests {
                 [
                     Event::ToolCallStart { index: 0, .. },
                     Event::Malformed { why: MalformedReason::UnterminatedRegion, .. },
-                    Event::ToolCallEnd { index: 0, source },
+                    Event::ToolCallEnd { index: 0, source, .. },
                 ] if source.text.is_empty()
             ),
             "{events:?}"
@@ -1506,7 +1532,7 @@ mod tests {
                     Event::ToolCallStart { index: 0, .. },
                     Event::ToolCallArguments { json, source, .. },
                     Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
-                    Event::ToolCallEnd { index: 0, source: end },
+                    Event::ToolCallEnd { index: 0, source: end, .. },
                 ] if json == r#"{"city": "Par"#
                     && source.text == "city=\"Par"
                     && text.text.is_empty()
@@ -2220,6 +2246,7 @@ mod tests {
         let end = |index: u32| Event::ToolCallEnd {
             index,
             source: Text::uncounted(""),
+            ended: CallEnd::Closed,
         };
         for ending in [Ending::Close, Ending::Stream] {
             assert_eq!(

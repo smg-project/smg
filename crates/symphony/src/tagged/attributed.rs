@@ -59,7 +59,7 @@ use std::borrow::Cow;
 use super::object::{Mode, Object};
 use crate::{
     engine::part,
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, CallEnd, DropReason, Event, Events, MalformedReason, Text},
     json::named_arguments,
     markers::Scanner,
     tagged::{
@@ -531,6 +531,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.object.index,
             source: Text::uncounted(terminal.to_owned()),
+            ended: CallEnd::Closed,
         });
         self.done = true;
     }
@@ -1054,6 +1055,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.object.index,
             source: Text::uncounted(terminal.to_owned()),
+            ended: CallEnd::Closed,
         });
         self.done = true;
     }

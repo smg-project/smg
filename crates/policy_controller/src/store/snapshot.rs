@@ -120,7 +120,7 @@ use crate::{
     load::signals::{SignalCell, SignalCells},
     stages::lifecycle::Lifecycle,
     store::{
-        encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
+        encoding::{EncodeClasses, EncodeMember},
         health::LeaderBits,
         index::{AffinityRowsBuffers, KvTables, PoolIndex, Predict, Reading},
         loads::LoadSample,
@@ -2592,16 +2592,10 @@ fn encoder_facts(
     if encoders.is_empty() {
         return None;
     }
-    let classed = classes.map_or(&[][..], EncodeClasses::encoders);
-    let stated = encoders.iter().enumerate().map(|(at, entry)| {
-        let offer = &entry.facts.encode;
-        EncoderFacts {
-            class: classed.get(at).copied().unwrap_or(0),
-            pushes: offer.handoff == EncodeHandoff::Push,
-            references: offer.references,
-        }
-    });
-    Some(stated.collect())
+    // A model with no class reads class `0` at every encoder.
+    let none = EncodeClasses::default();
+    let offers = encoders.iter().map(|entry| &entry.facts.encode);
+    Some(classes.unwrap_or(&none).encoder_facts(offers))
 }
 
 /// One member's row in one pool of the writer's working copy.

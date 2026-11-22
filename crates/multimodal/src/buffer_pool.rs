@@ -37,7 +37,11 @@
 //! than a previous request's bytes, so a producer that left a byte unwritten
 //! shows it in every test that compares its output with a reference.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::{
+    collections::TryReserveError,
+    convert::Infallible,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use bytes::Bytes;
 use image::DynamicImage;
@@ -121,6 +125,18 @@ fn class_index(capacity: usize) -> Option<usize> {
         .then(|| (capacity / SMALLEST).trailing_zeros() as usize)
 }
 
+/// A zeroed buffer of `len` bytes, or the allocator's refusal.
+fn zeroed(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    bytemuck::try_zeroed_vec(len).or_else(|()| {
+        // That refusal carries no value: the reserve asks again and gives
+        // the error, or the buffer after all.
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len)?;
+        buf.resize(len, 0);
+        Ok(buf)
+    })
+}
+
 impl BufferPool {
     pub(crate) const fn new() -> Self {
         Self {
@@ -139,26 +155,61 @@ impl BufferPool {
     /// Its bytes are a previous request's (the [`SENTINEL`] in a debug
     /// build), zeros only when it is fresh or outside the pooled range.
     pub(crate) fn take(&self, len: usize) -> Vec<u8> {
+        // A refused allocation ends the process, as before.
+        let Ok(buf) = self.sized(len, |len| Ok::<_, Infallible>(vec![0u8; len]));
+        buf
+    }
+
+    /// [`Self::take`] for a producer that reports a refused allocation.
+    pub(crate) fn try_take(&self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        self.sized(len, zeroed)
+    }
+
+    /// The buffer of both takes; `fresh` allocates a zeroed one.
+    fn sized<E>(
+        &self,
+        len: usize,
+        fresh: impl Fn(usize) -> Result<Vec<u8>, E>,
+    ) -> Result<Vec<u8>, E> {
         let Some(capacity) = class_capacity(len) else {
-            return vec![0u8; len];
-        };
-        let index = (capacity / SMALLEST).trailing_zeros() as usize;
-        let kept = {
-            let mut idle = self.idle();
-            let kept = idle.classes[index].pop();
-            if kept.is_some() && capacity != LARGEST {
-                idle.held -= capacity;
-            }
-            kept
+            return fresh(len);
         };
         // A fresh buffer is a zeroed allocation of the whole class: the pages
         // past `len` stay untouched, the ones below it are faulted in by the
         // producer's first write, once in the buffer's life.
-        let mut buf = kept.unwrap_or_else(|| vec![0u8; capacity]);
+        let mut buf = match self.kept(capacity) {
+            Some(buf) => buf,
+            None => fresh(capacity)?,
+        };
         buf.resize(len, 0);
         #[cfg(debug_assertions)]
         buf.fill(SENTINEL);
-        buf
+        Ok(buf)
+    }
+
+    /// An empty buffer with room for `len` bytes, for a producer that appends
+    /// them: nothing is filled here. A fresh one is reserved fallibly, with
+    /// the class's capacity or, outside the pooled range, `len` bytes.
+    pub(crate) fn take_empty(&self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        let class = class_capacity(len);
+        let mut buf = class
+            .and_then(|capacity| self.kept(capacity))
+            .unwrap_or_default();
+        buf.clear();
+        // Empty, so nothing to zero: the producer writes what it appends.
+        buf.try_reserve_exact(class.unwrap_or(len))?;
+        Ok(buf)
+    }
+
+    /// The idle buffer of the class of `capacity`, when it keeps one.
+    fn kept(&self, capacity: usize) -> Option<Vec<u8>> {
+        let index = (capacity / SMALLEST).trailing_zeros() as usize;
+        let mut idle = self.idle();
+        let kept = idle.classes[index].pop();
+        if kept.is_some() && capacity != LARGEST {
+            idle.held -= capacity;
+        }
+        kept
     }
 
     /// `buf` back for the next request: kept when it is a class's buffer and
@@ -204,6 +255,16 @@ impl BufferPool {
 /// [`BufferPool::take`] on the process's pool.
 pub(crate) fn take(len: usize) -> Vec<u8> {
     shared().take(len)
+}
+
+/// [`BufferPool::try_take`] on the process's pool.
+pub(crate) fn try_take(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    shared().try_take(len)
+}
+
+/// [`BufferPool::take_empty`] on the process's pool.
+pub(crate) fn take_empty(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    shared().take_empty(len)
 }
 
 /// A buffer back to the process's pool: kept for the next request of its
@@ -290,6 +351,17 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_buffer_that_cannot_be_reserved_is_an_error() {
+        let pool = BufferPool::new();
+        // No allocator gives this length: the refusal reaches the caller.
+        assert!(pool.take_empty(usize::MAX).is_err());
+        let outside = pool.take_empty(SMALLEST - 1).unwrap();
+        assert_eq!((outside.len(), outside.capacity()), (0, SMALLEST - 1));
+        let class = pool.take_empty(SMALLEST + 1).unwrap();
+        assert_eq!((class.len(), class.capacity()), (0, 2 * SMALLEST));
+    }
+
+    #[test]
     fn the_smallest_image_wire_is_served_from_the_pool() {
         // A single 336x336 tile on the bfloat16 wire, the smallest image wire
         // a processor emits per request; below the former 1 MiB floor it was
@@ -358,6 +430,12 @@ mod tests {
         pool.recycle(Vec::with_capacity(SMALLEST / 2));
         pool.recycle(Vec::with_capacity(2 * LARGEST));
         assert_eq!(pool.held(), 0);
+    }
+
+    #[test]
+    fn a_length_no_allocation_can_hold_is_refused() {
+        let pool = BufferPool::new();
+        assert!(pool.try_take(usize::MAX).is_err());
     }
 
     #[test]

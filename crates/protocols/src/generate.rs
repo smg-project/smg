@@ -107,6 +107,7 @@ pub struct GenerateRequest {
 
     /// Session parameters for continual prompting
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Path to LoRA adapter(s) for model customization
@@ -165,6 +166,7 @@ pub struct GenerateRequest {
 
     /// Custom metric labels
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub custom_labels: Option<HashMap<String, String>>,
 
     /// Whether to return bytes for image generation

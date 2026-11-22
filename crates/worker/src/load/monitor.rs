@@ -384,9 +384,9 @@ impl PushedFile {
     /// through the lock of the reports alone, so every live write of a
     /// pusher's series is made under that lock, where the sentinel is
     /// written too ([`WorkerMonitor::clear_series`]).
-    fn write_rank_series(&self, at: usize, url: &str, model_id: &str) {
+    fn write_rank_series(&self, at: usize, model_id: &str) {
         Metrics::record_engine_rank_load(
-            url,
+            self.pusher.as_ref(),
             model_id,
             registered_engine_role(*self.pusher.worker_type()),
             &self.report.loads[at],
@@ -713,8 +713,10 @@ impl<G: Generation> WorkerMonitor<G> {
         // writes the sentinel there with the report it removes: a record
         // behind that eviction reads the change, and one ahead of it has
         // its series under that sentinel.
-        let ready =
-            runtime.map_or_else(|| worker.status(), |state| state.status()) == WorkerStatus::Ready;
+        let ready = runtime
+            .as_deref()
+            .map_or_else(|| worker.status(), |state| state.status())
+            == WorkerStatus::Ready;
         let mut on_file = reports
             .get_mut(url)
             .filter(|file| Arc::ptr_eq(&file.pusher, worker));
@@ -787,6 +789,7 @@ impl<G: Generation> WorkerMonitor<G> {
             .record(worker, dp_rank, &*report, received_at, sampled_at);
         liveness::on_load_report(
             worker,
+            runtime.as_deref(),
             report.total_waiting_reqs(),
             record.engine_silence(),
             record.reports_every_step(),
@@ -799,7 +802,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // there leaves no load that reads as live. Its file is marked, and
         // the flush that finds the worker `Ready` writes the held series.
         if ready {
-            file.write_rank_series(at, url, worker.model_id());
+            file.write_rank_series(at, worker.model_id());
         } else {
             file.series_held = true;
         }
@@ -978,7 +981,7 @@ impl<G: Generation> WorkerMonitor<G> {
         for (worker, load, _) in &group_loads {
             if self.load_state.is_current_incarnation(worker) {
                 Metrics::record_engine_load(
-                    worker.url(),
+                    worker.as_ref(),
                     model_id,
                     registered_engine_role(*worker.worker_type()),
                     load,
@@ -1207,7 +1210,7 @@ impl<G: Generation> WorkerMonitor<G> {
                     continue;
                 }
                 for at in 0..file.report.loads.len() {
-                    file.write_rank_series(at, worker.url(), worker.model_id());
+                    file.write_rank_series(at, worker.model_id());
                 }
                 file.series_held = false;
             }
@@ -2408,7 +2411,8 @@ async fn poll_group_once<G: Generation>(
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs))
                 .sum();
-            liveness::on_load_report(&worker, waiting, None, false, None);
+            let state = worker.runtime_state();
+            liveness::on_load_report(&worker, state.as_deref(), waiting, None, false, None);
             group_loads.push((worker, load, carries_rank_capacity));
         }
     }

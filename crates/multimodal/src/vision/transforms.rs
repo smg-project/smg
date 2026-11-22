@@ -3295,9 +3295,11 @@ struct TorchAaAxis<'a> {
 }
 
 /// The two passes of [`resize_bicubic_torch_aa_f32`] and
-/// [`resize_bilinear_torch_aa_normalized`]: every source row resampled along
-/// the width, then the rows along the height. A source byte enters as
-/// `sample(channel, byte)`, the float the reference's tensor holds for it.
+/// [`resize_bilinear_torch_aa_normalized`]: the source rows resampled along
+/// the width a band at a time into a window of rows, and each output row
+/// resampled along the height from that window once the band of its last tap
+/// is done. A source byte enters as `sample(channel, byte)`, the float the
+/// reference's tensor holds for it.
 /// An output's taps add in the reference's three runs: the first tap is the
 /// bare product, the next [`torch_aa_plain_until`] taps add a rounded product
 /// in a second rounding, and the rest are fused multiply-adds. Inlined into
@@ -3312,7 +3314,6 @@ fn torch_aa_passes(
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Vec<f32> {
     let (out_w, out_h) = (x.bounds.len(), y.bounds.len());
-    let in_h = data.len() / (in_w * 3);
 
     // The width pass takes the source rows a band at a time. A tap has one
     // weight and one offset for every row, so with the rows of a band side by
@@ -3325,17 +3326,33 @@ fn torch_aa_passes(
     // and never copied out. A value still adds its own taps in the order
     // above, so no bit moves.
     const BAND: usize = 8;
-    let mut rows = plain_f32(in_h * out_w * 3);
+    // The height pass reads a source row only while the taps of an output
+    // row cover it, and an output row's taps never start or end before those
+    // of the row above. So the width pass keeps a window of `kept` rows, the
+    // longest run of whole bands one output row reads, not the image: a
+    // source row stands in it at its index modulo `kept`.
+    let kept = y
+        .bounds
+        .iter()
+        .map(|&(start, count)| (start + count).next_multiple_of(BAND) - start / BAND * BAND)
+        .fold(BAND, usize::max);
+    debug_assert!(
+        y.bounds
+            .windows(2)
+            .all(|w| w[0].0 + w[0].1 <= w[1].0 + w[1].1),
+        "an output row's taps end no earlier than those of the row above"
+    );
+    let mut rows = plain_f32(kept * out_w * 3);
     let mut band = plain_f32(in_w * BAND * 4);
     let (band, _) = band.as_chunks_mut::<4>();
     let (band, _) = band.as_chunks_mut::<BAND>();
     let mut sums = plain_f32(out_w * BAND * 4);
     let (sums, _) = sums.as_chunks_mut::<4>();
     let (sums, _) = sums.as_chunks_mut::<BAND>();
-    for (src, dst) in data
-        .chunks(BAND * in_w * 3)
-        .zip(rows.chunks_mut(BAND * out_w * 3))
-    {
+    let mut out = plain_f32(out_h * out_w * 3);
+    let mut written = 0;
+    for (index, src) in data.chunks(BAND * in_w * 3).enumerate() {
+        let dst = &mut rows[(index * BAND % kept) * out_w * 3..][..src.len() / in_w * out_w];
         for (src, row) in src.chunks_exact(in_w * 3).zip(0..BAND) {
             let (pixels, _) = src.as_chunks::<3>();
             for (values, pixel) in band.iter_mut().zip(pixels) {
@@ -3372,33 +3389,45 @@ fn torch_aa_passes(
                 *out = [r, g, b];
             }
         }
-    }
 
-    let mut out = plain_f32(out_h * out_w * 3);
-    let row = out_w * 3;
-    for (dst, (&(start, count), weights)) in out
-        .chunks_exact_mut(row)
-        .zip(y.bounds.iter().zip(y.weights))
-    {
-        let mut taps = weights[..count]
-            .iter()
-            .zip(rows[start * row..(start + count) * row].chunks_exact(row));
-        if let Some((&weight, src)) = taps.next() {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d = weight * v;
+        // The output rows whose last tap this band holds are written now.
+        let row = out_w * 3;
+        let held = index * BAND + src.len() / (in_w * 3);
+        while let Some(&(start, count)) = y.bounds.get(written) {
+            if start + count > held {
+                break;
             }
-        }
-        for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d += weight * v;
+            let dst = &mut out[written * row..][..row];
+            // The taps' rows run to the window's end and on from its start.
+            let first = start % kept;
+            let wrapped = (first + count).saturating_sub(kept);
+            let mut taps = y.weights[written][..count].iter().zip(
+                rows[first * row..(first + count - wrapped) * row]
+                    .chunks_exact(row)
+                    .chain(rows[..wrapped * row].chunks_exact(row)),
+            );
+            if let Some((&weight, src)) = taps.next() {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d = weight * v;
+                }
             }
-        }
-        for (&weight, src) in taps {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d = weight.mul_add(v, *d);
+            for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d += weight * v;
+                }
             }
+            for (&weight, src) in taps {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d = weight.mul_add(v, *d);
+                }
+            }
+            written += 1;
         }
     }
+    debug_assert_eq!(
+        written, out_h,
+        "every output row's taps lie inside the source"
+    );
     out
 }
 

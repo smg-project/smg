@@ -1,5 +1,4 @@
 use kv_index::{compute_request_content_hashes, ContentHash, GroupCap, WorkerGroups};
-use smg_policy_controller::engine::CacheIndex;
 use smg_worker::{
     common_proto::{kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent},
     kv_events::apply::{apply_cleared, apply_event, apply_events, WorkerIndexState},
@@ -152,11 +151,6 @@ fn non_main_attention_groups_are_kept_in_the_worker_view() {
             group: 1
         }]
     );
-    // The policy engine's lookup lowers the holder by the same rule.
-    let request: Vec<u64> = hashes.iter().map(|hash| hash.0).collect();
-    let mut kept = Vec::new();
-    indexer.deepest_into(&request, 4, &[1 << w1], 16, &mut |_| 0, &mut kept);
-    assert_eq!(kept, [(w1, 1)]);
 
     // A kind-less store on the learned group follows the group.
     let mut later = stored_event(2, &[]);

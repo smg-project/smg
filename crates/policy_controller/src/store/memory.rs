@@ -25,6 +25,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     document::spec::AppliedSpec,
     engine::{
+        decision_engine::DecodeRefused,
         prompt_hashes::{block_size_and_depth, HashSeeds, PromptHashes},
         view::{LoadRow, Role, Session, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS},
     },
@@ -36,8 +37,8 @@ use crate::{
         journal::{Journal, JournalKinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
-            DecodeMark, DecodeRefused, DecodeSide, Dispatch, InFlightCounts, LeaseRecord,
-            LeaseRefused, LeaseState, LeasesStore, Said, Sides, WorkerSlot, DISPATCH_TTL,
+            DecodeMark, DecodeSide, InFlightCounts, LeaseRecord, LeaseRefused, LeaseState,
+            LeasesStore, Sides, WorkerSlot,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
@@ -54,7 +55,10 @@ use crate::{
         },
         GatewayId,
     },
-    tracking::lease::{LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    tracking::lease::{
+        Dispatch, LeaseId, Membership, Outcome, ReleaseReason, Said, Side, TransportClass,
+        DISPATCH_TTL,
+    },
 };
 
 mod blocks;
@@ -4757,18 +4761,23 @@ impl MemoryStore {
             .is_some()
     }
 
-    /// The prefill worker of the lease a decode call names, where the
-    /// lease still takes a decode side: its prefill is dispatched and held
-    /// and its decode side is chosen. The call reads this before it
-    /// decides, and its issue tests the same again under its own turn.
-    pub(crate) fn held_prefill(
+    /// The pair of the lease a decode call names, where the lease still
+    /// takes a decode side: its prefill is dispatched and held and its
+    /// decode side is chosen. The prefill's worker comes first, then the
+    /// worker and the rank of the decode the lease's first decision chose.
+    /// The call reads this before it decides, and its issue tests the same
+    /// again under its own turn.
+    pub(crate) fn held_pair(
         &self,
         gateway: GatewayId,
         lease: LeaseId,
-    ) -> Result<WorkerId, DecodeRefused> {
+    ) -> Result<(WorkerId, Option<(WorkerId, u16)>), DecodeRefused> {
         self.turn_of(self.file_of(lease))
             .chosen_decode(&(gateway, lease))
-            .map(|(held, _)| held.record.target)
+            .map(|(held, decode)| {
+                let chosen = decode.side.target_at(decode.side.target_index);
+                (held.record.target, chosen)
+            })
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,

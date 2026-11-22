@@ -132,9 +132,9 @@
 //! filter of the catalog reads them, and no profile picks a member its
 //! gateway cannot dial. The candidates the wires take are counted, and a
 //! decision whose pool has rows and whose gateway shares a wire with none
-//! of them is shed under [`WIRES`](crate::engine::store_backed_engine::WIRES).
+//! of them is shed under [`WIRES`](crate::engine::decision::WIRES).
 //! One whose gateway hints a subset of 0, a decision over no candidates, is
-//! shed under [`SUBSET_HINT`](crate::engine::store_backed_engine::SUBSET_HINT).
+//! shed under [`SUBSET_HINT`](crate::engine::decision::SUBSET_HINT).
 //! A positive hint is read by no stage yet.
 //!
 //! What this build has no decision for is answered `Busy` with no reason,
@@ -190,6 +190,7 @@ use super::{
 use crate::{
     engine::{
         decision::Decision,
+        decision_engine::DecodeRefused,
         decision_slot::DecisionSlot,
         framework::{release, Engine},
         store_backed_engine::{
@@ -205,10 +206,9 @@ use crate::{
     },
     stages::lifecycle::Lifecycle,
     store::{
-        leases::DISPATCH_TTL, AtWork, DecodeIssue, DecodeRefused, GatewayId, LeaseRefused,
-        LookOutcome, MemoryStore, StoreSnapshot,
+        AtWork, DecodeIssue, GatewayId, LeaseRefused, LookOutcome, MemoryStore, StoreSnapshot,
     },
-    tracking::lease::{Lease, LeaseId, ReleaseReason},
+    tracking::lease::{Lease, LeaseId, ReleaseReason, DISPATCH_TTL},
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -1315,11 +1315,12 @@ pub(crate) mod tests {
         document::spec::{self, AppliedSpec, PolicySpec},
         engine::{
             decision::{Decision, Overlap, OverlapSource, Pick, Targets},
+            decision_engine::Request,
             decision_slot::DecisionSlot,
             framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
             store_backed_engine::{
-                self, cut_reach, keeps_a_row, narrow, pair_in, tests::pair_counts, Request,
-                RequestForm, StoreBackedEngine, TERM_MARK,
+                self, cut_reach, keeps_a_row, narrow, pair_in, tests::pair_counts, RequestForm,
+                StoreBackedEngine, TERM_MARK,
             },
             view::{
                 self, fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts,
@@ -1342,11 +1343,11 @@ pub(crate) mod tests {
         },
         stages::{lifecycle::Lifecycle, pickers::Best, registry::StageRegistry},
         store::{
-            leases::DISPATCH_TTL, DecodeIssue, Dispatch, GatewayId, HealthSink, LeaseState,
-            LeasesStore, MemoryStore, Said, StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery,
-            WorkerFacts, WorkerStatus, WorkersStore,
+            DecodeIssue, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore,
+            StoreSnapshot, ViewBuffers, ViewFacts, ViewQuery, WorkerFacts, WorkerStatus,
+            WorkersStore,
         },
-        tracking::lease::{Lease, LeaseId, ReleaseReason, Side},
+        tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
     };
 
     /// How long a case waits for a decider before it fails.
@@ -3513,8 +3514,8 @@ pub(crate) mod tests {
     ) -> crate::store::AtWork {
         use crate::{
             engine::decision_slot::DecisionSlot,
-            store::{Hand, LookOutcome, Said},
-            tracking::lease::ReleaseReason,
+            store::{Hand, LookOutcome},
+            tracking::lease::{ReleaseReason, Said},
         };
 
         let now = Instant::now();

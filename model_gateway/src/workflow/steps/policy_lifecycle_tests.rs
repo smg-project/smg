@@ -526,3 +526,46 @@ async fn a_mesh_import_removed_here_leaves_the_local_workers_policy() {
     remove(&app_context, import).await;
     assert_eq!(policy_of(&app_context, "llama"), Some("cache_aware"));
 }
+
+#[tokio::test]
+async fn a_removal_closes_the_encode_connection_pooled_to_its_worker() {
+    use std::time::Duration;
+
+    use smg_grpc_client::tokenspeed_encoder::tokenspeed_encoder_proto::EncodeRequest;
+    use tokio::io::AsyncReadExt;
+
+    use crate::routers::grpc::backend_client::send_tokenspeed_encode_rpc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let url = format!("grpc://{}", listener.local_addr().expect("its address"));
+    let app_context = app_context();
+    let encoder = worker(&url, "vision");
+    register(&app_context, Arc::clone(&encoder), "random").await;
+    // The peer answers nothing: the send ends at its bound and leaves the
+    // connection it dialled in the pool.
+    let send = tokio::time::timeout(
+        Duration::from_millis(200),
+        send_tokenspeed_encode_rpc(url.clone(), EncodeRequest::default()),
+    );
+    let (_, dialled) = tokio::join!(send, listener.accept());
+    let (mut pooled, _) = dialled.expect("the dialled connection");
+    // Open before the removal (past the client preface), so the close below
+    // is the removal's.
+    let mut preface = Vec::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), pooled.read_to_end(&mut preface))
+            .await
+            .is_err(),
+        "the pooled connection is open before the removal"
+    );
+
+    remove(&app_context, encoder).await;
+
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), pooled.read_to_end(&mut received))
+        .await
+        .expect("the removal closes the pooled connection")
+        .expect("a read to its end");
+}

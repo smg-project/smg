@@ -14,20 +14,24 @@
 //!   its rank, its wire, and its engine kind and labels as the document
 //!   lists them. It lists the pool's engines and numbers the pool. The
 //!   gateway keeps the value beside the list it was made from. No live
-//!   value of a worker is in it.
+//!   value of a worker is in it. What no worker object holds, the program
+//!   that holds it says here too, once a worker
+//!   ([`PoolRecords::with_fixed_facts`]): whether the worker takes images.
 //! - **Once a load snapshot.** A snapshot is published whole and never
 //!   changed, so a worker's report reads the same at every decision that
 //!   holds the snapshot. One decision that writes every record of a list
 //!   under a snapshot converts the list's reports, and the list keeps
 //!   those rows for the decisions behind it that hold the same snapshot
-//!   ([`Reported`]). A decision that holds another snapshot never reads
-//!   them: it reads its own snapshot's reports.
+//!   ([`Reported`]). Draws, which write a few records each, convert the
+//!   list's reports once they looked up as many under the snapshot as the
+//!   list holds ([`LookUps`]). A decision that holds another snapshot
+//!   never reads the rows: it reads its own snapshot's reports.
 //! - **Once a decision.** What a worker object says is read where the
 //!   gateway keeps it, at the decision's instant ([`Live`]): ready,
 //!   breaker, overload, stall, requests in flight. So is the age of the
 //!   worker's report. [`PoolRecords::write`] writes every worker's record
 //!   into a buffer of its caller, and [`PoolRecords::read`] one worker's.
-//!   Neither takes a lock. A write allocates nothing once the buffer has
+//!   Neither waits for a lock. A write allocates nothing once the buffer has
 //!   grown to the pool, but for the one decision a snapshot that converts
 //!   the list's reports.
 //!
@@ -42,17 +46,18 @@
 //! and by no other.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     ptr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Weak,
     },
     time::{Duration, Instant},
 };
 
 use arc_swap::{ArcSwapOption, Guard};
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, worker::WorkerStatus};
 
@@ -60,8 +65,9 @@ use super::{
     decision::Decision,
     framework::{Engine, Scratch},
     view::{
-        fingerprint, Candidate, Constraints, Engines, Health, OverloadRegime, PoolFacts,
-        RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
+        fingerprint, Candidate, Constraints, Engines, FixedFacts, Health, OverloadRegime,
+        PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,
+        LOAD_REPORT_CLOCK_HISTORY_MS,
     },
 };
 use crate::{document::spec::AppliedSpec, load::load_row};
@@ -298,7 +304,8 @@ fn report_into(
 /// list keeps the rows of one snapshot (`PoolRecords::reported`): one
 /// decision that writes every record of the list and finds the list holds
 /// none of its snapshot converts the list's reports, and leaves the rows
-/// for the decisions behind it ([`PoolRecords::convert`]).
+/// for the decisions behind it ([`PoolRecords::convert`]). So does the
+/// draw that pays the last of the list's length ([`LookUps`]).
 ///
 /// The rows are of one snapshot and one list, and are read by a decision
 /// that holds that snapshot and that list and by no other
@@ -348,7 +355,8 @@ type Held = Guard<Option<Arc<Reported>>>;
 /// in flight are read on the object at each decision ([`Live`]). A
 /// worker's load report is read from the load snapshot the decision holds:
 /// converted once for the list, by the first decision that writes every
-/// record under that snapshot, and read by the decisions behind it that
+/// record under that snapshot or by the draw that pays the last of the
+/// list's length in look-ups, and read by the decisions behind it that
 /// hold the same snapshot.
 ///
 /// Made from one list and good for that list alone: the list a gateway's
@@ -376,32 +384,49 @@ pub struct PoolRecords {
     /// lists name the engine kinds and the labels.
     generation: u64,
     /// The list's rows with the reports of one load snapshot written
-    /// ([`Reported`]), and none before a decision wrote every record under
-    /// a snapshot.
+    /// ([`Reported`]), and none before a decision converted the list's
+    /// reports ([`Self::convert`]).
     ///
     /// Read by one load of the slot through the calling thread's own
     /// protection: no lock, and no write another thread reads. Written by
     /// one atomic store of the whole value, by the one decision that holds
     /// the claim ([`Self::convert`]).
     reported: ArcSwapOption<Reported>,
-    /// The claim to convert the list's reports: set by one compare and
-    /// exchange, by the one decision that converts, and cleared when it is
-    /// done. A decision that finds it set converts nothing and waits for
-    /// nothing: it writes its own records from its own snapshot.
-    converting: AtomicBool,
+    /// The claim to convert the list's reports, with what the list's draws
+    /// paid toward it ([`LookUps`]): taken by one compare and exchange and
+    /// never waited for, by the one decision that converts or counts, and
+    /// given back when it is done. A decision that finds it taken converts
+    /// nothing, counts nothing and waits for nothing: it writes its own
+    /// records from its own snapshot.
+    converting: Mutex<LookUps>,
     /// How many times the list's reports were converted: once a snapshot
-    /// a decision wrote every record under.
+    /// a decision wrote every record under, or the list's draws paid for.
     conversions: AtomicU64,
 }
 
 impl PoolRecords {
     /// The records of `workers`, under the document `spec` and on `clock`,
-    /// whose count of pools this moves.
+    /// whose count of pools this moves. Nothing is said of a worker beside
+    /// its object ([`Self::with_fixed_facts`]).
     ///
     /// Called once a list. It reads each worker's registration and none of
     /// its live state.
     #[must_use]
     pub fn new(workers: &[Arc<dyn Worker>], spec: &AppliedSpec, clock: &DecisionClock) -> Self {
+        Self::with_fixed_facts(workers, spec, clock, |_| FixedFacts::default())
+    }
+
+    /// [`Self::new`], with what the program says of each worker beside its
+    /// object ([`FixedFacts`]): `facts_of` is asked once a worker, here, and
+    /// never at a decision. Whether a worker takes images goes into its
+    /// record.
+    #[must_use]
+    pub fn with_fixed_facts(
+        workers: &[Arc<dyn Worker>],
+        spec: &AppliedSpec,
+        clock: &DecisionClock,
+        mut facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
+    ) -> Self {
         let lists = spec.lists();
         let fixed: Box<[Candidate]> = workers
             .iter()
@@ -425,6 +450,7 @@ impl PoolRecords {
                     // A worker object states no zone.
                     Some(lists.positions(kind, None, &labels))
                 };
+                let FixedFacts { vision } = facts_of(worker);
                 Candidate {
                     position,
                     id,
@@ -436,6 +462,7 @@ impl PoolRecords {
                     wire_modes: WireModes::from(spec.connection_mode),
                     engine_kind: listed.map_or(0, |listed| listed.engine_kind),
                     labels: listed.map_or(0, |listed| listed.labels),
+                    vision,
                     // No admission window is the record's to know: both
                     // bits read open, and a caller that holds a window
                     // writes its own.
@@ -471,7 +498,7 @@ impl PoolRecords {
             number: number as u32,
             generation: spec.generation(),
             reported: ArcSwapOption::empty(),
-            converting: AtomicBool::new(false),
+            converting: Mutex::new(LookUps::default()),
             conversions: AtomicU64::new(0),
         }
     }
@@ -515,8 +542,9 @@ impl PoolRecords {
     }
 
     /// The fixed half of each worker's record, by its place in the list:
-    /// its position, id, key, role, rank, wire, engine kind and labels, and
-    /// every live field at rest.
+    /// its position, id, key, role, rank, wire, engine kind and labels,
+    /// whether it takes images where the program said so, and every live
+    /// field at rest.
     #[must_use]
     pub fn fixed(&self) -> &[Candidate] {
         &self.fixed
@@ -531,8 +559,8 @@ impl PoolRecords {
 
     /// How many times the list's reports were converted so far: once for
     /// each load snapshot a decision wrote every record under
-    /// ([`Self::write`]). What a bench and a case count against the
-    /// snapshots published.
+    /// ([`Self::write`]) or the list's draws paid for. What a bench and a
+    /// case count against the snapshots published.
     #[must_use]
     pub fn conversions(&self) -> u64 {
         self.conversions.load(Ordering::Relaxed)
@@ -580,7 +608,7 @@ impl PoolRecords {
     /// Left for the caller to write where it holds them: the pair class
     /// (zero), the two admission bits (open) and the session key's pin.
     ///
-    /// No lock is taken here beyond what a read of a worker object takes.
+    /// No lock is waited for here beyond what a read of a worker object takes.
     /// Nothing is allocated once `rows` has grown to the list. The one
     /// exception is the conversion: one allocation, by one decision, at
     /// most once a published snapshot a list.
@@ -603,7 +631,9 @@ impl PoolRecords {
                 let reported = match held.as_deref().filter(|reported| reported.is_of(loads)) {
                     Some(reported) => Some(reported),
                     None => {
-                        converted = self.convert(workers, loads, live, &held);
+                        // It looks every report up: it pays the list's length.
+                        converted =
+                            self.convert(workers, loads, live, &held, self.fixed.len() as u32);
                         converted.as_deref()
                     }
                 };
@@ -650,6 +680,12 @@ impl PoolRecords {
     /// slot). `None` where it is not the one, and writes its own records
     /// from its own snapshot.
     ///
+    /// **A conversion is paid for.** `looked_up` is how many reports the
+    /// calling decision looks up where the list holds no rows of its
+    /// snapshot: all of them for a whole write, the few it asked about for
+    /// a draw. They are counted under the claim, and the decision converts
+    /// where the count has reached the list's length ([`LookUps`]).
+    ///
     /// **One decision converts a snapshot.** The decision takes the
     /// list's claim first, by one compare and exchange. Another decision
     /// that meets the same snapshot meanwhile finds the claim taken,
@@ -676,6 +712,7 @@ impl PoolRecords {
         loads: &Arc<LoadSnapshot>,
         live: &Live<'_>,
         held: &Held,
+        looked_up: u32,
     ) -> Option<Arc<Reported>> {
         if held
             .as_deref()
@@ -683,10 +720,13 @@ impl PoolRecords {
         {
             return None;
         }
-        let claim = Claim::take(&self.converting)?;
+        let mut claim = self.converting.try_lock()?;
         let again = self.reported.load();
         if let Some(reported) = again.as_ref().filter(|reported| reported.is_of(loads)) {
             return Some(Arc::clone(reported));
+        }
+        if !claim.paid(loads, looked_up, self.fixed.len()) {
+            return None;
         }
         let mut all = true;
         let rows = self
@@ -734,25 +774,48 @@ impl PoolRecords {
     }
 }
 
-/// A list's claim to convert its reports, held by the one decision that
-/// converts and given back when it is dropped: at the conversion's end,
-/// and where the conversion unwinds.
-struct Claim<'a>(&'a AtomicBool);
-
-impl<'a> Claim<'a> {
-    /// The claim, where no other decision holds it: one compare and
-    /// exchange, never a wait.
-    #[inline]
-    fn take(word: &'a AtomicBool) -> Option<Self> {
-        word.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| Self(word))
-    }
+/// What a list's draws paid toward the conversion of its reports under one
+/// load snapshot: how many records they wrote by looking a worker's report
+/// up, because the list held no rows of that snapshot. The list's claim
+/// guards it (`PoolRecords::converting`).
+///
+/// A draw writes the few records it asks about, so the first draw under a
+/// new snapshot must not convert the whole list: under a policy that reads
+/// two records, one request would pay for every worker. But a look-up
+/// costs several times what a converted row costs to copy. So the draws
+/// over a list count their look-ups, and the draw that brings the count to
+/// the list's length converts the list's reports
+/// ([`PoolRecords::convert`]). The count held less than the list's length
+/// before that draw, and the conversion then looks up every report.
+/// Look-ups it never held (below) or lost to another snapshot come on top.
+///
+/// The count is written under the claim alone, which is never waited for:
+/// a draw that finds the claim taken leaves its look-ups uncounted. Only a
+/// decision that looked a report up writes it, so none writes it once the
+/// list holds the snapshot's rows.
+#[derive(Debug, Default)]
+struct LookUps {
+    /// The snapshot the look-ups were made in, named and not held, as a
+    /// list's rows name theirs ([`Reported`]): no later snapshot stands in
+    /// its place in memory, so none inherits the count.
+    snapshot: Weak<LoadSnapshot>,
+    /// The records written by a look-up under that snapshot.
+    records: u32,
 }
 
-impl Drop for Claim<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+impl LookUps {
+    /// Counts `records` more look-ups under `loads`, where a count of
+    /// another snapshot starts again, and says whether the count has
+    /// reached `list`, the list's length.
+    fn paid(&mut self, loads: &Arc<LoadSnapshot>, records: u32, list: usize) -> bool {
+        if !ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(loads)) {
+            *self = Self {
+                snapshot: Arc::downgrade(loads),
+                records: 0,
+            };
+        }
+        self.records = self.records.saturating_add(records);
+        self.records as usize >= list
     }
 }
 
@@ -760,16 +823,22 @@ impl Drop for Claim<'_> {
 /// read of one worker.
 ///
 /// It holds the list's rows for the decision where they are of the
-/// decision's snapshot ([`Reported`]), read once.
+/// decision's snapshot ([`Reported`]), read once. Where the list holds
+/// none, each record is written by a look-up of its worker's report, and a
+/// draw pays those toward the list's conversion at its end
+/// ([`Self::paid`]).
 struct Singly<'a> {
+    pool: &'a PoolRecords,
     workers: &'a [Arc<dyn Worker>],
     live: &'a Live<'a>,
     /// The list's rows, where they are of the decision's snapshot.
     held: Option<Held>,
+    /// The records this decision wrote without the list's rows.
+    looked_up: Cell<u32>,
 }
 
 impl<'a> Singly<'a> {
-    fn new(pool: &PoolRecords, workers: &'a [Arc<dyn Worker>], live: &'a Live<'a>) -> Self {
+    fn new(pool: &'a PoolRecords, workers: &'a [Arc<dyn Worker>], live: &'a Live<'a>) -> Self {
         let held = live.loads.and_then(|loads| {
             let held = pool.reported.load();
             held.as_deref()
@@ -777,9 +846,24 @@ impl<'a> Singly<'a> {
                 .then_some(held)
         });
         Self {
+            pool,
             workers,
             live,
             held,
+            looked_up: Cell::new(0),
+        }
+    }
+
+    /// Pays the decision's look-ups toward the conversion of its list's
+    /// reports ([`LookUps`]): the draw that pays the last of the list's
+    /// length converts them, and the draws behind it copy the rows.
+    fn paid(&self) {
+        let looked_up = self.looked_up.get();
+        if let (Some(loads), true) = (self.live.loads, looked_up > 0) {
+            let held = self.pool.reported.load();
+            let _ = self
+                .pool
+                .convert(self.workers, loads, self.live, &held, looked_up);
         }
     }
 
@@ -807,6 +891,7 @@ impl<'a> Singly<'a> {
             }
             None => {
                 *row = *fixed;
+                self.looked_up.set(self.looked_up.get() + 1);
                 self.live.write(worker.as_ref(), row);
             }
         }
@@ -867,7 +952,9 @@ thread_local! {
 /// request's profile draws first and its picker is one of the crate's own,
 /// the picker draws over the list and a worker's record is written when
 /// the draw asks about the worker: two workers for a pick of two, whatever
-/// the pool's size. The rows the request names join them. Every other
+/// the pool's size. The rows the request names join them. The draws over a
+/// list convert its reports once they looked up as many as the list holds,
+/// and copy the rows from there. Every other
 /// decision is handed every worker's record ([`PoolRecords::write`]), and
 /// so is a draw that kept no worker. Both give the pick the whole write
 /// gives: a stage that answers row by row reads no other row.
@@ -902,7 +989,7 @@ pub fn decide(
             let rows = &mut rows[..pool.len()];
             let singly = Singly::new(pool, workers, live);
             let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
-            return engine.decide_drawn(
+            let decision = engine.decide_drawn(
                 drawn,
                 facts,
                 &unsaid,
@@ -912,6 +999,8 @@ pub fn decide(
                 cx,
                 scratch,
             );
+            singly.paid();
+            return decision;
         }
         let (rows, pool_facts) = pool.write(workers, live, rows);
         engine.decide(facts, &pool_facts, rows, cx, scratch)

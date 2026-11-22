@@ -20,7 +20,7 @@
 //! templates write none.
 
 use crate::{
-    event::{Event, Events, MalformedReason, Text},
+    event::{CallEnd, Event, Events, MalformedReason, Text},
     json::{
         fragments::{Arrived, Fragments},
         outline::Scanner,
@@ -60,6 +60,7 @@ impl Object {
             out.push(Event::ToolCallEnd {
                 index: self.index,
                 source: Text::default(),
+                ended: CallEnd::Closed,
             });
         }
         taken
@@ -146,6 +147,7 @@ impl Object {
         out.push(Event::ToolCallEnd {
             index,
             source: Text::default(),
+            ended: CallEnd::Closed,
         });
     }
 
@@ -297,6 +299,7 @@ mod tests {
             Some(&Event::ToolCallEnd {
                 index: 0,
                 source: Text::default(),
+                ended: CallEnd::Closed,
             })
         );
         let cut = "{\"city\": \"Par";

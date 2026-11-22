@@ -11,10 +11,6 @@ use std::sync::Arc;
 use openai_protocol::{chat::ChatCompletionRequest, responses::ResponsesRequest};
 use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
-use smg_policy_controller::{
-    store::{GatewayId, LeasesStore},
-    tracking::TransportClass,
-};
 
 use super::super::HarmonyStreamingProcessor;
 use crate::{
@@ -25,16 +21,13 @@ use crate::{
         grpc::{
             common::{
                 response_formatting::TokenCounts, responses::streaming::ResponseStreamEventEmitter,
-                stages::ProcessStage,
             },
-            context::{self, test_support::assert_end, LoadGuards},
+            context,
             harmony::{
                 processor::{HarmonyResponseProcessor, ResponsesIterationResult},
-                stages::HarmonyResponseProcessingStage,
                 try_harmony_encoding,
             },
-            regular::streaming::tests::eof::{placed_stream_context, scripted_stream},
-            spec::{HarmonyResponseSpec, ResponseSpec},
+            regular::streaming::tests::eof::scripted_stream,
             utils,
         },
     },
@@ -127,57 +120,6 @@ fn chat_request(choices: u32, stream: bool) -> ChatCompletionRequest {
         request["stream_options"] = json!({"include_usage": true});
     }
     serde_json::from_value(request).expect("chat request")
-}
-
-#[tokio::test]
-async fn a_placed_harmony_chat_stream_says_its_tokens_only_when_it_completes() {
-    let tokens = harmony_tokens(None, "Hello!");
-    let counters = Counters {
-        prompt: 10,
-        cached: 0,
-        spec_accepted: 0,
-        spec_drafted: 0,
-    };
-    for complete in [true, false] {
-        let mut frames = frames(&tokens, 1, counters);
-        if !complete {
-            frames.pop();
-        }
-        let (stream, server) = scripted_stream(frames, "0").await;
-        let (mut ctx, store) = placed_stream_context(stream, dispatch()).await;
-        let placement = ctx
-            .load_guards
-            .as_ref()
-            .and_then(LoadGuards::placement)
-            .expect("the placement")
-            .clone();
-        let spec =
-            ResponseSpec::Harmony(HarmonyResponseSpec::Chat(Arc::new(chat_request(1, true))));
-        let response = HarmonyResponseProcessingStage::new()
-            .process(&mut ctx, spec)
-            .await
-            .expect("the stage succeeded")
-            .expect("a streaming response");
-        axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .expect("the stream's body");
-        if complete {
-            assert_end(
-                &placement.ends(),
-                &store,
-                200,
-                TransportClass::Ok,
-                10,
-                tokens.len() as u32,
-            );
-        } else {
-            assert!(placement.ends().lock().is_empty());
-            assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
-        }
-        drop(placement);
-        assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
-        server.abort();
-    }
 }
 
 #[tokio::test]

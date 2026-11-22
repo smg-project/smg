@@ -38,7 +38,6 @@ use smg_grpc_client::{
     tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
     SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
 };
-use smg_policy_controller::tracking::TransportClass;
 use smg_worker::{
     connection::engine::{
         AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, HealthAnswer, LoadSource,
@@ -738,7 +737,7 @@ enum Asked {
     NoWire,
     /// No answer of the engine's, with the reason: the status is the
     /// channel's own, as the request path classes it
-    /// ([`TonicStatusExt::transport_class`]).
+    /// ([`TonicStatusExt::is_no_answer`]).
     Lost(String),
 }
 
@@ -751,7 +750,7 @@ enum Asked {
 /// as an engine that speaks the wire, and the call is dropped there.
 async fn asked<T>(ask: impl Future<Output = Result<T, tonic::Status>>) -> Asked {
     match tokio::time::timeout(ASK_BOUND, ask).await {
-        Ok(Err(status)) if status.transport_class() == TransportClass::ConnectFailed => {
+        Ok(Err(status)) if status.is_no_answer() => {
             let reason = status.client_message();
             Asked::Lost(format!("the engine's health call got no answer: {reason}"))
         }

@@ -105,8 +105,7 @@ const CASE_CAP: Duration = Duration::from_secs(30);
 const FOREVER: Duration = Duration::from_secs(3_600);
 /// More chats than a rotation over two workers needs to start one on each:
 /// the bound of a case that sends chats until one starts on a given worker.
-/// Where a rotation starts is its policy's own: classic starts at the first
-/// worker registered, the policy engine at a drawn one.
+/// Where a rotation starts is its policy's own.
 const CHATS: usize = 4;
 /// How often a queued engine's gate lets a call through: five calls at once
 /// put the last one well past the bound, with an answer every turn.

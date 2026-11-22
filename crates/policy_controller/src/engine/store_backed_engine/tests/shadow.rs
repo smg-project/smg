@@ -35,11 +35,11 @@ use crate::{
     },
     stages::{lifecycle::Lifecycle, pickers::target_of, registry::StageRegistry},
     store::{
-        BatchFacts, BatchOutcome, ContentHash, Dispatch, KvEvent, KvEventSink, LeasesStore,
-        LoadSink, LoadSource, MemoryStore, Said, SequenceHash, Signals, StoredBlock, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, LeasesStore, LoadSink,
+        LoadSource, MemoryStore, SequenceHash, Signals, StoredBlock, WorkerFacts, WorkerStatus,
+        WorkersStore,
     },
-    tracking::lease::{LeaseId, Side},
+    tracking::lease::{Dispatch, LeaseId, Said, Side},
 };
 
 /// What a case's picker does with a decision.

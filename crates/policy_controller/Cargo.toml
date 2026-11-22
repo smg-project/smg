@@ -293,6 +293,10 @@ mock-worker = { path = "../mock_worker" }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1", default-features = false, features = ["pty"] }
 
+# The in-process bench's allocator: the gateway binary's, on the gateway's targets.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
+
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
@@ -515,6 +519,12 @@ harness = false
 [[bench]]
 name = "load_report_reader"
 harness = false
+
+# The in-process engine over a host's worker objects: a binary with switches.
+[[bench]]
+name = "in_process"
+harness = false
+required-features = ["in-process"]
 
 [lints]
 workspace = true

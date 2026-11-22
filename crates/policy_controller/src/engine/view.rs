@@ -808,6 +808,20 @@ pub struct Candidate {
     pub key: u32,
 }
 
+/// What a program says of a worker for the half of its record that no
+/// request changes, where the worker object holds no such fact: whether
+/// the worker takes images. A host that keeps such a fact beside its
+/// workers tells it to what writes the workers' records, once a list: a
+/// gateway of its own registrations, a controller of the stored worker an
+/// object stands for. The default says nothing. Further facts add their
+/// fields, so a host starts from the default and sets what it knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FixedFacts {
+    /// Whether the worker takes images ([`Candidate::vision`]).
+    pub vision: bool,
+}
+
 /// How far back the store's decision clock starts.
 pub(crate) const LOAD_REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
 
@@ -1323,6 +1337,27 @@ pub struct Constraints<'a> {
     /// the engine's table is the only one, as in a host that embeds the
     /// engine. In-process only.
     pub pins: Option<&'a dyn PinSource>,
+    /// The places of the pool's list the request may take, ascending, each
+    /// once, where its host holds it to a part of the pool: the workers a
+    /// retry may still take, the worker a request names, the workers that
+    /// meet its route's rule. `None`: every place.
+    ///
+    /// The request's own fact and no veto of a worker: no stage reads it,
+    /// and a profile that lists no filter is held to it like any other. A
+    /// decision's staged pass opens its set with these places and hands no
+    /// target outside them, and a pass that draws from the pool leaves
+    /// such a request to it. A keyed request's reads by place do not ask
+    /// them yet: until they do, the engine over worker lists declines a
+    /// request that states places, by name. They are places of the one
+    /// list a single request is decided over, and one set of places
+    /// cannot hold a pair's two lists: a pair that states any is declined
+    /// the same way, and the served controller states none.
+    ///
+    /// A request held to places whose every worker it already tried is
+    /// handed one of them again, not refused: the filter of tried
+    /// workers is soft, so the answer is the one a list of those workers
+    /// alone gives. In-process only.
+    pub places: Option<&'a [u32]>,
 }
 
 impl Constraints<'_> {

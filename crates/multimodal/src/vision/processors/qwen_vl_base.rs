@@ -22,7 +22,7 @@
 //! num_tokens = (grid_t * grid_h * grid_w) / merge_size²
 //! ```
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::TryReserveError};
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::{Array2, Array3};
@@ -1334,6 +1334,14 @@ impl ImageBatchPlan {
 }
 
 impl QwenVLProcessorBase {
+    /// The request's error for a patch buffer the allocator refuses.
+    fn refused(&self, error: TryReserveError) -> TransformError {
+        TransformError::ShapeError(format!(
+            "cannot reserve {} patch output: {error}",
+            self.config.model_name
+        ))
+    }
+
     /// The plan of a batch: every image's target size, grid and patch count
     /// (checked against overflow), the batch totals, the filter and the
     /// normalization the patch bytes carry.
@@ -1424,7 +1432,10 @@ impl QwenVLProcessorBase {
         let wire_len = batch.total_patch_values * element_size;
         // A pooled buffer: its bytes are a previous request's until the
         // bands below, which cover it exactly, are written.
-        let mut wire: Vec<u8> = buffer_pool::take(wire_len);
+        let mut wire: Vec<u8> = match buffer_pool::try_take(wire_len) {
+            Ok(wire) => wire,
+            Err(error) => return Some(Err(self.refused(error))),
+        };
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = wire.as_mut_slice();
         for plan in &batch.plans {
@@ -1677,7 +1688,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         // resize and patchify in parallel. A pooled buffer: its bytes are a
         // previous request's until the bands, which cover it exactly, are
         // written.
-        let mut all_patches: Vec<u8> = buffer_pool::take(total_patch_values);
+        let mut all_patches: Vec<u8> =
+            buffer_pool::try_take(total_patch_values).map_err(|error| self.refused(error))?;
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = all_patches.as_mut_slice();
         for plan in image_plans {
@@ -1786,7 +1798,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let plan = self.plan_video(frames.len(), width, height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
         // A pooled buffer, written end to end by the chunks below.
-        let mut all_patches = buffer_pool::take(plan.output_values);
+        let mut all_patches =
+            buffer_pool::try_take(plan.output_values).map_err(|error| self.refused(error))?;
         let mut out_idx = 0;
         let mut frame_rgbs = Vec::with_capacity(temporal_patch_size);
         for gt in 0..plan.grid_t {

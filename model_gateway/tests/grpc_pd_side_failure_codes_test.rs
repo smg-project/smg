@@ -64,8 +64,7 @@ const CASE_CAP: Duration = Duration::from_secs(30);
 const REASON: &str = "the engine says no";
 /// More chats than a rotation over two workers needs to start one on each:
 /// the bound of a case that sends chats until one starts on a given worker.
-/// Where a rotation starts is its policy's own: classic starts at the first
-/// worker registered, the policy engine at a drawn one.
+/// Where a rotation starts is its policy's own.
 const CHATS: usize = 4;
 
 /// What a mock engine does with a generate call.

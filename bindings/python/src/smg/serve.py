@@ -20,7 +20,7 @@ import time
 from abc import ABC, abstractmethod
 
 from smg.launch_router import launch_router
-from smg.router_args import RouterArgs, _policy_name
+from smg.router_args import RouterArgs
 
 logger = logging.getLogger("smg.serve")
 
@@ -1122,12 +1122,11 @@ class ServeOrchestrator:
                     self.args.data_parallel_size,
                 )
                 router_args.disable_circuit_breaker = True
-            # A single backend has nothing to balance across. Without a
-            # policy document, force passthrough so it keeps no KV index.
-            if (
-                getattr(router_args, "policy_spec", None) is None
-                and _policy_name(router_args.policy) != "passthrough"
-            ):
+            # A single backend has nothing to balance across, so force the
+            # passthrough policy (overriding any --policy). It keeps no KV
+            # index; the worker's load is read as under any policy (polled, or
+            # streamed by a servicer that pushes its records).
+            if router_args.policy != "passthrough":
                 logger.info(
                     "dp=%d: forcing router policy to passthrough (single backend; no KV index)",
                     self.args.data_parallel_size,

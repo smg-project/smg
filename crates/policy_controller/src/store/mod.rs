@@ -96,8 +96,7 @@ pub use kv_events::{
     SnapshotChunk, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,
 };
 pub use leases::{
-    DecodeMark, DecodeRefused, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState,
-    LeasesStore, PickRecord, Said, Sides,
+    DecodeMark, DecodeSide, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, PickRecord, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub(crate) use memory::DecodeIssue;

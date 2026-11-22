@@ -15,11 +15,12 @@ use dashmap::mapref::entry::Entry;
 
 use crate::{
     identity::{basic::Worker, endpoint::Endpoint},
-    metrics::writers::Metrics,
+    metrics::writers::{Metrics, WorkerHandles},
 };
 
 pub struct WorkerRoutingKeyLoad {
-    url: String,
+    /// The handles of the gauge it sets; they carry the worker URL.
+    metrics: WorkerHandles,
     /// Built by the first keyed request: the map takes four shards a CPU up
     /// front, and a worker that serves no sticky session never reads it.
     active_routing_keys: OnceLock<dashmap::DashMap<String, usize>>,
@@ -31,7 +32,7 @@ pub struct WorkerRoutingKeyLoad {
 impl WorkerRoutingKeyLoad {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
-            url: url.into(),
+            metrics: WorkerHandles::new(url),
             active_routing_keys: OnceLock::new(),
             active_keys: AtomicUsize::new(0),
         }
@@ -90,14 +91,14 @@ impl WorkerRoutingKeyLoad {
             Some(1..) => {}
             Some(0) => {
                 tracing::warn!(
-                    worker_url = %Endpoint::redacted_str(&self.url),
+                    worker_url = %Endpoint::redacted_str(self.metrics.url()),
                     routing_key = %routing_key,
                     "Attempted to decrement routing key counter that is already at 0"
                 );
             }
             None => {
                 tracing::warn!(
-                    worker_url = %Endpoint::redacted_str(&self.url),
+                    worker_url = %Endpoint::redacted_str(self.metrics.url()),
                     routing_key = %routing_key,
                     "Attempted to decrement non-existent routing key"
                 );
@@ -107,14 +108,14 @@ impl WorkerRoutingKeyLoad {
     }
 
     fn update_metrics(&self) {
-        Metrics::set_worker_routing_keys_active(&self.url, self.value());
+        Metrics::set_worker_routing_keys_active(&self.metrics, self.value());
     }
 }
 
 impl fmt::Debug for WorkerRoutingKeyLoad {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorkerRoutingKeyLoad")
-            .field("url", &self.url)
+            .field("url", &self.metrics.url())
             .field("active_routing_keys", &self.value())
             .finish()
     }

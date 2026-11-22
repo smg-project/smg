@@ -88,6 +88,27 @@ impl MediaPlan {
         counts
     }
 
+    /// The source class of the plan's media, read over every modality:
+    /// `none` for a plan without media, `inline` when every item is a
+    /// `data:` URL or carried bytes, `remote` when every item is a fetched
+    /// URL, `hybrid` for a mix. The class is the request's, not one
+    /// modality's: inline images beside a fetched clip are `hybrid`.
+    pub(crate) fn source_class(&self) -> &'static str {
+        let (mut inline, mut remote) = (0, 0);
+        for &modality in self.modalities() {
+            // The sources in the order `source_counts` writes them.
+            let [(_, url), (_, data_url), (_, bytes)] = self.source_counts(modality);
+            remote += url;
+            inline += data_url + bytes;
+        }
+        match (inline > 0, remote > 0) {
+            (false, false) => "none",
+            (true, false) => "inline",
+            (false, true) => "remote",
+            (true, true) => "hybrid",
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.parts.is_empty()
     }
@@ -1068,6 +1089,93 @@ pub(crate) mod tests {
             &parts[2],
             MediaContentPart::AudioUrl { url, .. } if url.as_str() == "audio-2"
         ));
+    }
+
+    /// An image part at `url`.
+    fn image_at(url: &str) -> MediaContentPart {
+        MediaContentPart::ImageUrl {
+            url: url.to_string().into(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }
+    }
+
+    /// An image part that carries its bytes.
+    fn image_bytes() -> MediaContentPart {
+        MediaContentPart::ImageData {
+            data: vec![1, 2, 3],
+            mime_type: Some("image/png".to_string()),
+            uuid: None,
+            detail: None,
+        }
+    }
+
+    /// An audio part at `url`.
+    fn audio_at(url: &str) -> MediaContentPart {
+        MediaContentPart::AudioUrl {
+            url: url.to_string().into(),
+            uuid: None,
+        }
+    }
+
+    /// A plan's source class is `none` without media, `inline` for `data:`
+    /// URLs and carried bytes, `remote` for fetched URLs and `hybrid` for a
+    /// mix, read over every modality: the class is the request's.
+    #[test]
+    fn a_plans_source_class_is_none_inline_remote_or_hybrid_over_every_modality() {
+        assert_eq!(MediaPlan::new([]).source_class(), "none");
+        assert_eq!(
+            MediaPlan::new([
+                image_at("data:image/png;base64,aGVsbG8="),
+                image_bytes(),
+                audio_at("data:audio/wav;base64,aGVsbG8="),
+            ])
+            .source_class(),
+            "inline",
+            "a data: URL and carried bytes, over two modalities"
+        );
+        assert_eq!(
+            MediaPlan::new([
+                image_at("https://example.com/a.png"),
+                audio_at("https://example.com/a.wav"),
+            ])
+            .source_class(),
+            "remote",
+            "fetched URLs alone, over two modalities"
+        );
+        assert_eq!(
+            MediaPlan::new([image_at("https://example.com/a.png"), image_bytes()]).source_class(),
+            "hybrid",
+            "one of each in one modality"
+        );
+        assert_eq!(
+            MediaPlan::new([image_bytes(), audio_at("https://example.com/a.wav")]).source_class(),
+            "hybrid",
+            "inline images beside a fetched clip: the class is not the images' alone"
+        );
+    }
+
+    /// The images a request is observed with are the plan's image items:
+    /// text is no media, and a part of another modality changes the class,
+    /// not the count.
+    #[test]
+    fn a_plan_counts_its_images_apart_from_its_source_class() {
+        let text = || MediaContentPart::Text {
+            text: "hi".to_string(),
+        };
+
+        let plan = MediaPlan::new([image_bytes(), text()]);
+        assert_eq!(plan.count(Modality::Image), 1);
+        assert_eq!(plan.source_class(), "inline");
+
+        let plan = MediaPlan::new([image_bytes(), audio_at("https://example.com/a.wav")]);
+        assert_eq!(plan.count(Modality::Image), 1);
+        assert_eq!(plan.source_class(), "hybrid");
+
+        let plan = MediaPlan::new([text()]);
+        assert_eq!(plan.count(Modality::Image), 0);
+        assert_eq!(plan.source_class(), "none");
     }
 
     #[test]

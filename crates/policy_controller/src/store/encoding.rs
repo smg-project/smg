@@ -43,6 +43,7 @@
 use rustc_hash::FxHashMap;
 
 use super::pairing::{known, normalize};
+use crate::engine::EncoderFacts;
 
 #[cfg(test)]
 mod tests;
@@ -254,6 +255,34 @@ impl EncodeClasses {
     /// it, and at every place when there is no class.
     pub fn prefill_class(&self, place: usize) -> u32 {
         self.prefills.get(place).copied().unwrap_or(0)
+    }
+
+    /// What a decision reads of each encoder beside its row
+    /// ([`EncoderFacts`]), one for each of `offers`: the offers the encoders
+    /// state, in the order the classes were derived in.
+    ///
+    /// An encoder's class is the one it has here: `0` where it states no
+    /// end, where there is no class, and for an offer past the encoders
+    /// derived. It pushes where its registration states the pushing form,
+    /// with its role or without. It takes an item's references where its
+    /// offer says so.
+    ///
+    /// The store writes these on a model's encode pool. A host that holds
+    /// its own lists of workers writes them for its encoders by this one
+    /// rule.
+    pub fn encoder_facts<'a, C>(&self, offers: impl IntoIterator<Item = &'a EncodeOffer>) -> C
+    where
+        C: FromIterator<EncoderFacts>,
+    {
+        let stated = offers
+            .into_iter()
+            .enumerate()
+            .map(|(at, offer)| EncoderFacts {
+                class: self.encoders.get(at).copied().unwrap_or(0),
+                pushes: offer.handoff == EncodeHandoff::Push,
+                references: offer.references,
+            });
+        stated.collect()
     }
 
     /// How many classes there are: the distinct ends the encoders state.

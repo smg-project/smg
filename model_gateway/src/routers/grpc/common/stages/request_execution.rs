@@ -38,7 +38,9 @@ use crate::{
         common::{
             attempt_ledger::{
                 is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+                Charges,
             },
+            pd_admission,
             pd_failure::{PdSide, SidePhase},
             prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
@@ -49,8 +51,7 @@ use crate::{
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
-                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, Placement,
-                WorkerSelection,
+                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             multimodal::ec_push::PushCleanup,
             proto_wrapper::{
@@ -275,10 +276,16 @@ pub(crate) async fn execute_plan(
     // encode jobs' SHM unclaimed for the duration: under the burst this gate
     // targets, holding it would queue a second scarce resource behind the
     // decode window and throw the finished encode work away on a shed. The
-    // gate abstains when the engine reports no window. A pair the policy
-    // controller placed is committed ahead of the wait, so its bookings
-    // outlast it.
-    let admission = ctx.admit(sub_requests).await?;
+    // gate abstains when the engine reports no window.
+    let admission = match ctx
+        .workers
+        .as_ref()
+        .and_then(WorkerSelection::decode_worker)
+    {
+        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
+        None => None,
+    };
+
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers a rendezvous plan's encode jobs and
     // their SHM Drop guards here: dispatch consumes them, while an early
@@ -299,17 +306,10 @@ pub(crate) async fn execute_plan(
     // request retried on it.
     let ledger = &ctx.ledger;
 
-    let guards = LoadGuards::at_dispatch(
-        workers,
-        ctx.sticky_key.as_deref(),
-        sub_requests,
-        ctx.placed.take().map(|placed| *placed),
-        Instant::now(),
-    );
-    ctx.load_guards = Some(LoadGuards::admitted(admission, guards));
-    // A sequential pair the controller placed ends its prefill's side at
-    // the phase's end: the dispatch reads the placement its guards hold.
-    let placement = ctx.load_guards.as_ref().and_then(LoadGuards::placement);
+    ctx.load_guards = Some(LoadGuards::admitted(
+        admission,
+        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
+    ));
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
     pin_grouped_dp_rank(
@@ -403,7 +403,6 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
-                    placement,
                 ))
                 .await
             }
@@ -422,7 +421,6 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
-                    placement,
                 ))
                 .await
                 .map_err(|mut response| {
@@ -444,7 +442,6 @@ pub(crate) async fn execute_plan(
                     prefill_guard,
                     ledger,
                     dispatched_at.into_std(),
-                    placement,
                 )
                 .await
             }
@@ -457,22 +454,10 @@ pub(crate) async fn execute_plan(
     let result = match deadline {
         Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
             Ok(result) => result,
-            Err(_) => {
-                // The timeout is the decode's that was waited on: the one a
-                // second ask moved the pair to, where it moved.
-                let moved = placement.and_then(|placement| placement.moved(workers));
-                let waited_on = moved.as_ref().unwrap_or(workers);
-                Err(dispatch_timed_out(deadline, waited_on, ledger, request_id))
-            }
+            Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
         },
         None => dispatch.await,
     };
-    // A pair's decode that was asked again behind its prefill's answer and
-    // moved: the attempt's selection names the decode that was sent, for
-    // the response's stages and for a retry.
-    if let Some(moved) = placement.and_then(|placement| placement.moved(workers)) {
-        ctx.workers = Some(moved);
-    }
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
     // replay would send it again.
@@ -569,11 +554,6 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
-/// `placement` is the placement of a pair the policy controller placed,
-/// committed ahead of the admission gate. A sequential dispatch ends the
-/// prefill's side on it at its last drain ([`Placement::prefill_ended`]).
-/// A parallel dispatch says no prefill end yet: both sides end with the
-/// response.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
@@ -584,7 +564,6 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -620,7 +599,6 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
-                placement,
             )
             .await
         }
@@ -796,7 +774,6 @@ async fn execute_epd_dispatch(
     encode_watch: &mut Option<EncodeWatch>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
@@ -809,7 +786,6 @@ async fn execute_epd_dispatch(
         ledger,
         None,
         encode_watch.clone(),
-        placement,
     )
     .await;
     if result.is_ok() {
@@ -974,7 +950,6 @@ async fn execute_batch_dispatch(
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
-    placement: Option<&Placement>,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -1010,7 +985,6 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
-                            placement,
                         )
                         .await
                     }
@@ -1192,7 +1166,7 @@ async fn execute_single(
     let streaming = proto_request.stream();
     let worker = workers.single();
     if let Some(worker) = worker {
-        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.as_ref());
     }
     // The call's future is boxed, as the disaggregated sides' are: it is the
     // large part of the dispatch, and inlined in the pipeline's future it
@@ -1391,7 +1365,7 @@ async fn execute_embed(
     let worker = workers.single();
     let calls = requests.into_iter().map(|request| {
         if let Some(worker) = worker {
-            WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+            WorkerMetrics::record_worker_request(worker.as_ref());
         }
         client.embed(request)
     });
@@ -1556,7 +1530,7 @@ async fn execute_parallel_pd(
         .into_iter()
         .flatten()
     {
-        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.as_ref());
     }
     // The side is booked on its worker here, before its call is polled: a
     // servicer that sends its headers with the first message answers the
@@ -1879,7 +1853,7 @@ fn parallel_side_failed_first(
         {
             Retirement::PartnerSilent
         } else {
-            Retirement::PartnerFailed
+            Retirement::PartnerFailed(sides.ledger.charges().clone())
         };
         retire_pd_side(
             side.partner(),
@@ -2128,13 +2102,15 @@ pub(crate) fn pd_start_failure_response(
 /// Why a PD side still dispatching is retired off the request path (see
 /// [`retire_pd_side`]), and what its late result is worth to its worker's
 /// record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum Retirement {
     /// Its partner failed to start, and the request with it. The side's own
     /// late failure is still this request's one word on its worker: sampled
-    /// on the breaker and counted as a dispatch's is. A late stream is
-    /// aborted and earns no success: the side never produced anything.
-    PartnerFailed,
+    /// on the breaker through the request's charges, so the attempts of one
+    /// request charge the worker once, and counted as a dispatch's is. A late
+    /// stream is aborted and earns no success: the side never produced
+    /// anything.
+    PartnerFailed(Charges),
     /// Its partner, the prefill, fell silent: the request charged that
     /// prefill where its bound passed, and this side's late result is not its
     /// worker's fault (the handoff it waited for never came), so it is
@@ -2157,22 +2133,25 @@ pub(crate) enum Retirement {
 }
 
 impl Retirement {
-    fn cause(self) -> &'static str {
+    fn cause(&self) -> &'static str {
         match self {
-            Self::PartnerFailed => "its partner failed",
+            Self::PartnerFailed(_) => "its partner failed",
             Self::PartnerSilent => "its partner fell silent",
             Self::Silent => "its silence bound passed",
             Self::HandoffSilent => "its first-token bound passed during the handoff",
         }
     }
 
-    fn defer_abort(self) -> bool {
+    fn defer_abort(&self) -> bool {
         matches!(self, Self::PartnerSilent | Self::HandoffSilent)
     }
 
-    /// Whether the late result is this request's word on the worker.
-    fn charges(self) -> bool {
-        matches!(self, Self::PartnerFailed)
+    /// The request's charges, where the late result is its word on the worker.
+    fn charges(&self) -> Option<&Charges> {
+        match self {
+            Self::PartnerFailed(charges) => Some(charges),
+            Self::PartnerSilent | Self::Silent | Self::HandoffSilent => None,
+        }
     }
 }
 
@@ -2205,11 +2184,11 @@ pub(crate) fn retire_pd_side(
 ) {
     tokio::spawn(async move {
         let result = dispatch.await;
-        if let Some(status) = result
-            .breaker_status()
-            .filter(|_| retirement.charges() && result.is_err())
-        {
-            worker.record_outcome(status);
+        if let (Some(charges), Some(status)) = (
+            retirement.charges(),
+            result.breaker_status().filter(|_| result.is_err()),
+        ) {
+            charges.record_outcome(worker.as_ref(), status);
         }
         let cause = retirement.cause();
         match result {
@@ -2226,7 +2205,7 @@ pub(crate) fn retire_pd_side(
                     drop(stream);
                 }
             }
-            Err(error) if retirement.charges() => {
+            Err(error) if retirement.charges().is_some() => {
                 UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
                 error!(
                     function = "retire_pd_side",
@@ -2895,10 +2874,11 @@ pub(crate) mod tests {
             "a late failure after the prefill fell silent is not the decode worker's fault"
         );
         assert!(Retirement::PartnerSilent.defer_abort());
-        assert!(!Retirement::PartnerSilent.charges());
-        assert!(Retirement::PartnerFailed.charges());
-        assert!(!Retirement::PartnerFailed.defer_abort());
-        assert!(!Retirement::Silent.charges());
+        assert!(Retirement::PartnerSilent.charges().is_none());
+        let partner_failed = Retirement::PartnerFailed(Charges::default());
+        assert!(partner_failed.charges().is_some());
+        assert!(!partner_failed.defer_abort());
+        assert!(Retirement::Silent.charges().is_none());
     }
 
     /// A side retired because its partner failed to start samples only a late
@@ -2926,7 +2906,7 @@ pub(crate) mod tests {
             "grpc",
             Arc::clone(&decode),
             late,
-            Retirement::PartnerFailed,
+            Retirement::PartnerFailed(Charges::default()),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
@@ -2935,6 +2915,50 @@ pub(crate) mod tests {
             decode.circuit_breaker_state(),
             CircuitState::Open,
             "the late stream earned no success between the two failures"
+        );
+    }
+
+    /// Two attempts of one request each retire the decode side after the
+    /// prefill failed to start: the side's late failures are that request's
+    /// one word on its worker, so a breaker set to two stays closed and the
+    /// next request's failure opens it.
+    #[tokio::test]
+    async fn the_retired_sides_of_one_request_charge_one_breaker_failure() {
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30003")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let mut workers = tokenspeed_pair();
+        if let WorkerSelection::Disaggregated { decode: side, .. } = &mut workers {
+            *side = Arc::clone(&decode);
+        }
+        let ledger = AttemptLedger::default();
+        let sides = PdSides::of(&workers, &ledger, &tokenspeed_request(1, None), false);
+        let refused = tonic::Status::unavailable("prefill refused");
+        for _attempt in 0..2 {
+            let late = answers_after(Duration::ZERO);
+            drop(parallel_side_failed_first(
+                &sides,
+                PdSide::Prefill,
+                &refused,
+                late,
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "one request charged the retired decode worker once an attempt"
+        );
+        AttemptLedger::default().record_outcome(decode.as_ref(), 503);
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "the retired side's late failure was charged once: the next request's opens the breaker"
         );
     }
 

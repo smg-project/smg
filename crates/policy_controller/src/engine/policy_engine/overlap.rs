@@ -1011,16 +1011,22 @@ struct Asked<'a> {
 /// decision's instant ([`RequestFacts::now_micros`]) on the one clock of the
 /// engine's decisions.
 ///
-/// A profile whose stages read no affinity, and a request whose host filled
-/// a column or named rows itself, pass straight to `decide`. A profile that
-/// reads affinity and is named no row (it shows its rows to a plugin, whose
-/// stage reads the column whole) is handed the column [`column()`] fills, in
+/// A request whose host filled a column or named rows itself passes straight
+/// to `decide`. So does every request of a phase none of whose bindings
+/// reads affinity ([`Engine::needs_for_phase`]): that is one test, and the
+/// list keeps no table for it. Under a document where another binding of
+/// the phase reads affinity, a profile that reads none passes on behind its
+/// list's table, which says so. A profile that reads affinity and is named
+/// no row (it shows its rows to a plugin, whose stage reads the column
+/// whole) is handed the column [`column()`] fills, in
 /// [`RequestFacts::affinity`].
 ///
 /// The rows live in the calling thread's buffers until this returns:
 /// `decide` reads them and keeps nothing of them. Nothing is allocated once
 /// the buffers have grown, but where a table is read: once a list, and then
 /// by one decision a second.
+///
+/// [`Engine::needs_for_phase`]: crate::engine::Engine::needs_for_phase
 pub fn decide(
     affinity: &Affinity,
     pool: &PoolAffinity,
@@ -1030,7 +1036,9 @@ pub fn decide(
     facts: &mut RequestFacts<'_>,
     decide: impl FnOnce(&mut RequestFacts<'_>) -> Decision,
 ) -> Decision {
-    if !facts.affinity.is_empty() || facts.named.is_some() {
+    // No binding of the phase reads affinity: one test, and no table.
+    let unread = !spec.engine().needs_for_phase(facts.phase).affinity;
+    if unread || !facts.affinity.is_empty() || facts.named.is_some() {
         return decide(facts);
     }
     debug_assert_eq!(workers.len(), ids.len(), "one id a worker of the list");

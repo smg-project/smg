@@ -635,12 +635,23 @@ What the syntax says, and what the assembler does with it:
   tagged syntax, since no member can be written for it. Before this the held bytes left as the
   word's text at both ends, and a chat client read `city="Par` as content next to a call whose
   arguments stopped at the member before. Outside a call the two endings differ: at the close a
-  name that never got its `(` comes back as `Malformed` with its own reason and the list's
-  wrapping before any call is dropped; at the stream's end what was held comes back as
-  `Malformed { UnterminatedRegion }`.
+  name that never got its `(` comes back as `Malformed`, a lone name or a word of prose as the
+  rule below has it, and the list's wrapping before any call is dropped; at the stream's end
+  what was held comes back as `Malformed { UnterminatedRegion }`.
 - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
   value, as the old parser's regular expression allowed it; a name or a key is the text less
   that whitespace.
+- **A name no `(` follows is a lone name or a word of prose.** A row is the words that
+  whitespace alone separates on one line. Every word of a row of two or more leaves as
+  `Malformed { TextBetweenCalls }`, as free text between calls does, the last one whatever ends
+  it (`sunny]`). A row of one word leaves as `Malformed { NameWithoutACall }`: a name alone on
+  its line, before a `,` or at the region's end, and a word that a character no name holds
+  parts from its neighbours (the `I` of `I'm`, `get_weather: Paris`, the `Enjoy` of
+  `sunny! Enjoy`), so that a tool named and not called keeps its own reason. Such a character
+  ends the row before it and leaves as text itself (a `,` or a bracket as the list's wrapping),
+  and the whitespace after it is dropped: a sentence it parts is one stretch of text a row, not
+  one stretch. The three pythonic tables share the rule: the list between markers (`olmo3`,
+  `lfm2.5`) and the turn's bare list once a call opened it (`llama4`).
 - **A list bare in the turn** (`Assembler::bare`, which the engine picks for a table no row of
   which enters the arguments state, as it picks the bare JSON list): a `[` is held with the name
   after it until a `(` says it opens a list, or anything else gives it back as content. At the

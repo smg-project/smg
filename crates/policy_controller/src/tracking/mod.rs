@@ -12,7 +12,7 @@ pub use decision_guard::DecisionGuard;
 pub use dispatch_credit::{CreditedDispatches, DispatchCounts, DispatchCredit, DispatchCreditPass};
 pub use in_flight::{InFlightBuffers, PoolInFlightCounts, WorkerSlot};
 pub use lease::{
-    EventKind, EventSet, Lease, LeaseId, LeaseKind, Membership, Outcome, ReleaseReason, Side,
-    Signal, TransportClass,
+    Dispatch, EventKind, EventSet, Lease, LeaseId, LeaseKind, Membership, Outcome, ReleaseReason,
+    Said, Side, Signal, TransportClass,
 };
 pub use prefix_predictor::{DeepestPrefix, PrefixPredictor};

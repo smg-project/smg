@@ -1207,6 +1207,7 @@ pub struct McpTool {
     pub server_url: Option<String>,
     pub authorization: Option<String>,
     /// Custom headers to send to MCP server (from request payload, not HTTP headers)
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub headers: Option<HashMap<String, String>>,
     pub server_label: String,
     pub server_description: Option<String>,
@@ -3914,6 +3915,7 @@ pub struct ResponsesRequest {
     /// string values up to 512 characters (the public API's limits)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(custom(function = "validate_metadata"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub metadata: Option<HashMap<String, Value>>,
 
     /// Model to use

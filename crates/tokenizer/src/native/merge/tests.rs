@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, HashSet};
 
 use rustc_hash::FxHashMap;
-use tiktoken_rs::CoreBPE;
+use tiktoken_rs::{byte_pair_split, CoreBPE};
 use tokenizers::{
     models::{
         bpe::{Merges, Vocab, BPE},
@@ -498,6 +498,47 @@ fn a_rank_set_the_table_cannot_stand_in_for_declines() {
             .to_string(),
         "ranks up to 1073741825 on a table bounded at 4194304"
     );
+}
+
+/// `from_ranks` proves a token from two halves unless a pair across the cut
+/// merges first; each declined set below fails one comparison of that proof.
+#[test]
+fn a_token_is_declined_when_a_pair_across_its_halves_merges_first() {
+    // Merges in rank order from 256; the last one forms the token in question.
+    for (merges, taken) in [
+        // `bc` merges before the left half `ab` forms.
+        ([("b", "c"), ("a", "b"), ("c", "d"), ("ab", "cd")], false),
+        // `bc` merges before the right half `cd` forms.
+        ([("b", "c"), ("c", "d"), ("a", "b"), ("ab", "cd")], false),
+        // A tie: `ab` + `ab` across the cut ranks with the right half's
+        // `abab`, and the leftmost of a tie merges first.
+        (
+            [("a", "b"), ("ab", "ab"), ("abab", "c"), ("ab", "ababc")],
+            false,
+        ),
+        // `bc` ranks over both halves: nothing crosses the cut first.
+        ([("a", "b"), ("c", "d"), ("b", "c"), ("ab", "cd")], true),
+        // A tie of the halves' own steps: the walk meets `ab` + `ab`, and the
+        // right one formed last, so the pair before it is `ab` + `a` (`aba`,
+        // which ranks under it), not `b` + `ab`.
+        ([("ab", "a"), ("a", "b"), ("ab", "b"), ("ab", "abb")], false),
+    ] {
+        let ranks = ranks_of(&merges, false);
+        assert_eq!(
+            MergeTable::from_ranks(&ranks)
+                .err()
+                .map(|declined| declined.to_string()),
+            (!taken).then(|| "token 259 is not the merge of its bytes".to_string()),
+            "{merges:?}"
+        );
+        // The plain merge of the token's bytes says the same.
+        let token = format!("{}{}", merges[3].0, merges[3].1);
+        assert_eq!(
+            byte_pair_split(token.as_bytes(), &ranks) == [token.as_bytes()],
+            taken,
+            "{merges:?}"
+        );
+    }
 }
 
 #[test]

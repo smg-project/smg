@@ -56,13 +56,9 @@ use crate::{
 const HOST_URL: &str = "grpc://worker.invalid:53177";
 const MODEL_ID: &str = "sample-model";
 
-/// A host's connection to one engine. Its load answer states the
-/// requests waiting in the engine's queue: the host's count where it knows
-/// one.
-#[derive(Debug, Default)]
-struct HostConnection {
-    waiting: Option<i32>,
-}
+/// A host's connection to one engine.
+#[derive(Debug)]
+struct HostConnection;
 
 #[async_trait]
 impl EngineConnection for HostConnection {
@@ -95,7 +91,7 @@ impl EngineConnection for HostConnection {
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
         let rank = SchedulerLoadSnapshot {
             num_running_reqs: 37,
-            num_waiting_reqs: self.waiting.unwrap_or(29),
+            num_waiting_reqs: 29,
             ..Default::default()
         };
         Ok(WorkerLoadResponse {
@@ -143,7 +139,7 @@ impl EngineConnector for HostConnector {
         runtime: RuntimeType,
     ) -> Result<Arc<dyn EngineConnection>, String> {
         if url == HOST_URL {
-            return Ok(Arc::new(HostConnection::default()));
+            return Ok(Arc::new(HostConnection));
         }
         BackendConnector::shared().connect_grpc(url, runtime).await
     }
@@ -157,61 +153,6 @@ impl EngineConnector for HostConnector {
             return Ok(());
         }
         BackendConnector::shared().dial_grpc(url, timeout).await
-    }
-}
-
-/// The host's engines, each at its address, and the requests each states
-/// waiting in its queue.
-const QUEUES: [(&str, i32); 3] = [
-    ("grpc://first.invalid:53177", 9),
-    ("grpc://second.invalid:53177", 1),
-    ("grpc://third.invalid:53177", 5),
-];
-
-/// The host owns the [`QUEUES`] addresses, with no listener at any. Its
-/// engines state the table's queues moved `turn` addresses along, so the
-/// shortest queue stands at each address in some turn.
-#[derive(Debug)]
-struct QueueConnector {
-    turn: usize,
-}
-
-impl QueueConnector {
-    /// The address whose engine states the table's shortest queue.
-    fn shortest(&self) -> &'static str {
-        let (least, _) = (0..QUEUES.len())
-            .map(|at| (at, self.queue_at(at)))
-            .min_by_key(|&(_, waiting)| waiting)
-            .unwrap();
-        QUEUES[least].0
-    }
-
-    /// The queue the engine at the table's place `at` states.
-    fn queue_at(&self, at: usize) -> i32 {
-        QUEUES[(at + self.turn) % QUEUES.len()].1
-    }
-}
-
-#[async_trait]
-impl EngineConnector for QueueConnector {
-    async fn connect_grpc(
-        &self,
-        url: &str,
-        _: RuntimeType,
-    ) -> Result<Arc<dyn EngineConnection>, String> {
-        let engine = QUEUES.iter().position(|(address, _)| *address == url);
-        let at = engine.ok_or_else(|| format!("the host has no engine at {url}"))?;
-        Ok(Arc::new(HostConnection {
-            waiting: Some(self.queue_at(at)),
-        }))
-    }
-
-    async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
-        BackendConnector::shared().connect_zmq(link).await
-    }
-
-    async fn dial_grpc(&self, _: &str, _: Duration) -> Result<(), String> {
-        Ok(())
     }
 }
 
@@ -451,7 +392,7 @@ impl EngineConnection for HostLoads {
     }
 
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        HostConnection::default().get_loads().await
+        HostConnection.get_loads().await
     }
 
     async fn flush_cache(&self, timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
@@ -569,22 +510,6 @@ async fn the_load_port_publishes_the_host_connections_report() {
     assert_eq!(report.loads[0].num_waiting_reqs, 29);
 }
 
-/// The gateway's context with the policy controller picked and no
-/// controller's address, under `policy`: it decides in its own process,
-/// over the worker data a gateway keeps with the setting off.
-async fn gateway_in_process(policy: PolicyConfig, extensions: Extensions) -> Arc<AppContext> {
-    let router = RouterConfig {
-        policy_controller: true,
-        policy,
-        ..RouterConfig::default()
-    };
-    let app = build_app_context(&ServerConfig::minimal(router), extensions)
-        .await
-        .unwrap();
-    assert!(app.in_process.is_some());
-    app
-}
-
 /// One poll of `worker`'s group by the gateway's load monitor, each of the
 /// group's engines through its own connection.
 async fn poll_once(app: &AppContext, worker: &dyn Worker) {
@@ -598,49 +523,10 @@ async fn poll_once(app: &AppContext, worker: &dyn Worker) {
     poll_group_once_for_test(monitor, &key, Duration::from_secs(11), Instant::now()).await;
 }
 
-/// With the policy controller picked and no controller's address, a
-/// placement follows what a host's connections state in their polled load
-/// answers. The gateway's context is built with the host's connector, and
-/// each engine registers through it. The load monitor polls each engine
-/// through its connection and publishes the answers. `least_load` reads
-/// that feed, and the gateway's placement puts the request on the engine
-/// that states the shortest queue: at each of the three addresses in turn,
-/// so the placement follows the answers and not the engines' order.
-#[tokio::test]
-async fn a_placement_follows_the_queue_a_host_connections_polled_answer_states() {
-    let least_load: PolicyConfig =
-        serde_json::from_value(serde_json::json!({ "type": "least_load" })).unwrap();
-    for turn in 0..QUEUES.len() {
-        let host = QueueConnector { turn };
-        let shortest = host.shortest();
-        let host = Extensions::new().connector(Arc::new(host));
-        let app = gateway_in_process(least_load.clone(), host).await;
-        let mut first = None;
-        for (url, _) in QUEUES {
-            let worker = register_grpc(&app, url).await;
-            first.get_or_insert(worker);
-        }
-        poll_once(&app, first.unwrap().as_ref()).await;
-
-        let placed = select_single(
-            &app.worker_registry,
-            &app.policy_registry,
-            MODEL_ID,
-            RoutingPool::GrpcPipelineRegular,
-            None,
-            PlacementInputs::default(),
-        )
-        .unwrap();
-        assert_eq!(placed.url(), shortest, "turn {turn}");
-        assert_host_connection(placed.as_ref()).await;
-    }
-}
-
 /// On each stock gRPC wire an engine states a value by name in its answer
-/// to a load poll. With the policy controller picked and no controller's
-/// address, the gateway's own client reads the list and the load monitor
-/// publishes it: the feed the gateway's policies read holds each engine's
-/// own value under its name.
+/// to a load poll. The gateway's own client reads the list and the load
+/// monitor publishes it: the feed the gateway's policies read holds each
+/// engine's own value under its name.
 #[tokio::test]
 async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name() {
     const NAME: &str = "free_slots";
@@ -650,7 +536,13 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
         SchedulerWire::Vllm,
         SchedulerWire::Sglang,
     ] {
-        let app = gateway_in_process(PolicyConfig::RoundRobin, Extensions::new()).await;
+        let router = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            ..RouterConfig::default()
+        };
+        let app = build_app_context(&ServerConfig::minimal(router), Extensions::new())
+            .await
+            .unwrap();
         let mut engines = Vec::new();
         for free in [10.0, 40.0, 70.0] {
             let url = mock_grpc_engine_stating(wire, NAME, UNIT, free).await;
@@ -683,43 +575,33 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
 /// registry builds a model's own policy at a local registration and keeps
 /// it while a local worker serves the model, so a model that only peers'
 /// workers serve has none: the placement reads the default policy for it.
-/// With the policy controller picked and no controller's address that is as
-/// with the setting off.
-///
-/// This case changes when the policy engine decides a profile that places
-/// otherwise than a rotation: under a supplied document, a model no local
-/// worker serves is then placed by the profile of its own binding.
 #[tokio::test]
 async fn a_model_only_a_peers_worker_serves_is_placed_by_the_default_policy() {
-    for picked in [false, true] {
-        let router = RouterConfig {
-            policy_controller: picked,
-            policy: PolicyConfig::RoundRobin,
-            ..RouterConfig::default()
-        };
-        let host = Extensions::new().connector(Arc::new(HostConnector));
-        let app = build_app_context(&ServerConfig::minimal(router), host)
-            .await
-            .unwrap();
-        assert_eq!(app.in_process.is_some(), picked);
-        let worker = import_worker(&app);
-        // The model the peer's worker serves, as its specification names it.
-        let model = worker.model_id().to_owned();
-        assert!(!app.worker_registry.serves_model_locally(&model));
-
-        let policies = &app.policy_registry;
-        assert!(policies.get_policy(&model).is_none(), "picked {picked}");
-        let read = policies.get_policy_or_default(&model);
-        assert!(Arc::ptr_eq(&read, &policies.get_default_policy()));
-        let placed = select_single(
-            &app.worker_registry,
-            policies,
-            &model,
-            RoutingPool::GrpcPipelineRegular,
-            None,
-            PlacementInputs::default(),
-        )
+    let router = RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        ..RouterConfig::default()
+    };
+    let host = Extensions::new().connector(Arc::new(HostConnector));
+    let app = build_app_context(&ServerConfig::minimal(router), host)
+        .await
         .unwrap();
-        assert!(Arc::ptr_eq(&placed, &worker), "picked {picked}");
-    }
+    let worker = import_worker(&app);
+    // The model the peer's worker serves, as its specification names it.
+    let model = worker.model_id().to_owned();
+    assert!(!app.worker_registry.serves_model_locally(&model));
+
+    let policies = &app.policy_registry;
+    assert!(policies.get_policy(&model).is_none());
+    let read = policies.get_policy_or_default(&model);
+    assert!(Arc::ptr_eq(&read, &policies.get_default_policy()));
+    let placed = select_single(
+        &app.worker_registry,
+        policies,
+        &model,
+        RoutingPool::GrpcPipelineRegular,
+        None,
+        PlacementInputs::default(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&placed, &worker));
 }
