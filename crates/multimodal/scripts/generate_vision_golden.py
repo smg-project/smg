@@ -3,8 +3,9 @@
 
 This script generates reference outputs from HuggingFace transformers
 that are used to verify the Rust image preprocessors produce identical results.
-Every processor is read from the hub at a pinned commit, so a hub repository
-that moves cannot change a reference.
+Every processor read from the hub is read at a pinned commit (llama4_vision
+reads none: it uses transformers' defaults), so a hub repository that moves
+cannot change a reference.
 
 Usage:
     # Generate all golden outputs
