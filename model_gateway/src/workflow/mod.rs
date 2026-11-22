@@ -8,6 +8,7 @@ pub mod steps;
 pub mod tokenizer_registration;
 pub mod wasm_module_registration;
 pub mod wasm_module_removal;
+pub(crate) mod worker_events;
 
 // Worker management (registration, removal)
 // Typed workflow data structures

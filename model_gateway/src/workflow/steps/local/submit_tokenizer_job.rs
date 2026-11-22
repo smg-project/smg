@@ -12,9 +12,12 @@ use smg_worker::{identity::basic::ConnectionMode, workflow::WorkerKind};
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::{
-    data::{require_app_context, WorkerWorkflowData},
-    Job, TokenizerConfigRequest, TokenizerLoadFailure,
+use crate::{
+    app_context::AppContext,
+    workflow::{
+        data::{require_app_context, WorkerWorkflowData},
+        Job, JobQueue, TokenizerConfigRequest, TokenizerLoadFailure,
+    },
 };
 
 /// Step: Submit tokenizer registration job for the worker's model
@@ -71,79 +74,15 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
             .and_then(|m| m.chat_template.clone())
             .or_else(|| app_context.router_config.chat_template.clone());
 
-        // Get cache config from router config
-        let cache_config = app_context.router_config.tokenizer_cache.to_option();
-
         for worker in workers {
-            let model_id = worker.model_id().to_string();
-
-            let tokenizer_path: String = if let Some(source) = tokenizer_source(
+            submit_tokenizer_job(
+                app_context,
+                job_queue,
+                worker.model_id(),
                 labels,
-                app_context.router_config.tokenizer_path.as_deref(),
-                app_context.router_config.model_path.as_deref(),
-            ) {
-                source.to_string()
-            } else {
-                // Nothing of this worker's loads the model's tokenizer. Unless
-                // the model has one already (another worker's or the
-                // operator's registration) or a load of it is in flight (that
-                // load decides), record it, so that requests are answered with
-                // the fact instead of a retry hint.
-                let recorded = !app_context.tokenizer_registry.contains(&model_id)
-                    && app_context
-                        .tokenizer_load_failures
-                        .record(&model_id, TokenizerLoadFailure::NoSource);
-                warn!(
-                    "No tokenizer source for model {} (checked the worker's tokenizer_path, model_path and model_id labels and the router config){}",
-                    model_id,
-                    if recorded {
-                        "; its requests answer 503 tokenizer_load_failed until a tokenizer is registered"
-                    } else {
-                        ""
-                    }
-                );
-                continue;
-            };
-
-            // Note: We don't check if tokenizer already exists here.
-            // The registry.load() handles deduplication gracefully (returns AlreadyExists).
-            // This simplifies the code and ensures consistent behavior.
-
-            info!(
-                "Submitting tokenizer registration job for model {} from {}",
-                model_id, tokenizer_path
-            );
-
-            // Create tokenizer config request
-            let config = TokenizerConfigRequest {
-                id: TokenizerRegistry::generate_id(),
-                name: model_id.clone(),
-                source: tokenizer_path,
-                chat_template_path: chat_template.clone(),
-                cache_config: cache_config.clone(),
-                fail_on_duplicate: false,
-                for_worker: true,
-            };
-
-            // Submit job (fire-and-forget, don't wait for completion); the
-            // queue counts the accepted load in flight for the model.
-            if let Err(e) = job_queue
-                .submit(Job::AddTokenizer {
-                    config: Box::new(config),
-                })
-                .await
-            {
-                warn!(
-                    "Failed to submit tokenizer job for model {}: {}",
-                    model_id, e
-                );
-                app_context.tokenizer_load_failures.record(
-                    &model_id,
-                    TokenizerLoadFailure::Failed(format!(
-                        "the registration job was not accepted: {e}"
-                    )),
-                );
-            }
+                chat_template.clone(),
+            )
+            .await;
         }
 
         Ok(StepResult::Success)
@@ -151,6 +90,82 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false // Job submission failures are not retryable at this level
+    }
+}
+
+/// Submits the job that loads the tokenizer of `model_id` for a worker with
+/// `labels`: a local registration's step and a mesh import share it.
+pub(crate) async fn submit_tokenizer_job(
+    app_context: &AppContext,
+    job_queue: &JobQueue,
+    model_id: &str,
+    labels: &HashMap<String, String>,
+    chat_template: Option<String>,
+) {
+    let tokenizer_path: String = if let Some(source) = tokenizer_source(
+        labels,
+        app_context.router_config.tokenizer_path.as_deref(),
+        app_context.router_config.model_path.as_deref(),
+    ) {
+        source.to_string()
+    } else {
+        // Nothing of this worker's loads the model's tokenizer. Unless
+        // the model has one already (another worker's or the
+        // operator's registration) or a load of it is in flight (that
+        // load decides), record it, so that requests are answered with
+        // the fact instead of a retry hint.
+        let recorded = !app_context.tokenizer_registry.contains(model_id)
+            && app_context
+                .tokenizer_load_failures
+                .record(model_id, TokenizerLoadFailure::NoSource);
+        warn!(
+            "No tokenizer source for model {} (checked the worker's tokenizer_path, model_path and model_id labels and the router config){}",
+            model_id,
+            if recorded {
+                "; its requests answer 503 tokenizer_load_failed until a tokenizer is registered"
+            } else {
+                ""
+            }
+        );
+        return;
+    };
+
+    // Note: We don't check if tokenizer already exists here.
+    // The registry.load() handles deduplication gracefully (returns AlreadyExists).
+    // This simplifies the code and ensures consistent behavior.
+
+    info!(
+        "Submitting tokenizer registration job for model {} from {}",
+        model_id, tokenizer_path
+    );
+
+    // Create tokenizer config request
+    let config = TokenizerConfigRequest {
+        id: TokenizerRegistry::generate_id(),
+        name: model_id.to_string(),
+        source: tokenizer_path,
+        chat_template_path: chat_template,
+        cache_config: app_context.router_config.tokenizer_cache.to_option(),
+        fail_on_duplicate: false,
+        for_worker: true,
+    };
+
+    // Submit job (fire-and-forget, don't wait for completion); the
+    // queue counts the accepted load in flight for the model.
+    if let Err(e) = job_queue
+        .submit(Job::AddTokenizer {
+            config: Box::new(config),
+        })
+        .await
+    {
+        warn!(
+            "Failed to submit tokenizer job for model {}: {}",
+            model_id, e
+        );
+        app_context.tokenizer_load_failures.record(
+            model_id,
+            TokenizerLoadFailure::Failed(format!("the registration job was not accepted: {e}")),
+        );
     }
 }
 
