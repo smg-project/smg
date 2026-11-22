@@ -146,9 +146,7 @@ impl ConsistentHashingPolicy {
     /// eligible, and the request moves to no other worker.
     ///
     /// O(1) parse + O(1) bounds check + O(1) health check. The one reading
-    /// of the header: this policy's pick, and a route that narrows its
-    /// candidates to the target ahead of a policy engine
-    /// (`placement::targeted`).
+    /// of the header, for this policy's pick.
     pub(crate) fn target_among(
         workers: &[Arc<dyn Worker>],
         headers: Option<&http::HeaderMap>,

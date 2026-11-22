@@ -27,6 +27,7 @@ use ndarray::Array2;
 
 use super::qwen_vl_base::pixel_norm;
 use crate::{
+    buffer_pool,
     encoder_inputs::{
         EncoderDtype, EncoderInput, ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
     },
@@ -314,10 +315,12 @@ fn resized_frame<'a>(
     })
 }
 
-/// The three channel planes of `width` x `height` interleaved RGB bytes.
+/// The three channel planes of `width` x `height` interleaved RGB bytes, in
+/// buffers of the pool: every byte of a plane is written here.
 fn planes(data: &[u8], width: usize, height: usize) -> [Vec<u8>; 3] {
     let pixels = width * height;
-    let mut planes = [vec![0u8; pixels], vec![0u8; pixels], vec![0u8; pixels]];
+    debug_assert_eq!(data.len(), pixels * CHANNELS);
+    let mut planes: [Vec<u8>; 3] = std::array::from_fn(|_| buffer_pool::take(pixels));
     let [red, green, blue] = &mut planes;
     for (((pixel, r), g), b) in data
         .as_chunks::<CHANNELS>()
@@ -373,7 +376,17 @@ fn patchify_group(
                             &mut slot[channel * channel_block..(channel + 1) * channel_block];
                         for (y, line) in block.chunks_exact_mut(patch).enumerate() {
                             let start = (top + y) * width + left;
-                            line.copy_from_slice(&plane[start..start + patch]);
+                            let source = &plane[start..start + patch];
+                            // The released patch size is known here, so its line
+                            // is copied by two moves and not by a call.
+                            if let (Ok(line), Ok(source)) = (
+                                <&mut [u8; DEFAULT_PATCH_SIZE]>::try_from(&mut *line),
+                                <&[u8; DEFAULT_PATCH_SIZE]>::try_from(source),
+                            ) {
+                                *line = *source;
+                            } else {
+                                line.copy_from_slice(source);
+                            }
                         }
                     }
                 }
@@ -389,6 +402,10 @@ fn patchify_group(
             }
         }
     }
+    frame_planes
+        .into_iter()
+        .flatten()
+        .for_each(buffer_pool::recycle);
 }
 
 /// Muse Spark image and video processor.
@@ -482,7 +499,7 @@ impl MuseSparkVisionProcessor {
                     let first = settings.plan(height, width)?;
                     original = (width as u32, height as u32);
                     rows_per_group = first.grid_h * first.grid_w;
-                    out = vec![0u8; groups * rows_per_group * features];
+                    out = buffer_pool::take(groups * rows_per_group * features);
                     plan = Some(first);
                     first
                 }
@@ -603,7 +620,7 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
             total_rows += plan.grid_h * plan.grid_w;
             plans.push(plan);
         }
-        let mut out = vec![0u8; total_rows * features];
+        let mut out = buffer_pool::take(total_rows * features);
         let mut tokens = Vec::with_capacity(images.len());
         let mut sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 3);
@@ -968,6 +985,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn another_patch_size_keeps_the_reading_order() {
+        // Patch 16 is not the released size, so its lines take the plain copy.
+        // 64x32: four patch columns, the left half red and the right half blue.
+        let image = RgbImage::from_fn(64, 32, |x, _| {
+            Rgb(if x < 32 { [200, 0, 0] } else { [0, 0, 200] })
+        });
+        let config = PreProcessorConfig::from_json(r#"{"patch_size": 16}"#).unwrap();
+        let output = MuseSparkVisionProcessor::from_preprocessor_config(&config)
+            .preprocess(&[&DynamicImage::ImageRgb8(image)])
+            .unwrap();
+        assert_eq!(output.encoder_input.shape(), &[8, 1536]);
+        let values = output.encoder_input.as_f32().into_owned();
+        for index in 0..8 {
+            // The end of the last patch line of the red and of the blue plane.
+            let (r, b) = (values[[index, 255]], values[[index, 767]]);
+            let red = index % 4 < 2;
+            assert_eq!((r > 0.0, b > 0.0), (red, !red), "row {index}");
+        }
+    }
+
     /// A 16-bit grey image in a container longer than its samples gives the
     /// bytes of the exact image.
     #[test]
@@ -1097,6 +1135,48 @@ mod tests {
         // The same frame as an image gets the image cap instead.
         let plan = MuseSparkVisionProcessor::image_plan(1280, 720, &image_config()).unwrap();
         assert_eq!((plan.grid_h, plan.grid_w, plan.tokens), (52, 92, 1196));
+    }
+
+    /// A batch's and a clip's patch rows are buffers of the pool, and so are an
+    /// image's channel planes: with the rows written out, all are back in their
+    /// classes, and the next run writes the same bytes into them.
+    #[test]
+    fn a_batch_and_a_clip_take_their_rows_and_planes_from_the_pool() {
+        use crate::buffer_pool::{self, BufferPool};
+
+        static BATCH: BufferPool = BufferPool::new();
+        static CLIP: BufferPool = BufferPool::new();
+        let frame = DynamicImage::ImageRgb8(RgbImage::from_fn(700, 700, |x, y| {
+            Rgb([x as u8, y as u8, (x ^ y) as u8])
+        }));
+        let frames = [frame.clone(), frame.clone()];
+        let image = MuseSparkVisionProcessor::from_preprocessor_config(&image_config());
+        let video = MuseSparkVisionProcessor::from_preprocessor_config(&video_config());
+        let clip = VideoClipOptions::sampled_at(2.0);
+        let bytes = |output: Result<PreprocessedEncoderInputs, TransformError>| {
+            output
+                .unwrap()
+                .encoder_input
+                .into_bytes_as(EncoderDtype::Uint8)
+                .unwrap()
+        };
+        let reused = |pool: &'static BufferPool, kept: usize, run: &dyn Fn() -> Vec<u8>| {
+            buffer_pool::with_pool(pool, || {
+                let first = run();
+                assert_eq!(pool.held(), kept, "the buffers went back to their classes");
+                assert!(run() == first, "the bytes differ on the reused buffers");
+            });
+        };
+        // 700x700 keeps its size as an image: 2,940,000 bytes of rows and three
+        // planes of 490,000 bytes.
+        reused(&BATCH, (4 << 20) + 3 * (512 << 10), &|| {
+            bytes(image.preprocess(&[&frame]))
+        });
+        // A clip's frame shrinks to 448x448: 1,204,224 bytes of rows; its planes
+        // are under the pool's smallest class.
+        reused(&CLIP, 2 << 20, &|| {
+            bytes(video.preprocess_video(&frames, &clip))
+        });
     }
 
     #[test]

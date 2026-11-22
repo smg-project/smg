@@ -3,6 +3,7 @@
 //! for equality and reads none.
 
 use super::{hands_to, EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer};
+use crate::engine::EncoderFacts;
 
 /// One worker as a case writes it: its runtime (empty when unknown) and the
 /// end it states.
@@ -340,4 +341,48 @@ fn the_classes_hold_exactly_the_handoffs_the_rule_makes_worker_by_worker() {
         .map(|class| classes.list(class)[0])
         .collect();
     assert!(firsts.is_sorted());
+}
+
+/// What a decision reads of an encoder beside its row comes from its class
+/// and its own offer. A pusher that states no role has no class and still
+/// pushes. An encoder that processes references says so whatever its class.
+/// An offer past the encoders the classes were derived from takes class `0`,
+/// and so does every offer where there is no class.
+#[test]
+fn an_encoders_facts_are_its_class_and_what_its_offer_states() {
+    let mut reads = meeter("rt-b");
+    reads.offer.references = true;
+    let encoders = [
+        pusher("rt-a", "c1"),
+        silent("rt-a").form(EncodeHandoff::Push).on("c1"),
+        reads,
+        silent("rt-a"),
+    ];
+    let classes = derive(&encoders, &[taker("rt-a", "c1"), meeter("rt-b")]);
+    assert_eq!(classes.encoders(), [1, 0, 2, 0]);
+    let of = |class, pushes, references| EncoderFacts {
+        class,
+        pushes,
+        references,
+    };
+    let offers = || encoders.iter().map(|worker| &worker.offer);
+    let facts: Vec<EncoderFacts> = classes.encoder_facts(offers());
+    let stated = [
+        of(1, true, false),
+        of(0, true, false),
+        of(2, false, true),
+        of(0, false, false),
+    ];
+    assert_eq!(facts, stated);
+
+    // One offer more than the classes were derived from.
+    let late = pusher("rt-a", "c1");
+    let facts: Vec<EncoderFacts> = classes.encoder_facts(offers().chain([&late.offer]));
+    assert_eq!(facts[..4], stated);
+    assert_eq!(facts[4], of(0, true, false));
+
+    // No class at all: each offer keeps what it states.
+    let facts: Vec<EncoderFacts> = EncodeClasses::default().encoder_facts(offers());
+    let unclassed = stated.map(|fact| EncoderFacts { class: 0, ..fact });
+    assert_eq!(facts, unclassed);
 }

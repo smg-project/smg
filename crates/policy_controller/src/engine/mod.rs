@@ -18,6 +18,8 @@ pub(crate) mod decision_engine;
 pub(crate) mod decision_slot;
 pub(crate) mod demands;
 pub(crate) mod framework;
+#[cfg(feature = "in-process")]
+pub(crate) mod lease_events;
 pub(crate) mod pair_classes;
 #[cfg(feature = "in-process")]
 pub(crate) mod policy_engine;
@@ -25,6 +27,7 @@ pub(crate) mod prefix_pass;
 pub(crate) mod prompt_hashes;
 #[cfg(feature = "in-process")]
 pub(crate) mod records;
+pub(crate) mod shadow;
 pub(crate) mod sticky_sessions;
 pub(crate) mod store_backed_engine;
 pub(crate) mod view;
@@ -36,7 +39,10 @@ pub use decision::{
 };
 #[cfg(feature = "in-process")]
 pub use decision_engine::WorkerLists;
-pub use decision_engine::{AlonePick, Decided, DecisionEngine, HeldDecision, Plain, RequestMaker};
+pub use decision_engine::{
+    AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, HeldDecode,
+    Leased, Plain, Request, RequestMaker, SweepOutcome,
+};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{
@@ -58,13 +64,13 @@ pub use policy_engine::{PolicyEngine, PoolMembers};
 pub use prompt_hashes::{HashSeeds, PromptHashes};
 #[cfg(feature = "in-process")]
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
+pub use shadow::SHADOW_ROWS;
 pub use sticky_sessions::{
     SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
     ABSENT_WORKER_PIN_TTL_MICROS,
 };
 pub use store_backed_engine::{
-    DecideOutcome, DecisionExplanation, DecisionNames, DecisionRecord, DecisionRefused, Leased,
-    Request, StoreBackedEngine, SweepOutcome, SHADOW_ROWS,
+    DecisionExplanation, DecisionNames, DecisionRecord, StoreBackedEngine,
 };
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,

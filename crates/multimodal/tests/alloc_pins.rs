@@ -613,6 +613,42 @@ const VIDEO_CALLS: Calls = Calls {
 };
 const VIDEO_LARGE: usize = 4;
 
+/// The Inkling processor's rescaled path walks the resized image where the resize left it:
+/// it allocates what the resize and the plain preprocess of the resized image allocate,
+/// less the one copy the plain path takes of an RGB8 image, three bytes a pixel.
+#[test]
+fn an_inkling_rescale_copies_no_resized_image() {
+    use llm_multimodal::vision::processors::InklingImageProcessor;
+
+    let _window = window();
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
+    let plain = InklingImageProcessor::new();
+    let config = PreProcessorConfig::from_json(r#"{"rescale_image_frac": 2.0}"#).expect("config");
+    let rescaled = InklingImageProcessor::from_preprocessor_config(&config).expect("processor");
+    let small = DynamicImage::ImageRgb8(RgbImage::from_fn(320, 240, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+    }));
+    let resized = resize_lanczos_pil(&small, 640, 480);
+    // Warm: the first pass pays for whatever the thread keeps.
+    drop(rescaled.preprocess(&[&small]).expect("warm"));
+    drop(plain.preprocess(&[&resized]).expect("warm"));
+    let whole = counted(|| rescaled.preprocess(&[&small]).expect("preprocess")).1;
+    let resize = counted(|| resize_lanczos_pil(&small, 640, 480)).1;
+    let walk = counted(|| plain.preprocess(&[&resized]).expect("preprocess")).1;
+    assert_eq!(
+        (
+            resize.calls + walk.calls - whole.calls,
+            resize.bytes + walk.bytes - whole.bytes
+        ),
+        (1, 3 * 640 * 480),
+        "the rescaled preprocess allocates no copy of the resized image"
+    );
+}
+
 /// A processor that composites the alpha channel itself reads an RGBA8 image where it
 /// stands: against the same pixels given as RGB8, its preprocess allocates the composited
 /// bytes and nothing else, one call of three bytes a pixel.

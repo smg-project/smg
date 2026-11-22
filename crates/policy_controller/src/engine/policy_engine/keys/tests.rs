@@ -13,11 +13,10 @@ use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
         decision::{Decision, MAX_TARGETS},
-        decision_engine::{DecisionEngine, RequestMaker, WorkerLists},
+        decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
         policy_engine::{PolicyEngine, PoolMembers},
         records::{self, Live},
         sticky_sessions::SessionVerdict,
-        store_backed_engine::{DecideOutcome, Request},
         view::{Constraints, Identity, RequestFacts, WorkerId},
     },
     store::GatewayId,

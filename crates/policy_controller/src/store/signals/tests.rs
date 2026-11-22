@@ -13,9 +13,8 @@ use serde_json::{json, Value};
 use crate::{
     document::{AppliedSpec, Needs, PolicySpec, API_VERSION},
     engine::{
-        store_backed_engine::{Request, StoreBackedEngine},
-        Candidate, Constraints, LoadRow, Phase, RequestFacts, Role, Scorer, TieBand, WireModes,
-        WorkerId,
+        decision_engine::Request, store_backed_engine::StoreBackedEngine, Candidate, Constraints,
+        LoadRow, Phase, RequestFacts, Role, Scorer, TieBand, WireModes, WorkerId,
     },
     load::SignalColumn,
     stages::{Lifecycle, StageRegistry},

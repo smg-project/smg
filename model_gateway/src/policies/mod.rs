@@ -3,15 +3,10 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{
-    any::TypeId,
-    fmt::Debug,
-    sync::{Arc, OnceLock},
-};
+use std::{any::TypeId, fmt::Debug, sync::Arc};
 
 use openai_protocol::UNKNOWN_MODEL_ID;
 use rand::RngExt as _;
-use smg_policy_controller::engine::PoolMembers;
 use smg_worker::{identity::basic::Worker, load::state::LoadReceiver, runtime::RoutingState};
 
 use crate::{config::CacheIndexKind, policies::hash_ring::HashRing};
@@ -40,7 +35,6 @@ mod classic_sticky_override_rows;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
-mod engine_policy;
 pub mod expected_wait;
 mod factory;
 pub mod hash_ring;
@@ -66,7 +60,6 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
-pub use engine_policy::EnginePolicy;
 pub use factory::PolicyFactory;
 pub use least_load::LeastLoadPolicy;
 pub use manual::{ManualConfig, ManualPolicy};
@@ -74,7 +67,7 @@ pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
-pub use registry::{DocumentOrigin, PolicyRegistry, Side};
+pub use registry::{PolicyRegistry, Side};
 pub use round_robin::RoundRobinPolicy;
 // The periodic task lives beside the worker runtime. The path it had here is
 // kept: the policies name it.
@@ -177,8 +170,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// `consistent_hashing`). The override leaves such a policy its own
     /// handling and places a keyed request of every other policy. The
     /// registry asks the policy, and never reads its name for it: a name is
-    /// a label, and a profile of a policy document may be called anything.
-    /// A constant for the policy's lifetime.
+    /// a label. A constant for the policy's lifetime.
     fn honors_routing_key(&self) -> bool {
         false
     }
@@ -237,8 +229,6 @@ pub(crate) fn as_bucket(policy: &dyn LoadBalancingPolicy) -> Option<&BucketPolic
 
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
-/// The policy object that asks the policy engine is built for a profile
-/// that tests a worker's health itself ([`EnginePolicy::of`]).
 ///
 /// The policy says its type once and the types are compared as values, so
 /// a type late in the list costs a compare for each type ahead of it and
@@ -247,7 +237,6 @@ pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolic
     let policy = policy.as_any().type_id();
     policy == TypeId::of::<RandomPolicy>()
         || policy == TypeId::of::<RoundRobinPolicy>()
-        || policy == TypeId::of::<EnginePolicy>()
         || policy == TypeId::of::<LeastLoadPolicy>()
         || policy == TypeId::of::<PowerOfTwoPolicy>()
         || policy == TypeId::of::<CacheAwarePolicy>()
@@ -563,13 +552,6 @@ pub struct NamedList<'a> {
     /// Candidate `k` is `list[positions[k]]`, ascending; `None` when the
     /// candidates are the whole list in its order.
     pub positions: Option<&'a [usize]>,
-    /// The routing snapshot's cell for what the policy engine keeps of the
-    /// list, when the caller drew the list from a snapshot's pool: the
-    /// policy object that asks the engine fills it at its first pick over
-    /// the list and finds it there at each pick after, with no lookup
-    /// ([`EnginePolicy`]). `None` for a list no such cell hangs beside. A
-    /// classic policy reads nothing of it.
-    pub members: Option<&'a OnceLock<Box<PoolMembers>>>,
 }
 
 impl NamedList<'_> {
@@ -588,7 +570,6 @@ impl Debug for NamedList<'_> {
         f.debug_struct("NamedList")
             .field("list", &self.list.len())
             .field("positions", &self.positions.map(<[usize]>::len))
-            .field("members", &self.members.map(|cell| cell.get().is_some()))
             .finish()
     }
 }

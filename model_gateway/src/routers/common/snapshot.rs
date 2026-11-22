@@ -10,7 +10,6 @@ use std::{
 };
 
 use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
-use smg_policy_controller::engine::PoolMembers;
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load,
@@ -21,7 +20,10 @@ use symphony::grammar::GrammarStart;
 
 use crate::{
     policies::hash_ring::HashRing,
-    routers::common::pair_index::{PdPairIndex, PdWire},
+    routers::{
+        common::pair_index::{PdPairIndex, PdWire},
+        grpc::multimodal::MediaFacts,
+    },
 };
 
 /// Static routing pool inside a model snapshot.
@@ -74,8 +76,7 @@ impl RoutingPool {
     }
 
     /// Whether `worker` is a member of this pool: the one rule of
-    /// membership. The snapshot projects its pools by it, and a route asks
-    /// it of a worker handed to it from outside the snapshot.
+    /// membership. The snapshot projects its pools by it.
     pub(crate) fn matches(self, worker: &dyn Worker) -> bool {
         match self {
             Self::HttpRegular => {
@@ -185,14 +186,13 @@ pub struct ModelWorkerSnapshot {
     /// What the workers of this generation say together, kept with the
     /// model id it was read for (see [`Self::labels`]).
     labels: OnceLock<(Box<str>, ModelLabels)>,
+    /// What the media gates read from the workers of this generation
+    /// together (see [`Self::media`]). `MediaFacts` stays with the gates in
+    /// `routers::grpc::multimodal`, so this module depends on that one.
+    media: OnceLock<MediaFacts>,
     /// The consistent-hash ring over the URLs of this generation's members
     /// (see [`Self::hash_ring`]).
     hash_ring: OnceLock<Arc<HashRing>>,
-    /// What the policy engine keeps of each pool (see
-    /// [`Self::pool_members_cell`]), each in a box of its own: the value
-    /// stands on cache lines of its own, and a snapshot no engine picks
-    /// over holds the empty cells alone.
-    pool_members: [OnceLock<Box<PoolMembers>>; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -204,8 +204,8 @@ impl ModelWorkerSnapshot {
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
+            media: OnceLock::new(),
             hash_ring: OnceLock::new(),
-            pool_members: std::array::from_fn(|_| OnceLock::new()),
         }
     }
 
@@ -278,6 +278,17 @@ impl ModelWorkerSnapshot {
             .labels
             .get_or_init(|| (model_id.into(), read(&self.all)));
         (**spelling == *model_id).then_some(labels)
+    }
+
+    /// What the media gates read from the snapshot's workers together:
+    /// `read` reads them on the first media request after the membership
+    /// change, every request after it reads the kept answers. They hang on
+    /// the workers' labels, connection modes and engines, which a worker
+    /// holds from its construction (see [`Self::labels`]), and on no model
+    /// id as spelled, so one snapshot keeps one value. The rules stay with
+    /// the media gates.
+    pub(crate) fn media(&self, read: impl FnOnce(&[Arc<dyn Worker>]) -> MediaFacts) -> &MediaFacts {
+        self.media.get_or_init(|| read(&self.all))
     }
 
     /// The consistent-hash ring over the URLs of this generation's members,
@@ -358,21 +369,6 @@ impl ModelWorkerSnapshot {
                 ))
             })
             .clone()
-    }
-
-    /// The cell for what the policy engine keeps of `pool`, as the placement
-    /// hands it on beside the pool's name ([`NamedList::members`]): the
-    /// pool's own list ([`Self::pool`]) and the word a rotation counts its
-    /// turns in. The policy object that asks the engine fills the cell at
-    /// its first pick over the pool and borrows the value at each pick
-    /// after. A registry holds one engine, the one its policies ask, so
-    /// one engine fills a snapshot's cells. Nothing is built for a pool no
-    /// such policy picks over, and nothing that changes while the
-    /// membership stands is kept: a worker's health stays on the worker.
-    ///
-    /// [`NamedList::members`]: crate::policies::NamedList::members
-    pub(crate) fn pool_members_cell(&self, pool: RoutingPool) -> &OnceLock<Box<PoolMembers>> {
-        &self.pool_members[pool.index()]
     }
 
     /// The workers of `pool`, projected once per snapshot and borrowed from

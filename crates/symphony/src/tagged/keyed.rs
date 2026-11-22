@@ -37,7 +37,7 @@ use std::borrow::Cow;
 
 use super::object::{Mode, Object};
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, CallEnd, DropReason, Event, Events, MalformedReason, Text},
     markers::Scanner,
     tagged::{
         end_cut_call, held_text, refuse,
@@ -356,6 +356,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.object.index,
             source: Text::uncounted(terminal.to_owned()),
+            ended: CallEnd::Closed,
         });
         self.done = true;
     }

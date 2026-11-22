@@ -174,24 +174,6 @@ Once the prefill is dispatched, `store.issue_decode(gateway, id, decode, now)` c
 
 `LeasesStore::expire` returns both sides as the sweep left them. For example, a completed decode stays `Completed` when its prefill is released as abandoned.
 
-### In the gateway
-
-The gateway shipped in this checkout runs the controller in its own process with `--policy-controller on`. Without the flag, routing uses the gateway's classic policies. `--print-policy-spec` prints the document the routing flags mean, and exits. The Python launcher takes `--policy-controller`, `--policy-spec` and the four options of a gateway that follows a controller. It does not take `--print-policy-spec`.
-
-**The document.** The gateway runs the policy document its routing flags mean. To run a document of your own, add `--policy-spec FILE`. A document replaces the routing flags: the command line refuses a routing flag typed beside `--policy-spec`, and the Python launcher refuses one that is not at its default. A document that names no generation starts as number 1. A program that embeds the gateway and registers stages of its own names them in that document, as [Register a Rust stage](#register-a-rust-stage) shows.
-
-**What it serves.** The regular HTTP router asks the controller in the gateway's process for the worker of a typed request or a transcription. It refuses by name, with `not_decided_by_policy_controller` (HTTP 501), a request that carries `x-smg-target-worker` for a model whose routing policy is consistent hashing: the classic policy holds such a request to the worker it names, and the controller reads no named worker yet. Under any other policy the header changes nothing, as under the classic policies. The regular gRPC router asks the controller for each request it places. Where the request itself narrows the workers that may take it, the router narrows the pool first, as under the classic policies, and the controller decides over the workers that are left: a request with media input, one with a context demand that a worker's window binds, a retry under a decoding rule, and one that carries `x-smg-target-worker` for a model whose routing policy is consistent hashing. Under a controller's address that router refuses these four shapes by name with `not_decided_by_policy_controller` (HTTP 501). The gRPC router of a prefill and decode pair asks it for the pair. The HTTP router of a pair asks it for each attempt's pair and takes the prefill through prefill admission. It refuses a request that carries `x-smg-target-worker` by the same name, where the pair's prefill or decode policy is consistent hashing. Both do so where the gateway's policy document plans pairs and the gateway follows no controller's address. Elsewhere each returns `not_decided_by_policy_controller` (HTTP 501) for every request: under a document that plans no pair, and under a controller's address. The gRPC router of an encode, prefill and decode plan returns it for every request. Under the policy controller the document that the routing settings mean plans one family for every model: pairs under the prefill-decode mode, single workers under the regular mode. A gateway of many routers serves a model of the other family under the classic policies and refuses it under the controller. To serve both, supply a policy document that binds each family: a `pd-pair` binding that matches the prefill and decode phases, ahead of a `single` binding. A provider's router, the realtime routes and the proxied GET routes serve as they do under the classic policies.
-
-**Workers.** With the flag on and no controller's address, the gateway keeps its workers as it does without the flag. Its registry holds them, registration and removal run the same worker workflows, its health checks probe them, and the worker API answers as it does under the classic policies. Under a controller's address the gateway's store mirrors that controller, and the gateway's worker workflows write no row there. There a row's worker object is built from the row, and reads the defaults in what no row states.
-
-**Rows.** The gateway serves the workers its policy controller decides over on its control plane: its own registered workers, or the policy store's rows under a controller's address. `GET /policy/snapshot` returns them in registration key order under the generation that runs, at most 1,024 a call. `models` keeps the rows that serve one of the models it names, at most 128, and `limit` cuts the page. A page also ends at 2 MiB of rows, and its `truncated` says that rows were left out. The page has no cursor, so a fleet past the cap is read by model. The call needs the `admin` role, and each address is told without its userinfo.
-
-**Cache events.** With the flag on and no controller's address, the gateway reads its workers' cache events as it does without the flag. Under a controller's address the gateway reads no events: the controller does.
-
-**Provider modes.** In a provider mode (`openai`, `anthropic`, `gemini`) without `--enable-igw`, every router of the gateway is the provider's, and the setting moves nothing. Such a router places its requests by no routing policy, so the gateway starts no controller and says so in one log line at the start. A `--policy-spec` document or a `--policy-controller-address` beside it is refused by name. With `--enable-igw` the gateway also serves self-hosted workers, and the controller stays in force for them.
-
-**Following a controller.** With the flag on, `--policy-controller-address <host:port>` makes the gateway follow a standalone controller's workers. It takes the controller's worker watch into its policy store, a snapshot first and then each change, and it discovers, registers and probes no worker itself. It keeps one worker object for each row. The object's status is the row's, so the controller's health verdict decides which workers the gateway may send to. `--policy-controller-tls-ca-cert`, `--policy-controller-tls-cert` and `--policy-controller-tls-key` name the PEM files of that connection. A client certificate needs its key and the authority's file. Readiness waits for the first whole snapshot and its worker objects, and the worker API's writes answer HTTP 409 `WORKER_CONTROLLER_OWNED`. The mode builds on Linux and macOS. A request is still decided in the gateway's own process, over the rows the controller tells: the gateway asks the controller for no decision yet.
-
 ### Standalone service
 
 Build from a checkout with `protoc` available. The service feature uses the worker protocol files from the checkout. The stock binary requires the `controller` and `worker-host` features. With either one missing, cargo builds no binary and says nothing. Save the first policy document above as `policy.yaml`, then run the following from the checkout root.
@@ -551,25 +533,6 @@ A host that keeps no store builds the cells itself, as before.
 
 The stock schema takes any stage name, written bare or mapped to an object, and lists the stock names in each entry's description. Validate an extended document against the host's catalog: the validator refuses a name the catalog does not hold, by its path. Stateful scorers and pickers can observe issue, dispatch, completion, release, membership and signals when the host supplies them. A stage that keeps a number of each worker's load report says so through `Lifecycle::keeps_loads`. The controller then tells it every report before a decision can read that report, through `Lifecycle::on_signal`. A stage that does not say so is told no report. In process the load signal names two more things: the worker's slot in the host's counts and the report's sample instant. A host that builds the signal itself fills both. A scorer of your own can state a pick's overlap too: implement `Scorer::states_overlap` and `Scorer::said`. Both have a default that says nothing. `said` is asked once a decision, of the first target alone. The standalone validator refuses stages that declare a need for the full lifecycle. [Runnable Rust example](../../examples/policy-controller) · [StageRegistry API](src/stages/registry.rs)
 
-A gateway binary of your own can take the same catalog. Build it as the `stages` function of [`examples/policy-controller`](../../examples/policy-controller) does, set it on `server::Extensions` and start through the gateway library's `main_with`.
-
-```rust
-smg::stock_allocator!();
-
-fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let extensions = Extensions::new().stages(stages()?);
-    main_with(extensions)
-}
-```
-
-The library sets no allocator. Write `smg::stock_allocator!();` once at the root of your `main.rs` to run on jemalloc with the stock executable's server options. That one line is all: the gateway finds out at its start which allocator serves the process, and publishes the allocator's metrics where it is jemalloc. On MSVC and musl the macro expands to nothing. A build without the macro runs on the system allocator, or on an allocator of its own. The gateway then says once on stderr that the process does not run on the stock allocator and that the allocator's statistics are off. The check needs the `jemalloc-stats` feature, which is on by default, and is not made on MSVC or musl.
-
-The gateway validates its policy document over that catalog at startup, where the policy controller is selected. A refusal stops the start and names what was refused. The gateway keeps its tenant header out of the document's view.
-
-The document the routing flags mean names stock stages alone. To run a stage of yours, name it in a document of your own and start the gateway with `--policy-controller on` and `--policy-spec FILE`. The document replaces the routing flags: a routing flag typed beside it is refused by name.
-
-The same gateway startup can take a worker connector. With an `Arc<dyn EngineConnector>` in `connector`, use `Extensions::new().stages(stages()?).connector(connector)`. The gateway uses it for worker probes and engine connections. Delegate to `BackendConnector::shared()` for workers that use the gateway's own client. Inference over gRPC or ZMQ requires that client. If the connection provides the engine's load reports, let the worker runtime be the only poller of that engine's load.
-
 ### Load a WebAssembly component
 
 Compile a component for the `smg:policy` package, at the version the WIT file names. The `policy` world takes records. `policy-packed` takes byte blocks with the layout given in the WIT. The host refuses imports from WASI. It provides log, clock, counter and seeded random calls. A component implements `init`, a decision resource with filter, score and pick, and `observe`. A score answer can carry `tie-band` on the scores' 0 to 1 scale: rows within that band of the best score tie, and the host uses its default band where the guest sends none. The host keeps instances per decider and meters their calls.
@@ -641,7 +604,7 @@ Use `apiVersion: smg.policy/v1` and at least one profile. Both YAML and JSON use
 | `apiVersion` | Required. Only `smg.policy/v1` is accepted. |
 | `generation` | Unsigned 64-bit number, default 0. Zero asks the service to number it. See [Updating a document](#updating-a-document). |
 | `profiles.<name>` | One to 65535 profiles. `filter` and `score` default to empty. `pick` is required. Stage mappings have one name. `sent_ttl_ms` is optional and positive. It sets how many milliseconds a send counts for in the profile's tally of sends (`StageBuild::dispatch_credit`). Left unset, a send ends at a report of the row sampled at or after it, or at the row's removal. The 8,192 sends a row holds bound the tally either way. A profile whose stages ask for no tally refuses it. Of the built-in stages, `least-load` asks for it, and so do a `least-cost` and a `has-room` rule with a `sent.` term. `resident-work` keeps a tally of its own, which the limit does not reach. See [Built-in stages](#built-in-stages). |
-| `view.headers` | Up to 256 unique lowercase HTTP header names, in wire position order. Default empty. Denied names are `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key` and `x-goog-api-key`. Embedded validation can deny more, such as the gateway's tenant header. |
+| `view.headers` | Up to 256 unique lowercase HTTP header names, in wire position order. Default empty. Denied names are `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key` and `x-goog-api-key`. Embedded validation can deny more. |
 | `view.block_size` | Positive fallback block size, in tokens, when a token request gives none. The prefix stages fall back to 16 if omitted. A text request states its own window and never reads this. |
 | `view.boundaries` | Positive, strictly ascending token positions, default empty. Used by prefix keying and required for a `hash` index entry. With a prefix-keyed scorer every boundary and `prefix_tokens` must cover at least one whole configured block and fit the hash cap. |
 | `view.max_block_hashes` | 1–8190, default 256. The generation can read fewer, down to zero when no stage needs hashes. It reads zero of a kind no stage declares: a text request is hashed only where a stage reads text windows, and a host asks `AppliedSpec::block_hashes_read` with the request's kind before it hashes. |
@@ -866,7 +829,7 @@ After a stream's end most repeats read `none`: the stream gave the lease up, or 
 
 **Calls.** `ApplyPolicySpec` requires a mode. Use `yaml` or `json` for the document format. `DRY_RUN` on either source checks the candidate under that source's rules. `ENFORCE` writes only under a store. Both can take the current `expected_digest` as a guard. A verdict can include before and after needs, or one issue with a field path when one applies. `AUDIT` is unserved. `GetPolicySpec` returns this replica's standing document, or a generation by number if held. It returns `NOT_FOUND` when none is held. `RollbackPolicySpec` under a store reapplies a named retained generation using a new number. Enforce and rollback under a file return `read_only` before document validation. Each dry-run and write queue has room for up to 32 waiting. Both use the same 128 KiB document cap as the file, with a separate bound on decoded YAML expansion.
 
-**In process.** A host that embeds the store takes the same door with the crate's `operator` feature. `document::operator::DocumentManager::new(store, catalog, denied_headers)` makes it. `apply` takes the host's document as bytes, YAML or JSON. It checks the document over the host's catalog and denied headers, and runs it. A changed document that leaves `generation` out runs as the next generation. One that states a higher number runs under that number. `dry_run` checks a document and applies nothing. A refused apply counts once in `apply_counts`, and a dry run counts nothing. `document::operator::MAX_DOCUMENT_BYTES` is the 128 KiB bound, and `Format::named` reads `yaml` or `json`. `status`, `document` and `standing` read the generation that runs, and `apply_counts` the applies. `EnforceRefused` and `NotHeld` are errors a host can print. `NotHeld` says what was asked, what is held, what stands and what a spec store has on file. `document::operator::snapshot::worker_rows_page` gives the worker rows an operator reads. An address is told without userinfo, and so is a provider's key that is a URL. A provider's key that is no URL and holds an `@` reads as `<unparsable address>`. No spec store is bound in process. `writable` says so, and `enforce` and `roll_back` are refused there with `not persisted: no spec store is bound`. The spec store itself builds on Linux and macOS. The gateway is such a host. With its policy controller on, it applies its policy document through this door at startup. `GET /policy/spec` on its control plane returns that document with its generation and digest, and `POST /policy/spec:validate` runs a dry run of the body against it. Both need the `admin` role, and nothing is applied in the gateway after startup.
+**In process.** A host that embeds the store takes the same door with the crate's `operator` feature. `document::operator::DocumentManager::new(store, catalog, denied_headers)` makes it. `apply` takes the host's document as bytes, YAML or JSON. It checks the document over the host's catalog and denied headers, and runs it. A changed document that leaves `generation` out runs as the next generation. One that states a higher number runs under that number. `dry_run` checks a document and applies nothing. A refused apply counts once in `apply_counts`, and a dry run counts nothing. `document::operator::MAX_DOCUMENT_BYTES` is the 128 KiB bound, and `Format::named` reads `yaml` or `json`. `status`, `document` and `standing` read the generation that runs, and `apply_counts` the applies. `EnforceRefused` and `NotHeld` are errors a host can print. `NotHeld` says what was asked, what is held, what stands and what a spec store has on file. `document::operator::snapshot::worker_rows_page` gives the worker rows an operator reads. An address is told without userinfo, and so is a provider's key that is a URL. A provider's key that is no URL and holds an `@` reads as `<unparsable address>`. No spec store is bound in process. `writable` says so, and `enforce` and `roll_back` are refused there with `not persisted: no spec store is bound`. The spec store itself builds on Linux and macOS.
 
 **Shared lease.** A standby follows the leader's document if replication is configured and working. It validates its own file at startup and watches without applying it while following. On promotion it may apply its file after it settles. A file already observed running since the last change is skipped. An unnumbered document the standby never saw run can take effect on promotion even if its file is older. An explicit generation keeps a stale number from taking over. A new leader awaiting its first document can return `Busy`. File lease renewals are durable writes. With the default timings, a slow renewal can stop decisions, close sessions or lose the lease. For slower storage, the lease flags can give more time, for example `--lease-duration-ms 15000 --lease-renew-deadline-ms 10000 --lease-renew-period-ms 2000`.
 
@@ -940,21 +903,13 @@ Plugin stats are available through the host APIs. Both kinds count answers, decl
 
 ## Gateway routing metrics
 
-The embedded host counts each ask and times its call to the controller. Each ask counts as
-`pick`, `shed`, `queue`, or `refused`. The `mode` is `embedded`. The `model` is the
-resolved model. The `profile` is empty on a refusal, and for a request that is shed ahead of
-every profile, as when no binding matches its model. It is also empty when the host needs a
-name after that generation has been replaced. When a commit finds no sendable target, each
-subsequent ask counts on its own.
-
-The embedded column gives the gateway family to query. `Same` carries the classic names over.
+`Same` carries the classic names over.
 The last column also records families whose embedded writers are pending. Four names in it
 are planned, and no code writes them yet: `smg_policy_lease_expired_total{kind}`,
 `smg_policy_leases{kind,state}`, `smg_policy_fallback_total{reason}` and
-`smg_policy_deadline_misses_total`. The shipped dashboard uses the classic names. Decision
-series appear after their first observation. The standalone controller keeps the
-`smg_policy_controller_` prefix for its process metrics, including role, replication,
-election, and load polling.
+`smg_policy_deadline_misses_total`. The shipped dashboard uses the classic names. The
+standalone controller keeps the `smg_policy_controller_` prefix for its process metrics,
+including role, replication, election, and load polling.
 
 | Classic gateway | Embedded gateway | Class and plan |
 | --- | --- | --- |
@@ -962,12 +917,11 @@ election, and load polling.
 | `smg_worker_overload_shed_total`, `smg_worker_overload_fallback_total`, `smg_worker_liveness_fallback_total` | Same | Kept. The embedded writers will use the decision's outcome and lifted veto. |
 | `smg_pd_admission_waits_total`, `smg_pd_admission_sheds_total`, `smg_pd_admission_window`, `smg_pd_prefill_admission_inflight`, `smg_pd_prefill_admission_queued`, `smg_pd_prefill_admission_rejections_total`, `smg_pd_prefill_admission_wait_seconds` | Same | Kept. The gateway owns admission. |
 | `smg_routing_key_source_total{source}` | Same | Kept. The gateway reads `header` or `rid` as the source. |
-| `smg_cache_aware_policy_branch_total`, `smg_manual_policy_branch_total{branch}`, `smg_consistent_hashing_policy_branch_total`, `smg_prefix_hash_policy_branch_total` | `smg_policy_decisions_total{model,profile,outcome,mode}` | Renamed. The new family groups by outcome. The standalone controller's `smg_policy_controller_decide_no_decision_total` corresponds to `outcome="refused"`. |
+| `smg_cache_aware_policy_branch_total`, `smg_manual_policy_branch_total{branch}`, `smg_consistent_hashing_policy_branch_total`, `smg_prefix_hash_policy_branch_total` | — | — |
 | `smg_policy_inflight_reconciled_total{policy}` | — | Planned rename to `smg_policy_lease_expired_total{kind}`. No code writes the new name yet. |
 | `smg_cache_aware_match_ratio`, `smg_kv_index_lookup_seconds`, `smg_cache_placement_entries` | Same | Moved to the process that holds the index. Match ratio is observed only when the scorer reports the chosen worker's overlap. Embedded observations from the index are pending. |
 | `smg_cache_tree_chars`, `smg_cache_tree_tokens`, `smg_cache_tree_tenants`, `smg_manual_policy_cache_entries` | — | Ends with the classic trees and manual cache. |
 | `smg_cache_aware_prefix_margin_held_total` | — | Open. An embedded successor requires the scorer to report whether the margin held without an extra read. Otherwise the counter ends with classic routing. |
-| — | `smg_policy_decision_seconds{mode,outcome}` | Added. One observation per ask. |
 | — | — | Planned additions. Embedded writers are pending for `smg_policy_leases{kind,state}`, `smg_policy_spec_generation`, and `smg_policy_spec_apply_total{result}`. The standalone controller already publishes the two spec families when it has a spec source. No code writes `smg_policy_leases` yet. |
 | — | — | Planned renames of the standalone controller's `smg_policy_controller_decide_busy_total` to `smg_policy_fallback_total{reason}` for fallback and of its `smg_policy_controller_decide_budget_outlasted_total` to `smg_policy_deadline_misses_total` for decision deadlines. No code writes the new names yet. |
 | `smg_router_requests_total`, `smg_router_request_errors_total`, `smg_router_request_duration_seconds`, `smg_router_tokens_total`, `smg_router_ttft_seconds`, `smg_router_dispatch_wait_seconds`, `smg_router_tpot_seconds`, `smg_http_responses_total`, `smg_http_request_duration_seconds`, `smg_http_inflight_request_age_count`, `smg_http_connections_active` | Same | Kept. Request and connection metrics. |
@@ -978,17 +932,6 @@ election, and load polling.
 | `smg_tokio_worker_busy_ratio`, `smg_tokio_event_loop_stalls_total`, `smg_tokio_event_loop_delay_seconds`, `smg_tokio_alive_tasks`, `smg_tokio_global_queue_depth`, `smg_log_dropped_lines` | Same | Kept. Runtime and logging. |
 | `smg_allocator_resident_bytes`, `smg_allocator_allocated_bytes` | Same | Kept. Available when the gateway runs with jemalloc statistics. |
 | `smg_pd_prefill_duration_seconds`, `smg_pd_kv_transfer_duration_seconds`, `smg_pd_decode_ttft_seconds`, `smg_pd_ttft_seconds`, `smg_pd_rendezvous_failures_total`, `smg_pd_bootstrap_failures_total`, `smg_pd_kv_transfer_failures_total`, `smg_pd_kv_connector_mode_total` | Same | Kept. Prefill and decode dispatch. |
-
-The manual policy branches `occupied_hit`, `occupied_miss`, `vacant`, and
-`no_routing_id` correspond to `pick`. `no_healthy_workers` corresponds to `shed`.
-`cap_respill` corresponds to `pick` when the policy returns a worker and `shed` when it
-returns none. The outcome count groups these branches together.
-
-An embedded selection uses the existing opt-in routing capture. Its `x-smg-cache-trace`
-selection row names the profile in `policy`, uses origin `policy_controller`, and carries
-a `decision` with up to three scored worker addresses. The gateway uses redacted addresses
-for the selected worker and the top candidates. The same row appears in the dispatch log
-when tracing is configured to log.
 
 ## Presets
 
@@ -1272,4 +1215,4 @@ Each removal write has one attempt. A worker that an `Upsert` job finds again wh
 - Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
 - The audit mode of the apply call.
 - Registration of the workers that discovery finds. A provider hands each worker to the controller's job queue, and nothing sets that queue yet. Until then a pass finds workers and registers none.
-- A gateway that asks a standalone controller for its decisions. Under `--policy-controller-address` the gateway follows the controller's workers and still decides in its own process: see [In the gateway](#in-the-gateway).
+- A gateway that asks a standalone controller for its decisions.

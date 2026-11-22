@@ -23,7 +23,7 @@
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue`]), or, where the request sends its decode later, at the decode
 //! call ([`issue_decode`]) or at the dispatch that sends the decode with no
-//! call ([`said`]). A side's dispatch and its end are told under that
+//! call ([`lease_events::pair`]). A side's dispatch and its end are told under that
 //! side's lease. It names the worker the side booked at its issue until
 //! the side's dispatch, and the worker it went to from there.
 //!
@@ -49,16 +49,16 @@ use super::{single, PolicyEngine, PoolMembers};
 use crate::{
     document::spec::AppliedSpec,
     engine::{
-        decision::{Decision, ShedReason, Target},
-        decision_engine::HeldDecision,
+        decision::{shed, Decision, ShedReason, SUBSET_HINT, WIRES},
+        decision_engine::{DecideOutcome, HeldDecision, Leased, Request},
         framework::{Engine, PairPools, Scratch},
+        lease_events,
         pair_classes::PartnerClasses,
         records::{DecisionClock, Live},
-        store_backed_engine::{shed, DecideOutcome, Leased, Request, SUBSET_HINT, WIRES},
         view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, Session, WorkerId},
     },
     stages::Lifecycle,
-    store::{leases::DISPATCH_TTL, Said},
+    store::leases::DISPATCH_TTL,
     tracking::lease::{Lease, LeaseId, LeaseKind, Side},
 };
 
@@ -204,15 +204,17 @@ pub(super) fn stamp(
 }
 
 /// How a pair's request is shed where it states what a pair's lists are not
-/// narrowed by, and the stage it is shed under: a subset hint, or a hard
-/// demand. A pair's records keep no demand fact, so such a request is shed
-/// and never placed past its demand. A hint of some records is declined: no
-/// stage here takes a part of a list.
+/// narrowed by, and the stage it is shed under: a subset hint, a hard
+/// demand, or places of its list. A pair's records keep no demand fact, so
+/// such a request is shed and never placed past its demand. A hint of some
+/// records is declined: no stage here takes a part of a list. So are
+/// places ([`single::PLACES`]): a pair's sides do not read them.
 fn not_narrowed_by(cx: &Constraints<'_>) -> Option<(ShedReason, &'static str)> {
     match cx.subset_hint {
         Some(0) => Some((ShedReason::NoEndpoints, SUBSET_HINT)),
         Some(_) => Some((ShedReason::PolicyDeclined, SUBSET_HINT)),
         None if !cx.demands.is_none() => Some((ShedReason::NoEndpoints, WIRES)),
+        None if cx.places.is_some() => Some((ShedReason::PolicyDeclined, single::PLACES)),
         None => None,
     }
 }
@@ -225,19 +227,6 @@ fn decode_session(facts: &RequestFacts<'_>) -> Session {
         ..*facts
     }
     .session()
-}
-
-/// The decode side's lease as issued beside `prefill`, the prefill side's:
-/// it books the decode of `first`, the pick's first target. `None` where
-/// that target names no pair.
-fn decode_as_issued(prefill: &Lease, first: &Target, session: Session) -> Option<Lease> {
-    Some(Lease {
-        side: Side::Decode,
-        target_index: 0,
-        booked: first.pair?.decode_id,
-        session,
-        ..*prefill
-    })
 }
 
 /// A pair's decision over the records of its two lists, stamped
@@ -274,7 +263,8 @@ fn decide_records(
 /// session under the decode phase, which its guard keeps for the decode
 /// side's words. The stages hear the prefill's issue, and the decode's
 /// behind it unless the request sends its decode `later`: such a side
-/// stands chosen and is told at its own issue ([`issue_decode`], [`said`]).
+/// stands chosen and is told at its own issue ([`issue_decode`],
+/// [`lease_events::pair`]).
 ///
 /// `None` for a decision that picks no pair: it issues nothing.
 pub(super) fn issue(
@@ -299,7 +289,7 @@ pub(super) fn issue(
         issued_micros: facts.now_micros,
         tokens: facts.prompt_tokens,
     };
-    let decode = decode_as_issued(&lease, first, session)?;
+    let decode = lease_events::decode_as_issued(&lease, first, session)?;
     engine.on_decision_issued(&lease, decision);
     if !later {
         engine.on_decision_issued(&decode, decision);
@@ -309,7 +299,8 @@ pub(super) fn issue(
 
 /// The decode asked again over the records of the two lists, stamped
 /// ([`stamp`]): the engine's decode entry over the partners of the held
-/// `prefill`. `pool` holds the decode list's facts.
+/// `prefill`. `pool` holds the decode list's facts. The entry is handed no
+/// first decode here, so it decides again under every profile.
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -328,12 +319,13 @@ fn decide_decode_records(
             generation: pool.generation,
             ..PoolFacts::default()
         };
-        return engine.decide_decode(&facts, &none, PairPools::default(), prefill, cx, scratch);
+        let no_lists = PairPools::default();
+        return engine.decide_decode(&facts, &none, no_lists, prefill, None, cx, scratch);
     }
     if let Some((reason, stage)) = not_narrowed_by(cx) {
         return shed(reason, stage, facts.seed, pool.generation);
     }
-    engine.decide_decode(&facts, pool, pools, prefill, cx, scratch)
+    engine.decide_decode(&facts, pool, pools, prefill, None, cx, scratch)
 }
 
 /// What a pick of the decode decided again ([`PairLists::decide`] behind a
@@ -354,7 +346,7 @@ pub(super) fn issue_decode(
     let first = decision.pick()?.targets.first()?;
     let decode = Lease {
         tokens: facts.prompt_tokens,
-        ..decode_as_issued(prefill, first, decode_session(facts))?
+        ..lease_events::decode_as_issued(prefill, first, decode_session(facts))?
     };
     let issued = Lease {
         issued_micros: now_micros,
@@ -414,118 +406,6 @@ pub(super) fn decided(
     }
 }
 
-/// Tells the stages what was `said` of a pair's lease, a side at a time, as
-/// the engine over a store tells it off its file.
-///
-/// - A dispatch is told on the side it names: the send counts, the session
-///   table, then the stages. The lease told is the side's as issued, under
-///   the index the dispatch took, and the target is the worker the side
-///   went to. A decode that stood chosen
-///   ([`HeldDecision::decode_chosen`]) goes out as its pick's with no call:
-///   its issue is told first, dated at the dispatch's instant by `micros`,
-///   under the decode it goes to.
-/// - A completion ends the side its outcome names. The prefill's is told
-///   under its lease as issued: every target of a pair's pick names the one
-///   prefill. The decode's names the decode it went to.
-/// - A release ends the side it names, as issued, and with none both sides:
-///   the prefill's first.
-///
-/// A word on a side a pair's lease does not hold tells nothing, and so
-/// does an end of a decode that stood chosen: no stage heard of that side.
-/// A send count takes a send at a rank it does not know yet, as it does of
-/// any host that tells a dispatch whole.
-///
-/// Every word behind a side's issue carries the instant of the pair's first
-/// decision, as a lease on file does. The decode's end names the index its
-/// guard holds, which is the one its dispatch took.
-pub(super) fn said(
-    engine: &Engine,
-    held: &HeldDecision<'_>,
-    said: Said,
-    micros: impl Fn(Instant) -> u64,
-) {
-    let prefill = held.lease;
-    let first = held.decision.pick().and_then(|pick| pick.targets.first());
-    let decode = first.and_then(|first| decode_as_issued(prefill, first, held.decode_session));
-    match said {
-        Said::Dispatched(dispatch, at) => {
-            let taken = held.target;
-            let (lease, target) = match dispatch.side {
-                Side::Prefill => (
-                    *prefill,
-                    Target {
-                        id: taken.id,
-                        dp_rank: taken.dp_rank,
-                        ..Target::default()
-                    },
-                ),
-                Side::Decode => {
-                    let (Some(decode), Some(pair)) = (decode, taken.pair) else {
-                        return;
-                    };
-                    let target = Target {
-                        id: pair.decode_id,
-                        dp_rank: pair.decode_dp_rank,
-                        ..Target::default()
-                    };
-                    (decode, target)
-                }
-                Side::Single | Side::Encode => return,
-            };
-            let lease = Lease {
-                target_index: dispatch.target_index,
-                ..lease
-            };
-            let since = dispatch.since_decision_micros;
-            engine.dispatched_sent(&lease, &target, dispatch.side, since, || true);
-            engine.dispatched_table(&lease, &target, dispatch.side);
-            if dispatch.side == Side::Decode && held.decode_chosen {
-                // No call issued the side: this dispatch books it, so the
-                // stages hear its issue first, under the worker that serves.
-                let sent = Lease {
-                    booked: target.id,
-                    ..lease
-                };
-                let issued = Lease {
-                    issued_micros: micros(at),
-                    ..sent
-                };
-                engine.on_decision_issued(&issued, held.decision);
-                engine.dispatched_stages(&sent, &target, dispatch.side, since);
-            } else {
-                engine.dispatched_stages(&lease, &target, dispatch.side, since);
-            }
-        }
-        Said::Completed(outcome) => match outcome.side {
-            Side::Prefill => engine.on_completed(prefill, &outcome),
-            Side::Decode => {
-                let (Some(decode), Some(pair)) = (decode, held.target.pair) else {
-                    return;
-                };
-                if held.decode_chosen {
-                    return;
-                }
-                let ended = Lease {
-                    target_index: held.index,
-                    booked: pair.decode_id,
-                    ..decode
-                };
-                engine.on_completed(&ended, &outcome);
-            }
-            Side::Single | Side::Encode => {}
-        },
-        Said::Released(side, reason) => {
-            if matches!(side, None | Some(Side::Prefill)) {
-                engine.on_released(prefill, reason);
-            }
-            let ends_decode = matches!(side, None | Some(Side::Decode)) && !held.decode_chosen;
-            if let Some(decode) = decode.filter(|_| ends_decode) {
-                engine.on_released(&decode, reason);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
@@ -541,15 +421,15 @@ mod tests {
     use crate::{
         document::spec::PolicySpec,
         engine::{
-            decision::{Pair, Pick, Targets},
-            decision_engine::{DecisionEngine, RequestMaker, WorkerLists},
+            decision::{Pair, Pick, Target, Targets},
+            decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
             demands::Demands,
             framework::{Filter, Picker, TieBand},
             records::worker_id,
             view::{Health, Identity, Role, WireModes},
         },
         stages::{Best, HasCapacity, StageRegistry},
-        store::{Dispatch, GatewayId},
+        store::{Dispatch, GatewayId, Said},
         tracking::{
             lease::{Outcome, ReleaseReason, TransportClass},
             DecisionGuard,
@@ -894,6 +774,12 @@ mod tests {
         };
         let declined = (ShedReason::PolicyDeclined, SUBSET_HINT);
         assert_eq!(shed_under(&some), declined);
+        let held = Constraints {
+            places: Some(&[0]),
+            ..Constraints::default()
+        };
+        let declined = (ShedReason::PolicyDeclined, single::PLACES);
+        assert_eq!(shed_under(&held), declined);
     }
 
     #[test]
@@ -1292,7 +1178,7 @@ mod tests {
     /// One word of a held pair told to the stages, the clock reading 9,900
     /// and every worker still listed.
     fn tell(engine: &Engine, held: &HeldDecision<'_>, word: Said) {
-        said(engine, held, word, |_| 9_900);
+        lease_events::pair(engine, held, word, |_| 9_900);
     }
 
     /// Each word of a pair, both sides issued with the prefill, the host
@@ -1312,10 +1198,12 @@ mod tests {
         let held = HeldDecision {
             decision: &decision,
             lease: &lease,
-            decode_session: session,
             index: 1,
             target: &taken,
-            decode_chosen: false,
+            decode: Some(HeldDecode {
+                session,
+                chosen: false,
+            }),
         };
         tell(engine, &held, dispatched(Side::Prefill, 1));
         tell(engine, &held, dispatched(Side::Decode, 1));
@@ -1353,10 +1241,12 @@ mod tests {
         let held = HeldDecision {
             decision: &pair.decision,
             lease: &lease,
-            decode_session: session,
             index: 0,
             target: &taken,
-            decode_chosen: false,
+            decode: Some(HeldDecode {
+                session,
+                chosen: false,
+            }),
         };
         let prefill = ("released", Side::Prefill, 1, 0, own, 7_000, 0);
         let decode = ("released", Side::Decode, 101, 0, session, 7_000, 0);
@@ -1388,10 +1278,12 @@ mod tests {
         let held = HeldDecision {
             decision: &decision,
             lease: &lease,
-            decode_session: session,
             index: 1,
             target: &taken,
-            decode_chosen: true,
+            decode: Some(HeldDecode {
+                session,
+                chosen: true,
+            }),
         };
         tell(engine, &held, dispatched(Side::Decode, 1));
         assert_eq!(
@@ -1417,10 +1309,12 @@ mod tests {
         let held = HeldDecision {
             decision: &pair.decision,
             lease: &lease,
-            decode_session: session,
             index: 0,
             target: &taken,
-            decode_chosen: true,
+            decode: Some(HeldDecode {
+                session,
+                chosen: true,
+            }),
         };
         tell(
             engine,

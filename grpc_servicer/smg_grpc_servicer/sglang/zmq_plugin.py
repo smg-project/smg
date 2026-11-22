@@ -218,11 +218,20 @@ def _trace_qwenvl_model_once(scheduler, trace_id):
             return result
 
         worker = field(scheduler, "tp_worker")
-        runner = field(worker, "model_runner")
-        runner_path = "tp_worker.model_runner"
-        if runner is None:
-            runner = field(field(worker, "worker"), "model_runner")
-            runner_path = "tp_worker.worker.model_runner"
+        # SGLang exposes model_runner as a property over _model_runner.
+        # Read either stored name without invoking SDK properties.
+        runner, runner_path = None, "tp_worker.model_runner"
+        for owner, path in (
+            (worker, "tp_worker"),
+            (field(worker, "worker"), "tp_worker.worker"),
+        ):
+            for name in ("model_runner", "_model_runner"):
+                runner = field(owner, name)
+                if runner is not None:
+                    runner_path = f"{path}.{name}"
+                    break
+            if runner is not None:
+                break
         model = field(runner, "model")
         vision = field(model, "visual")
         vision_path = "model.visual"
@@ -233,6 +242,9 @@ def _trace_qwenvl_model_once(scheduler, trace_id):
         if config is None:
             config = field(model, "config")
         attention = field(field(field(vision, "blocks"), "0"), "attn")
+        attention_backend = field(attention, "attn_backend")
+        if attention_backend is None:
+            attention_backend = field(attention, "qkv_backend")
         objects = {
             "scheduler": scheduler,
             "tp_worker": worker,
@@ -243,7 +255,7 @@ def _trace_qwenvl_model_once(scheduler, trace_id):
             "resolved_prefill_backend": field(runner, "prefill_attn_backend"),
             "resolved_decode_backend": field(runner, "decode_attn_backend"),
             "first_vision_attention": attention,
-            "first_vision_attention_backend": field(attention, "attn_backend"),
+            "first_vision_attention_backend": attention_backend,
         }
         facts = {name: identity(value) for name, value in objects.items()}
         facts.update(

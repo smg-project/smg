@@ -412,6 +412,59 @@ def test_qwenvl_loaded_model_metadata_is_once_bounded_and_read_only(monkeypatch,
     assert set(sys.modules) == modules_before and source.read_bytes() == content
 
 
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "wrapped"])
+def test_qwenvl_metadata_reads_property_backing_runner(monkeypatch, caplog, wrapped):
+    monkeypatch.setenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", "1")
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_MODEL_METADATA_ONCE", iter((True,)))
+    monkeypatch.setattr(zmq_plugin, "_QWENVL_TRACE_SLOTS", iter(range(64)))
+    property_reads = []
+
+    class Worker:
+        def __init__(self, runner):
+            self._model_runner = runner
+
+        @property
+        def model_runner(self):
+            property_reads.append("model_runner")
+            raise AssertionError("metadata must not invoke SDK properties")
+
+    class Model:
+        pass
+
+    class Vision:
+        pass
+
+    class Backend:
+        pass
+
+    model, vision, backend = Model(), Vision(), Backend()
+    attention = SimpleNamespace(_modules={"qkv_backend": backend})
+    vision._modules = {"blocks": [SimpleNamespace(attn=attention)]}
+    model._modules = {"visual": vision}
+    config = SimpleNamespace(vision_config=SimpleNamespace(patch_size=16))
+    runner = SimpleNamespace(model=model, model_config=SimpleNamespace(hf_config=config))
+    worker = Worker(runner)
+    scheduler = SimpleNamespace(tp_worker=SimpleNamespace(worker=worker) if wrapped else worker)
+    zmq_plugin._trace_qwenvl_model_once(scheduler, "smg-qwenvl-" + "a" * 32)
+    records = [r.getMessage().split("SMG_QWENVL_REQUEST_DIAGNOSTIC ", 1)[1] for r in caplog.records]
+    assert len(records) == 1 and len(records[0]) <= 8192
+    facts = json.loads(records[0])["metadata"]
+    path = "tp_worker.worker._model_runner" if wrapped else "tp_worker._model_runner"
+    assert facts["runner_lookup"] == {"path": path, "status": "found"}
+    assert facts["vision_lookup"] == {"path": "model.visual", "status": "found"}
+    for name, value in (
+        ("model", model),
+        ("vision", vision),
+        ("first_vision_attention_backend", backend),
+    ):
+        cls = type(value)
+        assert facts[name] == {"class": (cls.__module__ + "." + cls.__qualname__)[:160]}
+    assert facts["hf_vision_config"]["patch_size"] == 16
+    assert facts["source_files"] == {} and facts["source_bytes_read"] == 0
+    assert property_reads == []
+    assert worker._model_runner is runner and model._modules["visual"] is vision
+
+
 def test_qwenvl_loaded_model_metadata_does_not_invoke_properties(monkeypatch, caplog):
     monkeypatch.setenv("SMG_QWENVL_REQUEST_DIAGNOSTIC", "1")
     monkeypatch.setattr(zmq_plugin, "_QWENVL_MODEL_METADATA_ONCE", iter((True,)))

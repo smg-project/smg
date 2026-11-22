@@ -288,21 +288,15 @@ mod tests {
     use openai_protocol::UNKNOWN_MODEL_ID;
     use parking_lot::RwLock;
     use smg_mesh::{gossip::NodeState, WorkerState};
-    use smg_policy_controller::{
-        document::{AppliedSpec, PolicySpec},
-        engine::PolicyEngine,
-    };
     use smg_worker::{
         identity::basic::{Worker, WorkerType},
         test_support::no_health_check,
     };
     use tokio::time::sleep;
-    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
-        config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-        policies::{DocumentOrigin, SelectWorkerInfo},
+        config::types::PolicyConfig, policies::SelectWorkerInfo,
         routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
@@ -481,45 +475,6 @@ mod tests {
             !cache_aware.mesh_attached_for_test(),
             "detach must lower the mesh flag",
         );
-    }
-
-    /// The mesh shares the classic policy's trees alone. Where the policy
-    /// engine of this process decides, no decision reads them, and the
-    /// attach says so once, as a warning. A registry that keeps no policy
-    /// engine says nothing.
-    #[tokio::test]
-    #[traced_test]
-    async fn an_attach_warns_once_where_the_policy_engine_of_this_process_decides() {
-        const SAID: &str = "do not share which worker holds a prompt's prefix";
-        let attached = |policy_registry: PolicyRegistry| {
-            let mesh = MeshKV::new("node-a".into());
-            let adapters = MeshAdapters::start(
-                &mesh,
-                "node-a".into(),
-                Arc::new(WorkerRegistry::new()),
-                empty_cluster_state(),
-                Arc::new(policy_registry),
-            );
-            (mesh, adapters)
-        };
-        let _classic = attached(PolicyRegistry::new(cache_aware_policy_config()));
-        assert!(!logs_contain(SAID), "no policy engine decides here");
-
-        let document = PolicySpec::preset("cache_aware").expect("a built-in preset");
-        let spec = AppliedSpec::validate(&document).expect("the document validates");
-        let _asked = attached(PolicyRegistry::with_policy_engine(
-            cache_aware_policy_config(),
-            RoutingKeyOverrideConfig::default(),
-            Arc::new(PolicyEngine::new(spec)),
-            DocumentOrigin::Settings,
-            true,
-        ));
-        logs_assert(|lines: &[&str]| {
-            let said = lines.iter().filter(|line| line.contains(SAID)).count();
-            (said == 1)
-                .then_some(())
-                .ok_or_else(|| format!("the attach said it {said} times"))
-        });
     }
 
     /// Every producer-side hash-index write must publish a matching

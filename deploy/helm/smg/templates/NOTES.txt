@@ -3,7 +3,7 @@
 Router:
   Endpoint: http://{{ $fullname }}-router:{{ .Values.router.service.port }}
   Metrics:  http://{{ $fullname }}-router:{{ .Values.router.metrics.port }}/metrics
-  Policy:   {{ include "smg.routerPolicyArg" . | default "the policy document" }}
+  Policy:   {{ .Values.router.policy }}
 
 {{- if (.Values.policyController).enabled }}
 

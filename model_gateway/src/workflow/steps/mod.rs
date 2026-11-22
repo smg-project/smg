@@ -261,29 +261,12 @@ mod policy_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use smg_worker::workflow::{
+        DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
+    };
+    use wfaas::StepId;
 
-    use http::StatusCode;
-    use serde_json::{json, Value};
-    use smg_policy_controller::{
-        store::{MemoryStore, Registrant, WorkersStore},
-        worker_host::facts,
-    };
-    use smg_worker::{
-        identity::basic::{BasicWorker, Worker},
-        workflow::{
-            DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
-            WORKER_REGISTRATION_WORKFLOW,
-        },
-    };
-    use wfaas::{StepId, WorkflowEngine, WorkflowId, WorkflowStatus};
-
-    use super::{local::test_support::serve_json_routes, *};
-    use crate::{
-        app_context::testing::app_context_for_tests,
-        policy_controller::feed::following,
-        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
-    };
+    use super::*;
 
     fn config_with(timeout_secs: u64, check_interval_secs: u64) -> RouterConfig {
         RouterConfig::builder()
@@ -523,164 +506,6 @@ mod tests {
                  declares a parser override for model 'm' the gateway cannot read with: \
                  unknown tool-call parser 'no-such-parser'"
             )
-        );
-    }
-
-    /// What a worker object holds, by field: its spec as it serializes,
-    /// then what its builder was handed beside the spec.
-    fn fields(worker: &dyn Worker) -> BTreeMap<String, Value> {
-        let meta = worker.metadata();
-        let spec = serde_json::to_value(&*meta.spec).expect("a spec serializes");
-        let mut fields: BTreeMap<String, Value> = spec
-            .as_object()
-            .expect("a spec is an object")
-            .iter()
-            .map(|(name, value)| (format!("spec.{name}"), value.clone()))
-            .collect();
-        let resilience = worker.resilience();
-        let sorted = |codes: &HashSet<u16>| format!("{:?}", codes.iter().collect::<BTreeSet<_>>());
-        let breaker = worker
-            .as_any()
-            .downcast_ref::<BasicWorker>()
-            .map(|basic| format!("{:?}", basic.circuit_breaker.load().config()));
-        let handed = worker.http_client_handle_if_initialized().is_some();
-        for (name, value) in [
-            ("cards", format!("{:?}", worker.models())),
-            ("health_config", format!("{:?}", meta.health_config)),
-            ("health_endpoint", meta.health_endpoint.clone()),
-            (
-                "zmq_startup_timeout",
-                format!("{:?}", meta.zmq_startup_timeout),
-            ),
-            (
-                "zmq_request_timeout",
-                format!("{:?}", meta.zmq_request_timeout),
-            ),
-            ("retry", format!("{:?}", resilience.retry)),
-            ("retry_enabled", resilience.retry_enabled.to_string()),
-            (
-                "breaker_enabled",
-                resilience.circuit_breaker_enabled.to_string(),
-            ),
-            (
-                "retryable_codes",
-                sorted(&resilience.retryable_status_codes),
-            ),
-            ("capacity_codes", sorted(&resilience.capacity_status_codes)),
-            ("breaker", format!("{breaker:?}")),
-            ("http2", worker.http2().to_string()),
-            ("http_client_handed", handed.to_string()),
-            (
-                "engine_connector",
-                worker.engine_connector().is_some().to_string(),
-            ),
-            (
-                "max_running",
-                format!("{:?}", worker.max_running_requests()),
-            ),
-        ] {
-            fields.insert(name.to_owned(), Value::String(value));
-        }
-        fields
-    }
-
-    /// The names of the fields two worker objects hold differently.
-    fn differing(one: &dyn Worker, other: &dyn Worker) -> Vec<String> {
-        let (one, other) = (fields(one), fields(other));
-        let names: BTreeSet<&String> = one.keys().chain(other.keys()).collect();
-        names
-            .into_iter()
-            .filter(|name| one.get(*name) != other.get(*name))
-            .cloned()
-            .collect()
-    }
-
-    /// The object a gateway that follows a controller holds for a row,
-    /// field by field, beside the object the registration line leaves for
-    /// the same worker.
-    ///
-    /// Under a controller's address no job runs, so the holder builds the
-    /// object from the row, and the fields no row states read as the
-    /// defaults. Their names are pinned here. The job states what no row
-    /// holds: a priority, a cost, the two transfer names and the two parser
-    /// labels, under a gateway whose breaker and retry settings are not the
-    /// defaults.
-    #[tokio::test]
-    async fn a_followed_rows_object_differs_from_the_lines_object_in_what_no_row_states() {
-        let url = serve_json_routes(vec![
-            ("/health", StatusCode::OK, json!({"status": "ok"})),
-            (
-                "/model_info",
-                StatusCode::OK,
-                json!({"model_path": "m", "is_generation": true}),
-            ),
-            ("/server_info", StatusCode::OK, json!({"version": "test"})),
-        ])
-        .await;
-        let mut config = config_with(5, 1);
-        config.health_check.disable_health_check = true;
-        config.circuit_breaker.failure_threshold = 7;
-        config.circuit_breaker.success_threshold = 5;
-        config.circuit_breaker.timeout_duration_secs = 11;
-        config.circuit_breaker.window_duration_secs = 13;
-        config.retry.max_retries = 9;
-        config.retry.initial_backoff_ms = 17;
-        let mut spec = WorkerSpec::new(&url);
-        spec.priority = 7;
-        spec.cost = 2.5;
-        spec.bootstrap_port = Some(8998);
-        spec.kv_connector = Some("connector-a".into());
-        spec.kv_role = Some("role-a".into());
-        spec.labels.insert("tool_parser".into(), "parser-a".into());
-        spec.labels
-            .insert("reasoning_parser".into(), "parser-b".into());
-
-        let registry = Arc::new(WorkerRegistry::new());
-        let host = app_context_for_tests(config.clone(), Arc::clone(&registry), None);
-        let engine = WorkflowEngine::new();
-        engine
-            .register_workflow(create_worker_registration_workflow(&config))
-            .unwrap();
-        let id = engine
-            .start_workflow(
-                WorkflowId::new(WORKER_REGISTRATION_WORKFLOW),
-                create_worker_workflow_data(
-                    spec,
-                    WorkerRegistrationMode::Upsert,
-                    host,
-                    WorkerJobAsker::Startup,
-                ),
-            )
-            .await
-            .unwrap();
-        let state = engine
-            .wait_for_terminal_state(id, &url, Duration::from_secs(20))
-            .await
-            .unwrap();
-        assert_eq!(state.status, WorkflowStatus::Completed);
-        let registered = registry.get_by_url(&url).expect("the line's object");
-
-        // The row a controller serves for that worker, and the object a
-        // gateway that follows the controller builds from it.
-        let served = Arc::new(MemoryStore::default());
-        served.upsert_by(facts(registered.as_ref(), None), Registrant::Control);
-        let followed = Arc::new(WorkerRegistry::new());
-        following(&served, &followed, BackendConnector::shared()).settle();
-        let followed = followed.get_by_url(&url).expect("the followed object");
-        assert_eq!(
-            differing(registered.as_ref(), followed.as_ref()),
-            [
-                "breaker",
-                "cards",
-                "http_client_handed",
-                "retry",
-                "spec.cost",
-                "spec.kv_connector",
-                "spec.kv_role",
-                "spec.models",
-                "spec.priority",
-                "zmq_request_timeout",
-            ]
         );
     }
 }

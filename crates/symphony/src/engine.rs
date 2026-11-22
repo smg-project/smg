@@ -21,7 +21,8 @@ use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
     event::{
-        release_between, runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text,
+        release_between, runs_at, CallEnd, DropReason, Event, Events, FinishReason,
+        MalformedReason, Text,
     },
     format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
@@ -218,6 +219,8 @@ pub(crate) fn is_strip_space(c: char) -> bool {
 /// What the engine asks of a call syntax's assembler, whichever the syntax: the region's bytes as
 /// they arrive, the table's ignored terminal inside the region, and the two endings. Each syntax
 /// implements it over its own assembler, so the policy of what ends a call lives with the syntax.
+/// An assembler ends every call as [`CallEnd::Closed`]: how the region ended is the engine's to
+/// know, and the engine writes the word on the ends an ending pushes ([`Engine::close_call`]).
 /// An engine moves between threads with its request, so the assembler does too.
 pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// Takes the next bytes of the region and pushes the events they complete; the number of bytes
@@ -290,6 +293,18 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// the answer says whether the terminal's bytes were taken as the call's end (`ToolCallEnd`'s
     /// source); otherwise the engine drops them as the region's.
     fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool;
+
+    /// Whether the end of the output is the call's own end: for a syntax whose call has no
+    /// delimiter to close it (the forced arguments, which are the whole output), a value that
+    /// is whole where the bytes end, as a number or a literal the bytes end on is. Asked before
+    /// the stop or the cut ends the call, for the word its end carries ([`CallEnd`]): such a
+    /// call was not left open, and its end says `Closed`. `cut` says the output's end is a cut
+    /// and not the model's own stop: a value that more bytes could have continued (a number)
+    /// is whole at the stop alone. Every other syntax closes a call with bytes of its own, and
+    /// one the output's end reaches before them is open.
+    fn ends_with_the_output(&self, _cut: bool) -> bool {
+        false
+    }
 
     /// The stream was cut inside the region: nothing is closed for the client, so arguments cut
     /// short never look complete.
@@ -1334,6 +1349,8 @@ impl Engine {
         }
         let mut finished: Events<'static> = std::mem::take(&mut self.scratch);
         let mut as_marker = closed == Closed::Marker;
+        // Asked before the ending takes the call: whether the output's end is the call's own.
+        let own_end = closed != Closed::Marker && call.ends_with_the_output(closed == Closed::Cut);
         let taken = match closed {
             Closed::Marker => call.close(terminal, &mut finished),
             Closed::Stop => {
@@ -1352,13 +1369,27 @@ impl Engine {
         if taken {
             self.region.fed += terminal.len();
         }
+        // How a call this ending closes ended ([`CallEnd`]): the model's own doing where its
+        // marker closed the region, the stop stands for the marker, or the output's end is the
+        // end of a call whose syntax has no delimiter and whose value is whole there; else the
+        // stop or the cut that found it open. A call that ended inside the region ended before
+        // this, closed.
+        let ended = match closed {
+            Closed::Marker => CallEnd::Closed,
+            Closed::Stop | Closed::Cut if own_end => CallEnd::Closed,
+            Closed::Stop if as_marker => CallEnd::Closed,
+            Closed::Stop => CallEnd::Stop,
+            Closed::Cut => CallEnd::Cut,
+        };
         let closed_by_marker = |mut event: Event<'static>| {
-            if as_marker {
-                if let Event::Malformed { why, .. } = &mut event {
-                    if *why == MalformedReason::UnterminatedRegion {
-                        *why = MalformedReason::BlockWithoutACompleteCall;
-                    }
+            match &mut event {
+                Event::Malformed { why, .. }
+                    if as_marker && *why == MalformedReason::UnterminatedRegion =>
+                {
+                    *why = MalformedReason::BlockWithoutACompleteCall;
                 }
+                Event::ToolCallEnd { ended: how, .. } => *how = ended,
+                _ => {}
             }
             event
         };
@@ -1671,7 +1702,7 @@ mod tests {
         formats::{glm, inkling, llama4, mistral, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
-        testing::{arguments_of, bytes, malformed, weather_declared},
+        testing::{arguments_of, bytes, endings, malformed, weather_declared},
     };
 
     /// GLM's last call, its closing marker not written: the stop token that would end it is
@@ -2057,6 +2088,44 @@ mod tests {
         }
     }
 
+    /// Every call's end says who ended it. The model's own closing marker closes it, and so
+    /// does the stop where the table's stop row stands for the marker the stop decoder hides;
+    /// without the row the stop found the call open, whatever the syntax closed for the model;
+    /// the token limit and an abort cut it. Only the call the output's end found open ends as
+    /// stopped or cut: the call before it closed at its own marker.
+    #[test]
+    fn a_calls_end_says_who_ended_it() {
+        let whole = format!("{LAST_CALL}</tool_call>");
+        for finish in [EngineFinish::Stop, EngineFinish::Length] {
+            let events = run(glm(), &whole, finish);
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        }
+        let with_row = run(glm().closes_at_stop("call"), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(endings(&with_row), [(0, CallEnd::Closed)]);
+        let stopped = run(glm(), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(endings(&stopped), [(0, CallEnd::Stop)]);
+        // The syntax closed the object for the model and said so.
+        assert_eq!(
+            malformed(&stopped),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        for finish in [
+            EngineFinish::Length,
+            EngineFinish::Abort,
+            EngineFinish::Other("content_filter".to_string()),
+        ] {
+            for format in [glm(), glm().closes_at_stop("call")] {
+                let events = run(format, LAST_CALL, finish.clone());
+                assert_eq!(endings(&events), [(0, CallEnd::Cut)], "{finish:?}");
+            }
+        }
+        let two = format!("{whole}{LAST_CALL}");
+        let events = run(glm(), &two, EngineFinish::Length);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Cut)]);
+        let events = run(glm(), &two, EngineFinish::Stop);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Stop)]);
+    }
+
     #[test]
     fn a_closing_marker_the_model_wrote_ends_the_call_with_or_without_the_row() {
         let output = format!("{LAST_CALL}</tool_call><tool_call>get_weather</tool_call>");
@@ -2095,6 +2164,7 @@ mod tests {
                         Event::ToolCallEnd { index, .. } => Event::ToolCallEnd {
                             index: *index,
                             source: Text::uncounted(""),
+                            ended: CallEnd::Closed,
                         },
                         event => event.clone(),
                     })

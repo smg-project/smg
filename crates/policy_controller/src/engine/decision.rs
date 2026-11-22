@@ -553,6 +553,37 @@ impl ShadowKind {
     }
 }
 
+/// The stage a decision is shed under when its pool has rows and its
+/// gateway shares a wire with none of them, or its request's runtime is
+/// none of theirs
+/// ([`UnmetDemand::Runtime`](crate::engine::demands::UnmetDemand::Runtime)).
+pub(crate) const WIRES: &str = "wires";
+
+/// The stage a decision is shed under when its gateway hints a subset of 0
+/// of a pool that has rows: a decision over no candidates, as it asked.
+pub(crate) const SUBSET_HINT: &str = "subset-hint";
+
+/// A shed the deciders say in the engine's place, in the shape of the
+/// engine's own.
+pub(crate) fn shed(
+    reason: ShedReason,
+    emptied_by: &'static str,
+    seed: u64,
+    generation: u64,
+) -> Decision {
+    Decision::Shed(Shed {
+        reason,
+        emptied_by,
+        retry_after_secs: 1,
+        wait_allowed: false,
+        trace: Trace {
+            seed,
+            generation,
+            ..Trace::default()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

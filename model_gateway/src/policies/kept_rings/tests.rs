@@ -5,10 +5,6 @@
 use std::{sync::Barrier, time::Duration};
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerType};
-use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec},
-    engine::PolicyEngine as OwnEngine,
-};
 use smg_worker::{
     identity::basic::{ConnectionMode, Worker},
     test_support::no_health_check,
@@ -18,7 +14,7 @@ use tokio::runtime::Handle;
 use super::*;
 use crate::{
     policies::{ConsistentHashingPolicy, LoadBalancingPolicy, SelectWorkerInfo},
-    routers::{common::snapshot::RoutingPool, grpc::backend_client::BasicWorkerBuilder},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
 
 fn worker_serving(url: &str, model_ids: &[&str]) -> Arc<dyn Worker> {
@@ -951,80 +947,6 @@ async fn the_rings_are_current_once_the_task_has_followed_a_change() {
         "model",
         &both.each_ref().map(String::as_str),
     );
-}
-
-/// The policy engine of this process under the stock document `preset`,
-/// deciding over the lists of `registry`.
-fn engine_placing(preset: &str, registry: &Arc<WorkerRegistry>) -> Arc<PolicyEngine> {
-    let mut document = PolicySpec::preset(preset).expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    let engine = Arc::new(OwnEngine::new(spec));
-    Arc::new(PolicyEngine::own(engine, Arc::clone(registry)))
-}
-
-/// Where the policy engine of this process places the requests, the task
-/// fills the engine's ring of each list that stands, at its first pass and
-/// behind each membership change, and keeps and fills no ring of its own:
-/// one ring a list. A request a classic policy still places there fills
-/// its generation's ring itself and keeps none, as where no task lives.
-#[tokio::test]
-async fn the_task_fills_the_policy_engines_ring_of_a_list_in_the_place_of_its_own() {
-    let registry = Arc::new(registry_of(2));
-    let policy_engine = engine_placing("consistent_hashing", &registry);
-    let rings = Arc::new(KeptRings::filling(Some(Arc::clone(&policy_engine))));
-    assert!(!rings.are_current(&registry), "the first pass is owed");
-    rings.keep_warm(&registry, &Handle::current());
-    until("the first pass", || rings.are_current(&registry)).await;
-    assert!(policy_engine.rings_stand("model"));
-    assert!(policy_engine.rings_stand(UNKNOWN_MODEL_ID));
-
-    // The task takes no turn between this registration and the read.
-    registry
-        .register(worker_serving(&url(2), &["model"]))
-        .expect("a third worker");
-    assert!(
-        !policy_engine.rings_stand("model"),
-        "the ring of the list that stands is owed"
-    );
-    until("the fill", || rings.are_current(&registry)).await;
-    let generation = registry.get_routing_snapshot("model");
-    let members = generation.pool_members_cell(RoutingPool::HttpRegular).get();
-    let ring = members.and_then(|members| members.ring().get());
-    assert_eq!(ring.map(|ring| ring.len()), Some(3));
-
-    assert!(rings.kept.is_empty(), "the task kept a ring of its own");
-    assert!(!generation.hash_ring_is_filled());
-    let classic = rings
-        .of("model", &generation)
-        .expect("a served model has a ring");
-    assert_eq!(classic.worker_count(), 3);
-    assert!(generation.hash_ring_is_filled());
-    assert!(rings.kept.is_empty(), "a request keeps none");
-}
-
-/// Under a document that places by no ring the task makes nothing of a
-/// list: nothing of what the engine keeps of it, which a request makes, and
-/// no ring of its own.
-#[test]
-fn the_task_makes_nothing_of_a_list_the_policy_engine_places_by_no_ring() {
-    let registry = Arc::new(registry_of(2));
-    let policy_engine = engine_placing("round_robin", &registry);
-    let rings = Arc::new(KeptRings::filling(Some(Arc::clone(&policy_engine))));
-    assert!(rings.are_current(&registry), "no ring is owed");
-    // What one wake of the task does, on this thread.
-    let everything = Changed {
-        everything: true,
-        models: Vec::new(),
-    };
-    rings.fill(&registry, everything);
-    let generation = registry.get_routing_snapshot("model");
-    assert!(generation
-        .pool_members_cell(RoutingPool::HttpRegular)
-        .get()
-        .is_none());
-    assert!(rings.kept.is_empty());
-    assert!(!generation.hash_ring_is_filled());
 }
 
 /// A refresh of model cards publishes the generations again and sends no

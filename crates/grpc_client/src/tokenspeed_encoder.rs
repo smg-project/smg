@@ -18,11 +18,11 @@ use tonic::Request;
 use tracing::{debug, warn};
 
 use crate::{
-    channel::{connect_channel, Channel},
+    channel::{Channel, DEFAULT_CONNECT_TIMEOUT},
     BoxedTraceInjector, NoopTraceInjector,
 };
 
-/// Process-global cache of connected channels, keyed by encode-worker endpoint.
+/// Process-global cache of channels, keyed by encode-worker endpoint.
 ///
 /// The EPD encode stage dispatches one `Encode` RPC per image per request, so
 /// without pooling every call paid a fresh TCP + HTTP/2 (+ TLS) handshake on the
@@ -62,47 +62,37 @@ pub struct TokenSpeedEncoderClient {
 }
 
 impl TokenSpeedEncoderClient {
-    /// Connect reusing a cached `Channel` for `endpoint` (see `channel_cache`).
-    /// The lock is never held across the connect `await`, so a
-    /// rare concurrent first-connect may build two channels for the same endpoint
-    /// — harmless: the first cached wins and the extra is dropped.
+    /// A client over a channel of `endpoint`'s cached pool (see `channel_cache`).
+    /// A new endpoint's pool is built under the cache lock, of channels that
+    /// dial on their first call: built with the lock released, every request
+    /// of a burst dialled a pool of its own and dropped it.
+    #[expect(
+        clippy::unused_async,
+        reason = "a published signature: the body no longer waits"
+    )]
     pub async fn connect_cached(
         endpoint: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Fast path: pool already built for this endpoint -> pick a connection
-        // round-robin so concurrent images spread across the pool's sockets.
-        {
-            let cache = channel_cache()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(pool) = cache.get(endpoint) {
-                if !pool.is_empty() {
-                    let i = ENCODE_CONN_CURSOR.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Self::from_channel(pool[i % pool.len()].clone()));
-                }
-            }
+        // Round-robin, so concurrent images spread across the pool's sockets.
+        let pick = |pool: &[Channel]| {
+            pool[ENCODE_CONN_CURSOR.fetch_add(1, Ordering::Relaxed) % pool.len()].clone()
+        };
+        let mut cache = channel_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pool) = cache.get(endpoint) {
+            return Ok(Self::from_channel(pick(pool)));
         }
-        // Slow path: build N independent connections (lock NOT held across the
-        // connect awaits). A rare concurrent first-connect may build two pools;
-        // or_insert_with keeps the first and the extra is dropped.
+        let pool = (0..ENCODE_CONNS_PER_ENDPOINT)
+            .map(|_| Channel::unconnected(endpoint, DEFAULT_CONNECT_TIMEOUT))
+            .collect::<Result<Vec<_>, _>>()?;
         debug!(
-            "Connecting to TokenSpeed encoder at {} ({} conns, caching)",
-            endpoint, ENCODE_CONNS_PER_ENDPOINT
+            "pooling {ENCODE_CONNS_PER_ENDPOINT} connections to the TokenSpeed encoder at {}, each dialled on its first call",
+            pool[0].peer()
         );
-        let mut built = Vec::with_capacity(ENCODE_CONNS_PER_ENDPOINT);
-        for _ in 0..ENCODE_CONNS_PER_ENDPOINT {
-            built.push(connect_channel(endpoint).await?);
-        }
-        {
-            let mut cache = channel_cache()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pool = cache
-                .entry(endpoint.to_string())
-                .or_insert_with(|| built.clone());
-            let i = ENCODE_CONN_CURSOR.fetch_add(1, Ordering::Relaxed);
-            Ok(Self::from_channel(pool[i % pool.len()].clone()))
-        }
+        let client = Self::from_channel(pick(&pool));
+        cache.insert(endpoint.to_string(), pool);
+        Ok(client)
     }
 
     fn from_channel(channel: Channel) -> Self {

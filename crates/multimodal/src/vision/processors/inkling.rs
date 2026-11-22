@@ -200,7 +200,7 @@ impl InklingImageProcessor {
         if (scaled_width, scaled_height) == (width, height) {
             image.to_rgb8()
         } else {
-            transforms::resize_lanczos_pil(image, scaled_width, scaled_height).to_rgb8()
+            transforms::resize_lanczos_pil(image, scaled_width, scaled_height).into_rgb8()
         }
     }
 

@@ -132,9 +132,9 @@
 //! filter of the catalog reads them, and no profile picks a member its
 //! gateway cannot dial. The candidates the wires take are counted, and a
 //! decision whose pool has rows and whose gateway shares a wire with none
-//! of them is shed under [`WIRES`](crate::engine::store_backed_engine::WIRES).
+//! of them is shed under [`WIRES`](crate::engine::decision::WIRES).
 //! One whose gateway hints a subset of 0, a decision over no candidates, is
-//! shed under [`SUBSET_HINT`](crate::engine::store_backed_engine::SUBSET_HINT).
+//! shed under [`SUBSET_HINT`](crate::engine::decision::SUBSET_HINT).
 //! A positive hint is read by no stage yet.
 //!
 //! What this build has no decision for is answered `Busy` with no reason,
@@ -1315,11 +1315,12 @@ pub(crate) mod tests {
         document::spec::{self, AppliedSpec, PolicySpec},
         engine::{
             decision::{Decision, Overlap, OverlapSource, Pick, Targets},
+            decision_engine::Request,
             decision_slot::DecisionSlot,
             framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
             store_backed_engine::{
-                self, cut_reach, keeps_a_row, narrow, pair_in, tests::pair_counts, Request,
-                RequestForm, StoreBackedEngine, TERM_MARK,
+                self, cut_reach, keeps_a_row, narrow, pair_in, tests::pair_counts, RequestForm,
+                StoreBackedEngine, TERM_MARK,
             },
             view::{
                 self, fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts,

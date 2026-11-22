@@ -244,17 +244,11 @@ impl GenerateStreamUsage {
         &self,
         reservation: Option<Arc<SharedReservationHandle>>,
         expected_choices: u32,
-        counts: TokenCounts,
-        source: Option<&utils::StreamSource>,
     ) {
+        let Some(handle) = reservation else { return };
         if self.completed.len() as u32 >= expected_choices {
-            if let Some(handle) = reservation {
-                handle.settle_success(counts.settlement()).await;
-            }
-            if let Some(source) = source {
-                source.completed(counts.prompt, counts.completion);
-            }
-        } else if let Some(handle) = reservation {
+            handle.settle_success(self.counts().settlement()).await;
+        } else {
             handle.close_reserved_only().await;
         }
     }
@@ -608,7 +602,6 @@ impl StreamingProcessor {
                         &tx,
                         None,
                         reservation,
-                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
@@ -720,7 +713,6 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
-            None,
         )
         .await
     }
@@ -747,7 +739,6 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = ChatStream::open(
             self,
@@ -789,7 +780,7 @@ impl StreamingProcessor {
         };
 
         stream
-            .settle_and_record(reservation, client_left || terminal.is_err(), source)
+            .settle_and_record(reservation, client_left || terminal.is_err())
             .await;
         terminal
     }
@@ -834,7 +825,6 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
-                None,
             )
             .await;
 
@@ -916,7 +906,6 @@ impl StreamingProcessor {
                         ctx,
                         &tx,
                         reservation,
-                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.into()));
@@ -998,16 +987,8 @@ impl StreamingProcessor {
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        Self::process_generate_streaming_at(
-            Instant::now(),
-            tokenizer,
-            stream,
-            ctx,
-            tx,
-            reservation,
-            None,
-        )
-        .await
+        Self::process_generate_streaming_at(Instant::now(), tokenizer, stream, ctx, tx, reservation)
+            .await
     }
 
     async fn process_generate_streaming_at(
@@ -1017,7 +998,6 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -1224,19 +1204,11 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let counts = usage.counts();
-        let client_left = stream.client_left();
-        usage
-            .settle(
-                reservation,
-                ctx.expected_choices,
-                counts,
-                source.filter(|_| !client_left),
-            )
-            .await;
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
-        if client_left {
+        if stream.client_left() {
             return Ok(());
         }
         Self::record_generate_metrics(dispatch_start, first_token_time, counts, &ctx);
@@ -1577,9 +1549,7 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let counts = usage.counts();
-        usage
-            .settle(reservation, ctx.expected_choices, counts, None)
-            .await;
+        usage.settle(reservation, ctx.expected_choices).await;
         // The read ended with the client's leaving, not with the engine's end:
         // no terminal router metric for it, as the HTTP router has none for a
         // disconnect (neither a completed request nor a failure).
@@ -2664,7 +2634,6 @@ impl StreamingProcessor {
                         &tx,
                         None,
                         reservation,
-                        Some(&source),
                     ))
                     .await
                     .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
@@ -2788,7 +2757,6 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
-            None,
         )
         .await
     }
@@ -2812,7 +2780,6 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        source: Option<&utils::StreamSource>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = MessagesStream::open(
             self,
@@ -2851,7 +2818,7 @@ impl StreamingProcessor {
         };
 
         stream
-            .settle_and_record(reservation, client_left || terminal.is_err(), source)
+            .settle_and_record(reservation, client_left || terminal.is_err())
             .await;
         terminal
     }
@@ -2897,7 +2864,6 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
-                None,
             )
             .await;
 
@@ -3152,9 +3118,6 @@ impl StreamingProcessor {
                     // generation and gets no terminal router metric.
                     if tx.is_closed() {
                         return ReadingEnd::Complete;
-                    }
-                    if all_saw_complete {
-                        source.completed(total_prompt, total_completion);
                     }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
@@ -4947,25 +4910,22 @@ impl<'a> ChatStream<'a> {
         self,
         reservation: Option<Arc<SharedReservationHandle>>,
         client_left: bool,
-        source: Option<&utils::StreamSource>,
     ) {
         let model = &self.dispatch.model;
         let counts = self.counts();
         let (total_prompt, total_completion) = (counts.prompt, counts.completion);
-        // `prompt_tokens` has one entry per closed index: from its
-        // `Complete`, or from the chunk the gateway's own stop matched
-        // in. A clean EOF that didn't close every expected `n>1` choice
-        // has only partial usage -- settling with that would understate
-        // the real cost. Keep the reserved amount as final instead.
-        if self.closed_choices() >= self.spec.expected_choices {
-            if let Some(handle) = reservation {
+        if let Some(handle) = reservation {
+            // `prompt_tokens` has one entry per closed index: from its
+            // `Complete`, or from the chunk the gateway's own stop matched
+            // in. A clean EOF that didn't close every expected `n>1` choice
+            // has only partial usage -- settling with that would understate
+            // the real cost. Keep the reserved amount as final instead.
+            let expected_choices = self.spec.expected_choices;
+            if self.closed_choices() < expected_choices {
+                handle.close_reserved_only().await;
+            } else {
                 handle.settle_success(counts.settlement()).await;
             }
-            if let Some(source) = source.filter(|_| !client_left) {
-                source.completed(total_prompt, total_completion);
-            }
-        } else if let Some(handle) = reservation {
-            handle.close_reserved_only().await;
         }
         if client_left {
             return;
@@ -6271,12 +6231,11 @@ impl<'a> MessagesStream<'a> {
         self,
         reservation: Option<Arc<SharedReservationHandle>>,
         client_left: bool,
-        source: Option<&utils::StreamSource>,
     ) {
-        // The usage is settled by the engine's Complete, or by the
-        // gateway's own stop with the counts of the chunk it matched in.
-        if self.saw_complete || self.closed_by_stop {
-            if let Some(handle) = reservation {
+        if let Some(handle) = reservation {
+            // The usage is settled by the engine's Complete, or by the
+            // gateway's own stop with the counts of the chunk it matched in.
+            if self.saw_complete || self.closed_by_stop {
                 handle
                     .settle_success(UsageSettlement {
                         actual_input_tokens: self.prompt_tokens,
@@ -6285,12 +6244,9 @@ impl<'a> MessagesStream<'a> {
                         reasoning_tokens: self.engine_thinking_tokens,
                     })
                     .await;
+            } else {
+                handle.close_reserved_only().await;
             }
-            if let Some(source) = source.filter(|_| !client_left) {
-                source.completed(self.prompt_tokens, self.completion_tokens.total());
-            }
-        } else if let Some(handle) = reservation {
-            handle.close_reserved_only().await;
         }
 
         if client_left {

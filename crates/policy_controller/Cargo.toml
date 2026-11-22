@@ -516,5 +516,11 @@ harness = false
 name = "load_report_reader"
 harness = false
 
+# The in-process engine over a host's worker objects: a binary with switches.
+[[bench]]
+name = "in_process"
+harness = false
+required-features = ["in-process"]
+
 [lints]
 workspace = true
