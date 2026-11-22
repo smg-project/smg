@@ -145,6 +145,13 @@ impl crate::engine::CallAssembler for Assembler {
         self.started && !self.ended
     }
 
+    /// The call has no delimiter of its own, so the output's end is its end where the value
+    /// is whole there: a number or a literal the bytes end on. A value the end finds
+    /// unfinished is a call left open.
+    fn ends_with_the_output(&self) -> bool {
+        self.started && !self.ended && self.arguments.whole_at_the_end()
+    }
+
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
         // No terminal closes the call; the end of the stream does. A terminal that leaves the
         // state before the value began ([`Self::closes`]) finds nothing to end.

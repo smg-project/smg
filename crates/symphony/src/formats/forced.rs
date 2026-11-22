@@ -43,14 +43,15 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason, MalformedReason},
+        event::{CallEnd, DropReason, Event, Events, FinishReason, MalformedReason},
         format::ForcedCall,
         formats::{qwen3, Table},
         grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
         testing::{
-            calls, drive, drive_to, finish, said, the_same_at_every_cut, weather_tools, Said,
+            calls, drive, drive_to, endings, finish, malformed, said, the_same_at_every_cut,
+            weather_tools, Said,
         },
         Declared,
     };
@@ -109,6 +110,66 @@ mod tests {
             assert!(!events
                 .iter()
                 .any(|event| matches!(event, Event::Content(_) | Event::Reasoning(_))));
+        }
+    }
+
+    /// The forced call has no delimiter to close it: its value is the whole output, and the
+    /// output's end is the call's own end where the value is whole there. A number or a literal
+    /// the bytes end on is whole only then, and its call ends closed, at the model's stop and
+    /// at the token limit alike, as the object that closed at its brace does; a value the end
+    /// found unfinished is the call the stop found open, or the one the limit cut.
+    #[test]
+    fn a_value_whole_where_the_output_ends_closes_its_call_and_an_unfinished_one_does_not() {
+        let declared = Declared::default().forcing("get_weather");
+        let read = |output: &str, finish: EngineFinish| {
+            drive_to(
+                &mut Engine::new(forced(), declared.clone()),
+                "",
+                &[output],
+                finish,
+            )
+        };
+        for finish in [EngineFinish::Stop, EngineFinish::Length] {
+            for whole in [
+                "7",
+                "-12.5",
+                "true",
+                "null",
+                "{\"city\": \"Paris\"}",
+                "\"Paris\"",
+            ] {
+                let events = read(whole, finish.clone());
+                assert_eq!(
+                    calls(&events),
+                    [("get_weather".to_string(), whole.to_string())],
+                    "{whole}"
+                );
+                assert_eq!(
+                    endings(&events),
+                    [(0, CallEnd::Closed)],
+                    "{whole} under {finish:?}"
+                );
+                assert_eq!(malformed(&events), [], "{whole}");
+            }
+        }
+        let reasons = |events: &[Event]| -> Vec<MalformedReason> {
+            malformed(events).into_iter().map(|(_, why)| why).collect()
+        };
+        for unfinished in ["{\"city\": \"Par", "[1, 2", "tru", "\"Par"] {
+            let stopped = read(unfinished, EngineFinish::Stop);
+            assert_eq!(endings(&stopped), [(0, CallEnd::Stop)], "{unfinished}");
+            assert_eq!(
+                reasons(&stopped),
+                [MalformedReason::UnterminatedRegion],
+                "{unfinished}"
+            );
+            let cut = read(unfinished, EngineFinish::Length);
+            assert_eq!(endings(&cut), [(0, CallEnd::Cut)], "{unfinished}");
+            assert_eq!(
+                reasons(&cut),
+                [MalformedReason::UnterminatedRegion],
+                "{unfinished}"
+            );
         }
     }
 

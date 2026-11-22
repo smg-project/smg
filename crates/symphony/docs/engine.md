@@ -150,11 +150,15 @@ is a later step).
   reads as its end, or the stop where the table's stop row stands for the marker), `stop` for a
   call the model's stop found open in a state with no stop row, `cut` for one a cut found open.
   The engine writes it where the region ends (`Engine::close_call`); an assembler ends every call
-  as closed, since only the engine knows how the region ended. The events and their order are
-  what they were, so a driver that does not read the field sees no change. One that must not hand
-  on a call the model did not finish reads it there. A block that named no call has no end to
-  carry the word: the output's end that found it open refuses its bytes in that last step,
-  before the `Finish`.
+  as closed, since only the engine knows how the region ended. One syntax has no delimiter to
+  close its call, the forced arguments, which are the whole output: the output's end is that
+  call's own end where its value is whole there (a number or a literal the bytes end on), which
+  the assembler says when asked (`CallAssembler::ends_with_the_output`), and the end is then
+  `closed` at the stop and at a cut alike, as it is for the object that closed at its brace. The
+  events and their order are what they were, so a driver that does not read the field sees no
+  change. One that must not hand on a call the model did not finish reads it there. A block
+  that named no call has no end to carry the word: the output's end that found it open refuses
+  its bytes in that last step, before the `Finish`.
 - A table can say that the template discards the text of a state (`Format::framing`): Hugging
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is

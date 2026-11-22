@@ -294,6 +294,16 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// source); otherwise the engine drops them as the region's.
     fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool;
 
+    /// Whether the end of the output is the call's own end: for a syntax whose call has no
+    /// delimiter to close it (the forced arguments, which are the whole output), a value that
+    /// is whole where the bytes end, as a number or a literal the bytes end on is. Asked before
+    /// the stop or the cut ends the call, for the word its end carries ([`CallEnd`]): such a
+    /// call was not left open, and its end says `Closed`. Every other syntax closes a call with
+    /// bytes of its own, and one the output's end reaches before them is open.
+    fn ends_with_the_output(&self) -> bool {
+        false
+    }
+
     /// The stream was cut inside the region: nothing is closed for the client, so arguments cut
     /// short never look complete.
     fn finish(self: Box<Self>, out: &mut Events);
@@ -1337,6 +1347,8 @@ impl Engine {
         }
         let mut finished: Events<'static> = std::mem::take(&mut self.scratch);
         let mut as_marker = closed == Closed::Marker;
+        // Asked before the ending takes the call: whether the output's end is the call's own.
+        let own_end = closed != Closed::Marker && call.ends_with_the_output();
         let taken = match closed {
             Closed::Marker => call.close(terminal, &mut finished),
             Closed::Stop => {
@@ -1356,10 +1368,13 @@ impl Engine {
             self.region.fed += terminal.len();
         }
         // How a call this ending closes ended ([`CallEnd`]): the model's own doing where its
-        // marker closed the region or the stop stands for the marker, else the stop or the cut
-        // that found it open. A call that ended inside the region ended before this, closed.
+        // marker closed the region, the stop stands for the marker, or the output's end is the
+        // end of a call whose syntax has no delimiter and whose value is whole there; else the
+        // stop or the cut that found it open. A call that ended inside the region ended before
+        // this, closed.
         let ended = match closed {
             Closed::Marker => CallEnd::Closed,
+            Closed::Stop | Closed::Cut if own_end => CallEnd::Closed,
             Closed::Stop if as_marker => CallEnd::Closed,
             Closed::Stop => CallEnd::Stop,
             Closed::Cut => CallEnd::Cut,
