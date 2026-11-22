@@ -4388,11 +4388,13 @@ impl NativeEncoder {
     #[cold]
     #[inline(never)]
     fn seeded_raw(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
-        if cache.packed.slots() <= THREAD_BACKING_SLOTS
-            && self.seed.slots() > NEAR_SEED_SLOTS
-            && self.waits(vacancy, ids, cache)
-        {
-            return true;
+        if cache.packed.slots() <= THREAD_BACKING_SLOTS && self.seed.slots() > NEAR_SEED_SLOTS {
+            let at = ids.len();
+            let near = at.wrapping_sub(cache.last_miss) <= WAITING_GAP;
+            cache.last_miss = at;
+            if self.waits(vacancy, ids, cache, near) {
+                return true;
+            }
         }
         self.seeded_alone(vacancy, ids, cache)
     }
