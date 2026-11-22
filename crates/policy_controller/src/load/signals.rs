@@ -13,21 +13,37 @@
 //! position and the column's number ([`SignalColumn::read`]): an index
 //! and a compare of an age. No name and no hash is read in a decision.
 //!
-//! The cells stand beside the rows, not in them: a host hands them
+//! The cells stand beside the rows, not in them: a decision reads them
 //! through the request's facts
-//! ([`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)) for
-//! a profile whose stages read a signal, and for no other.
+//! ([`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)),
+//! under a profile whose stages read a signal and under no other. The
+//! store-backed engine fills them from its store. The engine over worker
+//! lists makes them itself, from the load reports its decision holds.
 
 use crate::{
-    document::spec::{AcrossRanks, MAX_SIGNALS},
+    document::spec::{AcrossRanks, COST_PARAMETER_LIMIT, MAX_SIGNALS},
     engine::view::{Candidate, RequestFacts},
 };
+
+/// The largest magnitude of a signal's value: the bound a cost rule's own
+/// parameters are held to. A value times a coefficient then stays far
+/// inside the finite range, and so does a sum of such terms. A cost that
+/// left the range would level the score of every other row.
+const VALUE_MAGNITUDE_LIMIT: f64 = COST_PARAMETER_LIMIT;
+
+/// Whether `value` is one a decision may read: a finite number of
+/// magnitude at most 1e15. Every source of a value is held to it, where
+/// it writes a cell.
+pub(crate) fn in_range(value: f64) -> bool {
+    value.is_finite() && value.abs() <= VALUE_MAGNITUDE_LIMIT
+}
 
 /// One value and when it was sampled, in microseconds on the host's clock.
 ///
 /// A value is finite and of magnitude at most 1e15. The store's sink takes
-/// no other. A host that hands cells it built passes no sink, and holds
-/// its values to the same bound itself.
+/// no other, and neither does the engine over worker lists where it reads
+/// a load report. A host that hands cells it built passes neither, and
+/// holds its values to the same bound itself.
 #[derive(Clone, Copy, Debug)]
 pub struct SignalCell {
     pub value: f64,
@@ -102,6 +118,48 @@ impl SignalCells {
         self.cells.clear();
         self.signals = counted(signals);
         &mut self.cells
+    }
+
+    /// The cells of `rows` rows of `signals` cells each, every one with no
+    /// value: what a reader of the rows' reports writes the stated values
+    /// into ([`Self::write`]). The room the cells held is kept.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn blank(&mut self, rows: usize, signals: usize) {
+        let signals = counted(signals) as usize;
+        self.refill(signals)
+            .resize(rows.saturating_mul(signals), SignalCell::NONE);
+    }
+
+    /// One value a report states for the row at `position` under `column`,
+    /// in `unit`, sampled at `sampled_at_micros`, and whether it was
+    /// written. It is written where a decision may read it: the unit is
+    /// the column's, byte for byte, and the value is in range
+    /// ([`in_range`]). A place outside the cells takes nothing.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn write(
+        &mut self,
+        position: u32,
+        column: &SignalColumn,
+        unit: &str,
+        value: f64,
+        sampled_at_micros: u64,
+    ) -> bool {
+        if column.unit() != unit || !in_range(value) {
+            return false;
+        }
+        let place = u64::from(position) * u64::from(self.signals) + u64::from(column.column);
+        let held = usize::try_from(place)
+            .ok()
+            .filter(|_| u32::from(column.column) < self.signals)
+            .and_then(|place| self.cells.get_mut(place));
+        let Some(held) = held else {
+            return false;
+        };
+        *held = SignalCell {
+            value,
+            sampled_at_micros,
+        };
+        true
     }
 
     /// The cell of the row at `position` under `column`: `None` for a
@@ -364,6 +422,48 @@ mod tests {
         assert_eq!(cells.cells_mut().capacity(), room);
         assert!(cells.cell(1, 1).is_some());
         assert!(cells.cell(1, 2).is_none(), "the old count's third column");
+    }
+
+    /// A stated value is written at its row's place under its column, and
+    /// nowhere a decision may not read it: under another unit than the
+    /// column's, out of range, or at a place outside the cells.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_stated_value_is_written_under_its_columns_unit_in_range_inside_the_cells() {
+        let held = SignalColumn::new("held", "tokens", 1, None);
+        let valued =
+            |cells: &SignalCells| cells.cells().iter().filter(|cell| !cell.is_none()).count();
+        let mut cells = SignalCells::default();
+        cells.blank(3, 2);
+        assert!(cells.fits(3) && valued(&cells) == 0, "every cell is blank");
+        assert!(cells.write(2, &held, "tokens", 7.0, 9));
+        let written = cells.cell(2, 1).expect("the cell");
+        assert_eq!((written.value, written.sampled_at_micros), (7.0, 9));
+        assert_eq!(valued(&cells), 1, "one cell was written");
+        for (position, unit, value) in [
+            (0, "bytes", 1.0),
+            (0, "Tokens", 1.0),
+            (0, "tokens", f64::NAN),
+            (0, "tokens", f64::INFINITY),
+            (0, "tokens", 1e15 + 1.0),
+            (0, "tokens", -1e15 - 1.0),
+            (3, "tokens", 1.0),
+        ] {
+            let taken = cells.write(position, &held, unit, value, 9);
+            assert!(!taken, "{value} {unit} at row {position}");
+        }
+        // A column past the cells' count of signals names no cell.
+        let past = SignalColumn::new("past", "tokens", 2, None);
+        assert!(!cells.write(0, &past, "tokens", 1.0, 9));
+        assert_eq!(valued(&cells), 1, "none of them was written");
+        // The bound itself is in range, at either sign.
+        assert!(cells.write(0, &held, "tokens", 1e15, 9));
+        assert!(cells.write(1, &held, "tokens", -1e15, 9));
+        // Blank again, over fewer rows: no value stays, and the room does.
+        let room = cells.cells_mut().capacity();
+        cells.blank(2, 2);
+        assert!(cells.fits(2) && valued(&cells) == 0);
+        assert_eq!(cells.cells_mut().capacity(), room);
     }
 
     #[test]

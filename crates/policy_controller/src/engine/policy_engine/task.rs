@@ -117,8 +117,12 @@ impl PolicyEngine {
     /// builds another monitor: a channel ends with its monitor. Of two
     /// hand-overs the newest stands: a later one replaces the one before.
     /// An engine whose document reads no load report
-    /// ([`Needs::loads`](crate::document::spec::Needs::loads)) keeps none,
-    /// and no decision of it reads a report.
+    /// ([`Needs::loads`](crate::document::spec::Needs::loads)) and no named
+    /// signal
+    /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells))
+    /// keeps none, and no decision of it reads a report. A named signal's
+    /// values stand in the same reports, so a document that reads one keeps
+    /// the channel as one that reads a report does.
     ///
     /// The engine's task reads the channel ([`Self::run`]). A decision
     /// reads the snapshot its request gives where it gives one
@@ -126,7 +130,8 @@ impl PolicyEngine {
     /// the newest the task keeps at hand otherwise: a single request's, a
     /// pair's first, and a pair's decode decided again.
     pub fn set_loads(&self, loads: LoadReceiver) {
-        if self.spec.needs().loads {
+        let needs = self.spec.needs();
+        if needs.loads || needs.signal_cells {
             let mut feed = self.loads.feed.lock();
             *feed = (feed.0 + 1, Some(loads));
             self.loads.handed.store(true, Ordering::Relaxed);

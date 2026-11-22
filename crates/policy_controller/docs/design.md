@@ -607,7 +607,7 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,           // the host's clock at the decision
     pub ring: Option<&'a dyn LentRing>, // the hash ring the host keeps, lent to this decision
     pub ring_positions: &'a [u64], // where the request stands on that ring, as the host states it
-    // eight more fields: `affinity` and `named`, and the six that 5.8 removes
+    // eight more fields: `affinity`, `named` and `signal_cells`, and the five that 5.8 removes
 }
 
 pub struct Constraints<'a> {
@@ -773,13 +773,23 @@ the kept one. `GatewayId` is still defined in the store.
   request states the positions of its list in `Constraints::places` and is decided, which is
   built); a pair's demands (a single request's are kept, which is built); a pair's encode
   items.
-- Six request fields that only the old engine's host fills leave with it (`pinned_at`,
-  `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`,
-  `signal_cells`), and `Constraints::pins`. One of them needs a successor: a sessions rule with
+- Five request fields that only the old engine's host fills leave with it (`pinned_at`,
+  `lent_in_flight`, `lent_session_in_flight`, `session_counted`, `model_fingerprint`),
+  and `Constraints::pins`. One of them needs a successor: a sessions rule with
   a cap asks `session_counted` of its host today.
 - The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
   or removed.
 - The record of sent prefixes becomes the two trees (section 4.5).
+
+`signal_cells` stays, and it is built for a single request: where the request's profile reads a
+named signal, the kept engine fills the field itself, from the reports of the load snapshot the
+decision holds. Such a decision converts its list's reports where no decision under its snapshot
+has, ahead of a routing key's short answer too. A row that is one rank of a data-parallel worker
+reads its own rank's values. One limit stands: a worker object that stands for several ranks
+reads no named value, because its report holds one sample instant for all its ranks. So a
+signal's `across_ranks` has no effect under the kept engine until the worker crate's report
+states each rank's own sample instant. A pair's two sides and an encode request's encoders are
+not lent cells yet.
 
 ## 6. The lease and its events **[built]**
 
@@ -871,7 +881,7 @@ At start:
 | keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
 | tells the engine when a worker joins | `engine.joined(address)` |
 | tells the engine when a worker is removed | `engine.forget(address)` |
-| hands its load monitor's channel | `engine.set_loads(channel)`, and again where it builds another monitor; an engine whose document reads no load report keeps none |
+| hands its load monitor's channel | `engine.set_loads(channel)`, and again where it builds another monitor; an engine whose document reads no load report and no named signal keeps none |
 | spawns the engine's own task, once | `engine.run()`: the upkeep once a second, and the newest load snapshot kept at hand |
 
 For each request the host implements a small trait and calls the engine. A host writes `model`

@@ -36,7 +36,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{document::spec, engine::view::WorkerId, load::signals::SignalColumn};
+use crate::{engine::view::WorkerId, load::signals::SignalColumn};
 
 #[cfg(test)]
 mod tests;
@@ -76,12 +76,6 @@ pub trait SignalSink: Send + Sync {
         sampled_at: Instant,
     ) -> SignalWriteOutcome;
 }
-
-/// The largest magnitude of a value the sink takes: the bound a cost
-/// rule's own parameters are held to. A value times a coefficient then
-/// stays far inside the finite range, and so does a sum of such terms. A
-/// cost that left the range would level the score of every other row.
-pub(crate) const VALUE_MAGNITUDE_LIMIT: f64 = spec::COST_PARAMETER_LIMIT;
 
 /// What became of a write to the signal sink.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

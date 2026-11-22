@@ -106,11 +106,14 @@ pub trait RequestMaker {
     /// that decides over its host's lists reads each worker's report there,
     /// and every record of one decision in the one snapshot. A host hands
     /// it where the document reads reports
-    /// ([`Needs::loads`](crate::document::spec::Needs::loads)). Where it
-    /// hands none, a decision reads the newest snapshot the engine's own
-    /// task keeps at hand
+    /// ([`Needs::loads`](crate::document::spec::Needs::loads)) or a named
+    /// signal
+    /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells)),
+    /// whose values the same reports state. Where it hands none, a decision
+    /// reads the newest snapshot the engine's own task keeps at hand
     /// ([`PolicyEngine::run`](super::policy_engine::PolicyEngine::run));
-    /// under no snapshot a record carries no report.
+    /// under no snapshot a record carries no report and a signal reads no
+    /// value.
     #[cfg(feature = "in-process")]
     fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
         None

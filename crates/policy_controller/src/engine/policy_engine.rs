@@ -49,6 +49,7 @@ mod labels;
 pub mod overlap;
 pub(super) mod pair;
 pub(super) mod place;
+mod signals;
 mod single;
 mod task;
 mod with_shadow;
@@ -65,7 +66,7 @@ use std::{
 };
 
 use rustc_hash::FxHasher;
-use smg_worker::{identity::basic::Worker, runtime::RoutingState};
+use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
 use self::overlap::{Affinity, PoolAffinity};
 use super::{
@@ -153,6 +154,13 @@ pub struct PolicyEngine {
     /// and the newest snapshot the engine's own task keeps at hand
     /// ([`Self::run`]).
     loads: task::Loads,
+    /// Whether a stage of the document reads a named signal
+    /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells)),
+    /// read once, here. Under such a document a single request whose
+    /// profile reads one is decided with its list's signal cells in its
+    /// facts ([`signals::decide`]), and any other document pays one test
+    /// of this word.
+    signals: bool,
     /// Whether a binding of the document names a shadow profile
     /// ([`SHADOWS`]), read once, here. A whole decision of a single request
     /// pays one test of it, and a place picked alone pays none.
@@ -191,6 +199,11 @@ pub struct PoolMembers {
     /// list's first whole decision, and by no pick a placement pass asks
     /// ([`PolicyEngine::pick`]).
     records: OnceLock<PoolRecords>,
+    /// The model of the list's first single request under a document a
+    /// stage of which reads a named signal, and whether a decision of that
+    /// model reads one ([`Self::reads_signal`]): such a decision reads the
+    /// list's signal cells beside its records.
+    signal: OnceLock<(Box<str>, bool)>,
     /// The wires the list's workers are dialed on ([`Self::wires`]): read
     /// of their registrations at the first whole decision over the list.
     wires: OnceLock<WireModes>,
@@ -318,6 +331,7 @@ impl PolicyEngine {
     #[must_use]
     pub fn new(mut spec: AppliedSpec) -> Self {
         let hears = spec.engine().hears();
+        let signals = spec.needs().signal_cells;
         let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
         // The table takes the document's two times where the document's
         // engine takes the pointer.
@@ -326,6 +340,7 @@ impl PolicyEngine {
         Self {
             hears,
             labels: labels::of(&spec),
+            signals,
             any_shadow,
             spec,
             applied: next_applied(),
@@ -461,6 +476,7 @@ impl PolicyEngine {
             // membership keeps changing does not lean on its first one.
             rotation: OwnWord(AtomicU64::new(mixed(epoch) >> 32)),
             records: OnceLock::new(),
+            signal: OnceLock::new(),
             wires: OnceLock::new(),
             alone: OnceLock::new(),
             shadow: OnceLock::new(),
@@ -746,6 +762,11 @@ impl PolicyEngine {
     /// written into `said`, for the caller to count behind its issue. A
     /// document that names no shadow pays one test: its path holds nothing
     /// else of a shadow.
+    ///
+    /// A request whose profile reads a named signal is decided with its
+    /// list's signal cells in its facts, made of that one snapshot
+    /// ([`signals::decide`]). A document none of whose stages reads one
+    /// pays one test.
     #[inline]
     fn decide_made<'a>(
         &self,
@@ -757,6 +778,28 @@ impl PolicyEngine {
     ) -> super::decision::Decision {
         let read = self.loads_read(maker);
         let loads = read.snapshot();
+        // Under a document a stage of which reads a named signal the
+        // list's word says whether this request's profile reads one.
+        if self.signals && members.reads_signal(&self.spec, request.facts.model) {
+            return signals::decide(self, request, members, loads, now, said);
+        }
+        self.decide_with_loads(request, members, loads, now, said)
+    }
+
+    /// [`Self::decide_made`] behind its choice of the snapshot: the
+    /// decision of a made single request over `loads`, by its binding's
+    /// live profile and, where the binding names one, its shadow behind
+    /// it. A request that is lent its list's signal cells is decided here
+    /// too, as the copy that carries them ([`signals::decide`]).
+    #[inline]
+    fn decide_with_loads(
+        &self,
+        request: &mut Request<'_>,
+        members: &PoolMembers,
+        loads: Option<&Arc<LoadSnapshot>>,
+        now: Instant,
+        said: &mut Option<Shadowed>,
+    ) -> super::decision::Decision {
         // Under a document that names a shadow the list's word says
         // whether this binding does.
         if self.any_shadow {

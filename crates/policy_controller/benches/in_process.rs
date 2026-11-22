@@ -53,6 +53,8 @@ mod counting_alloc;
 mod pair;
 #[path = "in_process/place.rs"]
 mod place;
+#[path = "in_process/signals.rs"]
+mod signals;
 
 #[cfg(any(target_env = "msvc", target_env = "musl"))]
 use std::alloc::System as Allocator;
@@ -127,7 +129,7 @@ type Cell = (
 );
 
 /// The cells. A change that moves a policy's cost adds its entry here.
-const CELLS: [Cell; 11] = [
+const CELLS: [Cell; 12] = [
     ("round_robin", || preset("round_robin"), plain, |_| ()),
     ("random", || preset("random"), plain, |_| ()),
     ("passthrough", || preset("passthrough"), plain, |_| ()),
@@ -164,6 +166,7 @@ const CELLS: [Cell; 11] = [
         pair::later,
         |_| (),
     ),
+    ("signal_cost", signals::document, plain, |_| ()),
 ];
 
 /// A built-in preset as a cell's document.
@@ -501,6 +504,7 @@ fn main() {
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
     let loads = reports(&workers);
+    let loads = signals::stated(&document, &workers, loads);
     feed.publish(&loads);
     // What a host does once: it hands its load monitor's channel and spawns
     // the engine's task, here on a runtime of its own.
