@@ -155,10 +155,11 @@ impl CacheNamespace {
 
     /// `tokens` with the marker at its head, padded to whole `page_size` pages.
     ///
-    /// Left out of line on purpose. It allocates, and inlined into
+    /// Kept out of line in every build. It allocates, and inlined into
     /// [`Self::keyed_tokens`] it grows that function past what its callers
     /// take in: every request, partitioned or not, then pays a call for its
-    /// key (35 instructions a decision, counted).
+    /// key (35 instructions a decision, counted under the bench profile).
+    #[inline(never)]
     pub fn prefixed_tokens(self, tokens: &[u32], page_size: usize) -> Vec<u32> {
         let marker_len = Self::token_marker_len(page_size);
         let mut keyed = Vec::with_capacity(marker_len + tokens.len());
@@ -168,8 +169,9 @@ impl CacheNamespace {
         keyed
     }
 
-    /// `text` with the marker at its head. Left out of line, as
+    /// `text` with the marker at its head. Kept out of line, as
     /// [`Self::prefixed_tokens`] is.
+    #[inline(never)]
     pub fn prefixed_text(self, text: &str) -> String {
         let mut keyed = String::with_capacity(TEXT_MARKER_LEN + text.len());
         keyed.push_str(&self.text_marker());
