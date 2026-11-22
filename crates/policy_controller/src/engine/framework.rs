@@ -6379,8 +6379,8 @@ impl Engine {
     /// profile, where the profile's picker takes turns
     /// ([`Picker::takes_turns`]): the draw a request with no session value
     /// is decided by ([`run_drawn`]), each row asked that draw's own test,
-    /// every filter of the profile, hard and soft alike. A row every filter
-    /// keeps is one of the survivors in `buf.kept`. A new session and a
+    /// every filter of the profile, hard and soft alike, and taken where it
+    /// is one of the survivors in `buf.kept` too. A new session and a
     /// session at its cap so take the next turn of the rotation such a
     /// request turns, and none of the survivors' own. `None` where the
     /// profile's plain request is not the draw's, or the draw keeps nobody:
@@ -6421,16 +6421,25 @@ impl Engine {
             ..
         } = buf;
         drawn.clear();
-        // The draw's own test of a row, as a request with no session value
-        // is asked it: by the profile's fold and the host's mask where the
-        // build made a fold, else a call a filter. A row every filter keeps
-        // is one of the survivors. Where the pass put back the rows a soft
-        // filter refused together, or the all-vetoed rule kept rows, the
-        // draw keeps none of them, as that request's does, and the stages
-        // place over the survivors.
-        let mut keeps = |row: &Candidate| match tests {
-            Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
-            None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+        // A row the draw takes passes two tests, and neither says the other.
+        // The draw's own, as a request with no session value is asked it:
+        // the profile's fold and the host's mask where the build made a
+        // fold, else a call a filter. Where the pass put back the rows a
+        // soft filter refused together, or the all-vetoed rule kept rows,
+        // every survivor fails it: the draw keeps none, as that request's
+        // does, and the stages place over the survivors. And the row is one
+        // of the survivors. A filter may read what another decision moves,
+        // so a row the pass refused can pass the first test here, and the
+        // session's cap is read of the survivors alone ([`Self::respill`]).
+        // The survivors name a row once, so as many as the rows is every row.
+        let all = kept.len() == candidates.len();
+        let mut keeps = |row: &Candidate| {
+            let passes = match tests {
+                Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
+                None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+            };
+            let at = candidates.element_offset(row);
+            passes && (all || at.is_some_and(|at| kept.contains(&(at as u32))))
         };
         let mut draw = Draw::new(facts.seed);
         let picker = &profile.picker;
@@ -6438,10 +6447,6 @@ impl Engine {
         // Asked on both arms: the stages behind a draw that keeps nobody are
         // handed the request's own seed too.
         debug_assert_eq!(draw.state(), facts.seed, "a turn reads no drawn value");
-        debug_assert!(
-            drawn.iter().all(|row| kept.contains(row)),
-            "a row every filter keeps is a survivor"
-        );
         if !drew {
             return None;
         }
@@ -15901,8 +15906,10 @@ mod tests {
     /// engine each, a new session is decided as a request with no session
     /// value is: by the draw where the turn's row is kept, its trace the
     /// draw's with the pass's count, and by the stages where a filter, a
-    /// host's filter or the host's veto refuses that row. A host's picker
-    /// that takes turns and orders nothing of its draw is the stages' too.
+    /// host's filter or the host's veto refuses that row. A row the pass
+    /// refused is not taken at the turn, whatever its filter says of it
+    /// there. A host's picker that takes turns and orders nothing of its
+    /// draw is the stages' too.
     /// `random` takes no turn: the stages alone place its new session.
     ///
     /// The classic router asks one function for all three kinds of request,
@@ -15912,6 +15919,8 @@ mod tests {
     /// for a new session at `:581` and for a session over its cap at `:552`.
     #[test]
     fn round_robin_under_delegate_turns_one_rotation_for_every_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let scored = || Profile {
             scorers: vec![WeightedScorer {
                 scorer: Box::new(LeastRequests),
@@ -16008,12 +16017,41 @@ mod tests {
         // trace is the draw's with the count of the session's own pass.
         // Where the turn's row is refused, the stages place both on the same
         // rows: by a filter of the fold, by a host's filter, by the host's
-        // veto, and with every row by a soft filter.
+        // veto, with every row by a soft filter of the fold or of a host,
+        // and with every row under the host's veto, which the rule lifts.
         let hosted = || Profile {
             filters: vec![Box::new(Hosted(Box::new(Healthy)))],
             ..round_robin_profile()
         };
-        assert!(draws_first(&hosted()));
+        let hosted_roomless = || Profile {
+            filters: vec![
+                Box::new(Hosted(Box::new(Healthy))),
+                Box::new(Hosted(Box::new(HasRoom))),
+            ],
+            ..round_robin_profile()
+        };
+        assert!(draws_first(&hosted()) && draws_first(&hosted_roomless()));
+        // A host's filter whose answer moves between two asks of one row, as
+        // a filter that reads what another decision moves can: it refuses
+        // `row` the first time it is asked of it, and keeps it after.
+        #[derive(Debug)]
+        struct Flips {
+            row: u32,
+            asked: AtomicBool,
+        }
+        impl Filter for Flips {
+            fn name(&self) -> &'static str {
+                "flips"
+            }
+
+            fn row_wise(&self) -> bool {
+                true
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+                c.position != self.row || self.asked.swap(true, Ordering::Relaxed)
+            }
+        }
         let shared = PoolFacts {
             generation: 7,
             ..PoolFacts::default()
@@ -16031,39 +16069,68 @@ mod tests {
         for rows in [DRAW_FROM as u32, 64] {
             let full = pool_of(rows, |_| false);
             let turn = decide(round_robin_profile(), &full, &free, false).0[0];
+            // The turn's row kept, by the fold's test and by a host's filter.
             let apart = pool_of(rows, |row| row == (turn + 8) % rows);
-            let (plain, drew) = decide(round_robin_profile(), &apart, &free, false);
-            let (keyed, counted) = decide(round_robin_profile(), &apart, &free, true);
-            assert!(drew.drew_first() && plain[0] == turn, "{rows}: {plain:?}");
-            assert_eq!(
-                (drew.made_under(), drew.seed, drew.generation),
-                (Some(0), request(5).seed, 7)
-            );
-            let pass = Trace {
-                survivors: Survivors::counted(rows - 1),
-                ..drew
-            };
-            assert_eq!((keyed, counted), (plain, pass), "{rows} rows");
+            for profile in [round_robin_profile as fn() -> Profile, hosted] {
+                let (plain, drew) = decide(profile(), &apart, &free, false);
+                let (keyed, counted) = decide(profile(), &apart, &free, true);
+                assert!(drew.drew_first() && plain[0] == turn, "{rows}: {plain:?}");
+                assert_eq!(
+                    (drew.made_under(), drew.seed, drew.generation),
+                    (Some(0), request(5).seed, 7)
+                );
+                let pass = Trace {
+                    survivors: Survivors::counted(rows - 1),
+                    ..drew
+                };
+                assert_eq!((keyed, counted), (plain, pass), "{rows} rows");
+            }
             let ailing = pool_of(rows, |row| row == turn);
             let stalled = [turn];
             let vetoed = Constraints {
                 stalled: &stalled,
                 ..Constraints::default()
             };
+            let every: Vec<u32> = (0..rows).collect();
+            let doubted = Constraints {
+                stalled: &every,
+                ..Constraints::default()
+            };
             // A profile, its pool and what the host holds the request to.
             type State<'a> = (fn() -> Profile, &'a [Candidate], &'a Constraints<'a>);
-            let refused: [State<'_>; 4] = [
+            let refused: [State<'_>; 6] = [
                 (round_robin_profile, &ailing, &free),
                 (hosted, &ailing, &free),
                 (round_robin_profile, &full, &vetoed),
                 (roomless, &full, &free),
+                (hosted_roomless, &full, &free),
+                (round_robin_profile, &full, &doubted),
             ];
             for (state, (profile, pool, cx)) in refused.into_iter().enumerate() {
                 let (plain, whole) = decide(profile(), pool, cx, false);
                 let (keyed, _) = decide(profile(), pool, cx, true);
                 assert!(!whole.drew_first(), "{rows} rows, state {state}");
+                assert!(!plain.is_empty(), "{rows} rows, state {state}: a pick");
                 assert_eq!(keyed, plain, "{rows} rows, state {state}");
+                let lifted = if state == 5 {
+                    LiftedVeto::Liveness
+                } else {
+                    LiftedVeto::None
+                };
+                assert_eq!(whole.lifted, lifted, "{rows} rows, state {state}");
             }
+            // The row a filter refused at the pass is no survivor, whatever
+            // the filter says of it at the turn: the turn does not take it.
+            let flips = Profile {
+                filters: vec![Box::new(Flips {
+                    row: turn,
+                    asked: AtomicBool::new(false),
+                })],
+                ..round_robin_profile()
+            };
+            let (keyed, counted) = decide(flips, &full, &free, true);
+            assert!(!keyed.contains(&turn), "{rows} rows: {keyed:?}");
+            assert_eq!(counted.survivors.get(), Some(rows - 1), "{rows} rows");
         }
         // A host's picker that takes turns and hands out nothing of the
         // row it drew: the stages place its new session, as they place its
