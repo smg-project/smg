@@ -189,9 +189,11 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
             );
             continue;
         }
-        // The reference runs the model `tokenizers` reads from the file
-        // itself: a model the accessor builds of the crate's own tables
-        // would vouch for the encode it is compared with.
+        // On a BPE file the reference runs the model `tokenizers` reads from
+        // the file itself (a model the accessor builds of the crate's own
+        // tables would vouch for the encode it is compared with), once the
+        // accessor's model holds that vocabulary. Unigram scores are the
+        // loader's read, which `from_file` does not follow in this build.
         let file = tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
             .expect("the file by `tokenizers`");
         let mut configured = ours
@@ -200,7 +202,14 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
             .expect("a tokenizer.json loads as the Hugging Face backend")
             .tokenizers_pipeline()
             .clone();
-        configured.with_model(file.get_model().clone());
+        if matches!(file.get_model(), tokenizers::models::ModelWrapper::BPE(_)) {
+            assert_eq!(
+                configured.get_vocab_size(false),
+                file.get_vocab_size(false),
+                "{dir}: the accessor's model holds the file's vocabulary"
+            );
+            configured.with_model(file.get_model().clone());
+        }
         let reference = &configured;
         let specials: Vec<String> = reference
             .get_added_vocabulary()
