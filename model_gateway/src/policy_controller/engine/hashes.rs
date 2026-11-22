@@ -1,101 +1,65 @@
 //! The prompt facts an attempt keeps for its asks to the controller.
 
-use std::fmt;
+use smg_policy_controller::engine::{HashSeeds, PromptHashes};
 
-use smg_policy_controller::engine::{HashSeeds, PromptHashes, PromptLent};
-
+use super::Prompt;
 use crate::policies::CacheNamespace;
 
-/// What an attempt states of its prompt: what its hashes are made of, for
-/// the cache index, and what the engine of this process is lent
-/// ([`Ask::prompt`](super::Ask::prompt)). Its `Debug` prints sizes alone,
-/// as the lent prompt's does: an ask that is printed shows no token id and
-/// no text of a request.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Prompt<'a> {
-    /// The prompt's token ids, where the router tokenized it.
-    pub tokens: Option<&'a [u32]>,
-    /// The request's text as its route reads it for routing, where the
-    /// router holds no token ids. Token ids win where both are stated.
-    pub text: Option<&'a str>,
-    /// The request's cache partition, where it has one.
-    pub namespace: Option<CacheNamespace>,
+/// The hashes of `prompt` as `hash` makes them of what the prompt holds:
+/// its token ids where the router tokenized it, else its text, under the
+/// seeds. The policy engine hands the hashing of the generation in force
+/// ([`DecisionEngine::prompt_hashes`](smg_policy_controller::engine::DecisionEngine::prompt_hashes)).
+///
+/// The seeds are the cache partition's. A request with no partition is
+/// hashed under the plain seeds, less the leading ids that carry a
+/// partition's marker.
+pub(super) fn hashed(
+    prompt: &Prompt<'_>,
+    hash: impl FnOnce(Option<&[u32]>, Option<&str>, HashSeeds) -> PromptHashes,
+) -> PromptHashes {
+    let seeds = prompt
+        .namespace
+        .map_or(HashSeeds::PLAIN, |namespace| HashSeeds {
+            // The blocks are hashed as the engines hash theirs, so the
+            // index of cache events finds them. That seed folds no extra
+            // key.
+            event: namespace.event_seed(),
+            // A prefix is named under the partition's whole identity.
+            // The record of sent prefixes and the ring keep two
+            // partitions apart that differ by the extra key alone, as an
+            // engine's cache does.
+            partition: namespace.partition_seed(),
+        });
+    let tokens = match prompt.namespace {
+        Some(_) => prompt.tokens,
+        None => prompt.tokens.map(CacheNamespace::unpartitioned_tokens),
+    };
+    hash(tokens, prompt.text, seeds)
 }
 
-impl fmt::Debug for Prompt<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Prompt")
-            .field("tokens", &self.tokens.map(<[u32]>::len))
-            .field("text_bytes", &self.text.map(str::len))
-            .field("partitioned", &self.namespace.is_some())
-            .finish()
-    }
-}
-
-impl<'a> Prompt<'a> {
-    /// A prompt of `tokens` under the request's cache partition, with no
-    /// text. A stage that states a text names it over this one, and a stage
-    /// that states none names no field of the prompt.
-    pub(crate) const fn of(tokens: Option<&'a [u32]>, namespace: Option<CacheNamespace>) -> Self {
-        Self {
-            tokens,
-            text: None,
-            namespace,
-        }
-    }
-
-    /// The prompt as the engine of this process is lent it: the same three
-    /// facts, borrowed for one decision.
-    pub(super) const fn lent(&self) -> PromptLent<'a> {
-        PromptLent {
-            tokens: self.tokens,
-            text: self.text,
-            namespace: self.namespace,
-        }
-    }
-
-    /// The prompt's hashes as `hash` makes them of what the prompt holds:
-    /// its token ids where the router tokenized it, else its text, under
-    /// the seeds. The policy engine hands the hashing of the generation in
-    /// force
-    /// ([`DecisionEngine::prompt_hashes`](smg_policy_controller::engine::DecisionEngine::prompt_hashes)).
-    ///
-    /// The seeds are the cache partition's. A request with no partition is
-    /// hashed under the plain seeds, less the leading ids that carry a
-    /// partition's marker.
-    pub(super) fn hashed(
-        &self,
-        hash: impl FnOnce(Option<&[u32]>, Option<&str>, HashSeeds) -> PromptHashes,
-    ) -> PromptHashes {
-        let seeds = self
-            .namespace
-            .map_or(HashSeeds::PLAIN, |namespace| HashSeeds {
-                // The blocks are hashed as the engines hash theirs, so the
-                // index of cache events finds them. That seed folds no extra
-                // key.
-                event: namespace.event_seed(),
-                // A prefix is named under the partition's whole identity.
-                // The record of sent prefixes and the ring keep two
-                // partitions apart that differ by the extra key alone, as an
-                // engine's cache does.
-                partition: namespace.partition_seed(),
-            });
-        let tokens = match self.namespace {
-            Some(_) => self.tokens,
-            None => self.tokens.map(CacheNamespace::unpartitioned_tokens),
-        };
-        hash(tokens, self.text, seeds)
-    }
-
+/// A prompt's hashes for a model under the generation in force in a store,
+/// for the cases of the policy engine.
+#[cfg(test)]
+pub(super) trait StoreHashes {
     /// The prompt's hashes for `model` under the generation in force in
     /// `store`.
-    #[cfg(test)]
-    pub(super) fn hashes(
+    fn hashes(
+        &self,
+        store: &smg_policy_controller::store::MemoryStore,
+        model: &str,
+    ) -> PromptHashes;
+}
+
+#[cfg(test)]
+impl StoreHashes for Prompt<'_> {
+    fn hashes(
         &self,
         store: &smg_policy_controller::store::MemoryStore,
         model: &str,
     ) -> PromptHashes {
-        self.hashed(|tokens, text, seeds| store.prompt_hashes(model, tokens, text, seeds))
+        hashed(self, |tokens, text, seeds| {
+            store.prompt_hashes(model, tokens, text, seeds)
+        })
     }
 }
 
@@ -121,6 +85,7 @@ mod tests {
     use crate::{
         policies::namespace_of,
         policy_controller::engine::{
+            hashes::StoreHashes as _,
             testing::{cache_bed, record_bed, store_blocks, MODEL},
             tests::first,
             Ask, Prompt, GATEWAY,

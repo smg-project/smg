@@ -58,7 +58,7 @@ use smg_policy_controller::{
         worker_id, worker_rank, AlonePick, Constraints, DecideOutcome, Decided, Decision,
         DecisionEngine, DecisionRefused, EncodeItems, EncodePlaced, HashSeeds, HeldDecision,
         Identity, LiftedVeto, MediaCounts, Pair, Phase, Plain, PolicyEngine as OwnEngine,
-        PoolMembers, PromptLent, Request, RequestFacts, RequestMaker, ShadowKind, ShedReason,
+        PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind, ShedReason,
         StoreBackedEngine, SweepOutcome, Target, Targets, Trace, WireModes, WorkerId, WorkerLists,
         MAX_TARGETS,
     },
@@ -98,8 +98,12 @@ use crate::{
 mod hashes;
 mod loads;
 
-pub(crate) use hashes::Prompt;
 pub(crate) use smg_policy_controller::engine::PromptHashes as Hashes;
+// What an attempt states of its prompt: what its hashes are made of
+// ([`PolicyEngine::hashes`]), and what the engine of this process is lent
+// ([`Ask::prompt`]). It is the policy crate's own type for a lent prompt,
+// so an ask that is printed shows the prompt's sizes alone.
+pub(crate) use smg_policy_controller::engine::PromptLent as Prompt;
 
 /// The gateway of this process, as the controller's store names it: the
 /// crate's own name for the one gateway that decides in its own process.
@@ -403,8 +407,8 @@ impl RequestMaker for Made<'_, '_> {
     }
 
     // The prompt its route stated on the ask, where it stated one.
-    fn prompt(&self) -> Option<PromptLent<'_>> {
-        self.ask.prompt.map(Prompt::lent)
+    fn prompt(&self) -> Option<Prompt<'_>> {
+        self.ask.prompt.copied()
     }
 }
 
@@ -902,7 +906,9 @@ impl PolicyEngine {
     /// The stage holding the tokens calls this once before the first ask.
     /// Each ask borrows the same result through [`Ask::hashes`].
     pub(crate) fn hashes(&self, model: &str, prompt: &Prompt<'_>) -> Hashes {
-        prompt.hashed(|tokens, text, seeds| self.door.prompt_hashes(model, tokens, text, seeds))
+        hashes::hashed(prompt, |tokens, text, seeds| {
+            self.door.prompt_hashes(model, tokens, text, seeds)
+        })
     }
 
     /// Fills the hash ring of each list a regular request of `model` is
