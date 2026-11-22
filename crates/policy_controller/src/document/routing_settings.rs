@@ -155,6 +155,40 @@ pub struct RoutingSettings {
     pub worker_overload_shed: bool,
 }
 
+impl Default for RoutingSettings {
+    /// The settings of a gateway that sets none: each setting at the value it
+    /// has where a configuration leaves it out. The document they mean is the
+    /// `random` preset.
+    ///
+    /// The warm-up numbers and the overload thresholds are the ones the
+    /// controller's stages run at when a document names none, so settings at
+    /// them write neither into a document.
+    fn default() -> Self {
+        Self {
+            mode: ModeSettings::Regular,
+            policy: PolicySettings::Random,
+            enable_igw: false,
+            policy_spec: None,
+            grouped_dp_sticky: None,
+            dp_minimum_tokens_scheduler: false,
+            pd_pairing_mode: Pairing::Lenient,
+            worker_warmup_secs: DEFAULT_WARMUP_SECS,
+            worker_warmup_share: DEFAULT_WARMUP_SHARE,
+            worker_warmup_blocks: DEFAULT_WARMUP_BLOCKS as usize,
+            worker_warmup_thin_ratio: DEFAULT_WARMUP_THIN_RATIO,
+            worker_warmup_divert_every: DEFAULT_WARMUP_DIVERT_EVERY,
+            routing_key_override: RoutingKeyOverrideSettings::default(),
+            worker_overload_protection: true,
+            worker_overload_waiting_requests: Some(OVERLOAD_WAITING_REQUESTS as usize),
+            // A configuration writes this usage as 0.8 in 64 bits. The
+            // controller's number is 32 bits wide: widened, it is another
+            // value.
+            worker_overload_token_usage: Some(0.8),
+            worker_overload_shed: false,
+        }
+    }
+}
+
 impl RoutingSettings {
     /// The provider's name, where every router of the gateway is that
     /// provider's: a provider mode of a gateway that does not run many routers.
@@ -186,6 +220,21 @@ pub struct RoutingKeyOverrideSettings {
     pub max_idle_secs: u64,
     /// How a key the override sees for the first time picks its worker.
     pub assignment_mode: Assignment,
+}
+
+impl Default for RoutingKeyOverrideSettings {
+    /// The override of a gateway that sets none of it: off, with the header,
+    /// the two times and the assignment a configuration that leaves them out
+    /// gets.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            headers: vec![MANUAL_SESSION_HEADER.to_owned()],
+            eviction_interval_secs: 60,
+            max_idle_secs: 4 * 3600,
+            assignment_mode: Assignment::Delegate,
+        }
+    }
 }
 
 /// The kinds of worker a gateway routes to. A side names its own policy or
@@ -479,9 +528,10 @@ impl RoutingSettings {
     /// document, it is the one the routing settings mean. A supplied
     /// document takes effect if the settings describe the same document or
     /// the document of `defaults` for this mode. `defaults` are the
-    /// settings of a gateway that sets none: the gateway's own, since this crate
-    /// holds no default of a gateway's configuration. A conflict names the
-    /// first difference and the two values.
+    /// settings of a gateway that sets none: [`RoutingSettings::default`],
+    /// or the gateway's own where its configuration defaults a setting to
+    /// another value. A conflict names the first difference and the two
+    /// values.
     ///
     /// Both launchers refuse a routing setting beside a document before
     /// this runs, so the comparison judges a configuration built by hand.
@@ -1620,31 +1670,7 @@ mod tests {
     /// The settings of a gateway that sets none, as its configuration
     /// defaults them. The document they mean is the `random` preset.
     fn defaults() -> RoutingSettings {
-        RoutingSettings {
-            mode: ModeSettings::Regular,
-            policy: PolicySettings::Random,
-            enable_igw: false,
-            policy_spec: None,
-            grouped_dp_sticky: None,
-            dp_minimum_tokens_scheduler: false,
-            pd_pairing_mode: Pairing::Lenient,
-            worker_warmup_secs: 60,
-            worker_warmup_share: 0.25,
-            worker_warmup_blocks: 1024,
-            worker_warmup_thin_ratio: 0.5,
-            worker_warmup_divert_every: 8,
-            routing_key_override: RoutingKeyOverrideSettings {
-                enabled: false,
-                headers: vec!["x-smg-routing-key".to_string()],
-                eviction_interval_secs: 60,
-                max_idle_secs: 14_400,
-                assignment_mode: Assignment::Delegate,
-            },
-            worker_overload_protection: true,
-            worker_overload_waiting_requests: Some(8),
-            worker_overload_token_usage: Some(0.8),
-            worker_overload_shed: false,
-        }
+        RoutingSettings::default()
     }
 
     /// The cache-aware policy with these five settings, and every other at
@@ -1899,6 +1925,16 @@ mod tests {
             }
             other => panic!("expected a setting refused by name, got {other:?}"),
         }
+    }
+
+    /// The settings a configuration leaves out are those of a gateway that
+    /// sets none: the `random` preset, with nothing written over it.
+    #[test]
+    fn the_settings_of_a_gateway_that_sets_none_mean_the_random_preset() {
+        assert_eq!(
+            RoutingSettings::default().policy_document(),
+            Ok(preset("random"))
+        );
     }
 
     #[test]
