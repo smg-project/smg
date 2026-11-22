@@ -22,6 +22,12 @@ pub enum TransformError {
     #[error("Shape error: {0}")]
     ShapeError(String),
 
+    /// The storage of a processor's output could not be reserved (the
+    /// allocator refused it, or its size passes what a `Vec` can hold). It
+    /// prints as a `ShapeError` does.
+    #[error("Shape error: {0}")]
+    ReserveRefused(String),
+
     /// The bytes the audio would decode to are over the cap `knob` sets: a
     /// size refusal, which the decoder reports as
     /// [`MediaConnectorError::DecodedTooLarge`].

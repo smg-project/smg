@@ -349,7 +349,7 @@ impl VisionPreProcessor for InklingImageProcessor {
             |capacity| {
                 let mut patches: Vec<f32> = Vec::new();
                 patches.try_reserve_exact(capacity).map_err(|e| {
-                    TransformError::ShapeError(format!(
+                    TransformError::ReserveRefused(format!(
                         "Inkling: cannot reserve {capacity} f32 for image patches: {e}"
                     ))
                 })?;
@@ -409,7 +409,7 @@ impl VisionPreProcessor for InklingImageProcessor {
                 // Empty: the patches are appended, so no byte of a previous
                 // request can be part of the wire.
                 buffer_pool::take_empty(elements).map_err(|e| {
-                    TransformError::ShapeError(format!(
+                    TransformError::ReserveRefused(format!(
                         "Inkling: cannot reserve {elements} bytes for image patches: {e}"
                     ))
                 })

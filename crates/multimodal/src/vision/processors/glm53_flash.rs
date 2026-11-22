@@ -409,7 +409,8 @@ fn encode<F: RgbSource>(
         "GLM features",
     )?;
     let expected = product(&[count, features], "GLM patch output size")?;
-    let refused = |error| shape(format!("cannot reserve GLM patch output: {error}"));
+    let refused =
+        |error| TransformError::ReserveRefused(format!("cannot reserve GLM patch output: {error}"));
     if values.capacity() == 0 {
         *values = buffer_pool::take_empty(expected).map_err(refused)?;
     }
@@ -682,8 +683,9 @@ impl VisionPreProcessor for Glm53FlashProcessor {
                 .checked_add(self.image_elements(image.width(), image.height())?)
                 .ok_or_else(|| shape("GLM image batch size overflow"))
         })?;
-        let mut values = buffer_pool::take_empty(expected)
-            .map_err(|error| shape(format!("cannot reserve GLM image batch: {error}")))?;
+        let mut values = buffer_pool::take_empty(expected).map_err(|error| {
+            TransformError::ReserveRefused(format!("cannot reserve GLM image batch: {error}"))
+        })?;
         let mut grids = Vec::with_capacity(images.len() * 3);
         let mut counts = Vec::with_capacity(images.len());
         let mut tokens = Vec::with_capacity(images.len());

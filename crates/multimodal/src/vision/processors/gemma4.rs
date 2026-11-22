@@ -498,7 +498,9 @@ fn stack(
     let mut values = Vec::new();
     values
         .try_reserve_exact(count * max_patches * patch_pixels)
-        .map_err(|error| shape(format!("cannot reserve Gemma 4 patch output: {error}")))?;
+        .map_err(|error| {
+            TransformError::ReserveRefused(format!("cannot reserve Gemma 4 patch output: {error}"))
+        })?;
     let mut positions = Vec::with_capacity(count * max_patches * 2);
     let mut tokens = Vec::with_capacity(count);
     for item in encoded {

@@ -403,15 +403,15 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         let batch_size = images.len();
         let tile = TILE_SIZE as usize;
         let shape = vec![batch_size, max_crops, 3, tile, tile];
-        let refused = |reason: String| {
-            TransformError::ShapeError(format!("cannot reserve Phi-3 patch output: {reason}"))
-        };
+        let refused = |reason: String| format!("cannot reserve Phi-3 patch output: {reason}");
         let len = shape
             .iter()
             .try_fold(1usize, |n, &d| n.checked_mul(d))
-            .ok_or_else(|| refused(format!("{shape:?} overflows usize")))?;
-        let mut flat_data =
-            scratch::try_take_f32_cap(len).map_err(|error| refused(error.to_string()))?;
+            .ok_or_else(|| {
+                TransformError::ShapeError(refused(format!("{shape:?} overflows usize")))
+            })?;
+        let mut flat_data = scratch::try_take_f32_cap(len)
+            .map_err(|error| TransformError::ReserveRefused(refused(error.to_string())))?;
         let mut all_image_sizes = Vec::with_capacity(images.len());
         let mut all_num_tokens = Vec::with_capacity(images.len());
 
@@ -870,7 +870,7 @@ mod tests {
         let error = processor.preprocess(&[&image]).expect_err("not reserved");
 
         assert!(
-            matches!(&error, TransformError::ShapeError(message)
+            matches!(&error, TransformError::ReserveRefused(message)
                 if message.contains("cannot reserve Phi-3 patch output")),
             "{error}"
         );
