@@ -396,7 +396,9 @@ fn assembler(
         // The list reader takes what frames the calls as one value: the list between markers
         // (Llama Nemotron) takes text in place of it as malformed; the bare list the output starts
         // in (xLAM) takes it for prose; the `json` table's output is one object, several with `;`
-        // or whitespace between them, or a list, behind the family's call marker or not.
+        // or whitespace between them, or a list, behind the family's call marker or not, and
+        // between the markers of a table with no call marker (Command) the same with text in
+        // place of it malformed.
         Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(
             index,
             ids,
@@ -409,7 +411,11 @@ fn assembler(
         Some(CallSyntax::JsonAlone(opener)) => Box::new(json::list::Assembler::new(
             index,
             ids,
-            json::list::Framing::ObjectOrList { opener },
+            if framed && opener.is_none() {
+                json::list::Framing::FramedObjectOrList
+            } else {
+                json::list::Framing::ObjectOrList { opener }
+            },
         )),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id())),
         Some(CallSyntax::Attributed(tags)) => {

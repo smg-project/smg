@@ -124,7 +124,9 @@ the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
 `{` at the first byte as one call alone and every further object after it, behind a `;` or behind
 whitespace alone, as another call, and carries the family's call marker the output may open with
-(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does; `Forced` (a
+(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does;
+`FramedObjectOrList` (Command) reads as `ObjectOrList` with no marker between a table's markers,
+where text in place of the calls is malformed as under `Framed`; `Forced` (a
 required call's list under the request's JSON schema) reads as `ObjectOrList` with no marker and
 differs at the end of the stream alone, where the engine held the output to the list and no byte of
 an open one is prose: the separators held after a call, an object cut before its arguments began and
@@ -142,11 +144,12 @@ under every framing.
 The JSON family so reads as one object reader with the framings around it, each stated once:
 none, where a table's markers frame one object (`CallSyntax::Json`, the JSON assembler itself); a
 header (`json::named`, whose `After` says what the JSON after the marker is); a list (`json::list`,
-whose `Framing` says what is around the objects). The lone object between markers is not a framing
-of the list reader: the engine, not the reader, reports what follows the object there
-(`Engine::wrapping`, per piece), where the list reader holds the whitespace after a lone object
-across pieces and reads a `;`, another object or prose after it; folding it in would change those
-events, or put a branch on the busiest JSON path for no reader fewer. The forced call
+whose `Framing` says what is around the objects). The one object a table's markers frame
+(`CallSyntax::Json`) is not a framing of the list reader: the engine, not the reader, reports what
+follows the object there (`Engine::wrapping`, per piece), where the list reader, between Command's
+markers too (`FramedObjectOrList`), holds the whitespace after a lone object across pieces and
+reads a `;`, another object or prose after it; folding it in would change those events, or put a
+branch on the busiest JSON path for no reader fewer. The forced call
 (`json::forced`) reads through the value reader (`json::arguments`), which ends where the value is
 whole and holds the strings a caller types, not at an object's brace: a different reader by design,
 named by the request rather than framed.
