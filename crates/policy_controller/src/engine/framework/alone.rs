@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use super::{profile_index, Binding, Engine, Marks, Plan, Profile};
+use super::{profile_index, Binding, Engine, Marks, Pattern, Plan, Profile};
 use crate::{document::spec::Needs, engine::view::Phase, stages::filters::RowTests};
 
 /// A profile whose whole decision is one pick of its picker
@@ -185,6 +185,32 @@ impl Engine {
             needs.is_some_and(|needs| needs.within(fed))
         };
         self.bindings.iter().all(single) && self.places().all(decided)
+    }
+
+    /// The model patterns the document plans single requests of, in its
+    /// bindings' order, where none of them holds every model. `None` where
+    /// one does: a binding of `*` that plans a single request, and a
+    /// document that states no binding has its one profile under `*`.
+    ///
+    /// A host that asks the engine for every request serves the models
+    /// these patterns hold, and the engine declines a single request of
+    /// any other model at the binding ([`Place::Unbound`]). The list is
+    /// empty where no binding plans a single request: each is declined.
+    /// The pattern is all that narrows a binding to some models: this
+    /// build refuses a document that states any other matcher.
+    #[must_use]
+    pub fn named_single_models(&self) -> Option<Vec<&str>> {
+        let mut models = Vec::new();
+        for (binding, phase, ..) in self.places() {
+            if phase != Phase::Single {
+                continue;
+            }
+            if matches!(binding.pattern(), Pattern::Any) {
+                return None;
+            }
+            models.push(binding.model.as_str());
+        }
+        Some(models)
     }
 
     /// The first stage of `profile`, which stands at `index`, that asks

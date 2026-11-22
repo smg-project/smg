@@ -1010,6 +1010,44 @@ mod tests {
         }
     }
 
+    /// A document says which models it plans single requests of: the
+    /// patterns of the bindings that plan one, in the document's order. It
+    /// has nothing to list where a binding of `*` plans one, and a document
+    /// that states no binding has its one profile under `*`. A pair's plan
+    /// has no side for a single request, so a document of pair bindings
+    /// alone plans single requests of no model.
+    #[test]
+    fn a_document_names_the_models_it_plans_single_requests_of() {
+        let named = |document: &PolicySpec| {
+            let engine = engine_of(document);
+            let models = engine.spec().engine().named_single_models();
+            models.map(|models| models.into_iter().map(str::to_owned).collect::<Vec<_>>())
+        };
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        document.generation = 1;
+        assert_eq!(named(&document), None);
+        let mut lone = document.clone();
+        lone.bindings.clear();
+        assert_eq!(named(&lone), None);
+
+        document.bindings[0].matcher.model = "alpha-*".to_owned();
+        let mut second = document.bindings[0].clone();
+        second.matcher.model = "beta-1".to_owned();
+        document.bindings.push(second);
+        let some = vec!["alpha-*".to_owned(), "beta-1".to_owned()];
+        assert_eq!(named(&document), Some(some));
+        // A `*` behind them plans the single requests of every model.
+        let mut every = document.bindings[0].clone();
+        every.matcher.model = "*".to_owned();
+        document.bindings.push(every);
+        assert_eq!(named(&document), None);
+
+        let mut pair =
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("built-in presets");
+        pair.generation = 1;
+        assert_eq!(named(&pair), Some(Vec::new()));
+    }
+
     /// Every request of a document is decided whole where each of its
     /// places is picked alone or its stages read nothing the host does not
     /// feed. Round robin asks nothing of a host. Random and passthrough
