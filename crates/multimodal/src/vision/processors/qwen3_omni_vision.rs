@@ -199,6 +199,11 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
         self.inner.calculate_num_tokens(width, height)
     }
 
+    /// Number of stored patch elements for one image.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
+    }
+
     fn model_name(&self) -> &'static str {
         self.inner.model_name()
     }
@@ -327,5 +332,13 @@ mod tests {
                 "sampled at {sampled_fps}"
             );
         }
+    }
+
+    #[test]
+    fn the_element_estimate_of_an_image_is_the_bases() {
+        let omni = Qwen3OmniVisionProcessor::new();
+        let estimate = omni.inner.image_input_elements(4096, 3136);
+        assert!(estimate.is_some());
+        assert_eq!(omni.image_input_elements(4096, 3136), estimate);
     }
 }
