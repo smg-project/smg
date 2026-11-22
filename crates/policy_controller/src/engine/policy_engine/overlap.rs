@@ -1099,7 +1099,7 @@ impl Table {
                 // count read from the tree has the marker's length taken
                 // off.
                 let (key, marker) =
-                    CacheNamespace::keyed_tokens(lent.namespace, tokens, record.page);
+                    CacheNamespace::keyed_tokens(lent.namespace, tokens, || record.page);
                 let block = token_block(facts, record.page);
                 let mut decided = None;
                 record.tokens().match_and_insert_with(&key, |found| {

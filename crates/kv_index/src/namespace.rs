@@ -206,17 +206,25 @@ impl CacheNamespace {
     /// so the prompt's page grid is the unpartitioned one. An unpartitioned
     /// request keys under its tokens stripped of marker material, marker
     /// length 0.
+    ///
+    /// `page_size` is asked for only where a marker is padded to it: an
+    /// unpartitioned request reads no page size. As a plain argument it was
+    /// read ahead of the branch on the namespace, by every request (4
+    /// instructions a decision, counted).
     #[inline]
     pub fn keyed_tokens(
         namespace: Option<Self>,
         tokens: &[u32],
-        page_size: usize,
+        page_size: impl FnOnce() -> usize,
     ) -> (Cow<'_, [u32]>, usize) {
         match namespace {
-            Some(namespace) => (
-                Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
-                Self::token_marker_len(page_size),
-            ),
+            Some(namespace) => {
+                let page_size = page_size();
+                (
+                    Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
+                    Self::token_marker_len(page_size),
+                )
+            }
             None => (Cow::Borrowed(Self::unpartitioned_tokens(tokens)), 0),
         }
     }
@@ -234,6 +242,8 @@ impl CacheNamespace {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use crate::{StringTree, TokenTree};
 
@@ -381,15 +391,24 @@ mod tests {
         let prompt: Vec<u32> = (100..132).collect();
         let text = "shared system prompt";
 
-        let (keyed, marker_len) = CacheNamespace::keyed_tokens(Some(tenant_a), &prompt, block_size);
+        // The page size is asked for once where a marker is padded to it,
+        // and never for an unpartitioned key.
+        let asked = Cell::new(0_u32);
+        let page_size = || {
+            asked.set(asked.get() + 1);
+            block_size
+        };
+        let (keyed, marker_len) = CacheNamespace::keyed_tokens(Some(tenant_a), &prompt, page_size);
+        assert_eq!(asked.get(), 1);
         assert_eq!(marker_len, CacheNamespace::token_marker_len(block_size));
         assert_eq!(
             &keyed[..],
             &tenant_a.prefixed_tokens(&prompt, block_size)[..]
         );
         assert_eq!(&keyed[marker_len..], &prompt[..]);
-        let (plain_key, plain_len) = CacheNamespace::keyed_tokens(None, &prompt, block_size);
+        let (plain_key, plain_len) = CacheNamespace::keyed_tokens(None, &prompt, page_size);
         assert_eq!((&plain_key[..], plain_len), (&prompt[..], 0));
+        assert_eq!(asked.get(), 1);
 
         // What the token tree reads back for the namespaced key is the
         // prompt plus the marker: the match count minus the marker length
