@@ -102,6 +102,10 @@ pub enum Job {
 }
 
 impl Job {
+    /// The type names of the tokenizer jobs: their status route reads them.
+    pub(crate) const ADD_TOKENIZER_TYPE: &str = "AddTokenizer";
+    pub(crate) const REMOVE_TOKENIZER_TYPE: &str = "RemoveTokenizer";
+
     /// Get job type as string for logging
     pub fn job_type(&self) -> &'static str {
         match self {
@@ -114,8 +118,8 @@ impl Job {
             Job::RegisterMcpServer { .. } => "RegisterMcpServer",
             Job::AddWasmModule { .. } => "AddWasmModule",
             Job::RemoveWasmModule { .. } => "RemoveWasmModule",
-            Job::AddTokenizer { .. } => "AddTokenizer",
-            Job::RemoveTokenizer { .. } => "RemoveTokenizer",
+            Job::AddTokenizer { .. } => Self::ADD_TOKENIZER_TYPE,
+            Job::RemoveTokenizer { .. } => Self::REMOVE_TOKENIZER_TYPE,
         }
     }
 
@@ -131,8 +135,8 @@ impl Job {
             | "RegisterMcpServer"
             | "AddWasmModule"
             | "RemoveWasmModule"
-            | "AddTokenizer"
-            | "RemoveTokenizer" => worker_url.to_string(),
+            | Self::ADD_TOKENIZER_TYPE
+            | Self::REMOVE_TOKENIZER_TYPE => worker_url.to_string(),
             _ => WorkerJob::shown_key(job_type, worker_url),
         }
     }
@@ -571,6 +575,9 @@ impl JobHost for AppContext {
                 // no state to cancel and left its mark: the workflow just
                 // started is cancelled here, and the wait below ends with it.
                 if take_mark(run.cancelled_before_start, run.own_id) {
+                    // The `DELETE` is answered already: whatever the cancel
+                    // and the wait below return, a `DELETE` ended this job.
+                    run.ended_by_delete.store(true, Ordering::Relaxed);
                     engines
                         .worker_registration
                         .cancel_workflow(instance_id)
@@ -1177,13 +1184,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_registration_reads_failed_with_its_reason_at_its_id() {
-        use crate::admin::worker_service::WorkerService;
+        use crate::{
+            admin::worker_service::WorkerService, endpoints::tokenize::get_tokenizer_status,
+        };
 
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        context.worker_job_queue.set(Arc::clone(&queue)).unwrap();
         let service = WorkerService::new(
             Arc::clone(&context.worker_registry),
-            Arc::new(std::sync::OnceLock::from(Arc::clone(&queue))),
+            Arc::clone(&context.worker_job_queue),
             context.router_config.clone(),
         );
         let url = "http://user:pass@worker:8000";
@@ -1216,11 +1226,21 @@ mod tests {
         // The view writes the address as the job's own lines write it.
         assert_eq!(read.spec.url, Endpoint::redacted_str(url));
         assert_eq!(status.worker_url, read.spec.url);
+        // The tokenizer status route takes the status of a tokenizer job alone.
+        let at_tokenizers = get_tokenizer_status(&context, id.as_str()).await;
+        assert_eq!(at_tokenizers.status().as_u16(), 404);
 
         // A later failure of the same URL replaces the kept one.
         let later = fail().await;
         assert!(service.get_worker(later.as_str()).is_ok());
         assert!(service.get_worker(id.as_str()).is_err());
+
+        // The pending view of a reserved id writes the address in that form too.
+        let held = context.worker_registry.reserve_id_for_url(url);
+        assert_eq!(
+            service.get_worker(held.as_str()).unwrap().0.spec.url,
+            read.spec.url
+        );
     }
 
     #[tokio::test]

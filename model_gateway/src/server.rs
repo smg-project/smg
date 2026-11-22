@@ -71,6 +71,7 @@ use smg_worker::{
     health::manager::{WorkerManager, WorkerManagerConfig},
     identity::{basic::ConnectionMode, endpoint::Endpoint},
     jobs::WorkerJobs,
+    registry::WorkerId,
 };
 
 use crate::{
@@ -946,10 +947,10 @@ async fn get_worker(
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(mut result) => {
-            // A pending view has no worker behind its id: a load under its
-            // address is another worker's.
-            let pending = Some(openai_protocol::worker::WorkerStatus::Pending);
-            let registered = result.0.status != pending;
+            // Only a worker in the registry has a load of its own: the
+            // address of a pending view can be another worker's.
+            let id = WorkerId::from_string(result.0.id.clone());
+            let registered = state.context.worker_registry.get(&id).is_some();
             if let Some(monitor) = state.context.worker_monitor.as_ref().filter(|_| registered) {
                 let snapshot = monitor.load_snapshot();
                 result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();

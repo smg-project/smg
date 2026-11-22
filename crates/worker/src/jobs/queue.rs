@@ -543,7 +543,7 @@ impl<H: JobHost> JobQueue<H> {
             }
             Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
             if let Some(id) = own_id {
-                cancelled_before_start.remove(&id);
+                Self::end_mark(status_map, cancelled_before_start, &id);
             }
         }
     }
@@ -769,9 +769,8 @@ impl<H: JobHost> JobQueue<H> {
                     host.failed(&job);
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
-                // A mark set for this job after its reads is over with it.
                 if let Some(id) = own_id {
-                    cancelled_before_start.remove(&id);
+                    Self::end_mark(&status_map, &cancelled_before_start, &id);
                 }
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
                 Self::run_kept(
@@ -820,6 +819,15 @@ impl<H: JobHost> JobQueue<H> {
                 id.as_str().to_string(),
                 JobStatus::failed(job_type, worker_url, error.to_string()),
             );
+        }
+    }
+
+    /// Ends the mark of a job's id with the job. A mark still set was set
+    /// after the job's reads, by a `DELETE` that was told it ended the
+    /// registration: the failure kept under the id goes with the mark.
+    fn end_mark(status_map: &DashMap<String, JobStatus>, marks: &DashSet<WorkerId>, id: &WorkerId) {
+        if marks.remove(id).is_some() {
+            status_map.remove(id.as_str());
         }
     }
 
