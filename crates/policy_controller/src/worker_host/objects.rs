@@ -21,6 +21,8 @@ use smg_worker::{
 };
 use tracing::warn;
 
+#[cfg(feature = "in-process")]
+use super::members::Members;
 use super::{
     credentials::Credentials,
     found::facts,
@@ -28,25 +30,12 @@ use super::{
     object::{builder, dial_address, status, thresholds, unchecked},
     remainder::RowRemainder,
 };
+#[cfg(feature = "in-process")]
+use crate::engine::{FixedFacts, LentList, Role};
 use crate::{
     engine::view::WorkerId,
     store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
 };
-
-/// What a host keeps of a registry's generation when it derives nothing
-/// from one: the members.
-#[derive(Debug)]
-pub struct Members(Arc<[Arc<dyn Worker>]>);
-
-impl Generation for Members {
-    fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
-        Self(members)
-    }
-
-    fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
-        &self.0
-    }
-}
 
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +249,10 @@ pub struct Objects<G> {
     /// time.
     read_to: Mutex<Place>,
     held: RwLock<Held>,
+    /// How many members of a generation the holder held no row's object
+    /// for when it cut the generation's lists ([`Self::unstated`]).
+    #[cfg(feature = "in-process")]
+    unstated: AtomicU64,
 }
 
 impl<G> fmt::Debug for Objects<G> {
@@ -356,6 +349,8 @@ impl<G: Generation> Objects<G> {
             unhanded: AtomicU64::new(0),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
+            #[cfg(feature = "in-process")]
+            unstated: AtomicU64::new(0),
         }
     }
 
@@ -1146,6 +1141,70 @@ impl<G: Generation> Objects<G> {
     }
 }
 
+#[cfg(feature = "in-process")]
+impl Objects<Members> {
+    /// `generation`'s workers of `role`, in the registry's order, lent with
+    /// the cell beside them and with what the holder's rows say of each
+    /// ([`FixedFacts`]): for a host that decides over the registry's worker
+    /// lists. A single request's list is the workers of [`Role::Single`]
+    /// alone. A host takes a model's generation from the registry
+    /// ([`WorkerRegistry::model_generation`]).
+    ///
+    /// A generation's lists are cut at its first ask, once, by one pass
+    /// over its members and one read of the holder's rows, whoever
+    /// published it: the holder's own write, or another writer of the
+    /// registry. Asks that meet there wait for that one pass. Every later
+    /// ask is one read. A generation keeps what its first ask read for as
+    /// long as it stands, and a membership change publishes another.
+    ///
+    /// A member the holder holds no row's object for is left out of the
+    /// lists and counted ([`Self::unstated`]). So every worker lent states
+    /// its row's id, and a decision's target names a worker by that id and
+    /// by its place in the list lent, not among the generation's members.
+    ///
+    /// The first ask of a generation reads the registry's id of each
+    /// member, and then the holder's entry once, under its read lock and
+    /// with no other lock taken under it. So the holder asks no list and
+    /// calls nothing of the engine while it writes its entry: an ask and a
+    /// membership change never wait on each other.
+    #[must_use]
+    pub fn lent<'a>(&self, generation: &'a Members, role: Role) -> LentList<'a> {
+        generation.lent(role, |members| self.fixed_facts(members))
+    }
+
+    /// How many members were left out of the lists so far: a worker
+    /// another writer registered, or one whose row's object was replaced
+    /// or dropped between its generation's publish and that generation's
+    /// first ask.
+    pub fn unstated(&self) -> u64 {
+        self.unstated.load(Relaxed)
+    }
+
+    /// What the holder's rows say of each of `members`, in their order:
+    /// whether the worker takes images, and the row's id. `None` for a
+    /// member the holder holds no row's object for, which is counted.
+    fn fixed_facts(&self, members: &[Arc<dyn Worker>]) -> Box<[Option<FixedFacts>]> {
+        // The registry's ids first: the entry's lock is not held across a
+        // read of the registry.
+        let id_of = |member: &Arc<dyn Worker>| self.registry.get_id_by_url(member.url());
+        let ids: Vec<Option<ObjectId>> = members.iter().map(id_of).collect();
+        let held = self.held.read();
+        let stated = members.iter().zip(ids).map(|(member, id)| {
+            let laid = id.and_then(|id| held.rows.get(&id));
+            let laid = laid.filter(|laid| Arc::ptr_eq(&laid.object, member));
+            if laid.is_none() {
+                self.unstated.fetch_add(1, Relaxed);
+            }
+            laid.map(|laid| FixedFacts {
+                vision: laid.remainder.vision,
+                id: Some(laid.remainder.standing.row),
+                ..FixedFacts::default()
+            })
+        });
+        stated.collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1176,8 +1235,8 @@ mod tests {
             WorkerPatch, WorkerStatus,
         },
         worker_host::{
-            facts as stated, object, HealthAdapter, KeptCredential, MembershipWriter, Over,
-            Precondition, SoleLead, StoreMembershipWriter,
+            facts as stated, object, HealthAdapter, KeptCredential, Members, MembershipWriter,
+            Over, Precondition, SoleLead, StoreMembershipWriter,
         },
     };
 

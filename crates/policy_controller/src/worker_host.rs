@@ -123,6 +123,7 @@ mod kv;
 mod kv_feed;
 mod lead;
 mod loads;
+mod members;
 mod membership_writer;
 mod object;
 mod objects;
@@ -138,6 +139,7 @@ pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
 pub use kv_feed::KvFeed;
 pub use lead::{Lead, SoleLead};
 pub use loads::{load_monitor, LoadAdapter};
+pub use members::Members;
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
@@ -152,7 +154,7 @@ pub use membership_writer::{
     StoreMembershipWriter,
 };
 pub use object::object;
-pub use objects::{Members, Objects, RowRevision};
+pub use objects::{Objects, RowRevision};
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,
     removal_from_store, remover_of, DrainWorkersInStore, NoCredentials, RegistrantError,
