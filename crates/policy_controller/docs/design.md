@@ -972,7 +972,8 @@ The design adds no second mechanism where one exists.
 | a model's worker lists | the registry's published lists (`Generation`) | one field beside each list: the engine's value |
 | a worker's health, breaker, overload, in-flight count | the worker object, read in place | nothing |
 | load reports | the load monitor's `LoadSnapshot` | nothing |
-| which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | nothing |
+| which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits, about 130 lines (section 9.2) |
+| which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file of 290 lines (section 9.2) |
 | which worker was sent a prompt | the kv-index crate's two tree types | the engine's own trees of those types |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's five placement functions | one call in each |
@@ -1299,7 +1300,7 @@ All eleven at a glance. An answer can be as short as the numbers with their lett
 | # | Decision | Recommended | Needed for |
 |---|---|---|---|
 | 1 | The name of a cache partition | (a) the host hands the entry already named | the two trees of `cache_aware` (in work, crate only) |
-| 2 | Recorders for the sheets that are missing | (a) new recorders beside classic's code, for the ring, the sticky override and `least_load` | proof against classic for those policies |
+| 2 | Recorders for the sheets that are missing | (a) new recorders beside classic's code, for the ring, the sticky override and `least_load`; (b) a crate test that names classic's rule, for `round_robin`, `random` and `passthrough` | proof against classic for those policies |
 | 3 | The hash ring | (a) the host lends its ring now; (b) one shared ring with the controller's switch | `consistent_hashing` and `prefix_hash` |
 | 4 | Where a placement stays during a request | (a) inside the load guard | the gateway's integration (stage 3) |
 | 5 | How the controller comes onto the one engine | (a) whole, in one switch | stage 4 |
@@ -1307,7 +1308,7 @@ All eleven at a glance. An answer can be as short as the numbers with their lett
 | 7 | Shadow and explain | (a) built on the kept engine before the old one is deleted | stage 4 |
 | 8 | User stages in WebAssembly and over gRPC | (a) left as library code | nothing now |
 | 9 | The gateway's options | three with stage 3, the address and TLS options with stage 5 | stages 3 and 5 |
-| 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped | stage 4 |
+| 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; still open: where the other worker facts live, and which overload thresholds apply | stage 4 |
 | 11 | The crate in CI and in the published set | (b) one line in CI's test script names the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
 
 ### Decision 1: the name of a cache partition
@@ -1440,7 +1441,7 @@ design (section 10) has to say which thresholds apply where two bindings reach o
 
 | Question | Fact | Options | Recommendation |
 |---|---|---|---|
-| How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. CI tests the crate on four lines of `scripts/ci_rust_tests.sh` and none enables that feature, so CI runs none of the 82 cases behind it (65 of the engine, 17 of its record writer). After stage 0 only the lint with every feature still compiles it. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But CI's two lines that test one feature alone would then build the engine too. Not measured. | (b), as one small change of its own. Its proof is the count of cases CI's first line runs before and after. |
+| How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. CI tests the crate on four lines of `scripts/ci_rust_tests.sh` and none enables that feature, so CI runs none of the 82 cases behind it (65 of the engine, 17 of its record writer). After stage 0 only the lint with every feature still compiles it. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But every build that takes the crate's test-only dependencies then builds the engine too: CI's two lines that test one feature alone, the lint of `operator` alone, and the three bench workflows that (a) names. Not measured. | (b), as one small change of its own. Its proof is the count of cases CI's first line runs before and after. |
 | Is the crate published before it is ready? | The earlier integration added the crate to the published set: four lines in two release workflows and the release version check. | (a) Stage 0's change takes the four lines out, and they return with the gateway's integration (stage 3). (b) They stay. | (a). |
 
 ## 16. The order of work
