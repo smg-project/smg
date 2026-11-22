@@ -995,12 +995,11 @@ runtime.spawn(engine.run());         // the engine's own background task
 The engine lives as long as the process, so a placement holds a plain reference to it.
 
 The engine's background task does what a host did by hand. Three of its jobs are built
-(`PolicyEngine::run`): the upkeep once a second, the newest load snapshot kept at hand, and a
-worker that joined or was removed told to the policies. The snapshot is swapped when the monitor
-publishes one, so that a decision reads it without touching the channel. A join and a leave are
-read from the events of the registry the host hands (`engine.set_registry`, section 8.1). A host
-that builds another load monitor hands its channel again (`engine.set_loads`): a channel ends
-with its monitor.
+(`PolicyEngine::run`): the upkeep once a second, and the newest load snapshot kept at hand,
+swapped when the monitor publishes one, so that a decision reads it without touching the
+channel. The third is a worker that joined or was removed told to the policies, read from the events of the registry the host hands (`engine.set_registry`, section 8.1). A host that
+builds another load monitor hands its channel again (`engine.set_loads`): a channel ends with
+its monitor.
 
 The host keeps one empty cell beside each worker list it publishes. That is one field in the
 host's `Generation` type. The engine fills the cell at the list's first decision.

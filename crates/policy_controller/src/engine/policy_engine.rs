@@ -161,6 +161,9 @@ pub struct PolicyEngine {
     /// and the newest snapshot the engine's own task keeps at hand
     /// ([`Self::run`]).
     loads: task::Loads,
+    /// The host's worker registry, once it handed it
+    /// ([`Self::set_registry`]): the engine's own task follows its events.
+    members: membership::Handed,
     /// Whether a stage of the document reads a named signal
     /// ([`Needs::signal_cells`](crate::document::spec::Needs::signal_cells)),
     /// read once, here. Under such a document a single request whose
@@ -176,9 +179,6 @@ pub struct PolicyEngine {
     /// by binding and kind. The table is allocated at the first of them: a
     /// document that names no shadow keeps none.
     shadow_counts: OnceLock<Box<ShadowCounts>>,
-    /// The host's worker registry, once it handed it
-    /// ([`Self::set_registry`]): the engine's own task follows its events.
-    members: membership::Handed,
 }
 
 /// The document's word of a binding's shadow: the binding's position, and
@@ -354,8 +354,8 @@ impl PolicyEngine {
             sessions,
             affinity: Affinity::default(),
             loads: task::Loads::default(),
-            shadow_counts: OnceLock::new(),
             members: membership::Handed::default(),
+            shadow_counts: OnceLock::new(),
         }
     }
 
