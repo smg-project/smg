@@ -108,7 +108,7 @@ A host with no token ids can hash a request's text in their place. It cuts the t
 | Name | What it reads and how it picks | Parameters and defaults |
 |---|---|---|
 | `best` | Combined scores. Highest first, with a seeded draw inside the score's tie band. | `sample` is unset by default. Use `best: { sample: 16 }` for a sample. Valid sizes are 1–64. |
-| `round-robin` | The worker list and the ordered survivor set. A single request over 16 workers or more takes its list's next worker where the filters keep it. Otherwise advances a rotation for the survivor set. | None |
+| `round-robin` | The worker list and the ordered survivor set. A single request over 16 workers or more, held to no part of its list, takes its list's next worker where the filters keep it. Otherwise advances a rotation for the survivor set. | None |
 | `random` | The survivors and the request's seed. Draws a worker and then alternates. | None |
 | `power-of-two` | Scores of two random draws. Uses two engines when the host supplies suitable engine groups. | None. Requires a scorer. |
 | `count-first` | In-flight counts, then combined score for the lowest-count rows. Orders higher-count alternates by count. | None |
@@ -958,7 +958,7 @@ bindings:
 
 ### `round_robin`
 
-Rotates through a worker list or a survivor set. A single request over 16 workers or more takes the next worker of its list's rotation where the filters keep that worker. Every other placement rotates through its survivor set: changes to that set change the rotation, and retained rotations are bounded.
+Rotates through a worker list or a survivor set. A single request over 16 workers or more, held to no part of its list, takes the next worker of its list's rotation where the filters keep that worker. Every other placement rotates through its survivor set: changes to that set change the rotation, and retained rotations are bounded.
 
 <!-- preset: round_robin -->
 ```yaml

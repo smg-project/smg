@@ -146,9 +146,9 @@ fn a_record_states_its_workers_registration_by_its_place_in_the_list() {
     assert!(!pool.fixed()[1].health.healthy);
 }
 
-/// The rows a decision writes borrow the records alone, and the pool's
-/// facts what its live facts borrow: the rows stand after the key text the
-/// live facts read is gone. A build that ties the two fails here.
+/// The rows a decision writes borrow their buffer alone, and the pool's
+/// facts what its live facts borrow: the rows stand after the key text
+/// handed to the live facts is gone. A build that ties the two fails here.
 #[test]
 fn the_rows_written_outlive_what_the_live_facts_borrow() {
     let (spec, clock) = (applied("round_robin"), DecisionClock::new());
@@ -161,6 +161,15 @@ fn the_rows_written_outlive_what_the_live_facts_borrow() {
         pool.write(&workers, &live, &mut rows).0
     };
     assert_eq!(written.len(), 1);
+    // The method is one function value for a call of any lifetime: a bound
+    // between its lifetimes would fix them where it is named.
+    type Write = for<'a> fn(
+        &'a PoolRecords,
+        &[Arc<dyn Worker>],
+        &Live<'a>,
+        &'a mut Vec<Candidate>,
+    ) -> (&'a mut [Candidate], PoolFacts<'a>);
+    let _: Write = PoolRecords::write;
 }
 
 #[test]

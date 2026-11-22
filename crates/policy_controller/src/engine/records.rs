@@ -720,18 +720,14 @@ impl PoolRecords {
     /// exception is the conversion: one allocation, by one decision, at
     /// most once a published snapshot a list.
     ///
-    /// The facts live as long as what `live` borrows, the list's own word
-    /// among it. The rows live as long as the records, whatever `live`
-    /// borrows.
+    /// The facts borrow the records and what `live` borrows, the list's own
+    /// word among it. The rows borrow their buffer alone.
     pub fn write<'a, 'f>(
-        &'a self,
+        &'f self,
         workers: &[Arc<dyn Worker>],
         live: &Live<'f>,
         rows: &'a mut Vec<Candidate>,
-    ) -> (&'a mut [Candidate], PoolFacts<'f>)
-    where
-        'a: 'f,
-    {
+    ) -> (&'a mut [Candidate], PoolFacts<'f>) {
         debug_assert_eq!(
             workers.len(),
             self.fixed.len(),

@@ -1520,8 +1520,8 @@ pub struct PoolFacts<'a> {
     /// pick over that list alone counts its turns in
     /// ([`PoolWord::word`](crate::engine::PoolWord::word)). A picker that
     /// takes turns counts a draw's turn in it too, and looks no rotation up
-    /// by the pool's name. Every request over one list then turns one
-    /// rotation, and two lists turn two, whatever else they share. `None`:
+    /// by the pool's name. That pick and that draw over one list then turn
+    /// one rotation, and two lists turn two, whatever else they share. `None`:
     /// such a picker finds its rotation by the pool's name, with
     /// [`Self::reach`] in it. In-process only.
     pub word: Option<&'a AtomicU64>,
