@@ -559,6 +559,16 @@ fn a_removal_or_the_registration_after_it_drops_the_kept_worker_counters() {
         .set(metrics::Counter::noop());
     Metrics::worker_registered("http://gone");
     assert!(!keeps(), "the registration after it");
+    // Another test's removal may move the generation at any moment, hence
+    // the tries.
+    let kept = (0..100).any(|fresh| {
+        let _ = handles::Kept::current(&worker.kept)
+            .requests
+            .set(metrics::Counter::noop());
+        Metrics::worker_registered(&format!("http://fresh-{fresh}"));
+        keeps()
+    });
+    assert!(kept, "a first registration");
 }
 
 /// The breaker's outcome counter is a per-worker series: through kept

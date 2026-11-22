@@ -361,6 +361,11 @@ mod handles {
         WORKER_SET_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Held by a registration from the store's answer to the move it asks
+    /// for: the store answers once, so no other registration may end, and
+    /// its worker be written for through a kept no-op handle, in between.
+    pub(super) static REGISTRATION: Mutex<()> = Mutex::new(());
+
     /// What one [`super::WorkerHandles`] keeps, with the worker-set
     /// generation it was kept under: a set whose handles are from an
     /// earlier state drops them at its next record. A handle of a request
@@ -1631,6 +1636,7 @@ impl Metrics {
     /// may be: this address was retired, or the upkeep forgot a retired
     /// address since the last registration.
     pub fn worker_registered(worker_url: &str) {
+        let _registering = handles::REGISTRATION.lock();
         if series::installed().is_some_and(|store| store.activate(worker_url)) {
             handles::worker_set_changed();
         }
