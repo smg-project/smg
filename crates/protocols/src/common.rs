@@ -157,6 +157,21 @@ pub struct CachePartition<'a> {
     pub lora_path: Option<&'a str>,
 }
 
+impl CachePartition<'_> {
+    /// True when no partitioning field is set, an empty string counting as
+    /// unset. Routing does not read it: `CacheNamespace::derive` in
+    /// `kv-index` owns the rule. Kept for this crate's published API until
+    /// its next breaking release.
+    #[deprecated(
+        note = "routing derives the partition with `kv_index::CacheNamespace::derive`; this copy goes at the crate's next breaking release"
+    )]
+    pub fn is_empty(&self) -> bool {
+        [self.cache_salt, self.extra_key, self.lora_path]
+            .iter()
+            .all(|field| field.is_none_or(str::is_empty))
+    }
+}
+
 /// Trait for unified access to generation request properties
 /// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
 /// EmbeddingRequest, RerankRequest, and ResponsesRequest
