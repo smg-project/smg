@@ -1456,7 +1456,8 @@ mod tests {
     /// A room narrows a prefill's partners, and hides no prefill. Both
     /// decodes are over their thresholds alone: one is full and its prefill
     /// free, the other has room and its prefill is at its limit. The pair is
-    /// the free prefill with its full decode. The gateway's own pair
+    /// the free prefill with its full decode, whichever of the two classes
+    /// stands first among the decodes. The gateway's own pair
     /// selection makes it so: a prefill at its limit leaves before the
     /// policy picks, and the rooms are asked among the picked prefill's
     /// partners (`model_gateway/src/routers/common/placement.rs:1467-1480`,
@@ -1467,13 +1468,18 @@ mod tests {
         limit.push(Box::new(HasCapacity));
         room.push(Box::new(HasRoom));
         let engine = pair_engine_of(false, [limit, room]);
-        let mut prefills = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
-        prefills[0].has_capacity = true;
-        let mut decodes = [classed(over(0, 0), 1), classed(over(1, 0), 2)];
-        decodes[1].has_room = true;
-        let decision = decide_pair(&engine, &prefills, &decodes);
-        assert_eq!(pair_of(&decision), (0, 0));
-        assert_eq!(decision.trace().lifted, LiftedVeto::Overload);
+        // The pair where the prefill at `under` is under its limit and the
+        // other prefill's decode has the room.
+        let placed = |under: usize| {
+            let mut prefills = [classed(free(0, 0), 1), classed(free(1, 0), 2)];
+            prefills[under].has_capacity = true;
+            let mut decodes = [classed(over(0, 0), 1), classed(over(1, 0), 2)];
+            decodes[1 - under].has_room = true;
+            let decision = decide_pair(&engine, &prefills, &decodes);
+            (pair_of(&decision), decision.trace().lifted)
+        };
+        assert_eq!(placed(0), ((0, 0), LiftedVeto::Overload));
+        assert_eq!(placed(1), ((1, 1), LiftedVeto::Overload));
     }
 
     /// The pass that opens the prefills sets the retry's tried list aside,
