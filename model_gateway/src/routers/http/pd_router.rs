@@ -1235,6 +1235,7 @@ impl PDRouter {
                 Arc::clone(&decode),
                 guards,
                 &mut prefill_outcome,
+                ledger,
             )
             .await;
         Self::record_attempt_outcomes(
@@ -1584,6 +1585,7 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         prefill_outcome: &mut PrefillOutcome,
+        ledger: &AttemptLedger,
     ) -> Response {
         let PdSetup {
             prefill_body,
@@ -1641,6 +1643,7 @@ impl PDRouter {
                 .map_err(|e| DispatchError::Transport(PdSide::Prefill, e))?;
             if context.is_stream && !context.return_logprob && resp.status().is_success() {
                 let prefill = Arc::clone(&prefill);
+                let charges = ledger.charges().clone();
                 let model_id = context.model_id.to_string();
                 // The drain owns both the permit and the outcome. It may finish
                 // before Decode sends headers; neither waits for the other.
@@ -1664,7 +1667,9 @@ impl PDRouter {
                             break;
                         }
                     }
-                    prefill.record_outcome(drained.as_u16());
+                    // Through the request's charges: retried attempts whose
+                    // drains all fail charge the worker once.
+                    charges.record_outcome(prefill.as_ref(), drained.as_u16());
                     if drained.is_server_error() {
                         Metrics::record_worker_error(
                             metrics_labels::WORKER_PREFILL,
@@ -7482,6 +7487,7 @@ mod tests {
                     headers: None,
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
+                let ledger = AttemptLedger::default();
                 let dispatch = router.execute_dual_dispatch_internal(
                     None,
                     (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
@@ -7490,6 +7496,7 @@ mod tests {
                     Arc::clone(&decode),
                     guards,
                     &mut outcome,
+                    &ledger,
                 );
                 tokio::pin!(dispatch);
 
@@ -7581,6 +7588,7 @@ mod tests {
                         decode,
                         guards,
                         &mut outcome,
+                        &AttemptLedger::default(),
                     )
                     .await;
                 assert_eq!(response.status(), StatusCode::OK);
@@ -7660,6 +7668,7 @@ mod tests {
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
+                    let ledger = AttemptLedger::default();
                     let dispatch = router.execute_dual_dispatch_internal(
                         None,
                         (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
@@ -7668,6 +7677,7 @@ mod tests {
                         Arc::clone(&decode),
                         guards,
                         &mut outcome,
+                        &ledger,
                     );
                     tokio::pin!(dispatch);
                     if failure == "cancel" {
@@ -9383,6 +9393,70 @@ mod tests {
         assert!(
             decode.circuit_breaker_can_execute(),
             "one request's retried decode refusals opened the breaker"
+        );
+    }
+
+    /// The drain's twin: a streamed request's prefill body is cut on every
+    /// attempt while its decode worker refuses, and the request charges the
+    /// prefill worker once.
+    #[tokio::test]
+    async fn retried_prefill_drain_cuts_charge_one_breaker_failure() {
+        let (prefill_url, _) = faulty_stub(Fault::CutAfterHead).await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        // The decode worker refuses once the attempt's drain has read the cut
+        // and let go of the prefill worker.
+        let drained = Arc::clone(&prefill);
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&refusals);
+        let decode = axum::Router::new().fallback(axum::routing::any(move || {
+            let (drained, counted) = (Arc::clone(&drained), Arc::clone(&counted));
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while drained.load() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the attempt's prefill drain must release its guard");
+                counted.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::SERVICE_UNAVAILABLE, REFUSAL)
+            }
+        }));
+        let router = quick_retry_router();
+        let decode = create_test_worker(spawn_stub(decode).await, WorkerType::Decode, true);
+        for worker in [Arc::clone(&prefill), Arc::from(decode)] {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        let response = chat_through(&router, true).await;
+
+        assert_eq!(
+            (response.status(), refusals.load(Ordering::SeqCst)),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                router.retry_config.max_retries as usize
+            ),
+            "the answer and the attempts on the refusing decode worker"
+        );
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "one request's retried prefill body cuts opened the breaker"
+        );
+        // ...and the request did charge it: the next request's failure is the
+        // second one the breaker counts, and opens it.
+        AttemptLedger::default().record_outcome(prefill.as_ref(), 503);
+        assert!(
+            !prefill.circuit_breaker_can_execute(),
+            "the request's one charge reached the prefill worker's breaker"
         );
     }
 
