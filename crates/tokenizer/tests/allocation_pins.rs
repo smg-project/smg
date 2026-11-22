@@ -716,9 +716,10 @@ fn a_token_more_costs_the_load_of_a_rank_file_no_allocator_call() {
         std::fs::write(dir.path().join("tiktoken.model"), model).expect("the model");
         allocations_during(|| TiktokenTokenizer::from_dir(dir.path()).expect("the load")).1
     };
-    assert_eq!(
-        (load(240) - load(40)) / 200,
-        0,
-        "allocator calls a token adds to a load"
+    // No subtraction: a load of more tokens may make fewer calls.
+    let (many, few) = (load(240), load(40));
+    assert!(
+        many < few + 200,
+        "a load of 200 tokens more makes {many} allocator calls against {few}"
     );
 }
