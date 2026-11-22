@@ -344,8 +344,8 @@ pub mod bench_support {
     ///
     /// A configuration no policy document says, a document the engine
     /// refuses, and a policy the engine does not pick by itself: the
-    /// registry would hand out the classic policy, and a cell named for
-    /// the object would time that one.
+    /// registry would hand out a policy that does not ask the engine, and
+    /// a cell named for the object would time that one.
     pub fn policies_asking_the_engine(config: &RouterConfig) -> Result<PolicyRegistry, String> {
         let picked = RouterConfig {
             policy_controller: true,
@@ -374,7 +374,7 @@ pub mod bench_support {
             Ok(policies)
         } else {
             Err(format!(
-                "the policy engine does not pick `{}` by itself: the registry builds the classic policy",
+                "the policy engine does not pick `{}` by itself: the registry's policy does not ask it",
                 config.policy.name()
             ))
         }
@@ -384,13 +384,19 @@ pub mod bench_support {
     /// start builds for `config`'s policy under the setting, whatever
     /// `config` says of the setting, and over `registry`'s lists: what the
     /// routers ask where the engine decides every request of the document
-    /// whole.
-    pub struct EngineObject(EngineObjectOf);
+    /// whole. With it, the policy registry the start builds beside the
+    /// object: a router reads a request's routing key by it, for the
+    /// worker's load guard.
+    pub struct EngineObject {
+        engine: EngineObjectOf,
+        policies: Arc<PolicyRegistry>,
+    }
 
     impl EngineObject {
         /// The object a gateway's start builds for `config` over `registry`,
         /// handed `loads`, the load feed the monitor would publish, as the
-        /// start hands it the monitor's.
+        /// start hands it the monitor's, and the policy registry the start
+        /// builds with the same engine.
         ///
         /// # Errors
         ///
@@ -410,17 +416,25 @@ pub mod bench_support {
             let started = start_in_process(&picked, None)
                 .map_err(|refused| refused.to_string())?
                 .ok_or("this configuration places its requests by no routing policy")?;
-            if !started.decides_whole() {
+            let whole = started.decides_whole();
+            if !whole {
                 return Err(format!(
                     "the policy engine does not decide `{}` whole yet: the routers keep their classic placement pass",
                     config.policy.name()
                 ));
             }
-            let object = EngineObjectOf::own(started.engine, Arc::clone(registry));
+            let policies = Arc::new(PolicyRegistry::with_policy_engine(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+                Arc::clone(&started.engine),
+                started.origin,
+                whole,
+            ));
+            let engine = EngineObjectOf::own(started.engine, Arc::clone(registry));
             if let Some(loads) = loads {
-                object.read_loads(loads);
+                engine.read_loads(loads);
             }
-            Ok(Self(object))
+            Ok(Self { engine, policies })
         }
 
         /// How many times the reports of `model`'s workers on `route` were
@@ -446,13 +460,18 @@ pub mod bench_support {
     ///
     /// What [`route_classic`] does under a classic policy, with the engine
     /// deciding the whole request through the object the routers hold: no
-    /// classic policy and no classic placement pass runs.
+    /// classic policy and no classic placement pass runs. `headers` are the
+    /// request's, where it carries any: the ask states them, and the engine
+    /// reads the request's routing key from them by its document's sources.
+    /// The load guard counts under the key the policy registry reads from
+    /// them, as a router's arm reads it.
     pub fn route_engine(
         registry: &WorkerRegistry,
         object: &EngineObject,
         model: &str,
         route: Route,
         tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
     ) -> Option<usize> {
         let (pool, wires) = match route {
             Route::Http => (RoutingPool::HttpRegular, WireModes::NONE),
@@ -461,10 +480,11 @@ pub mod bench_support {
                 WireModes::GRPC.union(WireModes::ZMQ),
             ),
         };
-        let hashes = object.0.hashes(model, &Prompt::of(tokens, None));
+        let hashes = object.engine.hashes(model, &Prompt::of(tokens, None));
         let id = mark();
         let ask = Ask {
             wires,
+            headers,
             hashes: Some(&hashes),
             pool: Some(pool),
             ..Ask::of(&id, model)
@@ -473,7 +493,7 @@ pub mod bench_support {
         // The engine of this process decides on the calling thread: the
         // arm's future is ready at its first poll.
         let placing = pin!(object
-            .0
+            .engine
             .place_where(&ask, |worker| pool.matches(worker), now));
         let Poll::Ready(Ok(mut placed)) = placing.poll(&mut Context::from_waker(Waker::noop()))
         else {
@@ -488,7 +508,8 @@ pub mod bench_support {
             return None;
         }
         placed.dispatched(now);
-        let guard = WorkerLoadGuard::with_key(Arc::clone(placed.worker()), None);
+        let key = object.policies.sticky_key(headers, None);
+        let guard = WorkerLoadGuard::with_key(Arc::clone(placed.worker()), key);
         drop(guard);
         placed.completed(
             End {

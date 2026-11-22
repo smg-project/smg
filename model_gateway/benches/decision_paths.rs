@@ -49,7 +49,7 @@
 //!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it,
-//! on both paths. `0`, the default, sends no key.
+//! on every path. `0`, the default, sends no key.
 //!
 //! `--prompts N` gives each request one of `N` prompts in turn, each of
 //! 1,024 tokens: the first 32 are the same in every prompt, as a chat
@@ -637,7 +637,9 @@ fn build(cell: &Cell) -> Built {
             Decider::Records(engine) => {
                 route_records(&registry, engine, model, route, Some(tokens), headers)
             }
-            Decider::Engine(object) => route_engine(&registry, object, model, route, Some(tokens)),
+            Decider::Engine(object) => {
+                route_engine(&registry, object, model, route, Some(tokens), headers)
+            }
         }
     });
     Built {
