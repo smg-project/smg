@@ -287,7 +287,7 @@ fn replay(row: &Row) -> Vec<String> {
             Answer::Refused { .. } => {}
         }
     }
-    found.extend(decided(row, &classes));
+    found.extend(decided(row, &classes, &of_encoders));
     found
 }
 
@@ -389,8 +389,8 @@ fn refusal(stage: &str) -> &'static str {
 }
 
 /// What of one row's answers the decision does not replay, request by
-/// request.
-fn decided(row: &Row, classes: &EncodeClasses) -> Vec<String> {
+/// request. `offers` are the ends its encoders state, in the row's order.
+fn decided(row: &Row, classes: &EncodeClasses, offers: &[EncodeOffer]) -> Vec<String> {
     let Some(engine) = engine(row) else {
         return vec!["a policy this replay does not build".to_string()];
     };
@@ -421,15 +421,9 @@ fn decided(row: &Row, classes: &EncodeClasses) -> Vec<String> {
             ..worker(at, 3_000, Role::Encode, w.open, w.in_flight)
         })
         .collect();
-    let stated = classes.encoders().iter().copied();
-    let of_encoders: Vec<EncoderFacts> = (row.encoders.iter())
-        .zip(stated.chain(std::iter::repeat(0)))
-        .map(|(w, class)| EncoderFacts {
-            class,
-            pushes: w.handoff == Some(Form::Push),
-            references: w.references,
-        })
-        .collect();
+    // What the decision reads of each encoder, by the rule the store
+    // writes it by.
+    let of_encoders: Vec<EncoderFacts> = classes.encoder_facts(offers);
     let prefill_classes: Vec<u32> = (0..row.prefills.len())
         .map(|at| classes.prefill_class(at))
         .collect();
