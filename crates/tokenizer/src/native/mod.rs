@@ -720,7 +720,7 @@ impl PieceCache {
     /// have lost its processor to another caller, and the table's lines
     /// to have left the near caches with it; read as a stream they cost
     /// less than fetched one probe at a time. A thread that did other
-    /// work in between reads as well.
+    /// work in between, a text the pool encoded for one, reads as well.
     fn reads_back(&mut self, now: Instant, bytes: usize) -> bool {
         let last = self.last_long.replace((now, bytes));
         last.is_some_and(|(then, last_bytes)| {
@@ -1614,8 +1614,9 @@ pub(crate) struct NativeEncoder {
     /// this are inside a long text, a thread reads its table back
     /// (`PieceCache::reads_back`).
     processors: usize,
-    /// The threads inside a long text of their own now
-    /// (`READ_BACK_MIN_BYTES` or more, no unit on the pool).
+    /// The threads that encode the units of a long text of their own now
+    /// (`READ_BACK_MIN_BYTES` or more): no unit on the pool, and no thread
+    /// that still normalizes or cuts its text or waits for the pool.
     inside: AtomicUsize,
 }
 
@@ -2886,12 +2887,6 @@ impl NativeEncoder {
         framed: bool,
         at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        // Counted from here to the return: a thread that normalizes or
-        // cuts a long text is inside it as well.
-        let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
-            let others = self.inside.fetch_add(1, Ordering::Relaxed);
-            (Inside(&self.inside), others)
-        });
         // The scanners' word scans, chosen once per call on the input's
         // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
         // them; a short input walks its runs byte by byte, the chain
@@ -2966,6 +2961,10 @@ impl NativeEncoder {
         // Only while more threads are inside a long text than the process
         // has processors, and the clock is read only then. Not for a unit
         // on the pool: it is no text of its thread.
+        let inside = (text.len() >= READ_BACK_MIN_BYTES).then(|| {
+            let others = self.inside.fetch_add(1, Ordering::Relaxed);
+            (Inside(&self.inside), others)
+        });
         match &inside {
             Some((_, others)) if *others >= self.processors => {
                 if cache.reads_back(Instant::now(), text.len()) {
