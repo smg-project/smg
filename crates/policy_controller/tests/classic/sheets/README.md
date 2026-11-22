@@ -451,6 +451,8 @@ fails once the reason no longer holds.
   name, and the replay keeps the gateway's words for each: a model no worker serves and a wire no worker is on
   are no model, a pool over its thresholds on every worker of the wire is overloaded where shedding is on, and
   any other pool left nobody is unavailable. The `message` and `retry_after` are no part of a decision.
-- `media_refs.json`, `context_window.json`, `constraint_decider.json`, `rank_pin.json`: owed whole. Of a
+- `media_refs.json`, `context_window.json`, `constraint_decider.json`: owed whole. Of a
   request's hard demands the crate keeps the wire of a retry alone yet, so no module replays these sheets, and
   the replay names each as owed until the change that keeps its demand brings its module.
+- `rank_pin.json`: every row replays, each worker stating whether it registered a rank (`rank_registered`) and
+  each request that no rank can be pinned for it.
