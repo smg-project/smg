@@ -1126,7 +1126,7 @@ the worker crate's structures, and the one engine.
 
 | Data | On main | As designed |
 |---|---|---|
-| workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the store keeps what the contract's worker entry states and the object does not (its id, its revision, who registered it), and the membership log that watchers and standbys read |
+| workers | records in the store, and worker objects kept in step with them | worker objects in a worker-crate registry; beside each, the code that keeps the objects holds what a registration stated and the object does not hold as stated (10.3); the membership log that watchers and standbys read stays |
 | lists | the store's published copy | the registry's published lists by role and protocol, with the engine's value beside each (decision 10) |
 | health | the worker crate's health checker over the worker objects, on the leader; each outcome is copied into the store's record | the same checker; a decision reads the object's own status; a gateway's veto on a worker stays in the store |
 | loads | the crate's own poller and table | the worker crate's load monitor, publishing `LoadSnapshot` (decision 10) |
@@ -1138,8 +1138,82 @@ the worker crate's structures, and the one engine.
 
 What leaves the crate with that switch: the store-backed engine, the store's copies of the worker
 data that a worker object holds, the crate's own load poller, and the adapters that write worker
-state into the store. Some facts of a worker have no field on a worker object today (decision
-10).
+state into the store. Some facts of a worker are not carried to its worker object today, and
+some stand there in a narrower form than a registration states: 10.3 names them and where they
+are kept.
+
+### 10.3 The controller's worker data **[partly]**
+
+One worker's data stands four times whole in a controller, and a fifth time in part: the
+remainder holds 17 of its 24 facts as stated and one bit of an eighteenth. The membership log
+tells the data once more:
+
+| Copy | Where | Read by |
+|---|---|---|
+| the worker record | the store's table of records (`store/memory.rs`) | the registration calls; a watcher's and a standby's first copy |
+| a copy of the record's facts | beside the worker objects (`worker_host/objects.rs`) | the code that keeps the objects, to tell a record that changed under its object |
+| the worker object | the worker-crate registry | the health checker and the follower of cache events |
+| the remainder: 17 of the 24 facts and one bit of an eighteenth, with the record's id and revision | beside each worker object (`worker_host/remainder.rs`) | nothing in the controller's service yet |
+| the published copy of the records | the store | the store-backed engine's decisions |
+| the membership log's event | `service/replication/log.rs` | a watcher behind its first copy; a standby |
+
+The record leads and the object follows it. After the switch the object leads: a worker's data
+stands once, as its worker object with its remainder beside it, and the log still tells it. The
+remainder is the copy that stays. The table of records and the second copy of the facts end
+with step 4 below, and the published copy with the store-backed engine (10.2).
+
+**What stands beside an object [built].** `RowRemainder` (`worker_host/remainder.rs`) holds
+what a registration stated and the worker object does not hold as stated. The code that keeps
+the objects writes one with every object it builds or takes. `Objects::row_of` gives a worker's
+whole record back from the object and its remainder, with no read of the store's table, for an
+object built from its record or handed in with it. An object that was handed in and kept while
+its record moved states the six facts it holds whole as they were handed in, and as the
+engine's address the one it dials, where the moved record names an engine. Nothing in the
+controller's service reads either yet. Of the 24 facts a registration states:
+
+- Six stand on the object whole, and the remainder holds none of them: the address, the role,
+  the models, the labels, the cache block size and the bootstrap port. So does the status.
+- Eight stand twice, in a narrower form on the object and as stated in the remainder; of the
+  engine's address the remainder holds one bit, whether a registration named one. The rank
+  and the width share a line:
+
+| Fact | On the object | What the object cannot say |
+|---|---|---|
+| the engine's address | the address the object dials, where that is not the worker's own | whether a registration named the worker's own address as its engine or named none |
+| rank and width | a width above one, and a rank unless the worker is its engine whole | a width of one or of none, and a rank stated beside either |
+| the wire modes | the one protocol the object speaks | the other protocols of the set |
+| the engine's kind | the runtime the worker crate reads the name as | a name that crate does not know, and a known name as it was written |
+| the health policy | the checks in whole seconds, off where the controller cannot dial the worker | a part of a second, and the policy of a worker built with its checks off |
+| the overload thresholds | none on a controller's objects today; where a program asks for them, the worker's own over the program's defaults | which of them the worker stated |
+| the drain window | the window in force | a window stated equal to the object's default, which reads back as none |
+
+- Ten are not carried to the worker object: the incarnation, the zone, the pairing facts, the
+  encode offer, vision, the admission window, the priority, from where the worker is reached,
+  how its signals arrive and the demand facts. Three of them have a place of the object's own
+  that a record does not fill: the object's priority is unsigned where a record's is signed,
+  the object derives its pairing facts when it is built, and it reads its admission window
+  from a label. The remainder holds the ten, with the record's id and revision, who registered
+  it and when.
+
+A fact leaves the remainder when the worker object gets a field that holds it as stated
+(decision 10).
+
+**Behind the switch [planned].** Four steps, each small:
+
+1. A registration builds the worker object first and tells the membership log; no table of
+   records leads. The object, its remainder, the count of membership changes and the log's
+   event change in one turn, and a first copy is cut in the same turn, as the store's lock
+   orders them today. A change that moves a fact the object holds builds the object again: the
+   new object takes the standing one's place under its id, with its running state, as the code
+   that keeps the objects does today for a record that changed.
+2. A standby applies the leader's events to its own worker objects, and a watcher's and a
+   standby's first copy is cut from the objects and their remainders.
+3. No health outcome is copied into a record: a decision reads the object's status.
+4. The table of records, the second copy of the facts, the two conversions between a record
+   and an object, and the task that follows the table are deleted.
+
+A lease keeps naming its worker by the record's id, never by a place in a list: a gateway
+reports on a lease later and across membership changes.
 
 ## 11. A gateway under a controller **[planned]**
 
@@ -1375,7 +1449,7 @@ All eleven at a glance. An answer can be as short as the numbers with their lett
 | 7 | Shadow and explain | (a) built on the kept engine before the old one is deleted | stage 4 |
 | 8 | User stages in WebAssembly and over gRPC | (a) left as library code | nothing now |
 | 9 | The gateway's options | three with stage 3, the address and TLS options with stage 5 | stages 3 and 5 |
-| 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; still open: where the other worker facts live, and which overload thresholds apply | stage 4 |
+| 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped; the other worker facts are kept beside the object; recommended: one set of overload thresholds for each worker | stage 4 |
 | 11 | The crate in CI and in the published set | (b) one line in CI's test script names the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
 
 ### Decision 1: the name of a cache partition
@@ -1498,11 +1572,17 @@ controller (section 11) brings `--policy-controller-address` and three TLS optio
 |---|---|---|
 | A model's lists by role and protocol, with the engine's value beside each | one type in the worker crate that the gateway and the controller both use | 279 lines added; the gateway moves onto it at its integration |
 | A load monitor that a controller can stop when it stops leading, and start again | one public `stop()` on the worker crate's monitor | about 110 lines with its test |
-| The facts of a worker that a decision reads and a worker object does not hold today (zone, the encode offer, vision, the admission window, the demand facts, pairing) | open: a field for each on the worker crate's object, or the controller keeps them beside the object | not counted yet |
+| The facts of a worker that a decision reads and a worker object does not hold today (zone, the encode offer, vision, the admission window, the demand facts, pairing) | the controller keeps them beside the object (10.3, built); a fact moves to a field of the worker crate's object when that crate has one that holds it as stated, checked against the crate first | 245 lines of code for what is kept beside the object |
 
-One more point is open under this decision. A document writes overload thresholds for each
-binding, and a worker may state its own. A worker object holds one set. The controller's own
-design (section 10) has to say which thresholds apply where two bindings reach one worker.
+One more point under this decision. A document writes overload thresholds for each binding, and
+a worker may state its own. A worker object holds one set. **Recommendation:** one set for each
+worker, the worker's own values over one default of the program, as the classic policies have
+it. A binding keeps whether its thresholds veto at all and whether a request is shed when every
+worker is vetoed. Under the one engine its two numbers have no reader: the two that a gateway's
+routing settings state are already the defaults its worker objects are built with, and the
+crate's translation of those settings, which writes one that is off its default onto every
+binding today, stops writing them there. A document that names one is then refused when it is
+applied; that refusal is planned, not built, and the validator takes such a document today.
 
 ### Decision 11: the crate in CI and in the published set
 

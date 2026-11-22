@@ -26,6 +26,7 @@ use super::{
     found::facts,
     membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
     object::{builder, dial_address, status, thresholds, unchecked},
+    remainder::RowRemainder,
 };
 use crate::{
     engine::view::WorkerId,
@@ -69,7 +70,9 @@ struct Place {
 
 /// A row and the object that stands for it.
 struct Laid {
-    standing: RowRevision,
+    /// What of the row the object does not hold as stated, with the row's
+    /// id and the revision the object was built from.
+    remainder: Arc<RowRemainder>,
     object: Arc<dyn Worker>,
     /// Whether a registration handed the object in. The holder built it
     /// from the row otherwise.
@@ -416,12 +419,14 @@ impl<G: Generation> Objects<G> {
                 .values()
                 .filter(|laid| {
                     held.facts
-                        .get(&laid.standing.row)
+                        .get(&laid.remainder.standing.row)
                         .is_some_and(|dialing| dial_address(dialing) == address)
-                        && credentials.of(address, laid.standing.row).as_ref()
+                        && credentials
+                            .of(address, laid.remainder.standing.row)
+                            .as_ref()
                             != laid.object.api_key()
                 })
-                .map(|laid| laid.standing.row)
+                .map(|laid| laid.remainder.standing.row)
                 .collect()
         };
         let mut laid = 0;
@@ -567,7 +572,50 @@ impl<G: Generation> Objects<G> {
     /// was built from; `None` for an id the holder laid no object under, or
     /// one whose row went.
     pub fn standing(&self, object: &ObjectId) -> Option<RowRevision> {
-        self.held.read().rows.get(object).map(|laid| laid.standing)
+        let held = self.held.read();
+        held.rows.get(object).map(|laid| laid.remainder.standing)
+    }
+
+    /// What the row of the object under `object` states and the object
+    /// does not hold as stated: the facts a decision reads of the row
+    /// alone among them. `None` as [`Self::standing`] answers it. The
+    /// remainder is shared with the entry: a row laid again gets another.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the controller's service reads it once its worker objects lead"
+        )
+    )]
+    pub(crate) fn remainder(&self, object: &ObjectId) -> Option<Arc<RowRemainder>> {
+        let held = self.held.read();
+        held.rows
+            .get(object)
+            .map(|laid| Arc::clone(&laid.remainder))
+    }
+
+    /// The row the object under `object` stands for, read back from the
+    /// object and what the holder keeps beside it, the two as one turn
+    /// of the entry holds them. It is the row the object was laid from,
+    /// with the object's own status: no table of rows is read. `None`
+    /// as [`Self::standing`] answers it.
+    ///
+    /// A kept object whose row moved with no hand-in
+    /// ([`Self::unhanded`]) states its key, role, models, labels, cache
+    /// block size and bootstrap port as it was handed in, and as the
+    /// engine the address it dials, where the moved row names one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the controller's service reads it once its worker objects lead"
+        )
+    )]
+    pub(crate) fn row_of(&self, object: &ObjectId) -> Option<WorkerRow> {
+        let held = self.held.read();
+        held.rows
+            .get(object)
+            .map(|laid| laid.remainder.row(laid.object.as_ref()))
     }
 
     /// The row and revision the holder built this object from. A writer
@@ -578,7 +626,7 @@ impl<G: Generation> Objects<G> {
             .rows
             .get(id)
             .filter(|laid| Arc::ptr_eq(&laid.object, object))
-            .map(|laid| laid.standing)
+            .map(|laid| laid.remainder.standing)
     }
 
     /// The registry's id of the object that stands for `row`.
@@ -745,7 +793,9 @@ impl<G: Generation> Objects<G> {
     /// that does not stand as its object was built is laid again. No
     /// revision held is trusted alone here: behind a gap of the tail, as in
     /// another history, a row under a held id and revision may be another
-    /// life with other facts. The facts are compared beside it.
+    /// life with other facts. The facts are compared beside it. A row that
+    /// stands so may still be another life, made by another or admitted at
+    /// another time: its object stays, and its entry is stated again.
     ///
     /// A row that went leaves its object's place to the life that took its
     /// URL, where a registration has that life's object on offer: the
@@ -768,6 +818,9 @@ impl<G: Generation> Objects<G> {
         }
         for row in rows {
             if self.stands(row) {
+                if self.remade(row) {
+                    self.restate(row);
+                }
                 self.follow_status(store, row.id);
             } else {
                 self.lay(store, row);
@@ -800,7 +853,19 @@ impl<G: Generation> Objects<G> {
                 .objects
                 .get(&row.id)
                 .and_then(|object| held.rows.get(object))
-                .is_some_and(|laid| laid.standing.revision == row.revision)
+                .is_some_and(|laid| laid.remainder.standing.revision == row.revision)
+    }
+
+    /// Whether the entry kept for `row` names another maker of the row, or
+    /// another time it was admitted at, than the row states.
+    fn remade(&self, row: &WorkerRow) -> bool {
+        let held = self.held.read();
+        held.objects
+            .get(&row.id)
+            .and_then(|object| held.rows.get(object))
+            .is_some_and(|laid| {
+                laid.remainder.maker != row.maker || laid.remainder.admitted_at != row.admitted_at
+            })
     }
 
     /// Settle the object of `id` against the row as the store holds it. A
@@ -916,7 +981,7 @@ impl<G: Generation> Objects<G> {
         let Some(laid) = entry.and_then(|id| held.rows.get_mut(id)) else {
             return;
         };
-        laid.standing.revision = row.revision;
+        laid.remainder = Arc::new(RowRemainder::of(row));
         held.state(row);
     }
 
@@ -1066,10 +1131,7 @@ impl<G: Generation> Objects<G> {
             entries.rows.insert(
                 id,
                 Laid {
-                    standing: RowRevision {
-                        row: row.id,
-                        revision: row.revision,
-                    },
+                    remainder: Arc::new(RowRemainder::of(row)),
                     object: Arc::clone(&object),
                     handed,
                 },
@@ -1465,6 +1527,19 @@ mod tests {
         assert!(Arc::ptr_eq(&replica.at(A), &first));
         assert!(entry_stands(&replica, A));
         assert_eq!(replica.objects.unhanded(), 2);
+
+        // The entry's remainder is the moved row's. The kept object
+        // states what it holds as it was handed in: no label.
+        let stands = replica.row(A);
+        let read = replica.objects.row_of(&replica.id(A));
+        let read = read.expect("the row read back");
+        assert!(read.facts.labels.is_empty());
+        let labels = stands.facts.labels.clone();
+        let facts = WorkerFacts {
+            labels,
+            ..read.facts
+        };
+        assert_eq!(WorkerRow { facts, ..read }, stands);
     }
 
     /// An object is taken only where it states the row its write left. One

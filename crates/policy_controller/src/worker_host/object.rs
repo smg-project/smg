@@ -174,6 +174,17 @@ pub(super) fn status(status: WorkerStatus) -> ObjectStatus {
     }
 }
 
+/// [`status`] read back: the store's status for an object's.
+pub(super) fn row_status(status: ObjectStatus) -> WorkerStatus {
+    match status {
+        ObjectStatus::Pending => WorkerStatus::Pending,
+        ObjectStatus::Ready => WorkerStatus::Ready,
+        ObjectStatus::NotReady => WorkerStatus::NotReady,
+        ObjectStatus::Failed => WorkerStatus::Failed,
+        ObjectStatus::Draining => WorkerStatus::Draining,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
