@@ -3339,7 +3339,10 @@ pub struct Engine {
     /// [`slot`]. Every other phase's request is turned away there by this
     /// one read.
     keyed: [bool; PHASES.len()],
-    sessions: SessionTable,
+    /// The session table this engine's decisions read and write: its own,
+    /// made with it, or the one its host keeps across documents
+    /// ([`Self::share_sessions`]).
+    sessions: Arc<SessionTable>,
     assignment: AssignmentStages,
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
@@ -4468,6 +4471,7 @@ impl Engine {
         let sessions = SessionTable::new(shortest_sweep(&bindings))
             .with_absence(absence(&bindings))
             .with_shards(session_shards(&bindings));
+        let sessions = Arc::new(sessions);
         let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
         let marks: Vec<Marks> = profiles
             .iter()
@@ -4658,6 +4662,18 @@ impl Engine {
     /// The session table: the pins of every key a sessions rule placed.
     pub fn sessions(&self) -> &SessionTable {
         &self.sessions
+    }
+
+    /// This engine reads and writes `table` from here on: the table a host
+    /// keeps for its life, where it keeps one engine object and gives it
+    /// documents. The table takes this document's two times
+    /// ([`SessionTable::set_times`]) and keeps its keys, its shards and the
+    /// workers it holds as absent. The table this engine was made with is
+    /// let go: its host calls this before the engine takes a decision.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn share_sessions(&mut self, table: Arc<SessionTable>) {
+        table.set_times(self.sessions.sweep_micros(), self.sessions.absence_micros());
+        self.sessions = table;
     }
 
     /// A worker that left membership stands again as `new`: its key was

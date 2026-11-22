@@ -15,7 +15,7 @@ use crate::{
         decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
         policy_engine::{PolicyEngine, PoolMembers},
         records,
-        sticky_sessions::SessionVerdict,
+        sticky_sessions::{shards_for_this_host, SessionVerdict},
         view::{Constraints, Identity, PinSource, RequestFacts, Session, WorkerId},
     },
     store::GatewayId,
@@ -313,4 +313,33 @@ fn a_request_that_lends_pins_of_record_is_decided_as_one_that_lends_none() {
     lent.request.constraints.pins = Some(&record);
     assert_eq!(twice(&engine, &lent), plain);
     assert!(record.1.get().is_none(), "the record is not asked");
+}
+
+/// The session table is the engine's own, one for its life: the document's
+/// engine reads and writes it through a pointer, so a pin can outlive the
+/// document it was made under. The table has the host's shards whatever
+/// the document rules, where a document with no sessions rule makes itself
+/// a table of one shard, and it takes the document's two times.
+#[test]
+fn the_session_table_is_the_engines_own_under_every_document() {
+    for (name, ruled) in [("manual", true), ("random", false)] {
+        let mut document = PolicySpec::preset(name).expect("a built-in preset");
+        document.generation = 1;
+        let alone = AppliedSpec::validate(&document).expect("the document validates");
+        let made = alone.engine().sessions();
+        assert_eq!(made.shards() == 1, !ruled, "{name}");
+        assert_eq!(made.sweep_micros() != 0, ruled, "{name}");
+        let engine = preset(name);
+        let own = &*engine.sessions;
+        assert!(
+            std::ptr::eq(engine.spec().engine().sessions(), own),
+            "{name}: the document's engine reads the engine's table"
+        );
+        assert_eq!(own.shards(), shards_for_this_host(), "{name}");
+        assert_eq!(
+            (own.sweep_micros(), own.absence_micros()),
+            (made.sweep_micros(), made.absence_micros()),
+            "{name}: the document's two times"
+        );
+    }
 }

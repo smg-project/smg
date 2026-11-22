@@ -35,6 +35,8 @@ use serde::{
 };
 use sha2::{Digest as _, Sha256};
 
+#[cfg(feature = "in-process")]
+use crate::engine::sticky_sessions::SessionTable;
 use crate::{
     document::routing_key::KeySources,
     engine::{
@@ -5432,6 +5434,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The document's engine reads and writes `table` from here on
+    /// ([`Engine::share_sessions`]): the session table of an engine object
+    /// that outlives the document.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn share_sessions(&mut self, table: Arc<SessionTable>) {
+        self.engine.share_sessions(table);
     }
 
     /// The document's block size, in tokens: the size a request's blocks

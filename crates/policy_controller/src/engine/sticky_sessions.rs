@@ -326,10 +326,11 @@ pub struct SessionTable {
     /// sweep alone: a sweep a leave asked for walks no shard for the keys
     /// before their pass is due. `u64::MAX` where no rule sweeps.
     next_pass_micros: AtomicU64,
-    /// The sweep interval: the shortest among the rules of the engine's
-    /// bindings, so no rule's interval defers another rule's expiry; `0`
-    /// never sweeps (no rule has a TTL).
-    sweep_micros: u64,
+    /// The sweep interval: the shortest among the rules of the document in
+    /// force, so no rule's interval defers another rule's expiry; `0`
+    /// never sweeps (no rule has had a TTL). A word a document re-sets
+    /// ([`Self::set_times`]), read by the sweep alone.
+    sweep_micros: AtomicU64,
     /// The workers that left membership while their pins stand
     /// ([`Self::left`]), each with the decision clock at which it is
     /// forgotten: `0` until a decision stamps it, the word of a leave
@@ -343,8 +344,9 @@ pub struct SessionTable {
     /// that sweep waits for one walk of the table: the price of a worker
     /// that joins again behind the end losing no pin it is given after.
     absent: Mutex<Vec<(WorkerId, u64)>>,
-    /// How long a worker that left keeps its pins.
-    absence_micros: u64,
+    /// How long a worker that left keeps its pins: the document's in force
+    /// ([`Self::set_times`]), read where a sweep stamps a leave.
+    absence_micros: AtomicU64,
     /// The ids workers had before they were registered again, each with
     /// the id that stands for it ([`Self::rename_worker`]). A dispatch
     /// names the id its lease was issued on, and one that lands behind
@@ -371,9 +373,9 @@ impl SessionTable {
             shards: empty_shards(SHARDS),
             next_sweep_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
             next_pass_micros: AtomicU64::new(if sweep_micros == 0 { u64::MAX } else { 0 }),
-            sweep_micros,
+            sweep_micros: AtomicU64::new(sweep_micros),
             absent: Mutex::new(Vec::new()),
-            absence_micros: ABSENT_WORKER_PIN_TTL_MICROS,
+            absence_micros: AtomicU64::new(ABSENT_WORKER_PIN_TTL_MICROS),
             renamed: RwLock::new(FxHashMap::default()),
             renamed_len: AtomicUsize::new(0),
             swept_by_pass: AtomicBool::new(false),
@@ -386,13 +388,41 @@ impl SessionTable {
     /// time ends.
     #[must_use]
     pub fn with_absence(mut self, micros: u64) -> Self {
-        self.absence_micros = micros;
+        *self.absence_micros.get_mut() = micros;
         self
     }
 
     /// How long a worker that left keeps its pins, in microseconds.
     pub fn absence_micros(&self) -> u64 {
-        self.absence_micros
+        self.absence_micros.load(Ordering::Relaxed)
+    }
+
+    /// The table's sweep interval, in microseconds: `0` where it never
+    /// sweeps.
+    pub(crate) fn sweep_micros(&self) -> u64 {
+        self.sweep_micros.load(Ordering::Relaxed)
+    }
+
+    /// The table takes the two times of a new document: the shortest sweep
+    /// interval among its rules and the time a worker that left keeps its
+    /// pins. The keys stand as they are: a table outlives a document where
+    /// its host keeps one engine and gives it documents.
+    ///
+    /// A new interval makes a pass due at once, so a table that never
+    /// swept starts to, and a shorter interval waits for no pass of the
+    /// longer one. A document with no interval (`0`: none of its rules
+    /// has a TTL) leaves the interval that stands: the keys the document
+    /// before wrote still leave at a pass.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) fn set_times(&self, sweep_micros: u64, absence_micros: u64) {
+        self.absence_micros.store(absence_micros, Ordering::Relaxed);
+        if sweep_micros == 0 {
+            return;
+        }
+        if self.sweep_micros.swap(sweep_micros, Ordering::Relaxed) != sweep_micros {
+            self.next_pass_micros.store(0, Ordering::Relaxed);
+            self.next_sweep_micros.store(0, Ordering::Relaxed);
+        }
     }
 
     /// The table with `shards` shards, rounded up to a power of two and one
@@ -793,7 +823,7 @@ impl SessionTable {
         let pass = self.next_pass_micros.load(Ordering::Relaxed);
         let idle = now_micros >= pass;
         let next_pass = if idle {
-            now_micros.saturating_add(self.sweep_micros)
+            now_micros.saturating_add(self.sweep_micros())
         } else {
             pass
         };
@@ -814,7 +844,7 @@ impl SessionTable {
         let mut next = next_pass;
         absent.retain_mut(|(worker, ends)| {
             if *ends == 0 {
-                *ends = now_micros.saturating_add(self.absence_micros).max(1);
+                *ends = now_micros.saturating_add(self.absence_micros()).max(1);
             }
             if *ends <= now_micros {
                 ended.push(*worker);
@@ -992,6 +1022,47 @@ mod tests {
         // hourly key stays.
         assert_eq!(table.lookup(s(2), 2_000, &RULE), [WorkerId(0); 2]);
         assert_eq!(table.pins(s(1)), Some([WorkerId(1), WorkerId(0)]));
+    }
+
+    /// A table that outlives a document takes the next one's two times and
+    /// keeps its keys. A table that never swept takes an interval, and a
+    /// pass is due at once. A document with no interval leaves the one
+    /// that stands, so the keys the document before wrote still leave at a
+    /// pass. A shorter interval waits for no pass of the longer one.
+    #[test]
+    fn a_table_takes_a_new_documents_two_times_and_keeps_its_keys() {
+        let pin = |table: &SessionTable, key: u64, at: u64| {
+            table.lookup(mixed(key), at, &RULE);
+            table.dispatched(mixed(key), SessionVerdict::Pinned, WorkerId(key));
+        };
+        // No rule of the first document has a TTL: nothing ever sweeps.
+        let table = SessionTable::new(0).with_shards(8);
+        pin(&table, 1, 0);
+        table.sweep_due(5_000);
+        assert_eq!(table.len(), 1, "a table with no interval sweeps nothing");
+        // The next document's rule sweeps: the key past its end leaves at
+        // the pass that is due now.
+        table.set_times(RULE.sweep_micros, 7_000);
+        assert_eq!((table.sweep_micros(), table.absence_micros()), (100, 7_000));
+        table.sweep_due(5_000);
+        assert_eq!(table.len(), 0, "the first pass under the new interval");
+        // A key of that document, then a document with no interval: the
+        // interval stands, and the key leaves at its pass.
+        pin(&table, 2, 5_000);
+        table.set_times(0, 9_000);
+        assert_eq!((table.sweep_micros(), table.absence_micros()), (100, 9_000));
+        table.sweep_due(6_200);
+        assert_eq!(table.len(), 0, "a pass under the interval that stood");
+
+        // A long interval, its first pass behind it, and a key past its end.
+        let table = SessionTable::new(1_000_000).with_shards(8);
+        table.sweep_due(10);
+        pin(&table, 3, 20);
+        table.sweep_due(2_000);
+        assert_eq!(table.len(), 1, "the long interval's pass is not due");
+        table.set_times(RULE.sweep_micros, 7_000);
+        table.sweep_due(2_000);
+        assert_eq!(table.len(), 0, "the shorter interval's pass is due at once");
     }
 
     /// A host reads a key's pins with the instant its rule forgets it, and
