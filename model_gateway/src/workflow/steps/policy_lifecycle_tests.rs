@@ -551,6 +551,15 @@ async fn a_removal_closes_the_encode_connection_pooled_to_its_worker() {
     );
     let (_, dialled) = tokio::join!(send, listener.accept());
     let (mut pooled, _) = dialled.expect("the dialled connection");
+    // Open before the removal (past the client preface), so the close below
+    // is the removal's.
+    let mut preface = Vec::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), pooled.read_to_end(&mut preface))
+            .await
+            .is_err(),
+        "the pooled connection is open before the removal"
+    );
 
     remove(&app_context, encoder).await;
 
