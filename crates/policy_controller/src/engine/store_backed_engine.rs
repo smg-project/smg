@@ -6880,6 +6880,42 @@ pub(crate) mod tests {
         assert_eq!(door.undialed(), 0);
     }
 
+    /// A retry whose constraint was decided a way no member of its pool
+    /// states is left nobody: it is shed with no endpoint under the stage
+    /// `decoding`, beside a member that states no way too. A member that
+    /// states the retry's number takes it.
+    #[test]
+    fn a_constraint_no_member_decides_alike_is_shed_under_its_own_stage() {
+        let decides = |decoding: u8| {
+            let stated = DemandFacts {
+                decoding,
+                ..DemandFacts::default()
+            };
+            (false, stated)
+        };
+        let (store, ids) = stating_facts(&[decides(5), decides(0)]);
+        let door = StoreBackedEngine::new(Arc::clone(&store));
+        let decided = |decoding: u8| {
+            let mut asked = request(b"r-1", 7);
+            asked.constraints.demands = Demands {
+                decoding,
+                ..Demands::default()
+            };
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            decided.expect("a decision").decision
+        };
+        match decided(7) {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::NoEndpoints, "decoding")
+            ),
+            other => panic!("a member took it: {other:?}"),
+        }
+        let alike = decided(5);
+        let pick = alike.pick().expect("a member decides alike");
+        assert_eq!(pick.targets.first().map(|target| target.id), Some(ids[0]));
+    }
+
     /// A prefill-phase request of a model no pair plan binds is decided
     /// as a single over its prefill pool. Its rows are held to the input
     /// alone: the completion's bound is a decode's to hold, and a host
