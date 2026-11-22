@@ -768,6 +768,10 @@ impl Scorer for PrefixAffinity {
             // host hashes its text for a source that reads the record.
             sent_prefixes: placements,
             text_hashes: placements,
+            // A sent prefix's share is taken of the prompt's size, and a
+            // pick states its overlap of it: a host that can send a request
+            // on unread reads it under this stage.
+            prompt_size: true,
             loads: self.gates.kv_configured(),
             ..Needs::default()
         }
@@ -1272,6 +1276,8 @@ impl Scorer for WarmupSlice {
             affinity: true,
             events: true,
             loads: true,
+            // A miss is an overlap that is thin against the prompt's size.
+            prompt_size: true,
             ..Needs::default()
         }
     }
@@ -2280,6 +2286,29 @@ mod tests {
         }
         assert!(warmup(1.0, 0).needs().affinity);
         assert!(!KvPressure.needs().affinity);
+    }
+
+    /// The two stages that read the prompt's size declare it, under every
+    /// source: a host may state zero where no stage declares the size
+    /// ([`Needs::prompt_size`]), and a zero size reads every sent prefix as
+    /// the whole prompt. The classic policy is handed the prompt's length
+    /// always (`model_gateway/src/policies/cache_aware.rs:3474-3482`).
+    #[test]
+    fn the_stages_that_read_the_prompts_size_declare_it() {
+        for source in [
+            AffinitySource::Index,
+            AffinitySource::Predictor,
+            AffinitySource::Merged,
+        ] {
+            let params = PrefixAffinityParams {
+                source: Some(source),
+                ..PrefixAffinityParams::default()
+            };
+            let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
+            assert!(stage.needs().prompt_size, "{source:?}");
+        }
+        assert!(warmup(1.0, 0).needs().prompt_size);
+        assert!(!KvPressure.needs().prompt_size);
     }
 
     /// `row` named as holding `blocks` by the index.
