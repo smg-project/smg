@@ -46,8 +46,6 @@
 //! the leftmost of equal ranks: equal ranks are one token, formed at two
 //! positions by the same or by different splits).
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{borrow::Cow, cmp::Reverse, collections::BinaryHeap};
 
 use rustc_hash::FxHashMap;
@@ -285,7 +283,7 @@ pub(super) struct MergeTable {
     pub(super) ignore_merges: bool,
     /// The calls of [`Self::read_through`], for the test of who reads.
     #[cfg(test)]
-    pub(super) reads: AtomicUsize,
+    pub(super) reads: super::AtomicUsize,
 }
 
 /// The model's `merges` field read back: `[[a, b], ...]` in rank order.
@@ -829,7 +827,7 @@ impl MergeTable {
     pub(super) fn read_through(&self) {
         const GRID_STEP: usize = 64 / size_of::<Merge>();
         #[cfg(test)]
-        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.reads.fetch_add(1, super::Ordering::Relaxed);
         let mut sum = 0u64;
         for bucket in &self.buckets {
             sum = sum.wrapping_add(bucket.0[0].key);
