@@ -16,7 +16,8 @@
 //!   gateway keeps the value beside the list it was made from. No live
 //!   value of a worker is in it. What no worker object holds, the program
 //!   that holds it says here too, once a worker
-//!   ([`PoolRecords::with_fixed_facts`]): whether the worker takes images.
+//!   ([`PoolRecords::with_fixed_facts`]): whether the worker takes images,
+//!   and the id it knows the worker by where it keeps ids of its own.
 //! - **Once a load snapshot.** A snapshot is published whole and never
 //!   changed, so a worker's report reads the same at every decision that
 //!   holds the snapshot. One decision that writes every record of a list
@@ -79,6 +80,11 @@ use crate::{document::spec::AppliedSpec, load::load_row};
 /// The same for every worker object registered at one address, so it is
 /// the same at every attempt of a request and across a membership change,
 /// and a removal names the id every decision knew the worker by.
+///
+/// A program that keeps ids of its own states each worker's with its
+/// list's fixed facts ([`FixedFacts::id`]): the list's records then carry
+/// that id in this one's place, and a removal said by address still names
+/// this one.
 #[must_use]
 pub fn worker_id(worker: &dyn Worker) -> WorkerId {
     WorkerId(fingerprint(worker.url().as_bytes()))
@@ -419,7 +425,8 @@ impl PoolRecords {
     /// [`Self::new`], with what the program says of each worker beside its
     /// object ([`FixedFacts`]): `facts_of` is asked once a worker, here, and
     /// never at a decision. Whether a worker takes images goes into its
-    /// record.
+    /// record, and so does the id its program states, in place of the
+    /// fingerprint of its address ([`worker_id`]).
     #[must_use]
     pub fn with_fixed_facts(
         workers: &[Arc<dyn Worker>],
@@ -433,7 +440,9 @@ impl PoolRecords {
             .zip(0u32..)
             .map(|(worker, position)| {
                 let spec = &worker.metadata().spec;
-                let id = worker_id(worker.as_ref());
+                // The fingerprint of the registration key: the worker's
+                // key, and its id where its program states none.
+                let address = worker_id(worker.as_ref());
                 let listed = if lists.is_empty() {
                     None
                 } else {
@@ -450,10 +459,10 @@ impl PoolRecords {
                     // A worker object states no zone.
                     Some(lists.positions(kind, None, &labels))
                 };
-                let FixedFacts { vision } = facts_of(worker);
+                let facts = facts_of(worker);
                 Candidate {
                     position,
-                    id,
+                    id: facts.id_or(address),
                     role: Role::from(spec.worker_type),
                     // Values wider than a record's fields take the largest
                     // value they hold.
@@ -462,7 +471,7 @@ impl PoolRecords {
                     wire_modes: WireModes::from(spec.connection_mode),
                     engine_kind: listed.map_or(0, |listed| listed.engine_kind),
                     labels: listed.map_or(0, |listed| listed.labels),
-                    vision,
+                    vision: facts.vision,
                     // No admission window is the record's to know: both
                     // bits read open, and a caller that holds a window
                     // writes its own.
@@ -470,7 +479,7 @@ impl PoolRecords {
                     has_room: true,
                     // The low 32 bits of the registration key's
                     // fingerprint.
-                    key: id.0 as u32,
+                    key: address.0 as u32,
                     ..Candidate::default()
                 }
             })
@@ -515,14 +524,16 @@ impl PoolRecords {
         self.fixed.is_empty()
     }
 
-    /// Each worker's id ([`worker_id`]), by its place in the list.
+    /// Each worker's id, by its place in the list: the one its program
+    /// stated ([`FixedFacts::id`]), or the fingerprint of its address
+    /// ([`worker_id`]).
     #[must_use]
     pub fn ids(&self) -> &[WorkerId] {
         &self.ids
     }
 
     /// The place in the list of the worker whose id is `id`
-    /// ([`worker_id`]), and `None` where the list holds no such worker:
+    /// ([`Self::ids`]), and `None` where the list holds no such worker:
     /// what finds the one record an id names ([`Self::read`]) with no walk
     /// of the list.
     ///
@@ -964,7 +975,7 @@ thread_local! {
 /// was made at ([`Live::now_micros`]).
 ///
 /// A target of the decision names its worker by position, the worker's
-/// place in `workers`, and by id ([`worker_id`]).
+/// place in `workers`, and by id ([`PoolRecords::ids`]).
 ///
 /// The records and the engine's scratch are the calling thread's own.
 pub fn decide(

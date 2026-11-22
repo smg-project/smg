@@ -560,6 +560,95 @@ mod tests {
         assert_eq!(asks.made.get(), 1);
     }
 
+    /// A program that keeps ids of its own states each worker's with its
+    /// list's fixed facts. The list's records carry those ids whole, and
+    /// a record's key stays the low half of its address's fingerprint. A
+    /// whole decision names every target by the stated id, and passes
+    /// over the worker a retry names by it. A list handed with nothing
+    /// said names each worker by its address's fingerprint.
+    #[test]
+    fn a_list_names_each_worker_by_the_id_its_host_states() {
+        use crate::engine::view::FixedFacts;
+
+        // Ids past 32 bits: no half of one stands for it.
+        let wide = |at: u64| WorkerId((1 << 40) + at);
+        let engine = preset("round_robin");
+        let list = pool(4);
+        let place = |worker: &Arc<dyn Worker>| list.iter().position(|one| Arc::ptr_eq(one, worker));
+        let members = engine.pool_members_with_fixed_facts(&list, |worker| FixedFacts {
+            id: place(worker).map(|at| wide(at as u64)),
+            ..FixedFacts::default()
+        });
+        let records = members.records(&engine.spec, &engine.clock);
+        let stated: Vec<WorkerId> = (0..4).map(wide).collect();
+        assert_eq!(records.ids(), stated);
+        for (row, worker) in records.fixed().iter().zip(list.iter()) {
+            assert_eq!(row.key, worker_id(worker.as_ref()).0 as u32);
+        }
+
+        let tried = [stated[1]];
+        let mut retry = request();
+        retry.facts.tried = &tried;
+        let asks = Asks::of(retry, Some(&members));
+        let mut seen = [false; 4];
+        for _ in 0..12 {
+            let whole = decided(&engine, &asks);
+            let pick = whole.decision.pick().expect("a pick");
+            for target in pick.targets.iter() {
+                assert_eq!(target.id, stated[target.position as usize]);
+                assert_ne!(target.id, tried[0], "the tried one is no alternate");
+            }
+            let target = pick.targets.first().expect("a target");
+            seen[target.position as usize] = true;
+        }
+        assert_eq!(seen, [true, false, true, true], "the tried one is passed");
+
+        let unsaid = engine.pool_members(&list);
+        let prints: Vec<WorkerId> = list
+            .iter()
+            .map(|worker| worker_id(worker.as_ref()))
+            .collect();
+        let records = unsaid.records(&engine.spec, &engine.clock);
+        assert_eq!(records.ids(), prints);
+    }
+
+    /// Zero is no worker's id: it reads as absent wherever an id travels,
+    /// and a session's table keeps no pin on it. A program that states
+    /// zero for a worker states none: the list's records name the worker
+    /// by its address's fingerprint, and a session placed on that worker
+    /// keeps its pin.
+    #[test]
+    fn a_list_names_a_worker_by_its_address_where_its_host_states_zero() {
+        use crate::engine::view::FixedFacts;
+
+        let engine = preset("manual");
+        let list = pool(4);
+        let members = engine.pool_members_with_fixed_facts(&list, |_| FixedFacts {
+            id: Some(WorkerId(0)),
+            ..FixedFacts::default()
+        });
+        let prints: Vec<WorkerId> = list
+            .iter()
+            .map(|worker| worker_id(worker.as_ref()))
+            .collect();
+        let records = members.records(&engine.spec, &engine.clock);
+        assert_eq!(records.ids(), prints);
+
+        // The stock sessions rule: a key's first request is placed and
+        // its dispatch pins the key, and the key's next request follows
+        // the pin.
+        let mut keyed = request();
+        keyed.facts.session_key = Identity::hashed(41);
+        let asks = Asks::of(keyed, Some(&members));
+        let placed = served(&engine, &asks, Instant::now());
+        assert_eq!(placed.id, prints[placed.position as usize]);
+        let followed = decided(&engine, &asks).decision;
+        let pick = followed.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        let again = pick.targets.first().expect("a target");
+        assert_eq!(again.id, placed.id);
+    }
+
     /// The entry reads its host's clock where a decision is dated and
     /// nowhere else: a place reads none, and a retry's whole pass, a profile
     /// that scores and a place noted for a stage that takes a word read it
