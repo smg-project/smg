@@ -1,0 +1,105 @@
+//! A program that decides in its own process.
+//!
+//! The engine chooses the worker each request goes to, inside the program
+//! that serves the request. This example is such a program, as small as one
+//! can be. It keeps its workers in the worker crate's registry, starts the
+//! engine once from routing settings, and serves each request by the one
+//! call the engine has for a request ([`PolicyEngine::place`]): it keeps
+//! the placement to the request's end and says when the request went out
+//! and how it ended.
+//!
+//! `program.rs` is the program. This file runs it over three workers that
+//! serve nothing: a send is a line on the output, and one worker answers
+//! every send with a server error, so a request that meets it is asked
+//! again past it.
+//!
+//! ```text
+//! cargo run -p smg-policy-controller --features in-process --example in_process
+//! ```
+//!
+//! [`PolicyEngine::place`]: smg_policy_controller::engine::PolicyEngine::place
+
+#![expect(
+    clippy::print_stdout,
+    reason = "an example says on its output what it did"
+)]
+
+use std::{error::Error, sync::Arc};
+
+use program::{settings, Asked, Program};
+use smg_policy_controller::document::{AppliedSpec, PolicySettings};
+use smg_worker::{
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    model_card::ModelCard,
+    worker::{HealthCheckConfig, WorkerStatus},
+};
+
+mod program;
+
+/// The model the example's workers serve.
+const MODEL: &str = "model-a";
+
+/// The worker that answers every send with a server error.
+const FAILING: &str = "http://worker-1:8000";
+
+/// A ready worker at `address` that serves [`MODEL`], with no health
+/// checker behind it.
+fn worker(address: &str) -> Arc<dyn Worker> {
+    let health = HealthCheckConfig {
+        disable_health_check: true,
+        ..HealthCheckConfig::default()
+    };
+    let worker = <BasicWorkerBuilder>::new(address)
+        .model(ModelCard::new(MODEL))
+        .health_config(health)
+        .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
+/// The example's network: a send is a line on the output.
+fn send(worker: &dyn Worker) -> u16 {
+    let status = if worker.url() == FAILING { 502 } else { 200 };
+    println!("  sent to {}, answered {status}", worker.url());
+    status
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // The document a configuration's `policy: round_robin` means.
+    let document = settings(PolicySettings::RoundRobin).policy_document()?;
+    let spec = AppliedSpec::validate(&document)?;
+    // This program has no load monitor, so it hands the engine no channel.
+    let (program, task) = Program::start(spec, None, send);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the engine's task runs for the life of the process"
+    )]
+    let _task = tokio::spawn(task);
+
+    let addresses = ["http://worker-0:8000", FAILING, "http://worker-2:8000"];
+    for address in addresses {
+        assert!(program.join(worker(address)), "a free address joins");
+    }
+    let asked = Asked {
+        model: MODEL,
+        headers: None,
+    };
+    for request in 1..=4 {
+        println!("request {request}:");
+        let answer = program.serve(&asked);
+        println!("  the client reads {}", answer.status);
+    }
+
+    for address in addresses {
+        assert!(program.leave(address), "a worker that joined leaves");
+    }
+    let answer = program.serve(&asked);
+    println!(
+        "with no worker left the client reads {} after {} sends: {:?}",
+        answer.status,
+        answer.sent.len(),
+        answer.unplaced
+    );
+    Ok(())
+}
