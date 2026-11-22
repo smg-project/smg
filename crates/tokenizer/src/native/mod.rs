@@ -2835,8 +2835,21 @@ impl NativeEncoder {
                     let marker = self.marker_before(units, index, at_start);
                     let mut mapped = String::new();
                     let mut cache = self.piece_cache_for_text(text.len());
-                    self.encode_unit(model, unit, marker, words, &mut mapped, ids, &mut cache)?;
-                    self.answer_rest(ids, &mut cache);
+                    // Filled through a Vec in this thread's frame: the slots
+                    // of `parts` share a cache line or two, and every piece
+                    // appended writes its Vec's length.
+                    let mut filled = std::mem::take(ids);
+                    self.encode_unit(
+                        model,
+                        unit,
+                        marker,
+                        words,
+                        &mut mapped,
+                        &mut filled,
+                        &mut cache,
+                    )?;
+                    self.answer_rest(&mut filled, &mut cache);
+                    *ids = filled;
                     Ok(())
                 })?;
             let body: usize = parts.iter().map(Vec::len).sum();
