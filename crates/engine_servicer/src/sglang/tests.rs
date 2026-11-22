@@ -1829,6 +1829,137 @@ async fn prepared_decode_retains_terminal_error_until_slow_reader_drains_full_qu
     server.stop(Duration::from_secs(5)).unwrap();
 }
 
+/// An already-expired decode admission must be rejected with `DEADLINE_EXCEEDED` before
+/// sending native `Add` to the scheduler, while still leaving post-submit D decoding unbounded.
+#[tokio::test]
+async fn prepared_decode_rejects_expired_admission_before_submit() {
+    use smg_grpc_client::sglang_managed::Limits;
+    let config = managed_test_config("decode");
+    let Harness {
+        server,
+        mut engine_in,
+        _dir,
+        ..
+    } = managed_harness("decode").await;
+    let client_engine = server.state.shared.engine().unwrap().clone();
+    let runtime = Arc::new(
+        ManagedNativeRuntime::new(
+            Arc::new(move || Some(client_engine.clone())),
+            &config,
+            Limits::default(),
+        )
+        .unwrap(),
+    );
+    let rid = "expired-prepared-decode";
+    let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
+    let mut output = runtime
+        .submit(
+            PreparedRequest {
+                binding: prepared_binding("p-expired", rid),
+                request: generate_request(rid, true, Vec::new()),
+                external: None,
+                manifest: None,
+                deadline: Instant::now() - Duration::from_millis(10),
+            },
+            registration,
+            cancellation,
+        )
+        .unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), output.next())
+        .await
+        .unwrap()
+        .expect("must yield DeadlineExceeded instead of silent EOF")
+        .unwrap_err();
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert_scheduler_idle(&mut engine_in).await;
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    assert!(runtime.ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// If the 8-slot chunk queue is full when abort grace expires, the out-of-band terminal
+/// error must still be delivered to the caller after the 8 buffered chunks drain.
+#[tokio::test]
+async fn prepared_full_queue_delivers_quarantine_error_after_buffered_chunks() {
+    use smg_grpc_client::sglang_managed::Limits;
+    let config = managed_test_config("decode");
+    let Harness {
+        server,
+        mut engine_in,
+        mut engine_out,
+        _dir,
+        ..
+    } = managed_harness("decode").await;
+    let client_engine = server.state.shared.engine().unwrap().clone();
+    let runtime = Arc::new(
+        ManagedNativeRuntime::new(
+            Arc::new(move || Some(client_engine.clone())),
+            &config,
+            Limits::default(),
+        )
+        .unwrap()
+        .with_abort_grace(Duration::from_millis(100)),
+    );
+    let rid = "full-queue-quarantine-err";
+    let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
+    let mut output = runtime
+        .submit(
+            PreparedRequest {
+                binding: prepared_binding("p-full-abort", rid),
+                request: generate_request(rid, true, Vec::new()),
+                external: None,
+                manifest: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+            registration,
+            cancellation,
+        )
+        .unwrap();
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+    // Fill all 8 slots of the output queue without reading.
+    for i in 1..=8 {
+        send(&mut engine_out, &batch(rid, vec![200 + i], i, None, None)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    // Trigger server-side cancellation while the 8-slot queue is still full, and do NOT
+    // send a native terminal receipt so abort_grace expires and quarantines the worker.
+    server.state.shared.registry.cancel_all().unwrap();
+    assert_eq!(recv_abort(&mut engine_in).bounded().await, vec![rid]);
+    wait_until(|| !runtime.ready()).await;
+
+    // Now drain the stream: all 8 chunks followed by Unavailable (not silent EOF).
+    let mut tokens = Vec::new();
+    let mut final_err = None;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(2), output.next())
+        .await
+        .unwrap()
+    {
+        match item {
+            Ok(resp) => {
+                if let Some(sg::generate_response::Response::Chunk(c)) = resp.response {
+                    tokens.extend(c.token_ids);
+                }
+            }
+            Err(status) => {
+                final_err = Some(status);
+                break;
+            }
+        }
+    }
+    assert_eq!(tokens, vec![201, 202, 203, 204, 205, 206, 207, 208]);
+    let status = final_err.expect("quarantine error must not be dropped when queue is full");
+    assert_eq!(status.code(), Code::Unavailable);
+
+    // Late native terminal still recovers the worker from quarantine.
+    send(
+        &mut engine_out,
+        &batch(rid, vec![209], 9, Some("abort"), None),
+    )
+    .await;
+    wait_until(|| runtime.ready() && server.state.shared.registry.active() == 0).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 /// String stops ride the request to the scheduler, which keeps its tokenizer
 /// and reports the matched string back.
 #[tokio::test]

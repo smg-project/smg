@@ -251,7 +251,6 @@ def before_queue(original, scheduler, req, *args, **kwargs):
     except Exception as error:
         req.set_finish_with_abort(f"managed layout refused: {error}")
         return original(scheduler, req, *args, **kwargs)
-    req._smg_managed_exported = True
     if _sender is not None:
         import zmq
 
@@ -263,11 +262,15 @@ def before_queue(original, scheduler, req, *args, **kwargs):
             logging.getLogger(__name__).exception(
                 "managed metadata publication failed rid=%s", req.rid
             )
+            req.set_finish_with_abort("managed metadata publication failed")
             return original(scheduler, req, *args, **kwargs)
+        req._smg_managed_exported = True
         logging.getLogger(__name__).info(
             "managed P metadata exported before bootstrap rid=%s room=%s images=%s",
             req.rid,
             binding.bootstrap.room,
             len(manifest.images),
         )
+    else:
+        req._smg_managed_exported = True
     return original(scheduler, req, *args, **kwargs)

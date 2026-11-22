@@ -2,22 +2,23 @@
 
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use engine_zmq_adapter::ZmqEngineClient;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use prost::Message;
 use smg_grpc_client::{
     sglang_managed::{proto, validate_manifest, Limits, LAYOUT, VERSION},
     sglang_proto,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use zeromq::{PullSocket, Socket, SocketRecv};
 
@@ -291,6 +292,7 @@ impl ManagedNativeRuntime {
         let (cancel, cancelled) = watch::channel(false);
         let (layout, layouts) = mpsc::channel(1);
         let (output, receiver) = mpsc::channel(8);
+        let terminal_error = Arc::new(Mutex::new(None));
         entries.insert(
             rid.clone(),
             Entry {
@@ -302,6 +304,7 @@ impl ManagedNativeRuntime {
         );
         drop(entries);
         let runtime = Arc::clone(self);
+        let task_terminal_error = Arc::clone(&terminal_error);
         #[expect(
             clippy::disallowed_methods,
             reason = "native task retains submission through acknowledged termination"
@@ -313,6 +316,7 @@ impl ManagedNativeRuntime {
                 cancelled,
                 layouts,
                 output,
+                task_terminal_error,
                 &runtime.quarantined,
                 runtime.abort_grace,
             );
@@ -336,7 +340,10 @@ impl ManagedNativeRuntime {
                 runtime.metadata_failed.store(true, Ordering::Release);
             }
         });
-        Ok(Box::pin(ReceiverStream::new(receiver)))
+        Ok(Box::pin(PreparedOutputStream {
+            receiver,
+            terminal_error,
+        }))
     }
 
     /// A connected engine cannot serve prepared inputs while quarantined or after permanent failure.
@@ -363,18 +370,57 @@ fn definitely_unsubmitted(error: &Status) -> bool {
         })
 }
 
+/// Bounded chunk stream with an out-of-band terminal error slot so cancellation or
+/// failure status is never dropped when the 8-slot chunk queue is full.
+struct PreparedOutputStream {
+    receiver: mpsc::Receiver<Result<sglang_proto::GenerateResponse, Status>>,
+    terminal_error: Arc<Mutex<Option<Status>>>,
+}
+
+impl Stream for PreparedOutputStream {
+    type Item = Result<sglang_proto::GenerateResponse, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(None) => Poll::Ready(
+                self.terminal_error
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .map(Err),
+            ),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn push_terminal_error(
+    output: &mpsc::Sender<Result<sglang_proto::GenerateResponse, Status>>,
+    terminal_error: &Mutex<Option<Status>>,
+    status: Status,
+) {
+    if let Err(mpsc::error::TrySendError::Full(Err(status))) = output.try_send(Err(status)) {
+        if let Ok(mut slot) = terminal_error.lock() {
+            slot.get_or_insert(status);
+        }
+    }
+}
+
 /// Preserve Generate->Abort ordering while retaining the native output registration.
 ///
 /// The prepared `deadline` bounds P (encode/layout/prefill) and D admission; once D is
 /// submitted to the scheduler, total generation duration (both streaming and buffered
 /// `stream=false` requests) follows the gateway's `--grpc-request-timeout-secs` (via
 /// stream close/abort), matching ordinary text PD.
+#[expect(clippy::too_many_arguments)]
 async fn run_native(
     client: ZmqEngineClient,
     input: PreparedRequest,
     mut cancel: watch::Receiver<bool>,
     mut layouts: mpsc::Receiver<Vec<u8>>,
     output: mpsc::Sender<Result<sglang_proto::GenerateResponse, Status>>,
+    terminal_error: Arc<Mutex<Option<Status>>>,
     quarantined: &AtomicUsize,
     abort_grace: Duration,
 ) -> (bool, bool) {
@@ -385,8 +431,15 @@ async fn run_native(
         manifest,
         deadline,
     } = input;
-    if *cancel.borrow() || output.is_closed() || (external.is_some() && Instant::now() >= deadline)
-    {
+    if *cancel.borrow() || output.is_closed() {
+        return (true, false);
+    }
+    if Instant::now() >= deadline {
+        push_terminal_error(
+            &output,
+            &terminal_error,
+            Status::deadline_exceeded("prepared request deadline expired before submission"),
+        );
         return (true, false);
     }
     let ext_ref = external.as_ref().map(|(ep, n)| (ep.as_str(), *n));
@@ -397,7 +450,7 @@ async fn run_native(
         Ok(stream) => stream,
         Err(error) => {
             let unsubmitted = definitely_unsubmitted(&error);
-            let _ = output.try_send(Err(error));
+            push_terminal_error(&output, &terminal_error, error);
             return (unsubmitted, false);
         }
     };
@@ -427,9 +480,11 @@ async fn run_native(
         {
             if native_finished {
                 if needs_layout && !layout_sent {
-                    let _ = output.try_send(Err(Status::deadline_exceeded(
-                        "prepared layout export timed out",
-                    )));
+                    push_terminal_error(
+                        &output,
+                        &terminal_error,
+                        Status::deadline_exceeded("prepared layout export timed out"),
+                    );
                 }
                 return (true, false);
             }
@@ -453,7 +508,11 @@ async fn run_native(
                     // A silent D may still own RDMA receive buffers. Quarantine the worker,
                     // close the RPC, and keep draining until a native terminal receipt arrives.
                     quarantined.fetch_add(1, Ordering::AcqRel);
-                    let _ = output.try_send(Err(Status::unavailable("native cancellation unconfirmed; worker quarantined")));
+                    push_terminal_error(
+                        &output,
+                        &terminal_error,
+                        Status::unavailable("native cancellation unconfirmed; worker quarantined"),
+                    );
                     drop(output);
                     while let Some(item) = native.next().await {
                         if waiting_for_decode && item.is_ok() {
@@ -474,12 +533,16 @@ async fn run_native(
                         prepared_input: layout_bytes,
                         ..Default::default()
                     };
-                    if !send_owned_event(&output, Ok(event), &mut cancel, Some(deadline)).await {
-                        let _ = output.try_send(Err(Status::resource_exhausted("managed output stalled")));
+                    if !send_owned_event(&output, &terminal_error, Ok(event), &mut cancel, Some(deadline)).await {
+                        push_terminal_error(
+                            &output,
+                            &terminal_error,
+                            Status::resource_exhausted("managed output stalled"),
+                        );
                         stalled = true;
                     }
                     for response in pending.drain(..) {
-                        if !send_owned_event(&output, Ok(response), &mut cancel, Some(deadline)).await {
+                        if !send_owned_event(&output, &terminal_error, Ok(response), &mut cancel, Some(deadline)).await {
                             stalled = true;
                             break;
                         }
@@ -506,13 +569,29 @@ async fn run_native(
                             } else {
                                 pending.push(event);
                             }
-                        } else if !send_owned_event(&output, Ok(event), &mut cancel, active_deadline).await {
+                        } else if !send_owned_event(&output, &terminal_error, Ok(event), &mut cancel, active_deadline).await {
                             stalled = true;
                         }
                     }
                     Some(Err(error)) => {
-                        let _ = send_owned_event(&output, Err(error), &mut cancel, active_deadline).await;
-                        return (safe, false);
+                        let _ = send_owned_event(
+                            &output,
+                            &terminal_error,
+                            Err(error),
+                            &mut cancel,
+                            active_deadline,
+                        )
+                        .await;
+                        if safe {
+                            return (true, false);
+                        }
+                        if !aborting {
+                            aborting = true;
+                            abort_until = Instant::now() + abort_grace;
+                            if !waiting_for_decode {
+                                send_abort(&client);
+                            }
+                        }
                     }
                     None if safe && needs_layout && !layout_sent && !aborting => {
                         native_finished = true;
@@ -527,21 +606,31 @@ async fn run_native(
 
 async fn send_owned_event(
     output: &mpsc::Sender<Result<sglang_proto::GenerateResponse, Status>>,
+    terminal_error: &Mutex<Option<Status>>,
     item: Result<sglang_proto::GenerateResponse, Status>,
     cancel: &mut watch::Receiver<bool>,
     deadline: Option<Instant>,
 ) -> bool {
     if *cancel.borrow() || deadline.is_some_and(|dl| Instant::now() >= dl) {
-        if item.is_err() {
-            let _ = output.try_send(item);
+        if let Err(status) = item {
+            push_terminal_error(output, terminal_error, status);
         }
         return false;
     }
     let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
-    tokio::select! {
+    let permit = tokio::select! {
         biased;
-        _ = cancel.changed() => false,
-        () = tokio::time::sleep(remaining.unwrap_or_default()), if remaining.is_some() => false,
-        result = output.send(item) => result.is_ok(),
+        _ = cancel.changed() => None,
+        () = tokio::time::sleep(remaining.unwrap_or_default()), if remaining.is_some() => None,
+        permit = output.reserve() => permit.ok(),
+    };
+    if let Some(permit) = permit {
+        permit.send(item);
+        true
+    } else {
+        if let Err(status) = item {
+            push_terminal_error(output, terminal_error, status);
+        }
+        false
     }
 }

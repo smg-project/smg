@@ -33,6 +33,26 @@ use crate::{BoxStream, ServerThread, ServicerError};
 
 type Reply = Result<Value, Status>;
 
+const CANCEL_RECEIPT_GRACE: Duration = Duration::from_secs(30);
+
+enum NativeCallError {
+    /// The command frame was never handed to the native peer (e.g. ZMQ `ReturnToSender` or
+    /// pre-send failure), so the operation never started in Python and its slot may be released.
+    NotSent(Status),
+    /// Delivery or release outcome is ambiguous; the owner must retain the slot and fail closed.
+    Ambiguous(Status),
+}
+
+impl NativeCallError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::NotSent(status) | Self::Ambiguous(status) => status,
+        }
+    }
+}
+
+type PendingReply = Result<Value, NativeCallError>;
+
 /// Private same-host IPC command/reply channel to Python native encoder runtime.
 #[derive(Clone)]
 pub struct NativeEncoderLink {
@@ -42,7 +62,7 @@ pub struct NativeEncoderLink {
 
 struct NativeState {
     sequence: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<PendingReply>>>,
     connected: AtomicBool,
     failed: AtomicBool,
 }
@@ -109,13 +129,9 @@ impl NativeEncoderLink {
         )]
         tokio::spawn(async move {
             while let Some((sequence, mut message)) = rx.recv().await {
-                let mut delivered = false;
                 for attempt in 0..20 {
                     match commands.send(message).await {
-                        Ok(()) => {
-                            delivered = true;
-                            break;
-                        }
+                        Ok(()) => break,
                         Err(zeromq::ZmqError::ReturnToSender {
                             message: returned, ..
                         }) if attempt < 19 => {
@@ -125,12 +141,13 @@ impl NativeEncoderLink {
                         Err(zeromq::ZmqError::ReturnToSender { .. }) => {
                             if let Ok(mut pending) = writer.pending.lock() {
                                 if let Some(sender) = pending.remove(&sequence) {
-                                    let _ = sender.send(Err(Status::unavailable(
-                                        "native encoder IPC peer not connected",
+                                    let _ = sender.send(Err(NativeCallError::NotSent(
+                                        Status::unavailable(
+                                            "native encoder IPC peer not connected",
+                                        ),
                                     )));
                                 }
                             }
-                            delivered = true;
                             break;
                         }
                         Err(error) => {
@@ -139,13 +156,6 @@ impl NativeEncoderLink {
                             return;
                         }
                     }
-                }
-                if !delivered {
-                    writer.fail(Status::unavailable(
-                        "native encoder command delivery failed",
-                    ));
-                    closed.send_replace(true);
-                    return;
                 }
             }
             writer.fail(Status::unavailable("native encoder command owner closed"));
@@ -180,29 +190,33 @@ impl NativeEncoderLink {
         &self,
         mut command: Value,
         artifact: Option<Bytes>,
-    ) -> Result<(PendingCall, oneshot::Receiver<Reply>), Status> {
+    ) -> Result<(PendingCall, oneshot::Receiver<PendingReply>), NativeCallError> {
         if self.state.failed.load(Ordering::Acquire) {
-            return Err(Status::unavailable("native encoder connection failed"));
+            return Err(NativeCallError::NotSent(Status::unavailable(
+                "native encoder connection failed",
+            )));
         }
         let sequence = self.state.sequence.fetch_add(1, Ordering::Relaxed);
-        let fields = command
-            .as_object_mut()
-            .ok_or_else(|| Status::internal("native encoder command must be an object"))?;
+        let fields = command.as_object_mut().ok_or_else(|| {
+            NativeCallError::NotSent(Status::internal("native encoder command must be an object"))
+        })?;
         fields.insert("sequence".into(), sequence.into());
-        let header = serde_json::to_vec(&command).map_err(wire_error)?;
+        let header = serde_json::to_vec(&command)
+            .map_err(wire_error)
+            .map_err(NativeCallError::NotSent)?;
         let mut message = ZmqMessage::from(Bytes::from(header));
         if let Some(artifact) = artifact {
             message.push_back(artifact);
         }
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self
-                .state
-                .pending
-                .lock()
-                .map_err(|_| Status::internal("native reply ledger poisoned"))?;
+            let mut pending = self.state.pending.lock().map_err(|_| {
+                NativeCallError::NotSent(Status::internal("native reply ledger poisoned"))
+            })?;
             if self.state.failed.load(Ordering::Acquire) {
-                return Err(Status::unavailable("native encoder connection failed"));
+                return Err(NativeCallError::NotSent(Status::unavailable(
+                    "native encoder connection failed",
+                )));
             }
             pending.insert(sequence, tx);
         }
@@ -213,16 +227,22 @@ impl NativeEncoderLink {
         if self.commands.send((sequence, message)).await.is_err() {
             self.state
                 .fail(Status::unavailable("native encoder command stream closed"));
-            return Err(Status::unavailable("native encoder command stream closed"));
+            return Err(NativeCallError::NotSent(Status::unavailable(
+                "native encoder command stream closed",
+            )));
         }
         Ok((pending, rx))
     }
 
     /// Send one JSON command (and optional binary artifact frame) and await its sequenced reply.
     pub async fn call(&self, command: Value, artifact: Option<Bytes>) -> Reply {
-        let (_pending, rx) = self.enqueue(command, artifact).await?;
+        let (_pending, rx) = self
+            .enqueue(command, artifact)
+            .await
+            .map_err(NativeCallError::into_status)?;
         rx.await
             .map_err(|_| Status::unavailable("native encoder reply stream closed"))?
+            .map_err(NativeCallError::into_status)
     }
 
     /// Return whether Python has connected its IPC sockets and the link has no fatal error.
@@ -250,10 +270,10 @@ impl NativeState {
             .remove(&reply.sequence);
         if let Some(sender) = sender {
             let result = reply.error.map_or(Ok(reply.result), |error| {
-                Err(Status::new(
+                Err(NativeCallError::Ambiguous(Status::new(
                     tonic::Code::from_i32(reply.error_code.unwrap_or(13)),
                     error,
-                ))
+                )))
             });
             let _ = sender.send(result);
         }
@@ -265,7 +285,7 @@ impl NativeState {
         self.failed.store(true, Ordering::Release);
         if let Ok(mut pending) = self.pending.lock() {
             for (_, sender) in pending.drain() {
-                let _ = sender.send(Err(error.clone()));
+                let _ = sender.send(Err(NativeCallError::Ambiguous(error.clone())));
             }
         }
     }
@@ -341,6 +361,7 @@ pub struct EncoderRuntime {
     cpu: Arc<Semaphore>,
     draining: AtomicBool,
     fatal: Mutex<Option<String>>,
+    cancel_grace: Duration,
 }
 
 impl EncoderRuntime {
@@ -349,6 +370,16 @@ impl EncoderRuntime {
         config: EncoderConfig,
         native: NativeEncoderLink,
         processor: EncoderProcessor,
+    ) -> Result<Arc<Self>, Status> {
+        Self::with_cancel_grace(config, native, processor, CANCEL_RECEIPT_GRACE)
+    }
+
+    /// Create the runtime state with an explicit post-cancel receipt timeout (used by tests).
+    pub(crate) fn with_cancel_grace(
+        config: EncoderConfig,
+        native: NativeEncoderLink,
+        processor: EncoderProcessor,
+        cancel_grace: Duration,
     ) -> Result<Arc<Self>, Status> {
         if config.max_active == 0
             || config.max_cpu == 0
@@ -368,6 +399,7 @@ impl EncoderRuntime {
             owners: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
             fatal: Mutex::new(None),
+            cancel_grace,
         }))
     }
 
@@ -520,7 +552,7 @@ impl EncoderRuntime {
         };
         // Enqueue `execute` on the FIFO command channel before racing `cancel`, so Python
         // always observes `execute` before any subsequent `cancel` for the same `rid`.
-        let receipt = match self
+        let receipt: PendingReply = match self
             .native
             .enqueue(
                 serde_json::json!({
@@ -537,8 +569,11 @@ impl EncoderRuntime {
         {
             Ok((_pending, rx)) => {
                 let exec = async move {
-                    rx.await
-                        .map_err(|_| Status::unavailable("native encoder reply stream closed"))?
+                    rx.await.map_err(|_| {
+                        NativeCallError::Ambiguous(Status::unavailable(
+                            "native encoder reply stream closed",
+                        ))
+                    })?
                 };
                 tokio::pin!(exec);
                 tokio::select! {
@@ -551,13 +586,27 @@ impl EncoderRuntime {
                         tokio::pin!(cancel);
                         tokio::select! {
                             receipt = &mut exec => receipt,
-                            _ = &mut cancel => exec.await,
+                            _ = &mut cancel => {
+                                tokio::time::timeout(self.cancel_grace, &mut exec)
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        Err(NativeCallError::Ambiguous(Status::unavailable(
+                                            "native encoder release receipt timed out",
+                                        )))
+                                    })
+                            }
                         }
                     }
                 }
             }
             Err(error) => Err(error),
         };
+        if let Err(NativeCallError::NotSent(error)) = receipt {
+            self.release_owner(&rid);
+            drop(permit);
+            owner.result.send_replace(Some(Err(error)));
+            return;
+        }
         let safe = receipt
             .as_ref()
             .is_ok_and(|receipt| receipt.get("released").and_then(Value::as_bool) == Some(true));
@@ -569,7 +618,7 @@ impl EncoderRuntime {
             Ok(_) => Err(Status::unavailable(
                 "native encoder did not confirm safe release",
             )),
-            Err(error) => Err(error),
+            Err(error) => Err(error.into_status()),
         };
         if safe {
             self.release_owner(&rid);
@@ -1050,6 +1099,127 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!runtime.ready());
         assert!(runtime.fatal_error().is_some());
+        assert_eq!(runtime.loads().0, 1);
+    }
+
+    #[tokio::test]
+    async fn unsent_command_releases_slot_without_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = format!("ipc://{}/commands.sock", dir.path().display());
+        let events = format!("ipc://{}/events.sock", dir.path().display());
+        let link = NativeEncoderLink::bind(&commands, &events, 32)
+            .await
+            .unwrap();
+        // Connect ONLY the events socket and advertise ready — command peer never attaches,
+        // so PushSocket::send returns ReturnToSender through the retry window.
+        let mut push = PushSocket::new();
+        push.connect(&events).await.unwrap();
+        let processor: EncoderProcessor = Arc::new(|_| {
+            Box::pin(async {
+                Ok(EncoderArtifact {
+                    bytes: Bytes::from_static(b"pixels"),
+                    embedding_tokens: 4,
+                })
+            })
+        });
+        let runtime = EncoderRuntime::new(test_config(), link, processor).unwrap();
+        let ready_msg = serde_json::to_vec(&json!({"ready": true})).unwrap();
+        push.send(ZmqMessage::from(Bytes::from(ready_msg)))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if runtime.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(runtime.ready());
+
+        let err = runtime
+            .encode(encode_request("unsent-req"), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            runtime.ready(),
+            "unsent command must not quarantine encoder"
+        );
+        assert!(runtime.fatal_error().is_none());
+        assert_eq!(runtime.loads(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn cancel_receipt_timeout_marks_fatal_and_retains_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = format!("ipc://{}/commands.sock", dir.path().display());
+        let events = format!("ipc://{}/events.sock", dir.path().display());
+        let link = NativeEncoderLink::bind(&commands, &events, 32)
+            .await
+            .unwrap();
+        let mut pull = PullSocket::new();
+        let mut push = PushSocket::new();
+        pull.connect(&commands).await.unwrap();
+        push.connect(&events).await.unwrap();
+        let processor: EncoderProcessor = Arc::new(|_| {
+            Box::pin(async {
+                Ok(EncoderArtifact {
+                    bytes: Bytes::from_static(b"pixels"),
+                    embedding_tokens: 4,
+                })
+            })
+        });
+        let runtime = EncoderRuntime::with_cancel_grace(
+            test_config(),
+            link,
+            processor,
+            Duration::from_millis(80),
+        )
+        .unwrap();
+        let ready_msg = serde_json::to_vec(&json!({"ready": true})).unwrap();
+        push.send(ZmqMessage::from(Bytes::from(ready_msg)))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if runtime.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(runtime.ready());
+
+        let handle = tokio::spawn({
+            let rt = runtime.clone();
+            async move {
+                rt.encode(encode_request("stuck-req"), Duration::from_secs(5))
+                    .await
+            }
+        });
+        let exec: Value =
+            serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
+        assert_eq!(exec["operation"], "execute");
+
+        // Cancel the RPC; acknowledge cancel, but never send the execute receipt.
+        handle.abort();
+        let cancel: Value =
+            serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
+        assert_eq!(cancel["operation"], "cancel");
+        let reply_c =
+            serde_json::to_vec(&json!({"sequence": cancel["sequence"], "result": {}})).unwrap();
+        push.send(ZmqMessage::from(Bytes::from(reply_c)))
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            if runtime.fatal_error().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!runtime.ready());
+        assert!(runtime
+            .fatal_error()
+            .as_deref()
+            .is_some_and(|msg| msg.contains("timed out")));
         assert_eq!(runtime.loads().0, 1);
     }
 }

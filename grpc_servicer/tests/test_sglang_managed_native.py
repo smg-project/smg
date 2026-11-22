@@ -161,6 +161,7 @@ def test_plugin_intake_queue_and_backpressure_errors(monkeypatch):
     assert queued == [req] and "bad" in req.to_finish
 
     req2 = SimpleNamespace(rid="blocked", to_finish=None)
+    req2.set_finish_with_abort = lambda reason: setattr(req2, "to_finish", reason)
     monkeypatch.setattr(
         plugin.native,
         "export_layout",
@@ -173,7 +174,8 @@ def test_plugin_intake_queue_and_backpressure_errors(monkeypatch):
     )
     queued.clear()
     plugin.before_queue(lambda s, r: queued.append(r), SimpleNamespace(model_config=object()), req2)
-    assert queued == [req2] and req2.to_finish is None
+    assert queued == [req2] and "metadata publication failed" in req2.to_finish
+    assert not getattr(req2, "_smg_managed_exported", False)
 
 
 @pytest.mark.parametrize(
