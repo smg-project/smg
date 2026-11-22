@@ -1,3 +1,5 @@
+mod pair;
+
 use std::{
     cell::Cell,
     collections::{BTreeSet, HashMap},
@@ -406,7 +408,8 @@ fn the_prompts_blocks_are_hashed_under_its_partition_once() {
 /// carries no encode item and asks no decode again says it is plain, with
 /// the size its request would state. The engine then answers it a place where one pick decides its
 /// place: no clock is read for it. Each fact that asks more than a worker
-/// of the list takes the request off that path.
+/// of the list takes the request off that path. A decode asked again
+/// does not: over one list the word asks nothing.
 #[test]
 fn a_plain_request_says_so_and_is_answered_a_place() {
     let engine = preset("round_robin");
@@ -469,10 +472,6 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
             ..PlaceRequest::of(MODEL, plain.lists)
         },
         PlaceRequest {
-            decode_again: true,
-            ..PlaceRequest::of(MODEL, plain.lists)
-        },
-        PlaceRequest {
             encode: Some(EncodeItems::default()),
             ..PlaceRequest::of(MODEL, plain.lists)
         },
@@ -485,6 +484,12 @@ fn a_plain_request_says_so_and_is_answered_a_place() {
         None,
         "a missed target"
     );
+    // A decode asked again is a pair's word: over one list it asks nothing.
+    let again = PlaceRequest {
+        decode_again: true,
+        ..plain
+    };
+    assert_eq!(Made::new(&engine, &again, &[]).plain(), said);
 }
 
 /// A request states the later decode where its caller asks the decode
@@ -870,9 +875,9 @@ fn a_decision_no_target_of_which_can_be_sent_to_is_given_up_by_name() {
 
 /// A request with no worker is answered why. A decision's shed keeps its
 /// reason and the stage that left nobody. What this call does not place
-/// yet is declined by name: a pair's two lists and encode items. A demand
-/// no worker of the list meets is shed under the demand's name. A decision
-/// that panics is refused, and costs its request alone.
+/// yet is declined by name: encode items. A demand no worker of the list
+/// meets is shed under the demand's name. A decision that panics is
+/// refused, and costs its request alone.
 #[test]
 fn a_request_with_no_worker_is_answered_why() {
     let engine = hosted(preset("round_robin"));
@@ -910,13 +915,6 @@ fn a_request_with_no_worker_is_answered_why() {
     assert_eq!(
         engine.place(&encoding).err(),
         shed(ShedReason::PolicyDeclined, "encode-items")
-    );
-    let classes = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
-    let pair = pair_of(&members, &classes);
-    let paired = PlaceRequest::of(MODEL, WorkerLists::Pair(pair));
-    assert_eq!(
-        engine.place(&paired).err(),
-        shed(ShedReason::PolicyDeclined, "pair-lists")
     );
     // No worker of the list is ready: the decision sheds, and names the
     // filter that left nobody.

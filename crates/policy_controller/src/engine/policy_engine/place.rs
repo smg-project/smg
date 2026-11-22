@@ -19,6 +19,11 @@
 //! The engine then decides, and takes the first target of the decision that
 //! can be sent to ([`ready`]). The caller is answered a [`Placement`], which
 //! it keeps with the request, or the reason there is none ([`Unplaced`]).
+//!
+//! A request with a pair's two lists is placed the same way, a target at a
+//! time over both its workers ([`pair`]).
+
+mod pair;
 
 use std::{
     cell::{Cell, OnceCell},
@@ -36,7 +41,7 @@ use super::{PolicyEngine, PoolMembers};
 use crate::{
     document::spec::{AppliedSpec, DecodePick},
     engine::{
-        decision::{Decision, Pick, ShedReason},
+        decision::{Decision, Pick, ShedReason, Target, MAX_TARGETS},
         decision_engine::{
             DecideOutcome, Decided, DecisionEngine, DecisionRefused, Plain, Request, RequestMaker,
             WorkerLists,
@@ -173,7 +178,8 @@ pub struct PlaceRequest<'a> {
     /// answer. Where the document picks the decode after the prefill, such
     /// a request's first decision books the prefill alone. A caller that
     /// sends both sides at once states nothing here and keeps one decision
-    /// under every document.
+    /// under every document. The word is a pair's: over one list it asks
+    /// nothing, and a first attempt that carries it is plain still.
     pub decode_again: bool,
 }
 
@@ -366,12 +372,14 @@ impl RequestMaker for Made<'_, '_> {
 
     // A first attempt that names nothing tried or missed, demands nothing,
     // carries no encode item and asks no decode again is plain. Its size
-    // is the one the request made would state.
+    // is the one the request made would state. A decode asked again is a
+    // pair's word: over one list it asks nothing, and the request is plain
+    // still.
     fn plain(&self) -> Option<Plain> {
         let request = self.request;
         let first = request.attempt == 0 && request.tried.is_empty() && self.missed.is_empty();
-        let asks_more =
-            !request.demands.is_none() || request.encode.is_some() || request.decode_again;
+        let again = request.decode_again && matches!(request.lists, WorkerLists::Pair(_));
+        let asks_more = !request.demands.is_none() || request.encode.is_some() || again;
         (first && !asks_more).then(|| Plain {
             phase: request.phase(),
             wires: WireModes::NONE,
@@ -408,8 +416,17 @@ pub enum Unplaced {
     /// The engine queued the request. A caller that holds no request
     /// answers as for overloaded workers.
     Queued,
-    /// The decision named workers and none of them can be sent to now:
-    /// none is ready and let through by its circuit breaker. A caller
+    /// The document's capacity filter left a pair's request no prefill:
+    /// each one the filters ahead of it kept is at its caller's admission
+    /// limit
+    /// ([`PairAdmission::has_capacity`](crate::engine::PairAdmission::has_capacity)),
+    /// whether or not a decode it pairs with can be sent to. The request
+    /// is not refused: its caller waits for a prefill's room and places
+    /// it again. A document with no capacity filter never answers this.
+    PrefillsFull,
+    /// The decision named workers and none of its targets can be sent to
+    /// now: a target holds where its worker, and a pair's decode beside
+    /// it, is ready and let through by its circuit breaker. A caller
     /// answers that it has no worker for the request.
     NoWorkers,
     /// The engine made no decision, for the reason it carries. A caller
@@ -425,10 +442,6 @@ pub(super) fn ready(worker: &dyn Worker) -> bool {
     let state = worker.routing_state();
     state.healthy && state.can_execute
 }
-
-/// What a request with a pair's two lists is declined under: this call
-/// places a single request.
-const PAIR_LISTS: &str = "pair-lists";
 
 /// What a request that carries encode items is declined under.
 const ENCODE_ITEMS: &str = "encode-items";
@@ -472,6 +485,58 @@ pub(super) fn picked(decision: &Decision) -> Result<&Pick, Unplaced> {
         }),
         Decision::Queue(_) => Err(Unplaced::Queued),
     }
+}
+
+/// The workers of one target, as its caller's lists hold them: the worker
+/// the request goes to, and a pair's decode.
+pub(super) type Sides = (Arc<dyn Worker>, Option<Arc<dyn Worker>>);
+
+/// One walk of a whole decision's targets, best first: the first target
+/// that holds is taken. `sides` answers a target's workers where each can
+/// be sent to, or the ids of those that cannot: a single request's worker,
+/// or each side of a pair by its own id.
+///
+/// `None` where no target holds. The decision is then given up by name
+/// ([`give_up`]), and the ids `sides` named join `missed`, each once: the
+/// next decision is told to leave them out. A document's `not-tried`
+/// filter does so while another worker is left, and steps aside where
+/// none is.
+///
+/// # Errors
+///
+/// The decision's shed or its queue ([`picked`]).
+pub(super) fn walk<'a>(
+    engine: &'static PolicyEngine,
+    decided: DecideOutcome,
+    later: bool,
+    now: Instant,
+    missed: &mut Vec<WorkerId>,
+    sides: impl Fn(&Target) -> Result<Sides, [Option<WorkerId>; 2]>,
+) -> Result<Option<Placement<'a>>, Unplaced> {
+    let pick = picked(&decided.decision)?;
+    let mut failed = [[None; 2]; MAX_TARGETS];
+    let mut held = None;
+    for (index, target) in pick.targets.iter().enumerate() {
+        match sides(target) {
+            Ok(sides) => {
+                held = Some((index, sides));
+                break;
+            }
+            Err(ids) => failed[index] = ids,
+        }
+    }
+    let Some((index, (worker, decode))) = held else {
+        give_up(engine, decided, later, now);
+        for id in failed.into_iter().flatten().flatten() {
+            if !missed.contains(&id) {
+                missed.push(id);
+            }
+        }
+        return Ok(None);
+    };
+    Ok(Placement::taken(
+        engine, decided, later, now, index, worker, decode,
+    ))
 }
 
 /// Gives up a whole decision none of whose targets can be sent to. A lease
@@ -545,10 +610,20 @@ impl PolicyEngine {
     /// the document derived one that leaves in the clear, and none for a
     /// request a place answers: no fact of such a request is made.
     ///
+    /// A request with a pair's two lists is decided once over both, and the
+    /// first target both of whose workers can be sent to is taken: the
+    /// placement names the prefill as its worker and the decode beside it.
+    /// Which workers pair is the caller's word, in the classes its lists
+    /// carry: no pair is tested here again. Prefills that are all at the
+    /// caller's limit answer [`Unplaced::PrefillsFull`], on which the
+    /// caller waits for room and places the request again.
+    ///
     /// Not placed by this call yet, and declined by name
-    /// ([`ShedReason::PolicyDeclined`]): a request with a pair's two lists
-    /// (`pair-lists`) and a request that carries encode items
-    /// (`encode-items`).
+    /// ([`ShedReason::PolicyDeclined`]): a request that carries encode
+    /// items (`encode-items`). A pair that states a demand is shed with no
+    /// worker for it ([`ShedReason::NoEndpoints`], under `wires`) where
+    /// each of its lists holds a worker: a pair's decision narrows neither
+    /// list by a demand.
     ///
     /// Its caller counts each request it sends under the placement's
     /// routing value on the request's worker, as that worker's load guard
@@ -589,7 +664,9 @@ impl PolicyEngine {
             return Err(declined(ENCODE_ITEMS));
         }
         match request.lists {
-            WorkerLists::Pair(_) => Err(declined(PAIR_LISTS)),
+            WorkerLists::Pair(lists) => {
+                pair::ask(self, request, &lists, &mut Vec::new())?.ok_or(Unplaced::NoWorkers)
+            }
             WorkerLists::Single(members) => single(self, request, Some(members)),
             WorkerLists::None => single(self, request, None),
         }
