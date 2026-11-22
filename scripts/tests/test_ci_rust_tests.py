@@ -330,10 +330,11 @@ class ShardTableTests(unittest.TestCase):
             for need in target.get("required-features", []):
                 self.assertIn(need, on, f"the kv shard would skip tests/{target['name']}.rs")
 
-    def test_the_kv_shard_runs_the_policy_crates_library_as_the_gateway_builds_it(self):
+    def test_the_kv_shard_runs_the_policy_crates_library_with_the_in_process_engine(self):
         # The gateway is the one build that turns the policy crate's `in-process` feature on,
         # and its shards run the gateway's own cases. The kv shard runs the crate's library
-        # under the gateway's feature set, or no line runs the cases behind that feature.
+        # under the features the gateway asks for on every target (its target table adds
+        # `client` on Linux and macOS), or no line runs the cases behind `in-process`.
         gateway = tomllib.loads((REPO / "model_gateway" / "Cargo.toml").read_text())
         asked = gateway["dependencies"]["smg-policy-controller"]
         root = tomllib.loads((REPO / "Cargo.toml").read_text())
@@ -611,8 +612,10 @@ KNOWN = REPO / "model_gateway" / "tests" / "policy_controller_known.tsv"
 
 # A stand-in for cargo: the metadata of a gateway whose test binaries are the scenario's, and
 # `cargo test` over them as libtest answers it (--exact, --skip and names; a binary's cases one
-# line each; status 101 where a case fails). A case with a `policy` writes the line of a classic
-# pick to the file SMG_TEST_CLASSIC_PICKS names, as the gateway's test build does.
+# line each on the standard output; cargo's own lines and a case's `stderr` text on the standard
+# error; status 101 where a case fails). A case with a `policy` writes the line of a classic
+# pick to the file SMG_TEST_CLASSIC_PICKS names, as the gateway's test build does: under the
+# case's name, the name of its thread, or under the `thread` the scenario gives.
 CARGO_STUB = r"""#!/usr/bin/env python3
 import json
 import os
@@ -640,16 +643,18 @@ names = [
 status = 0
 for binary in binaries:
     executable = f"{binary}-0123456789abcdef"
-    print(f"     Running tests/{binary}.rs (target/debug/deps/{executable})", flush=True)
+    print(f"     Running tests/{binary}.rs (target/debug/deps/{executable})", file=sys.stderr)
     for case, facts in scenario[binary].items():
         if case in skips or (names and case not in names):
             continue
+        if "stderr" in facts:
+            print(facts["stderr"], file=sys.stderr, flush=True)
         print(f"test {case} ... {facts['result']}", flush=True)
         if facts["result"] == "FAILED":
             status = 101
         if picks and "policy" in facts:
             with open(picks, "a") as file:
-                file.write(f"{executable}\t{case}\t{facts['policy']}\n")
+                file.write(f"{executable}\t{facts.get('thread', case)}\t{facts['policy']}\n")
 sys.exit(status)
 """
 
@@ -706,6 +711,8 @@ class PolicyControllerRunTests(unittest.TestCase):
                     "CARGO_STUB_SCENARIO": str(scenario_file),
                     "POLICY_CONTROLLER_KNOWN": str(known),
                     **({"GITHUB_ACTIONS": "true"} if hosted else {}),
+                    # An interpreter built as a shared library starts only with its library path.
+                    **{k: os.environ[k] for k in ("LD_LIBRARY_PATH",) if k in os.environ},
                 },
             )
             return done, [json.loads(line) for line in calls.read_text().splitlines()]
@@ -803,6 +810,25 @@ class PolicyControllerRunTests(unittest.TestCase):
             "alpha_tests one::pair: no classic policy places its requests with the policy "
             "controller on any more: delete its line from the list",
         )
+
+    def test_a_pick_on_a_thread_that_is_no_case_says_it_cannot_be_tied_to_a_case(self):
+        scenario = self.changed(
+            "gamma_tests", "plain", result="ok", policy="manual", thread="tokio-runtime-worker"
+        )
+        done, _ = self.run_shard(scenario)
+        self.assert_red(
+            done,
+            "gamma_tests: a classic policy (manual) picks on the thread tokio-runtime-worker, "
+            "which is no case this binary ran: the pick cannot be tied to its case",
+        )
+
+    def test_a_result_is_read_from_the_standard_output_alone(self):
+        # What a case writes to the standard error is no result, whatever it looks like.
+        noise = "test plain ... FAILED"
+        done, _ = self.run_shard(self.changed("gamma_tests", "plain", result="ok", stderr=noise))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(noise, done.stderr)
+        self.assertIn("policy controller on, gateway-1: OK", done.stdout)
 
     def test_a_line_that_names_no_test_binary_or_is_malformed_is_red(self):
         done, _ = self.run_shard(listed=self.LIST + "nowhere_tests\tx\tfails\twhy\n")

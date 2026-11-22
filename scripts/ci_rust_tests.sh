@@ -201,10 +201,11 @@ commands_of() {
             # The policy crate's library as a host in process builds it: `worker-host` without the
             # controller. The shard's first line turns the controller on, so that build would never be made.
             echo "-p smg-policy-controller --lib --no-default-features --features worker-host"
-            # The policy crate's library as the gateway builds it: the engine a gateway keeps in its own
-            # process (`in-process`) beside `operator` and `worker-host`, without the controller. The gateway
-            # alone asks for `in-process`, and its shards run the gateway's cases, so no other line runs the
-            # cases behind that feature.
+            # The policy crate's library under the features the gateway asks for on every target: the engine a
+            # gateway keeps in its own process (`in-process`) beside `operator` and `worker-host`, without the
+            # controller (on Linux and macOS the gateway also asks for `client`, which turns the controller on).
+            # The gateway alone asks for `in-process`, and its shards run the gateway's cases, so no other line
+            # runs the cases behind that feature.
             echo "-p smg-policy-controller --lib --no-default-features --features in-process,operator,worker-host"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
@@ -269,7 +270,7 @@ known_cases() {
 #      `classic`: a pick in a case the list does not name is red, and so is a listed case with no pick.
 # The change that cures a case deletes its line: the list only shrinks.
 policy_controller_run() {
-    local shard=$1 index every targets target names skips plain="" work status=0
+    local shard=$1 index every targets target names skips work status=0
     case "$shard" in
         gateway-[0-9]*) index=${shard#gateway-} ;;
         *) echo "ci_rust_tests.sh: only a gateway integration shard (gateway-1 to gateway-$GATEWAY_SHARDS) runs with the policy controller on, not '$shard'" >&2; exit 2 ;;
@@ -282,26 +283,20 @@ policy_controller_run() {
     targets=$(printf '%s\n' "$every" | awk -v i="$index" -v n="$GATEWAY_SHARDS" 'NR % n == i % n')
     work=$(mktemp -d)
     : > "$work/picks"
-    : > "$work/part1"
     export SMG_TEST_POLICY_CONTROLLER=on
 
+    # A binary an invocation, in parts 1 and 2: a case is named by its binary and its own name, and the
+    # binary's standard output alone is kept for part 3. What cargo and a case write to the standard
+    # error stays apart from it, so the line of a case's result is read whole.
     echo "== The policy controller on, part 1 of 3: the tests of $shard, without the cases the list names as failing =="
     for target in $targets; do
         names=$(known_cases fails "$target")
-        if [ -z "$names" ]; then
-            plain="$plain --test $target"
-            continue
-        fi
-        # A binary with listed cases runs alone: --skip with --exact leaves out exactly those names, and
-        # another binary may hold a case of the same name.
-        skips=$(printf '%s\n' "$names" | awk '{ printf " --skip %s", $1 }')
+        skips=
+        # --skip with --exact leaves out exactly the listed names.
+        [ -z "$names" ] || skips=$(printf '%s\n' "$names" | awk 'BEGIN { printf " -- --exact" } { printf " --skip %s", $1 }')
         # shellcheck disable=SC2086
-        (set -x; SMG_TEST_CLASSIC_PICKS="$work/picks" cargo test --no-fail-fast -p smg --test "$target" -- --exact$skips) 2>&1 | tee -a "$work/part1" || status=$?
+        (set -x; SMG_TEST_CLASSIC_PICKS="$work/picks" cargo test --no-fail-fast -p smg --test "$target"$skips) | tee "$work/part1.$target" || status=$?
     done
-    if [ -n "$plain" ]; then
-        # shellcheck disable=SC2086
-        (set -x; SMG_TEST_CLASSIC_PICKS="$work/picks" cargo test --no-fail-fast -p smg$plain) 2>&1 | tee -a "$work/part1" || status=$?
-    fi
 
     # The failures of this part are the expected ones: a hosted log folds them into one group.
     [ -z "${GITHUB_ACTIONS:-}" ] || echo "::group::The policy controller on, part 2 of 3: expected failures"
@@ -310,8 +305,7 @@ policy_controller_run() {
         names=$(known_cases fails "$target")
         [ -n "$names" ] || continue
         # shellcheck disable=SC2086
-        (set -x; cargo test --no-fail-fast -p smg --test "$target" -- --exact $names) > "$work/fails.$target" 2>&1 || true
-        cat "$work/fails.$target"
+        (set -x; cargo test --no-fail-fast -p smg --test "$target" -- --exact $names) | tee "$work/fails.$target" || true
     done
     [ -z "${GITHUB_ACTIONS:-}" ] || echo "::endgroup::"
 
@@ -346,24 +340,20 @@ for number, line in enumerate(Path(known).read_text().splitlines(), 1):
 mine = {key: kind for key, kind in listed.items() if key[0] in targets}
 
 
-def results(text):
-    """(binary, case) -> ok, FAILED or ignored: the binary of a Running line of cargo, then its test lines."""
+def results(output):
+    """case -> ok, FAILED or ignored, from the standard output one test binary wrote to the file."""
     found = {}
-    binary = None
-    for line in text.splitlines():
-        running = re.match(r"\s*Running .*\((?:[^)]*/)?([^/)]+?)(?:-[0-9a-f]{16})?\)\s*$", line)
-        if running:
-            binary = running.group(1)
-            continue
-        test = re.match(r"test (\S+)(?: - should panic)? \.\.\. (ok|FAILED|ignored)\b", line)
-        if test and binary:
-            found[(binary, test.group(1))] = test.group(2)
+    if output.exists():
+        for line in output.read_text().splitlines():
+            test = re.match(r"test (\S+)(?: - should panic)? \.\.\. (ok|FAILED|ignored)\b", line)
+            if test:
+                found[test.group(1)] = test.group(2)
     return found
 
 
 # Part 1: nothing fails but the cases left out of it.
-part1 = results((work / "part1").read_text())
-failed = sorted(key for key, result in part1.items() if result == "FAILED")
+part1 = {binary: results(work / f"part1.{binary}") for binary in targets}
+failed = sorted((binary, case) for binary, cases in part1.items() for case, result in cases.items() if result == "FAILED")
 for binary, case in failed:
     problems.append(f"{binary} {case}: fails with the policy controller on, and the list does not name it")
 if part1_status != "0" and not failed:
@@ -373,8 +363,7 @@ if part1_status != "0" and not failed:
 for (binary, case), kind in sorted(mine.items()):
     if kind != "fails":
         continue
-    output = work / f"fails.{binary}"
-    result = results(output.read_text()).get((binary, case)) if output.exists() else None
+    result = results(work / f"fails.{binary}").get(case)
     if result == "ok":
         problems.append(f"{binary} {case}: passes now with the policy controller on: delete its line from the list")
     elif result != "FAILED":
@@ -390,8 +379,11 @@ for line in (work / "picks").read_text().splitlines():
     binary = re.sub(r"-[0-9a-f]{16}$", "", fields[0])
     picked.setdefault((binary, fields[1]), set()).add(fields[2])
 for (binary, case), policies in sorted(picked.items()):
-    if mine.get((binary, case)) != "classic":
-        names = ", ".join(sorted(policies))
+    names = ", ".join(sorted(policies))
+    if case not in part1.get(binary, {}):
+        # The line names its thread, and a case is known by the thread it runs on.
+        problems.append(f"{binary}: a classic policy ({names}) picks on the thread {case}, which is no case this binary ran: the pick cannot be tied to its case")
+    elif mine.get((binary, case)) != "classic":
         problems.append(f"{binary} {case}: a classic policy ({names}) places a request with the policy controller on, and the list does not name the case")
 for (binary, case), kind in sorted(mine.items()):
     if kind == "classic" and (binary, case) not in picked:
@@ -399,7 +391,8 @@ for (binary, case), kind in sorted(mine.items()):
 
 kinds = list(mine.values())
 failing, classic = kinds.count("fails"), kinds.count("classic")
-print(f"policy controller on, {shard}: {len(targets)} test binaries, {len(part1)} cases run in part 1; the list names {failing} of their cases as failing and {classic} as placed by a classic policy")
+ran = sum(len(cases) for cases in part1.values())
+print(f"policy controller on, {shard}: {len(targets)} test binaries, {ran} cases run in part 1; the list names {failing} of their cases as failing and {classic} as placed by a classic policy")
 for problem in problems:
     print(f"policy controller on, {shard}: PROBLEM: {problem}")
     if os.environ.get("GITHUB_ACTIONS"):
