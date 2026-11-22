@@ -36,6 +36,12 @@ use crate::engine::{
 /// whose breaker refuses execution does. A place past the list's end
 /// names no record.
 ///
+/// For a decode request the engine's word carries the decode side of its
+/// model's pair too ([`Engine::reads_for`]). So the vetoes are also
+/// written where that side shows its rows and the request's own profile
+/// shows none. The answer is the same: the crate's stages refuse a
+/// written record as they refuse a masked one.
+///
 /// Cold and out of line: a decision under no veto asks one test of its
 /// constraints and never comes here.
 #[cold]

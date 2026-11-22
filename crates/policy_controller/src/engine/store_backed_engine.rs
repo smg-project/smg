@@ -63,7 +63,7 @@ use crate::{
         sticky_sessions::{SessionExpiry, SessionVerdict},
         view::{
             fingerprint, AffinityFacts, AffinityRows, Candidate, Constraints, HashKind, KeyedRow,
-            Phase, PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
+            Phase, PinSource, PoolFacts, RequestFacts, Session, WireModes, WorkerId,
         },
     },
     stages::lifecycle::Lifecycle,
@@ -387,15 +387,6 @@ impl PinSource for KeyRead<'_> {
     }
 }
 
-/// Whether `phase` is one of the sides a pair plan decides at its prefill.
-fn pair_side(plan: Plan, phase: Phase) -> bool {
-    match plan {
-        Plan::Single => false,
-        Plan::PdPair => matches!(phase, Phase::Prefill | Phase::Decode),
-        Plan::Epd { .. } => !matches!(phase, Phase::Single),
-    }
-}
-
 /// The path a request takes to its decision under the plan its model is
 /// bound to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,7 +407,7 @@ pub(crate) enum Entry {
 }
 
 /// The path `taken`'s request takes in the world of one load
-/// ([`pair_side`]). A single request is no plan's side: its binding is
+/// ([`Plan::pairs`]). A single request is no plan's side: its binding is
 /// not looked up here, and the engine looks it up once.
 pub(crate) fn entry<A: RequestForm>(world: &StoreSnapshot, taken: &DecisionCall<'_, A>) -> Entry {
     entry_and_plan(world, taken).0
@@ -433,7 +424,7 @@ fn entry_and_plan<A: RequestForm>(
     }
     let binding = world.spec().engine().binding(model, phase);
     match binding {
-        Some(binding) if pair_side(binding.plan, phase) => match phase {
+        Some(binding) if binding.plan.pairs(phase) => match phase {
             Phase::Prefill => (Entry::Pair, binding.plan),
             _ => (Entry::Side, binding.plan),
         },
@@ -743,7 +734,7 @@ impl<'a> OwnRows<'a> {
             binding,
             ..
         } = self;
-        let role = role_of(facts.phase);
+        let role = facts.phase.role();
         let naming = AffinityQuery {
             gateway,
             block_hashes: facts.block_hashes,
@@ -923,7 +914,7 @@ pub(crate) fn decide_own_in<A: RequestForm>(
         cut: !taken
             .request
             .demands()
-            .held_by(role_of(taken.request.phase()))
+            .held_by(taken.request.phase().role())
             .is_none(),
         named,
         column: engine.live_column_at(due.0, taken.request.phase()),
@@ -1915,7 +1906,7 @@ pub(crate) fn hand<A: RequestForm, R>(
         affinity: column && !names,
         signal_cells: needs.signal_cells,
     };
-    let role = role_of(phase);
+    let role = phase.role();
     let Buffers {
         view,
         held: holds,
@@ -2143,17 +2134,6 @@ fn emptied<R>(
         unmet.map_or(WIRES, demands::UnmetDemand::stage)
     };
     decide.emptied(facts, pool, constraints, scratch, stage)
-}
-
-/// The role whose pool decides a request of `phase`: the pool [`hand`]
-/// reads its rows of, and the one a shadow's own rows are named in.
-const fn role_of(phase: Phase) -> Role {
-    match phase {
-        Phase::Single => Role::Single,
-        Phase::Prefill => Role::Prefill,
-        Phase::Decode => Role::Decode,
-        Phase::Encode => Role::Encode,
-    }
 }
 
 /// Whether the request's own narrowing can leave a row: a subset of none

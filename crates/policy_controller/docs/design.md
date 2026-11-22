@@ -785,7 +785,11 @@ the kept one. `GatewayId` is still defined in the store.
 
 A lease is the engine's note that a decision's request is on its way. For a single request it
 exists only when a stage of the document wants to hear what became of requests. A pair's pick
-always has one.
+always has one where the engine issues it.
+
+A host that keeps its own leases asks the entries that issue none
+(`PolicyEngine::decide_without_lease`, `PolicyEngine::decide_decode_without_lease`). The engine
+notes nothing for such a decision: the host files the lease and tells the stages of it.
 
 ```rust
 // tracking/lease.rs

@@ -2921,6 +2921,20 @@ pub enum Plan {
     },
 }
 
+impl Plan {
+    /// Whether `phase` is one of the sides this plan decides together, at
+    /// the pair's prefill. A request of any other phase is decided by
+    /// itself: one profile over the one pool of its phase.
+    #[must_use]
+    pub(crate) const fn pairs(self, phase: Phase) -> bool {
+        match self {
+            Self::Single => false,
+            Self::PdPair => matches!(phase, Phase::Prefill | Phase::Decode),
+            Self::Epd { .. } => !matches!(phase, Phase::Single),
+        }
+    }
+}
+
 /// The profile a binding resolves a phase to, by position; `None` when the
 /// binding's plan has no side for the phase: a single or an encode request
 /// under the pair plan, a single request under `epd`. The host and the spec

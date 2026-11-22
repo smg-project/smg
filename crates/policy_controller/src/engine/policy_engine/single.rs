@@ -242,7 +242,7 @@ pub(super) fn decide(
     let cx = if cx.demands.is_none() {
         &cx
     } else {
-        match held(records, cx, &mut meeting) {
+        match held(records, cx, request.facts.phase, &mut meeting) {
             Ok(held) => {
                 narrowed = held;
                 &narrowed
@@ -295,6 +295,12 @@ pub(super) fn decide(
 /// the demands, it is held to no more than its host said. Where none does,
 /// the answer is the demand that took the last worker.
 ///
+/// A request of the prefill `phase` is decided by itself here, with no
+/// decode beside it. Its list is held to what a prefill worker holds of
+/// the demands, the input alone
+/// ([`Demands::held_by`](crate::engine::Demands::held_by)): a host states
+/// both bounds whatever the phase.
+///
 /// The places stand in `meeting`, the calling thread's own list, taken
 /// here: its caller puts it back ([`MEETING`]). Out of line: its code
 /// stays off the path of a request that states no demand.
@@ -302,10 +308,12 @@ pub(super) fn decide(
 fn held<'a>(
     records: &PoolRecords,
     cx: Constraints<'a>,
+    phase: Phase,
     meeting: &'a mut Option<Vec<u32>>,
 ) -> Result<Constraints<'a>, UnmetDemand> {
     let kept = meeting.insert(MEETING.take());
-    match records.meeting(cx.demands, cx.places, kept) {
+    let demands = cx.demands.held_by(phase.role());
+    match records.meeting(demands, cx.places, kept) {
         None => Ok(cx),
         Some(unmet) if kept.is_empty() => Err(unmet),
         Some(_) => Ok(Constraints {
@@ -1034,8 +1042,7 @@ pub(crate) mod tests {
     }
 
     /// A request that hands no list is decided over no worker. One that
-    /// states what no stage here runs is declined under that stage's name,
-    /// and a side sent on its own has no decision.
+    /// states what no stage here runs is declined under that stage's name.
     #[test]
     fn what_no_stage_runs_is_answered_by_name() {
         let engine = preset("round_robin");
@@ -1065,15 +1072,6 @@ pub(crate) mod tests {
         dialed.constraints.wire_modes = WireModes::HTTP.union(WireModes::GRPC);
         let asks = Asks::of(dialed, Some(&members));
         assert!(matches!(answered(&engine, &asks), Decided::Alone(_)));
-        let mut side = request();
-        side.facts.phase = Phase::Decode;
-        let asks = Asks::of(side, Some(&members));
-        assert_eq!(
-            engine
-                .decide_under(GatewayId::LOCAL, &asks, Instant::now())
-                .err(),
-            Some(DecisionRefused::PairSide)
-        );
     }
 
     /// A request its host holds to places of its list is made and decided
@@ -1527,15 +1525,11 @@ pub(crate) mod tests {
         assert!(record.1.get().is_none(), "the record is not asked");
     }
 
-    /// A request that hands no list of its kind is decided over no worker,
-    /// as the one entry decides it: a single with no list, a pair's prefill
-    /// with none, and a prefill over a single's list. A decode or an encode
-    /// request sent on its own is refused.
+    /// A request that hands no list is decided over no worker, as the one
+    /// entry decides it, whatever its phase: no plan here pairs a side.
     #[test]
     fn a_decision_without_a_lease_over_no_list_names_no_worker() {
         let engine = preset("round_robin");
-        let list = pool(2);
-        let members = engine.pool_members(&list);
         let stating = |phase, members| {
             let mut stated = request();
             stated.facts.phase = phase;
@@ -1545,7 +1539,8 @@ pub(crate) mod tests {
         for (phase, members) in [
             (Phase::Single, None),
             (Phase::Prefill, None),
-            (Phase::Prefill, Some(&members)),
+            (Phase::Decode, None),
+            (Phase::Encode, None),
         ] {
             let listed = members.is_some();
             let shed = engine.decide_without_lease(&stating(phase, members), Instant::now());
@@ -1560,11 +1555,6 @@ pub(crate) mod tests {
                 panic!("{phase:?}, {listed}: the one entry picks");
             };
             assert_eq!((theirs.reason, theirs.emptied_by), none);
-        }
-        for phase in [Phase::Decode, Phase::Encode] {
-            let asks = stating(phase, None);
-            let refused = engine.decide_without_lease(&asks, Instant::now());
-            assert_eq!(refused.err(), Some(DecisionRefused::PairSide), "{phase:?}");
         }
     }
 

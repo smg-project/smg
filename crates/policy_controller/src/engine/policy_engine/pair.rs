@@ -33,7 +33,8 @@
 //!
 //! **The answer.** The engine asks through [`decided`], for a pair's first
 //! decision and for its decode asked again: the decision ([`decide`]), with
-//! the lease a pick issued.
+//! the lease a pick issued. Its entries that issue no lease ask [`decide`]
+//! alone.
 //!
 //! No function here waits for a lock. A decision's records are written into
 //! buffers of the calling thread, so it allocates nothing once they have

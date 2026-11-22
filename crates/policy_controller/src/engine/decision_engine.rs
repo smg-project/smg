@@ -75,12 +75,13 @@ pub trait RequestMaker {
     /// every other request, and from a maker that does not say.
     ///
     /// An engine that decides over its host's lists asks this ahead of
-    /// [`RequestMaker::make`], at its entry that issues a pick's lease. A
+    /// [`RequestMaker::make`], at its entry that issues a first decision's
+    /// lease ([`DecisionEngine::decide_under`]). A
     /// place one pick of a picker decides reads no fact of a request, so a
     /// plain request of such a place is decided with none made: its routing
     /// key is not derived and no seed is drawn for it. The answer is cheap:
-    /// it reads the document nowhere. That engine's entry that issues no
-    /// lease never asks: it makes every request.
+    /// it reads the document nowhere. That engine's entries that issue no
+    /// lease never ask: they make every request.
     ///
     /// A request held to places of its list
     /// ([`Constraints::places`](super::view::Constraints::places)) is not
@@ -178,7 +179,8 @@ pub enum WorkerLists<'a> {
     /// The host hands no list.
     #[default]
     None,
-    /// A single request's list.
+    /// A single request's list, and the one list of a request of another
+    /// phase that is decided by itself.
     Single(&'a super::policy_engine::PoolMembers),
     /// A pair's two lists, its prefills and its decodes, with the pair
     /// classes of their workers and the host's reads of its admission.

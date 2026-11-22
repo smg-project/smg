@@ -46,6 +46,7 @@
 pub(super) mod encode;
 mod keys;
 mod labels;
+mod lone;
 pub mod overlap;
 pub(super) mod pair;
 pub(super) mod place;
@@ -298,12 +299,17 @@ impl PoolMembers {
         }
     }
 
-    /// What the document says of the shadow of a single request of `model`
-    /// ([`ShadowWord`]): `None` under a binding that names no shadow. Found
-    /// once a list, as [`Self::alone`] is: a request of the list's model
-    /// pays no second read of its binding.
-    fn shadow(&self, spec: &AppliedSpec, model: &str) -> Option<ShadowWord> {
-        let find = || spec.engine().shadow_for(model, Phase::Single);
+    /// What the document says of the shadow of a request of `model` and
+    /// `phase` that is decided by itself ([`ShadowWord`]): `None` under a
+    /// binding that names no shadow. A single request's word is found once
+    /// a list, as [`Self::alone`] is: a request of the list's model pays no
+    /// second read of its binding. A binding matches by phase, so a request
+    /// of another phase asks the document each time.
+    fn shadow(&self, spec: &AppliedSpec, model: &str, phase: Phase) -> Option<ShadowWord> {
+        let find = || spec.engine().shadow_for(model, phase);
+        if phase != Phase::Single {
+            return find();
+        }
         let (named, shadow) = self.shadow.get_or_init(|| (model.into(), find()));
         if **named == *model {
             *shadow
@@ -643,7 +649,8 @@ impl PolicyEngine {
     ///
     /// The request is made once and decided whole, at `now`, as
     /// [`Self::decide_at`] decides a request that is not plain
-    /// ([`RequestMaker::plain`]): a single over its host's list, a pair at
+    /// ([`RequestMaker::plain`]): a request by itself ([`Self::lone`])
+    /// over its host's one list, a pair at
     /// its prefill over its host's two lists ([`pair::decide`], the test
     /// of the request's wires in it), and a request that hands no such
     /// list over no worker. This entry never asks whether a request is
@@ -661,7 +668,8 @@ impl PolicyEngine {
     ///
     /// # Errors
     ///
-    /// [`DecisionRefused::PairSide`] for a decode or an encode request. A
+    /// [`DecisionRefused::PairSide`] for a decode or an encode request
+    /// that is a side of its plan's pair, or that hands two lists. A
     /// decode behind its pair's prefill has an entry of its own
     /// ([`Self::decide_decode_without_lease`]).
     /// [`DecisionRefused::Faulted`] where the decision panicked.
@@ -681,7 +689,9 @@ impl PolicyEngine {
             let mut request = self.made(maker);
             let mut said = None;
             let decision = match (request.facts.phase, maker.workers()) {
-                (Phase::Single, WorkerLists::Single(members)) => {
+                // A single, and a request of a phase its plan pairs no side
+                // of: one profile over its host's one list.
+                (phase, WorkerLists::Single(members)) if self.lone(request.facts.model, phase) => {
                     Ok(self.decide_made(maker, &mut request, members, now, &mut said))
                 }
                 // A pair is decided at its prefill, over its host's two
@@ -692,6 +702,10 @@ impl PolicyEngine {
                     Ok(pair::decide(self, &lists, &mut request, None, loads, now))
                 }
                 (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(self, &request)),
+                // A request decided by itself that hands no list.
+                (phase, WorkerLists::None) if self.lone(request.facts.model, phase) => {
+                    Ok(single::over_none(self, &request))
+                }
                 (Phase::Decode | Phase::Encode, _) => Err(DecisionRefused::PairSide),
             };
             decision.map(|decision| (decision, said))
@@ -704,6 +718,12 @@ impl PolicyEngine {
     /// is the one the leasing entry makes for a guard's decode call
     /// ([`DecisionEngine::decide_decode_under`]). The host files the decode
     /// side's issue and tells the stages of it.
+    ///
+    /// The host refuses the call where its lease's decode was not chosen,
+    /// its prefill is not held, or the side was issued already, as a
+    /// request's guard does
+    /// ([`DecisionGuard::decide_decode`](crate::tracking::DecisionGuard::decide_decode)).
+    /// On a shed the host keeps the decode its first decision named.
     ///
     /// A call that hands no pair's lists is decided over no worker.
     ///
@@ -736,7 +756,7 @@ impl PolicyEngine {
         })
     }
 
-    /// A made single request's whole decision over its host's list, for
+    /// A made request's whole decision by itself over its host's list, for
     /// every entry that decides one. It reads the snapshot the request
     /// gives where it gives one, and the newest the engine's own task
     /// keeps at hand otherwise ([`Self::loads_read`]).
@@ -760,7 +780,8 @@ impl PolicyEngine {
         // Under a document that names a shadow the list's word says
         // whether this binding does.
         if self.any_shadow {
-            if let Some(binding) = members.shadow(&self.spec, request.facts.model) {
+            let (model, phase) = (request.facts.model, request.facts.phase);
+            if let Some(binding) = members.shadow(&self.spec, model, phase) {
                 let (decision, shadow) =
                     with_shadow::decide(self, request, members, loads, now, binding);
                 *said = shadow;
@@ -802,7 +823,9 @@ impl PolicyEngine {
         let mut request = self.made(maker);
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
-            (Phase::Single, WorkerLists::Single(members)) => {
+            // A single, and a request of a phase its plan pairs no side of:
+            // one profile over its host's one list.
+            (phase, WorkerLists::Single(members)) if self.lone(request.facts.model, phase) => {
                 let mut said = None;
                 let decision = self.decide_made(maker, &mut request, members, now, &mut said);
                 // What a shadow said is counted behind the lease's issue.
@@ -825,6 +848,9 @@ impl PolicyEngine {
             // A request that hands no list of its own is decided over
             // no worker.
             (Phase::Single | Phase::Prefill, _) => single::over_none(self, &request),
+            (phase, WorkerLists::None) if self.lone(request.facts.model, phase) => {
+                single::over_none(self, &request)
+            }
             (Phase::Decode | Phase::Encode, _) => return Err(DecisionRefused::PairSide),
         };
         let decided = single::issued(self, decided, &request, now);

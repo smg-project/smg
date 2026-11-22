@@ -93,6 +93,20 @@ impl Phase {
             Self::Encode => "encode",
         }
     }
+
+    /// The role whose pool decides a request of this phase by itself: the
+    /// pool an engine over stored records reads its rows of, and the role
+    /// a request's demands are held by
+    /// ([`Demands::held_by`](crate::engine::Demands::held_by)).
+    #[must_use]
+    pub(crate) const fn role(self) -> Role {
+        match self {
+            Self::Single => Role::Single,
+            Self::Prefill => Role::Prefill,
+            Self::Decode => Role::Decode,
+            Self::Encode => Role::Encode,
+        }
+    }
 }
 
 /// What the request's block hashes were computed over.
