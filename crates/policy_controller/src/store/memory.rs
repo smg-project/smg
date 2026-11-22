@@ -37,8 +37,8 @@ use crate::{
         journal::{Journal, JournalKinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
-            DecodeMark, DecodeSide, InFlightCounts, LeaseRecord, LeaseRefused, LeaseState,
-            LeasesStore, Sides, WorkerSlot,
+            DecodeMark, DecodeSide, HostCount, InFlightCounts, LeaseRecord, LeaseRefused,
+            LeaseState, LeasesStore, Sides, WorkerSlot,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
@@ -560,7 +560,11 @@ impl MemoryStore {
         // The index is this replica's own: a row that left gives up its
         // lane, a row that stays keeps what was heard for it, and a row the
         // cut brings takes the lane its facts ask for.
-        // The rows the cut drops stay in hand.
+        // The rows the cut drops stay in hand. Each one's slot is given to
+        // no row again, so the count its host handed for it goes.
+        for held in previous.values() {
+            self.counts.left(held.slot);
+        }
         previous.retain(|id, _| !workers.rows.contains_key(id));
         for &id in previous.keys() {
             self.kv.forget(id);
@@ -698,7 +702,7 @@ impl MemoryStore {
                         .get(&old)
                         .is_some_and(|held| held.row.facts.key == row.facts.key) =>
             {
-                let left = workers.rows.remove(&old).map(|held| held.row);
+                let left = workers.rows.remove(&old).map(|held| self.row_left(held));
                 let same = |left: &WorkerRow| same_worker(&left.facts, &row.facts);
                 if left.as_ref().is_some_and(same) {
                     follows = Some((old, new));
@@ -717,7 +721,7 @@ impl MemoryStore {
                 };
                 workers.by_key.remove(&held.row.facts.key);
                 self.forget_worker(id);
-                (change, Some(held.row))
+                (change, Some(self.row_left(held)))
             }
             (MembershipChange::StatusChanged { id, from, to }, None) => {
                 let held = workers.rows.get_mut(&id);
@@ -2117,6 +2121,9 @@ impl WorkersStore for MemoryStore {
             // though a change of either starts another life: it is the same
             // reachable worker.
             let old = workers.rows.remove(&old_id);
+            if let Some(old) = &old {
+                self.counts.left(old.slot);
+            }
             let new_id = identity(&facts.key, facts.incarnation);
             // The same worker under a new life: its role, its models and
             // its wires stand. Its status and its session pins follow it.
@@ -2271,6 +2278,7 @@ impl WorkersStore for MemoryStore {
         let mut workers = self.writing();
         workers.guarded(id, revision)?;
         let row = workers.rows.remove(&id)?;
+        self.counts.left(row.slot);
         workers.by_key.remove(&row.row.facts.key);
         // The worker's tables leave with its row, under the workers lock
         // and before the removal is told: a veto, a completed dispatch or a
@@ -2326,6 +2334,15 @@ impl WorkersStore for MemoryStore {
 
     fn history(&self) -> u64 {
         self.workers.lock().history
+    }
+
+    /// Kept beside the cell of the row's slot in the counts, the one the
+    /// leases' doors book. Under the workers lock, as the write that takes
+    /// a row is: no count is kept for a row that left.
+    fn host_count(&self, id: WorkerId, count: Box<dyn HostCount>) -> bool {
+        let workers = self.workers.lock();
+        let slot = workers.rows.get(&id).map(|held| held.slot);
+        slot.is_some_and(|slot| self.counts.beside(slot, count))
     }
 
     fn all_rows(&self) -> (u64, Vec<WorkerRow>) {
@@ -5089,6 +5106,15 @@ impl MemoryStore {
         let slot = self.counts.claim();
         self.joined.lock().push((id, slot));
         slot
+    }
+
+    /// The row of a member that left the store, its slot told so: the
+    /// count its host handed for it gives up the leases that stand and
+    /// goes ([`InFlightCounts::left`]). Called under the workers lock, by
+    /// the write that takes the member's row.
+    fn row_left(&self, held: Row) -> WorkerRow {
+        self.counts.left(held.slot);
+        held.row
     }
 
     /// Empties the table of the members no world named. Called behind

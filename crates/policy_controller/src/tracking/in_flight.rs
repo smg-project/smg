@@ -7,11 +7,17 @@
 //! row's position: nothing is written into a row and no lock is taken. A row's
 //! first read in a decision is kept ([`InFlightBuffers`]) and every later read
 //! returns it, so a decision reads one count a row.
+//!
+//! A host that counts a worker's requests on an object of its own hands
+//! the table that count ([`HostCount`]), and the table keeps it equal to
+//! the worker's cell: the engine over worker lists reads the object's count.
 
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
     OnceLock,
 };
+
+use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::engine::view::Candidate;
 
@@ -123,9 +129,67 @@ impl<T> Pieces<T> {
 pub(crate) struct InFlightCounts {
     /// A cell a slot, its piece laid when its first slot is given.
     cells: Pieces<AtomicU32>,
+    /// The count each member's host keeps for it, by the member's slot
+    /// ([`HostCount`]): a place a slot, its piece laid with the cell's.
+    hosts: Pieces<HostPlace>,
     /// The slots given so far.
     given: AtomicU32,
 }
+
+/// The count a store's host keeps of one worker's requests, beside the
+/// worker's cell in the store's counts. A controller's worker object
+/// counts its requests in flight on itself, and the engine over worker
+/// lists reads that count and no cell of the store's.
+///
+/// The store keeps it equal to the cell of the worker's row. It steps it
+/// where it steps the cell: once for each lease that books the worker and
+/// once for each that books it no longer, whatever door filed, moved or
+/// ended the lease. A count handed for a row takes a step for each lease
+/// that books the row by then, and the count it takes the place of gives
+/// each of them up: a lease filed ahead of its worker's count is on it
+/// all the same, and two counts that step one number leave it as it
+/// stood. Where the row leaves the store, the count gives up the leases
+/// that still book it and the store lets it go: a lease that outlives its
+/// worker's row is on no host's count.
+///
+/// Each call is one step, from whichever thread books. Two files book one
+/// worker at once and neither waits on the other. A hand-over and a row's
+/// leaving wait for the steps under way, and a step waits for them: each
+/// of the two makes one call a lease that stands.
+///
+/// The calls and the count's drop run under the store's locks: none of
+/// them calls the store. A store that is dropped tells its counts
+/// nothing.
+pub trait HostCount: Send + Sync {
+    /// One lease more books the worker.
+    fn booked(&self);
+
+    /// One lease that booked the worker books it no longer.
+    fn freed(&self);
+}
+
+/// One member's place for the count its host keeps.
+///
+/// A step of the member's cell holds the place shared around its two
+/// writes, the cell's and the count's. A hand-over and the member's
+/// leaving hold it alone, so neither finds a step half made: the cell
+/// either reads is what the count holds.
+#[derive(Default)]
+struct HostPlace {
+    count: RwLock<Option<Box<dyn HostCount>>>,
+}
+
+impl std::fmt::Debug for HostPlace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stands = self.count.try_read().map(|count| count.is_some());
+        f.debug_struct("HostPlace")
+            .field("stands", &stands)
+            .finish()
+    }
+}
+
+/// A member's place held shared, for one step of the member's cell.
+type Stepping<'a> = RwLockReadGuard<'a, Option<Box<dyn HostCount>>>;
 
 impl InFlightCounts {
     /// The next slot of the table, its cell at zero. A table that gave
@@ -138,9 +202,11 @@ impl InFlightCounts {
         let Ok(slot) = given.map(WorkerSlot) else {
             return WorkerSlot::NONE;
         };
-        match self.cells.lay(slot) {
-            Some(_) => slot,
-            None => WorkerSlot::NONE,
+        // The place of a host's count is laid with the cell: no booking
+        // lays one.
+        match (self.cells.lay(slot), self.hosts.lay(slot)) {
+            (Some(_), Some(_)) => slot,
+            _ => WorkerSlot::NONE,
         }
     }
 
@@ -165,8 +231,14 @@ impl InFlightCounts {
     /// lost under the other. No reader waits on the line.
     pub(crate) fn book(&self, slot: WorkerSlot) {
         if let Some(cell) = self.cell(slot) {
+            let host = self.stepping(slot);
             let one_more = |held: u32| held.saturating_add(1);
-            cell.update(Ordering::Relaxed, Ordering::Relaxed, one_more);
+            let held = cell.update(Ordering::Relaxed, Ordering::Relaxed, one_more);
+            // The host's count takes the step the cell took.
+            let count = host.as_deref().and_then(Option::as_deref);
+            if let Some(count) = count.filter(|_| held != u32::MAX) {
+                count.booked();
+            }
         }
     }
 
@@ -174,9 +246,59 @@ impl InFlightCounts {
     /// atomic step as well: a count at zero stays there.
     pub(crate) fn free(&self, slot: WorkerSlot) {
         if let Some(cell) = self.cell(slot) {
+            let host = self.stepping(slot);
             let one_less = |held: u32| held.saturating_sub(1);
-            cell.update(Ordering::Relaxed, Ordering::Relaxed, one_less);
+            let held = cell.update(Ordering::Relaxed, Ordering::Relaxed, one_less);
+            let count = host.as_deref().and_then(Option::as_deref);
+            if let Some(count) = count.filter(|_| held != 0) {
+                count.freed();
+            }
         }
+    }
+
+    /// Takes `count`, the count the store's host keeps for the member of
+    /// `slot`, in the place of the one handed before ([`HostCount`]). It
+    /// takes a step for each lease that books the member, and the one
+    /// before it gives each of them up. `false` for a slot that names no
+    /// cell: nothing is kept. A membership write's call, under the
+    /// workers lock as the member's leaving is: no count is handed for a
+    /// member that left.
+    pub(crate) fn beside(&self, slot: WorkerSlot, count: Box<dyn HostCount>) -> bool {
+        let (Some(cell), Some(place)) = (self.cell(slot), self.hosts.cell(slot)) else {
+            return false;
+        };
+        let mut stood = place.count.write();
+        // Added before they are taken: a number the two counts share
+        // reads high between the two, never low.
+        let standing = cell.load(Ordering::Relaxed);
+        (0..standing).for_each(|_| count.booked());
+        if let Some(before) = stood.as_deref() {
+            (0..standing).for_each(|_| before.freed());
+        }
+        *stood = Some(count);
+        true
+    }
+
+    /// The member of `slot` left the store: the count its host handed
+    /// gives up the leases that still book the member, and is let go. A
+    /// lease that outlives its worker's row steps the cell alone from
+    /// here on. A membership write's call, under the workers lock.
+    pub(crate) fn left(&self, slot: WorkerSlot) {
+        let (Some(cell), Some(place)) = (self.cell(slot), self.hosts.cell(slot)) else {
+            return;
+        };
+        let mut stood = place.count.write();
+        if let Some(count) = stood.take() {
+            (0..cell.load(Ordering::Relaxed)).for_each(|_| count.freed());
+        }
+    }
+
+    /// The place of the host's count for the member of `slot`, held shared
+    /// for one step of the member's cell ([`HostPlace`]). Its piece was
+    /// laid with the cell's ([`Self::claim`]).
+    #[inline]
+    fn stepping(&self, slot: WorkerSlot) -> Option<Stepping<'_>> {
+        Some(self.hosts.cell(slot)?.count.read())
     }
 
     /// A lease's booking moves from the worker of `from` to the worker of
@@ -635,6 +757,131 @@ pub(crate) mod tests {
             "every booking of both"
         );
         assert_eq!(both(InFlightCounts::free), 0, "and each one given back");
+    }
+
+    /// A step the cell does not take is no step of the host's count: an
+    /// end of a cell at zero, and a booking of a cell that holds every
+    /// lease it can. A slot that names no cell keeps no count.
+    #[test]
+    fn a_step_the_cell_does_not_take_steps_no_hosts_count() {
+        use std::sync::{atomic::AtomicU32, Arc};
+
+        use super::HostCount;
+
+        /// The bookings and the ends a count was told.
+        #[derive(Default)]
+        struct Told {
+            bookings: AtomicU32,
+            ends: AtomicU32,
+        }
+
+        struct Count(Arc<Told>);
+
+        impl HostCount for Count {
+            fn booked(&self) {
+                self.0.bookings.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn freed(&self) {
+                self.0.ends.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let counts = InFlightCounts::default();
+        let slot = counts.claim();
+        let told = Arc::new(Told::default());
+        let count = || Box::new(Count(Arc::clone(&told)));
+        assert!(!counts.beside(WorkerSlot::NONE, count()), "no cell");
+        assert!(counts.beside(slot, count()));
+        let read = || {
+            let bookings = told.bookings.load(Ordering::Relaxed);
+            (bookings, told.ends.load(Ordering::Relaxed))
+        };
+        counts.free(slot);
+        assert_eq!((counts.in_flight(slot), read()), (0, (0, 0)), "at zero");
+        let cell = counts.cell(slot).expect("the slot's cell");
+        cell.store(u32::MAX, Ordering::Relaxed);
+        counts.book(slot);
+        assert_eq!(read(), (0, 0), "a cell that holds every lease it can");
+        counts.free(slot);
+        assert_eq!((counts.in_flight(slot), read()), (u32::MAX - 1, (0, 1)));
+        counts.book(slot);
+        assert_eq!(read(), (1, 1), "the last booking the cell takes");
+    }
+
+    /// Writers of one cell with no file's turn between them, while the
+    /// cell's count is handed and then while its member leaves: the count
+    /// takes what the cell holds at the hand-over and gives up what it
+    /// holds at the leaving, and no step reaches it half made.
+    #[test]
+    fn a_count_handed_and_taken_among_writers_holds_what_the_cell_holds() {
+        use std::sync::{atomic::AtomicI64, Arc};
+
+        use super::HostCount;
+
+        /// The leases a count holds: never an end with no booking under it.
+        struct Held(Arc<AtomicI64>);
+
+        impl HostCount for Held {
+            fn booked(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn freed(&self) {
+                let held = self.0.fetch_sub(1, Ordering::SeqCst);
+                assert!(held > 0, "an end with no booking under it");
+            }
+        }
+
+        /// Says a writer ended, however it ended.
+        struct Ended<'a>(&'a AtomicUsize);
+
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        const WRITERS: usize = 4;
+        const EACH: usize = 50_000;
+        let counts = InFlightCounts::default();
+        let slot = counts.claim();
+        let held = Arc::new(AtomicI64::new(0));
+        // Four writers book twice and free once, `EACH` times: `among`
+        // runs once they are under way, or once each ended.
+        let among_writers = |among: &dyn Fn()| {
+            let (wrote, ended) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            thread::scope(|scope| {
+                for _ in 0..WRITERS {
+                    scope.spawn(|| {
+                        let _ended = Ended(&ended);
+                        for _ in 0..EACH {
+                            counts.book(slot);
+                            counts.book(slot);
+                            counts.free(slot);
+                            wrote.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }
+                let under_way = || wrote.load(Ordering::SeqCst) >= 1_000;
+                while !under_way() && ended.load(Ordering::SeqCst) < WRITERS {
+                    thread::yield_now();
+                }
+                among();
+            });
+        };
+        let wrote = i64::try_from(WRITERS * EACH).expect("a small count");
+
+        among_writers(&|| {
+            let count = Box::new(Held(Arc::clone(&held)));
+            assert!(counts.beside(slot, count));
+        });
+        assert_eq!(i64::from(counts.in_flight(slot)), wrote);
+        assert_eq!(held.load(Ordering::SeqCst), wrote, "what the cell holds");
+
+        among_writers(&|| counts.left(slot));
+        assert_eq!(i64::from(counts.in_flight(slot)), 2 * wrote);
+        assert_eq!(held.load(Ordering::SeqCst), 0, "every lease given up");
     }
 
     /// A booking that moves is added before it is taken: a reader beside the

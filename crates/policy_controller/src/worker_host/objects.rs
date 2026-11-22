@@ -39,6 +39,8 @@ use crate::{
     store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
 };
 
+mod host_count;
+
 /// The row an object stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowRevision {
@@ -819,6 +821,9 @@ impl<G: Generation> Objects<G> {
                     self.restate(row);
                 }
                 self.follow_status(store, row.id);
+                // The store may have given the row a new place in its
+                // counts, which holds no count yet: a lay hands its own.
+                self.counted(store, row.id);
             } else {
                 self.lay(store, row);
             }
@@ -941,6 +946,9 @@ impl<G: Generation> Objects<G> {
             self.missed(row, "the object that stands is kept");
             self.restate(row);
             self.follow_status(store, row.id);
+            // No object is put: the one kept is the row's count still,
+            // at whatever place the store gives the row now.
+            self.counted(store, row.id);
             return;
         }
         if self.built_kept {
@@ -1012,6 +1020,8 @@ impl<G: Generation> Objects<G> {
         if stands {
             self.restate(row);
             self.copy_status(store, row.id);
+            // As for an object that is kept: no put hands the count.
+            self.counted(store, row.id);
             return;
         }
         let at = status(row.status);
@@ -1135,6 +1145,10 @@ impl<G: Generation> Objects<G> {
             );
         }
         self.registry.register_or_replace(object);
+        // Behind the registry's write: an object laid in another's place
+        // takes the standing object's running state there, and with it the
+        // leases the store counted on that object.
+        self.counted(store, row.id);
         if handed {
             self.copy_status(store, row.id);
         } else {
