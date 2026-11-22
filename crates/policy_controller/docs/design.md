@@ -1200,7 +1200,7 @@ Three things follow, and they are the first work of section 16.
 
 Hosted CI's test of the crate does not enable the feature the kept engine is behind, so it runs
 none of that engine's own tests. Only the gateway enables that feature today, so after stage 0
-only the lint with every feature still compiles the kept engine. Decision 11 has two ways to
+only the lint with every feature still compiles the kept engine. Decision 11 has three ways to
 close this.
 
 ### 13.2 Speed
@@ -1303,7 +1303,7 @@ All eleven at a glance. An answer can be as short as the numbers with their lett
 | 8 | User stages in WebAssembly and over gRPC | (a) left as library code | nothing now |
 | 9 | The gateway's options | three with stage 3, the address and TLS options with stage 5 | stages 3 and 5 |
 | 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped | stage 4 |
-| 11 | The crate in CI and in the published set | (a) the feature in the crate's default build; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
+| 11 | The crate in CI and in the published set | (b) one line in CI's test script names the engine's feature; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
 
 ### Decision 1: the name of a cache partition
 
@@ -1435,7 +1435,7 @@ design (section 10) has to say which thresholds apply where two bindings reach o
 
 | Question | Fact | Options | Recommendation |
 |---|---|---|---|
-| How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. CI tests the crate on four lines of `scripts/ci_rust_tests.sh` and none enables that feature, so CI runs none of the engine's own cases. After stage 0 only the lint with every feature still compiles it. | (a) The crate's default build includes the feature: one line in the crate's manifest. Two of CI's four lines build with defaults and then run the cases. The gateway turns the crate's defaults off; the example controller builds with them. A default build then also builds the worker crate's runtime. (b) CI's first test line names the feature: one line in the script, outside the crate. | (a), as a first change of stage 1. Its proof is the count of cases CI runs before and after, and the job's time against its 20-minute limit. |
+| How does CI run the kept engine's own tests? | The kept engine compiles only under the feature `in-process`. CI tests the crate on four lines of `scripts/ci_rust_tests.sh` and none enables that feature, so CI runs none of the 82 cases behind it (65 of the engine, 17 of its record writer). After stage 0 only the lint with every feature still compiles it. | (a) The crate's default build includes the feature: one line in the crate's manifest. Measured: two of CI's four lines then run the 82 cases, in under a second more. But a default build of the crate goes from 147 to 272 packages, the controller's image and three bench workflows then build the engine in, and two READMEs become wrong, one of them outside the crate. (b) CI's first test line names the feature: one line in the script, outside the crate. That line builds the same 364 packages with it and without it, and nothing else builds differently. (c) The crate's test-only dependency on itself names the feature: inside the crate, and no product build changes. But CI's two lines that test one feature alone would then build the engine too. Not measured. | (b), as one small change of its own. Its proof is the count of cases CI's first line runs before and after. |
 | Is the crate published before it is ready? | The earlier integration added the crate to the published set: four lines in two release workflows and the release version check. | (a) Stage 0's change takes the four lines out, and they return with the gateway's integration (stage 3). (b) They stay. | (a). |
 
 ## 16. The order of work
