@@ -151,6 +151,32 @@ fn a_record_states_its_workers_registration_by_its_place_in_the_list() {
     assert!(!pool.fixed()[1].health.healthy);
 }
 
+/// The rows a decision writes borrow their buffer alone, and the pool's
+/// facts what its live facts borrow: the rows stand after the key text
+/// handed to the live facts is gone. A build that ties the two fails here.
+#[test]
+fn the_rows_written_outlive_what_the_live_facts_borrow() {
+    let (spec, clock) = (applied("round_robin"), DecisionClock::new());
+    let workers: Vec<Arc<dyn Worker>> = vec![ready_worker(&url(0), MODEL)];
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let mut rows = Vec::new();
+    let written = {
+        let key = String::from("key-a");
+        let live = Live::at(spec.engine(), &clock, Instant::now(), None, Some(&key));
+        pool.write(&workers, &live, &mut rows).0
+    };
+    assert_eq!(written.len(), 1);
+    // The method is one function value for a call of any lifetime: a bound
+    // between its lifetimes would fix them where it is named.
+    type Write = for<'a> fn(
+        &'a PoolRecords,
+        &[Arc<dyn Worker>],
+        &Live<'a>,
+        &'a mut Vec<Candidate>,
+    ) -> (&'a mut [Candidate], PoolFacts<'a>);
+    let _: Write = PoolRecords::write;
+}
+
 #[test]
 fn a_record_states_what_its_worker_object_says_at_the_decision() {
     let spec = applied("least_load");
@@ -435,7 +461,7 @@ fn assert_drawn_as_written(
 
         let live = Live::at(drawing.engine(), &clock, now, Some(loads), None);
         let mut facts = request;
-        let unsaid = drawn_pool.facts(&clock, false);
+        let unsaid = drawn_pool.facts(&live, false);
         draws += usize::from(
             drawing
                 .engine()
@@ -572,7 +598,7 @@ fn a_pick_of_two_writes_the_records_of_the_two_workers_it_draws() {
     let cx = Constraints::default();
     let mut facts = single();
     facts.now_micros = live.now_micros();
-    let unsaid = pool.facts(&clock, false);
+    let unsaid = pool.facts(&live, false);
     let drawn = spec
         .engine()
         .drawn_for(&facts, &unsaid, pool.len())
@@ -600,7 +626,7 @@ fn a_pick_of_two_writes_the_records_of_the_two_workers_it_draws() {
     // Under the draw's floor every record is written: the pool is small.
     let few = fleet(DRAW_FROM - 1);
     let pool = PoolRecords::new(&few, &spec, &clock);
-    let unsaid = pool.facts(&clock, false);
+    let unsaid = pool.facts(&live, false);
     assert!(spec
         .engine()
         .drawn_for(&facts, &unsaid, pool.len())
@@ -609,7 +635,7 @@ fn a_pick_of_two_writes_the_records_of_the_two_workers_it_draws() {
     // A profile that scores every worker is no draw's.
     let scores = applied("least_load");
     let pool = PoolRecords::new(&workers, &scores, &clock);
-    let unsaid = pool.facts(&clock, false);
+    let unsaid = pool.facts(&live, false);
     assert!(scores
         .engine()
         .drawn_for(&facts, &unsaid, pool.len())

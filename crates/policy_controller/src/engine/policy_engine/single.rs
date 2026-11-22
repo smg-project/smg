@@ -254,10 +254,13 @@ pub(super) fn decide(
     };
     let facts = &mut request.facts;
     // One value for every record of the decision: its instant, the host's
-    // snapshot as the host holds it, and the key's text for a stage that
-    // counts the key's requests on a worker.
+    // snapshot as the host holds it, the key's text for a stage that
+    // counts the key's requests on a worker, and the list's own word, the
+    // one a pick alone turns ([`PolicyEngine::pick`]): a draw of this
+    // decision takes the list's next turn.
     let key = facts.session_key.plain;
-    let live = records::Live::at(spec.engine(), &own.clock, now, loads, key);
+    let live =
+        records::Live::at(spec.engine(), &own.clock, now, loads, key).turning(&members.rotation.0);
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
     // what the whole pass would: its key's pin.
@@ -417,7 +420,7 @@ pub(crate) mod tests {
                 Decided, DecisionEngine, DecisionRefused, RequestMaker, WorkerLists,
             },
             demands::{DemandFacts, Demands},
-            framework::{Picker, Place, PoolWord, TieBand},
+            framework::{Picker, Place, PoolWord, TieBand, DRAW_FROM},
             prompt_hashes::HashSeeds,
             records::worker_id,
             view::{
@@ -924,6 +927,108 @@ pub(crate) mod tests {
             Decision::Pick(pick) => assert_eq!(pick.trace.lifted, LiftedVeto::Overload),
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "not-overloaded"),
             Decision::Queue(_) => panic!("no queue is planned"),
+        }
+    }
+
+    /// Round robin under a sessions rule that leaves a new session to the
+    /// profile (`delegate`) turns one rotation for a request with no routing
+    /// key and for a new session: in turn they take the list's workers one
+    /// after the other, under the draw's floor, at it and above it. The
+    /// gateway's classic override asks its one policy for both
+    /// (`model_gateway/src/policies/round_robin.rs:142-167`): for a request
+    /// with no key at `model_gateway/src/policies/registry.rs:471` and for a
+    /// new session at `:581`.
+    #[test]
+    fn a_plain_request_and_a_new_session_share_one_rotation_under_delegate() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::Delegate;
+        document.bindings[0].sessions = Some(rule);
+        let keys = ["key-a", "key-b", "key-c", "key-d", "key-e", "key-f"];
+        for workers in [DRAW_FROM - 1, DRAW_FROM, 64] {
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            let engine = PolicyEngine::new(spec);
+            let list = pool(workers);
+            let members = engine.pool_members(&list);
+            let mut places = Vec::new();
+            for turn in 0..12_usize {
+                let mut ask = request();
+                if turn % 2 == 1 {
+                    ask.facts.session_key = Identity::plain(keys[turn / 2]);
+                }
+                let asks = Asks::of(ask, Some(&members));
+                let decided = decided(&engine, &asks);
+                let pick = decided.decision.pick().expect("a pick");
+                places.push(pick.targets.first().expect("the target").position as usize);
+            }
+            let in_turn: Vec<usize> = (0..12).map(|turn| (places[0] + turn) % workers).collect();
+            assert_eq!(places, in_turn, "{workers} workers");
+        }
+    }
+
+    /// A draw turns the list's own word, the one a pick alone turns. Two
+    /// lists of one model and one size so turn a rotation each: asked in
+    /// turn, a request with no routing key and a new session at each, they
+    /// take each list's workers one after the other. And over one list a
+    /// pick alone and a new session's whole decision share one rotation.
+    /// The gateway's classic policy keeps its rotation by the list it is
+    /// handed whole (`model_gateway/src/policies/round_robin.rs:95-99`,
+    /// `:151`).
+    #[test]
+    fn each_list_turns_its_own_rotation_for_every_request() {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        let manual = PolicySpec::preset("manual").expect("a built-in preset");
+        document.view.headers.clone_from(&manual.view.headers);
+        let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
+        rule.assignment = Assignment::Delegate;
+        document.bindings[0].sessions = Some(rule);
+        let keys: Vec<String> = (0..24).map(|key| format!("key-{key}")).collect();
+        let mut keys = keys.iter();
+        for workers in [DRAW_FROM, 64] {
+            let spec = AppliedSpec::validate(&document).expect("the document validates");
+            let engine = PolicyEngine::new(spec);
+            let Place::Alone(profile) = engine.place(MODEL, Phase::Single) else {
+                panic!("one pick of round robin decides the place");
+            };
+            let (one, other) = (pool(workers), pool(workers));
+            let lists = [engine.pool_members(&one), engine.pool_members(&other)];
+            let mut whole = |members: &PoolMembers, keyed: bool| {
+                let mut ask = request();
+                if keyed {
+                    ask.facts.session_key = Identity::plain(keys.next().expect("a key"));
+                }
+                let asks = Asks::of(ask, Some(members));
+                let decided = decided(&engine, &asks);
+                let pick = decided.decision.pick().expect("a pick");
+                pick.targets.first().expect("the target").position as usize
+            };
+            let mut places = [Vec::new(), Vec::new()];
+            for turn in 0..8 {
+                for (list, members) in lists.iter().enumerate() {
+                    places[list].push(whole(members, turn % 2 == 1));
+                }
+            }
+            for places in &places {
+                let in_turn: Vec<usize> = (0..8).map(|turn| (places[0] + turn) % workers).collect();
+                assert_eq!(*places, in_turn, "{workers} workers, two lists");
+            }
+            // The first list's rotation goes on, a pick alone and a new
+            // session's whole decision in turn.
+            let mut shared = Vec::new();
+            for turn in 0..8 {
+                shared.push(if turn % 2 == 0 {
+                    let alone = engine.pick(profile, &lists[0], RoutingState::eligible);
+                    alone.expect("a worker")
+                } else {
+                    whole(&lists[0], true)
+                });
+            }
+            let in_turn: Vec<usize> = (8..16)
+                .map(|turn| (places[0][0] + turn) % workers)
+                .collect();
+            assert_eq!(shared, in_turn, "{workers} workers, one list");
         }
     }
 

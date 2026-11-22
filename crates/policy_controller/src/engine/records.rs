@@ -175,6 +175,9 @@ pub struct Live<'a> {
     /// Whether a stage of the document reads a worker's count of session
     /// keys with a request in flight.
     sessions: bool,
+    /// The list's own word, where the decision is over one list
+    /// ([`Self::turning`]).
+    word: Option<&'a AtomicU64>,
 }
 
 impl<'a> Live<'a> {
@@ -205,6 +208,20 @@ impl<'a> Live<'a> {
             loads,
             counted_key: session_key.filter(|_| needs.session_in_flight),
             sessions: needs.active_sessions,
+            word: None,
+        }
+    }
+
+    /// These reads for a decision over the one list whose own word is
+    /// `word`, the word a pick over the list alone counts its turns in: the
+    /// pool's facts made by them lend it ([`PoolFacts::word`]), so a picker
+    /// that takes turns counts a draw's turn in it too. A pair's decision
+    /// reads two lists by one value of these and lends none.
+    #[must_use]
+    pub(crate) fn turning(self, word: &'a AtomicU64) -> Self {
+        Self {
+            word: Some(word),
+            ..self
         }
     }
 
@@ -653,11 +670,13 @@ impl PoolRecords {
     }
 
     /// The pool's facts beside its records: `reported` is whether every
-    /// record written carries a report.
-    fn facts(&self, clock: &DecisionClock, reported: bool) -> PoolFacts<'_> {
+    /// record written carries a report. They lend the list's own word where
+    /// `live` holds it ([`Live::turning`]), written here, where the facts
+    /// are made: a decision makes no second copy of them to add it.
+    fn facts<'a>(&'a self, live: &Live<'a>, reported: bool) -> PoolFacts<'a> {
         PoolFacts {
             pool_size: self.fixed.len() as u32,
-            membership_epoch: clock.membership_epoch(),
+            membership_epoch: live.clock.membership_epoch(),
             ring_epoch: 0,
             regime: OverloadRegime::None,
             generation: self.generation,
@@ -665,6 +684,7 @@ impl PoolRecords {
             reach: 0,
             reported,
             engines: Engines::new(self.number, &self.engine_rows, &self.engine_ends),
+            word: live.word,
         }
     }
 
@@ -698,12 +718,15 @@ impl PoolRecords {
     /// Nothing is allocated once `rows` has grown to the list. The one
     /// exception is the conversion: one allocation, by one decision, at
     /// most once a published snapshot a list.
-    pub fn write<'a>(
-        &'a self,
+    ///
+    /// The facts borrow the records and what `live` borrows, the list's own
+    /// word among it. The rows borrow their buffer alone.
+    pub fn write<'a, 'f>(
+        &'f self,
         workers: &[Arc<dyn Worker>],
-        live: &Live<'_>,
+        live: &Live<'f>,
         rows: &'a mut Vec<Candidate>,
-    ) -> (&'a mut [Candidate], PoolFacts<'a>) {
+    ) -> (&'a mut [Candidate], PoolFacts<'f>) {
         debug_assert_eq!(
             workers.len(),
             self.fixed.len(),
@@ -757,7 +780,7 @@ impl PoolRecords {
                 self.fixed.is_empty()
             }
         };
-        (rows.as_mut_slice(), self.facts(live.clock, reported))
+        (rows.as_mut_slice(), self.facts(live, reported))
     }
 
     /// The list's rows with the reports of `loads` written, where the
@@ -1052,6 +1075,11 @@ thread_local! {
 /// A target of the decision names its worker by position, the worker's
 /// place in `workers`, and by id ([`PoolRecords::ids`]).
 ///
+/// Where `live` carries the list's own word, as the engine's decision of a
+/// single request over one list hands it, the pool's facts lend it to the
+/// decision ([`PoolFacts::word`]): a picker that takes turns counts a
+/// draw's turn in it.
+///
 /// The records and the engine's scratch are the calling thread's own.
 pub fn decide(
     engine: &Engine,
@@ -1065,9 +1093,9 @@ pub fn decide(
     let facts = &*facts;
     let decide = |buffers: &mut Buffers| {
         let Buffers { rows, scratch } = buffers;
-        // No record says yet whether it carries a report: a draw reads the
+        // No record says yet whether it carries a report: a draw reads that
         // fact of no pool.
-        let unsaid = pool.facts(live.clock, false);
+        let unsaid = pool.facts(live, false);
         if let Some(drawn) = engine.drawn_for(facts, &unsaid, pool.len()) {
             if rows.len() < pool.len() {
                 rows.resize(pool.len(), Candidate::default());

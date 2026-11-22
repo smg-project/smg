@@ -14,6 +14,8 @@
 //! `dispatched` has no struct of its own: the host composes it from a lease,
 //! a target and a side.
 
+use std::sync::atomic::AtomicU64;
+
 use crate::{
     engine::{
         decision::{Pair, Target},
@@ -95,6 +97,9 @@ wit! {
     // Host-only: the signal cells stand beside the rows of the host that
     // decides, and no contract carries them yet.
     Option<&crate::load::SignalCells> => "host-only",
+    // Host-only: the word a host keeps beside its own list of workers
+    // counts that list's turns, and a guest is shown rows.
+    Option<&AtomicU64> => "host-only",
     // Host-only: the engines a host lists beside its rows name the rows by
     // position, and a guest is shown rows.
     Engines<'_> => "host-only",
@@ -224,8 +229,8 @@ pub(crate) fn all() -> Vec<Probe> {
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
             pool_size, membership_epoch, ring_epoch, regime, generation, zones, reach,
-            reported, engines,
-        } host [reach, reported, engines], &pool),
+            reported, engines, word,
+        } host [reach, reported, engines, word], &pool),
         // The lease's session crosses under the name both contracts still
         // spell, `session-key`. A gateway's client reads it under that name.
         // A change that renames the field renames it in both contracts and
