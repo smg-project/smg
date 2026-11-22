@@ -12,7 +12,6 @@ pub(super) use openai_protocol::{
 };
 pub(super) use serde_json::{json, Value};
 pub(super) use symphony::{formats::qwen3, CallSyntax, EngineFinish, Event, Events, Format};
-pub(super) use tool_parser::ToolConstraint;
 
 pub(super) use super::{
     constraint::*, names::*, reader::*, telemetry::Who, template::Templates, *,
