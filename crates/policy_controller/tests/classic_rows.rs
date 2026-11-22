@@ -619,6 +619,20 @@ fn the_classic_all_vetoed_rows_replay_pick_for_pick_and_share_for_share() {
     assert!(defects.is_empty(), "{defects:#?}");
 }
 
+/// The ring rows of the all-vetoed sheet list their workers in their key's
+/// ring order. Each is replayed a second time on a ring the request's
+/// caller lends, built in that order, and holds its recorded answer.
+#[test]
+fn the_classic_ring_rows_replay_on_a_ring_their_caller_lends() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classic/sheets");
+    let sheet = fs::read_to_string(dir.join("all_vetoed.json")).expect("the sheet is readable");
+    for (text, least) in [(classic::all_vetoed::INLINE, 8), (sheet.as_str(), 12)] {
+        let (rows, defects) = classic::all_vetoed::replay_on_a_lent_ring(text);
+        assert!(rows >= least, "{rows} ring rows, under {least}");
+        assert!(defects.is_empty(), "{defects:#?}");
+    }
+}
+
 #[test]
 fn the_classic_encode_pair_rows_replay_the_stores_part_list_for_list() {
     let (rows, defects) = replay_sheet(classic::encode_pair::INLINE, "the inline rows");

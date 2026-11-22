@@ -72,9 +72,8 @@ use super::{
     demands::{DemandFacts, Demands, UnmetDemand},
     framework::{Engine, Scratch},
     view::{
-        fingerprint, Candidate, Constraints, Engines, FixedFacts, Health, OverloadRegime,
-        PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,
-        LOAD_REPORT_CLOCK_HISTORY_MS,
+        Candidate, Constraints, Engines, FixedFacts, Health, OverloadRegime, PoolFacts,
+        RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
     },
 };
 use crate::{document::spec::AppliedSpec, load::load_row};
@@ -93,7 +92,7 @@ use crate::{document::spec::AppliedSpec, load::load_row};
 /// this one.
 #[must_use]
 pub fn worker_id(worker: &dyn Worker) -> WorkerId {
-    WorkerId(fingerprint(worker.url().as_bytes()))
+    WorkerId::from_address(worker.url())
 }
 
 /// The data-parallel rank a pick that reads no record names for `worker`:

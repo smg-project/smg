@@ -24,6 +24,7 @@ use crate::{
             Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
         },
     },
+    policies::consistent_hashing::LentRing,
     tracking::lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
 };
 
@@ -97,6 +98,9 @@ wit! {
     // Host-only: the engines a host lists beside its rows name the rows by
     // position, and a guest is shown rows.
     Engines<'_> => "host-only",
+    // Host-only: the ring a caller lends names its workers by address,
+    // and a guest is shown rows.
+    Option<&dyn LentRing> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -211,10 +215,10 @@ pub(crate) fn all() -> Vec<Probe> {
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
             lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
-            model_fingerprint, signal_cells, client_key,
+            model_fingerprint, signal_cells, client_key, ring, ring_positions,
         } host [
             now_micros, pinned_at, lent_in_flight, lent_session_in_flight, session_counted,
-            affinity, named, model_fingerprint, signal_cells, client_key
+            affinity, named, model_fingerprint, signal_cells, client_key, ring, ring_positions
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),

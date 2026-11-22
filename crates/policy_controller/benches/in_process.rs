@@ -74,6 +74,7 @@ use smg_policy_controller::{
         Constraints, Decided, Identity, Phase, Plain, PolicyEngine, PoolMembers, Request,
         RequestFacts, RequestMaker, WorkerId, WorkerLists,
     },
+    policies::consistent_hashing::LentRing,
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
 };
@@ -208,11 +209,58 @@ fn plain(seed: u64) -> Request<'static> {
 /// The routing keys a keyed cell's callers send, one a turn by its seed.
 const KEYS: u64 = 1_024;
 
+/// The ring a host lends with a keyed request: the list's addresses in the
+/// list's order, walked round once from the place a key states. A stand-in
+/// for the ring a host keeps: it hashes nothing and holds no points, so a
+/// keyed cell counts what the engine does with a lent ring and no lookup of
+/// a host's ring.
+#[derive(Debug)]
+struct ListOrder(Vec<String>);
+
+impl LentRing for ListOrder {
+    fn position(&self, _: &str) -> u64 {
+        0
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        let (before, behind) = self.0.split_at(position as usize % self.0.len());
+        let _ = behind.iter().chain(before).any(|address| take(address));
+    }
+}
+
+/// The run's ring, made of its list before the first request ([`lend`]).
+static RING: OnceLock<ListOrder> = OnceLock::new();
+
+/// Makes the run's ring of `workers`, in the list's order.
+fn lend(workers: &[Arc<dyn Worker>]) {
+    let addresses = workers.iter().map(|worker| worker.url().to_owned());
+    let lent = RING.set(ListOrder(addresses.collect()));
+    lent.expect("one list a run");
+}
+
+/// Where each routing key stands on the ring: its own number, kept as a
+/// host keeps what its ring answered for a key.
+static PLACES: [u64; KEYS as usize] = {
+    let mut places = [0; KEYS as usize];
+    let mut key = 0;
+    while key < places.len() {
+        places[key] = key as u64;
+        key += 1;
+    }
+    places
+};
+
 /// [`plain`]'s request with a routing key, one of [`KEYS`]: a ring places
-/// it by the key.
+/// it by the key. Its host lends its ring with it ([`RING`]) and states
+/// where the key stands there ([`PLACES`]).
 fn keyed(seed: u64) -> Request<'static> {
     let mut request = plain(seed);
-    request.facts.session_key = Identity::hashed(mix(seed % KEYS) | 1);
+    let key = seed % KEYS;
+    request.facts.session_key = Identity::hashed(mix(key) | 1);
+    if let Some(ring) = RING.get() {
+        request.facts.ring = Some(ring);
+    }
+    request.facts.ring_positions = std::slice::from_ref(&PLACES[key as usize]);
     request
 }
 
@@ -389,6 +437,7 @@ fn main() {
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
         .collect();
+    lend(&workers);
     if run.overloaded {
         for (at, worker) in workers.iter().enumerate() {
             worker.set_overloaded(true);

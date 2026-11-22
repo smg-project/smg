@@ -577,6 +577,11 @@ impl Engine {
             // The encoders' own cells: the request's would be read by
             // another pool's positions.
             signal_cells: encode.signal_cells,
+            // The place stated on a lent ring is the request's routing
+            // value's: an item is placed by its own key, so it takes no
+            // lent ring and the stage's own places it.
+            ring: None,
+            ring_positions: &[],
             ..*facts
         };
         let takes = |row: &Candidate, of: &EncoderFacts| takes_media(&items, images, row, of);
