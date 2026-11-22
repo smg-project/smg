@@ -788,9 +788,14 @@ where
             let bytes = Bytes::from_request(req, state)
                 .await
                 .map_err(|err| json_rejection(JsonRejection::from(err)))?;
-            match serde_json::from_slice::<T>(&bytes) {
-                Ok(data) => Json(data),
-                Err(_) => Json::<T>::from_bytes(&bytes).map_err(json_rejection)?,
+            // The body is checked as text once, as a whole: a parse from bytes
+            // checks every key and every string on its own.
+            let direct = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| serde_json::from_str::<T>(text).ok());
+            match direct {
+                Some(data) => Json(data),
+                None => Json::<T>::from_bytes(&bytes).map_err(json_rejection)?,
             }
         } else {
             Json::<T>::from_request(req, state)
