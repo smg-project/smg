@@ -808,6 +808,20 @@ pub struct Candidate {
     pub key: u32,
 }
 
+/// What a program says of a worker for the half of its record that no
+/// request changes, where the worker object holds no such fact: whether
+/// the worker takes images. A host that keeps such a fact beside its
+/// workers tells it to what writes the workers' records, once a list: a
+/// gateway of its own registrations, a controller of the stored worker an
+/// object stands for. The default says nothing. Further facts add their
+/// fields, so a host starts from the default and sets what it knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FixedFacts {
+    /// Whether the worker takes images ([`Candidate::vision`]).
+    pub vision: bool,
+}
+
 /// How far back the store's decision clock starts.
 pub(crate) const LOAD_REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
 

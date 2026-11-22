@@ -499,6 +499,12 @@ the list is published (`PolicyEngine::pool_members`), and keeps it beside the li
 membership changes the registry publishes a new list, the host asks again, and the old value is
 dropped with the old list.
 
+A host that knows a fact of its workers that their objects do not hold asks through
+`PolicyEngine::pool_members_with_fixed_facts` instead. It says the fact once for each worker, at
+that call, and the engine writes it into the worker's record (5.3). The one such fact today is
+whether a worker takes images. That entry makes the list's records at the call, where
+`pool_members` leaves them to their first use.
+
 ```rust
 // engine/policy_engine.rs
 pub struct PoolMembers {
@@ -837,7 +843,7 @@ At start:
 |---|---|
 | builds the engine from the document | `PolicyEngine::new(spec)` |
 | hands its index of cache events | `engine.affinity().set_indexes(indexes)`; the host implements `CacheIndexes` and `CacheIndex` |
-| keeps the engine's value beside each published worker list | `engine.pool_members(list)` |
+| keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
 | builds each list's hash ring off the request path | `engine.fill_ring(..)` |
 | tells the engine when a worker is removed | `engine.forget(address)` |
 | runs the upkeep about once a second | `engine.sweep(now)` |
