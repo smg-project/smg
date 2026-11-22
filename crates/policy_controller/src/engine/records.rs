@@ -66,7 +66,7 @@ use super::{
         RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
     },
 };
-use crate::{document::spec::AppliedSpec, load::load_row};
+use crate::{document::spec::AppliedSpec, load::load_report::load_row_aged};
 
 /// A worker's id in the engine's own state (a load stage's credit of
 /// dispatches, a hash ring, session pins, a stage's bookings): the
@@ -267,8 +267,8 @@ impl<'a> Live<'a> {
 /// Writes `worker`'s report of `loads` into `row`, with the sample's
 /// instant on `clock`, and says whether the snapshot holds a report of the
 /// worker: one look-up of the worker's address, one conversion
-/// ([`load_row`]). The report's age is left at rest: it is a decision's to
-/// state ([`Live::age`]).
+/// ([`load_row_aged`]). The report's age is left at rest: it is a
+/// decision's to state ([`Live::age`]).
 #[inline]
 fn report_into(
     worker: &dyn Worker,
@@ -279,14 +279,8 @@ fn report_into(
     let Some((report, sampled_at)) = loads.report(worker.url()) else {
         return false;
     };
-    // The conversion is asked the age of a report at its own sample.
-    row.load = Some(load_row(
-        report,
-        row.role,
-        sampled_at,
-        sampled_at,
-        SignalSource::Poll,
-    ));
+    // The row states no age, and no clock is read for one.
+    row.load = Some(load_row_aged(report, row.role, 0, SignalSource::Poll));
     row.load_sampled_at_micros = clock.micros(sampled_at);
     true
 }

@@ -30,6 +30,19 @@ pub fn load_row(
     sampled_at: Instant,
     source: SignalSource,
 ) -> LoadRow {
+    let age = now.saturating_duration_since(sampled_at).as_millis();
+    load_row_aged(report, role, u32::try_from(age).unwrap_or(u32::MAX), source)
+}
+
+/// [`load_row`] of a report whose age the caller states, with no clock
+/// read for it: `0` for a row whose reader takes the age from the sample's
+/// instant, as a decision's record does.
+pub(crate) fn load_row_aged(
+    report: &WorkerLoadResponse,
+    role: Role,
+    report_age_ms: u32,
+    source: SignalSource,
+) -> LoadRow {
     let mut running: i64 = 0;
     let mut queued: i64 = 0;
     let mut uncached: i64 = 0;
@@ -80,8 +93,7 @@ pub fn load_row(
         resident_tokens: resident.map_or(0, narrow),
         // Counted when the report has ranks and every one of them sends it.
         resident_counted: resident.is_some() && !report.loads.is_empty(),
-        report_age_ms: u32::try_from(now.saturating_duration_since(sampled_at).as_millis())
-            .unwrap_or(u32::MAX),
+        report_age_ms,
         source,
         max_running: narrow(max_running),
     }
