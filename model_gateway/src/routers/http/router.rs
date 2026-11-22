@@ -69,8 +69,8 @@ use crate::{
         metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
         otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
-    policies::{namespace_of, CacheNamespace, PolicyRegistry},
-    policy_controller::engine::{self, Ask, BehindAnswer, Placed, PolicyEngine, Prompt, Sent},
+    policies::{namespace_of, PolicyRegistry},
+    policy_controller::engine::{AnsweredBy, BehindAnswer, Placed, Sent},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -83,9 +83,7 @@ use crate::{
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload, placement,
-            placement::{
-                CandidateFilter, Missed, PlacementFailure, PlacementInputs, Placer, RefusalSite,
-            },
+            placement::{Missed, PlacementFailure, PlacementInputs, Placer, RefusalSite},
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -179,8 +177,9 @@ struct TypedAttempt<'a, T> {
     rid: Option<&'a str>,
 }
 
-/// The regular HTTP router places typed requests and multipart transcriptions
-/// through its policy engine or its injected load balancing policies.
+/// The regular HTTP router places typed requests, multipart transcriptions
+/// and requests whose body it sends on unread through one placer: its
+/// injected load balancing policies, or the policy engine.
 ///
 /// Proxied GETs and realtime sessions pick their worker by no routing
 /// policy: they read the worker registry directly, with a policy engine or
@@ -188,10 +187,8 @@ struct TypedAttempt<'a, T> {
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    /// The policy engine, when it places this router's requests.
-    policy_engine: Option<Arc<PolicyEngine>>,
-    /// Who places a typed request: the classic policies, or the policy
-    /// engine where it places this router's requests.
+    /// Who places this router's requests: the classic policies, or the
+    /// policy engine where it places them.
     placer: Placer,
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
@@ -267,7 +264,6 @@ impl Router {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
-            policy_engine: ctx.policy_engine.clone(),
             placer: Placer::of(&ctx.policy_registry, ctx.policy_engine.as_ref()),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
@@ -349,47 +345,6 @@ impl Router {
             }
             Err(e) => error::service_unavailable("no_workers", e),
         }
-    }
-
-    /// Select worker considering circuit breaker state.
-    /// Filters to workers serving the specified model. When model is "unknown"
-    /// (generate endpoint without model), considers all HTTP workers. `tried`
-    /// are the engines the request's failed attempts dispatched to (see
-    /// `PlacementInputs::tried`).
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "selection threads every routing input the policy consumes"
-    )]
-    fn select_worker_for_model(
-        &self,
-        model_id: &str,
-        text: Option<&str>,
-        tokens: Option<&[u32]>,
-        headers: Option<&HeaderMap>,
-        rid_key: Option<&str>,
-        cache_namespace: Option<CacheNamespace>,
-        candidate_filter: Option<CandidateFilter<'_>>,
-        tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
-        // This router proxies plain HTTP to the worker's URL, so only HTTP
-        // workers are candidates; nothing pins a wire on this path.
-        placement::select_single(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            RoutingPool::HttpRegular,
-            None,
-            PlacementInputs {
-                text,
-                tokens,
-                headers,
-                rid_key,
-                cache_namespace,
-                candidate_filter,
-                tried,
-                ..Default::default()
-            },
-        )
     }
 
     /// Select a local, realtime-capable worker for the given model.
@@ -802,14 +757,12 @@ impl Router {
                 Some(placed.id())
             });
 
-        match placed {
-            None => response,
-            Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
-            Some(placed) => {
-                placed.ended_by(&response, Instant::now());
-                response
-            }
-        }
+        Sent::end_with(
+            placed,
+            response,
+            head_success_recorded,
+            AnsweredBy::AsTheResponseSays,
+        )
     }
 
     /// Resolve an unnamed request to the one primary model this router's
@@ -1368,9 +1321,9 @@ impl Router {
     /// its dispatch-time overload re-check, the form's send and the relay of
     /// the worker's answer. Separate from `route_typed_request` because the
     /// endpoint is not JSON-bodied: the form is sent once (no retry could
-    /// replay it) and never passes through `prepare_request`. Under the
-    /// policy engine the worker is the engine's placement, with no
-    /// re-check, and a streamed answer carries it to the end of its body.
+    /// replay it) and never passes through `prepare_request`. A placement
+    /// that owes its decider a word is told the send and the end, and a
+    /// streamed answer carries it to the end of its body.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -1392,32 +1345,9 @@ impl Router {
         // exit below.
         let outcome = self.begin_route(route, model_id, is_stream);
 
-        let (worker, mut placed) = match &self.policy_engine {
-            None => {
-                let worker = match self.select_transcription_worker(headers, model_id, &routing) {
-                    Ok(worker) => worker,
-                    Err(refusal) => {
-                        outcome.pre_send_error(&refusal);
-                        return refusal;
-                    }
-                };
-
-                // Same dispatch-time re-check the regular path takes. A transcription
-                // occupies its worker for far longer than a chat completion, so a
-                // report landing in the selection→dispatch window is the one case where
-                // dispatching anyway is measurably worse.
-                if let Some(resp) = overload::shed_if_worker_overloaded(
-                    worker.as_ref(),
-                    model_id,
-                    self.worker_registry.overload_shed_enabled(),
-                ) {
-                    outcome.pre_send_error(&resp);
-                    return resp;
-                }
-                (worker, None)
-            }
-            Some(policy_engine) => match self
-                .place_transcription(policy_engine, headers, body.rid(), model_id, is_stream)
+        let (worker, mut placed) = if self.placer.waits() {
+            match self
+                .place_transcription_waiting(headers, body.rid(), model_id, is_stream)
                 .await
             {
                 Ok(placed) => Sent::of(placed),
@@ -1425,14 +1355,41 @@ impl Router {
                     outcome.pre_send_error(&refusal);
                     return refusal;
                 }
-            },
+            }
+        } else {
+            let placed = match self.place_transcription(
+                headers,
+                body.rid(),
+                model_id,
+                is_stream,
+                &routing,
+            ) {
+                Ok(placed) => placed,
+                Err(refusal) => {
+                    outcome.pre_send_error(&refusal);
+                    return refusal;
+                }
+            };
+
+            // Same dispatch-time re-check the regular path takes. A transcription
+            // occupies its worker for far longer than a chat completion, so a
+            // report landing in the selection→dispatch window is the one case where
+            // dispatching anyway is measurably worse. A placement refused here is
+            // given up at its drop, ahead of any dispatch.
+            if let Some(resp) = overload::shed_if_worker_overloaded(
+                placed.worker().as_ref(),
+                model_id,
+                self.worker_registry.overload_shed_enabled(),
+            ) {
+                outcome.pre_send_error(&resp);
+                return resp;
+            }
+            Sent::of(placed)
         };
 
-        // Streamed requests have no rid; the header is the whole sticky key.
-        let load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            self.policy_registry.sticky_header_key(headers),
-        );
+        // A transcription states no rid; the header is the whole session key.
+        let load_guard =
+            WorkerLoadGuard::with_key(worker.clone(), self.placer.session_key(headers, None));
 
         let res = match Self::send_transcription(
             headers,
@@ -1447,14 +1404,9 @@ impl Router {
         .await
         {
             Ok(res) => res,
-            Err(response) => {
-                // A send that failed says so; a form that was never sent
-                // leaves the placement to its drop.
-                if let Some(placed) = placed {
-                    placed.ended(response.status(), false, Instant::now());
-                }
-                return response;
-            }
+            // A send that failed says so; a form that was never sent
+            // leaves the placement to its drop.
+            Err(response) => return Sent::end_with(placed, response, false, AnsweredBy::Nobody),
         };
 
         let status = res.status();
@@ -1477,22 +1429,19 @@ impl Router {
             .await
         };
 
-        match placed {
-            None => response,
-            Some(placed) if is_stream => placed.held_to_the_end_of(response),
-            Some(placed) => {
-                placed.ended(response.status(), true, Instant::now());
-                response
-            }
-        }
+        // This route's own relay and its buffered read set no mark on the
+        // answer: the worker's head was read, and the client's `stream`
+        // says whether the body still runs.
+        Sent::end_with(placed, response, is_stream, AnsweredBy::Worker)
     }
 
-    /// A transcription's placement by the policy controller, or its refusal.
-    /// The route cannot pin a rank, so the commit passes over a data-parallel
-    /// worker, and it keeps to this router's own pool ([`RoutingPool::HttpRegular`]).
-    async fn place_transcription(
+    /// A transcription's placement where the placement waits, under a
+    /// controller's address ([`Placer::waits`]), or its refusal. The route
+    /// cannot pin a rank, so the commit passes over a data-parallel worker,
+    /// and it keeps to this router's own pool
+    /// ([`RoutingPool::HttpRegular`]). The ask states no prompt.
+    async fn place_transcription_waiting(
         &self,
-        policy_engine: &PolicyEngine,
         headers: Option<&HeaderMap>,
         rid: Option<&str>,
         model_id: &str,
@@ -1511,32 +1460,21 @@ impl Router {
         if pool.iter().all(|worker| worker.is_dp_aware()) {
             return Err(Self::transcription_dp_not_supported());
         }
-        if let Some(refusal) = self.explicit_target_refusal(model_id, headers) {
-            return Err(refusal);
-        }
-
-        let id = engine::mark();
-        let ask = Ask {
-            streaming,
+        let inputs = PlacementInputs {
             headers,
             rid,
-            pool: Some(RoutingPool::HttpRegular),
-            ..Ask::of(&id, model_id)
+            streaming,
+            ..Default::default()
         };
-        policy_engine
-            .place_at(
-                &ask,
-                |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
-                Instant::now,
-            )
-            .await
-            .map_err(|unplaced| {
-                self.report_refusal(
-                    TRANSCRIPTION_REFUSAL_SITE,
-                    model_id,
-                    unplaced.answer(model_id),
-                )
-            })
+        self.place_waiting(
+            TRANSCRIPTION_REFUSAL_SITE,
+            model_id,
+            model_id,
+            &inputs,
+            |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
+            &[],
+        )
+        .await
     }
 
     fn transcription_dp_not_supported() -> Response {
@@ -1550,16 +1488,19 @@ impl Router {
     /// Multipart transcription can't route through `worker.prepare_request`,
     /// which is the hook that injects `data_parallel_rank` for DP-aware
     /// workers: DP-aware workers are pre-filtered out of the candidate pool
-    /// so the policy can pick a non-DP worker when one exists, and the
-    /// request falls back to model_not_found / 400 only when the pool is
-    /// empty or every candidate is DP-aware. The verdict on a policy that
-    /// returns no worker is judged from the same pool.
-    fn select_transcription_worker(
+    /// so a non-DP worker is placed when one exists, and the request falls
+    /// back to model_not_found / 400 only when the pool is empty or every
+    /// candidate is DP-aware. The route places over that list of its own
+    /// ([`Placer::place_from`]), and the verdict on a request nobody was
+    /// placed for is judged from the same list.
+    fn place_transcription(
         &self,
         headers: Option<&HeaderMap>,
+        rid: Option<&str>,
         model_id: &str,
+        streaming: bool,
         routing: &RoutingDerivatives,
-    ) -> Result<Arc<dyn Worker>, Response> {
+    ) -> Result<Placed, Response> {
         let all_workers = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
@@ -1578,49 +1519,64 @@ impl Router {
         if non_dp_workers.is_empty() {
             return Err(Self::transcription_dp_not_supported());
         }
-        let Some(worker) = placement::select_from(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            &non_dp_workers,
-            PlacementInputs {
-                text: routing.text.as_deref(),
-                tokens: routing.tokens.as_deref(),
-                headers,
-                rid_key: routing.rid_key.as_deref(),
-                cache_namespace: routing.cache_namespace,
-                candidate_filter: None,
-                tried: &[],
-                ..Default::default()
-            },
-        ) else {
-            // Judged from the same candidates whether the pre-filter emptied
-            // or a self-filtering policy missed on an all-overloaded pool, so
-            // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(
-                &non_dp_workers,
+        self.placer
+            .place_from(
+                &self.worker_registry,
                 model_id,
-                self.worker_registry.overload_shed_enabled(),
-            ) {
-                PlacementFailure::AllOverloaded(shed) => shed,
-                PlacementFailure::NoCandidates
-                | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_)
-                | PlacementFailure::NoCompatiblePair { .. }
-                | PlacementFailure::PrefillAtCapacity => {
-                    // The verdict cannot tell a policy miss from a drained
-                    // pool; the pool can.
-                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
-                        "Policy returned no eligible worker"
-                    } else {
-                        "All workers are unavailable (circuit breaker open or unhealthy)"
-                    };
-                    placement::no_available_workers(message)
-                }
-            };
-            return Err(self.report_refusal(TRANSCRIPTION_REFUSAL_SITE, model_id, resp));
-        };
-        Ok(worker)
+                RoutingPool::HttpRegular,
+                &non_dp_workers,
+                &PlacementInputs {
+                    text: routing.text.as_deref(),
+                    tokens: routing.tokens.as_deref(),
+                    headers,
+                    rid_key: routing.rid_key.as_deref(),
+                    cache_namespace: routing.cache_namespace,
+                    rid,
+                    streaming,
+                    ..Default::default()
+                },
+            )
+            .map_err(|missed| {
+                let answer = match missed {
+                    Missed::Nobody => self.transcription_no_worker(model_id, &non_dp_workers),
+                    // A verdict only the policy engine has keeps its own
+                    // answer.
+                    Missed::Engine(unplaced) => unplaced.answer(model_id),
+                };
+                self.report_refusal(TRANSCRIPTION_REFUSAL_SITE, model_id, answer)
+            })
+    }
+
+    /// The answer of a transcription nobody was placed for, judged from the
+    /// candidates its placement drew from whether the pre-filter emptied or
+    /// a self-filtering policy missed on an all-overloaded pool, so a shed
+    /// keeps its Retry-After, retryability and metric.
+    fn transcription_no_worker(
+        &self,
+        model_id: &str,
+        non_dp_workers: &[Arc<dyn Worker>],
+    ) -> Response {
+        match placement::failure_from(
+            non_dp_workers,
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            PlacementFailure::AllOverloaded(shed) => shed,
+            PlacementFailure::NoCandidates
+            | PlacementFailure::Unavailable
+            | PlacementFailure::PolicyDeclined(_)
+            | PlacementFailure::NoCompatiblePair { .. }
+            | PlacementFailure::PrefillAtCapacity => {
+                // The verdict cannot tell a policy miss from a drained
+                // pool; the pool can.
+                let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                    "Policy returned no eligible worker"
+                } else {
+                    "All workers are unavailable (circuit breaker open or unhealthy)"
+                };
+                placement::no_available_workers(message)
+            }
+        }
     }
 
     /// The send of a transcription to its worker: the trace headers, the
@@ -2572,19 +2528,7 @@ impl Router {
             .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
-            // Where the policy engine of this process places the request,
-            // the document in force says whether a placement reads the
-            // prompt. A valid tokens hint lifts the read there too.
-            policy_needs_text: match self.policy_engine.as_deref() {
-                Some(policy_engine) if policy_engine.in_process() => {
-                    policy_engine.reads_body(|| {
-                        header_utils::parse_routing_tokens_hint(Some(headers)).is_some()
-                    })
-                }
-                _ => self
-                    .policy_registry
-                    .any_policy_needs_request_text(Some(headers)),
-            },
+            policy_needs_text: self.placer.needs_request_text(headers),
             // A worker knows a model's canonical id alone, and only a body
             // read here has an alias in it rewritten to that id.
             model_ambiguous: self.worker_registry.model_count() > 1
@@ -2613,8 +2557,12 @@ impl Router {
     /// defer to the worker). `Err` hands the request back untouched —
     /// body unconsumed — for the buffered typed path.
     ///
-    /// Where the policy engine of this process places requests, it places
-    /// this one from its headers ([`Self::place_streamed`]), and its lease
+    /// The worker is placed by the one call every route of this router
+    /// makes ([`Placer::place`]), with what the headers alone state: no
+    /// model, so the request is placed over every HTTP worker, and a valid
+    /// tokens hint as its prompt. A request nobody is placed for is not
+    /// judged here: it goes back to the buffered path, which answers it
+    /// with the body read. Where the placement owes its decider a word, it
     /// is told the dispatch and the end as an attempt of the buffered path
     /// tells them. A gateway that follows a controller hands every request
     /// back: its streamed path does not ask the controller.
@@ -2624,8 +2572,7 @@ impl Router {
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
-        let policy_engine = self.policy_engine.as_deref();
-        if policy_engine.is_some_and(|policy_engine| !policy_engine.in_process()) {
+        if self.placer.waits() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PLACED_BY_CONTROLLER);
             return Err(req);
         }
@@ -2653,40 +2600,23 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let (worker, mut placed) = match policy_engine {
-            None => {
-                let Some(worker) = self.select_worker_for_model(
-                    model_id,
-                    None,
-                    hinted_tokens.as_deref(),
-                    Some(req.headers()),
-                    None,
-                    None,
-                    None,
-                    &[],
-                ) else {
-                    Metrics::record_request_body_path(
-                        BODY_PATH_BUFFERED,
-                        REASON_NO_AVAILABLE_WORKER,
-                    );
-                    return Err(req);
-                };
-                (worker, None)
-            }
-            Some(policy_engine) => {
-                let placed = self
-                    .place_streamed(policy_engine, req.headers(), hinted_tokens.as_deref())
-                    .await;
-                match placed {
-                    Ok(placed) => Sent::of(placed),
-                    Err(Unstreamed::Refused(refusal)) => return Ok(*refusal),
-                    Err(Unstreamed::Buffered(reason)) => {
-                        Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
-                        return Err(req);
-                    }
-                }
-            }
+        // This router proxies plain HTTP to the worker's URL, so only HTTP
+        // workers are candidates; nothing pins a wire on this path.
+        let Ok(placed) = self.placer.place(
+            &self.worker_registry,
+            model_id,
+            RoutingPool::HttpRegular,
+            None,
+            &PlacementInputs {
+                tokens: hinted_tokens.as_deref(),
+                headers: Some(req.headers()),
+                ..Default::default()
+            },
+        ) else {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
+            return Err(req);
         };
+        let (worker, mut placed) = Sent::of(placed);
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
@@ -2715,9 +2645,10 @@ impl Router {
             "false",
         );
 
+        // An unread body states no rid: the header is the whole session key.
         let load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
-            self.policy_registry.sticky_header_key(Some(req.headers())),
+            self.placer.session_key(Some(req.headers()), None),
         );
         events::RequestSentEvent {
             url: worker.redacted_url(),
@@ -2797,76 +2728,13 @@ impl Router {
         }
         // A placement ends with its answer: a stream's at the end of its
         // body, any other here.
-        Ok(match placed {
-            None => response,
-            Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
-            Some(placed) => {
-                placed.ended_by(&response, Instant::now());
-                response
-            }
-        })
+        Ok(Sent::end_with(
+            placed,
+            response,
+            head_success_recorded,
+            AnsweredBy::AsTheResponseSays,
+        ))
     }
-
-    /// The placement of a request whose body is not read, by the policy
-    /// engine of this process: the ask of an attempt on the buffered path
-    /// ([`Self::place_typed`]) with what the headers alone state. The
-    /// request names no model here, so it is asked under the one model the
-    /// workers serve. A valid tokens hint is the prompt the buffered path
-    /// would hash. The request is sent once, so no ledger narrows the
-    /// commit: it keeps to this router's own pool.
-    ///
-    /// A request the engine does not place goes back to the buffered path,
-    /// which answers it with the body read, as one the classic selection
-    /// finds no worker for does. A request that names its worker where the
-    /// buffered path refuses the shape ([`Self::explicit_target_refusal`])
-    /// reads that refusal here, with no body read for it: like the version
-    /// check's, it is counted on neither body path.
-    async fn place_streamed(
-        &self,
-        policy_engine: &PolicyEngine,
-        headers: &HeaderMap,
-        hinted_tokens: Option<&[u32]>,
-    ) -> Result<Placed, Unstreamed> {
-        let Some(model) = self.model_of_an_unnamed_request() else {
-            return Err(Unstreamed::Buffered(REASON_MODEL_AMBIGUOUS));
-        };
-        if let Some(refusal) = self.explicit_target_refusal(&model, Some(headers)) {
-            return Err(Unstreamed::Refused(Box::new(refusal)));
-        }
-        let id = engine::mark();
-        // The hint is the prompt this route holds: it is hashed, and lent
-        // to the engine of this process as the buffered path lends its own.
-        let prompt = hinted_tokens.map(|tokens| Prompt::of(Some(tokens), None));
-        let hashes = prompt
-            .as_ref()
-            .map(|prompt| policy_engine.hashes(&model, prompt));
-        let ask = Ask {
-            headers: Some(headers),
-            hashes: hashes.as_ref(),
-            prompt: prompt.as_ref(),
-            pool: Some(RoutingPool::HttpRegular),
-            ..Ask::of(&id, &model)
-        };
-        let placed = policy_engine
-            .place_at(
-                &ask,
-                |worker| RoutingPool::HttpRegular.matches(worker),
-                Instant::now,
-            )
-            .await;
-        placed.map_err(|_| Unstreamed::Buffered(REASON_NO_AVAILABLE_WORKER))
-    }
-}
-
-/// Why the policy engine placed no worker for a request whose body is not
-/// read ([`Router::place_streamed`]).
-enum Unstreamed {
-    /// The request is answered here, with this refusal. Behind a pointer:
-    /// the other answer is one word, and a placement's error rides small.
-    Refused(Box<Response>),
-    /// The request goes back to the buffered path, counted under this
-    /// reason.
-    Buffered(&'static str),
 }
 
 /// State of [`StreamBodyLayer`]: the app-level router handle (the manager in
@@ -3510,7 +3378,6 @@ mod tests {
             worker_registry,
             placer: Placer::of(&policy_registry, None),
             policy_registry,
-            policy_engine: None,
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -3578,7 +3445,6 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
-            policy_engine: None,
             ..create_test_regular_router()
         };
 
@@ -3811,17 +3677,22 @@ mod tests {
     fn model_less_selection_uses_live_availability_from_shared_pool() {
         let router = create_test_unhealthy_router();
 
-        let selected = router
-            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
-            .unwrap();
-        assert!(selected.is_available());
+        let place = || {
+            router.placer.place(
+                &router.worker_registry,
+                UNKNOWN_MODEL_ID,
+                RoutingPool::HttpRegular,
+                None,
+                &PlacementInputs::default(),
+            )
+        };
+        let placed = place().unwrap();
+        assert!(placed.worker().is_available());
 
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
-        assert!(router
-            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
-            .is_none());
+        assert!(matches!(place(), Err(Missed::Nobody)));
     }
 
     #[tokio::test]
@@ -3931,7 +3802,6 @@ mod tests {
             worker_registry,
             placer: Placer::of(&policy_registry, None),
             policy_registry,
-            policy_engine: None,
             retry_config: retry,
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -4705,7 +4575,6 @@ mod tests {
             worker_registry,
             placer: Placer::of(&policy_registry, None),
             policy_registry,
-            policy_engine: None,
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -6243,7 +6112,6 @@ mod tests {
         ));
         let router = Router {
             worker_registry,
-            policy_engine: None,
             ..create_test_regular_router()
         };
 

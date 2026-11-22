@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     body::BodyDataStream,
-    http::header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+    http::header::{CONTENT_LENGTH, RETRY_AFTER, TRANSFER_ENCODING},
     routing::{post, MethodRouter},
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -21,7 +21,7 @@ use smg_policy_controller::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
     },
 };
-use smg_worker::test_support::RefusedAddress;
+use smg_worker::{identity::basic::BasicWorker, test_support::RefusedAddress};
 use tokio::{net::TcpListener, time::timeout};
 
 use super::{
@@ -31,7 +31,10 @@ use super::{
 use crate::{
     config::{PolicyConfig, RouterConfig},
     middleware::ReportedRefusal,
-    policy_controller::engine::testing::{bed_over, bed_over_models, record_bed_over, MODEL},
+    policy_controller::engine::{
+        testing::{bed_over, bed_over_models, record_bed_over, MODEL},
+        Ask, PolicyEngine,
+    },
     routers::{
         common::{
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
@@ -60,7 +63,6 @@ fn router(worker_registry: Arc<WorkerRegistry>, policy_engine: Option<PolicyEngi
         worker_registry,
         placer: Placer::of(&policy_registry, policy_engine.as_ref()),
         policy_registry,
-        policy_engine,
         retry_config: fast_retry_config(1),
         max_payload_size: 1 << 20,
         stream_stall_timeout: None,
@@ -70,6 +72,18 @@ fn router(worker_registry: Arc<WorkerRegistry>, policy_engine: Option<PolicyEngi
         webrtc_stun_server: None,
         rate_limit_manager: None,
     }
+}
+
+/// `router` with `policy` as the classic policy of its registry: the one
+/// its placer reads beside the engine, where the engine places.
+fn with_classic_policy(mut router: Router, policy: PolicyConfig) -> Router {
+    let policies = Arc::new(PolicyRegistry::new(policy));
+    router.placer = match &router.placer {
+        Placer::Classic(_) => Placer::of(&policies, None),
+        Placer::Engine(engine, _) => Placer::of(&policies, Some(engine)),
+    };
+    router.policy_registry = policies;
+    router
 }
 
 async fn chat(router: &dyn RouterTrait) -> Case<Response> {
@@ -721,7 +735,7 @@ async fn a_proxied_get_and_a_realtime_session_read_as_on_the_classic_line_under_
         router(Arc::clone(&registry), Some(policy_engine)),
         router(registry, None),
     ] {
-        let hosted = router.policy_engine.is_some();
+        let hosted = router.placer.waits();
         let get = router.health_generate(Request::new(Body::empty())).await;
         assert_eq!(get.status(), StatusCode::SERVICE_UNAVAILABLE, "{hosted}");
         assert_eq!(extract_error_code_from_response(&get), "no_workers");
@@ -964,7 +978,7 @@ async fn a_pool_of_data_parallel_workers_alone_reads_the_routes_400() -> Case {
     );
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
 
-    router.policy_engine = None;
+    router.placer = Placer::of(&router.policy_registry, None);
     let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(to_bytes(response.into_body(), 1024).await?, hosted);
@@ -1058,9 +1072,11 @@ fn own_router(preset: &str, urls: &[&str]) -> Case<Router> {
     let engine = Arc::new(OwnEngine::new(AppliedSpec::validate(&document)?));
     let policy_engine = PolicyEngine::own(engine, Arc::clone(&registry));
     // The app's task fills a list's hash ring off the path of a request,
-    // and no request does: this bed has no such task, and fills the ring of
-    // its one list here.
+    // and no request does: this bed has no such task, and fills here the
+    // rings the task would, the model's and the one of every worker, which
+    // a request that names no model is placed over.
     assert!(policy_engine.fill_rings(MODEL));
+    assert!(policy_engine.fill_rings(UNKNOWN_MODEL_ID));
     Ok(router(registry, Some(policy_engine)))
 }
 
@@ -1278,40 +1294,240 @@ async fn a_request_the_engine_does_not_place_goes_back_to_the_buffered_path() ->
     Ok(())
 }
 
-/// A request that names its worker reads the buffered path's refusal on the
-/// streamed path too, where the model's classic policy holds it to that
-/// worker: no worker is asked, no body is read for it, and it is counted on
-/// neither body path. Under a policy that reads no target the header
-/// changes nothing.
+/// A request that names its worker reads one answer on the streamed path
+/// and on the buffered one, whoever places: both routes make the one
+/// placing call, which says whether such a request is held to the worker
+/// it names. So four requests that name one worker go to the same workers
+/// by either path, under a classic policy that reads the header and under
+/// one that does not, and the streamed path refuses none of them.
 #[tokio::test]
-async fn a_streamed_request_that_names_its_worker_is_refused_by_name() -> Case {
-    for (policy, refused) in [
-        (PolicyConfig::ConsistentHashing, true),
-        (PolicyConfig::RoundRobin, false),
-    ] {
-        let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
-        let mut router = own_router("round_robin", &[&url])?;
-        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
-        let request = keyed(
-            streamed_request(&[GENERATE_BODY]),
-            "x-smg-target-worker",
-            "0",
-        )?;
-        let (answer, counted) = streamed(&router, request).await;
-        let response = answer.map_err(|_| "the router buffered the request")?;
-        if refused {
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+async fn a_streamed_request_that_names_its_worker_is_placed_as_a_buffered_one() -> Case {
+    let named = |request: Request<Body>| keyed(request, "x-smg-target-worker", "0");
+    for policy in [PolicyConfig::ConsistentHashing, PolicyConfig::RoundRobin] {
+        for engine in [false, true] {
+            let case = format!("{policy:?}, engine {engine}");
+            let mut spread = Vec::new();
+            for unread in [true, false] {
+                let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+                let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+                let registry =
+                    registry_of(false, vec![http_worker(&a, None), http_worker(&b, None)])?;
+                let router = with_classic_policy(
+                    routed(&round_robin(false), &registry, engine)?,
+                    policy.clone(),
+                );
+                for _ in 0..4 {
+                    let response = if unread {
+                        let request = named(streamed_request(&[GENERATE_BODY]))?;
+                        let (answer, counted) = streamed(&router, request).await;
+                        assert_eq!(counted, [("streamed", "pure_forward", 1)], "{case}");
+                        answer.map_err(|_| "the router buffered the request")?
+                    } else {
+                        let request = named(Request::new(Body::empty()))?;
+                        let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+                        let body = serde_json::from_value(json!({"text": "hi"}))?;
+                        router
+                            .route_generate(Some(request.headers()), &meta, body, UNKNOWN_MODEL_ID)
+                            .await
+                    };
+                    assert_eq!(response.status(), StatusCode::OK, "{case}, unread {unread}");
+                }
+                let mut hits = [hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst)];
+                hits.sort_unstable();
+                spread.push(hits);
+            }
             assert_eq!(
-                extract_error_code_from_response(&response),
-                "not_decided_by_policy_controller"
+                spread[0], spread[1],
+                "{case}: the body sent on unread, then the body read"
             );
-            assert!(counted.is_empty(), "{counted:?}");
-        } else {
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(counted, [("streamed", "pure_forward", 1)]);
         }
-        assert_eq!(hits.load(Ordering::SeqCst), usize::from(!refused));
     }
+    Ok(())
+}
+
+/// A ready HTTP worker of [`MODEL`] at `url`, with the data-parallel rank
+/// it registered, if any.
+fn http_worker(url: &str, rank: Option<usize>) -> BasicWorker {
+    let builder = BasicWorkerBuilder::new(url)
+        .status(WorkerStatus::Ready)
+        .model(ModelCard::new(MODEL));
+    match rank {
+        Some(rank) => builder.dp_config(rank, 2).build(),
+        None => builder.build(),
+    }
+}
+
+/// A registry of `workers`, which sheds a pool over its thresholds where
+/// `shed`.
+fn registry_of(shed: bool, workers: Vec<BasicWorker>) -> Case<Arc<WorkerRegistry>> {
+    let registry = Arc::new(WorkerRegistry::new());
+    registry.set_overload_shed(shed);
+    for worker in workers {
+        registry
+            .register(Arc::new(worker))
+            .ok_or("the worker did not register")?;
+    }
+    Ok(registry)
+}
+
+/// The sum of the series of `rendered` whose lines start with `series`
+/// and hold every one of `labels`.
+fn series_total(rendered: &str, series: &str, labels: &[&str]) -> u64 {
+    rendered
+        .lines()
+        .filter(|line| line.starts_with(series) && labels.iter().all(|label| line.contains(label)))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// A transcription where the gateway decides in its own process is placed
+/// as the classic policies place it: over the workers that registered no
+/// data-parallel rank, a list made ahead of the decision. So each request
+/// takes one decision, none is spent on a worker the route cannot send to,
+/// and its selection is counted as the classic selection's is.
+#[tokio::test]
+async fn a_transcription_placed_in_this_process_takes_one_decision_over_its_list() -> Case {
+    let (ranked, ranked_hits) = fixed_status_upstream(&[TRANSCRIBE], StatusCode::OK).await;
+    let (plain, plain_hits) = fixed_status_upstream(&[TRANSCRIBE], StatusCode::OK).await;
+    let registry = registry_of(
+        false,
+        vec![http_worker(&ranked, Some(0)), http_worker(&plain, None)],
+    )?;
+    let router = routed(&round_robin(false), &registry, true)?;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        for _ in 0..6 {
+            let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+    assert_eq!(
+        (
+            ranked_hits.load(Ordering::SeqCst),
+            plain_hits.load(Ordering::SeqCst)
+        ),
+        (0, 6)
+    );
+    let rendered = recorder.handle().render();
+    assert_eq!(
+        series_total(&rendered, "smg_policy_decisions_total{", &[]),
+        6,
+        "one decision a request: {rendered}"
+    );
+    let model = format!(r#"model="{MODEL}""#);
+    assert_eq!(
+        series_total(&rendered, "smg_worker_selection_total{", &[&model]),
+        6,
+        "{rendered}"
+    );
+    Ok(())
+}
+
+/// A transcription nobody can take reads one answer whoever places: the
+/// route judges the workers it placed over. Its one worker with no rank is
+/// over its thresholds beside a free worker that registered a rank, and the
+/// gateway sheds: 503 with the shed's code, its `Retry-After` and its
+/// counter, under the classic policies and under the engine of this process.
+#[tokio::test]
+async fn a_transcription_nobody_can_take_is_shed_whoever_places() -> Case {
+    for engine in [false, true] {
+        let over = http_worker("http://127.0.0.1:2", None);
+        over.set_overloaded(true);
+        let registry = registry_of(true, vec![http_worker("http://127.0.0.1:1", Some(0)), over])?;
+        let router = routed(&round_robin(true), &registry, engine)?;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let response = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            transcription(&router, MODEL, false, AUDIO_TYPE).await
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine {engine}"
+        );
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+            "engine {engine}"
+        );
+        assert!(
+            response.headers().contains_key(RETRY_AFTER),
+            "engine {engine}"
+        );
+        let rendered = recorder.handle().render();
+        assert_eq!(
+            series_total(
+                &rendered,
+                "smg_worker_overload_shed_total{",
+                &[r#"stage="selection""#]
+            ),
+            1,
+            "engine {engine}: {rendered}"
+        );
+    }
+    Ok(())
+}
+
+/// The two requests the route itself cannot place read the route's own
+/// refusals whoever places: a pool of workers that all registered a rank
+/// is the route's 400, and a model no worker serves is not found.
+#[tokio::test]
+async fn a_transcription_the_route_cannot_place_reads_its_refusal_whoever_places() -> Case {
+    for engine in [false, true] {
+        let registry = registry_of(false, vec![http_worker("http://127.0.0.1:1", Some(0))])?;
+        let router = routed(&round_robin(false), &registry, engine)?;
+        let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "engine {engine}"
+        );
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "dp_aware_not_supported",
+            "engine {engine}"
+        );
+        let response = transcription(&router, "unserved-model", false, AUDIO_TYPE).await;
+        assert_model_not_found(response, "unserved-model").await?;
+    }
+    Ok(())
+}
+
+/// The overload check between the pick and the send runs for a
+/// transcription whoever placed it. The engine of a document that does not
+/// shed steers to its one worker, which is over its thresholds; the
+/// gateway's own switch then sheds at the dispatch, and the worker takes no
+/// request.
+#[tokio::test]
+async fn a_transcription_placed_in_this_process_takes_the_overload_check_before_its_send() -> Case {
+    let (url, hits) = fixed_status_upstream(&[TRANSCRIBE], StatusCode::OK).await;
+    let router = own_router("round_robin", &[&url])?;
+    router.worker_registry.set_overload_shed(true);
+    for worker in router.worker_registry.get_all() {
+        assert!(router.worker_registry.set_worker_overloaded(&worker, true));
+    }
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let response = {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        transcription(&router, MODEL, false, AUDIO_TYPE).await
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        extract_error_code_from_response(&response),
+        overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let rendered = recorder.handle().render();
+    assert_eq!(
+        series_total(
+            &rendered,
+            "smg_worker_overload_shed_total{",
+            &[r#"stage="dispatch""#]
+        ),
+        1,
+        "{rendered}"
+    );
     Ok(())
 }
 

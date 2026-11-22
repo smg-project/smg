@@ -5,7 +5,8 @@
 //! tried, then whoever decides. Each line of the table below states one
 //! attempt, runs it through both sides, and reads the same workers taken and
 //! the same miss back. A step that moves a route onto the call adds its
-//! lines here.
+//! lines here. [`Placer::place_from`] is the same pass over a list its route
+//! made, and its lines read the same way.
 
 use std::collections::BTreeSet;
 
@@ -107,6 +108,24 @@ impl Sides {
         assert_eq!(classic, engine, "{line}: the classic side, then the engine");
         classic
     }
+
+    /// [`Self::agree`] for an attempt placed over `candidates`, a list its
+    /// route made of `pool` ([`Placer::place_from`]).
+    #[track_caller]
+    fn agree_from(
+        &self,
+        line: &str,
+        pool: RoutingPool,
+        candidates: &[Arc<dyn Worker>],
+        inputs: &PlacementInputs<'_>,
+    ) -> Seen {
+        let over = |placer: &Placer| {
+            Seen::repeated(|| placer.place_from(&self.registry, MODEL, pool, candidates, inputs))
+        };
+        let (classic, engine) = (over(&self.classic), over(&self.engine));
+        assert_eq!(classic, engine, "{line}: the classic side, then the engine");
+        classic
+    }
 }
 
 /// What a side did with one attempt, asked several times: the workers it
@@ -126,12 +145,18 @@ impl Seen {
         wire: Option<WireConstraint>,
         inputs: &PlacementInputs<'_>,
     ) -> Self {
+        Self::repeated(|| placer.place(registry, model, pool, wire, inputs))
+    }
+
+    /// What `place`, one attempt put to one side, did when it was
+    /// repeated [`TURNS`] times.
+    fn repeated(place: impl Fn() -> Result<Placed, Missed>) -> Self {
         let mut seen = Self {
             placed: BTreeSet::new(),
             missed: false,
         };
         for _ in 0..TURNS {
-            match placer.place(registry, model, pool, wire, inputs) {
+            match place() {
                 Ok(placed) => {
                     seen.placed.insert(placed.worker().url().to_owned());
                 }
@@ -464,4 +489,126 @@ fn both_sides_count_a_selection_and_the_steer_of_a_vetoed_pool() {
             "{side}: {rendered}"
         );
     }
+}
+
+/// A route that makes its own list places over it through both sides
+/// ([`Placer::place_from`]): the transcription route's list is its pool less
+/// the workers that registered a data-parallel rank. Both sides are handed
+/// that list and no other worker of the pool, and a miss is the route's to
+/// judge over the list.
+#[test]
+fn both_sides_place_over_a_list_its_route_made() {
+    const HTTP: RoutingPool = RoutingPool::HttpRegular;
+    let plain = PlacementInputs::default();
+    let ranked = |rank: usize| {
+        BasicWorkerBuilder::new("http://e:8000")
+            .model(ModelCard::new(MODEL))
+            .dp_config(rank, 2)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build()
+    };
+    let unranked = |sides: &Sides| -> Vec<Arc<dyn Worker>> {
+        sides
+            .registry
+            .get_routing_pool(MODEL, HTTP)
+            .iter()
+            .filter(|worker| !worker.is_dp_aware())
+            .cloned()
+            .collect()
+    };
+
+    let line = "a list keeps the pool's other workers out";
+    let sides = Sides::over(
+        vec![ranked(0), ranked(1), http("http://h:1"), http("http://h:2")],
+        false,
+    );
+    let list = unranked(&sides);
+    sides
+        .agree_from(line, HTTP, &list, &plain)
+        .placed_on(line, &["http://h:1", "http://h:2"]);
+
+    let line = "the request's own rule narrows a list too";
+    let rule = |worker: &dyn Worker| worker.url() != "http://h:2";
+    let ruled = PlacementInputs {
+        candidate_filter: Some(&rule),
+        ..Default::default()
+    };
+    sides
+        .agree_from(line, HTTP, &list, &ruled)
+        .placed_on(line, &["http://h:1"]);
+
+    let line = "a list with no worker places nobody";
+    sides
+        .agree_from(line, HTTP, &[], &plain)
+        .placed_nobody(line);
+
+    // One worker with no rank, over its thresholds, beside a free worker
+    // that registered a rank.
+    let over_beside_ranked = || {
+        let over = http("http://h:1");
+        over.set_overloaded(true);
+        vec![ranked(0), over]
+    };
+
+    let line = "a list over its thresholds is steered within the list";
+    let steering = Sides::over(over_beside_ranked(), false);
+    let list = unranked(&steering);
+    steering
+        .agree_from(line, HTTP, &list, &plain)
+        .placed_on(line, &["http://h:1"]);
+
+    let line = "a list over its thresholds places nobody where the gateway sheds";
+    let shedding = Sides::over(over_beside_ranked(), true);
+    let list = unranked(&shedding);
+    shedding
+        .agree_from(line, HTTP, &list, &plain)
+        .placed_nobody(line);
+    assert!(
+        matches!(
+            failure_from(&list, MODEL, true),
+            PlacementFailure::AllOverloaded(_)
+        ),
+        "{line}: the route's judgment over its list is the shed"
+    );
+    assert!(
+        matches!(
+            single_failure(&shedding.registry, MODEL, HTTP, None),
+            PlacementFailure::Unavailable
+        ),
+        "{line}: the pool whole holds a free worker, and is not shed"
+    );
+}
+
+/// The attempt of a request whose body is sent on unread: it names no model
+/// and states the tokens of its hint as its prompt. Both sides place it over
+/// every worker.
+#[test]
+fn both_sides_place_an_unread_body_over_every_worker() {
+    let sides = Sides::over(
+        vec![
+            worker("http://m:1", "m", ConnectionMode::Http, RuntimeType::Sglang),
+            worker("http://n:1", "n", ConnectionMode::Http, RuntimeType::Sglang),
+        ],
+        false,
+    );
+    let hint: Vec<u32> = (1..=64).collect();
+    let headers = HeaderMap::new();
+    let hinted = PlacementInputs {
+        tokens: Some(&hint),
+        headers: Some(&headers),
+        ..Default::default()
+    };
+    let line = "no model named, the hint's tokens as the prompt";
+    sides
+        .agree(
+            line,
+            UNKNOWN_MODEL_ID,
+            RoutingPool::HttpRegular,
+            None,
+            &hinted,
+        )
+        .placed_on(line, &["http://m:1", "http://n:1"]);
 }

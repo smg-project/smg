@@ -2487,7 +2487,7 @@ impl Held {
 }
 
 mod ride;
-pub(crate) use ride::{BehindAnswer, Sent};
+pub(crate) use ride::{AnsweredBy, BehindAnswer, Sent};
 #[cfg(test)]
 mod decode_again_tests;
 #[cfg(test)]

@@ -35,6 +35,23 @@ fn answered(response: &Response) -> bool {
     marks.get::<UpstreamAnswer>().is_some() || marks.get::<BehindAnswer>().is_some()
 }
 
+/// Who gave the answer a regular route returns, as the route knows it at
+/// its end ([`Sent::end_with`]). The worker's breaker and its load report are
+/// charged for an answer the worker gave, and for no other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnsweredBy {
+    /// The worker. The route read the worker's head, and what it returns is
+    /// the worker's own answer or one the gateway made behind that head.
+    Worker,
+    /// Nobody. The request reached no worker: the send failed, and the
+    /// answer is the gateway's own.
+    Nobody,
+    /// The route does not know, and the response says. The relay of a
+    /// worker's answer marks the response it builds; an answer the gateway
+    /// made with no worker's head carries no mark, and is nobody's.
+    AsTheResponseSays,
+}
+
 /// The end of the drain of a pair's prefill, which the drain shares with
 /// the placement. The drain outlives the attempt that sent it, and it can
 /// outlive the answer's body. A placement whose answer ended first is left
@@ -254,6 +271,38 @@ impl Sent {
                 self.placed.decode_completed(end, now);
             }
         }
+    }
+
+    /// Ends the placement a regular route's request was sent under with
+    /// `response`, the answer the route returns, and hands that response
+    /// back: the one end of such a route.
+    ///
+    /// A route that kept no placement, since nothing was owed of it, gets
+    /// its response back and nothing is read of it. Where the answer's body
+    /// is still `streaming` after this return, the placement is held to the
+    /// end of that body ([`Self::held_to_the_end_of`]). Else the request
+    /// ends here with the whole answer, given `by` the worker or by nobody
+    /// ([`Self::ended`]): the clock is read for such an end alone.
+    #[inline]
+    pub(crate) fn end_with(
+        sent: Option<Self>,
+        response: Response,
+        streaming: bool,
+        by: AnsweredBy,
+    ) -> Response {
+        let Some(sent) = sent else {
+            return response;
+        };
+        if streaming {
+            return sent.held_to_the_end_of(response);
+        }
+        let answered = match by {
+            AnsweredBy::Worker => true,
+            AnsweredBy::Nobody => false,
+            AnsweredBy::AsTheResponseSays => answered(&response),
+        };
+        sent.ended(response.status(), answered, Instant::now());
+        response
     }
 
     /// `response` with this placement held to the end of its body. The body

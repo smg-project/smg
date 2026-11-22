@@ -518,6 +518,101 @@ pub mod bench_support {
         Some(went)
     }
 
+    /// The three sites of the regular HTTP router that place a request:
+    /// each states its attempt in its own way and makes the one placing
+    /// call.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HttpSite {
+        /// A typed request: a model named, the pool as the registry lists
+        /// it, the overload veto read at the dispatch.
+        Typed,
+        /// A request whose body is streamed to its worker unread: no model
+        /// named, placed over every HTTP worker from its tokens hint, no
+        /// overload veto read at the dispatch.
+        StreamedBody,
+        /// A multipart transcription: placed over the pool's workers that
+        /// registered no data-parallel rank, a list made for the request,
+        /// the overload veto read at the dispatch.
+        Transcription,
+    }
+
+    /// One request's routing at `site` of the regular HTTP router, as its
+    /// router runs that site for whoever places: the typed site is
+    /// `route_http`, and the other two state their attempt as their route
+    /// does, make the one placing call and tell the placement its dispatch
+    /// and its end. The place of the worker the request went to, and `None`
+    /// where it had no worker.
+    pub fn route_http_at(
+        site: HttpSite,
+        registry: &WorkerRegistry,
+        placer: &CellPlacer,
+        model: &str,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = RoutingPool::HttpRegular;
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let placed = match site {
+            HttpSite::Typed => return route_http(registry, placer, model, tokens, headers),
+            // The request names no model: it is placed under the no-model
+            // id, and a request nobody is placed for goes back unjudged.
+            HttpSite::StreamedBody => placer
+                .0
+                .place(
+                    registry,
+                    openai_protocol::UNKNOWN_MODEL_ID,
+                    pool,
+                    None,
+                    &inputs,
+                )
+                .ok()?,
+            // The route makes its list for each request, places over it,
+            // and reads the chosen worker's overload veto.
+            HttpSite::Transcription => {
+                let all_workers = registry.get_routing_pool(model, pool);
+                if all_workers.is_empty() {
+                    return None;
+                }
+                let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
+                    .iter()
+                    .filter(|w| !w.is_dp_aware())
+                    .cloned()
+                    .collect();
+                if non_dp_workers.is_empty() {
+                    return None;
+                }
+                let placed = placer
+                    .0
+                    .place_from(registry, model, pool, &non_dp_workers, &inputs)
+                    .ok()?;
+                let shed = overload::shed_if_worker_overloaded(
+                    placed.worker().as_ref(),
+                    model,
+                    registry.overload_shed_enabled(),
+                );
+                if shed.is_some() {
+                    return None;
+                }
+                placed
+            }
+        };
+        let (worker, mut sent) = Sent::of(placed);
+        if let Some(sent) = &mut sent {
+            sent.dispatched(Instant::now());
+        }
+        let went = placed_on(&worker);
+        let guard = WorkerLoadGuard::with_key(worker, placer.0.session_key(headers, None));
+        drop(guard);
+        if let Some(sent) = sent {
+            sent.ended(StatusCode::OK, true, Instant::now());
+        }
+        Some(went)
+    }
+
     /// One request's routing by the gateway's engine object on `route`, as
     /// a regular router's arm runs it: the prompt's hashes, the ask over
     /// the route's pool and the commit of the first target the gateway can

@@ -47,6 +47,15 @@
 //! two side policies the classic ones or the objects that ask the engine.
 //! `--not-ready` and `--ready` then hold for each side.
 //!
+//! `--site typed|streamed|transcription` names the site of the regular
+//! HTTP router a single request is placed at (`--route http`, by the
+//! classic policies or the engine object). `typed`, the default, is a typed
+//! request. `streamed` is a request whose body is streamed to its worker
+//! unread: it names no model and no overload veto is read after its
+//! placement. `transcription` is a multipart transcription: it is placed
+//! over a list made for the request, the pool's workers that registered no
+//! data-parallel rank.
+//!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it,
 //! on both paths. `0`, the default, sends no key.
@@ -126,8 +135,8 @@ use smg::{
         common::{
             bench_support::{
                 attach_loads, policies_asking_the_engine, route_classic, route_engine, route_http,
-                route_pair, route_records, set_pair_sides, thread_allocated_bytes, CellPlacer,
-                EngineObject, EngineOverRecords, Route,
+                route_http_at, route_pair, route_records, set_pair_sides, thread_allocated_bytes,
+                CellPlacer, EngineObject, EngineOverRecords, HttpSite, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -190,6 +199,8 @@ struct Cell {
     /// The tokens a request adds to its caller's conversation; `0` for the
     /// prompts in turn.
     grow: usize,
+    /// The site of the regular HTTP router a single request is placed at.
+    site: HttpSite,
 }
 
 fn cell() -> Cell {
@@ -210,6 +221,7 @@ fn cell() -> Cell {
         prompts: 1,
         publish_ms: 0,
         grow: 0,
+        site: HttpSite::Typed,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -243,6 +255,14 @@ fn cell() -> Cell {
             "--prompts" => cell.prompts = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             "--grow" => cell.grow = value.parse().unwrap(),
+            "--site" => {
+                cell.site = match value.as_str() {
+                    "typed" => HttpSite::Typed,
+                    "streamed" => HttpSite::StreamedBody,
+                    "transcription" => HttpSite::Transcription,
+                    other => panic!("no site {other}"),
+                }
+            }
             other => panic!("no flag {other}"),
         }
     }
@@ -626,6 +646,11 @@ fn build(cell: &Cell) -> Built {
         Decider::Engine(object) if route == Route::Http => Some(CellPlacer::engine(object)),
         Decider::Policies(_) | Decider::Engine(_) | Decider::Records(_) => None,
     };
+    let site = cell.site;
+    assert!(
+        site == HttpSite::Typed || placer.is_some(),
+        "a site other than the typed one is the regular HTTP router's, on the classic or the engine path"
+    );
     assert!(
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
@@ -638,6 +663,9 @@ fn build(cell: &Cell) -> Built {
             count => keys.get((turn % count as u64) as usize),
         };
         if let Some(placer) = &placer {
+            if site != HttpSite::Typed {
+                return route_http_at(site, &registry, placer, model, Some(tokens), headers);
+            }
             return route_http(&registry, placer, model, Some(tokens), headers);
         }
         match &*decider {
@@ -793,9 +821,10 @@ fn main() {
         returned as f64 / turns as f64
     };
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} site={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
+        cell.site,
         cell.policy,
         cell.workers,
         cell.callers,

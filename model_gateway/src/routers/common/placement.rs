@@ -514,8 +514,65 @@ impl Placer {
                 };
                 worker.map(Placed::of_worker).ok_or(Missed::Nobody)
             }
-            Self::Engine(engine, policies) => {
-                place_by_engine(engine, policies, registry, model, pool, wire, inputs)
+            Self::Engine(engine, policies) => place_by_engine(
+                engine,
+                policies,
+                registry,
+                model,
+                pool,
+                inputs,
+                |side, snapshot| select_of(registry, side, model, snapshot, pool, wire, *inputs),
+            ),
+        }
+    }
+
+    /// [`Self::place`] over a part of `pool`: the workers the route may
+    /// take, in the pool's order, a list nobody names. The entry for a route
+    /// with a rule on a worker that it applies itself, as the transcription
+    /// route drops the data-parallel workers of a path that cannot pin a
+    /// rank. The route judges a miss over the same list ([`failure_from`]).
+    ///
+    /// The classic side is [`select_from`]. The engine's side decides over
+    /// the list as the workers the request may take, of the pool it names.
+    #[inline]
+    pub(crate) fn place_from(
+        &self,
+        registry: &WorkerRegistry,
+        model: &str,
+        pool: RoutingPool,
+        candidates: &[Arc<dyn Worker>],
+        inputs: &PlacementInputs<'_>,
+    ) -> Result<Placed, Missed> {
+        match self {
+            Self::Classic(policies) => select_from(registry, policies, model, candidates, *inputs)
+                .map(Placed::of_worker)
+                .ok_or(Missed::Nobody),
+            Self::Engine(engine, policies) => place_by_engine(
+                engine,
+                policies,
+                registry,
+                model,
+                pool,
+                inputs,
+                |side, _| select_among(registry, side, model, candidates, None, *inputs),
+            ),
+        }
+    }
+
+    /// Whether a placement needs the request's text, so that its body must
+    /// be read: what a route asks ahead of a body it would send on unread.
+    /// The classic policies answer by what each reads of a request's text
+    /// ([`PolicyRegistry::any_policy_needs_request_text`]), and the policy
+    /// engine of this process by the document in force
+    /// ([`PolicyEngine::reads_body`]). A valid tokens hint in `headers`
+    /// lifts the read for both. Under a controller's address the classic
+    /// answer stands: such a gateway sends no body on unread.
+    pub(crate) fn needs_request_text(&self, headers: &HeaderMap) -> bool {
+        match self {
+            Self::Engine(engine, _) if engine.in_process() => engine
+                .reads_body(|| header_utils::parse_routing_tokens_hint(Some(headers)).is_some()),
+            Self::Classic(policies) | Self::Engine(_, policies) => {
+                policies.any_policy_needs_request_text(Some(headers))
             }
         }
     }
@@ -600,10 +657,13 @@ impl Placer {
     }
 }
 
-/// The policy engine's side of [`Placer::place`]: the pass every placement
-/// runs ([`select_of`]) with the engine as who decides ([`EngineSide`]),
-/// over one read of the registry, the snapshot the inputs state or else the
-/// model's as the registry holds it now.
+/// The policy engine's side of [`Placer::place`] and [`Placer::place_from`]:
+/// a selection with the engine as who decides ([`EngineSide`]), over one
+/// read of the registry, the snapshot the inputs state or else the model's
+/// as the registry holds it now. `select` is the selection the entry runs:
+/// the pass every placement runs over `pool` of that snapshot
+/// ([`select_of`]), or the same pass over a part of the pool the route made
+/// ([`select_among`]).
 ///
 /// The engine's verdict on a request it did not place stands beside the
 /// pass. Where it says the engine found no worker to send to, the miss is
@@ -617,8 +677,8 @@ fn place_by_engine(
     registry: &WorkerRegistry,
     model: &str,
     pool: RoutingPool,
-    wire: Option<WireConstraint>,
     inputs: &PlacementInputs<'_>,
+    select: impl FnOnce(&EngineSide<'_>, &ModelWorkerSnapshot) -> Option<Placed>,
 ) -> Result<Placed, Missed> {
     debug_assert!(
         engine.in_process(),
@@ -640,7 +700,7 @@ fn place_by_engine(
         inputs,
         verdict: Cell::new(None),
     };
-    if let Some(placed) = select_of(registry, &side, model, snapshot, pool, wire, *inputs) {
+    if let Some(placed) = select(&side, snapshot) {
         return Ok(placed);
     }
     Err(match side.verdict.take() {

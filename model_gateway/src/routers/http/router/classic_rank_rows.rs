@@ -199,13 +199,13 @@ impl Bed {
         for _ in 0..ROUNDS * self.workers.len().max(1) {
             match self
                 .router
-                .select_transcription_worker(None, MODEL, &routing)
+                .place_transcription(None, None, MODEL, false, &routing)
             {
-                Ok(worker) => {
+                Ok(taken) => {
                     let at = self
                         .workers
                         .iter()
-                        .position(|w| w.url() == worker.url())
+                        .position(|w| w.url() == taken.worker().url())
                         .expect("a worker of the row");
                     placed.insert(at);
                 }
