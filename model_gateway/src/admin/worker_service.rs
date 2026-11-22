@@ -897,8 +897,9 @@ impl WorkerService {
                 .filter(|status| status.job_type == Job::REGISTRATION_TYPE)
         };
         if let Some(mut status) = in_flight.or_else(failed) {
-            // The address as the job's own lines write it.
-            status.worker_url = Endpoint::redacted_str(&status.worker_url);
+            // A plain address as registered, any other as the gateway's log
+            // lines write it.
+            status.worker_url = Endpoint::redacted_url(&status.worker_url);
             return Ok(GetWorkerResponse(WorkerInfo::pending(
                 worker_id.as_str(),
                 status.worker_url.clone(),
