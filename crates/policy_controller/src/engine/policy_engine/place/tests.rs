@@ -25,7 +25,7 @@ use crate::{
         framework::{Filter, Picker, Place, TieBand},
         records::worker_id,
         view::{fingerprint, Candidate, FixedFacts, HashKind},
-        PairAdmission, PairLists, PartnerClasses,
+        EncodeLists, PairAdmission, PairLists, PartnerClasses,
     },
     policies::consistent_hashing::InOrder as Lent,
     stages::{pickers::push_drawn, registry::StageRegistry, Lifecycle},
@@ -153,6 +153,17 @@ fn pair_of<'a>(members: &'a PoolMembers, classes: &'a PartnerClasses) -> PairLis
         prefill_places: None,
         decode_places: None,
     }
+}
+
+/// An encode request's three lists: `pair` and its prefills as the
+/// encoders, with nothing said of them.
+fn three_of(pair: PairLists<'_>) -> WorkerLists<'_> {
+    WorkerLists::Encode(EncodeLists {
+        pair,
+        encoders: pair.prefill,
+        facts: &[],
+        prefill_classes: &[],
+    })
 }
 
 fn preset(name: &str) -> PolicyEngine {
@@ -301,6 +312,10 @@ fn a_request_is_made_of_what_its_caller_states() {
     let made = Made::new(&engine, &paired, &[]);
     assert_eq!(made.make(engine.spec()).facts.phase, Phase::Prefill);
     assert_eq!(made.plain().map(|plain| plain.phase), Some(Phase::Prefill));
+    // And so is a request with an encode request's three.
+    let three = PlaceRequest::of(MODEL, three_of(pair));
+    let made = Made::new(&engine, &three, &[]);
+    assert_eq!(made.make(engine.spec()).facts.phase, Phase::Prefill);
     // A client's tokens and text reach no log line.
     let prompt = Prompt {
         tokens: Some(&[7, 8, 9]),
@@ -896,6 +911,14 @@ fn a_request_with_no_worker_is_answered_why() {
     assert_eq!(
         engine.place(&none).err(),
         shed(ShedReason::NoEndpoints, "none")
+    );
+    // An encode request's three lists, with no item stated, are declined
+    // by name.
+    let partners = PartnerClasses::number(2, [&[0_u32, 1][..], &[0, 1][..]]);
+    let three = PlaceRequest::of(MODEL, three_of(pair_of(&members, &partners)));
+    assert_eq!(
+        engine.place(&three).err(),
+        shed(ShedReason::PolicyDeclined, "encode-lists")
     );
     let demands = Demands {
         vision: true,

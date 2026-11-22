@@ -227,10 +227,11 @@ impl<'a> PlaceRequest<'a> {
     }
 
     /// The phase the request is decided at: a pair is asked at its
-    /// prefill, and every other request is single.
+    /// prefill, over its two lists or an encode request's three, and every
+    /// other request is single.
     const fn phase(&self) -> Phase {
         match self.lists {
-            WorkerLists::Pair(_) => Phase::Prefill,
+            WorkerLists::Pair(_) | WorkerLists::Encode(_) => Phase::Prefill,
             WorkerLists::None | WorkerLists::Single(_) => Phase::Single,
         }
     }
@@ -488,6 +489,11 @@ pub(super) fn ready(worker: &dyn Worker) -> bool {
 /// What a request that carries encode items is declined under.
 const ENCODE_ITEMS: &str = "encode-items";
 
+/// What a request that hands an encode request's three lists and carries
+/// no item is declined under: this call does not ask the engine's entry for
+/// an encode request yet.
+const ENCODE_LISTS: &str = "encode-lists";
+
 /// The refusal of a request this call does not place, by name: the shed a
 /// decision answers for what no stage of it runs.
 const fn declined(stated: &'static str) -> Unplaced {
@@ -667,6 +673,9 @@ impl PolicyEngine {
     /// each of its lists holds a worker: a pair's decision narrows neither
     /// list by a demand.
     ///
+    /// A request that hands an encode request's three lists and carries no
+    /// item is declined by name too (`encode-lists`).
+    ///
     /// Its caller counts each request it sends under the placement's
     /// routing value on the request's worker, as that worker's load guard
     /// does. The decision is told that the count stands
@@ -711,6 +720,7 @@ impl PolicyEngine {
             }
             WorkerLists::Single(members) => single(self, request, Some(members)),
             WorkerLists::None => single(self, request, None),
+            WorkerLists::Encode(_) => Err(declined(ENCODE_LISTS)),
         }
     }
 }

@@ -36,7 +36,9 @@
 //! ([`HeldDecision`]). A single request is decided in [`single`], and a pair
 //! in [`pair`], with its decode asked again behind its prefill. Where a
 //! single's binding names a shadow, that profile decides after the whole
-//! decision and its decision is counted ([`with_shadow`]).
+//! decision and its decision is counted ([`with_shadow`]). An encode
+//! request is decided with its pair in [`encode`], over three lists
+//! ([`PolicyEngine::decide_encode_at`]).
 //!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation, and for the stages
@@ -68,7 +70,10 @@ use std::{
 use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
-use self::overlap::{Affinity, PoolAffinity};
+use self::{
+    encode::EncodeLists,
+    overlap::{Affinity, PoolAffinity},
+};
 use super::{
     decision::ShadowKind,
     decision_engine::{
@@ -667,6 +672,10 @@ impl PolicyEngine {
     /// whole decision drew, for a host that hands a decision's targets to
     /// another process and cannot ask again cheaply.
     ///
+    /// A request at its prefill that hands an encode request's three lists
+    /// ([`WorkerLists::Encode`]) is decided as its pair, over the pair's
+    /// two of the three.
+    ///
     /// A binding's shadow decides behind the live decision, as under the
     /// leasing entry. What it said is answered beside the decision and
     /// counted nowhere here: the caller counts it once its own filing of
@@ -701,8 +710,12 @@ impl PolicyEngine {
                     Ok(self.decide_made(maker, &mut request, members, now, &mut said))
                 }
                 // A pair is decided at its prefill, over its host's two
-                // lists.
-                (Phase::Prefill, WorkerLists::Pair(lists)) => {
+                // lists, and so is a request that hands an encode
+                // request's three.
+                (
+                    Phase::Prefill,
+                    WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }),
+                ) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
                     Ok(pair::decide(self, &lists, &mut request, None, loads, now))
@@ -742,7 +755,7 @@ impl PolicyEngine {
         self.caught(|| {
             let mut request = self.made(maker);
             Ok(match maker.workers() {
-                WorkerLists::Pair(lists) => {
+                WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
                     pair::decide(self, &lists, &mut request, Some(held), loads, now)
@@ -857,8 +870,12 @@ impl PolicyEngine {
                 decision
             }
             // A pair is decided at its prefill, over its host's two
-            // lists.
-            (Phase::Prefill, WorkerLists::Pair(lists)) => {
+            // lists. An encode request's three hand its pair's two: a
+            // request that states no item here is its pair's alone.
+            (
+                Phase::Prefill,
+                WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }),
+            ) => {
                 let read = self.loads_read(maker);
                 let loads = read.snapshot();
                 let decided = pair::decided(self, &lists, &mut request, None, loads, now);
@@ -916,7 +933,9 @@ impl DecisionEngine for PolicyEngine {
         self.caught(|| {
             let mut request = self.made(maker);
             Ok(match maker.workers() {
-                WorkerLists::Pair(lists) => {
+                // An encode request's decode is asked again over its
+                // pair's two lists.
+                WorkerLists::Pair(lists) | WorkerLists::Encode(EncodeLists { pair: lists, .. }) => {
                     let read = self.loads_read(maker);
                     let loads = read.snapshot();
                     pair::decided(self, &lists, &mut request, Some(held), loads, now)
@@ -926,7 +945,9 @@ impl DecisionEngine for PolicyEngine {
         })
     }
 
-    // A side sent on its own: the encode family's pair has no entry here.
+    // A side sent on its own: a request stated ahead hands no list. A host
+    // of this engine asks with its three lists
+    // (`PolicyEngine::decide_encode_at`).
     fn decide_encode_pair(
         &self,
         _: GatewayId,
