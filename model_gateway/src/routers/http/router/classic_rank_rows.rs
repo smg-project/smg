@@ -197,10 +197,21 @@ impl Bed {
         };
         let mut placed = BTreeSet::new();
         for _ in 0..ROUNDS * self.workers.len().max(1) {
-            match self
+            // A first attempt: nothing answered yet and nothing tried.
+            let selected = self
                 .router
-                .select_transcription_worker(None, MODEL, &routing)
-            {
+                .transcription_candidates(MODEL)
+                .and_then(|candidates| {
+                    self.router.select_transcription_worker(
+                        None,
+                        MODEL,
+                        &routing,
+                        &candidates,
+                        &AttemptLedger::default(),
+                        &parking_lot::Mutex::new(Vec::new()),
+                    )
+                });
+            match selected {
                 Ok(worker) => {
                     let at = self
                         .workers
