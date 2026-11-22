@@ -919,9 +919,10 @@ impl Format {
     /// answer (the response tags, the message close) frame the answer, not the thought, and stay
     /// dropped on every row they move: the think tags the model wrote stay and the answer comes
     /// back bare, and a thought that the response tag itself ends runs straight into the answer.
-    /// A state's own text rows stay with it: a trimmed stay is still trimmed, a framing state's
-    /// text still dropped; and a tag the end cut short is still dropped, as the legacy parsers
-    /// drop it on both their paths.
+    /// The markers on a row that stays in a content state (Command's response tags) frame the
+    /// answer inside that state and stay dropped too. A state's own text rows stay with it: a
+    /// trimmed stay is still trimmed, a framing state's text still dropped; and a tag the end cut
+    /// short is still dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
     /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
@@ -939,7 +940,9 @@ impl Format {
             .iter()
             .filter(|row| {
                 let answer = |state: usize| self.emits(state) == Emits::Content;
-                wrapped && ((row.from == 0 && answer(row.to)) || (row.to == 0 && answer(row.from)))
+                (wrapped
+                    && ((row.from == 0 && answer(row.to)) || (row.to == 0 && answer(row.from))))
+                    || (row.from == row.to && answer(row.to))
             })
             .map(|row| row.on)
             .collect();

@@ -88,4 +88,25 @@ mod tests {
             assert_eq!(content(&run(output)), "Hello!", "{output}");
         }
     }
+
+    #[test]
+    fn without_its_thought_the_answer_reads_bare_and_the_call_still_reads() {
+        // The answer's markers frame the answer, not the thought: where the thought's own are
+        // shown they stay dropped, as the legacy tool parser strips them.
+        let events = drive(
+            &mut Engine::new(command().without_reasoning(), Declared::default()),
+            "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+            &[
+                "<|START_THINKING|>Hm.<|END_THINKING|><|START_RESPONSE|>Checking.<|END_RESPONSE|>\
+               <|START_ACTION|>[{\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \
+               \"parameters\": {\"city\": \"Paris\"}}]<|END_ACTION|>",
+            ],
+        );
+        assert_eq!(
+            content(&events),
+            "<|START_THINKING|>Hm.<|END_THINKING|>Checking."
+        );
+        assert_eq!(reasoning(&events), "");
+        assert_eq!(calls(&events).len(), 1);
+    }
 }
