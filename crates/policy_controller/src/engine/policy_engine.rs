@@ -45,6 +45,7 @@ mod keys;
 pub mod overlap;
 pub(super) mod pair;
 mod single;
+mod task;
 
 use std::{
     cell::RefCell,
@@ -102,6 +103,9 @@ pub struct PolicyEngine {
     /// How many words of a lease and changes of membership panicked in a
     /// stage that heard them.
     unheard: AtomicU64,
+    /// How many runs of the upkeep panicked in the engine's own task
+    /// ([`Self::upkeep_faults`]).
+    upkeep_faults: AtomicU64,
     /// The id of the last lease issued. A pick that is issued one writes
     /// it: one atomic step, on cache lines of its own.
     leases: OwnWord,
@@ -114,6 +118,10 @@ pub struct PolicyEngine {
     /// of cache events, once it handed them, and the engine's record of the
     /// prefixes it sent, one a model ([`Self::affinity`]).
     affinity: Affinity,
+    /// The host's load channel, once it handed it ([`Self::set_loads`]),
+    /// and the newest snapshot the engine's own task keeps at hand
+    /// ([`Self::run`]).
+    loads: task::Loads,
 }
 
 /// One pool of one model as the engine keeps it: the gateway's shared list
@@ -249,8 +257,10 @@ impl PolicyEngine {
             clock: DecisionClock::new(),
             faults: AtomicU64::new(0),
             unheard: AtomicU64::new(0),
+            upkeep_faults: AtomicU64::new(0),
             leases: OwnWord(AtomicU64::new(0)),
             affinity: Affinity::default(),
+            loads: task::Loads::default(),
         }
     }
 
@@ -535,6 +545,29 @@ impl PolicyEngine {
         }
     }
 
+    /// A made single request's whole decision over its host's list, for
+    /// every entry that decides one. It reads the snapshot the request
+    /// gives where it gives one, and the newest the engine's own task
+    /// keeps at hand otherwise.
+    #[inline]
+    fn decide_made<'a>(
+        &self,
+        maker: &impl RequestMaker,
+        request: &mut Request<'a>,
+        members: &'a PoolMembers,
+        now: Instant,
+    ) -> super::decision::Decision {
+        let kept;
+        let loads = match maker.loads() {
+            Some(given) => Some(given),
+            None => {
+                kept = self.loads.newest();
+                kept.as_ref().and_then(|newest| newest.as_ref())
+            }
+        };
+        single::decide(self, request, members, loads, now)
+    }
+
     /// The decision's pass: the place it answers, or its whole decision
     /// written into `whole` with whether the request made stated the later
     /// decode.
@@ -568,7 +601,7 @@ impl PolicyEngine {
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
             (Phase::Single, WorkerLists::Single(members)) => {
-                single::decide(self, &mut request, members, maker.loads(), now)
+                self.decide_made(maker, &mut request, members, now)
             }
             // A pair is decided at its prefill, over its host's two
             // lists.

@@ -9,10 +9,12 @@
 //! does a decision that is not leased. A leased one is held by a guard,
 //! which is told the dispatch and the end ([`DecisionGuard`]).
 //!
-//! The request is made, the clock read and the load snapshot borrowed
-//! where the engine asks for them, the snapshot under a document that reads
-//! load reports alone: a place answered alone takes none. No other work of
-//! a host is done: no route, no metric, no in-flight count.
+//! The request is made and the clock read where the engine asks for them.
+//! The load snapshot is the engine's own: the host hands its load monitor's
+//! channel once and spawns the engine's task ([`PolicyEngine::run`]), which
+//! keeps the newest snapshot at hand under a document that reads load
+//! reports. No other work of a host is done: no route, no metric, no
+//! in-flight count.
 //!
 //! ```text
 //! cargo bench -p smg-policy-controller --features in-process --bench in_process -- \
@@ -50,6 +52,7 @@ use std::{
     cell::OnceCell,
     collections::HashMap,
     env,
+    future::pending,
     hint::black_box,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -72,7 +75,7 @@ use smg_policy_controller::{
 };
 use smg_worker::{
     identity::basic::Worker,
-    load::state::{one_rank_load, LoadReceiver, LoadSnapshot, TestFeed},
+    load::state::{one_rank_load, TestFeed},
     test_support::ready_worker,
     worker::WorkerLoadResponse,
 };
@@ -80,6 +83,7 @@ use smg_worker::{
 // it, with its calls counted: what a decision costs depends on it.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 use tikv_jemallocator::Jemalloc as Allocator;
+use tokio::{runtime::Builder, time::sleep};
 
 #[global_allocator]
 static GLOBAL: Counting<Allocator> = Counting(Allocator);
@@ -277,11 +281,10 @@ fn reports(workers: &[Arc<dyn Worker>]) -> HashMap<String, WorkerLoadResponse> {
 }
 
 /// One turn's request as its host states it: made where the engine makes
-/// one, with the load snapshot borrowed where the engine first asks for it.
+/// one. It gives no load snapshot: the engine reads its own.
 struct Stated<'a> {
     host: &'a Host,
     seed: u64,
-    loads: OnceCell<Arc<LoadSnapshot>>,
 }
 
 impl RequestMaker for Stated<'_> {
@@ -300,20 +303,14 @@ impl RequestMaker for Stated<'_> {
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(&self.host.members)
     }
-
-    fn loads(&self) -> Option<&Arc<LoadSnapshot>> {
-        let feed = self.host.loads.as_ref()?;
-        Some(self.loads.get_or_init(|| feed.borrow().clone()))
-    }
 }
 
-/// A list of worker objects as a host keeps it: the engine with what it
-/// keeps of the list, the load monitor's feed where the document reads load
-/// reports, and the cell's request.
+/// A list of worker objects as a host keeps it: the engine, which stands
+/// as long as the process, with what it keeps of the list, and the cell's
+/// request.
 struct Host {
-    engine: PolicyEngine,
+    engine: &'static PolicyEngine,
     members: PoolMembers,
-    loads: Option<LoadReceiver>,
     request: fn(u64) -> Request<'static>,
     plain: Option<Plain>,
 }
@@ -322,11 +319,7 @@ impl Host {
     /// One request by the engine's one entry: the place in the list it was
     /// sent to, with the dispatch and the end told where a decision is leased.
     fn place(&self, seed: u64) -> Option<u32> {
-        let stated = Stated {
-            host: self,
-            seed,
-            loads: OnceCell::new(),
-        };
+        let stated = Stated { host: self, seed };
         // The instant the engine dated the decision at, where it dated one.
         let dated = OnceCell::new();
         let clock = || *dated.get_or_init(Instant::now);
@@ -337,7 +330,7 @@ impl Host {
                 if decided.lease.is_some() {
                     let now = *dated.get()?;
                     let mut held =
-                        DecisionGuard::holding(&self.engine, GatewayId::LOCAL, decided, later, now);
+                        DecisionGuard::holding(self.engine, GatewayId::LOCAL, decided, later, now);
                     Self::told(&mut held, target.id, now);
                 }
                 Some(target.position)
@@ -382,22 +375,45 @@ fn main() {
         }
     }
     let document = document();
-    let engine = PolicyEngine::new(AppliedSpec::validate(&document).expect("a valid document"));
-    behind(&engine);
+    let spec = AppliedSpec::validate(&document).expect("a valid document");
+    let engine: &'static PolicyEngine = Box::leak(Box::new(PolicyEngine::new(spec)));
+    behind(engine);
     let members = engine.pool_members(&workers);
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
     let loads = reports(&workers);
     feed.publish(&loads);
-    let feed_read = engine.spec().needs().loads;
+    // What a host does once: it hands its load monitor's channel and spawns
+    // the engine's task, here on a runtime of its own.
+    engine.set_loads(receiver.expect("the feed's channel"));
+    let upkeep = Builder::new_current_thread().enable_time().build();
+    let upkeep = upkeep.expect("a runtime");
+    upkeep.spawn(engine.run());
     let host = Host {
         engine,
         members,
-        loads: receiver.filter(|_| feed_read),
         request,
         plain: request(0).plain(),
     };
     let decide = |seed: u64| host.place(seed);
+    // The task's first step is taken ahead of the list's first requests:
+    // the runtime is turned for it, then requests are made until one reads
+    // the engine's snapshot, each try a request of its own. A list converts
+    // its reports once its requests have looked up as many as it holds, so
+    // the tries follow the list's length. A thread of its own turns the
+    // runtime from then on.
+    let read = || !engine.spec().needs().loads || host.members.conversions() > 0;
+    for probe in 0..1_000 + run.workers as u64 {
+        if read() {
+            break;
+        }
+        if probe < 16 {
+            upkeep.block_on(async { sleep(Duration::from_millis(1)).await });
+        }
+        black_box(decide(mix(probe)));
+    }
+    assert!(read(), "the engine's task keeps the reports at hand");
+    thread::spawn(move || upkeep.block_on(pending::<()>()));
     // The list's first requests, untimed: what they build once.
     for turn in 0..(run.workers as u64 * 8).max(4_096) {
         assert!(decide(mix(turn)).is_some(), "a worker takes it");

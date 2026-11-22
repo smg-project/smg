@@ -1,0 +1,178 @@
+//! The engine's own task: what a host of the engine no longer does by hand.
+//!
+//! A host hands the engine its load monitor's channel
+//! ([`PolicyEngine::set_loads`]) and spawns [`PolicyEngine::run`] once. The
+//! task runs the engine's upkeep once a second and keeps the newest load
+//! snapshot at hand, so a single request's decision whose request gives
+//! none reads the engine's and never touches the channel.
+
+use std::{
+    fmt,
+    future::pending,
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use arc_swap::{ArcSwapOption, Guard};
+use parking_lot::Mutex;
+use smg_worker::load::state::{LoadReceiver, LoadSnapshot};
+use tokio::time::{self, MissedTickBehavior};
+
+use super::PolicyEngine;
+use crate::engine::{
+    decision_engine::{DecisionEngine, SweepOutcome},
+    framework::release,
+};
+
+/// How often the task runs the engine's upkeep.
+const UPKEEP: Duration = Duration::from_secs(1);
+
+/// The engine's own view of its host's load channel.
+#[derive(Default)]
+pub(super) struct Loads {
+    /// The channel the host handed last, with the count of its hand-overs
+    /// ([`PolicyEngine::set_loads`]). The task takes the lock once a
+    /// second, and no decision takes it.
+    feed: Mutex<(u64, Option<LoadReceiver>)>,
+    /// Whether the host ever handed a channel: a decision of an engine
+    /// handed none reads this one word.
+    handed: AtomicBool,
+    /// The newest snapshot the engine's task read from the channel. The
+    /// task alone writes it ([`PolicyEngine::run`]).
+    newest: ArcSwapOption<LoadSnapshot>,
+}
+
+impl fmt::Debug for Loads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Loads")
+            .field("hand_overs", &self.feed.lock().0)
+            .field("at_hand", &self.newest.load().is_some())
+            .finish()
+    }
+}
+
+impl Loads {
+    /// The newest snapshot at hand, for a single request's decision whose
+    /// request gives none: none where the host handed no channel, or the
+    /// task has not read it yet.
+    #[inline]
+    pub(super) fn newest(&self) -> Option<Guard<Option<Arc<LoadSnapshot>>>> {
+        let handed = self.handed.load(Ordering::Relaxed);
+        handed.then(|| self.newest.load())
+    }
+
+    /// The channel the host handed last and its count, where the task took
+    /// the hand-over of another count: `taken`.
+    fn handed_past(&self, taken: u64) -> Option<(u64, Option<LoadReceiver>)> {
+        let feed = self.feed.lock();
+        (feed.0 != taken).then(|| feed.clone())
+    }
+
+    /// Keeps the newest snapshot of `feed` at hand.
+    fn keep(&self, feed: Option<&mut LoadReceiver>) {
+        if let Some(feed) = feed {
+            let newest = Arc::clone(&feed.borrow_and_update());
+            self.newest.store(Some(newest));
+        }
+    }
+}
+
+/// The load monitor's next publication on `feed`: `false` where the monitor
+/// ended. Never ready with no channel.
+async fn published(feed: Option<&mut LoadReceiver>) -> bool {
+    match feed {
+        Some(feed) => feed.changed().await.is_ok(),
+        None => pending().await,
+    }
+}
+
+impl PolicyEngine {
+    /// Hands the engine its host's load channel: its load monitor's
+    /// subscription. A host hands it at its start, and again where it
+    /// builds another monitor: a channel ends with its monitor. Of two
+    /// hand-overs the newest stands: a later one replaces the one before.
+    /// An engine whose document reads no load report
+    /// ([`Needs::loads`](crate::document::spec::Needs::loads)) keeps none,
+    /// and no decision of it reads a report.
+    ///
+    /// The engine's task reads the channel ([`Self::run`]). A single
+    /// request's decision reads the snapshot its request gives where it
+    /// gives one
+    /// ([`RequestMaker::loads`](crate::engine::RequestMaker::loads)), and
+    /// the newest the task keeps at hand otherwise. A pair's decision
+    /// reads no load report.
+    pub fn set_loads(&self, loads: LoadReceiver) {
+        if self.spec.needs().loads {
+            let mut feed = self.loads.feed.lock();
+            *feed = (feed.0 + 1, Some(loads));
+            self.loads.handed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The engine's own task: what its host no longer does by hand. The
+    /// host spawns it once, at its start, on a runtime whose timer is
+    /// enabled, and it runs for as long as the engine stands.
+    ///
+    /// - The upkeep once a second ([`DecisionEngine::sweep`]), dated at its
+    ///   run by the runtime's clock. A task that was not run for a while
+    ///   runs it once for the seconds it missed. A panic in it is held and
+    ///   counted ([`Self::upkeep_faults`]): the task goes on.
+    /// - The newest load snapshot kept at hand: read from the host's
+    ///   channel at the first upkeep behind its hand-over, so within a
+    ///   second of it, and swapped when the load monitor publishes one.
+    ///   Until then, and for an engine handed no channel, a decision whose
+    ///   request gives no snapshot reads no report. A monitor that ended
+    ///   leaves its last snapshot standing until another is handed.
+    pub async fn run(&self) {
+        self.run_with(|now| self.sweep(now)).await;
+    }
+
+    /// How many runs of the upkeep panicked in the engine's own task
+    /// ([`Self::run`]). Each was held, and the task went on. While the
+    /// count rises the upkeep does not run whole: session keys past their
+    /// end can stay on file, though every request is still answered.
+    #[must_use]
+    pub fn upkeep_faults(&self) -> u64 {
+        self.upkeep_faults.load(Ordering::Relaxed)
+    }
+
+    /// The task's loop. `upkeep` is the step it runs once a second under
+    /// a catch of its own: [`Self::run`] hands the engine's own.
+    async fn run_with(&self, upkeep: impl Fn(Instant) -> SweepOutcome) {
+        let mut tick = time::interval(UPKEEP);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The host's channel while its monitor publishes, and the count of
+        // the hand-over it came with.
+        let (mut taken, mut feed) = (0, None);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    // Dated at this run, not at the second its tick was due.
+                    let now = time::Instant::now().into_std();
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| upkeep(now))) {
+                        release(payload);
+                        self.upkeep_faults.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(handed) = self.loads.handed_past(taken) {
+                        (taken, feed) = handed;
+                        self.loads.keep(feed.as_mut());
+                    }
+                }
+                went_on = published(feed.as_mut()) => {
+                    if went_on {
+                        self.loads.keep(feed.as_mut());
+                    } else {
+                        feed = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
