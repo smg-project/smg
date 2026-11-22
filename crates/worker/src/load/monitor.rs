@@ -384,9 +384,9 @@ impl PushedFile {
     /// through the lock of the reports alone, so every live write of a
     /// pusher's series is made under that lock, where the sentinel is
     /// written too ([`WorkerMonitor::clear_series`]).
-    fn write_rank_series(&self, at: usize, url: &str, model_id: &str) {
+    fn write_rank_series(&self, at: usize, model_id: &str) {
         Metrics::record_engine_rank_load(
-            url,
+            self.pusher.as_ref(),
             model_id,
             registered_engine_role(*self.pusher.worker_type()),
             &self.report.loads[at],
@@ -802,7 +802,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // there leaves no load that reads as live. Its file is marked, and
         // the flush that finds the worker `Ready` writes the held series.
         if ready {
-            file.write_rank_series(at, url, worker.model_id());
+            file.write_rank_series(at, worker.model_id());
         } else {
             file.series_held = true;
         }
@@ -981,7 +981,7 @@ impl<G: Generation> WorkerMonitor<G> {
         for (worker, load, _) in &group_loads {
             if self.load_state.is_current_incarnation(worker) {
                 Metrics::record_engine_load(
-                    worker.url(),
+                    worker.as_ref(),
                     model_id,
                     registered_engine_role(*worker.worker_type()),
                     load,
@@ -1210,7 +1210,7 @@ impl<G: Generation> WorkerMonitor<G> {
                     continue;
                 }
                 for at in 0..file.report.loads.len() {
-                    file.write_rank_series(at, worker.url(), worker.model_id());
+                    file.write_rank_series(at, worker.model_id());
                 }
                 file.series_held = false;
             }

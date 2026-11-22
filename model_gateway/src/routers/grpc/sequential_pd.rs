@@ -712,7 +712,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        WorkerMetrics::record_worker_request(prefill.url(), prefill.model_id());
+        WorkerMetrics::record_worker_request(prefill.as_ref());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -948,7 +948,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        WorkerMetrics::record_worker_request(decode.url(), decode.model_id());
+        WorkerMetrics::record_worker_request(decode.as_ref());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,
