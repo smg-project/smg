@@ -38,7 +38,16 @@ fn classic_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> Worker
 /// ask that engine, and the policy registry only says what the model's own
 /// policy keeps of a request.
 fn own_stage(registry: &Arc<WorkerRegistry>, policy: PolicyConfig) -> WorkerSelectionStage {
-    let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+    own_stage_under("round_robin", registry, policy)
+}
+
+/// [`own_stage`] over the engine of the stock document `preset`.
+fn own_stage_under(
+    preset: &str,
+    registry: &Arc<WorkerRegistry>,
+    policy: PolicyConfig,
+) -> WorkerSelectionStage {
+    let mut document = PolicySpec::preset(preset).expect("a built-in preset");
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     let engine = PolicyEngine::own(Arc::new(OwnEngine::new(spec)), Arc::clone(registry));
@@ -75,12 +84,34 @@ fn listed(
 
 /// A first attempt whose prompt is `tokens` tokens long.
 fn prompt_of(registry: &Arc<WorkerRegistry>, tokens: usize) -> RequestContext {
+    asking(registry, vec![1; tokens])
+}
+
+/// A first attempt whose prompt is the token ids `tokens`.
+fn asking(registry: &Arc<WorkerRegistry>, tokens: Vec<u32>) -> RequestContext {
     let mut ctx = prepared_ctx(Arc::clone(registry), None);
     ctx.state.preparation = Some(PreparationOutput::Generate {
         original_text: None,
-        token_ids: vec![1; tokens],
+        token_ids: tokens,
     });
     ctx
+}
+
+/// The place in `workers` of the worker `stage` selects for a first attempt
+/// whose prompt is the token ids `tokens`.
+async fn placed_at(
+    stage: &WorkerSelectionStage,
+    registry: &Arc<WorkerRegistry>,
+    workers: &[Arc<dyn Worker>],
+    tokens: Vec<u32>,
+) -> usize {
+    let mut ctx = asking(registry, tokens);
+    stage.execute(&mut ctx).await.expect("a worker");
+    let chosen = single(ctx.state.workers.as_ref());
+    let at = workers
+        .iter()
+        .position(|worker| Arc::ptr_eq(worker, chosen));
+    at.expect("a worker the registry lists")
 }
 
 /// A first attempt that names the worker at place `target` in its header.
@@ -310,4 +341,37 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
         turns[place.expect("a worker of the pool")] += 1;
     }
     assert!(turns[0] == 0 && turns[1] > 0 && turns[2] > 0, "{turns:?}");
+}
+
+/// A conversation's next turn goes back to the worker its last turn went
+/// to, where the engine of this process decides under the default policy.
+/// The stage states the prompt's token ids on its ask, and the engine walks
+/// and writes its record of sent prefixes with them: an ask that stated no
+/// prompt would leave that record empty, and the turns would scatter. Other
+/// conversations are not held to that worker.
+#[tokio::test]
+async fn a_conversations_next_turn_goes_back_to_its_worker() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let workers: Vec<Arc<dyn Worker>> = (0..4)
+        .map(|at| {
+            let url = format!("grpc://worker-{at}:8000");
+            listed(&registry, &url, RuntimeType::Vllm, None, UNLABELED)
+        })
+        .collect();
+    let stage = own_stage_under("cache_aware", &registry, PolicyConfig::RoundRobin);
+    let mut conversation: Vec<u32> = (0..1_024).collect();
+    let first = placed_at(&stage, &registry, &workers, conversation.clone()).await;
+    for turn in 1..=16_u32 {
+        let said = 1_000_000 * turn;
+        conversation.extend(said..said + 64);
+        let next = placed_at(&stage, &registry, &workers, conversation.clone()).await;
+        assert_eq!(next, first, "turn {turn}");
+    }
+    let mut others = Vec::new();
+    for other in 1..=16_u32 {
+        let begins = 100_000_000 * other;
+        let prompt: Vec<u32> = (begins..begins + 1_024).collect();
+        others.push(placed_at(&stage, &registry, &workers, prompt).await);
+    }
+    assert!(others.iter().any(|&at| at != others[0]), "{others:?}");
 }
