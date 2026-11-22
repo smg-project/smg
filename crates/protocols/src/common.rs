@@ -87,6 +87,30 @@ pub fn is_true(v: &bool) -> bool {
     *v
 }
 
+/// Serializes a request's map with its keys sorted. A standard map iterates in an order of its
+/// own for every map built, so two equal requests would go upstream as two different bodies.
+/// Every `HashMap` field of a request type the typed route writes upstream must name this.
+#[expect(
+    clippy::ref_option,
+    reason = "serde's `serialize_with` hands the field to its serializer by reference"
+)]
+pub(crate) fn serialize_with_sorted_keys<K, V, S>(
+    map: &Option<HashMap<K, V>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    K: Ord + Serialize,
+    V: Serialize,
+    S: serde::Serializer,
+{
+    let Some(map) = map else {
+        return serializer.serialize_none();
+    };
+    let mut entries: Vec<(&K, &V)> = map.iter().collect();
+    entries.sort_unstable_by_key(|&(key, _)| key);
+    serializer.collect_map(entries)
+}
+
 /// Deserialize a bool that also accepts JSON `null` (mapped to `false`).
 ///
 /// Use with `#[serde(default, deserialize_with = "deserialize_null_as_false")]`
@@ -2087,6 +2111,7 @@ impl std::fmt::Debug for Redacted {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResponsePrompt {
     pub id: String,
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub variables: Option<HashMap<String, PromptVariable>>,
     pub version: Option<String>,
 }
@@ -2218,6 +2243,64 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Equal requests are written as one body: a request's map goes upstream with its keys
+    /// sorted, where a standard map gave every parse an order of its own.
+    #[test]
+    fn equal_requests_are_written_as_one_body_with_sorted_map_keys() {
+        // A request type, a body with every map out of order, the maps as they are written.
+        fn check<T: de::DeserializeOwned + Serialize>(body: &str, sorted: &[&str]) {
+            let written: HashSet<String> = (0..8)
+                .map(|_| serde_json::to_string(&serde_json::from_str::<T>(body).unwrap()).unwrap())
+                .collect();
+            assert_eq!(
+                written.len(),
+                1,
+                "equal requests are written as one body: {body}"
+            );
+            let written = written.iter().next().unwrap();
+            for map in sorted {
+                assert!(written.contains(map), "{map} is not in {written}");
+            }
+        }
+        check::<crate::chat::ChatCompletionRequest>(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"logit_bias":{"9":1.0,"1":-1.0,"5":2.0,"3":0.5},"metadata":{"zone":"c","tenant":"a","trace":"b","app":"d"},"session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"},"chat_template_kwargs":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""logit_bias":{"1":-1.0,"3":0.5,"5":2.0,"9":1.0}"#,
+                r#""metadata":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""chat_template_kwargs":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::completion::CompletionRequest>(
+            r#"{"model":"m","prompt":"hi","logit_bias":{"9":1.0,"1":-1.0,"5":2.0,"3":0.5},"session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""logit_bias":{"1":-1.0,"3":0.5,"5":2.0,"9":1.0}"#,
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::generate::GenerateRequest>(
+            r#"{"text":"hi","session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"},"custom_labels":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""custom_labels":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::responses::ResponsesRequest>(
+            r#"{"model":"m","input":"hi","metadata":{"zone":"c","tenant":"a","trace":"b","app":"d"},"prompt":{"id":"p","variables":{"zone":"c","tenant":"a","trace":"b","app":"d"}},"tools":[{"type":"mcp","server_label":"docs","server_url":"https://mcp.example/sse","headers":{"zone":"c","tenant":"a","trace":"b","app":"d"}}]}"#,
+            &[
+                r#""metadata":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""variables":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""headers":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::messages::CreateMessageRequest>(
+            r#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"mcp_toolset","mcp_server_name":"docs","configs":{"zone":{"enabled":true},"tenant":{"enabled":true},"trace":{"enabled":true},"app":{"enabled":true}}}]}"#,
+            &[
+                r#""configs":{"app":{"enabled":true},"tenant":{"enabled":true},"trace":{"enabled":true},"zone":{"enabled":true}}"#,
+            ],
+        );
+    }
 
     /// A history tool call's `arguments`: the JSON text the API documents,
     /// or the JSON object itself, kept as its text so every reader and a
