@@ -183,28 +183,28 @@ jobs:
         with:
           name: smg-wheel
           path: bindings/python/dist/*.whl
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload Go FFI library artifact
         uses: actions/upload-artifact@v7
         with:
           name: go-ffi-library
           path: bindings/golang/target/release/libsmg_go.*
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload Python client types
         uses: actions/upload-artifact@v7
         with:
           name: python-client-types
           path: clients/python/smg_client/types/_generated.py
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload WASM test fixtures
         uses: actions/upload-artifact@v7
         with:
           name: wasm-test-fixtures
           path: crates/wasm/tests/fixtures/*.wasm
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Set up Python
