@@ -193,7 +193,7 @@ pub enum WorkerLists<'a> {
 /// from it in its side, in the worker it books (the decode of the pick's
 /// first target where the side was issued with its prefill, the decode of
 /// the target taken where it stood chosen) and in its session
-/// ([`Self::decode_session`]). A decode issued later is dated at its
+/// ([`HeldDecode::session`]). A decode issued later is dated at its
 /// issue, the decode call's instant or its dispatch's, and its later words
 /// bear the first decision's instant, which is this lease's
 /// ([`Lifecycle::on_decision_issued`](crate::stages::Lifecycle::on_decision_issued)).
@@ -205,10 +205,6 @@ pub struct HeldDecision<'a> {
     /// The lease as its decision issued it: a single's, or the prefill
     /// side's of a pair.
     pub lease: &'a Lease,
-    /// A pair's session under the decode phase
-    /// ([`DecideOutcome::decode_session`]): the one value of the decode
-    /// side's lease that the prefill side's does not give.
-    pub decode_session: Session,
     /// The place in the pick of the target taken. An end and a release
     /// carry no index of their own. Behind a decode call that picked, it is
     /// the place in that call's pick, for the prefill's later words too:
@@ -218,11 +214,25 @@ pub struct HeldDecision<'a> {
     /// The target its host took: the pick's first, or the one a take moved
     /// to. A pair's decode is in it.
     pub target: &'a Target,
-    /// A pair's decode side stood chosen until this word: its request
-    /// stated the later decode, no decode call picked it, and nothing was
-    /// issued for it. The side's dispatch said under this is its issue
-    /// too, dated at the word's instant.
-    pub decode_chosen: bool,
+    /// A pair's decode side. `None` for a single's lease, which carries
+    /// nothing of a pair's.
+    pub decode: Option<HeldDecode>,
+}
+
+/// What a guard holds of a pair's decode side ([`HeldDecision::decode`]):
+/// what that side's lease does not share with the prefill side's, and
+/// where the side stands as the word finds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldDecode {
+    /// The pair's session under the decode phase
+    /// ([`DecideOutcome::decode_session`]): the one value of the decode
+    /// side's lease that the prefill side's does not give.
+    pub session: Session,
+    /// The side stood chosen until this word: its request stated the later
+    /// decode, no decode call picked it, and nothing was issued for it.
+    /// The side's dispatch said under this is its issue too, dated at the
+    /// word's instant.
+    pub chosen: bool,
 }
 
 /// What the one entry answers its host ([`DecisionEngine::decide_under`]).
@@ -408,7 +418,7 @@ pub trait DecisionEngine {
     /// end, or a release. `held` is the guard's view of the decision at the
     /// word. The word names its side. Whoever applies the word tells the
     /// stages of the engine that issued the lease, once. A decode that
-    /// stood chosen ([`HeldDecision::decode_chosen`]) goes out with no
+    /// stood chosen ([`HeldDecode::chosen`]) goes out with no
     /// decode call: its dispatch tells the side's issue first.
     fn say(&self, gateway: GatewayId, held: &HeldDecision<'_>, said: Said, now: Instant);
 

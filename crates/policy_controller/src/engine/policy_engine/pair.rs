@@ -422,7 +422,7 @@ mod tests {
         document::spec::PolicySpec,
         engine::{
             decision::{Pair, Pick, Target, Targets},
-            decision_engine::{DecisionEngine, RequestMaker, WorkerLists},
+            decision_engine::{DecisionEngine, HeldDecode, RequestMaker, WorkerLists},
             demands::Demands,
             framework::{Filter, Picker, TieBand},
             records::worker_id,
@@ -1198,10 +1198,12 @@ mod tests {
         let held = HeldDecision {
             decision: &decision,
             lease: &lease,
-            decode_session: session,
             index: 1,
             target: &taken,
-            decode_chosen: false,
+            decode: Some(HeldDecode {
+                session,
+                chosen: false,
+            }),
         };
         tell(engine, &held, dispatched(Side::Prefill, 1));
         tell(engine, &held, dispatched(Side::Decode, 1));
@@ -1239,10 +1241,12 @@ mod tests {
         let held = HeldDecision {
             decision: &pair.decision,
             lease: &lease,
-            decode_session: session,
             index: 0,
             target: &taken,
-            decode_chosen: false,
+            decode: Some(HeldDecode {
+                session,
+                chosen: false,
+            }),
         };
         let prefill = ("released", Side::Prefill, 1, 0, own, 7_000, 0);
         let decode = ("released", Side::Decode, 101, 0, session, 7_000, 0);
@@ -1274,10 +1278,12 @@ mod tests {
         let held = HeldDecision {
             decision: &decision,
             lease: &lease,
-            decode_session: session,
             index: 1,
             target: &taken,
-            decode_chosen: true,
+            decode: Some(HeldDecode {
+                session,
+                chosen: true,
+            }),
         };
         tell(engine, &held, dispatched(Side::Decode, 1));
         assert_eq!(
@@ -1303,10 +1309,12 @@ mod tests {
         let held = HeldDecision {
             decision: &pair.decision,
             lease: &lease,
-            decode_session: session,
             index: 0,
             target: &taken,
-            decode_chosen: true,
+            decode: Some(HeldDecode {
+                session,
+                chosen: true,
+            }),
         };
         tell(
             engine,

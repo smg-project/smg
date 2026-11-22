@@ -72,7 +72,8 @@ pub(crate) fn decode_as_issued(prefill: &Lease, first: &Target, session: Session
 ///   table, then the stages. The lease told is the side's as issued, under
 ///   the index the dispatch took, and the target is the worker the side
 ///   went to. A decode that stood chosen
-///   ([`HeldDecision::decode_chosen`]) goes out as its pick's with no call:
+///   ([`HeldDecode::chosen`](super::decision_engine::HeldDecode::chosen))
+///   goes out as its pick's with no call:
 ///   its issue is told first, dated at the dispatch's instant by `micros`,
 ///   under the decode it goes to.
 /// - A completion ends the side its outcome names. The prefill's is told
@@ -97,7 +98,13 @@ pub(crate) fn pair(
 ) {
     let prefill = held.lease;
     let first = held.decision.pick().and_then(|pick| pick.targets.first());
-    let decode = first.and_then(|first| decode_as_issued(prefill, first, held.decode_session));
+    // The decode side as its host lends it: a lease that lends none has no
+    // decode side to tell.
+    let decode = held
+        .decode
+        .zip(first)
+        .and_then(|(side, first)| decode_as_issued(prefill, first, side.session));
+    let chosen = held.decode.is_some_and(|side| side.chosen);
     match said {
         Said::Dispatched(dispatch, at) => {
             let taken = held.target;
@@ -130,7 +137,7 @@ pub(crate) fn pair(
             let since = dispatch.since_decision_micros;
             engine.dispatched_sent(&lease, &target, dispatch.side, since, || true);
             engine.dispatched_table(&lease, &target, dispatch.side);
-            if dispatch.side == Side::Decode && held.decode_chosen {
+            if dispatch.side == Side::Decode && chosen {
                 // No call issued the side: this dispatch books it, so the
                 // stages hear its issue first, under the worker that serves.
                 let sent = Lease {
@@ -153,7 +160,7 @@ pub(crate) fn pair(
                 let (Some(decode), Some(pair)) = (decode, held.target.pair) else {
                     return;
                 };
-                if held.decode_chosen {
+                if chosen {
                     return;
                 }
                 let ended = Lease {
@@ -169,7 +176,7 @@ pub(crate) fn pair(
             if matches!(side, None | Some(Side::Prefill)) {
                 engine.on_released(prefill, reason);
             }
-            let ends_decode = matches!(side, None | Some(Side::Decode)) && !held.decode_chosen;
+            let ends_decode = matches!(side, None | Some(Side::Decode)) && !chosen;
             if let Some(decode) = decode.filter(|_| ends_decode) {
                 engine.on_released(&decode, reason);
             }
