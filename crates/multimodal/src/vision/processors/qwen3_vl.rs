@@ -218,37 +218,6 @@ impl Qwen3VLProcessor {
         .with_transform_config(config)
     }
 
-    /// Get the patch size.
-    pub fn patch_size(&self) -> usize {
-        self.inner.patch_size()
-    }
-
-    /// Get the merge size.
-    pub fn merge_size(&self) -> usize {
-        self.inner.merge_size()
-    }
-
-    /// Get the minimum pixels.
-    pub fn min_pixels(&self) -> usize {
-        self.inner.min_pixels()
-    }
-
-    /// Get the maximum pixels.
-    pub fn max_pixels(&self) -> usize {
-        self.inner.max_pixels()
-    }
-
-    /// Get the temporal patch size.
-    pub fn temporal_patch_size(&self) -> usize {
-        self.inner.temporal_patch_size()
-    }
-
-    /// Get the factor for dimension alignment.
-    #[inline]
-    pub fn get_factor(&self) -> usize {
-        self.inner.get_factor()
-    }
-
     /// Smart resize algorithm for Qwen3-VL.
     pub fn smart_resize(
         &self,
@@ -256,22 +225,6 @@ impl Qwen3VLProcessor {
         width: usize,
     ) -> Result<(usize, usize), TransformError> {
         self.inner.smart_resize(height, width)
-    }
-
-    /// Calculate the grid dimensions (T, H, W) for an image.
-    pub fn calculate_grid_thw(
-        &self,
-        height: usize,
-        width: usize,
-        num_frames: usize,
-    ) -> (usize, usize, usize) {
-        self.inner.calculate_grid_thw(height, width, num_frames)
-    }
-
-    /// Calculate the number of image tokens after merge.
-    pub fn calculate_tokens_from_grid(&self, grid_t: usize, grid_h: usize, grid_w: usize) -> usize {
-        self.inner
-            .calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
 }
 
