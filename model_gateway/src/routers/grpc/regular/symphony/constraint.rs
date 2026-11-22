@@ -892,8 +892,11 @@ pub(super) fn auto_tag(
 /// take it as its wire pair ([`Self::to_tuple`]).
 #[derive(Debug, Clone)]
 pub(crate) enum ToolConstraint {
-    /// A JSON schema: the answer is pure JSON from the first token, read by the generic JSON
-    /// parser rather than the model's own.
+    /// A JSON schema the engine holds the output to, from the first token or once the model's
+    /// thought is over, by where the worker starts the grammar. The kind does not pick the
+    /// reader: a table reads a schema it built, and a forced call's schema it did not build
+    /// where it reads the response; the generic JSON parser reads one only on the legacy path
+    /// (`regular::stages::reading::Prepared::json_schema`, `regular::symphony::assign_for`).
     JsonSchema(String),
     /// A structural tag: the answer carries the model's own framing, read by the model's parser.
     StructuralTag(String),
