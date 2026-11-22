@@ -60,8 +60,8 @@ use super::{
     decision::Decision,
     framework::{Engine, Scratch},
     view::{
-        fingerprint, Candidate, Constraints, Engines, Health, OverloadRegime, PoolFacts,
-        RequestFacts, Role, SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
+        Candidate, Constraints, Engines, Health, OverloadRegime, PoolFacts, RequestFacts, Role,
+        SignalSource, WireModes, WorkerId, LOAD_REPORT_CLOCK_HISTORY_MS,
     },
 };
 use crate::{document::spec::AppliedSpec, load::load_row};
@@ -75,7 +75,7 @@ use crate::{document::spec::AppliedSpec, load::load_row};
 /// and a removal names the id every decision knew the worker by.
 #[must_use]
 pub fn worker_id(worker: &dyn Worker) -> WorkerId {
-    WorkerId(fingerprint(worker.url().as_bytes()))
+    WorkerId::from_address(worker.url())
 }
 
 /// The data-parallel rank a pick that reads no record names for `worker`:
@@ -556,6 +556,21 @@ impl PoolRecords {
             .binary_search_by_key(&id, |&(listed, _)| listed)
             .ok()?;
         self.places.get(at).map(|&(_, place)| place)
+    }
+
+    /// The list's rows by id: each worker's id with its place in the list,
+    /// ids ascending and each once. Empty where two rows of the list carry
+    /// one id ([`Self::has_distinct_ids`]): no id of such a list names a row.
+    #[must_use]
+    pub fn by_id(&self) -> &[(WorkerId, u32)] {
+        &self.places
+    }
+
+    /// Whether every row of the list has an id of its own: an id then names
+    /// one row ([`Self::place_of`]).
+    #[must_use]
+    pub fn has_distinct_ids(&self) -> bool {
+        self.places.len() == self.fixed.len()
     }
 
     /// The fixed half of each worker's record, by its place in the list:

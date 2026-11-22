@@ -5331,6 +5331,18 @@ impl AppliedSpec {
         digest: Digest,
         (engine, depth, signal_columns): (Engine, HashDepth, Arc<[SignalColumn]>),
     ) -> Self {
+        // A binding's sources, with the phases whose requests its profile
+        // places by a hash ring: such a request states its key's position
+        // on its host's ring.
+        let key_sources = document
+            .bindings
+            .iter()
+            .zip(0u32..)
+            .map(|(binding, at)| {
+                let sources = KeySources::of_binding(binding, &document.view)?;
+                Some(sources.with_ring_phases(|phase| engine.binding_reads_ring(at, phase)))
+            })
+            .collect();
         Self {
             engine,
             digest: Some(digest),
@@ -5342,11 +5354,7 @@ impl AppliedSpec {
             pairing: document.plans.pd_pair.pairing,
             decode_pick: document.plans.pd_pair.decode,
             lists: ViewLists::of(&document.view),
-            key_sources: document
-                .bindings
-                .iter()
-                .map(|binding| KeySources::of_binding(binding, &document.view))
-                .collect(),
+            key_sources,
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }

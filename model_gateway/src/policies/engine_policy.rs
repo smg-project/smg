@@ -914,6 +914,32 @@ mod tests {
         });
     }
 
+    /// The two policies that place by the hash ring leave their classic
+    /// object no reader either, where the routers ask the engine for every
+    /// request: the engine walks the ring the registry keeps, and the
+    /// registry holds each policy's name alone. Where the routers keep
+    /// their classic pass each is built as ever.
+    #[test]
+    fn the_registry_builds_no_classic_ring_policy_where_the_engine_decides_whole() {
+        use crate::policies::{ConsistentHashingPolicy, PrefixHashPolicy};
+
+        for name in ["consistent_hashing", "prefix_hash"] {
+            let document = PolicySpec::preset(name).expect("a built-in preset");
+            let whole = asking_as(&document, name, DocumentOrigin::Settings, true);
+            let default = whole.get_default_policy();
+            assert_eq!(default.name(), name);
+            assert!(default.as_any().is::<DecidedByEngine>(), "{name}");
+
+            let classic_pass = asking_as(&document, name, DocumentOrigin::Settings, false);
+            let default = classic_pass.get_default_policy();
+            let built = default.as_any();
+            assert!(
+                built.is::<ConsistentHashingPolicy>() || built.is::<PrefixHashPolicy>(),
+                "{name}"
+            );
+        }
+    }
+
     /// The prefill side's profile holds the test of a free slot of the
     /// prefill window, and the object drops it: the pass holds it. Under
     /// prefill admission a prefill at its bound leaves the candidates before

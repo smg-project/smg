@@ -432,10 +432,12 @@ impl Checked {
                 // the rows of the host that decides, whose view hands them.
                 signal_cells: view.signal_cells,
                 client_key: facts.client_key,
-                // No frame carries a ring: the ring stage places by its
-                // own, as it learns it from the rows.
+                // No frame carries a ring, or a key's place on one: the
+                // ring stage places by its own, as it learns it from the
+                // rows.
                 ring: None,
                 ring_awaited: false,
+                ring_position: 0,
             },
             Constraints {
                 excluded: &lists.excluded,

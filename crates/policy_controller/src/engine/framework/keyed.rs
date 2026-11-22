@@ -24,7 +24,7 @@ use crate::{
         sticky_sessions::{SessionRule, SessionVerdict},
         view::{Candidate, Constraints, PoolFacts, RequestFacts, WorkerId},
     },
-    policies::consistent_hashing::PoolRing,
+    policies::consistent_hashing::ListRing,
     stages::{filters::NotOverloaded, pickers::target_of},
 };
 
@@ -35,8 +35,9 @@ use crate::{
 /// at that place: its fixed fields, its health and its counts as they stand,
 /// and `position` its place.
 ///
-/// `'p` is how long the pool's list stands: the ring it lends
-/// ([`Self::ring`]) is borrowed that long, whatever holds the rows' reader.
+/// `'p` is how long the pool's list stands for the decision: the ring it
+/// lends ([`Self::ring`]) is borrowed that long, whatever holds the rows'
+/// reader.
 pub trait PoolRows<'p> {
     /// How many rows the pool holds.
     fn len(&self) -> usize;
@@ -60,21 +61,22 @@ pub trait PoolRows<'p> {
     /// ([`Trace::generation`]).
     fn generation(&self) -> u64;
 
-    /// The hash ring of the pool's list, where the host keeps one a list:
-    /// asked for a request whose binding places by a ring, and for no
-    /// other. It is the ring of this pool's rows and of no other list
+    /// The host's own hash ring as this pool's list reads it, where the
+    /// host keeps the rings its workers are placed on: asked for a request
+    /// whose binding places by a ring, and for no other. It names this
+    /// pool's rows by their places and no other list's
     /// ([`RequestFacts::ring`]). `None` where the host keeps none, and the
     /// ring stage then places by its own ring, over every row; `None` too
-    /// where the host keeps one a list and this list's is not built yet
+    /// where the host keeps the rings and holds none for the request yet
     /// ([`Self::keeps_a_ring`]).
-    fn ring(&self) -> Option<&'p PoolRing>;
+    fn ring(&self) -> Option<&'p ListRing<'p>>;
 
-    /// Whether the host keeps a ring for each of its lists, built off the
-    /// path of a request. Under such a host a list whose ring is not built
-    /// yet hands none ([`Self::ring`]), and a request that reads a ring
-    /// there is placed as one that carries no key
-    /// ([`RequestFacts::ring_awaited`]): no decision builds a ring, and
-    /// none waits for one.
+    /// Whether the host keeps the rings its workers are placed on, filled
+    /// off the path of a request. Such a host that hands none
+    /// ([`Self::ring`]) holds none for the request yet, and a request that
+    /// reads a ring there is placed by the host's rule for a request with
+    /// no ring ([`RequestFacts::ring_awaited`]): no decision builds a ring,
+    /// and none waits for one.
     fn keeps_a_ring(&self) -> bool {
         false
     }
@@ -99,10 +101,11 @@ impl Engine {
     ///   whole decision does for a kept key.
     ///
     /// A request of the single plan whose profile reads a ring, or whose
-    /// shadow's does, is lent the pool's ([`PoolRows::ring`]) where its
-    /// facts carry none: it is written into `facts`
-    /// ([`RequestFacts::ring`]) and stands there for the whole decision
-    /// and the shadow that follow a `None`, which then read that ring too.
+    /// shadow's does, is lent its host's as the pool reads it
+    /// ([`PoolRows::ring`]) where its facts carry none: it is written into
+    /// `facts` ([`RequestFacts::ring`]) and stands there for the whole
+    /// decision and the shadow that follow a `None`, which then read that
+    /// ring too.
     ///
     /// `None` wherever the whole decision would answer from more than these
     /// rows, and the host then asks it ([`Self::decide`]): a key with no pin
@@ -153,9 +156,10 @@ impl Engine {
         };
         if facts.ring.is_none() && (reads_ring(index) || shadow.is_some_and(reads_ring)) {
             facts.ring = rows.ring();
-            // A host that keeps a ring a list and hands none has not built
-            // this list's yet: the ring stage draws, here and in the whole
-            // decision that follows.
+            // A host that keeps the rings and hands none holds none for
+            // this request yet: the ring stage places by the host's rule
+            // for a request with no ring, in the whole decision that
+            // follows.
             facts.ring_awaited = facts.ring.is_none() && rows.keeps_a_ring();
         }
         let at = usize::from(index);

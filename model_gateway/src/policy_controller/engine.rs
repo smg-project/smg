@@ -35,32 +35,30 @@
 
 use std::{
     borrow::Cow,
-    cell::Cell,
+    cell::{Cell, OnceCell},
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Instant,
 };
 
-use arc_swap::ArcSwap;
 use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 use parking_lot::Mutex;
 use rand::RngExt;
-use rustc_hash::FxHashMap;
 use smg_policy_controller::{
-    document::{AppliedSpec, DecodePick, DerivedKey, KeySource},
+    document::{AppliedSpec, DecodePick, DerivedKeys, KeySource},
     engine::{
         worker_id, worker_rank, AlonePick, Constraints, DecideOutcome, Decided, Decision,
         DecisionEngine, DecisionRefused, EncodeItems, EncodePlaced, HashSeeds, HeldDecision,
-        Identity, LiftedVeto, MediaCounts, Pair, Phase, Plain, PolicyEngine as OwnEngine,
-        PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind, ShedReason,
-        StoreBackedEngine, SweepOutcome, Target, Targets, Trace, WireModes, WorkerId, WorkerLists,
-        MAX_TARGETS,
+        Identity, LiftedVeto, MediaCounts, MembershipRing, Pair, Phase, Plain,
+        PolicyEngine as OwnEngine, PoolMembers, Request, RequestFacts, RequestMaker, ShadowKind,
+        ShedReason, StoreBackedEngine, SweepOutcome, Target, Targets, Trace, WireModes, WorkerId,
+        WorkerLists, MAX_TARGETS,
     },
     store::{pairing::Refusal, GatewayId, MemoryStore, Said},
     tracking::{DecisionGuard, Outcome, ReleaseReason, Side, TransportClass},
@@ -80,6 +78,7 @@ use crate::{
         cache_trace,
         metrics::{Metrics, PolicyDecision},
     },
+    policies::{GenerationRing, KeptRings},
     routers::{
         common::{
             overload::{routable_but_for_veto, WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE},
@@ -255,35 +254,32 @@ impl<'a> Ask<'a> {
         }
     }
 
-    /// The request's two keys by the sources its binding names in `spec`.
+    /// The request's keys by the sources its binding names in `spec`
+    /// ([`KeySources::derive_keys`](smg_policy_controller::document::KeySources::derive_keys)).
     /// Its routing key is the first session source that holds a value, with
-    /// the source it came from
-    /// ([`KeySources::derive`](smg_policy_controller::document::KeySources::derive)):
-    /// `None` where the binding names no source, or none of them holds a
-    /// value. Its client's key is read where it has no routing key
-    /// ([`KeySources::derive_client`](smg_policy_controller::document::KeySources::derive_client)),
-    /// and is `0` where it carries none.
+    /// the source it came from: `None` where the binding names no source,
+    /// or none of them holds a value. Its client's key is read where it has
+    /// no routing key, and is `0` where it carries none.
+    ///
+    /// Where `ring_supplied`, the gateway lends its own hash ring to the
+    /// ask's decision, the keys carry where the key a ring places the
+    /// request by stands on that ring: the ring's hash of the key's text,
+    /// which a classic policy takes of the same text. It is taken under a
+    /// binding that places by a ring, and for no other ask.
     ///
     /// The routing key borrows the document. The door hands the ask the
     /// world it decides under, and the keys are derived there
     /// ([`DecisionGuard::decide_under`]).
-    fn keys<'s>(&self, spec: &'s AppliedSpec) -> (Option<DerivedKey<'s>>, u64)
+    fn keys<'s>(&self, spec: &'s AppliedSpec, ring_supplied: bool) -> DerivedKeys<'s>
     where
         'a: 's,
     {
         let Some(sources) = spec.key_sources_for(self.model, self.phase) else {
-            return (None, 0);
+            return DerivedKeys::NONE;
         };
         let headers = self.headers;
         let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
-        let derived = sources.derive(header, self.rid);
-        // A client's key places where no session's does: it is read for
-        // such a request alone.
-        let client_key = match derived {
-            Some(_) => 0,
-            None => sources.derive_client(header),
-        };
-        (derived, client_key)
+        sources.derive_keys(header, self.rid, ring_supplied.then_some(self.phase))
     }
 
     /// The request as the controller reads it, with its routing `key`, its
@@ -360,6 +356,32 @@ struct Made<'r, 'a> {
     /// behind a lease the store refused: the policy engine counts after the
     /// decision, once.
     source: Cell<Option<&'static str>>,
+    /// The gateway's hash rings and the membership the ask is decided
+    /// over, where the engine of this process places by a ring
+    /// ([`PolicyEngine::read_rings`]): `None` for every other ask.
+    rings: Option<(&'r KeptRings, &'r ModelWorkerSnapshot)>,
+    /// The membership's ring, once the engine asked for it
+    /// ([`RequestMaker::ring`]): read at most once an ask, and by no ask
+    /// whose binding places by no ring.
+    ring: OnceCell<Option<GenerationRing<'r>>>,
+}
+
+impl<'r, 'a> Made<'r, 'a> {
+    /// The ask as the door makes it, with nothing of the engine of this
+    /// process: no list, no load snapshot, no place kept and no ring.
+    fn of(ask: &'r Ask<'a>, missed: &'r [WorkerId]) -> Self {
+        Self {
+            ask,
+            missed,
+            members: None,
+            loads: None,
+            kept: None,
+            cut_by_wire: false,
+            source: Cell::new(None),
+            rings: None,
+            ring: OnceCell::new(),
+        }
+    }
 }
 
 impl RequestMaker for Made<'_, '_> {
@@ -368,13 +390,17 @@ impl RequestMaker for Made<'_, '_> {
     }
 
     fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
-        let (derived, client_key) = self.ask.keys(spec);
-        self.source.set(derived.map(|derived| match derived.source {
-            KeySource::Header(_) => "header",
-            KeySource::Rid => "rid",
-        }));
-        let key = derived.map_or(Identity::NONE, |derived| derived.key);
-        let mut request = self.ask.request(key, client_key, self.missed);
+        let keys = self.ask.keys(spec, self.rings.is_some());
+        self.source
+            .set(keys.session.map(|derived| match derived.source {
+                KeySource::Header(_) => "header",
+                KeySource::Rid => "rid",
+            }));
+        let key = keys.session.map_or(Identity::NONE, |derived| derived.key);
+        let mut request = self.ask.request(key, keys.client_key, self.missed);
+        // Where the request's key stands on the ring the gateway lends:
+        // stated under a binding that places by a ring, `0` under any other.
+        request.facts.ring_position = keys.ring_position;
         // The document's word, like the keys: read from the generation
         // that decides.
         request.constraints.decode_later = self.ask.decode_later(spec);
@@ -411,6 +437,19 @@ impl RequestMaker for Made<'_, '_> {
 
     fn kept(&self) -> Option<&[usize]> {
         self.kept
+    }
+
+    // The ring the membership's requests are placed on: the gateway's own,
+    // read as a classic policy reads it, the first time the engine asks.
+    fn ring(&self) -> Option<MembershipRing<'_>> {
+        let (rings, membership) = self.rings?;
+        let ring = self
+            .ring
+            .get_or_init(|| rings.ring_for(self.ask.model, membership));
+        ring.as_ref().map(|ring| MembershipRing {
+            ring: ring.ring(),
+            of_this_membership: ring.is_current(),
+        })
     }
 }
 
@@ -732,56 +771,12 @@ pub(crate) struct PolicyEngine {
     /// under a document that reads load reports
     /// ([`Self::read_loads`]).
     loads: loads::Loads,
-    /// The memberships whose hash rings stand, where the engine of this
-    /// process places by a ring.
-    standing: Standing,
-}
-
-/// The memberships whose hash rings stand, by model: for each model the
-/// engine of this process places by a ring, the registry's value of the
-/// last membership whose rings the fill built ([`PolicyEngine::fill_rings`]).
-///
-/// A membership change publishes another list, and that list's ring is
-/// built off the path of a request. An attempt that comes ahead of it is
-/// decided over the membership kept here, by its ring, and takes a worker
-/// of the list in force ([`stood_before`]): a key keeps its worker across
-/// the change, a key whose worker left goes to the next member of the ring,
-/// and a worker that joined takes no keyed request until its list's ring
-/// stands.
-///
-/// The fill alone writes, a whole map a time. A request reads with no lock,
-/// and only where the list in force has no ring yet.
-struct Standing {
-    /// Whether the document places a single request of some model by a
-    /// ring, read once where the object is made. `false` under a followed
-    /// controller and under a document with no ring: nothing is kept and no
-    /// request reads the map.
-    kept: bool,
-    memberships: ArcSwap<FxHashMap<Box<str>, Arc<ModelWorkerSnapshot>>>,
-}
-
-impl Standing {
-    fn new(kept: bool) -> Self {
-        Self {
-            kept,
-            memberships: ArcSwap::default(),
-        }
-    }
-
-    /// Keeps `membership`, whose rings the fill has built, as `model`'s. A
-    /// membership with no worker keeps none: the model's next list waits
-    /// for a ring of its own.
-    fn keep(&self, model: &str, membership: &Arc<ModelWorkerSnapshot>) {
-        self.memberships.rcu(|memberships| {
-            let mut memberships = FxHashMap::clone(memberships);
-            if membership.is_empty() {
-                memberships.remove(model);
-            } else {
-                memberships.insert(model.into(), Arc::clone(membership));
-            }
-            memberships
-        });
-    }
+    /// The gateway's hash rings, where the engine of this process places a
+    /// single request by a ring ([`Self::read_rings`]): the rings its
+    /// classic policies walk, one a membership, filled off the path of a
+    /// request. An ask reads its membership's ring there, and the engine
+    /// builds none.
+    rings: OnceLock<Arc<KeptRings>>,
 }
 
 /// Where the policy engine finds the worker of a target.
@@ -806,7 +801,7 @@ impl PolicyEngine {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::Held(objects),
             loads: loads::Loads::default(),
-            standing: Standing::new(false),
+            rings: OnceLock::new(),
         }
     }
 
@@ -814,13 +809,37 @@ impl PolicyEngine {
     /// `engine` decides over the lists `registry` publishes, and no store
     /// stands between them.
     pub(crate) fn own(engine: Arc<OwnEngine>, registry: Arc<WorkerRegistry>) -> Self {
-        let rings = engine.spec().engine().needs_for_phase(Phase::Single).ring;
         Self {
             door: Arc::new(Decider::Own(engine)),
             workers: Workers::Listed(registry),
             loads: loads::Loads::default(),
-            standing: Standing::new(rings),
+            rings: OnceLock::new(),
         }
+    }
+
+    /// Hands the policy engine the gateway's hash rings, at the gateway's
+    /// start: the rings the classic policies walk, one a membership, which
+    /// the gateway fills off the path of a request. The engine of this
+    /// process reads an ask's ring there where its document places a single
+    /// request by a ring, so a key has the owner a classic policy's walk
+    /// finds, and no second ring is built. Under any other document, and
+    /// where the gateway follows a controller, the rings are not kept: no
+    /// ask reads one.
+    pub(crate) fn read_rings(&self, rings: &Arc<KeptRings>) {
+        if let Decider::Own(engine) = &*self.door {
+            if engine.spec().engine().needs_for_phase(Phase::Single).ring {
+                // Handed once, at the start: a second hand-over finds the
+                // first in place.
+                let _ = self.rings.set(Arc::clone(rings));
+            }
+        }
+    }
+
+    /// The gateway's hash rings, where the engine was handed them and kept
+    /// them ([`Self::read_rings`]).
+    #[cfg(test)]
+    pub(crate) fn rings(&self) -> Option<&Arc<KeptRings>> {
+        self.rings.get()
     }
 
     /// Hands the policy engine the load monitor's feed, at the gateway's
@@ -868,6 +887,30 @@ impl PolicyEngine {
         matches!(*self.door, Decider::Own(_))
     }
 
+    /// Whether a single request of `model` that names its worker is held to
+    /// that worker, where the engine of this process decides: the document
+    /// in force places the model by the plain hash ring alone, the shape
+    /// of the `consistent_hashing` policy, whose classic form holds such a
+    /// request. The document alone says it there, and no classic policy
+    /// object: none is built for a policy the engine decides whole, and a
+    /// model's policy is what the document binds it to.
+    ///
+    /// `None` where the gateway follows a controller: its registry keeps
+    /// the classic policies, and the model's policy says it
+    /// ([`placement::strict_target`]).
+    ///
+    /// One answer for every wire, and one of the questions a route asks of
+    /// whoever decides: the one placing call takes it with this object.
+    pub(crate) fn holds_to_named_worker(&self, model: &str) -> Option<bool> {
+        match &*self.door {
+            Decider::Own(engine) => {
+                let document = engine.spec().engine();
+                Some(document.placed_by_hash_ring_alone(model, Phase::Single))
+            }
+            Decider::Followed(_) => None,
+        }
+    }
+
     /// The id a retry names `worker` by as tried, where its route kept no
     /// placement of it: a placement that owed the engine of this process
     /// nothing is its worker alone to its route ([`Sent::of`]), and its
@@ -911,61 +954,6 @@ impl PolicyEngine {
         prompt.hashed(|tokens, text, seeds| self.door.prompt_hashes(model, tokens, text, seeds))
     }
 
-    /// Fills the hash ring of each list a regular request of `model` is
-    /// placed over ([`RING_POOLS`]), where the engine of this process
-    /// places it by a ring ([`OwnEngine::fill_ring`]), and says whether the
-    /// engine of this process places the gateway's requests. `false` under
-    /// a followed controller, whose engine reads its own rows: nothing is
-    /// filled.
-    ///
-    /// For the task that hears the registry's membership events, off the
-    /// path of a request: a fill hashes every worker's positions and sorts
-    /// them, and no request builds a ring or waits for one. The lists are
-    /// the ones the registry publishes for `model` now, each with what the
-    /// engine keeps of it in the snapshot's cell, as a request finds it.
-    /// A list that holds no worker takes no ring. Under a document that
-    /// places the model by no ring nothing is made of its lists here.
-    ///
-    /// The membership whose rings were built is kept as the model's
-    /// ([`Standing`]): the attempts that come ahead of the next
-    /// membership's rings are decided over it.
-    pub(crate) fn fill_rings(&self, model: &str) -> bool {
-        let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) else {
-            return false;
-        };
-        if engine.reads_ring(model) {
-            let snapshot = registry.get_routing_snapshot(model);
-            for pool in RING_POOLS {
-                if !snapshot.pool(pool).is_empty() {
-                    engine.fill_ring(model, members_of(engine, &snapshot, pool));
-                }
-            }
-            self.standing.keep(model, &snapshot);
-        }
-        true
-    }
-
-    /// Whether the engine's ring stands for each list a regular request of
-    /// `model` is placed over, where the document places it by a ring: the
-    /// requests of `model` walk the ring of the membership that stands. For
-    /// a caller that changed the membership and waits for the placements to
-    /// follow, as a test bed does.
-    #[cfg(any(test, feature = "test-util"))]
-    pub(crate) fn rings_stand(&self, model: &str) -> bool {
-        let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) else {
-            return true;
-        };
-        if !engine.reads_ring(model) {
-            return true;
-        }
-        let snapshot = registry.get_routing_snapshot(model);
-        RING_POOLS.into_iter().all(|pool| {
-            let members = snapshot.pool_members_cell(pool).get();
-            snapshot.pool(pool).is_empty()
-                || members.is_some_and(|members| members.ring().get().is_some())
-        })
-    }
-
     /// The policy engine of a bed that registers its workers by hand in
     /// `registry`.
     #[cfg(test)]
@@ -974,7 +962,7 @@ impl PolicyEngine {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::AtKey(registry),
             loads: loads::Loads::default(),
-            standing: Standing::new(false),
+            rings: OnceLock::new(),
         }
     }
 
@@ -1172,15 +1160,7 @@ impl PolicyEngine {
         first: bool,
         now: Instant,
     ) -> Result<Asked, Unplaced> {
-        let made = Made {
-            ask,
-            missed,
-            members: None,
-            loads: None,
-            kept: None,
-            cut_by_wire: false,
-            source: Cell::new(None),
-        };
+        let made = Made::of(ask, missed);
         let started = Instant::now();
         let decided = DecisionGuard::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
         let seconds = started.elapsed().as_secs_f64();
@@ -1585,11 +1565,11 @@ impl PolicyEngine {
     /// ([`narrow`]): the workers its route stated ([`Ask::among`]), its
     /// wires where the pool's workers do not all serve them, and its
     /// route's rule from the rule's first refusal. The decision reads the
-    /// pool's own records and its ring, and nothing is made for the part:
-    /// a keyed request narrowed to a part walks the pool's ring past the
-    /// members left out, as a classic pass asks its ring among its
-    /// candidates. A narrowing that leaves no worker leaves the attempt
-    /// none.
+    /// pool's own records and its membership's ring, and nothing is made
+    /// for the part: a keyed request narrowed to a part walks the ring
+    /// past the members left out, as a classic pass asks its ring among
+    /// its candidates. A narrowing that leaves no worker leaves the
+    /// attempt none.
     ///
     /// The engine answers one of two things ([`Decided`]). A place is a
     /// worker of the list and nothing else: no stage of the document takes
@@ -1609,14 +1589,15 @@ impl PolicyEngine {
     /// the rule refuses: the engine picks among what the route can send
     /// to, as a classic pass narrows its candidates ahead of its policy.
     ///
-    /// Under a document that places by a hash ring, an attempt's first ask
-    /// can come ahead of the ring of the list in force, which is built off
-    /// the path of a request. It is then decided over the last membership
-    /// whose rings stand, and a target's worker is the one the list in
-    /// force holds at that worker's address ([`stood_before`]). Where no
-    /// target holds, the next ask is decided over the list in force. A
-    /// narrowed ask is decided over the list in force as it is: the places
-    /// it keeps are that list's.
+    /// Under a document that places by a hash ring, an ask is handed the
+    /// ring a classic policy would walk for it ([`KeptRings::ring_for`]): its
+    /// membership's own, or, until the gateway has filled that, the ring
+    /// kept from the membership before. The engine walks that ring over the
+    /// list in force and builds none. So a key keeps its worker across a
+    /// membership change, a key whose worker left goes to the next worker
+    /// on the kept ring, and a worker that joined takes no keyed request
+    /// until its membership's ring is filled: what a classic placement
+    /// answers. Each ask of an attempt reads the ring anew, with the list.
     fn place_listed(
         &self,
         registry: &WorkerRegistry,
@@ -1666,31 +1647,19 @@ impl PolicyEngine {
             // load reports: lent once, and every record of the decision is
             // read in it. The ask's instant was read before it.
             let lent = self.loads.lend();
-            // The first ask over the whole of the registry's list is
-            // decided over the membership before it, where this list's
-            // ring is not built yet. A narrowed ask names places of the
-            // list in force, and is decided over it.
-            let stood = match (kept, &snapshot) {
-                (Some(in_force), Some((_, pool))) if first && !narrowed => {
-                    stood_before(&self.standing, ask.model, *pool, in_force)
-                }
-                _ => None,
-            };
-            let members = stood.as_ref().and_then(Stood::members).or(kept);
-            // The worker at a place of the list the ask is decided over,
-            // as the list in force holds it.
-            let at = |place: u32| match &stood {
-                Some(stood) => stood.worker(place),
-                None => list?.get(place as usize),
-            };
+            // The worker at a place of the list the ask is decided over.
+            let at = |place: u32| list?.get(place as usize);
+            // The gateway's rings with the ask's membership, where the
+            // document places by a ring: the engine asks for the
+            // membership's ring where the ask's binding reads one.
+            let rings = self.rings.get().zip(snapshot.as_ref());
             let made = Made {
-                ask,
-                missed: &missed,
-                members,
+                members: kept,
                 loads: lent.snapshot(),
                 kept: narrowed.then_some(places.as_slice()),
                 cut_by_wire: off_wire,
-                source: Cell::new(None),
+                rings: rings.map(|(rings, (membership, _))| (&**rings, &***membership)),
+                ..Made::of(ask, &missed)
             };
             // The decision's instant, where the engine dated one: a place
             // reads no clock.
@@ -1888,14 +1857,10 @@ fn narrow(
     }
 }
 
-/// The pools the engine of this process places a regular request over: the
-/// lists whose hash ring the gateway fills ([`PolicyEngine::fill_rings`]).
-const RING_POOLS: [RoutingPool; 2] = [RoutingPool::HttpRegular, RoutingPool::GrpcPipelineRegular];
-
 /// What `engine` keeps of `pool`'s list in `snapshot`, the registry's value
 /// of one membership: made at the first call for the pool and kept in the
 /// snapshot's cell beside the list, for as long as the list stands. The one
-/// read of the cell, for a request and for the fill of the list's ring.
+/// read of the cell.
 fn members_of<'s>(
     engine: &OwnEngine,
     snapshot: &'s ModelWorkerSnapshot,
@@ -1905,66 +1870,6 @@ fn members_of<'s>(
     snapshot
         .pool_members_cell(pool)
         .get_or_init(|| Box::new(engine.pool_members(list)))
-}
-
-/// The membership an attempt's first ask is decided over in the place of
-/// `in_force`, what the engine keeps of `pool`'s list of `model` as the
-/// registry publishes it: the last one whose rings the fill built
-/// ([`Standing`]). `None` where the ask is decided over the list in force:
-/// the document places by no ring, the list's own ring stands, or no ring
-/// of the model stands yet, as at its first requests.
-///
-/// One load of the kept map and one handle of the membership, and only for
-/// an ask that finds its list's ring not built.
-fn stood_before<'f>(
-    standing: &Standing,
-    model: &str,
-    pool: RoutingPool,
-    in_force: &'f PoolMembers,
-) -> Option<Stood<'f>> {
-    if !standing.kept || in_force.ring().get().is_some() {
-        return None;
-    }
-    let membership = Arc::clone(standing.memberships.load().get(model)?);
-    let stood = Stood {
-        membership,
-        pool,
-        in_force: in_force.workers(),
-    };
-    // A membership whose list of this pool took no ring decides nothing.
-    stood.members()?.ring().get()?;
-    Some(stood)
-}
-
-/// A membership whose rings stand, and the list in force that came after
-/// it: what an ask ahead of that list's ring is decided over
-/// ([`stood_before`]).
-struct Stood<'f> {
-    membership: Arc<ModelWorkerSnapshot>,
-    pool: RoutingPool,
-    in_force: &'f [Arc<dyn Worker>],
-}
-
-impl<'f> Stood<'f> {
-    /// What the engine keeps of the membership's list: the members the ask
-    /// is decided over, by their ring and their records.
-    fn members(&self) -> Option<&PoolMembers> {
-        let members = self.membership.pool_members_cell(self.pool).get()?;
-        Some(members)
-    }
-
-    /// The worker of the list in force at the address of the membership's
-    /// worker at `place`: that worker where it stayed, the one registered
-    /// at its address where it was replaced, and `None` where it left. A
-    /// worker's id is its address, so the engine knows the two by one id.
-    ///
-    /// One pass over the list in force by the object, and a second by the
-    /// address where the object is not on it.
-    fn worker(&self, place: u32) -> Option<&'f Arc<dyn Worker>> {
-        let stood = self.members()?.workers().get(place as usize)?;
-        let held = self.in_force.iter().find(|held| Arc::ptr_eq(held, stood));
-        held.or_else(|| self.in_force.iter().find(|held| held.url() == stood.url()))
-    }
 }
 
 /// A request's end, as its router read it.
@@ -2393,16 +2298,8 @@ impl Placed {
         if !handle.decode_chosen() {
             return None;
         }
-        let made = Made {
-            ask,
-            missed: &[],
-            // A pair's decode call hands no list of a regular pool.
-            members: None,
-            loads: None,
-            kept: None,
-            cut_by_wire: false,
-            source: Cell::new(None),
-        };
+        // A pair's decode call hands no list of a regular pool.
+        let made = Made::of(ask, &[]);
         let started = Instant::now();
         // The call's request is made as the first ask's was: from the
         // world the door decides it under, by the sources of that document.
@@ -2507,6 +2404,8 @@ pub(crate) use ride::{BehindAnswer, Sent};
 mod decode_again_tests;
 #[cfg(test)]
 mod own_tests;
+#[cfg(test)]
+mod ring_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

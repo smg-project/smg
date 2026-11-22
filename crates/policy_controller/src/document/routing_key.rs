@@ -12,13 +12,23 @@
 //! carries no session key, and nothing else reads it
 //! ([`RequestFacts::client_key`]).
 //!
-//! [`RequestFacts::client_key`]: crate::engine::RequestFacts::client_key
+//! A host that lends its own hash ring to a decision says where the
+//! request's key stands on it ([`RequestFacts::ring_position`]). The key's
+//! text is read here and leaves in no other form, so the position is taken
+//! here, with the two keys, by one read of the sources
+//! ([`KeySources::derive_keys`]).
 //!
+//! [`RequestFacts::client_key`]: crate::engine::RequestFacts::client_key
+//! [`RequestFacts::ring_position`]: crate::engine::RequestFacts::ring_position
 //! [`RequestFacts::session_key`]: crate::engine::RequestFacts::session_key
 
 use crate::{
     document::spec::{BindingSpec, RoutingKeySpec, SessionsSpec, ViewSpec, KEY_BYTES},
-    engine::view::{fingerprint, Identity},
+    engine::{
+        framework::{slot, PHASES},
+        view::{fingerprint, Identity, Phase},
+    },
+    policies::consistent_hashing::HashRing,
 };
 
 /// The sources a binding's requests take their routing key from, as a host
@@ -30,6 +40,11 @@ use crate::{
 pub struct KeySources {
     sources: Box<[Source]>,
     strip_lineage: bool,
+    /// The phases whose requests the binding's profile places by a hash
+    /// ring, each at its slot: the keys of such a request are read with
+    /// where its key stands on its host's ring
+    /// ([`DerivedKeys::ring_position`]).
+    ring_phases: [bool; PHASES.len()],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +82,39 @@ pub struct DerivedKey<'a> {
     pub source: KeySource<'a>,
 }
 
+/// A request's keys by the sources its binding names
+/// ([`KeySources::derive_keys`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DerivedKeys<'a> {
+    /// Its routing key ([`KeySources::derive`]), `None` where it carries
+    /// none.
+    pub session: Option<DerivedKey<'a>>,
+    /// Its client's key ([`KeySources::derive_client`]), read where it
+    /// carries no routing key: `0` under a routing key, and where it
+    /// carries none.
+    pub client_key: u64,
+    /// Where the key a ring places the request by stands on its host's hash
+    /// ring: the ring's own hash ([`HashRing::hash_position`]) of the
+    /// routing key's text as its source handed it, and of the client's
+    /// value where the request carries no routing key. What the host states
+    /// as the request's position
+    /// ([`RequestFacts::ring_position`](crate::engine::RequestFacts::ring_position)).
+    ///
+    /// `0` where the request carries neither key, under a binding whose
+    /// profile reads no ring, and from a host that lends no ring: nothing
+    /// is hashed for such a request.
+    pub ring_position: u64,
+}
+
+impl DerivedKeys<'_> {
+    /// The keys of a request that carries none.
+    pub const NONE: Self = Self {
+        session: None,
+        client_key: 0,
+        ring_position: 0,
+    };
+}
+
 impl KeySources {
     /// The sources of `binding`: its `routing_key` block, or the headers of
     /// its sessions rule where the rule names them. `None` where the
@@ -96,6 +144,7 @@ impl KeySources {
         Self {
             sources,
             strip_lineage: block.strip_lineage,
+            ring_phases: [false; PHASES.len()],
         }
     }
 
@@ -119,7 +168,18 @@ impl KeySources {
         Self {
             sources,
             strip_lineage: false,
+            ring_phases: [false; PHASES.len()],
         }
+    }
+
+    /// These sources, for a binding whose profile places a request of a
+    /// phase by a hash ring where `reads_ring` says so of the phase: the keys
+    /// of such a request are read with its key's position on its host's
+    /// ring ([`Self::derive_keys`]).
+    #[must_use]
+    pub(crate) fn with_ring_phases(mut self, reads_ring: impl Fn(Phase) -> bool) -> Self {
+        self.ring_phases = PHASES.map(reads_ring);
+        self
     }
 
     /// The headers these sources read, in order: what a host keeps of a
@@ -151,6 +211,16 @@ impl KeySources {
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
     ) -> Option<DerivedKey<'a>> {
+        self.session(&header, rid).map(|(key, _)| key)
+    }
+
+    /// [`Self::derive`], with the key's text as its source handed it: the
+    /// text a host's hash ring places the request by.
+    fn session<'a>(
+        &'a self,
+        header: &impl Fn(&str) -> Option<&'a [u8]>,
+        rid: Option<&'a str>,
+    ) -> Option<(DerivedKey<'a>, &'a str)> {
         let lineage = |key| {
             if self.strip_lineage {
                 strip_lineage(key)
@@ -179,14 +249,15 @@ impl KeySources {
                     (key, KeySource::Rid)
                 }
             };
-            Some(DerivedKey {
+            let derived = DerivedKey {
                 key: if source.plain {
                     Identity::plain(key)
                 } else {
                     Identity::hashed(fingerprint(key.as_bytes()))
                 },
                 source: from,
-            })
+            };
+            Some((derived, key))
         })
     }
 
@@ -197,6 +268,13 @@ impl KeySources {
     /// text is. It is read whole, with any suffix, and no source behind it
     /// is read. Its text leaves in no form.
     pub fn derive_client<'a>(&self, header: impl Fn(&str) -> Option<&'a [u8]>) -> u64 {
+        self.client(&header)
+            .map_or(0, |value| fingerprint(value.as_bytes()))
+    }
+
+    /// The value [`Self::derive_client`] takes the client's key of, where
+    /// it can be handed: visible ASCII, and so text.
+    fn client<'a>(&self, header: &impl Fn(&str) -> Option<&'a [u8]>) -> Option<&'a str> {
         self.sources
             .iter()
             .filter(|source| source.client)
@@ -207,7 +285,53 @@ impl KeySources {
                         .iter()
                         .all(|&byte| matches!(byte, b'\t' | b' '..=b'~'))
             })
-            .map_or(0, fingerprint)
+            .and_then(|value| std::str::from_utf8(value).ok())
+    }
+
+    /// The request's keys, by one read of the sources: its routing key
+    /// ([`Self::derive`]), its client's key where it carries no routing
+    /// key ([`Self::derive_client`]), and where the key a ring places it by
+    /// stands on its host's hash ring ([`DerivedKeys::ring_position`]).
+    ///
+    /// The position is the ring's own hash of the key's text, the one its
+    /// host's classic policy takes of the same text, so the key has one
+    /// owner by either. It is taken where the host lends its own hash ring
+    /// to the request's decision, and `ring_phase` is then the request's phase,
+    /// under a binding whose profile places a request of that phase by a
+    /// ring. It is taken for no other request: a host that keeps no ring
+    /// hashes nothing here.
+    pub fn derive_keys<'a>(
+        &'a self,
+        header: impl Fn(&str) -> Option<&'a [u8]>,
+        rid: Option<&'a str>,
+        ring_phase: Option<Phase>,
+    ) -> DerivedKeys<'a> {
+        let on_ring = ring_phase.is_some_and(|phase| self.ring_phases[slot(phase)]);
+        // A position of zero says none is stated: the one key in 2^64 that
+        // hashes there stands at the next position, which the ring's walk
+        // starts from all the same.
+        let position = |text: &str| {
+            if on_ring {
+                HashRing::hash_position(text).max(1)
+            } else {
+                0
+            }
+        };
+        match self.session(&header, rid) {
+            Some((key, text)) => DerivedKeys {
+                session: Some(key),
+                client_key: 0,
+                ring_position: position(text),
+            },
+            None => {
+                let client = self.client(&header);
+                DerivedKeys {
+                    client_key: client.map_or(0, |value| fingerprint(value.as_bytes())),
+                    ring_position: client.map_or(0, position),
+                    ..DerivedKeys::NONE
+                }
+            }
+        }
     }
 }
 
@@ -430,6 +554,58 @@ mod tests {
             sources.headers().collect::<Vec<_>>(),
             ["x-smg-routing-key", "x-forwarded-for", "cookie"]
         );
+    }
+
+    /// The keys of a request are its two keys, as each is derived alone,
+    /// and where the key a ring places it by stands on its host's ring: the
+    /// ring's own hash of the routing key's text as its source handed it,
+    /// with no lineage where the block strips it, and of the client's value
+    /// where the request carries no routing key. The position is taken on a
+    /// ring the host lends, under a binding on a ring, and for no other
+    /// request.
+    #[test]
+    fn the_keys_of_a_request_state_where_its_key_stands_on_its_hosts_ring() {
+        let block = r#"{"sources":[{"header":"x-smg-routing-key"},{"rid":true},{"header":"x-forwarded-for","client":true},{"header":"cookie","client":true}],"strip_lineage":true}"#;
+        let on_ring = sources(block).with_ring_phases(|phase| phase == Phase::Single);
+        let single = Some(Phase::Single);
+        let stands = |text: &str| HashRing::hash_position(text);
+        let keyed: [(&str, &[u8]); 2] = [
+            ("x-forwarded-for", b"10.0.0.1"),
+            ("x-smg-routing-key", b"conv-1_t2_r1"),
+        ];
+        let keys = on_ring.derive_keys(request(&keyed), Some("rid-9"), single);
+        assert_eq!(keys.session, on_ring.derive(request(&keyed), Some("rid-9")));
+        assert_eq!((keys.client_key, keys.ring_position), (0, stands("conv-1")));
+        // No routing key header: the request's own id, without its lineage.
+        let keys = on_ring.derive_keys(request(&keyed[..1]), Some("rid-9_r3"), single);
+        assert_eq!(keys.session.map(|key| key.source), Some(KeySource::Rid));
+        assert_eq!(keys.ring_position, stands("rid-9"));
+        // No session key: the client's value, whole.
+        let keys = on_ring.derive_keys(request(&keyed[..1]), None, single);
+        assert_eq!(keys.session, None);
+        assert_eq!(keys.client_key, fingerprint(b"10.0.0.1"));
+        assert_eq!(keys.ring_position, stands("10.0.0.1"));
+        // No key at all: no position.
+        assert_eq!(
+            on_ring.derive_keys(request(&[]), None, single),
+            DerivedKeys::NONE
+        );
+        // A host that lends no ring, a phase the binding places by none,
+        // and a binding on no ring: the two keys, and nothing hashed for a
+        // position.
+        let off_ring = sources(block);
+        for (sources, lent) in [
+            (&on_ring, None),
+            (&on_ring, Some(Phase::Encode)),
+            (&off_ring, single),
+        ] {
+            let keys = sources.derive_keys(request(&keyed), None, lent);
+            assert_eq!(keys.session, on_ring.derive(request(&keyed), None));
+            assert_eq!(keys.ring_position, 0);
+            let keys = sources.derive_keys(request(&keyed[..1]), None, lent);
+            assert_eq!(keys.client_key, fingerprint(b"10.0.0.1"));
+            assert_eq!(keys.ring_position, 0);
+        }
     }
 
     /// A key from a header the view does not list leaves as its fingerprint

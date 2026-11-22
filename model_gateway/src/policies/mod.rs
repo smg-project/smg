@@ -43,7 +43,12 @@ mod dp_min_token;
 mod engine_policy;
 pub mod expected_wait;
 mod factory;
-pub mod hash_ring;
+/// The consistent-hash ring. The type lives in the policy crate, where the
+/// policy engine of this process walks the same ring a classic policy does:
+/// one ring a membership, whichever of the two places the request.
+pub mod hash_ring {
+    pub use smg_policy_controller::policies::consistent_hashing::HashRing;
+}
 mod kept_rings;
 pub mod kv_index;
 mod least_load;
@@ -69,6 +74,7 @@ pub use dp_min_token::MinimumTokensPolicy;
 pub(crate) use engine_policy::DecidedByEngine;
 pub use engine_policy::EnginePolicy;
 pub use factory::PolicyFactory;
+pub(crate) use kept_rings::{GenerationRing, KeptRings};
 pub use least_load::LeastLoadPolicy;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use passthrough::PassthroughPolicy;

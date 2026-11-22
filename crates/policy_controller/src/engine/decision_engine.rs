@@ -47,6 +47,8 @@ use super::{
     },
     view::{Phase, Session, WireModes, WorkerId},
 };
+#[cfg(feature = "in-process")]
+use crate::policies::consistent_hashing::HashRing;
 use crate::{
     document::AppliedSpec,
     store::{pairing::Refusal, GatewayId, Said},
@@ -125,6 +127,23 @@ pub trait RequestMaker {
     fn kept(&self) -> Option<&[usize]> {
         None
     }
+
+    /// The hash ring the host walks for the request's list
+    /// ([`MembershipRing`]): the ring its own policies place a key on. An
+    /// engine that decides over its host's lists walks that ring for a
+    /// profile that places by one
+    /// ([`Needs::ring`](crate::document::spec::Needs::ring)) and builds
+    /// none of its own. It asks here once a decision, where a stage of the
+    /// request's binding reads a ring, and for no other request: a host
+    /// reads its ring for the requests a ring places, as its own policies
+    /// do. `None` where the host holds no ring for the list yet, and from
+    /// a host that keeps none: a request that reads a ring is then placed
+    /// by the rule for a request with no ring
+    /// ([`RequestFacts::ring_awaited`](super::view::RequestFacts::ring_awaited)).
+    #[cfg(feature = "in-process")]
+    fn ring(&self) -> Option<MembershipRing<'_>> {
+        None
+    }
 }
 
 impl RequestMaker for Request<'_> {
@@ -175,6 +194,26 @@ pub struct Plain {
     /// ([`RequestFacts::prompt_tokens`](super::view::RequestFacts::prompt_tokens)):
     /// a lease issued for it states the size.
     pub prompt_tokens: u32,
+}
+
+/// The hash ring a host walks for a request's list, handed with the request
+/// ([`RequestMaker::ring`]).
+///
+/// A host keeps one ring a membership and fills it off the path of a
+/// request. Between a membership's change and the fill of its ring the host
+/// walks the ring it kept, of an earlier membership, and hands that one
+/// here: the decision then reads a ring whose addresses are not the list's.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy, Debug)]
+pub struct MembershipRing<'a> {
+    /// The ring.
+    pub ring: &'a Arc<HashRing>,
+    /// Whether the ring was made of the membership the request's list is
+    /// of. The list then keeps the table it reads the ring through
+    /// ([`PoolMembers::ring_places`](super::policy_engine::PoolMembers::ring_places)).
+    /// A ring of another membership is read through a table made for the
+    /// one request, and nothing is kept of it.
+    pub of_this_membership: bool,
 }
 
 /// The workers a request may be sent to, as its host holds them for one

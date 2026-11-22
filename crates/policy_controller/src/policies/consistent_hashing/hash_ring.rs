@@ -11,6 +11,14 @@
 //! The type intentionally has no dependency on the `Worker` trait — it is
 //! constructed from URLs — so policies and tests can build rings without
 //! materializing fake workers.
+//!
+//! One ring has two readers. A gateway's classic policies hash a key's text
+//! and ask about a worker by its URL ([`HashRing::find_healthy_url`]). The
+//! consistent-hash stage, where its host lends it the ring of a decision's
+//! workers ([`ListRing`](super::ListRing)), is handed the key's position
+//! ([`HashRing::hash_position`]) and walks the same entries from it
+//! ([`HashRing::around`]). So a key has one owner whichever of the two
+//! places it.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -204,7 +212,7 @@ impl HashRing {
     /// behind, so a list given again answers true unless a list moved a URL
     /// the ring kept. False decides nothing: the same URLs in another order
     /// make the same ring, and [`Self::updated`] finds it.
-    pub(crate) fn is_over<I>(&self, urls: I) -> bool
+    pub fn is_over<I>(&self, urls: I) -> bool
     where
         I: IntoIterator,
         I::Item: AsRef<str>,
@@ -217,15 +225,29 @@ impl HashRing {
 
     /// This ring's URLs in the ring's own order: each where its first list
     /// put it, new ones behind.
-    pub(crate) fn urls(&self) -> &Arc<[Arc<str>]> {
+    pub fn urls(&self) -> &Arc<[Arc<str>]> {
         &self.urls
     }
 
     /// Whether this ring and `other` are one table of positions, for the
     /// cases that say a ring was taken from another and not built again.
-    #[cfg(test)]
-    pub(crate) fn shares_positions_with(&self, other: &Self) -> bool {
+    pub fn shares_positions_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.entries, &other.entries)
+    }
+
+    /// The ring's URLs clockwise from `position`, once around: each by its
+    /// index among [`Self::urls`], from the first entry at or past
+    /// `position`. A URL stands at each of its positions, so a walk meets
+    /// it more than once.
+    ///
+    /// The entries [`Self::find_healthy_url`] walks, in its order, for a
+    /// reader that was handed its key's position
+    /// ([`Self::hash_position`]) and knows a worker by a place of its own.
+    /// It allocates nothing.
+    pub fn around(&self, position: u64) -> impl Iterator<Item = u32> + '_ {
+        let start = self.entries.partition_point(|(pos, _)| *pos < position);
+        let (before, from) = self.entries.split_at(start);
+        from.iter().chain(before).map(|&(_, index)| index)
     }
 
     /// Hash a string to a ring position using blake3 (stable across versions).
@@ -234,7 +256,7 @@ impl HashRing {
         clippy::expect_used,
         reason = "blake3 always produces 32 bytes — converting a fixed 8-byte slice to [u8; 8] is infallible"
     )]
-    pub(crate) fn hash_position(s: &str) -> u64 {
+    pub fn hash_position(s: &str) -> u64 {
         let hash = blake3::hash(s.as_bytes());
         u64::from_le_bytes(
             hash.as_bytes()[..8]
@@ -390,6 +412,52 @@ mod tests {
                 "{workers} workers: each asked once, got {asked:?}"
             );
         }
+    }
+
+    /// A walk from a key's position meets the URLs in the order a lookup of
+    /// the key asks about them, each at its first meeting: the two readers
+    /// of a ring walk one order. It goes once around, a URL at every one of
+    /// its positions, from a position under the first entry and past the
+    /// last alike.
+    #[test]
+    fn a_walk_from_a_keys_position_meets_the_urls_in_the_lookups_order() {
+        for workers in [1, 2, 3, 16, 64] {
+            let urls: Vec<String> = (0..workers).map(|i| format!("http://w{i}:8000")).collect();
+            let ring = HashRing::new(&urls);
+            for key in 0..200 {
+                let key = format!("key-{key}");
+                let asked = std::cell::RefCell::new(Vec::new());
+                assert_eq!(
+                    ring.find_healthy_url(&key, |url| {
+                        asked.borrow_mut().push(url.to_string());
+                        false
+                    }),
+                    None
+                );
+                let mut met: Vec<String> = Vec::new();
+                let mut entries = 0;
+                for index in ring.around(HashRing::hash_position(&key)) {
+                    entries += 1;
+                    let url = &*ring.urls()[index as usize];
+                    if !met.iter().any(|met| met == url) {
+                        met.push(url.to_string());
+                    }
+                }
+                assert_eq!(met, asked.into_inner(), "{key} over {workers} workers");
+                assert_eq!(entries, ring.len(), "{key}: once around");
+            }
+            for position in [0, u64::MAX] {
+                assert_eq!(ring.around(position).count(), ring.len());
+                let first = ring.around(position).next().expect("an entry");
+                let (_, lowest) = ring.entries[0];
+                assert_eq!(
+                    first, lowest,
+                    "a walk past the last entry starts at the first"
+                );
+            }
+        }
+        let empty = HashRing::new(std::iter::empty::<&str>());
+        assert_eq!(empty.around(7).count(), 0);
     }
 
     #[test]

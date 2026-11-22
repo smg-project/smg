@@ -8103,6 +8103,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
+ "blake3",
  "clap",
  "criterion",
  "crossbeam-queue",

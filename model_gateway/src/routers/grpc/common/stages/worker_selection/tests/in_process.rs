@@ -97,6 +97,16 @@ fn naming(registry: &Arc<WorkerRegistry>, target: &'static str) -> RequestContex
     ctx
 }
 
+/// A first attempt that carries the routing key `key` in its header.
+fn keyed(registry: &Arc<WorkerRegistry>, key: &str) -> RequestContext {
+    let mut ctx = prompt_of(registry, 3);
+    let mut headers = HeaderMap::new();
+    let key = HeaderValue::from_str(key).expect("a header's value");
+    headers.insert("x-smg-routing-key", key);
+    ctx.input.headers = Some(headers);
+    ctx
+}
+
 /// The one worker a selection left in `workers`.
 fn single(workers: Option<&WorkerSelection>) -> &Arc<dyn Worker> {
     match workers {
@@ -267,12 +277,16 @@ async fn a_retry_under_a_decoding_rule_stays_on_the_workers_that_decide_alike() 
     }
 }
 
-/// Where the model's own policy keeps an explicit target, the request is
-/// held to the worker its header names, and the engine decides over that
-/// worker alone. The number counts the workers that are available, as the
-/// consistent hashing policy counts them, so both name one worker. A number
-/// past them is no worker, with one answer. Under a policy that reads no
-/// target the header holds the request to nobody.
+/// Where the document in force places the model by the plain hash ring,
+/// the request is held to the worker its header names, and the engine
+/// decides over that worker alone. The document alone says it: with the
+/// setting on under `consistent_hashing` the registry builds no classic
+/// policy, and none is asked. The number counts the workers that are
+/// available, as the consistent hashing policy counts them, so both name
+/// one worker. A number past them is no worker, with one answer. Under a
+/// document that reads no target the header holds the request to nobody:
+/// under round robin's, where the stage's classic registry holds a
+/// consistent hashing policy for the model, and under `prefix_hash`.
 #[tokio::test]
 async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
     let registry = Arc::new(WorkerRegistry::new());
@@ -280,7 +294,7 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
     let workers = ["grpc://w0:8000", "grpc://w1:8000", "grpc://w2:8000"]
         .map(|url| listed(&registry, url, vllm, None, UNLABELED));
     workers[0].set_status(WorkerStatus::NotReady);
-    let stage = own_stage(&registry, PolicyConfig::ConsistentHashing);
+    let (stage, policies) = started_stage(PolicyConfig::ConsistentHashing, &registry);
     let classic = classic_stage(&registry, PolicyConfig::ConsistentHashing);
     for _ in 0..PLACEMENTS {
         let mut ctx = naming(&registry, "1");
@@ -304,8 +318,9 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
     assert_eq!(own.0, StatusCode::SERVICE_UNAVAILABLE);
     let missed = classic.execute(&mut naming(&registry, "2")).await;
     assert_eq!(answer_of(missed.expect_err("no worker")).await, own);
+    assert!(!classic_was_asked(&policies));
 
-    let reads_none = own_stage(&registry, PolicyConfig::RoundRobin);
+    let reads_none = own_stage(&registry, PolicyConfig::ConsistentHashing);
     let mut turns = [0; 3];
     for _ in 0..PLACEMENTS {
         let mut ctx = naming(&registry, "1");
@@ -315,6 +330,23 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
         turns[place.expect("a worker of the pool")] += 1;
     }
     assert!(turns[0] == 0 && turns[1] > 0 && turns[2] > 0, "{turns:?}");
+
+    let prefix_hash = PolicyConfig::PrefixHash {
+        prefix_token_count: 256,
+        load_factor: 1.25,
+        balance_abs_threshold: 10,
+        cache_boundaries: Vec::new(),
+    };
+    let (reads_none, policies) = started_stage(prefix_hash, &registry);
+    for _ in 0..PLACEMENTS {
+        // A number that names no worker: placed all the same.
+        let mut ctx = naming(&registry, "2");
+        reads_none.execute(&mut ctx).await.expect("a worker");
+        assert!(ctx.state.placed.is_some(), "the engine placed it");
+        let on = single(ctx.state.workers.as_ref());
+        assert!(!Arc::ptr_eq(on, &workers[0]), "a worker that is not ready");
+    }
+    assert!(!classic_was_asked(&policies));
 }
 
 /// The regular stage as a gateway's start builds it under the manual policy
@@ -322,13 +354,25 @@ async fn an_explicit_target_holds_the_request_to_the_worker_it_names() {
 /// decides every request, with the policy registry the start builds beside
 /// that engine. The registry too, for what it holds.
 fn manual_stage(registry: &Arc<WorkerRegistry>) -> (WorkerSelectionStage, Arc<PolicyRegistry>) {
+    let manual = PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    started_stage(manual, registry)
+}
+
+/// [`manual_stage`] under `policy`, a policy whose every request the engine
+/// decides. The engine object is handed the hash rings the registry keeps,
+/// as the start hands them, and no task fills them here: a request fills
+/// its membership's ring.
+fn started_stage(
+    policy: PolicyConfig,
+    registry: &Arc<WorkerRegistry>,
+) -> (WorkerSelectionStage, Arc<PolicyRegistry>) {
     let config = RouterConfig {
         policy_controller: true,
-        policy: PolicyConfig::Manual {
-            eviction_interval_secs: 60,
-            max_idle_secs: 14_400,
-            assignment_mode: ManualAssignmentMode::Random,
-        },
+        policy,
         ..RouterConfig::default()
     };
     let started = start_in_process(&config, None)
@@ -343,6 +387,7 @@ fn manual_stage(registry: &Arc<WorkerRegistry>) -> (WorkerSelectionStage, Arc<Po
         true,
     ));
     let engine = PolicyEngine::own(started.engine, Arc::clone(registry));
+    policies.share_rings_with(&engine);
     let stage = WorkerSelectionStage::new(
         Arc::clone(registry),
         Arc::clone(&policies),
@@ -351,6 +396,15 @@ fn manual_stage(registry: &Arc<WorkerRegistry>) -> (WorkerSelectionStage, Arc<Po
     )
     .with_policy_engine(Some(Arc::new(engine)));
     (stage, policies)
+}
+
+/// Whether a placement asked the classic policy of the registry's default
+/// place, of which the registry holds the name alone.
+fn classic_was_asked(policies: &PolicyRegistry) -> bool {
+    let default = policies.get_default_policy();
+    let held = default.as_any().downcast_ref::<DecidedByEngine>();
+    let held = held.expect("the registry holds the policy's name alone");
+    held.was_asked()
 }
 
 /// The worker `stage` places a first attempt under the routing key `key`
@@ -402,4 +456,47 @@ async fn under_the_manual_policy_the_engine_places_and_no_classic_policy_is_aske
     let held = default.as_any().downcast_ref::<DecidedByEngine>();
     let held = held.expect("the registry holds the policy's name alone");
     assert!(!held.was_asked(), "the stage asked the classic policy");
+}
+
+/// On the gRPC pipeline's regular stage a routing key has one worker by the
+/// engine of this process and by the classic consistent hashing policy:
+/// both walk the one ring the gateway keeps for the membership. A worker
+/// that is not ready is passed over by both, to the same next worker. The
+/// registry holds the policy's name alone, and the stage never asks it.
+#[tokio::test]
+async fn a_routing_key_goes_to_the_worker_the_classic_ring_policy_gives_it() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let workers: Vec<Arc<dyn Worker>> = (0..8)
+        .map(|at| {
+            let url = format!("grpc://w{at}:8000");
+            listed(&registry, &url, RuntimeType::Vllm, None, UNLABELED)
+        })
+        .collect();
+    let (stage, policies) = started_stage(PolicyConfig::ConsistentHashing, &registry);
+    let classic = classic_stage(&registry, PolicyConfig::ConsistentHashing);
+    let mut taken = [0_u32; 8];
+    for down in [None, Some(3), Some(5)] {
+        for (at, worker) in workers.iter().enumerate() {
+            worker.set_status(if Some(at) == down {
+                WorkerStatus::NotReady
+            } else {
+                WorkerStatus::Ready
+            });
+        }
+        for key in 0..256 {
+            let key = format!("conversation-{key}");
+            let mut ctx = keyed(&registry, &key);
+            stage.execute(&mut ctx).await.expect("a worker");
+            assert!(ctx.state.placed.is_some(), "the engine placed it");
+            let own = Arc::clone(single(ctx.state.workers.as_ref()));
+            let mut ctx = keyed(&registry, &key);
+            classic.execute(&mut ctx).await.expect("a worker");
+            let by_classic = single(ctx.state.workers.as_ref());
+            assert!(Arc::ptr_eq(&own, by_classic), "{key}, down {down:?}");
+            let place = workers.iter().position(|worker| Arc::ptr_eq(worker, &own));
+            taken[place.expect("a worker of the pool")] += 1;
+        }
+    }
+    assert!(taken.iter().all(|&keys| keys > 0), "{taken:?}");
+    assert!(!classic_was_asked(&policies));
 }

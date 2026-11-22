@@ -860,8 +860,18 @@ impl Router {
         if header_utils::extract_target_worker(headers).is_none() {
             return Ok(None);
         }
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-        if !placement::strict_target(policy.as_ref(), headers) {
+        // Where the engine of this process decides, its document alone
+        // says whether the model is held to the worker a request names: no
+        // classic policy is built for a policy the engine decides whole. A
+        // gateway that follows a controller keeps its classic registry,
+        // and the model's policy says it.
+        let held = policy_engine
+            .holds_to_named_worker(model_id)
+            .unwrap_or_else(|| {
+                let policy = self.policy_registry.get_policy_or_default(model_id);
+                placement::strict_target(policy.as_ref(), headers)
+            });
+        if !held {
             return Ok(None);
         }
         if !policy_engine.in_process() {

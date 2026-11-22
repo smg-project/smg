@@ -1084,17 +1084,14 @@ impl AppContextBuilder {
             ),
             None => PolicyRegistry::with_override(policy, routing_key_override),
         };
+        let registry = registry.with_pd_pairing_mode(config.pd_pairing_mode);
         // Where the engine of this process places the gateway's requests,
-        // the task that fills the hash rings fills the engine's.
-        let placing = self
-            .policy_engine
-            .clone()
-            .filter(|_| self.in_process.is_some());
-        self.policy_registry = Some(Arc::new(
-            registry
-                .with_pd_pairing_mode(config.pd_pairing_mode)
-                .with_rings_of(placing),
-        ));
+        // it reads the hash rings this registry keeps: one ring a
+        // membership, whichever of the two places the request.
+        if let (Some(policy_engine), Some(_)) = (&self.policy_engine, &self.in_process) {
+            registry.share_rings_with(policy_engine);
+        }
+        self.policy_registry = Some(Arc::new(registry));
         self
     }
 
@@ -1408,10 +1405,11 @@ mod tests {
     /// whose every place the engine picks by itself starts, and its
     /// bindings place the models. So does one whose place the engine
     /// decides by its whole pass from what this process feeds it: the
-    /// routers ask the context's engine object. One that holds a place the
-    /// engine does not decide in this process yet is refused at the start,
-    /// by the profile, the stage of it that asks more, the binding and the
-    /// phase.
+    /// routers ask the context's engine object. A document that places by
+    /// a hash ring is one, beside settings that state the same sources of
+    /// its key: the engine reads the gateway's own ring. Beside settings
+    /// that state none it is refused at the start, by the binding and the
+    /// rule the settings do not run.
     #[tokio::test]
     async fn a_supplied_document_starts_where_the_engine_picks_each_of_its_places() {
         // A document that names no number: the first of its gateway.
@@ -1445,18 +1443,30 @@ mod tests {
             .unwrap();
         assert!(context.policy_engine.is_some());
 
-        // A place that reads a hash ring, which this process does not feed
-        // a whole decision yet.
+        // A place that reads a hash ring: the whole pass reads the ring
+        // the gateway keeps, and the object is handed the registry's.
+        let ringed = RouterConfig {
+            policy: PolicyConfig::ConsistentHashing,
+            ..supplied("consistent_hashing")
+        };
+        let context = AppContext::from_config(ringed, 10, None, None)
+            .await
+            .unwrap();
+        let policy_engine = context.policy_engine.as_ref().expect("the engine object");
+        let rings = policy_engine.rings().expect("the gateway's hash rings");
+        assert!(Arc::ptr_eq(rings, context.policy_registry.kept_rings()));
+
+        // The same document beside settings that read no key: its binding
+        // states the sources of its key, and the placement runs the
+        // settings' own.
         let started = AppContext::from_config(supplied("consistent_hashing"), 10, None, None).await;
         let Err(refused) = started else {
             panic!("the start is not refused");
         };
         assert!(
-            refused.contains("profile `consistent_hashing` is not decided in this process yet"),
+            refused.contains("binding 1 (`*`) states `routing_key`, which is not run"),
             "{refused}"
         );
-        assert!(refused.contains("it holds the scorer `"), "{refused}");
-        assert!(refused.contains("(binding `*`, phase single)"), "{refused}");
     }
 
     /// The parts a start builds for a context or leaves out, by name, and
@@ -1565,7 +1575,8 @@ mod tests {
     /// a key's first request. A gateway of many routers holds none under
     /// it: it serves pairs, which a sessions rule does not plan, and keeps
     /// its classic pass. Under the two policies that place by a hash ring
-    /// a gateway holds none yet: the classic policy places their requests.
+    /// a gateway holds the object too, handed the hash rings its policy
+    /// registry keeps, and a gateway of many routers holds none.
     #[tokio::test]
     async fn a_context_in_process_holds_the_engine_object_under_the_manual_policy() {
         use crate::config::ManualAssignmentMode;
@@ -1604,8 +1615,15 @@ mod tests {
         };
         for policy in [PolicyConfig::ConsistentHashing, prefix_hash] {
             let name = policy.name();
-            let context = built(policy, false).await;
-            assert!(context.policy_engine.is_none(), "{name}");
+            let context = built(policy.clone(), false).await;
+            let policy_engine = context.policy_engine.as_ref().expect(name);
+            let rings = policy_engine.rings().expect(name);
+            assert!(
+                Arc::ptr_eq(rings, context.policy_registry.kept_rings()),
+                "{name}"
+            );
+            let many = built(policy, true).await;
+            assert!(many.policy_engine.is_none(), "{name}: many routers");
         }
     }
 

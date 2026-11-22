@@ -893,16 +893,42 @@ async fn under_the_setting_many_routers_decide_typed_requests_and_leave_the_rest
 /// model with no worker.
 #[tokio::test]
 async fn under_the_manual_policy_no_route_asks_a_classic_policy() -> Case {
-    use smg_worker::health::circuit_breaker::CircuitBreakerConfig;
-
-    use crate::policies::DecidedByEngine;
-
-    let mut config = picked(quiet());
-    config.policy = PolicyConfig::Manual {
+    let manual = PolicyConfig::Manual {
         eviction_interval_secs: 60,
         max_idle_secs: 14_400,
         assignment_mode: ManualAssignmentMode::Random,
     };
+    Box::pin(no_route_asks_a_classic_policy_under(manual)).await
+}
+
+/// Under the two policies that place by the hash ring, as under `manual`:
+/// the engine walks the ring the gateway keeps, the registry holds each
+/// policy's name alone, and no route asks it.
+#[tokio::test]
+async fn under_the_hash_ring_policies_no_route_asks_a_classic_policy() -> Case {
+    let prefix_hash = PolicyConfig::PrefixHash {
+        prefix_token_count: 256,
+        load_factor: 1.25,
+        balance_abs_threshold: 10,
+        cache_boundaries: Vec::new(),
+    };
+    for policy in [PolicyConfig::ConsistentHashing, prefix_hash] {
+        Box::pin(no_route_asks_a_classic_policy_under(policy)).await?;
+    }
+    Ok(())
+}
+
+/// With the setting on under `policy`, a policy the engine decides whole
+/// and the registry builds no classic object for: every route leaves the
+/// policy's name unasked.
+async fn no_route_asks_a_classic_policy_under(policy: PolicyConfig) -> Case {
+    use smg_worker::health::circuit_breaker::CircuitBreakerConfig;
+
+    use crate::policies::DecidedByEngine;
+
+    let name = policy.name();
+    let mut config = picked(quiet());
+    config.policy = policy;
     config.disable_retries = true;
     let (context, gateway) = Box::pin(build(config)).await?;
     // A worker no failed send takes out of the pool: each route's request
@@ -926,15 +952,18 @@ async fn under_the_manual_policy_no_route_asks_a_classic_policy() -> Case {
             .iter()
             .find(|(ask, _, _)| *ask == placed)
             .ok_or("the route was not asked")?;
-        assert_ne!(*status, StatusCode::NOT_FOUND, "{placed}: {code}");
-        assert_ne!(code, BY_NAME, "{placed}");
+        assert_ne!(*status, StatusCode::NOT_FOUND, "{name}, {placed}: {code}");
+        assert_ne!(code, BY_NAME, "{name}, {placed}");
     }
     let default = context.policy_registry.get_default_policy();
     let held = default
         .as_any()
         .downcast_ref::<DecidedByEngine>()
-        .ok_or("a classic policy was built for `manual`")?;
-    assert!(!held.was_asked(), "a route asked the classic policy");
+        .ok_or_else(|| format!("a classic policy was built for `{name}`"))?;
+    assert!(
+        !held.was_asked(),
+        "{name}: a route asked the classic policy"
+    );
     Ok(())
 }
 

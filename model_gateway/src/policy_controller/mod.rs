@@ -256,18 +256,21 @@ impl InProcess {
 /// ([`engine::PolicyEngine::read_loads`]), and a worker's count of session
 /// keys in flight on the worker object, with the rest of its record.
 ///
-/// Not fed yet, so a profile that reads one keeps the classic placement
-/// pass: a hash ring, a header of the request, a named signal's cells, and
-/// the media a request carries. No route states a request's media counts
-/// to the engine: a stage that declared them would read none for every
-/// request, with no error. Nor is a session key's own count of requests
-/// on a worker fed, so a sessions rule with an in-flight cap keeps that
-/// pass too.
+/// The hash ring a stage reads is the gateway's own, the one its classic
+/// policies walk: one ring a membership, filled off the path of a request.
+/// An ask reads its membership's ring where the gateway keeps it
+/// ([`engine::PolicyEngine::read_rings`]) and states where its key's text
+/// stands on it, so a key has the worker a classic placement gives it and
+/// keeps that worker when the setting is turned on. The engine builds no
+/// ring. The prefix form walks the same ring from positions of its own:
+/// a prefix does not stand where the classic `prefix_hash` policy puts it.
 ///
-/// The hash ring of a list stands beside the list already, filled off the
-/// path of a request ([`engine::PolicyEngine::fill_rings`]). It is not
-/// stated here until it places a key on the worker the classic policy's
-/// ring does: a key then keeps its worker when the setting is turned on.
+/// Not fed yet, so a profile that reads one keeps the classic placement
+/// pass: a header of the request, a named signal's cells, and the media a
+/// request carries. No route states a request's media counts to the
+/// engine: a stage that declared them would read none for every request,
+/// with no error. Nor is a session key's own count of requests on a worker
+/// fed, so a sessions rule with an in-flight cap keeps that pass too.
 fn fed() -> Needs {
     Needs {
         token_hashes: true,
@@ -276,6 +279,7 @@ fn fed() -> Needs {
         loads: true,
         events: true,
         sent_prefixes: true,
+        ring: true,
         active_sessions: true,
         affinity: true,
         ..Needs::default()

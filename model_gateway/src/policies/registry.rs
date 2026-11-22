@@ -97,8 +97,20 @@ impl Side {
 /// `manual`: the keys' pins are the engine's session table and its pass
 /// drops the idle ones, in the place of the policy's own map and its
 /// eviction task.
+///
+/// `consistent_hashing` and `prefix_hash`: the engine walks the one hash
+/// ring a membership has, which this registry keeps and fills whoever
+/// places ([`KeptRings`]), and the policies' objects keep nothing. A route
+/// that holds a request to the worker it names asks the document for it
+/// ([`GatewayEngine::holds_to_named_worker`]), where it read the type of
+/// the consistent hashing object.
 const fn no_classic_object(config: &PolicyConfig) -> bool {
-    matches!(config, PolicyConfig::Manual { .. })
+    matches!(
+        config,
+        PolicyConfig::Manual { .. }
+            | PolicyConfig::ConsistentHashing
+            | PolicyConfig::PrefixHash { .. }
+    )
 }
 
 /// The policy engine a registry's policies ask, with its document's origin.
@@ -475,16 +487,20 @@ impl PolicyRegistry {
         self.rings.are_current(registry)
     }
 
-    /// The registry of a gateway where `policy_engine`, the gateway's object
-    /// over the policy engine of this process, places the requests: the
-    /// task that fills the hash rings fills the engine's
-    /// ([`KeptRings::filling`]). `None` leaves the rings as they are.
-    #[must_use]
-    pub(crate) fn with_rings_of(mut self, policy_engine: Option<Arc<GatewayEngine>>) -> Self {
-        if policy_engine.is_some() {
-            self.rings = Arc::new(KeptRings::filling(policy_engine));
-        }
-        self
+    /// Hands `policy_engine`, the gateway's object over the policy engine
+    /// of this process, the hash rings this registry keeps
+    /// ([`GatewayEngine::read_rings`]). The engine places a key on the ring
+    /// a classic policy walks, one ring a membership, and builds none: the
+    /// task that fills the rings is the one a classic gateway runs.
+    pub(crate) fn share_rings_with(&self, policy_engine: &GatewayEngine) {
+        policy_engine.read_rings(&self.rings);
+    }
+
+    /// The hash rings this registry keeps, for a case that stands in for
+    /// the task that fills them.
+    #[cfg(test)]
+    pub(crate) fn kept_rings(&self) -> &Arc<KeptRings> {
+        &self.rings
     }
 
     /// Starts the task that fills the hash rings off the request path

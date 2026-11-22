@@ -1063,11 +1063,14 @@ fn own_router_under(spec: AppliedSpec, urls: &[&str]) -> Case<Router> {
     }
     let engine = Arc::new(OwnEngine::new(spec));
     let policy_engine = PolicyEngine::own(engine, Arc::clone(&registry));
-    // The app's task fills a list's hash ring off the path of a request,
-    // and no request does: this bed has no such task, and fills the ring of
-    // its one list here.
-    assert!(policy_engine.fill_rings(MODEL));
-    Ok(router(registry, Some(policy_engine)))
+    let hosted = router(registry, Some(policy_engine));
+    // A gateway's start hands the engine object the hash rings its policy
+    // registry keeps. This bed runs no task that fills them, so a request
+    // fills the ring of its membership, as where a gateway runs none.
+    if let Some(policy_engine) = &hosted.policy_engine {
+        hosted.policy_registry.share_rings_with(policy_engine);
+    }
+    Ok(hosted)
 }
 
 /// A retry names the worker of a failed attempt as tried where its route
@@ -1088,18 +1091,18 @@ fn a_retry_names_the_worker_of_a_placement_its_route_did_not_keep() -> Case {
 }
 
 /// Where the engine of this process places, a request that names its
-/// worker is held to that worker under a model whose classic policy keeps
-/// an explicit target: the route states the one worker the header names,
-/// found as the classic policy finds it, and the engine decides over it
-/// alone. A number that names no worker leaves the request none, and it
-/// moves to no other.
+/// worker is held to that worker under a document that places the model by
+/// the plain hash ring, as the classic consistent hashing policy holds it:
+/// the route states the one worker the header names, found as the classic
+/// policy finds it, and the engine decides over it alone. A number that
+/// names no worker leaves the request none, and it moves to no other. The
+/// document alone says it: this bed's classic registry holds round robin.
 #[tokio::test]
 async fn a_request_that_names_its_worker_is_held_to_it_in_process() -> Case {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
-    let mut router = own_router("round_robin", &[&a, &b])?;
-    router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing));
+    let router = own_router("consistent_hashing", &[&a, &b])?;
     let hits = || (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
     let named = |target: &'static str| {
         let mut headers = HeaderMap::new();
@@ -1132,6 +1135,42 @@ async fn a_request_that_names_its_worker_is_held_to_it_in_process() -> Case {
         .await;
     assert_eq!(missed.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(hits(), (4, 4), "a miss moves to no other worker");
+    Ok(())
+}
+
+/// The status of one generate request that names the worker at place
+/// `target` in its header, put to `router`.
+async fn generate_naming(router: &Router, target: &'static str) -> Case<StatusCode> {
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let mut headers = HeaderMap::new();
+    headers.insert("x-smg-target-worker", HeaderValue::from_static(target));
+    let request = serde_json::from_value(json!({"text": "hi"}))?;
+    let response = router
+        .route_generate(Some(&headers), &meta, request, MODEL)
+        .await;
+    Ok(response.status())
+}
+
+/// Under a document that places a model by no plain hash ring, a request
+/// that names its worker is held to nobody: a number that names no worker
+/// is placed all the same. So under round robin's document, where the
+/// gateway's classic registry holds a consistent hashing policy for the
+/// model and no classic policy is asked, and so under `prefix_hash`, whose
+/// classic policy reads no target either.
+#[tokio::test]
+async fn a_document_that_reads_no_target_holds_a_named_request_to_nobody() -> Case {
+    let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let hits = || hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst);
+    let mut turns = own_router("round_robin", &[&a, &b])?;
+    turns.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing));
+    let prefixes = own_router("prefix_hash", &[&a, &b])?;
+    for (free, sent) in [(&turns, 4), (&prefixes, 8)] {
+        for _ in 0..4 {
+            assert_eq!(generate_naming(free, "7").await?, StatusCode::OK);
+        }
+        assert_eq!(hits(), sent, "each request went to a worker");
+    }
     Ok(())
 }
 
@@ -1500,17 +1539,18 @@ async fn a_request_the_engine_does_not_place_goes_back_to_the_buffered_path() ->
 }
 
 /// A request that names its worker is held to it on the streamed path as
-/// on the buffered one, where the model's classic policy holds it to that
-/// worker and the engine of this process places: each number names its own
-/// worker, and the body is streamed to it. A number that names no worker
-/// goes back to the buffered path, which answers it. Under a policy that
-/// reads no target the header changes nothing: the workers take their
+/// on the buffered one, where the document in force places the model by
+/// the plain hash ring and the engine of this process places: each number
+/// names its own worker, and the body is streamed to it. A number that
+/// names no worker goes back to the buffered path, which answers it. Under
+/// a document that reads no target the header changes nothing, whatever
+/// classic policy the registry holds for the model: the workers take their
 /// turns.
 #[tokio::test]
 async fn a_streamed_request_that_names_its_worker_is_held_to_it_in_process() -> Case {
     let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
-    let mut router = own_router("round_robin", &[&a, &b])?;
+    let router = own_router("consistent_hashing", &[&a, &b])?;
     let hits = || (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst));
     let named = |target: &str| {
         keyed(
@@ -1519,7 +1559,6 @@ async fn a_streamed_request_that_names_its_worker_is_held_to_it_in_process() -> 
             target,
         )
     };
-    router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing));
     let mut took = Vec::new();
     for target in ["0", "1"] {
         let before = hits();
@@ -1543,7 +1582,10 @@ async fn a_streamed_request_that_names_its_worker_is_held_to_it_in_process() -> 
     assert_eq!(counted, [("buffered", "no_available_worker", 1)]);
     assert_eq!(hits(), (3, 3), "a miss moves to no other worker");
 
-    router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+    // Round robin's document, beside a classic consistent hashing policy
+    // in the registry: no classic policy is asked whether it holds.
+    let mut router = own_router("round_robin", &[&a, &b])?;
+    router.policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing));
     for _ in 0..4 {
         let (answer, counted) = streamed(&router, named("0")?).await;
         let response = answer.map_err(|_| "the router buffered the request")?;

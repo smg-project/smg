@@ -1570,6 +1570,7 @@ mod tests {
             client_key: 0,
             ring: None,
             ring_awaited: false,
+            ring_position: 0,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

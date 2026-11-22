@@ -40,14 +40,6 @@
 //! fills and keeps the ring of each generation a membership change
 //! published. Where no task lives, the first request of a generation fills
 //! its ring itself.
-//!
-//! Where the policy engine of this process places the gateway's requests
-//! ([`KeptRings::filling`]), a list's ring is the engine's own, kept beside
-//! the list, and the same task fills it in the place of the ring above: one
-//! subscriber of the registry's events, and one ring a list. No request of
-//! the engine's builds a ring or waits for one. A request a classic policy
-//! still places there reads the ring above, and fills it as where no task
-//! lives.
 
 use std::{
     sync::{
@@ -68,10 +60,7 @@ use tokio::sync::broadcast::{
 use tracing::{debug, error};
 
 use super::hash_ring::HashRing;
-use crate::{
-    policy_controller::engine::PolicyEngine,
-    routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry, WorkerRegistryExt},
-};
+use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry, WorkerRegistryExt};
 
 /// The last ring the warm task filled for each model the registry holds,
 /// the model-less ring under [`UNKNOWN_MODEL_ID`].
@@ -82,34 +71,9 @@ pub(crate) struct KeptRings {
     /// who fills a generation's ring. A count read a moment late places no
     /// request wrongly: a ring a request fills is its generation's own.
     warming: Arc<AtomicUsize>,
-    /// The policy engine of this process, where it places the gateway's
-    /// requests ([`Self::filling`]): the warm task fills its ring of each
-    /// list, and none of these.
-    engine: Option<Placing>,
-}
-
-/// The gateway's policy engine, as the warm task holds it.
-struct Placing(Arc<PolicyEngine>);
-
-impl std::fmt::Debug for Placing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the policy engine of this process")
-    }
 }
 
 impl KeptRings {
-    /// The kept rings of a gateway where `policy_engine`, the policy engine
-    /// of this process, places the requests: the warm task fills the
-    /// engine's ring of each list that stands
-    /// ([`PolicyEngine::fill_rings`]), in the place of the ring it would
-    /// keep here. `None` keeps the rings as a classic gateway does.
-    pub(crate) fn filling(policy_engine: Option<Arc<PolicyEngine>>) -> Self {
-        Self {
-            engine: policy_engine.map(Placing),
-            ..Self::default()
-        }
-    }
-
     /// The ring `model_id`'s requests are placed on, for `generation`, the
     /// registry's generation of the model: `None` for a generation without
     /// a member, as a model nobody serves has no ring. It is the
@@ -130,14 +94,38 @@ impl KeptRings {
         }
     }
 
+    /// [`Self::of`] for a reader that holds `generation` for as long as it
+    /// walks the ring, as the policy engine of this process holds it for
+    /// one decision. The generation's own ring is borrowed where it stands
+    /// in its cell: the read moves no count two requests share. Where it
+    /// does not stand yet, the read is [`Self::of`]'s, and the ring is the
+    /// one that read found or left there ([`GenerationRing`]).
+    ///
+    /// The engine builds no ring of its own: a key it places has the owner
+    /// a classic policy's walk of this ring finds.
+    pub(crate) fn ring_for<'g>(
+        &self,
+        model_id: &str,
+        generation: &'g ModelWorkerSnapshot,
+    ) -> Option<GenerationRing<'g>> {
+        if let Some(own) = generation.hash_ring() {
+            return Some(GenerationRing::Current(own));
+        }
+        let standing = self.of(model_id, generation)?;
+        // That read fills the generation's ring where no task does, and
+        // puts the kept one there where it is the generation's.
+        Some(match generation.hash_ring() {
+            Some(own) => GenerationRing::Current(own),
+            None => GenerationRing::Earlier(standing),
+        })
+    }
+
     /// [`Self::of`] for a generation whose ring is not filled yet. Out of
     /// line, so the read of a filled ring pays nothing for it.
     #[cold]
     fn standing(&self, model_id: &str, generation: &ModelWorkerSnapshot) -> Option<Arc<HashRing>> {
-        if self.warming.load(Ordering::Relaxed) == 0 || self.engine.is_some() {
+        if self.warming.load(Ordering::Relaxed) == 0 {
             // No task will fill this generation's ring: this request does.
-            // Where the task fills the policy engine's rings, the request
-            // is one a classic policy still places.
             let kept = self.kept_for(model_id);
             return Some(Arc::clone(generation.fill_hash_ring(kept)));
         }
@@ -157,20 +145,20 @@ impl KeptRings {
     /// placements to follow, as a test bed does.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn are_current(&self, registry: &WorkerRegistry) -> bool {
-        let models = registry.get_models();
-        let mut models = models.iter().map(String::as_str).chain([UNKNOWN_MODEL_ID]);
-        // The policy engine's rings, where the task fills those.
-        if let Some(Placing(engine)) = &self.engine {
-            return models.all(|model_id| engine.rings_stand(model_id));
-        }
         if self.warming.load(Ordering::Relaxed) == 0 {
             return true;
         }
-        models.all(|model_id| {
-            let generation = registry.get_routing_snapshot(model_id);
-            generation.is_empty()
-                || (self.of(model_id, &generation).is_some() && generation.hash_ring().is_some())
-        })
+        registry
+            .get_models()
+            .iter()
+            .map(String::as_str)
+            .chain([UNKNOWN_MODEL_ID])
+            .all(|model_id| {
+                let generation = registry.get_routing_snapshot(model_id);
+                generation.is_empty()
+                    || (self.of(model_id, &generation).is_some()
+                        && generation.hash_ring().is_some())
+            })
     }
 
     /// The ring kept for `model_id`.
@@ -182,12 +170,6 @@ impl KeptRings {
     /// it, for the next generation's requests and for its fill to start
     /// from; a model without a member keeps none.
     fn warm(&self, registry: &WorkerRegistry, model_id: &str) {
-        // Where the policy engine of this process places the requests, the
-        // ring of a list is the engine's: filled here, and none is kept.
-        let placing = self.engine.as_ref();
-        if placing.is_some_and(|Placing(engine)| engine.fill_rings(model_id)) {
-            return;
-        }
         let generation = registry.get_routing_snapshot(model_id);
         if generation.is_empty() {
             self.kept.remove(model_id);
@@ -269,7 +251,6 @@ impl KeptRings {
         runtime: &tokio::runtime::Handle,
     ) {
         let mut events = registry.subscribe_events();
-        let fills_the_engines = self.engine.is_some();
         let rings = Arc::downgrade(self);
         let registry = Arc::downgrade(registry);
         let warming = Warming::start(&self.warming);
@@ -290,15 +271,9 @@ impl KeptRings {
                 let heard = std::mem::take(&mut changed);
                 let filled = tokio::task::spawn_blocking(move || rings.fill(&registry, heard));
                 // A fill that panicked is this task's last: the requests
-                // fill from here on. A request of the policy engine fills
-                // none, so the engine's lists that follow take no ring.
+                // fill from here on.
                 if let Err(ended) = filled.await {
-                    if ended.is_panic() && fills_the_engines {
-                        error!(
-                            "A hash ring fill panicked: the policy engine places a request with \
-                             a routing key as one with none on every list that follows"
-                        );
-                    } else if ended.is_panic() {
+                    if ended.is_panic() {
                         error!("A hash ring fill panicked: requests fill the rings from here on");
                     }
                     return;
@@ -310,6 +285,51 @@ impl KeptRings {
                 }
             }
         });
+    }
+}
+
+/// The ring a generation's requests are placed on, as a reader that holds
+/// the generation is handed it ([`KeptRings::ring_for`]).
+#[derive(Debug)]
+pub(crate) enum GenerationRing<'g> {
+    /// The generation's own ring, in its cell.
+    Current(&'g Arc<HashRing>),
+    /// The ring kept from another generation, while this one's is filled.
+    Earlier(Arc<HashRing>),
+}
+
+impl GenerationRing<'_> {
+    /// The ring.
+    pub(crate) fn ring(&self) -> &Arc<HashRing> {
+        match self {
+            Self::Current(ring) => ring,
+            Self::Earlier(ring) => ring,
+        }
+    }
+
+    /// Whether the ring is the generation's own: made of its membership.
+    pub(crate) fn is_current(&self) -> bool {
+        matches!(self, Self::Current(_))
+    }
+}
+
+/// The warm task, as a case of another module stands in for it.
+#[cfg(test)]
+impl KeptRings {
+    /// Leaves every fill to the warm task from here on, as where one
+    /// lives, for as long as the guard does: a request fills no ring.
+    pub(crate) fn pretend_warm_task(&self) -> impl Drop + use<> {
+        Warming::start(&self.warming)
+    }
+
+    /// One wake of the warm task behind missed events, on this thread: it
+    /// fills and keeps the ring of every model `registry` holds.
+    pub(crate) fn fill_every_model(&self, registry: &WorkerRegistry) {
+        let everything = Changed {
+            everything: true,
+            models: Vec::new(),
+        };
+        self.fill(registry, everything);
     }
 }
 

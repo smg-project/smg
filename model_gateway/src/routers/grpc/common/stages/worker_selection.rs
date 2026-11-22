@@ -1970,14 +1970,23 @@ impl WorkerSelectionStage {
     /// header is asked first, so a request that names nobody asks no policy.
     ///
     /// A regular request asks its model's policy, as the classic selection
-    /// does. A pair asks its settings: no role policy is built under the
+    /// does. Where the policy engine of this process decides, the document
+    /// in force alone says it ([`PolicyEngine::holds_to_named_worker`]):
+    /// no classic policy is built for a policy the engine decides whole. A
+    /// pair asks its settings: no role policy is built under the
     /// controller, and the registry would answer for the main one.
     fn strict_target(&self, model_id: &str, headers: Option<&HeaderMap>) -> bool {
         extract_target_worker(headers).is_some()
             && match self.mode {
                 WorkerSelectionMode::Regular => {
-                    let policy = self.policy_registry.get_policy_or_default(model_id);
-                    placement::strict_target(policy.as_ref(), headers)
+                    let by_document = self
+                        .policy_engine
+                        .as_deref()
+                        .and_then(|engine| engine.holds_to_named_worker(model_id));
+                    by_document.unwrap_or_else(|| {
+                        let policy = self.policy_registry.get_policy_or_default(model_id);
+                        placement::strict_target(policy.as_ref(), headers)
+                    })
                 }
                 WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
                     self.pair_keeps_target

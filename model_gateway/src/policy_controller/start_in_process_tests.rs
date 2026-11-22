@@ -155,16 +155,11 @@ fn a_document_the_gateway_does_not_run_is_answered_as_a_start_under_it() -> Case
             .map(|refused| refused.to_string())
     };
 
-    // A place the engine does not decide in this process yet: one that
-    // places by a hash ring.
+    // A document that places by a hash ring states the sources of its
+    // key, and the settings of the gateway asked state none.
     let ringed = PolicySpec::preset("consistent_hashing")?;
-    let words = answer(&running, &ringed).ok_or("a hash ring was taken")?;
-    assert!(
-        words.starts_with(
-            "the policy document's profile `consistent_hashing` is not decided in this process yet"
-        ),
-        "{words}"
-    );
+    let words = not_run(1, "*", "routing_key", BY_SETTINGS);
+    assert_eq!(answer(&running, &ringed), Some(words.clone()));
     assert_eq!(words, refusal(&supplied(ringed))?);
 
     // A rule nothing runs.
@@ -758,10 +753,11 @@ fn a_stage_that_reads_media_is_not_decided_whole_while_no_route_states_it() -> C
 /// gateway's own ask derives and whose pins are the engine's table, and
 /// the rule compares at most a count the worker object keeps. A gateway of
 /// many routers under it is not: it serves pairs, which a sessions rule
-/// does not plan. A policy that places by a hash ring or by a header of
-/// the request is not yet: the routers keep their classic pass under it,
-/// and a supplied document of it is refused by its first stage that asks
-/// more than a pick.
+/// does not plan. So are the two policies that place by a hash ring: the
+/// engine reads the ring the gateway keeps for a model, and builds none. A
+/// profile that places by a header of the request is not yet: the routers
+/// keep their classic pass under it, and a supplied document of it is
+/// refused by its first stage that asks more than a pick.
 #[test]
 fn the_engine_decides_whole_what_this_process_feeds() -> Case {
     let started = |policy: PolicyConfig| -> Result<InProcess, Box<dyn Error>> {
@@ -782,12 +778,11 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
         .needs_for("a-model", Phase::Single);
     assert!(declared.affinity && declared.loads);
     assert!(declared.within(fed()));
-    // Of every routing policy, the engine decides whole all but the two
-    // that place by a hash ring.
+    // The engine decides every routing policy whole, the two that place
+    // by a hash ring among them.
     for policy in policies() {
         let name = policy.name();
-        let classic = matches!(name, "consistent_hashing" | "prefix_hash");
-        assert_eq!(started(policy)?.decides_whole(), !classic, "{name}");
+        assert!(started(policy)?.decides_whole(), "{name}");
     }
     // The manual policy is decided whole under each assignment of a key's
     // first request: the fewest session keys compares a count the worker
@@ -836,8 +831,9 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
 
     // A supplied document whose profile reads who holds the prompt is
     // decided whole, so it starts: the prefix stage by itself, and the
-    // warm-up slice beside it, which reads a report. One that places by a
-    // hash ring is refused by the first stage that asks more than a pick.
+    // warm-up slice beside it, which reads a report. So does one that
+    // places by a hash ring, beside settings that state the same sources
+    // of its key.
     for kept in [
         &["prefix-affinity"][..],
         &["warmup-slice", "prefix-affinity"][..],
@@ -848,10 +844,11 @@ fn the_engine_decides_whole_what_this_process_feeds() -> Case {
         let started = start_in_process(&supplied(held), None)?.ok_or("an engine")?;
         assert!(started.decides_whole(), "{kept:?}");
     }
-    let refused = refusal(&supplied(PolicySpec::preset("consistent_hashing")?))?;
-    assert!(
-        refused.starts_with("the policy document's profile `consistent_hashing` is not decided"),
-        "{refused}"
-    );
+    let ringed = RouterConfig {
+        policy: PolicyConfig::ConsistentHashing,
+        ..supplied(PolicySpec::preset("consistent_hashing")?)
+    };
+    let started = start_in_process(&ringed, None)?.ok_or("an engine")?;
+    assert!(started.decides_whole());
     Ok(())
 }

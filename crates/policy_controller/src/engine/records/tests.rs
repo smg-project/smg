@@ -16,7 +16,7 @@ use crate::{
     engine::{
         decision::Decision,
         framework::DRAW_FROM,
-        view::{AffinityHolder, AffinityRows, Phase},
+        view::{fingerprint, AffinityHolder, AffinityRows, Phase},
     },
 };
 

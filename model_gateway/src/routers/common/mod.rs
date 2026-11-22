@@ -434,6 +434,10 @@ pub mod bench_support {
             if let Some(loads) = loads {
                 engine.read_loads(loads);
             }
+            // The hash rings the policy registry keeps, as the start hands
+            // them. No task fills these: the first request of a membership
+            // fills its ring, as where a gateway runs none.
+            policies.share_rings_with(&engine);
             Ok(Self { engine, policies })
         }
 

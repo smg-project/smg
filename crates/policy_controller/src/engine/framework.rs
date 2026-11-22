@@ -3678,7 +3678,7 @@ struct Entry {
 }
 
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
-const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+pub(crate) const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
 
 /// A phase's slot in [`Engine::phase_needs`] (and in a plugin's open
 /// decisions, one per side of a pair): total, so no read falls back to
@@ -4875,6 +4875,25 @@ impl Engine {
             .is_some_and(|needs| needs.affinity)
     }
 
+    /// Whether a profile of the binding at `at`, its live one or its
+    /// shadow, places a request of `phase` by a hash ring
+    /// ([`Needs::ring`]): the bindings whose requests are lent their host's
+    /// ring ([`Self::decide_keyed`]). A host that lends its own ring states
+    /// where such a request's key stands on it
+    /// ([`RequestFacts::ring_position`]).
+    pub(crate) fn binding_reads_ring(&self, at: u32, phase: Phase) -> bool {
+        let Some(entry) = self.bindings.get(at as usize) else {
+            return false;
+        };
+        let reads_ring = |profile: u16| {
+            let needs = self.profile_needs.get(usize::from(profile));
+            needs.is_some_and(|needs| needs.ring)
+        };
+        let live = profile_index(&entry.binding, phase);
+        let shadow = shadow_index(&entry.binding, phase);
+        live.is_some_and(reads_ring) || shadow.is_some_and(reads_ring)
+    }
+
     /// The cap of each list of rows a host names again for the shadow of
     /// the binding at `at` ([`ShadowRows::Own`]): the shadow profile's
     /// own, as [`Self::affinity_rows_cap`] says a live profile's. `0` where the
@@ -4931,6 +4950,21 @@ impl Engine {
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {
         self.resolve(model, phase)
             .map(|(_, index, profile)| (index, profile))
+    }
+
+    /// Whether the plain hash ring alone places a request of `phase` for
+    /// `model` by its key: the profile its binding resolves to carries the
+    /// key's mark, which the validator sets for one shape of profile, the
+    /// stock `consistent_hashing` one. `false` where no binding matches.
+    ///
+    /// For a host with a rule of its own for such a place, which it reads
+    /// off the document and off no object beside it: a gateway holds a
+    /// request that names its worker to that worker there, ahead of the
+    /// decision, as its classic consistent hashing does.
+    #[must_use]
+    pub fn placed_by_hash_ring_alone(&self, model: &str, phase: Phase) -> bool {
+        self.resolve(model, phase)
+            .is_some_and(|(_, index, _)| self.marks[usize::from(index)].keyed())
     }
 
     /// The warm-up ruling a decision of `phase` for `model` applies: the one

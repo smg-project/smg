@@ -35,7 +35,8 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_policy_controller::{
     document::{
-        AppliedSpec, DerivedKey, KeySource, KeySourceSpec, Pairing, PolicySpec, RoutingKeySpec,
+        AppliedSpec, DerivedKey, DerivedKeys, KeySource, KeySourceSpec, Pairing, PolicySpec,
+        RoutingKeySpec,
     },
     engine::{
         fingerprint, Candidate, Decision, DecisionRefused, Identity, LoadRow, MediaCounts, Phase,
@@ -68,6 +69,7 @@ use crate::{
         ADMISSION_QUEUE_TIMEOUT_STATUS,
     },
     observability::{cache_trace, metrics::test_support::render_with_recorder},
+    policies::hash_ring::HashRing,
     routers::{
         common::{
             placement::refusal_reason,
@@ -1271,19 +1273,46 @@ async fn an_ask_states_the_key_its_bindings_sources_hold() {
     };
     let (_, store, _) = bed_under(manual(), &URLS[..1]);
     store.deciding(|world| {
-        let (derived, client) = ask.keys(world.spec());
-        let derived = derived.expect("the header's key");
+        let keys = ask.keys(world.spec(), false);
+        let derived = keys.session.expect("the header's key");
         assert_eq!(derived.key, Identity::plain("conv-1"));
         assert_eq!(derived.source, KeySource::Header(KEY_HEADER));
-        assert_eq!(client, 0);
-        let stated = ask.request(derived.key, client, &[]).facts.session_key;
+        assert_eq!(keys.client_key, 0);
+        let stated = ask.request(derived.key, 0, &[]).facts.session_key;
         assert_eq!(stated, derived.key);
         let bare = first(b"request");
-        assert_eq!(bare.keys(world.spec()), (None, 0), "no header");
+        assert_eq!(bare.keys(world.spec(), false), DerivedKeys::NONE);
     });
     // A binding that names no source gives its requests no key.
     let (_, store, _) = bed(&URLS[..1]);
-    store.deciding(|world| assert_eq!(ask.keys(world.spec()), (None, 0)));
+    store.deciding(|world| assert_eq!(ask.keys(world.spec(), false), DerivedKeys::NONE));
+}
+
+/// An ask states where its key stands on the ring the gateway lends its
+/// decision: the ring's own hash of the key's text, a routing key's and a
+/// client's alike, under a document that places by a ring. An ask the
+/// gateway lends no ring states no position, and neither does one under a
+/// document that places by none: nothing is hashed for it.
+#[tokio::test]
+async fn an_ask_states_where_its_key_stands_on_the_ring_the_gateway_supplies() {
+    let position_under = |policy: PolicyConfig, headers: &HeaderMap, ring_supplied: bool| {
+        let (_, store, _) = bed_under(policy, &URLS[..1]);
+        let ask = Ask {
+            headers: Some(headers),
+            ..first(b"request")
+        };
+        store.deciding(|world| ask.keys(world.spec(), ring_supplied).ring_position)
+    };
+    let on_ring = |headers: &HeaderMap, ring_supplied: bool| {
+        position_under(PolicyConfig::ConsistentHashing, headers, ring_supplied)
+    };
+    let session = keyed(KEY_HEADER, "conv-1");
+    assert_eq!(on_ring(&session, true), HashRing::hash_position("conv-1"));
+    let client = keyed("x-forwarded-for", "10.0.0.1");
+    assert_eq!(on_ring(&client, true), HashRing::hash_position("10.0.0.1"));
+    assert_eq!(on_ring(&HeaderMap::new(), true), 0, "no key, no position");
+    assert_eq!(on_ring(&session, false), 0, "no ring lent");
+    assert_eq!(position_under(manual(), &session, true), 0, "no ring read");
 }
 
 #[tokio::test]
@@ -1297,10 +1326,11 @@ async fn an_ask_with_no_routing_key_states_its_clients_key() {
             ..first(b"request")
         };
         store.deciding(|world| {
-            let (derived, client) = ask.keys(world.spec());
+            let keys = ask.keys(world.spec(), false);
+            let client = keys.client_key;
             let stated = ask.request(Identity::NONE, client, &[]).facts.client_key;
             assert_eq!(stated, client);
-            (derived.is_none(), client)
+            (keys.session.is_none(), client)
         })
     };
     let mut headers = keyed("cookie", "session=abc");
@@ -1357,8 +1387,8 @@ async fn a_key_is_read_by_the_documents_sources_in_their_order() {
         };
         let key = |derived: DerivedKey<'_>| owned(derived.key);
         store.deciding(|world| {
-            ask.keys(world.spec())
-                .0
+            ask.keys(world.spec(), false)
+                .session
                 .map_or_else(|| owned(Identity::NONE), key)
         })
     };

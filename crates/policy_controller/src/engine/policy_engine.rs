@@ -45,7 +45,7 @@ pub(super) mod pair;
 mod single;
 
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
     hash::Hasher,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
@@ -70,12 +70,12 @@ use super::{
     prompt_hashes::{HashSeeds, PromptHashes},
     records::{DecisionClock, PoolRecords},
     store_backed_engine::{DecideOutcome, DecisionRefused, Request, SweepOutcome},
-    view::{fingerprint, Phase, WireModes, WorkerId},
+    view::{Phase, WireModes, WorkerId},
 };
 use crate::{
     document::spec::AppliedSpec,
     names::intern,
-    policies::consistent_hashing::PoolRing,
+    policies::consistent_hashing::RingPlaces,
     stages::Lifecycle,
     store::{pairing::Refusal, GatewayId, Said},
     tracking::lease::{EventKind, EventSet, Side},
@@ -137,9 +137,10 @@ pub struct PoolMembers {
     /// engine picks alone for it, where the document holds one
     /// ([`Self::alone`]).
     alone: OnceLock<(Box<str>, Option<AloneProfile>)>,
-    /// The list's hash ring ([`Self::ring`]): built off the path of a
-    /// request, and by no decision ([`PolicyEngine::fill_ring`]).
-    ring: OnceLock<PoolRing>,
+    /// Where the addresses of the host's hash ring for the list's
+    /// membership stand in the list ([`Self::ring_places`]): made by the
+    /// list's first decision that reads that ring, and by no other.
+    ring_places: OnceLock<RingPlaces>,
     /// What a decision whose stages read affinity keeps of the list
     /// ([`Self::affinity`]): read at the list's first such decision, and by
     /// no other.
@@ -195,16 +196,21 @@ impl PoolMembers {
         })
     }
 
-    /// The cell of the list's hash ring: each worker of the list at its
-    /// positions, by its id and its stable key. Empty until the gateway
-    /// fills it, off the path of a request ([`PolicyEngine::fill_ring`]):
-    /// a decision reads the cell, lends the ring where it stands, and
-    /// neither builds one nor waits for one. A list no ring policy decides
-    /// builds none. The ring is never changed: a membership change
-    /// publishes another list, which takes a ring of its own.
+    /// The cell of the table a decision reads its host's hash ring
+    /// through: for each address of the ring of the list's own membership,
+    /// the place of that address's worker in the list ([`RingPlaces`]).
+    ///
+    /// The engine builds no ring. Its host keeps one a membership, the one
+    /// its classic policies walk, and hands it with a request
+    /// ([`RequestMaker::ring`]). The cell is empty until the list's first
+    /// decision that reads that ring: that decision makes the table, once,
+    /// and every later one reads it. A list no ring stage decides makes
+    /// none, and a ring of another membership is read with no table. The
+    /// table is never changed: a membership change publishes another list,
+    /// which takes a table of its own.
     #[must_use]
-    pub fn ring(&self) -> &OnceLock<PoolRing> {
-        &self.ring
+    pub fn ring_places(&self) -> &OnceLock<RingPlaces> {
+        &self.ring_places
     }
 
     /// What a decision whose stages read affinity keeps of the list: each
@@ -275,8 +281,7 @@ impl PolicyEngine {
     /// policies. A worker no record holds costs one lookup a model.
     pub fn forget(&self, address: &str) {
         // The id every decision knew the worker by ([`records::worker_id`]).
-        self.affinity
-            .forget(WorkerId(fingerprint(address.as_bytes())));
+        self.affinity.forget(WorkerId::from_address(address));
     }
 
     /// The clock of the engine's decisions. A caller that makes a list's
@@ -318,38 +323,9 @@ impl PolicyEngine {
             records: OnceLock::new(),
             wires: OnceLock::new(),
             alone: OnceLock::new(),
-            ring: OnceLock::new(),
+            ring_places: OnceLock::new(),
             affinity: PoolAffinity::default(),
         }
-    }
-
-    /// Whether the document places a single request of `model` by a hash
-    /// ring: a stage that may decide such a request reads one. The gateway
-    /// keeps a ring for each list of such a model's workers
-    /// ([`Self::fill_ring`]), and none for another model's.
-    #[must_use]
-    pub fn reads_ring(&self, model: &str) -> bool {
-        let engine = self.spec.engine();
-        engine.needs_for(model, Phase::Single).ring
-    }
-
-    /// Builds the hash ring of `members`, a list of `model`'s workers,
-    /// where the document places a single request of the model by a ring
-    /// ([`Self::reads_ring`]), and says whether the list's ring stands.
-    /// `false` where it places such a request by none: the list takes none.
-    ///
-    /// For the gateway, off the path of a request, where it hears of a list:
-    /// the build hashes every worker's positions and sorts them, and no
-    /// decision does it ([`PoolMembers::ring`]). It makes the list's
-    /// records where no decision has yet. A second call is one read.
-    pub fn fill_ring(&self, model: &str, members: &PoolMembers) -> bool {
-        if !self.reads_ring(model) {
-            return false;
-        }
-        members
-            .ring
-            .get_or_init(|| keys::ring_of(members.records(&self.spec, &self.clock)));
-        true
     }
 
     /// What the document holds for one place the gateway builds a policy
@@ -524,17 +500,18 @@ impl PolicyEngine {
                 return Ok(None);
             }
         }
+        // Where the host's ring is read into as the request's list reads
+        // it, once a stage reads one: it stands ahead of the request, whose
+        // facts borrow it.
+        let cell = OnceCell::new();
         let mut request = maker.make(&self.spec);
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
-            (Phase::Single, WorkerLists::Single(members)) => single::decide(
-                self,
-                &mut request,
-                members,
-                maker.loads(),
-                maker.kept(),
-                now,
-            ),
+            (Phase::Single, WorkerLists::Single(members)) => {
+                let ring = keys::LazyRing { maker, cell: &cell };
+                let (loads, kept) = (maker.loads(), maker.kept());
+                single::decide(self, &mut request, members, loads, kept, ring, now)
+            }
             // A pair is decided at its prefill, over its host's two
             // lists.
             (Phase::Prefill, WorkerLists::Pair(lists)) => {
@@ -958,12 +935,12 @@ mod tests {
     /// feed. Round robin asks nothing of a host. Random and passthrough
     /// read a worker's record and no more. Least load reads the workers'
     /// reports, and the default policy who holds the prompt beside them.
-    /// A host that feeds less than a profile declares, a profile that
-    /// reads a hash ring and a pair's plan are not decided so. A sessions
-    /// rule is the engine's own table, and the host feeds it the counts it
-    /// compares: none for the stock rule, each worker's count of session
-    /// keys for an assignment by the fewest keys, the key's own count for
-    /// a cap.
+    /// The two ring policies read a hash ring, which a host that lends its
+    /// own feeds. A host that feeds less than a profile declares and a
+    /// pair's plan are not decided so. A sessions rule is the engine's own
+    /// table, and the host feeds it the counts it compares: none for the
+    /// stock rule, each worker's count of session keys for an assignment by
+    /// the fewest keys, the key's own count for a cap.
     #[test]
     fn a_document_is_decided_whole_where_each_place_is_picked_alone_or_fed() {
         let whole = |engine: &PolicyEngine, fed: Needs| engine.spec().engine().single_and_fed(fed);
@@ -991,9 +968,20 @@ mod tests {
             ..declared
         };
         assert!(!whole(&default, unfed), "its load stages read reports");
-        // A ring is no part of what the default policy's host feeds.
+        // A ring is no part of what the default policy's host feeds. A
+        // host that lends its own ring feeds one, with what the prefix form
+        // reads beside it.
         for name in ["consistent_hashing", "prefix_hash"] {
-            assert!(!whole(&preset(name), declared), "{name}");
+            let ring = preset(name);
+            assert!(!whole(&ring, declared), "{name}");
+            let read = ring.spec().engine().needs_for(MODEL, Phase::Single);
+            assert!(read.ring, "{name}");
+            assert!(whole(&ring, read), "{name}");
+            let unlent = Needs {
+                ring: false,
+                ..read
+            };
+            assert!(!whole(&ring, unlent), "{name}");
         }
         // The stock sessions rule draws a key's first worker and caps
         // nothing: its host feeds it nothing.

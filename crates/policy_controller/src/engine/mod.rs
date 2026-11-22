@@ -34,9 +34,9 @@ pub use decision::{
     Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, Queue, ShadowKind, Shed, ShedReason,
     Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-#[cfg(feature = "in-process")]
-pub use decision_engine::WorkerLists;
 pub use decision_engine::{AlonePick, Decided, DecisionEngine, HeldDecision, Plain, RequestMaker};
+#[cfg(feature = "in-process")]
+pub use decision_engine::{MembershipRing, WorkerLists};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use framework::{

@@ -3,7 +3,7 @@
 //! reads counted, and the session table left as the whole decision leaves
 //! it.
 
-use std::cell::Cell;
+use std::{cell::Cell, sync::Arc};
 
 use super::{
     super::{Binding, Engine, Filter, Plan, Profile, Scorer, TieBand, WeightedScorer},
@@ -20,27 +20,36 @@ use crate::{
         },
         Scratch, DRAW_BOUND,
     },
-    policies::consistent_hashing::{ConsistentHash, PoolRing},
+    policies::consistent_hashing::{ConsistentHash, HashRing, ListRing, RingPlaces},
     stages::{lifecycle::Lifecycle, pickers::Best},
     tracking::lease::{Lease, Side},
     Draw,
 };
 
 /// A pool as a host keeps it for a keyed decision: the rows a whole
-/// decision is handed, read one at a time and counted, and the list's ring.
+/// decision is handed, read one at a time and counted, and the host's ring
+/// as the list reads it.
 struct Listed<'a> {
     rows: &'a [Candidate],
-    ring: &'a PoolRing,
+    ring: &'a ListRing<'a>,
     read: Cell<u32>,
 }
 
-/// The ring of the list `rows` are, as a host builds it once a list.
-fn ring_of(rows: &[Candidate]) -> PoolRing {
-    PoolRing::new(rows.iter().map(|row| (row.id, row.key)))
+/// The address of the worker at `position` of a pool.
+fn address(position: u32) -> String {
+    format!("http://worker-{position}.pool:8000")
+}
+
+/// The host's ring of the workers of the list `rows` are, with the table
+/// the list reads it through, as a host makes it once a list.
+fn ring_of(rows: &[Candidate]) -> RingPlaces {
+    let ring = Arc::new(HashRing::new((0..rows.len() as u32).map(address)));
+    let ids: Vec<WorkerId> = rows.iter().map(|row| row.id).collect();
+    RingPlaces::new(&ring, &ids)
 }
 
 impl<'a> Listed<'a> {
-    fn of(rows: &'a [Candidate], ring: &'a PoolRing) -> Self {
+    fn of(rows: &'a [Candidate], ring: &'a ListRing<'a>) -> Self {
         Self {
             rows,
             ring,
@@ -73,23 +82,27 @@ impl<'a> PoolRows<'a> for Listed<'a> {
         1
     }
 
-    fn ring(&self) -> Option<&'a PoolRing> {
+    fn ring(&self) -> Option<&'a ListRing<'a>> {
         Some(self.ring)
     }
 }
 
-/// A pool of `count` rows in an order of its host's own: ids that rise and
-/// fall along it, each row's stable key its id's low half. One row in
-/// `down` is not ready and one in `over` is over its thresholds, by `shape`.
+/// A pool of `count` rows in an order of its host's own: a row's id is its
+/// worker's address's, so the ids rise and fall along it, and its stable
+/// key is its id's low half. One row in `down` is not ready and one in
+/// `over` is over its thresholds, by `shape`.
 fn pool(count: u32, shape: u64, down: usize, over: usize) -> Vec<Candidate> {
     let mut draw = Draw::new(shape);
     (0..count)
         .map(|position| {
-            let id = draw.next_u64() | 1;
+            let id = WorkerId::from_address(&address(position));
+            // A row's health is drawn behind one draw of its own, which
+            // names nothing here.
+            draw.next_u64();
             Candidate {
                 position,
-                id: WorkerId(id),
-                key: id as u32,
+                id,
+                key: id.0 as u32,
                 health: Health {
                     healthy: down == 0 || draw.below(down) != 0,
                     overloaded: over != 0 && draw.below(over) == 0,
@@ -201,21 +214,20 @@ fn answer(decision: &Decision) -> Option<Answer> {
 /// A ring's keyed request over rows read one at a time is the whole
 /// decision's answer: the same targets in the same order and the same mark
 /// of a lifted veto, by the stock document, by one whose binding sheds and
-/// by an engine built by hand, for a session's key and a client's, over
-/// pools with rows down, over their thresholds, tried, excluded and masked.
-/// The whole decision is asked twice: under the lent ring, and by a twin
-/// engine that is lent none and learns its own. The three agree. A decision
-/// made here reads no more rows than its walk met.
+/// by an engine built by hand, for a session's key and a client's, where
+/// the host says the key stands and where it says nothing, over pools with
+/// rows down, over their thresholds, tried, excluded and masked. The whole
+/// decision is asked under the ring the keyed one was lent. A decision made
+/// here reads no more rows than its walk met.
 #[test]
 fn a_rings_walk_over_rows_read_one_at_a_time_is_the_whole_decisions_answer() {
     let (stock_ring, shedding) = (stock("consistent_hashing"), shedding_ring());
-    let (twin_stock, twin_shedding) = (stock("consistent_hashing"), shedding_ring());
-    let engines: [(&Engine, &Engine, &str); 3] = [
-        (stock_ring.engine(), twin_stock.engine(), "stock"),
-        (shedding.engine(), twin_shedding.engine(), "shedding"),
-        (&hand_built_ring(), &hand_built_ring(), "by hand"),
+    let engines: [(&Engine, &str); 3] = [
+        (stock_ring.engine(), "stock"),
+        (shedding.engine(), "shedding"),
+        (&hand_built_ring(), "by hand"),
     ];
-    for (engine, twin, name) in engines {
+    for (engine, name) in engines {
         let (mut decided, mut asked) = (0, 0);
         for (count, shape, down, over) in [
             (1, 1, 0, 0),
@@ -228,11 +240,12 @@ fn a_rings_walk_over_rows_read_one_at_a_time_is_the_whole_decisions_answer() {
             (200, 8, 9, 5),
         ] {
             let rows = pool(count, shape, down, over);
-            let ring = ring_of(&rows);
+            let places = ring_of(&rows);
+            let ring = places.list_ring();
             let listed = Listed::of(&rows, &ring);
             let pool_facts = facts_of(&rows);
             let mut draw = Draw::new(shape ^ 0x5eed);
-            let (mut scratch, mut twin_scratch) = (Scratch::new(), Scratch::new());
+            let mut scratch = Scratch::new();
             for turn in 0..400_u64 {
                 let key = draw.next_u64() | 1;
                 // A retry names the workers it tried, the host one it just
@@ -247,7 +260,7 @@ fn a_rings_walk_over_rows_read_one_at_a_time_is_the_whole_decisions_answer() {
                     stalled: if turn % 7 == 0 { &stalled } else { &[] },
                     ..Constraints::default()
                 };
-                let unlent = RequestFacts {
+                let mut facts = RequestFacts {
                     model: "m",
                     session_key: if turn % 4 == 3 {
                         Identity::NONE
@@ -255,11 +268,16 @@ fn a_rings_walk_over_rows_read_one_at_a_time_is_the_whole_decisions_answer() {
                         Identity::hashed(key)
                     },
                     client_key: if turn % 4 >= 2 { key ^ 1 } else { 0 },
+                    // Where its host says the key stands, two turns in three.
+                    ring_position: if turn % 3 == 2 {
+                        0
+                    } else {
+                        key.rotate_left(23) | 1
+                    },
                     tried: &tried,
                     seed: turn,
                     ..RequestFacts::default()
                 };
-                let mut facts = unlent;
                 listed.read();
                 let keyed = engine.decide_keyed(&mut facts, &listed, &cx);
                 let read = listed.read();
@@ -268,12 +286,6 @@ fn a_rings_walk_over_rows_read_one_at_a_time_is_the_whole_decisions_answer() {
                     "{name}: the pool's ring is lent on the way"
                 );
                 let whole = engine.decide(&facts, &pool_facts, &rows, &cx, &mut scratch);
-                let own = twin.decide(&unlent, &pool_facts, &rows, &cx, &mut twin_scratch);
-                assert_eq!(
-                    answer(&whole),
-                    answer(&own),
-                    "{name}, turn {turn} over {count} rows: the lent ring and the learned one"
-                );
                 asked += 1;
                 if let Some(keyed) = keyed {
                     assert_eq!(
@@ -306,7 +318,8 @@ fn a_kept_key_is_decided_by_its_walk_where_a_row_it_met_stands_under_the_veto() 
     let engine = applied.engine();
     for (over, least, most) in [(4, 150, 200), (1, 0, 0)] {
         let rows = pool(64, 21, 0, over);
-        let ring = ring_of(&rows);
+        let places = ring_of(&rows);
+        let ring = places.list_ring();
         let listed = Listed::of(&rows, &ring);
         let mut decided = 0;
         for key in 1..=200 {
@@ -340,6 +353,9 @@ fn a_kept_key_is_decided_by_its_walk_where_a_row_it_met_stands_under_the_veto() 
 /// rule's idle time. A pin is followed by reading one row or two.
 fn pins_followed(whole: &Engine, keyed: &Engine, capped: bool) -> (u32, u32) {
     let mut rows = pool(16, 31, 0, 0);
+    // The list's membership stands through the turns, and so does its ring.
+    let places = ring_of(&rows);
+    let ring = places.list_ring();
     let mut draw = Draw::new(33);
     let keys: Vec<u64> = (0..40).map(|_| draw.next_u64() | 1).collect();
     let (mut scratch, mut keyed_scratch) = (Scratch::new(), Scratch::new());
@@ -369,12 +385,13 @@ fn pins_followed(whole: &Engine, keyed: &Engine, capped: bool) -> (u32, u32) {
                 ..*row
             })
             .collect();
-        let ring = ring_of(&seen);
         let listed = Listed::of(&seen, &ring);
         let key = keys[draw.below(keys.len())];
         let tried: Vec<WorkerId> = (0..turn % 2)
             .map(|_| seen[draw.below(seen.len())].id)
             .collect();
+        // Both decisions read the host's ring where the profile places by
+        // one: the whole pass is lent the ring the keyed one is.
         let request = RequestFacts {
             model: "m",
             session_key: Identity::hashed(key),
@@ -382,6 +399,7 @@ fn pins_followed(whole: &Engine, keyed: &Engine, capped: bool) -> (u32, u32) {
             tried: &tried,
             seed: turn,
             now_micros: now,
+            ring: Some(&ring),
             ..RequestFacts::default()
         };
         let cx = Constraints::default();
@@ -490,7 +508,8 @@ fn a_kept_keys_pin_is_followed_with_the_veto_as_it_stands() {
 #[test]
 fn a_request_the_key_does_not_decide_is_left_whole_to_the_whole_decision() {
     let rows = pool(16, 41, 0, 0);
-    let ring = ring_of(&rows);
+    let places = ring_of(&rows);
+    let ring = places.list_ring();
     let listed = Listed::of(&rows, &ring);
     let cx = Constraints::default();
     let keyed = RequestFacts {
@@ -603,7 +622,8 @@ fn profile_of(name: &str, scorer: Box<dyn Scorer>) -> Profile {
 #[test]
 fn a_shadowed_binding_is_lent_the_ring_and_left_to_the_whole_decision() {
     let rows = pool(16, 51, 0, 0);
-    let ring = ring_of(&rows);
+    let places = ring_of(&rows);
+    let ring = places.list_ring();
     let listed = Listed::of(&rows, &ring);
     let cx = Constraints::default();
     let by_ring = || profile_of("ring", Box::new(ConsistentHash::new(None)));
@@ -646,7 +666,8 @@ fn a_shadowed_binding_is_lent_the_ring_and_left_to_the_whole_decision() {
 #[test]
 fn a_pin_under_a_scorer_that_states_its_picks_holding_is_left_to_the_whole_decision() {
     let rows = pool(16, 61, 0, 0);
-    let ring = ring_of(&rows);
+    let places = ring_of(&rows);
+    let ring = places.list_ring();
     let listed = Listed::of(&rows, &ring);
     let cx = Constraints::default();
     let rule = SessionRule {

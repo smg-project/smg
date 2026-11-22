@@ -7,12 +7,23 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
-use crate::{load::signals, policies::consistent_hashing::PoolRing, tracking::in_flight};
+use crate::{load::signals, policies::consistent_hashing::ListRing, tracking::in_flight};
 
 /// The stable identity of a candidate: a hash of the registration key and the
 /// incarnation, never a URL. A same-URL replacement is a new id.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(pub u64);
+
+impl WorkerId {
+    /// The id of the worker at `address`, by a host that names its workers
+    /// by their addresses alone, as a gateway that decides in its own
+    /// process does: the address's [`fingerprint`]. The one spelling of it,
+    /// for a worker object's row and for an address a hash ring holds.
+    #[must_use]
+    pub fn from_address(address: &str) -> Self {
+        Self(fingerprint(address.as_bytes()))
+    }
+}
 
 /// A worker's role in the fleet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -1069,25 +1080,38 @@ pub struct RequestFacts<'a> {
     /// The wire's request facts carry it to a controller, and a plugin's
     /// frame keeps `0` under every exposure.
     pub client_key: u64,
-    /// The hash ring of the list the candidates are, where the host keeps
-    /// one a list ([`PoolRing`]): a stage that places by a ring reads this
-    /// one, with no lock, and its own ring learns nothing of the decision.
-    /// `None` where the host keeps none: such a stage then places by its
-    /// own ring, which learns its members from the candidates. A host
-    /// lends the ring of the list it hands as the candidates and never the
-    /// ring of another list: a ring of another length than the candidates
-    /// is its caller's error, which a debug build stops at and any other
-    /// build passes over, placing by the stage's own ring. A pair takes
-    /// none: each side is a list of its own. In-process only.
-    pub ring: Option<&'a PoolRing>,
-    /// The host keeps a ring for the candidates' list and that ring is not
-    /// built yet, so [`Self::ring`] is `None`. Such a host builds a list's
-    /// ring off the path of a request, and a request that comes first
-    /// neither builds it nor waits for it. A stage that places by a ring
-    /// places such a request as one that carries no key, by its profile's
-    /// draw, and neither reads its own ring nor teaches it. In-process
-    /// only.
+    /// The host's own hash ring, as the list the candidates are reads it
+    /// ([`ListRing`]), where the host keeps the rings its workers are placed
+    /// on: a stage that places by a ring reads this one, with no lock, and
+    /// its own ring learns nothing of the decision. `None` where the host
+    /// keeps none: such a stage then places by its own ring, which learns
+    /// its members from the candidates. A host lends a ring as the list it
+    /// hands as the candidates reads it and as no other list does: a ring
+    /// read by a list of another length than the candidates is its caller's
+    /// error, which a debug build stops at and any other build passes over,
+    /// placing by the stage's own ring. A pair takes none: each side is a
+    /// list of its own. In-process only.
+    pub ring: Option<&'a ListRing<'a>>,
+    /// The host keeps the rings and holds none for this request yet, so
+    /// [`Self::ring`] is `None`: a ring is filled off the path of a
+    /// request, and a model's first requests come ahead of its first. A
+    /// stage that places by a ring places such a request by its host's
+    /// rule for a request with no ring ([`Self::ring_position`]), and
+    /// neither reads its own ring nor teaches it. In-process only.
     pub ring_awaited: bool,
+    /// Where the key a ring places the request by ([`Self::ring_key`])
+    /// stands on its host's ring ([`Self::ring`]): the host hashes the
+    /// key's text as its ring hashes a key ([`HashRing::hash_position`]),
+    /// where the request's binding reads a ring
+    /// ([`KeySources::derive_keys`](crate::document::KeySources::derive_keys)).
+    /// `0` where the request carries no such key, where its binding reads
+    /// no ring, and from a host that keeps no ring: a stage then places
+    /// the key by its fingerprint. A walk of the lent ring from here meets
+    /// the workers the host's own walk meets for the key, in its order.
+    /// In-process only: no frame carries it.
+    ///
+    /// [`HashRing::hash_position`]: crate::policies::consistent_hashing::HashRing::hash_position
+    pub ring_position: u64,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1528,12 +1552,13 @@ mod tests {
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
     /// The signal cells are one word, for every signal, the client's key
-    /// is one word more and the lent ring another: a field the facts gain
-    /// moves this number and carries the decision bench's cells that copy
-    /// the facts (`benches/decision.rs`).
+    /// is one word more, the lent ring another and the key's position on
+    /// it a fourth: a field the facts gain moves this number and carries
+    /// the decision bench's cells that copy the facts
+    /// (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 304);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 312);
     }
 
     #[test]

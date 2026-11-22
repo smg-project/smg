@@ -3,7 +3,6 @@
 //! target is the worker at its place in that list.
 
 use std::{
-    cell::Cell,
     collections::HashMap,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -33,9 +32,12 @@ use smg_worker::{
 };
 
 use super::{mark, Ask, End, Made, PolicyEngine, Prompt, Sent, Unplaced, Workers};
-use crate::routers::{
-    common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
-    grpc::backend_client::BasicWorkerBuilder,
+use crate::{
+    policies::{hash_ring::HashRing, KeptRings},
+    routers::{
+        common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        grpc::backend_client::BasicWorkerBuilder,
+    },
 };
 
 const MODEL: &str = "model-a";
@@ -58,8 +60,13 @@ fn own_dialed(name: &str, modes: &[ConnectionMode]) -> (PolicyEngine, Vec<Arc<dy
         .enumerate()
         .map(|(at, &mode)| joined(&registry, at, mode))
         .collect();
-    let engine = Arc::new(OwnEngine::new(spec));
-    (PolicyEngine::own(engine, registry), listed)
+    let policy_engine = PolicyEngine::own(Arc::new(OwnEngine::new(spec)), registry);
+    // A gateway's start hands the object the hash rings its policy registry
+    // keeps: these are the bed's own, kept under a document that places by
+    // a ring. No task fills them here, so a request fills its membership's
+    // ring, as where a gateway runs none.
+    policy_engine.read_rings(&Arc::new(KeptRings::default()));
+    (policy_engine, listed)
 }
 
 /// A ready worker of [`MODEL`] dialed on `mode`, the `at`-th.
@@ -124,18 +131,7 @@ fn a_first_ask_is_plain_and_states_the_size_its_request_would() {
         hashes: Some(&hashes),
         ..Ask::of(&id, MODEL)
     };
-    let plain = |ask: &Ask<'_>, missed: &[WorkerId]| {
-        let made = Made {
-            ask,
-            missed,
-            members: None,
-            loads: None,
-            kept: None,
-            cut_by_wire: false,
-            source: Cell::new(None),
-        };
-        made.plain()
-    };
+    let plain = |ask: &Ask<'_>, missed: &[WorkerId]| Made::of(ask, missed).plain();
     assert_eq!(
         plain(&ask, &[]),
         Some(Plain {
@@ -723,16 +719,15 @@ async fn places_of_a_key_among(
     places
 }
 
-/// A keyed ask narrowed to a part of its pool is decided over the pool's
-/// own ring, and nothing is made for the part: each key keeps one worker of
-/// the part across its requests, a key whose owner stands in the part keeps
-/// that owner, and the keys spread over the part. Narrowed to one worker,
-/// as a route narrows a request that names its worker, every key goes to
-/// it.
+/// A keyed ask narrowed to a part of its pool is decided over the ring of
+/// its membership, and nothing is made for the part: each key keeps one
+/// worker of the part across its requests, a key whose owner stands in the
+/// part keeps that owner, and the keys spread over the part. Narrowed to
+/// one worker, as a route narrows a request that names its worker, every
+/// key goes to it.
 #[tokio::test]
 async fn a_keyed_ask_narrowed_to_a_part_walks_its_pools_ring() {
     let (policy_engine, workers) = own("consistent_hashing", 8);
-    assert!(policy_engine.fill_rings(MODEL));
     let whole: Arc<[Arc<dyn Worker>]> = workers.iter().cloned().collect();
     let part: Arc<[Arc<dyn Worker>]> = [1, 4, 6].map(|at| Arc::clone(&workers[at])).into();
     let one: Arc<[Arc<dyn Worker>]> = [Arc::clone(&workers[4])].into();
@@ -757,42 +752,71 @@ async fn a_keyed_ask_narrowed_to_a_part_walks_its_pools_ring() {
 
 const KEY: &str = "conversation";
 
-/// No request builds a list's hash ring and none waits for one: here
-/// nothing fills a ring but the case's own call, so a request that waited
-/// would never return. A keyed request ahead of its model's first ring is
-/// placed, not refused, as one that carries no key: one key is handed more
-/// workers than one. Once the ring stands the key keeps one worker.
-#[tokio::test]
-async fn a_keyed_request_ahead_of_its_models_first_ring_is_placed_and_keeps_one_worker_behind_it() {
-    let (policy_engine, workers) = own("consistent_hashing", 8);
-    assert!(!policy_engine.rings_stand(MODEL));
-    let ahead = places_of(&policy_engine, &workers, KEY, 24).await;
-    assert!(ahead.len() > 1, "one key, one worker: a ring placed it");
-    assert!(
-        !policy_engine.rings_stand(MODEL),
-        "a request built the ring"
-    );
-
-    assert!(policy_engine.fill_rings(MODEL));
-    assert!(policy_engine.rings_stand(MODEL));
-    let kept = places_of(&policy_engine, &workers, KEY, 24).await;
-    assert_eq!(kept.len(), 1, "the key moved: {kept:?}");
+/// The gateway's hash rings as `policy_engine` reads them: the bed's own,
+/// under a document that places by a ring.
+fn rings_of(policy_engine: &PolicyEngine) -> &KeptRings {
+    let rings = policy_engine.rings();
+    rings.expect("a document that places by a ring")
 }
 
-/// A membership change publishes another list, whose ring is built off the
-/// path of a request. Until it stands, here for as long as the case holds
-/// the fill back, a keyed request is decided over the last membership whose
-/// ring stands and takes only a worker the list in force holds. A key keeps
-/// its worker across a join, across another worker's leave, and where its
-/// worker is replaced at its address. A worker that joined takes no keyed
-/// request. A key whose worker left goes to the next member of the ring:
-/// the one that takes the key while its worker is not ready. Once the ring
-/// of the list in force stands, the worker that joined takes its keys.
+/// Whether the ring of [`MODEL`]'s membership in force is filled.
+fn ring_is_filled(registry: &WorkerRegistry) -> bool {
+    registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
+}
+
+/// Where a task fills the gateway's hash rings, no request builds one and
+/// none waits for one: here the case stands in for the task, so a request
+/// that waited would never return. A keyed request ahead of its model's
+/// first ring is placed as the classic policy places one with no ring: on
+/// the worker at its key's position among the workers it may take, in
+/// their list's order. So one key has one worker there too. Once the ring
+/// is filled the key goes to its owner on the ring.
+#[tokio::test]
+async fn a_keyed_request_ahead_of_its_models_first_ring_is_placed_by_its_keys_position() {
+    let (policy_engine, workers) = own("consistent_hashing", 8);
+    let registry = registry_of(&policy_engine);
+    let rings = rings_of(&policy_engine);
+    let _task = rings.pretend_warm_task();
+    let ahead = places_of(&policy_engine, &workers, KEY, 24).await;
+    let [ahead] = ahead[..] else {
+        panic!("one key, more workers than one: {ahead:?}");
+    };
+    let listed = registry.get_routing_snapshot(MODEL);
+    let listed = listed.pool(RoutingPool::HttpRegular);
+    let by_position = HashRing::hash_position(KEY) as usize % listed.len();
+    assert_eq!(workers[ahead].url(), listed[by_position].url());
+    assert!(!ring_is_filled(registry), "a request built the ring");
+
+    rings.fill_every_model(registry);
+    assert!(ring_is_filled(registry));
+    let generation = registry.get_routing_snapshot(MODEL);
+    let ring = generation.hash_ring().expect("the ring the fill built");
+    let owner = ring.find_healthy_url(KEY, |_| true);
+    let kept = places_of(&policy_engine, &workers, KEY, 24).await;
+    let [kept] = kept[..] else {
+        panic!("the key moved: {kept:?}");
+    };
+    assert_eq!(Some(workers[kept].url()), owner);
+    assert_eq!(policy_engine.faults(), 0);
+}
+
+/// A membership change publishes another list, whose ring is filled off the
+/// path of a request. Until it is, here for as long as the case holds the
+/// fill back, a keyed request walks the ring the gateway keeps from the
+/// membership before, over the list in force, and takes only a worker that
+/// list holds. A key keeps its worker across a join, across another
+/// worker's leave, and where its worker is replaced at its address. A
+/// worker that joined takes no keyed request. A key whose worker left goes
+/// to the next worker on the kept ring: the one that takes the key while
+/// its worker is not ready. Once the ring of the list in force is filled,
+/// the worker that joined takes its keys.
 #[tokio::test]
 async fn behind_a_membership_change_a_key_is_placed_by_the_ring_that_stands() {
     let (policy_engine, mut workers) = own("consistent_hashing", 8);
     let registry = registry_of(&policy_engine);
-    assert!(policy_engine.fill_rings(MODEL));
+    let rings = rings_of(&policy_engine);
+    let _task = rings.pretend_warm_task();
+    rings.fill_every_model(registry);
     let kept = places_of(&policy_engine, &workers, KEY, 8).await;
     let [owner] = kept[..] else {
         panic!("the key moved: {kept:?}");
@@ -801,7 +825,7 @@ async fn behind_a_membership_change_a_key_is_placed_by_the_ring_that_stands() {
 
     // A worker joins: the ring of the list in force is owed from here on.
     workers.push(joined(registry, 8, ConnectionMode::Http));
-    assert!(!policy_engine.rings_stand(MODEL));
+    assert!(!ring_is_filled(registry));
     let across_the_join = places_of(&policy_engine, &workers, KEY, 24).await;
     assert_eq!(across_the_join, [owner]);
     for key in &keys {
@@ -816,7 +840,7 @@ async fn behind_a_membership_change_a_key_is_placed_by_the_ring_that_stands() {
     let across_the_leave = places_of(&policy_engine, &workers, KEY, 24).await;
     assert_eq!(across_the_leave, [owner]);
 
-    // The key's worker is replaced at its address: the engine knows a
+    // The key's worker is replaced at its address: the ring knows a
     // worker by its address, and the key stays there.
     let id = registry.get_id_by_url(workers[owner].url());
     let replacing = ready(owner, ConnectionMode::Http);
@@ -838,10 +862,12 @@ async fn behind_a_membership_change_a_key_is_placed_by_the_ring_that_stands() {
     let moved = places_of(&policy_engine, &workers, KEY, 24).await;
     assert_eq!(moved, [next]);
 
-    // The ring of the list in force stands: the worker that joined takes
-    // its share of the keys.
-    assert!(policy_engine.fill_rings(MODEL));
-    assert!(policy_engine.rings_stand(MODEL));
+    assert!(!ring_is_filled(registry), "a request built the ring");
+
+    // The ring of the list in force is filled: the worker that joined
+    // takes its share of the keys.
+    rings.fill_every_model(registry);
+    assert!(ring_is_filled(registry));
     let mut taken_by_the_joined = 0;
     for key in &keys {
         let placed = places_of(&policy_engine, &workers, key, 2).await;

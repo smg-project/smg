@@ -11,8 +11,8 @@
 //!
 //! **A key's rows, between** ([`keys::decide`]). A request that is made,
 //! under a sessions rule or a ring, is decided by the rows its key names:
-//! its key's pin, which is one worker's record, or its key's owner on the
-//! list's ring and the members behind it. It answers where those rows say
+//! its key's pin, which is one worker's record, or its key's owner on its
+//! host's ring and the members behind it. It answers where those rows say
 //! what the whole pass would, and nothing where they do not.
 //!
 //! **The whole pass, behind them** ([`decide`]). Every other request is made
@@ -145,21 +145,23 @@ pub(super) fn noted(
 /// written for the request from the list's workers. Each worker's report
 /// is read from `loads`, the host's load snapshot for this decision. A
 /// request that states what no stage here runs is declined under that
-/// stage's name. The list is borrowed as long as the request: its ring is
-/// lent into the request's facts.
+/// stage's name. The list is borrowed as long as the request: `ring`, the
+/// ring its host handed with the request, is lent into the request's facts
+/// as the list reads it, where a stage reads one.
 ///
 /// `kept` are the places of the list the request may take, where its host
 /// narrowed it ([`RequestMaker::kept`](crate::engine::RequestMaker::kept)):
 /// a request narrowed to a part of its pool is decided over the pool's own
-/// records and ring, every other place read as a worker a hold stands on
-/// ([`records::Live::keeping`]). So a key's walk of the ring passes those
-/// members, and the whole pass keeps none of them.
+/// records and its host's ring, every other place read as a worker a hold
+/// stands on ([`records::Live::keeping`]). So a key's walk of the ring
+/// passes those members, and the whole pass keeps none of them.
 pub(super) fn decide<'r>(
     own: &PolicyEngine,
     request: &mut Request<'r>,
     members: &'r PoolMembers,
     loads: Option<&Arc<LoadSnapshot>>,
     kept: Option<&[usize]>,
+    ring: keys::LazyRing<'r>,
     now: Instant,
 ) -> Decision {
     let spec = &own.spec;
@@ -182,9 +184,9 @@ pub(super) fn decide<'r>(
     let live = records::Live::at(spec.engine(), &own.clock, now, loads, key).keeping(kept);
     let (engine, workers) = (spec.engine(), members.workers());
     // A keyed request is decided by the rows its key names, where they say
-    // what the whole pass would: its key's pin, or its key's owner on the
-    // list's ring and the members behind it.
-    if let Some(keyed) = keys::decide(engine, members.ring(), records, workers, &live, facts, &cx) {
+    // what the whole pass would: its key's pin, or its key's owner on its
+    // host's ring and the members behind it.
+    if let Some(keyed) = keys::decide(engine, ring, members, records, &live, facts, &cx) {
         return keyed;
     }
     // A profile whose stages read who holds the prompt is named its rows
@@ -330,14 +332,14 @@ mod tests {
         document::spec::{AppliedSpec, PolicySpec},
         engine::{
             decision::{LiftedVeto, Targets, MAX_TARGETS},
-            decision_engine::{Decided, DecisionEngine, RequestMaker, WorkerLists},
+            decision_engine::{Decided, DecisionEngine, MembershipRing, RequestMaker, WorkerLists},
             framework::{Picker, Place, PoolWord, TieBand},
             prompt_hashes::HashSeeds,
             records::worker_id,
             store_backed_engine::DecisionRefused,
             view::{Candidate, Constraints, Identity, RequestFacts, WireModes, WorkerId},
         },
-        policies::random::Random,
+        policies::{consistent_hashing::HashRing, random::Random},
         stages::registry::StageRegistry,
         store::GatewayId,
         tracking::{
@@ -373,13 +375,15 @@ mod tests {
     }
 
     /// A request stated ahead, with the list its host hands for it, the
-    /// places of the list it may take, and how many times the
-    /// engine made it.
+    /// places of the list it may take, the hash ring of the list's
+    /// membership where its host keeps one, and how many times the engine
+    /// made it.
     struct Asks<'a> {
         request: Request<'a>,
         members: Option<&'a PoolMembers>,
         loads: Option<Arc<LoadSnapshot>>,
         kept: Option<&'a [usize]>,
+        ring: Option<Arc<HashRing>>,
         made: Cell<u32>,
     }
 
@@ -390,6 +394,7 @@ mod tests {
                 members,
                 loads: None,
                 kept: None,
+                ring: None,
                 made: Cell::new(0),
             }
         }
@@ -420,6 +425,13 @@ mod tests {
 
         fn kept(&self) -> Option<&[usize]> {
             self.kept
+        }
+
+        fn ring(&self) -> Option<MembershipRing<'_>> {
+            self.ring.as_ref().map(|ring| MembershipRing {
+                ring,
+                of_this_membership: true,
+            })
         }
     }
 
@@ -610,37 +622,49 @@ mod tests {
         }
     }
 
-    /// A keyed request narrowed to a part of its pool walks the pool's own
-    /// ring past the members it may not take. Kept to every member but its
-    /// key's owner, it is handed the members the whole walk names behind
-    /// the owner, in the walk's order.
+    /// A keyed request narrowed to a part of its pool walks its host's
+    /// ring of the pool past the members it may not take. Kept to every
+    /// member but its key's owner, it is handed the members the whole walk
+    /// names behind the owner, in the walk's order. The owner is the worker
+    /// the host's own lookup answers for the key's text.
     #[test]
     fn a_keyed_request_narrowed_to_a_part_walks_its_pools_ring() {
         let engine = preset("consistent_hashing");
         let list = pool(16);
         let members = engine.pool_members(&list);
-        assert!(
-            engine.fill_ring(MODEL, &members),
-            "the stock ring reads one"
-        );
+        let ring = Arc::new(HashRing::new(list.iter().map(|worker| worker.url())));
         let places = |decided: &DecideOutcome| -> Vec<u32> {
             let pick = decided.decision.pick().expect("a pick");
             pick.targets.iter().map(|target| target.position).collect()
         };
         for key in 1..=40 {
+            let text = format!("session-{key}");
             let mut keyed = request();
             keyed.facts.seed = key;
             keyed.facts.session_key = Identity::hashed(key);
-            let whole = places(&decided(&engine, &Asks::of(keyed, Some(&members))));
+            keyed.facts.ring_position = HashRing::hash_position(&text);
+            let asks = |kept| Asks {
+                kept,
+                ring: Some(Arc::clone(&ring)),
+                ..Asks::of(keyed, Some(&members))
+            };
+            let whole = places(&decided(&engine, &asks(None)));
             assert_eq!(whole.len(), MAX_TARGETS, "key {key}");
             let owner = whole[0] as usize;
+            assert_eq!(
+                ring.find_healthy_url(&text, |_| true),
+                Some(list[owner].url()),
+                "key {key}"
+            );
             let others: Vec<usize> = (0..list.len()).filter(|&place| place != owner).collect();
-            let mut narrowed = Asks::of(keyed, Some(&members));
-            narrowed.kept = Some(&others);
-            let part = places(&decided(&engine, &narrowed));
+            let part = places(&decided(&engine, &asks(Some(&others))));
             assert_eq!(part.len(), MAX_TARGETS, "key {key}");
             assert_eq!(part[..MAX_TARGETS - 1], whole[1..], "key {key}");
         }
+        assert!(
+            members.ring_places().get().is_some(),
+            "the list's table of its own ring was made, once"
+        );
     }
 
     /// A place whose profile scores is never picked ahead of its request:
