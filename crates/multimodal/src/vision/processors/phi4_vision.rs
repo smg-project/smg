@@ -36,11 +36,12 @@
 use std::collections::HashSet;
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage};
-use ndarray::{s, Array2, Array3, Array4, IxDyn};
+use ndarray::{s, Array2, Array3, IxDyn};
 
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+    scratch,
     transforms::{self, TransformError},
 };
 
@@ -63,8 +64,8 @@ pub const MASK_RESOLUTION: usize = 32;
 pub const PATCH_SIZE: usize = 14;
 
 /// Result type for single image processing.
-/// Contains (encoder_input, attention_mask, (height, width), num_tokens).
-type SingleImageResult = (Array4<f32>, Array3<u32>, (u32, u32), usize);
+/// Contains (attention_mask, (height, width), num_tokens).
+type SingleImageResult = (Array3<u32>, (u32, u32), usize);
 
 /// Phi4-Vision image processor.
 ///
@@ -199,6 +200,25 @@ impl Phi4VisionProcessor {
         best_ratio
     }
 
+    /// The crop grid `(w_crops, h_crops)` of an image of this size.
+    fn target_crops(&self, width: u32, height: u32) -> (usize, usize) {
+        let base_res = self.base_resolution as f64;
+
+        // Calculate natural crop numbers
+        let w_crop_num = (width as f64 / base_res).ceil() as usize;
+        let h_crop_num = (height as f64 / base_res).ceil() as usize;
+
+        if w_crop_num * h_crop_num > self.dynamic_hd {
+            // Image exceeds max crops, need to find best aspect ratio
+            let aspect_ratio = width as f64 / height as f64;
+            let target_ratios = self.compute_target_ratios(1, self.dynamic_hd);
+            self.find_closest_aspect_ratio(aspect_ratio, &target_ratios, width, height)
+        } else {
+            // Image fits within max crops
+            (w_crop_num, h_crop_num)
+        }
+    }
+
     /// Dynamic preprocess: calculate target dimensions and create attention mask.
     ///
     /// Returns (processed_image, attention_mask, target_h_crops, target_w_crops)
@@ -207,29 +227,9 @@ impl Phi4VisionProcessor {
         image: &DynamicImage,
     ) -> (DynamicImage, Array2<u32>, usize, usize) {
         let (orig_w, orig_h) = image.dimensions();
-        let base_res = self.base_resolution as f64;
-
-        // Calculate natural crop numbers
-        let w_crop_num = (orig_w as f64 / base_res).ceil() as usize;
-        let h_crop_num = (orig_h as f64 / base_res).ceil() as usize;
-
-        let (target_w_crops, target_h_crops, target_width, target_height) =
-            if w_crop_num * h_crop_num > self.dynamic_hd {
-                // Image exceeds max crops, need to find best aspect ratio
-                let aspect_ratio = orig_w as f64 / orig_h as f64;
-                let target_ratios = self.compute_target_ratios(1, self.dynamic_hd);
-                let (w_ratio, h_ratio) =
-                    self.find_closest_aspect_ratio(aspect_ratio, &target_ratios, orig_w, orig_h);
-
-                let target_width = self.base_resolution * w_ratio as u32;
-                let target_height = self.base_resolution * h_ratio as u32;
-                (w_ratio, h_ratio, target_width, target_height)
-            } else {
-                // Image fits within max crops
-                let target_width = self.base_resolution * w_crop_num as u32;
-                let target_height = self.base_resolution * h_crop_num as u32;
-                (w_crop_num, h_crop_num, target_width, target_height)
-            };
+        let (target_w_crops, target_h_crops) = self.target_crops(orig_w, orig_h);
+        let target_width = self.base_resolution * target_w_crops as u32;
+        let target_height = self.base_resolution * target_h_crops as u32;
 
         // Calculate resize ratios
         let ratio_width = target_width as f64 / orig_w as f64;
@@ -311,32 +311,6 @@ impl Phi4VisionProcessor {
         transforms::bicubic_resize(tensor, target, target)
     }
 
-    /// Tile the HD image into crops of base_resolution x base_resolution.
-    fn tile_image(&self, tensor: &Array3<f32>, h_crops: usize, w_crops: usize) -> Array4<f32> {
-        let base = self.base_resolution as usize;
-        let num_tiles = h_crops * w_crops;
-
-        let mut tiles = Array4::<f32>::zeros((num_tiles, 3, base, base));
-
-        for h_idx in 0..h_crops {
-            for w_idx in 0..w_crops {
-                let tile_idx = h_idx * w_crops + w_idx;
-                let y_start = h_idx * base;
-                let x_start = w_idx * base;
-
-                for c in 0..3 {
-                    for y in 0..base {
-                        for x in 0..base {
-                            tiles[[tile_idx, c, y, x]] = tensor[[c, y_start + y, x_start + x]];
-                        }
-                    }
-                }
-            }
-        }
-
-        tiles
-    }
-
     /// Downsample attention mask by factor of 2.
     fn downsample_mask(&self, mask: &Array2<u32>, h_crops: usize, w_crops: usize) -> Array2<u32> {
         let half_res = self.mask_resolution / 2;
@@ -377,8 +351,15 @@ impl Phi4VisionProcessor {
         256 + 1 + mask_sum as usize + mask_col0_sum as usize + 16
     }
 
-    /// Process a single image.
-    fn process_single_image(&self, image: &DynamicImage) -> SingleImageResult {
+    /// Process a single image and append its `[max_crops, 3, base, base]`
+    /// values to `values`: the global image, the HD image's tiles in
+    /// row-major order, zeros for the crops the image does not fill.
+    fn process_single_image(
+        &self,
+        image: &DynamicImage,
+        max_crops: usize,
+        values: &mut Vec<f32>,
+    ) -> SingleImageResult {
         // Step 1: Dynamic preprocess (resize, pad, create attention mask)
         let (hd_image, attention_mask, h_crops, w_crops) = self.dynamic_preprocess(image);
 
@@ -389,28 +370,34 @@ impl Phi4VisionProcessor {
         let mut hd_tensor = transforms::to_tensor(&hd_image);
         transforms::normalize(&mut hd_tensor, &self.mean, &self.std);
 
-        // Step 3: Create global image
-        let global_tensor = self.create_global_image(&hd_tensor);
-
-        // Step 4: Tile HD image
-        let tiles = self.tile_image(&hd_tensor, h_crops, w_crops);
-        let num_hd_tiles = h_crops * w_crops;
-
-        // Step 5: Concatenate global + tiles
-        // Output shape: [num_hd_tiles + 1, 3, base_resolution, base_resolution]
+        // Step 3: The global image comes first
         let base = self.base_resolution as usize;
-        let total_crops = num_hd_tiles + 1;
-        let mut output = Array4::<f32>::zeros((total_crops, 3, base, base));
+        let end = values.len() + max_crops * 3 * base * base;
+        let (global, _) = self
+            .create_global_image(&hd_tensor)
+            .into_raw_vec_and_offset();
+        values.extend_from_slice(&global);
 
-        // First slot is global image
-        output.slice_mut(s![0, .., .., ..]).assign(&global_tensor);
-
-        // Remaining slots are HD tiles
-        if num_hd_tiles > 0 {
-            output.slice_mut(s![1.., .., .., ..]).assign(&tiles);
+        // Step 4: The HD image's tiles, row-major. The planes are dropped
+        // after it, not given to the scratch: the next request's batch would
+        // take them there and have to grow them.
+        let (h, w) = (hd_h as usize, hd_w as usize);
+        let (planes, _) = hd_tensor.into_raw_vec_and_offset();
+        for grid_y in 0..h_crops {
+            for grid_x in 0..w_crops {
+                for plane in planes.chunks_exact(h * w) {
+                    for row in plane.chunks_exact(w).skip(grid_y * base).take(base) {
+                        values.extend_from_slice(&row[grid_x * base..(grid_x + 1) * base]);
+                    }
+                }
+            }
         }
 
+        // Step 5: Zeros for the crops the image does not fill
+        values.resize(end, 0.0);
+
         // Step 6: Create combined attention mask [total_crops, mask_resolution, mask_resolution]
+        let total_crops = h_crops * w_crops + 1;
         let mask_res = self.mask_resolution;
         let mut combined_mask = Array3::<u32>::zeros((total_crops, mask_res, mask_res));
 
@@ -438,7 +425,7 @@ impl Phi4VisionProcessor {
         let downsampled = self.downsample_mask(&attention_mask, h_crops, w_crops);
         let num_tokens = self.calculate_num_tokens(&downsampled);
 
-        (output, combined_mask, (hd_h, hd_w), num_tokens)
+        (combined_mask, (hd_h, hd_w), num_tokens)
     }
 }
 
@@ -457,52 +444,47 @@ impl VisionPreProcessor for Phi4VisionProcessor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         TransformError::if_empty(images)?;
 
-        let mut all_outputs = Vec::new();
-        let mut all_masks = Vec::new();
-        let mut item_sizes = Vec::new();
-        let mut feature_token_counts = Vec::new();
-
-        for image in images {
-            let (output, mask, size, tokens) = self.process_single_image(image);
-            all_outputs.push(output);
-            all_masks.push(mask);
-            item_sizes.push(size);
-            feature_token_counts.push(tokens);
-        }
-
         // Find max crops across batch for padding
-        let max_crops = all_outputs
+        let max_crops = images
             .iter()
-            .map(|o| o.shape()[0])
+            .map(|image| {
+                let (w_crops, h_crops) = self.target_crops(image.width(), image.height());
+                w_crops * h_crops + 1
+            })
             .max()
             .ok_or(TransformError::EmptyBatch)?;
         let base = self.base_resolution as usize;
         let mask_res = self.mask_resolution;
 
-        // Pad all outputs to max_crops
+        // The batch [B, max_crops, 3, base, base], written once per image.
+        // Pooled: it is the encoder input's storage, which returns to the
+        // pool when the input is written out.
         let batch_size = images.len();
-        let mut encoder_input =
-            ndarray::ArrayD::<f32>::zeros(IxDyn(&[batch_size, max_crops, 3, base, base]));
+        let shape = vec![batch_size, max_crops, 3, base, base];
+        let mut flat_data = scratch::take_f32_cap(shape.iter().product());
+        let mut all_masks = Vec::new();
+        let mut item_sizes = Vec::new();
+        let mut feature_token_counts = Vec::new();
+
+        for image in images {
+            let (mask, size, tokens) = self.process_single_image(image, max_crops, &mut flat_data);
+            all_masks.push(mask);
+            item_sizes.push(size);
+            feature_token_counts.push(tokens);
+        }
+
         let mut attention_masks =
             ndarray::ArrayD::<u32>::zeros(IxDyn(&[batch_size, max_crops, mask_res, mask_res]));
 
-        for (b, (output, mask)) in all_outputs.iter().zip(all_masks.iter()).enumerate() {
-            let num_crops = output.shape()[0];
+        for (b, mask) in all_masks.iter().enumerate() {
+            let num_crops = mask.shape()[0];
             for t in 0..num_crops {
-                for c in 0..3 {
-                    for y in 0..base {
-                        for x in 0..base {
-                            encoder_input[[b, t, c, y, x]] = output[[t, c, y, x]];
-                        }
-                    }
-                }
                 for y in 0..mask_res {
                     for x in 0..mask_res {
                         attention_masks[[b, t, y, x]] = mask[[t, y, x]];
                     }
                 }
             }
-            // Remaining crops stay as zeros (padding)
         }
 
         // Convert to standard format
@@ -531,6 +513,12 @@ impl VisionPreProcessor for Phi4VisionProcessor {
             },
         );
 
+        let encoder_input = ndarray::ArrayD::<f32>::from_shape_vec(IxDyn(&shape), flat_data)
+            .map_err(|e| TransformError::InvalidShape {
+                expected: format!("valid 5D shape, but failed with error: {e}"),
+                actual: shape.clone(),
+            })?;
+
         Ok(PreprocessedEncoderInputs {
             encoder_input: encoder_input.into(),
             feature_token_counts,
@@ -540,18 +528,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
-        let base_res = self.base_resolution as f64;
-
-        let w_crop_num = (width as f64 / base_res).ceil() as usize;
-        let h_crop_num = (height as f64 / base_res).ceil() as usize;
-
-        let (target_w_crops, target_h_crops) = if w_crop_num * h_crop_num > self.dynamic_hd {
-            let aspect_ratio = width as f64 / height as f64;
-            let target_ratios = self.compute_target_ratios(1, self.dynamic_hd);
-            self.find_closest_aspect_ratio(aspect_ratio, &target_ratios, width, height)
-        } else {
-            (w_crop_num, h_crop_num)
-        };
+        let (target_w_crops, target_h_crops) = self.target_crops(width, height);
 
         // Approximate token count (without actual mask)
         // Full mask would have target_w_crops * target_h_crops * (mask_res/2)^2 tokens
@@ -725,5 +702,25 @@ mod tests {
         let processor = Phi4VisionProcessor::new();
         let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
+    }
+
+    /// The batch is a request's first take from the thread's float scratch,
+    /// so it gets the buffer that a written-out input gave back.
+    #[test]
+    fn the_batch_takes_the_buffer_a_written_input_gave_back() {
+        std::thread::spawn(|| {
+            let kept = scratch::take_f32_cap(4 * 3 * 448 * 448);
+            let capacity = kept.capacity();
+            scratch::give_f32(kept);
+
+            let image = create_test_image(448, 448, Rgb([128, 128, 128]));
+            let result = Phi4VisionProcessor::new().preprocess(&[&image]).unwrap();
+
+            // Two crops fill half of that buffer: a fresh batch would be smaller.
+            let (batch, _) = result.encoder_input.into_f32().into_raw_vec_and_offset();
+            assert_eq!(batch.capacity(), capacity);
+        })
+        .join()
+        .unwrap();
     }
 }
