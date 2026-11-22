@@ -599,10 +599,14 @@ async fn fetch_tokenizer_from_worker(
             chat_template_path,
         ) {
             Ok(tokenizer) => return Ok(tokenizer),
-            Err(e) => keep_first(format!(
-                "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
-                worker.redacted_url(),
-            )),
+            Err(e) => {
+                let failure = format!(
+                    "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
+                    worker.redacted_url(),
+                );
+                warn!("Tokenizer fetch for model '{model_id}': {failure}");
+                keep_first(failure);
+            }
         };
     }
 
