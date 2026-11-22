@@ -1330,6 +1330,49 @@ impl<G: Generation> WorkerMonitor<G> {
         *self.liveness_sweep_task.lock() = Some(sweep_handle);
     }
 
+    /// End what [`Self::start_event_loop`] started, for a host that reads
+    /// its workers' loads for a part of its life alone. The event task ends
+    /// first, so no group starts behind this call. Then every group's
+    /// polling loop, the eviction flusher, the liveness sweep and the
+    /// publisher of pushed reports end. Each task's end is awaited, so no
+    /// tick publishes and no verdict is written behind the reset. Last the
+    /// monitor resets as its rebuild from the registry does
+    /// ([`Self::stop_all_groups`]): the shared snapshot is published empty,
+    /// the probe memo goes, and the sink is told the reset
+    /// ([`LoadSink::reset`]). The monitor's own sink takes every overload
+    /// veto off the registry's workers there.
+    ///
+    /// The monitor then stands as [`Self::new`] left it. Its receivers stay
+    /// subscribed and read the empty snapshot, and
+    /// [`Self::start_event_loop`] starts it again over the registry as it
+    /// stands at that call: its first tick polls every `Ready` worker.
+    ///
+    /// A stopped monitor still takes a pushed record
+    /// ([`Self::apply_pushed_load`]), as one that was never started does. A
+    /// host that stops its monitor hands it no stream's records.
+    ///
+    /// Called by no task of the monitor: the call waits for each of them.
+    pub async fn stop(&self) {
+        let events = self.event_task.lock().take();
+        ended(events).await;
+        let groups: Vec<GroupState> = {
+            let mut handles = self.group_handles.lock();
+            handles.drain().map(|(_, state)| state).collect()
+        };
+        for state in groups {
+            ended(Some(state.handle)).await;
+        }
+        for task in [
+            &self.eviction_flush_task,
+            &self.liveness_sweep_task,
+            &self.pushed_flush_task,
+        ] {
+            let handle = task.lock().take();
+            ended(handle).await;
+        }
+        self.stop_all_groups();
+    }
+
     /// Stop every per-group polling loop, evict every pusher that is no longer
     /// the registry's `Ready` worker at its URL
     /// ([`Self::evict_lost_pushers`]), clear the shared load snapshot and the
@@ -2088,6 +2131,15 @@ impl<G> Drop for WorkerMonitor<G> {
         for (_, state) in self.group_handles.get_mut().drain() {
             state.handle.abort();
         }
+    }
+}
+
+/// Abort a task of the monitor and wait for its end ([`WorkerMonitor::stop`]).
+/// An aborted task ends at its next wait, and a cancelled join is its end.
+async fn ended(handle: Option<JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        handle.abort();
+        let _ = handle.await;
     }
 }
 

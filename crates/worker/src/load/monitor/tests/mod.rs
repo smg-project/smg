@@ -632,6 +632,65 @@ async fn spawned_tasks_use_weak_references() {
     );
 }
 
+/// A host that reads its workers' loads for a part of its life stops the
+/// monitor and starts it again. The stop ends every task the start made,
+/// each awaited, so none holds the monitor behind it. The monitor's
+/// receivers stay subscribed and read the empty snapshot, and the sink's
+/// reset takes the overload veto off. A later start polls the registry as it
+/// stands then, a worker registered while the monitor was stopped among it.
+#[tokio::test]
+async fn a_stopped_monitor_ends_its_tasks_and_starts_again_over_the_registry() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w1:8080", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let reports = monitor.subscribe();
+    monitor.start_event_loop();
+    assert_eq!(monitor.group_handles.lock().len(), 1);
+
+    // What a tick leaves: a published report and a veto.
+    let _ = monitor.load_state.publish_group(
+        &[],
+        vec![(Arc::clone(&worker), Arc::new(WorkerLoadResponse::default()))],
+    );
+    assert!(reports.borrow().contains(worker.url()));
+    assert!(registry.set_worker_overloaded(&worker, true));
+
+    monitor.stop().await;
+
+    assert!(monitor.group_handles.lock().is_empty());
+    for task in [
+        &monitor.event_task,
+        &monitor.eviction_flush_task,
+        &monitor.liveness_sweep_task,
+    ] {
+        assert!(task.lock().is_none(), "a task the start made stands");
+    }
+    assert_eq!(
+        Arc::weak_count(&monitor),
+        0,
+        "a task of the stopped monitor still holds it"
+    );
+    assert!(
+        reports.borrow().is_empty(),
+        "a receiver subscribed before the stop reads the empty snapshot"
+    );
+    assert!(!worker.is_overloaded(), "the reset takes the veto off");
+
+    // A second stop finds nothing to end.
+    monitor.stop().await;
+
+    // A worker registered while the monitor is stopped starts no group.
+    registry
+        .register(ready_worker("http://w2:8080", "gpt-4"))
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(monitor.group_handles.lock().is_empty());
+
+    monitor.start_event_loop();
+    assert_eq!(monitor.group_handles.lock().len(), 2);
+    assert!(monitor.event_task.lock().is_some());
+}
+
 fn pushed(running: i32) -> PushedRecord {
     PushedRecord {
         snapshot: SchedulerLoadSnapshot {
