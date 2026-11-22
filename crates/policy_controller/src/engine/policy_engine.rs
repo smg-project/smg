@@ -589,24 +589,28 @@ impl PolicyEngine {
         }
     }
 
-    /// One single request's decision and nothing its host hears of later:
-    /// no lease is issued, no id is taken and no stage is told. For a host
-    /// that files a pick's lease itself and tells the stages of the issue
-    /// under that lease ([`Lifecycle::on_decision_issued`] of the
-    /// document's engine), as a controller's service does in its store.
+    /// One request's decision and nothing its host hears of later: no lease
+    /// is issued, no id is taken and no stage is told. For a host that
+    /// files a pick's lease itself and tells the stages of the issue under
+    /// that lease ([`Lifecycle::on_decision_issued`] of the document's
+    /// engine), as a controller's service does in its store.
     ///
-    /// The request is made once and decided whole, at `now`: the decision
-    /// is the one [`Self::decide_at`] makes of a request that is not plain
-    /// ([`RequestMaker::plain`]). No pick is made ahead of the request, so
-    /// a pick names its alternates: a host that hands a decision's targets
-    /// to another process cannot ask again cheaply.
+    /// The request is made once and decided whole, at `now`, as
+    /// [`Self::decide_at`] decides a request that is not plain
+    /// ([`RequestMaker::plain`]): a single over its host's list, a pair at
+    /// its prefill over its host's two lists ([`pair::decide`], the test
+    /// of the request's wires in it), and a request that hands no such
+    /// list over no worker. This entry never asks whether a request is
+    /// plain, so it answers no place: a pick names the alternates its
+    /// whole decision drew, for a host that hands a decision's targets to
+    /// another process and cannot ask again cheaply.
     ///
     /// # Errors
     ///
-    /// [`DecisionRefused::PairSide`] for a request of any phase but
-    /// `Single`: a pair has no entry of this kind yet. The leasing entry
-    /// tests a pair's wires beside its issue, ahead of the lists' own
-    /// decision. [`DecisionRefused::Faulted`] where the decision panicked.
+    /// [`DecisionRefused::PairSide`] for a decode or an encode request. A
+    /// decode behind its pair's prefill has an entry of its own
+    /// ([`Self::decide_decode_without_lease`]).
+    /// [`DecisionRefused::Faulted`] where the decision panicked.
     #[cfg_attr(
         not(test),
         expect(
@@ -625,11 +629,50 @@ impl PolicyEngine {
                 (Phase::Single, WorkerLists::Single(members)) => {
                     Ok(self.decide_made(maker, &mut request, members, now))
                 }
-                (Phase::Single, _) => Ok(single::over_none(self, &request)),
-                (Phase::Prefill | Phase::Decode | Phase::Encode, _) => {
-                    Err(DecisionRefused::PairSide)
+                // A pair is decided at its prefill, over its host's two
+                // lists.
+                (Phase::Prefill, WorkerLists::Pair(lists)) => {
+                    Ok(pair::decide(self, &lists, &mut request, None, now))
                 }
+                (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(self, &request)),
+                (Phase::Decode | Phase::Encode, _) => Err(DecisionRefused::PairSide),
             }
+        })
+    }
+
+    /// A pair's decode decided again behind the prefill of `held`, the
+    /// target its host holds of the pair's first decision, and nothing its
+    /// host hears of later ([`Self::decide_without_lease`]). The decision
+    /// is the one the leasing entry makes for a guard's decode call
+    /// ([`DecisionEngine::decide_decode_under`]). The host files the decode
+    /// side's issue and tells the stages of it.
+    ///
+    /// A call that hands no pair's lists is decided over no worker.
+    ///
+    /// # Errors
+    ///
+    /// [`DecisionRefused::Faulted`] where the decision panicked.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the controller's service calls it once it decides by this engine"
+        )
+    )]
+    pub(crate) fn decide_decode_without_lease(
+        &self,
+        maker: &impl RequestMaker,
+        held: &super::decision::Target,
+        now: Instant,
+    ) -> Result<super::decision::Decision, DecisionRefused> {
+        self.caught(|| {
+            let mut request = self.made(maker);
+            Ok(match maker.workers() {
+                WorkerLists::Pair(lists) => {
+                    pair::decide(self, &lists, &mut request, Some(held), now)
+                }
+                _ => single::over_none(self, &request),
+            })
         })
     }
 

@@ -75,10 +75,12 @@ pub trait RequestMaker {
     /// every other request, and from a maker that does not say.
     ///
     /// An engine that decides over its host's lists asks this ahead of
-    /// [`RequestMaker::make`]. A place one pick of a picker decides reads
-    /// no fact of a request, so a plain request of such a place is decided
-    /// with none made: its routing key is not derived and no seed is drawn
-    /// for it. The answer is cheap: it reads the document nowhere.
+    /// [`RequestMaker::make`], at its entry that issues a pick's lease. A
+    /// place one pick of a picker decides reads no fact of a request, so a
+    /// plain request of such a place is decided with none made: its routing
+    /// key is not derived and no seed is drawn for it. The answer is cheap:
+    /// it reads the document nowhere. That engine's entry that issues no
+    /// lease never asks: it makes every request.
     ///
     /// A request held to places of its list
     /// ([`Constraints::places`](super::view::Constraints::places)) is not
@@ -531,9 +533,7 @@ pub struct SweepOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecisionRefused {
     /// The request is a decode or encode side sent on its own. A pair is
-    /// asked at its prefill, and that one request decides both sides. An
-    /// entry that files no lease answers this for a prefill too, while a
-    /// pair has no entry of that kind.
+    /// asked at its prefill, and that one request decides both sides.
     PairSide,
     /// The store filed no lease for the pick, at the second try too: its
     /// term mints no id, or another hand raised it under both tries.
