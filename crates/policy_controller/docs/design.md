@@ -919,7 +919,7 @@ id's next life: a leave and a join of the id, and the removal then tells nothing
 under the registry's own id of a worker too: a removal tells a leave only of the object the
 task holds. The events
 are a broadcast that drops its oldest for a reader that falls behind: the task then reads the
-registry whole, tells what changed, and last tells the ids that stand, so a policy keeps
+registry whole, tells what changed, and last tells the ids that stand, so a stage keeps
 nothing of a worker whose whole life the channel dropped. It does the same behind a channel
 that closed. The session table is told nothing: a pin on a worker that is gone stands until the
 session's idle time or two other workers end it.

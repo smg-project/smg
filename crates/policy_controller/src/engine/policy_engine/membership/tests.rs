@@ -30,14 +30,18 @@ use tokio::{
 };
 
 use super::{Follow, Members};
-use crate::engine::{
-    decision_engine::DecisionEngine,
-    policy_engine::{
-        single::tests::{hearing, Heard},
-        PolicyEngine,
+use crate::{
+    document::spec::{AppliedSpec, PolicySpec},
+    engine::{
+        decision_engine::DecisionEngine,
+        policy_engine::{
+            single::tests::{decided, hearing, pool, request, Asks, Heard},
+            PolicyEngine,
+        },
+        prompt_hashes::HashSeeds,
+        records::worker_id,
+        view::{FixedFacts, WorkerId},
     },
-    records::worker_id,
-    view::{FixedFacts, WorkerId},
 };
 
 const MODEL: &str = "model-a";
@@ -196,6 +200,15 @@ fn removed(object: &ObjectId, worker: &Arc<dyn Worker>) -> WorkerEvent {
     }
 }
 
+/// The registry's word that `new` replaces `old` under its id `object`.
+fn replaced(object: &ObjectId, old: &Arc<dyn Worker>, new: &Arc<dyn Worker>) -> WorkerEvent {
+    WorkerEvent::Replaced {
+        worker_id: object.clone(),
+        old: Arc::clone(old),
+        new: Arc::clone(new),
+    }
+}
+
 /// `registry` as a host hands it to the engine.
 fn handed(registry: &Arc<impl Members + 'static>) -> Arc<dyn Members> {
     Arc::clone(registry) as Arc<dyn Members>
@@ -290,6 +303,8 @@ fn a_registration_and_a_removal_of_the_registry_are_told_to_the_stages() {
     let (engine, heard, mut follow) = following(&registry);
     let stand = vec![("joined", id(0)), ("joined", id(1))];
     assert_eq!(in_id_order(told(&heard)), in_id_order(stand));
+    // A later hand-over is ignored.
+    engine.set_registry(handed(&Arc::new(Registry::new())));
 
     register(&registry, 2);
     remove(&registry, 0);
@@ -373,10 +388,13 @@ fn a_follow_that_fell_behind_reads_the_registry_whole() {
     remove(&registry, 0);
     register(&registry, 2);
     flood(&registry, 1);
+    // A read the follow owed already is this one.
+    follow.unread = true;
     drain(&engine, &mut follow);
     let moved = vec![("left", id(0)), ("joined", id(2))];
     assert_eq!(in_id_order(told(&heard)), in_id_order(moved));
     assert_eq!(held(&follow), sorted(vec![id(1), id(2)]));
+    assert!(!follow.unread, "the lag's read is the read owed");
 }
 
 /// The events the channel kept come behind a whole read and may be older
@@ -450,6 +468,66 @@ fn a_registration_heard_ahead_of_the_removal_it_follows_is_the_ids_next_life() {
     assert_eq!(held(&follow), []);
 }
 
+/// A replacement names the object it replaces. One of an object the follow
+/// does not hold tells nothing and asks the host nothing: it is older than
+/// a read that found a later object, or its worker's removal was heard
+/// ahead of it. So a host that states another id by then is told no leave
+/// of the id that stands.
+#[test]
+fn a_replacement_of_an_object_the_follow_does_not_hold_tells_nothing() {
+    let registry = registry(0);
+    let host = Stating::over(&registry);
+    host.state(0, 7);
+    let (engine, heard, mut follow) = following(&host);
+    let object = ObjectId::new();
+    let worker = || ready_worker(&url(0), MODEL);
+    let (earlier, standing, later) = (worker(), worker(), worker());
+
+    // No worker is held under the registry's id.
+    assert!(engine.tells(&mut follow, Ok(replaced(&object, &earlier, &later))));
+    assert_eq!(told(&heard), []);
+    assert_eq!(held(&follow), []);
+
+    assert!(engine.tells(&mut follow, Ok(registered(&object, &standing))));
+    assert_eq!(told(&heard), [("joined", WorkerId(7))]);
+
+    // The host states another id by now, and the word is of another object.
+    host.state(0, 8);
+    assert!(engine.tells(&mut follow, Ok(replaced(&object, &earlier, &later))));
+    assert_eq!(told(&heard), [], "the worker held stands under its id");
+    assert_eq!(held(&follow), [WorkerId(7)]);
+
+    assert!(engine.tells(&mut follow, Ok(replaced(&object, &standing, &later))));
+    let rekeyed = [("left", WorkerId(7)), ("joined", WorkerId(8))];
+    assert_eq!(told(&heard), rekeyed, "the replacement of the object held");
+}
+
+/// A replacement inherits its worker's state. Where the follow never heard
+/// the replacement, the worker's removal names an object the follow does
+/// not hold: it is the worker held all the same, by that state, and the
+/// removal is its leave. The removal of a worker with a state of its own
+/// is another life's, and tells nothing.
+#[test]
+fn the_removal_of_a_replacement_the_follow_never_heard_is_the_workers_leave() {
+    let registry = registry(0);
+    let (engine, heard, mut follow) = following(&registry);
+    let object = ObjectId::new();
+    let worker = || ready_worker(&url(0), MODEL);
+    let (first, second, stranger) = (worker(), worker(), worker());
+    let inherited = second.inherit_shared_state_from(first.as_ref());
+    assert!(inherited, "a replacement takes its worker's state");
+
+    assert!(engine.tells(&mut follow, Ok(registered(&object, &first))));
+    assert_eq!(told(&heard), [("joined", id(0))]);
+
+    assert!(engine.tells(&mut follow, Ok(removed(&object, &stranger))));
+    assert_eq!(told(&heard), [], "another life's removal");
+
+    assert!(engine.tells(&mut follow, Ok(removed(&object, &second))));
+    assert_eq!(told(&heard), [("left", id(0))]);
+    assert_eq!(held(&follow), []);
+}
+
 /// A registry can say a registration under its own id of a worker ahead of
 /// that worker's removal: it frees the id ahead of the removal's word.
 /// Another object registered under a registry id the follow holds is the
@@ -502,12 +580,12 @@ fn a_registration_heard_behind_the_read_that_found_its_worker_tells_nothing() {
     assert_eq!(held(&follow), [id(0)]);
 }
 
-/// A whole read cannot tell an object the registry replaced inside the
-/// dropped events from a worker it registered again under its id. Another
-/// object under a registry id the follow holds is told as the worker's
-/// next life: a leave and a join.
+/// A worker the registry replaced inside the dropped events keeps its
+/// state, which a replacement inherits: the whole read finds another
+/// object under the registry id the follow holds, knows the worker by that
+/// state, and tells nothing. Its removal behind the read is its leave.
 #[test]
-fn a_whole_read_tells_another_object_under_a_held_registry_id_as_its_next_life() {
+fn a_worker_replaced_inside_dropped_events_is_told_nothing_by_the_read() {
     let registry = registry(2);
     let (engine, heard, mut follow) = following(&registry);
     let _ = told(&heard);
@@ -515,8 +593,48 @@ fn a_whole_read_tells_another_object_under_a_held_registry_id_as_its_next_life()
     replace(&registry, 0);
     flood(&registry, 1);
     drain(&engine, &mut follow);
-    assert_eq!(told(&heard), [("left", id(0)), ("joined", id(0))]);
+    assert_eq!(
+        told(&heard),
+        [],
+        "the worker stands, with what the stages keep"
+    );
     assert_eq!(held(&follow), sorted(vec![id(0), id(1)]));
+
+    remove(&registry, 0);
+    drain(&engine, &mut follow);
+    assert_eq!(told(&heard), [("left", id(0))]);
+}
+
+/// A host that keeps ids by address answers of the worker that stands, so
+/// an id that stood only between two replacements heard together is told
+/// to no stage. A replacement that changes the id told owes a whole read
+/// at the next upkeep, with no lag: its snapshot names the ids that stand,
+/// and a stage drops what requests left under any other.
+#[test]
+fn a_replacement_that_changes_the_id_told_owes_a_whole_read() {
+    let registry = registry(1);
+    let host = Stating::over(&registry);
+    host.state(0, 7);
+    let (engine, heard, follow) = following(&host);
+    let mut members = Some(follow);
+    let _ = told(&heard);
+
+    // The host stated 8 and then 9 of the worker ahead of the first word.
+    replace(&registry, 0);
+    replace(&registry, 0);
+    host.state(0, 9);
+    drain(&engine, members.as_mut().expect("the follow"));
+    let rekeyed = [("left", WorkerId(7)), ("joined", WorkerId(9))];
+    assert_eq!(told_and_standing(&heard), (rekeyed.to_vec(), vec![]));
+
+    engine.follow_registry(&mut members);
+    assert_eq!(told_and_standing(&heard), (vec![], vec![WorkerId(9)]));
+
+    // No read is owed behind it, and none behind a replacement under which the id stands.
+    replace(&registry, 0);
+    drain(&engine, members.as_mut().expect("the follow"));
+    engine.follow_registry(&mut members);
+    assert_eq!(told_and_standing(&heard), (vec![], vec![]));
 }
 
 /// Two workers stand under one stated id, and the host gives one of them
@@ -546,6 +664,59 @@ fn a_worker_given_another_id_leaves_the_id_it_shared_standing() {
     drain(&engine, &mut follow);
     assert_eq!(told(&heard), [("left", one_id)]);
     assert_eq!(held(&follow), [WorkerId(8)]);
+}
+
+/// The records of sent prefixes forget a worker's id where the follow tells
+/// its join with no leave ahead, and where it tells its leave: a prompt
+/// the records name a worker for is then placed by its request's seed
+/// again. A worker so inherits nothing of a life the channel dropped whole.
+/// The lists name eight workers by their addresses, whatever the registry
+/// holds.
+#[test]
+fn a_join_and_a_leave_of_the_follow_forget_the_ids_sent_prefixes() {
+    let mut document = PolicySpec::preset("cache_aware").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let engine = PolicyEngine::new(spec);
+    let registry = registry(0);
+    engine.set_registry(handed(&registry));
+    let mut follow = started(&engine).expect("a registry was handed");
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let sent = |prompt: u32, seed: u64| {
+        let tokens: Vec<u32> = (prompt * 100_000..prompt * 100_000 + 1_024).collect();
+        let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+        let mut asked = request();
+        asked.facts.seed = seed;
+        hashes.write_to(&mut asked.facts);
+        let asks = Asks::of(asked, Some(&members));
+        let decided = decided(&engine, &asks);
+        let pick = decided.decision.pick().expect("a pick");
+        pick.targets.first().expect("a target").position
+    };
+    // Sixteen prompts, each asked under a seed of its own.
+    let places = |seeds: u64| -> Vec<u32> {
+        (0..16)
+            .map(|prompt| sent(prompt, seeds + u64::from(prompt)))
+            .collect()
+    };
+    let first = places(0);
+    assert_eq!(places(100), first, "a prompt stays where it was sent");
+
+    // Eight joins no leave came ahead of.
+    for at in 0..8 {
+        register(&registry, at);
+    }
+    drain(&engine, &mut follow);
+    let second = places(200);
+    assert_ne!(second, first, "a join starts with no sent prefixes");
+    assert_eq!(places(300), second);
+
+    for at in 0..8 {
+        remove(&registry, at);
+    }
+    drain(&engine, &mut follow);
+    assert_ne!(places(400), second, "a leave forgets the sent prefixes");
 }
 
 /// The engine's own task follows the registry its host handed: the workers

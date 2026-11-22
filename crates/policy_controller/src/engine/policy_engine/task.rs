@@ -129,7 +129,7 @@ impl PolicyEngine {
     ///
     /// The engine's task reads the channel ([`Self::run`]). A decision
     /// reads the snapshot its request gives where it gives one
-    /// ([`RequestMaker::loads`](crate::engine::RequestMaker::loads)), and
+    /// ([`RequestMaker::loads`]), and
     /// the newest the task keeps at hand otherwise: a single request's, a
     /// pair's first, and a pair's decode decided again.
     pub fn set_loads(&self, loads: LoadReceiver) {
