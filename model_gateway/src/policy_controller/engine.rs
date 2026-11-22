@@ -68,7 +68,10 @@ use smg_policy_controller::{
 };
 use smg_worker::{
     identity::basic::{Worker, WorkerLoadGuard, WorkerType},
-    load::state::{LoadReceiver, LoadSnapshot},
+    load::{
+        lend as loads,
+        state::{LoadReceiver, LoadSnapshot},
+    },
 };
 
 use crate::{
@@ -96,7 +99,6 @@ use crate::{
 };
 
 mod hashes;
-mod loads;
 
 pub(crate) use hashes::Prompt;
 pub(crate) use smg_policy_controller::engine::PromptHashes as Hashes;

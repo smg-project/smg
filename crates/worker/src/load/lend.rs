@@ -34,14 +34,14 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use smg_worker::load::state::{LoadReceiver, LoadSnapshot};
+use crate::load::state::{LoadReceiver, LoadSnapshot};
 
-/// The monitor's feed for the asks the engine of this process decides,
-/// where its document reads load reports. Empty under any other document,
-/// and until the gateway's start has built its monitor: an ask is then
-/// lent no snapshot, and its records carry no report.
+/// The monitor's feed for the asks a policy engine of this process
+/// decides. Empty until its host hands it the monitor's channel
+/// ([`Self::read`]): an ask is then lent no snapshot, and its records
+/// carry no report.
 #[derive(Debug, Default)]
-pub(super) struct Loads {
+pub struct Loads {
     feed: OnceLock<LoadReceiver>,
 }
 
@@ -59,14 +59,14 @@ thread_local! {
 
 impl Loads {
     /// Reads `feed` from here on: the monitor's channel, handed once, at
-    /// the gateway's start. A second hand-over is ignored.
-    pub(super) fn read(&self, feed: LoadReceiver) {
+    /// the host's start. A second hand-over is ignored.
+    pub fn read(&self, feed: LoadReceiver) {
         let _ = self.feed.set(feed);
     }
 
     /// Whether a feed was handed.
-    #[cfg(test)]
-    pub(super) fn reads_a_feed(&self) -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn reads_a_feed(&self) -> bool {
         self.feed.get().is_some()
     }
 
@@ -81,7 +81,8 @@ impl Loads {
     /// thread's keep empty and reads the channel itself: it is lent the
     /// current snapshot all the same, and nothing panics (the case
     /// `an_ask_made_while_a_loan_stands_reads_the_channel_itself`).
-    pub(super) fn lend(&self) -> Lent {
+    #[inline]
+    pub fn lend(&self) -> Lent {
         let Some(feed) = self.feed.get() else {
             return Lent(None, PhantomData);
         };
@@ -106,7 +107,7 @@ impl Loads {
 /// It cannot leave its thread. A loan that crossed to another thread would
 /// be put back into that thread's keep, whose receiver would then answer
 /// "seen" for a snapshot it never read.
-pub(super) struct Lent(Option<Seen>, PhantomData<*const ()>);
+pub struct Lent(Option<Seen>, PhantomData<*const ()>);
 
 // A loan is not `Send`, held at compile time: were it `Send`, both of the
 // two blanket answers below would fit and the line would not compile.
@@ -120,14 +121,16 @@ const _: fn() = || {
 };
 
 impl Lent {
-    /// The snapshot, as the monitor published it. `None` where the engine
-    /// reads no feed.
-    pub(super) fn snapshot(&self) -> Option<&Arc<LoadSnapshot>> {
+    /// The snapshot, as the monitor published it. `None` where no feed was
+    /// handed.
+    #[inline]
+    pub fn snapshot(&self) -> Option<&Arc<LoadSnapshot>> {
         self.0.as_ref().map(|seen| &seen.snapshot)
     }
 }
 
 impl Drop for Lent {
+    #[inline]
     fn drop(&mut self) {
         if let Some(seen) = self.0.take() {
             SEEN.set(Some(seen));
@@ -139,9 +142,8 @@ impl Drop for Lent {
 mod tests {
     use std::collections::HashMap;
 
-    use smg_worker::load::state::{one_rank_load, TestFeed};
-
     use super::*;
+    use crate::load::state::{one_rank_load, TestFeed};
 
     /// A feed `loads` reads from here on, where it reads none yet.
     fn fed(loads: &Loads) -> TestFeed {
@@ -181,8 +183,8 @@ mod tests {
         assert!(Arc::ptr_eq(lent.snapshot().expect("a snapshot"), &second));
     }
 
-    /// Two engines' feeds read on one thread do not answer for each other:
-    /// each ask is lent its own feed's snapshot.
+    /// Two feeds read on one thread do not answer for each other: each ask
+    /// is lent its own feed's snapshot.
     #[test]
     fn a_thread_that_reads_two_feeds_is_lent_each_ones_own() {
         let (one, other) = (Loads::default(), Loads::default());
