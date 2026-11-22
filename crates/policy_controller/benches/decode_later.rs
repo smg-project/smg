@@ -3,6 +3,9 @@
 //! decodes of `n` rows, a quarter of them prefills, and each target named
 //! with the held prefill. The held prefill stands in the middle of its
 //! pool: the entry finds it by a walk of the rows.
+//! `policy_engine/decode_later_round_robin/{kept,picked}/<n>`: the same
+//! call under round robin, handed the decode the pair's first decision
+//! named (it is kept) and handed none (the picker turns again).
 //!
 //! The cells stand in a bench of their own. A bench binary is optimized
 //! whole, so the entries it links shape every cell in it: beside the pair
@@ -86,6 +89,7 @@ fn decode_later(c: &mut Criterion) {
                     &pool,
                     black_box(pools),
                     held,
+                    None,
                     &cx,
                     &mut scratch,
                 )
@@ -95,5 +99,56 @@ fn decode_later(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, decode_later);
+/// The second decision under round robin, a profile that keeps its pick.
+/// `kept`: the entry is handed the decode in the middle of the decodes as
+/// the one the first decision named, and answers it behind the profile's
+/// filters. `picked`: handed none, it asks the picker again.
+fn decode_later_round_robin(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_engine/decode_later_round_robin");
+    let engine = PolicySpec::pair_presets("round_robin", "round_robin")
+        .expect("a pair spec of this build")
+        .validate()
+        .expect("the pair spec validates");
+    for &n in &SIZES {
+        let prefills = side_view(n / 4, Role::Prefill, 10_000);
+        let decodes = side_view(n - n / 4, Role::Decode, 20_000);
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        let pool = PoolFacts {
+            pool_size: decodes.len() as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let (cx, mut scratch) = (Constraints::default(), Scratch::new());
+        let held = prefills[prefills.len() / 2].id;
+        let first = &decodes[decodes.len() / 2];
+        let first = Some((first.id, first.dp_rank));
+        for (name, first) in [("kept", first), ("picked", None)] {
+            let facts = RequestFacts {
+                model: "m",
+                now_micros: 1_000_000,
+                ..RequestFacts::default()
+            };
+            group.bench_with_input(BenchmarkId::new(name, n), &n, |b, _| {
+                b.iter(|| {
+                    engine.decide_decode(
+                        &facts,
+                        &pool,
+                        black_box(pools),
+                        held,
+                        first,
+                        &cx,
+                        &mut scratch,
+                    )
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, decode_later, decode_later_round_robin);
 criterion_main!(benches);

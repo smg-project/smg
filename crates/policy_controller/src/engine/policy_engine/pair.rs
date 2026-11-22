@@ -299,7 +299,8 @@ pub(super) fn issue(
 
 /// The decode asked again over the records of the two lists, stamped
 /// ([`stamp`]): the engine's decode entry over the partners of the held
-/// `prefill`. `pool` holds the decode list's facts.
+/// `prefill`. `pool` holds the decode list's facts. The entry is handed no
+/// first decode here, so it decides again under every profile.
 fn decide_decode_records(
     engine: &Engine,
     facts: &RequestFacts<'_>,
@@ -318,12 +319,13 @@ fn decide_decode_records(
             generation: pool.generation,
             ..PoolFacts::default()
         };
-        return engine.decide_decode(&facts, &none, PairPools::default(), prefill, cx, scratch);
+        let no_lists = PairPools::default();
+        return engine.decide_decode(&facts, &none, no_lists, prefill, None, cx, scratch);
     }
     if let Some((reason, stage)) = not_narrowed_by(cx) {
         return shed(reason, stage, facts.seed, pool.generation);
     }
-    engine.decide_decode(&facts, pool, pools, prefill, cx, scratch)
+    engine.decide_decode(&facts, pool, pools, prefill, None, cx, scratch)
 }
 
 /// What a pick of the decode decided again ([`PairLists::decide`] behind a
