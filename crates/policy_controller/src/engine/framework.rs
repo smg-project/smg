@@ -674,8 +674,9 @@ pub trait Picker: Lifecycle + Debug {
     /// health on the worker and holds every other rule of a placement
     /// itself asks such a picker for one pick and nothing else of a
     /// decision ([`Engine::place_for`]). The default is no. The engine reads
-    /// it where such a caller asks for a place's profile, not at a
-    /// decision.
+    /// it where such a caller asks for a place's profile, and at one
+    /// decision: a pair's decode decided again, handed the decode of the
+    /// pair's first decision ([`Profile::keeps_its_pick`]).
     fn picks_alone(&self) -> bool {
         false
     }
@@ -2186,8 +2187,12 @@ fn vision_fits(facts: &RequestFacts<'_>, c: &Candidate) -> bool {
 
 /// The scoring half of a profile's run, over the survivors its filter half
 /// left in `buf.kept`: the scorers and the picker ([`score_and_pick`]), then
-/// the trace. A picker that pushes no target declined. Inlined: each of its
-/// two callers is one profile's run, as it was before the halves had names.
+/// the trace. A picker that pushes no target declined. A pair's decode
+/// decided again hands `first`, the decode its first decision named: where
+/// that decode is a survivor it leads the targets and the picker is not
+/// asked ([`keep_first`]). Inlined: each of its callers is one profile's
+/// run, as it was before the halves had names, and one that hands no
+/// `first` holds no test of it.
 #[inline(always)]
 fn score_survivors(
     profile: &Profile,
@@ -2196,9 +2201,12 @@ fn score_survivors(
     pool: &PoolFacts<'_>,
     candidates: &[Candidate],
     buf: &mut Buffers,
+    first: Option<(WorkerId, u16)>,
 ) -> Decision {
     let mut targets = Targets::new();
-    score_and_pick(profile, facts, candidates, buf, &mut targets);
+    if !first.is_some_and(|first| keep_first(candidates, buf, first, &mut targets)) {
+        score_and_pick(profile, facts, candidates, buf, &mut targets);
+    }
     // The trace counts every survivor of the filters; its top rows are of
     // the compared set, which leads the survivors and alone holds scores.
     let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
@@ -2224,6 +2232,29 @@ fn run_profile(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Decision {
+    run_side(profile, index, facts, pool, set, cx, buf, None)
+}
+
+/// The body of [`run_profile`], which hands no `first`. A pair's decode
+/// decided again enters here with the decode its first decision named,
+/// where its profile keeps its pick ([`Engine::decide_decode`]): the scoring
+/// half keeps that decode where it is a survivor ([`score_survivors`]).
+/// Inlined into the two, so a run that hands none is the code it was.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a side's run, beside the decode the pair's first decision named"
+)]
+fn run_side(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+    first: Option<(WorkerId, u16)>,
+) -> Decision {
     let candidates = set.candidates;
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
         return shed(
@@ -2232,41 +2263,36 @@ fn run_profile(
             trace_of(index, facts, pool, candidates, &[], &[]),
         );
     }
-    score_survivors(profile, index, facts, pool, candidates, buf)
+    score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
 
-/// The scoring half of a pair's decode decided again under a profile that
-/// keeps its pick ([`Profile::keeps_its_pick`]), over the survivors its
-/// filter half left in `buf.kept`. Where `first`, the worker and the rank
-/// of the decode the pair's first decision named, is one of them, it is
-/// the one target and the picker is not asked: the trace is a pick's under
-/// no scorer. Where it is not, the picker picks among the survivors
-/// ([`score_survivors`]).
-fn keep_or_pick(
-    profile: &Profile,
-    index: u16,
-    facts: &RequestFacts<'_>,
-    pool: &PoolFacts<'_>,
+/// The targets of a pair's decode decided again where `first`, the worker
+/// and the rank of the decode the pair's first decision named, is one of
+/// the survivors in `buf.kept`: that decode, then the survivors behind it
+/// in their order, wrapping, to the count a pick names. They are the
+/// alternates a rotation's pick at that decode hands, and the scores are a
+/// pick's under no scorer. `false` where `first` is none of the survivors,
+/// with nothing written: the picker then picks among them.
+fn keep_first(
     candidates: &[Candidate],
     buf: &mut Buffers,
     first: (WorkerId, u16),
-) -> Decision {
-    let stands = buf.kept.iter().copied().find(|&row| {
+    targets: &mut Targets,
+) -> bool {
+    let stands = buf.kept.iter().position(|&row| {
         let row = &candidates[row as usize];
         (row.id, row.dp_rank) == first
     });
-    let Some(row) = stands else {
-        return score_survivors(profile, index, facts, pool, candidates, buf);
+    let Some(at) = stands else {
+        return false;
     };
-    let mut targets = Targets::new();
-    targets.push(target_of(&candidates[row as usize]));
+    let (before, from) = buf.kept.split_at(at);
+    for &row in from.iter().chain(before).take(MAX_TARGETS) {
+        targets.push(target_of(&candidates[row as usize]));
+    }
     buf.scores.clear();
     buf.scores.resize(buf.kept.len(), 0.0);
-    Decision::Pick(Pick {
-        targets,
-        trace: trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores),
-        session_verdict: SessionVerdict::None,
-    })
+    true
 }
 
 /// The staged pass of the single plan over `set` (an `epd` plan's encode
@@ -2292,7 +2318,7 @@ fn run_single(
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
         return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
-    score_survivors(profile, index, facts, pool, candidates, buf)
+    score_survivors(profile, index, facts, pool, candidates, buf, None)
 }
 
 /// The whole pass at the decision's own door, and the one a draw widens to
@@ -2338,7 +2364,7 @@ fn run_whole(
             // does: no pass of another kind behind it grows a list.
             buf.reserve(candidates.len());
             if keep_folded(tests, facts, candidates, cx, &mut buf.kept) {
-                return score_survivors(profile, index, facts, pool, candidates, buf);
+                return score_survivors(profile, index, facts, pool, candidates, buf, None);
             }
         }
     }
@@ -6727,12 +6753,13 @@ impl Engine {
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode
     /// profile that keeps its pick ([`Profile::keeps_its_pick`]) the call
-    /// answers that decode alone while the profile's filters keep it, and
-    /// the picker is not asked: a second pick would turn a rotation a
-    /// second time for one request, and move the request for no reason.
-    /// Where a filter refuses that decode, or none of the partners is that
-    /// worker, the picker picks among the decodes the filters keep. So it
-    /// does under every other profile, and for a caller that hands none.
+    /// answers that decode first while the profile's filters keep it, the
+    /// decodes they keep behind it as its alternates, and the picker is not
+    /// asked: a second pick would turn a rotation a second time for one
+    /// request, and move the request for no reason. Where a filter refuses
+    /// that decode, or none of the partners is that worker, the picker
+    /// picks among the decodes the filters keep. So it does under every
+    /// other profile, and for a caller that hands none.
     #[expect(
         clippy::too_many_arguments,
         reason = "the request and the pair's pools, beside the pair the call is held by"
@@ -6780,29 +6807,16 @@ impl Engine {
         // This call has one draw sequence, seeded by its own request.
         decode_facts.seed = facts.seed;
         let _opened = shown.then(|| profile.open(&decode_facts, decodes, pool));
-        let partners = Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None);
-        let buf = &mut scratch.decode;
-        let mut decision = match first_decode.filter(|_| profile.keeps_its_pick()) {
-            None => run_profile(
-                profile,
-                index,
-                &decode_facts,
-                pool,
-                partners,
-                decode_cx,
-                buf,
-            ),
-            // The filter half as every run of a side makes it, then the
-            // first decode where it stands.
-            Some(first) => match filter(profile, &decode_facts, decode_cx, buf, partners) {
-                Some(emptied_by) => shed(
-                    reason_of(emptied_by),
-                    emptied_by,
-                    trace_of(index, &decode_facts, pool, decodes, &[], &[]),
-                ),
-                None => keep_or_pick(profile, index, &decode_facts, pool, decodes, buf, first),
-            },
-        };
+        let mut decision = run_side(
+            profile,
+            index,
+            &decode_facts,
+            pool,
+            Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None),
+            decode_cx,
+            &mut scratch.decode,
+            first_decode.filter(|_| profile.keeps_its_pick()),
+        );
         // Each target names the held prefill with one decode, as the
         // targets of a pair's first decision do. They are turned where the
         // decision stands, and its trace and its verdict stay the decode's:
@@ -12049,15 +12063,16 @@ mod tests {
     }
 
     /// One request's two decisions over one prefill and `decodes`: the
-    /// pair's first, then its decode decided again, handed the decode the
-    /// first decision named where `handed`. `meanwhile` is what happens to
-    /// that decode between the two. The decode positions the two name.
+    /// pair's first, then its decode decided again, handed what `held`
+    /// makes of the worker and the rank the first named. `meanwhile` is
+    /// what happens to the decodes between the two, told that decode's
+    /// position. The position the first names, then those the second does.
     fn decided_twice(
         engine: &Engine,
         decodes: &mut [Candidate],
-        handed: bool,
-        meanwhile: impl FnOnce(&mut Candidate),
-    ) -> (u32, u32) {
+        held: impl FnOnce((WorkerId, u16)) -> Option<(WorkerId, u16)>,
+        meanwhile: impl FnOnce(&mut [Candidate], usize),
+    ) -> (u32, Vec<u32>) {
         let prefills = classed_rows(&[1]);
         let (pool, cx) = (PoolFacts::default(), Constraints::default());
         let (facts, mut scratch) = (request(7), Scratch::new());
@@ -12070,15 +12085,17 @@ mod tests {
         let target = first.pick().and_then(|pick| pick.targets.first().copied());
         let target = target.expect("a pair");
         let named = target.pair.expect("a decode");
-        meanwhile(&mut decodes[named.decode_position as usize]);
+        meanwhile(&mut *decodes, named.decode_position as usize);
         let pools = PairPools {
             prefills: &prefills,
             decodes,
             ..PairPools::default()
         };
-        let held = handed.then_some((named.decode_id, named.decode_dp_rank));
+        let held = held((named.decode_id, named.decode_dp_rank));
         let again = engine.decide_decode(&facts, &pool, pools, target.id, held, &cx, &mut scratch);
-        let again = first_decode(&again).expect("a decode decided again");
+        let again = again.pick().expect("a decode decided again");
+        let again = again.targets.iter().filter_map(|target| target.pair);
+        let again = again.map(|pair| pair.decode_position).collect();
         (named.decode_position, again)
     }
 
@@ -12088,20 +12105,55 @@ mod tests {
     /// second answer is its first. With none handed the call turns the
     /// rotation its first decision turned: every first decision names one
     /// decode, and every second the other, which then serves every request.
+    /// The two decodes are two workers, or one worker's two ranks: a first
+    /// decode is kept at its rank, and one at a rank no row holds is not.
     #[test]
     fn a_decode_decided_again_under_round_robin_keeps_its_first_decode() {
-        for (handed, served) in [(true, [4, 4]), (false, [0, 8])] {
+        type Held = fn((WorkerId, u16)) -> Option<(WorkerId, u16)>;
+        let cases: [(bool, Held, bool); 4] = [
+            (false, Some, true),
+            (true, Some, true),
+            (false, |_| None, false),
+            (true, |(worker, rank)| Some((worker, rank + 2)), false),
+        ];
+        for (ranks, held, kept) in cases {
             let engine = pair_engine(round_robin_profile());
             let mut decodes = classed_rows(&[1, 1]);
+            if ranks {
+                (decodes[1].id, decodes[1].dp_rank) = (decodes[0].id, 1);
+            }
             let mut sent = [0; 2];
             for _ in 0..8 {
-                let (first, again) = decided_twice(&engine, &mut decodes, handed, |_| {});
-                assert_eq!(again == first, handed);
-                sent[again as usize] += 1;
+                let (first, again) = decided_twice(&engine, &mut decodes, held, |_, _| {});
+                assert_eq!(again[0] == first, kept);
+                sent[again[0] as usize] += 1;
             }
             sent.sort_unstable();
-            assert_eq!(sent, served, "handed: {handed}");
+            assert_eq!(sent, if kept { [4, 4] } else { [0, 8] }, "{ranks}");
         }
+    }
+
+    /// The kept answer names what a pick names over the same survivors:
+    /// the first decode leads, and the survivors behind it follow in their
+    /// order, wrapping, to a pick's count. Five decodes and a request at
+    /// each: four decodes from the first decision's on. Where no other
+    /// decode stays healthy, the first is the whole answer.
+    #[test]
+    fn a_kept_decode_leads_the_survivors_behind_it() {
+        let engine = pair_engine(round_robin_profile());
+        let mut decodes = classed_rows(&[1; 5]);
+        for _ in 0..5 {
+            let (first, again) = decided_twice(&engine, &mut decodes, Some, |_, _| {});
+            let behind = (0..MAX_TARGETS as u32).map(|k| (first + k) % 5);
+            assert_eq!(again, behind.collect::<Vec<_>>());
+        }
+        let alone = |rows: &mut [Candidate], at: usize| {
+            for (i, row) in rows.iter_mut().enumerate() {
+                row.health.healthy = i == at;
+            }
+        };
+        let (first, again) = decided_twice(&engine, &mut decodes, Some, alone);
+        assert_eq!(again, [first]);
     }
 
     /// A first decode that a filter refuses at the second call is not
@@ -12115,12 +12167,12 @@ mod tests {
         let mut decodes = classed_rows(&[1, 1, 1]);
         let (mut firsts, mut seconds) = ([0; 3], [0; 3]);
         for _ in 0..6 {
-            let unhealthy = |row: &mut Candidate| row.health.healthy = false;
-            let (first, again) = decided_twice(&engine, &mut decodes, true, unhealthy);
-            assert_ne!(again, first);
+            let unhealthy = |rows: &mut [Candidate], at: usize| rows[at].health.healthy = false;
+            let (first, again) = decided_twice(&engine, &mut decodes, Some, unhealthy);
+            assert_ne!(again[0], first);
             decodes[first as usize].health.healthy = true;
             firsts[first as usize] += 1;
-            seconds[again as usize] += 1;
+            seconds[again[0] as usize] += 1;
         }
         assert_eq!((firsts, seconds), ([2; 3], [2; 3]));
     }
@@ -12134,9 +12186,11 @@ mod tests {
         let engine = pair_engine(least_requests_profile());
         let mut decodes = classed_rows(&[1, 1]);
         decodes[1].in_flight = 3;
-        assert_eq!(decided_twice(&engine, &mut decodes, true, |_| {}), (0, 0));
-        let busy = |row: &mut Candidate| row.in_flight = 7;
-        assert_eq!(decided_twice(&engine, &mut decodes, true, busy), (0, 1));
+        let (first, again) = decided_twice(&engine, &mut decodes, Some, |_, _| {});
+        assert_eq!((first, again[0]), (0, 0));
+        let busy = |rows: &mut [Candidate], at: usize| rows[at].in_flight = 7;
+        let (first, again) = decided_twice(&engine, &mut decodes, Some, busy);
+        assert_eq!((first, again[0]), (0, 1));
     }
 
     #[test]
