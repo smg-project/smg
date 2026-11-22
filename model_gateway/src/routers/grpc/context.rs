@@ -25,8 +25,8 @@ use parking_lot::Mutex;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::RequestDeadline;
 use smg_policy_controller::{
-    engine::view::WorkerId,
-    tracking::lease::{ReleaseReason, TransportClass},
+    engine::WorkerId,
+    tracking::{ReleaseReason, TransportClass},
 };
 use smg_worker::identity::basic::{RuntimeType, Worker, WorkerLoadGuard};
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -61,7 +61,7 @@ use super::{
 };
 use crate::{
     config::ParserChoice,
-    middleware::TenantRequestMeta,
+    middleware::{RequestStarted, TenantRequestMeta},
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     policy_controller::engine::{End, Held, Placed},
@@ -2291,6 +2291,38 @@ impl ExecutionResult {
     }
 }
 
+/// A request's wait ahead of the dispatch its answer's clocks start at, as
+/// [`dispatch_wait`] reads it; `None` when no entry stamp is in scope.
+pub(crate) type DispatchWait = Option<std::time::Duration>;
+
+/// The wait of the request whose answering attempt was dispatched at
+/// `dispatched` (the single RPC's dispatch, the prefill dispatch of a pair):
+/// the time since its entry at the edge ([`RequestStarted`]). The body read,
+/// auth, admission, tokenizing, templating and worker selection are in it,
+/// and so are a refused attempt with its backoff and an encode call that
+/// runs ahead of the pair.
+///
+/// The stamp is scoped to the request's future. The streaming entry points
+/// run inside it, so they read the wait there, against the dispatch instant
+/// their stream's clocks start at, and hand it to the reading they build:
+/// the response body drives that reading once the request's future has
+/// returned, outside the scope.
+///
+/// A streamed Responses tool loop dispatches its generations from a task of
+/// its own and puts each of them under a stamp there: the first turn's under
+/// the request's own, a later turn's under one taken where that turn starts.
+/// A later turn's wait is therefore the gateway's time from the turn's start
+/// to its dispatch, with none of the generations and tool calls before it.
+///
+/// `None` when no stamp is in scope. Behind the edge every entry point that
+/// reads the wait runs under one. A pipeline a test runs bare has none, on
+/// any turn of a tool loop either, and its stream records its time to first
+/// token alone.
+pub(crate) fn dispatch_wait(dispatched: Instant) -> DispatchWait {
+    let entered = RequestStarted::current()?;
+    Some(dispatched.saturating_duration_since(entered))
+}
+
 /// Timing context threaded from PD execution into the streaming layer so the
 /// first decode token can be measured against the prefill and decode dispatch
 /// instants.
@@ -2354,8 +2386,8 @@ pub(crate) enum FinalResponse {
 #[cfg(test)]
 pub(super) mod test_support {
     use smg_policy_controller::{
-        document::spec::DecodePick,
-        engine::view::Phase,
+        document::DecodePick,
+        engine::Phase,
         store::{GatewayId, LeasesStore, MemoryStore},
     };
     use smg_worker::identity::basic::ConnectionMode;
@@ -2573,7 +2605,7 @@ mod tests {
     use smg_grpc_client::VllmEngineClient;
     use smg_policy_controller::{
         store::{GatewayId, LeasesStore, MemoryStore, WorkersStore},
-        LeaseId, Side,
+        tracking::{LeaseId, Side},
     };
 
     use super::{

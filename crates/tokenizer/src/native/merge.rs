@@ -58,13 +58,13 @@ use tokenizers::{
 use crate::{
     encode_path::Declined,
     tiktoken::MAX_BYTE_LEVEL_TABLE_IDS,
-    word_cache::{entries_of, ReadBpe},
+    word_cache::{entries_of, Listing, ReadBpe},
 };
 
 mod preformed;
 mod serialized;
 
-use preformed::{char_len, code_point, is_continuation, Preformed, NO_CHAR};
+use preformed::{char_len, code_point, is_continuation, Preformed, Raws, NO_CHAR};
 
 /// Entries of one bucket of the pair table: sixteen bytes each, so a bucket
 /// is one 64-byte cache line, read whole.
@@ -397,19 +397,23 @@ impl MergeTable {
             for (byte, &c) in alphabet.iter().enumerate() {
                 byte_of[c as usize] = Some(byte as u8);
             }
-            let raw_of = |token: &str| -> Option<Vec<u8>> {
-                token
-                    .chars()
-                    .map(|c| byte_of.get(c as usize).copied().flatten())
-                    .collect()
-            };
             // The entries borrowed from the read's listing when it has one,
             // by id where the read says the ids are the range, else through
             // a clone of the vocabulary map.
-            let raws = entries_of(bpe, read)
-                .filter_map(|(id, token)| raw_of(token.as_ref()).map(|raw| (id, raw)))
-                .filter(|(_, raw)| !table.lacks_a_token_for(raw))
-                .collect();
+            let entries = entries_of(bpe, read);
+            // A token stands for a byte per character, so its text bounds its
+            // bytes: the listing's text, all of them (none without a listing).
+            let listed = read
+                .and_then(|read| read.tokens.as_deref())
+                .map_or(0, Listing::bytes);
+            let mut raws = Raws::for_tokens(entries.size_hint().1.unwrap_or_default(), listed);
+            for (id, token) in entries {
+                let token: &str = token.as_ref();
+                let raw = token
+                    .chars()
+                    .map(|c| byte_of.get(c as usize).copied().flatten());
+                raws.push(id, raw, |raw| !table.lacks_a_token_for(raw));
+            }
             table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }
         Ok(table)
@@ -474,6 +478,12 @@ impl MergeTable {
             )));
         }
         // Every split of every token into two tokens, at the token's rank.
+        // `root[rank]` is where the token's splits start; the proof below
+        // turns it into the split the token's merge ends with.
+        const UNSET: u32 = u32::MAX - 2;
+        const BYTE: u32 = u32::MAX - 1;
+        const UNPROVEN: u32 = u32::MAX;
+        let mut root = vec![UNSET; ranks_end];
         let mut splits = Vec::with_capacity(ranks.len() * 2);
         for (token, &rank) in ranks {
             if token.len() < 2 {
@@ -481,10 +491,16 @@ impl MergeTable {
             }
             let before = splits.len();
             for cut in 1..token.len() {
-                if let (Some(&left), Some(&right)) =
-                    (ranks.get(&token[..cut]), ranks.get(&token[cut..]))
-                {
-                    splits.push((left, right, rank));
+                let (left, right) = token.split_at(cut);
+                // The longer half is less often a token than the shorter: it
+                // is looked up first, and the shorter only where it is one.
+                let halves = if left.len() < right.len() {
+                    ranks.get(right).and_then(|b| Some((ranks.get(left)?, b)))
+                } else {
+                    ranks.get(left).and_then(|a| Some((a, ranks.get(right)?)))
+                };
+                if let Some((&a, &b)) = halves {
+                    splits.push((a, b, rank));
                 }
             }
             if splits.len() == before {
@@ -492,6 +508,12 @@ impl MergeTable {
                     "token {rank} is no two tokens' concatenation"
                 )));
             }
+            // A rank two tokens share proves neither.
+            let slot = &mut root[rank as usize];
+            *slot = match (*slot, u32::try_from(before)) {
+                (UNSET, Ok(at)) if at < UNSET => at,
+                _ => UNPROVEN,
+            };
         }
         let mut table = Self::with_capacity(splits.len(), false, true);
         table.byte_ids = byte_ids;
@@ -499,9 +521,75 @@ impl MergeTable {
         for &(left, right, rank) in &splits {
             table.insert(left, right, Merge::new(rank, rank));
         }
+        // A token is the merge of its bytes when two halves that are each the
+        // merge of their own bytes join last: their own steps run in rising
+        // rank unless a pair across the cut merges first, and such a pair is a
+        // node of the left half's right spine beside one of the right half's
+        // left spine. A token no split proves keeps the full merge below.
+        for &id in &byte_ids {
+            let slot = &mut root[id as usize];
+            *slot = if *slot == UNSET { BYTE } else { UNPROVEN };
+        }
+        for rank in 0..ranks_end as u32 {
+            let start = root[rank as usize];
+            if start >= UNSET {
+                continue;
+            }
+            root[rank as usize] = UNPROVEN;
+            'split: for (at, &(a, b, of)) in splits.iter().enumerate().skip(start as usize) {
+                if of != rank {
+                    break;
+                }
+                let usable = |half: u32| {
+                    let state = root[half as usize];
+                    state == BYTE || (half < rank && state < UNSET)
+                };
+                if !usable(a) || !usable(b) {
+                    continue;
+                }
+                let (mut x, mut y) = (a, b);
+                loop {
+                    let (of_x, of_y) = (root[x as usize], root[y as usize]);
+                    if of_x == BYTE && of_y == BYTE {
+                        break;
+                    }
+                    // Undo the side formed last: the higher rank, the right
+                    // one on a tie. The pair that stood until that step
+                    // merges first if it ranks lower, or equal where the
+                    // step is the right side's (the leftmost of a tie wins).
+                    if of_y == BYTE || (of_x != BYTE && x > y) {
+                        let half = splits[of_x as usize].1;
+                        if table.merge_of(half, y).rank() < x {
+                            continue 'split;
+                        }
+                        x = half;
+                    } else {
+                        let half = splits[of_y as usize].0;
+                        if table.merge_of(x, half).rank() <= y {
+                            continue 'split;
+                        }
+                        y = half;
+                    }
+                }
+                root[rank as usize] = at as u32;
+                break;
+            }
+        }
         let mut ids = Vec::new();
         for (token, &rank) in ranks {
             if token.len() < 2 {
+                continue;
+            }
+            if root[rank as usize] < UNSET {
+                if cfg!(debug_assertions) {
+                    ids.clear();
+                    table.merge(token, &mut ids);
+                    debug_assert_eq!(
+                        ids,
+                        [rank],
+                        "token {rank} proven but not the merge of its bytes"
+                    );
+                }
                 continue;
             }
             ids.clear();
@@ -512,6 +600,8 @@ impl MergeTable {
                 )));
             }
         }
+        // The analysis below holds the load's heap peak: the index goes first.
+        drop(root);
         // The least rank of a merge that takes each id as an operand: every
         // split the table holds is such a merge, at the token's rank.
         let mut min_operand = vec![NO_RANK; ranks_end];
@@ -519,10 +609,24 @@ impl MergeTable {
             min_operand[left as usize] = min_operand[left as usize].min(rank);
             min_operand[right as usize] = min_operand[right as usize].min(rank);
         }
-        let raws = ranks
+        // The tokens in rank order, placed and not sorted: the analysis
+        // orders them by id, one pass where they come in order. A token
+        // another of its rank displaces goes after the placed ones.
+        let mut by_rank: Vec<Option<&Vec<u8>>> = vec![None; ranks_end];
+        let mut twice = Vec::new();
+        for (token, &rank) in ranks {
+            if let Some(first) = by_rank[rank as usize].replace(token) {
+                twice.push((rank, first));
+            }
+        }
+        let placed = by_rank
             .iter()
-            .map(|(token, &rank)| (rank, token.clone()))
-            .collect();
+            .enumerate()
+            .filter_map(|(rank, token)| token.map(|token| (rank as u32, token)));
+        let mut raws = Raws::for_tokens(ranks.len(), ranks.keys().map(Vec::len).sum());
+        for (rank, token) in placed.chain(twice) {
+            raws.push(rank, token.iter().copied().map(Some), |_| true);
+        }
         table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         Ok(table)
     }
@@ -702,7 +806,7 @@ impl MergeTable {
 
     /// Reads one word of every line of the table, the buckets first, then
     /// the grid and the filter (the small, hot tables last, so they stay in
-    /// the nearer caches), and keeps nothing: a thread's first encode with
+    /// the nearer caches), and keeps nothing: an early encode of a thread with
     /// the encoder calls it so that the table's lines come in as one stream
     /// then rather than one dependent probe at a time during the first-sight
     /// pieces of the texts after it. In a fresh process the table was built
@@ -1108,18 +1212,19 @@ impl<const N: usize> ShortMerge<N> {
     #[inline(always)]
     fn run(mut self, table: &MergeTable, ids: &mut Vec<u32>) {
         let pairs = self.n.saturating_sub(1);
+        let mut best = NO_KEY;
         for at in 0..pairs {
             let merge = table.merge_of(self.symbols[at], self.symbols[at + 1]);
-            self.set_pair(at, merge);
+            best = best.min(self.set_pair(at, merge));
         }
-        self.settle(table, pairs, ids);
+        self.settle(table, best, ids);
     }
 
-    /// Merges from the `pairs` of the first round until no live pair is a
-    /// merge, and appends the ids to `ids`.
+    /// Merges from `best`, the least key of the first round, until no live
+    /// pair is a merge, and appends the ids to `ids`. It borrows the state:
+    /// taken by value it is copied here, even with both functions inlined.
     #[inline(always)]
-    fn settle(mut self, table: &MergeTable, pairs: usize, ids: &mut Vec<u32>) {
-        let mut best = self.least(pairs);
+    fn settle(&mut self, table: &MergeTable, mut best: i32, ids: &mut Vec<u32>) {
         while best != NO_KEY {
             best = self.merge_at(table, (best as u32 & SHORT_KEY_MASK) as usize);
         }

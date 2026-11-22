@@ -200,7 +200,7 @@ impl InklingImageProcessor {
         if (scaled_width, scaled_height) == (width, height) {
             image.to_rgb8()
         } else {
-            transforms::resize_lanczos_pil(image, scaled_width, scaled_height).to_rgb8()
+            transforms::resize_lanczos_pil(image, scaled_width, scaled_height).into_rgb8()
         }
     }
 
@@ -222,6 +222,9 @@ impl InklingImageProcessor {
         // PAD_RAW_VALUE is in the [0,1] domain; recover the raw byte for scale/bias.
         let pad_byte = PAD_RAW_VALUE * 255.0;
         let pad_norm: [f32; 3] = std::array::from_fn(|c| pad_byte * scale[c] + bias[c]);
+        let table: [[f32; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|byte| byte as f32 * scale[c] + bias[c]));
+        let (pixels, _) = raw.as_chunks::<3>();
 
         for patch_idx in 0..height.div_ceil(self.patch_size) * npw {
             let patch_y = patch_idx / npw;
@@ -230,18 +233,24 @@ impl InklingImageProcessor {
             let x_base = patch_x * self.patch_size;
             let patch_start = output.len();
 
-            for y in 0..self.patch_size {
-                let iy = y_base + y;
-                for x in 0..self.patch_size {
-                    let ix = x_base + x;
-                    if iy < height && ix < width {
-                        let offset = (iy * width + ix) * 3;
-                        for c in 0..3 {
-                            output.push(raw[offset + c] as f32 * scale[c] + bias[c]);
-                        }
-                    } else {
-                        output.extend_from_slice(&pad_norm);
-                    }
+            // The patch's columns that lie on the image: a run of its pixels,
+            // then padding to the patch's width.
+            let columns = x_base.min(width)..(x_base + self.patch_size).min(width);
+            for iy in y_base..y_base + self.patch_size {
+                let on_image = if iy < height {
+                    &pixels[iy * width..][columns.clone()]
+                } else {
+                    &[]
+                };
+                for pixel in on_image {
+                    output.extend_from_slice(&[
+                        table[0][usize::from(pixel[0])],
+                        table[1][usize::from(pixel[1])],
+                        table[2][usize::from(pixel[2])],
+                    ]);
+                }
+                for _ in on_image.len()..self.patch_size {
+                    output.extend_from_slice(&pad_norm);
                 }
             }
 

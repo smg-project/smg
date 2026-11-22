@@ -48,7 +48,8 @@ bitflags! {
         const REASONING_LLM = Self::LLM.bits() | Self::REASONING.bits();
 
         /// Full-featured LLM: all text generation capabilities
-        const FULL_LLM = Self::VISION_LLM.bits() | Self::REASONING.bits();
+        const FULL_LLM = Self::VISION_LLM.bits() | Self::REASONING.bits()
+                       | Self::GENERATE.bits();
 
         /// Embedding model only
         const EMBED_MODEL = Self::EMBEDDINGS.bits();
@@ -392,6 +393,26 @@ impl std::fmt::Display for Endpoint {
             Endpoint::Rerank => write!(f, "rerank"),
             Endpoint::Generate => write!(f, "generate"),
             Endpoint::Models => write!(f, "models"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Endpoint, ModelType};
+
+    #[test]
+    fn full_llm_supports_every_text_generation_endpoint() {
+        for endpoint in [
+            Endpoint::Chat,
+            Endpoint::Completions,
+            Endpoint::Responses,
+            Endpoint::Generate,
+        ] {
+            assert!(
+                ModelType::FULL_LLM.supports_endpoint(endpoint),
+                "FULL_LLM does not support {endpoint}"
+            );
         }
     }
 }

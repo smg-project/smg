@@ -119,7 +119,8 @@ interface types {
   /// `zone`, `engine-kind` and `connector`); `budget-micros` is relative to
   /// the host's receipt; `seed` is the only randomness (see `host`).
   /// `block-hashes` is empty unless the plugin's row declares `token_hashes` or
-  /// `text_hashes` among its needs.
+  /// `text_hashes` among its needs. `prompt-tokens` is zero unless the row
+  /// declares `prompt_size`: a plugin that reads the request's size declares it.
   record request {
     model: string,
     namespace-seed: u64,
@@ -336,7 +337,8 @@ interface plugin {
 ///   byte plus one; 0 is `none`; under `plain` the key's string follows in
 ///   its section and bit 2 says so);
 ///   32 budget-micros u32;
-///   36 prompt-tokens u32; 40 max-output-tokens u32; 44 priority s32;
+///   36 prompt-tokens u32 (zero for a plugin whose row does not declare
+///   `prompt_size` among its needs); 40 max-output-tokens u32; 44 priority s32;
 ///   48 hash-count u16; 50 tried-count u16; 52 header-count u16;
 ///   54 model-len u16; 56 phase u8 (0 single, 1 prefill, 2 decode,
 ///   3 encode); 57 hash-kind u8 (0 token, 1 text); 58 attempt u8;

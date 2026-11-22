@@ -34,7 +34,7 @@ use super::{object::role, Lead, Objects};
 use crate::{
     engine::view::{Role, SignalSource, WorkerId},
     load::{
-        load_report::{load_row, signal_values, RankValues, ReportOf},
+        load_report::{load_row, signal_values, LoadReportRanks, RankValues},
         signals::SignalColumn,
     },
     store::{LoadSink as StoreLoadSink, LoadSource, PollMode as StorePollMode, SignalSink},
@@ -366,10 +366,10 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
             let mut keeper = keeper.lock();
             if passed_over {
                 let pushed = Some(i32::from(rank));
-                let of = ReportOf::EveryRank { pushed };
+                let of = LoadReportRanks::EveryRank { pushed };
                 keeper.keep(report, of, &columns, polled_at);
             } else {
-                let of = ReportOf::EveryRank { pushed: None };
+                let of = LoadReportRanks::EveryRank { pushed: None };
                 keeper.values(report, of, &columns, polled_at, write);
             }
         }
@@ -439,7 +439,7 @@ where
         // at its latest record: this record states its own rank. Another
         // rank's entry is read where nothing of it is kept yet, as old as
         // the keeper was told that entry is.
-        let of = ReportOf::OneRank {
+        let of = LoadReportRanks::OneRank {
             rank: i32::from(rank),
         };
         keeper
@@ -551,8 +551,8 @@ mod tests {
         document::spec::{AcrossRanks, AppliedSpec, PolicySpec, SignalSpec},
         engine::view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
         store::{
-            Ask, GatewayId, LoadSample, LoadSource, MemoryStore, Overload,
-            PollMode as StorePollMode, Taken, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
+            GatewayId, LoadSample, LoadSource, MemoryStore, Overload, PollMode as StorePollMode,
+            SignalWriteOutcome, ViewBuffers, ViewQuery, WorkerFacts, WorkerPatch, WorkerStatus,
             WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
@@ -644,7 +644,7 @@ mod tests {
             unit: &str,
             value: f64,
             sampled_at: Instant,
-        ) -> Taken {
+        ) -> SignalWriteOutcome {
             self.memory
                 .signal_value(id, rank, column, unit, value, sampled_at)
         }
@@ -723,7 +723,7 @@ mod tests {
 
         fn overloaded(&self, id: WorkerId, now: Instant) -> bool {
             let mut out = ViewBuffers::default();
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now,
                 pinned: None,
@@ -732,7 +732,7 @@ mod tests {
             };
             self.store
                 .memory
-                .world()
+                .snapshot()
                 .build(MODEL, Role::Single, &ask, &mut out)
                 .expect("the pool");
             out.candidates
@@ -1459,7 +1459,7 @@ mod tests {
     fn cells(replica: &Replica) -> FxHashMap<WorkerId, Held> {
         replica.publish();
         replica.store.memory.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: Instant::now(),
                 pinned: None,
@@ -1471,7 +1471,7 @@ mod tests {
                 .view(MODEL, Role::Single, &ask, false, &mut out)
                 .expect("the pool");
             let block = view.signal_cells.expect("the publication's block");
-            let held = |cell: &crate::SignalCell| {
+            let held = |cell: &crate::load::SignalCell| {
                 (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
             };
             let cells = block.cells().chunks(block.signals());
@@ -1527,14 +1527,14 @@ mod tests {
         assert_eq!(cells(&replica)[&id], held);
         // The name no document declares was never offered: no write
         // counts it.
-        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+        assert_eq!(store.stats().signal_writes, [2, 0, 0, 0, 0, 0]);
         // A record that leaves the names out leaves their cells.
         let later = received + PERIOD;
         adapter.record(&worker, 1, &report(1, 4), later, later);
         let row = replica.store.load(id, 1).expect("the later row");
         assert_eq!(row.row.running, 4);
         assert_eq!(cells(&replica)[&id], held);
-        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+        assert_eq!(store.stats().signal_writes, [2, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -1563,12 +1563,12 @@ mod tests {
         let held = cells(&replica);
         assert_eq!(held[&zero], [None, None]);
         assert_eq!(held[&one], [Some((5.0, at)), Some((1_025.0, at))]);
-        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+        assert_eq!(store.stats().signal_writes, [2, 0, 0, 0, 0, 0]);
         // A failed fetch and an answer with no row write no value.
         let empty = WorkerLoadResponse::default();
         adapter.report(&[polled(&first, Some(&empty))], asked + PERIOD);
         adapter.fetch_failed(slice::from_ref(&first), asked + PERIOD);
-        assert_eq!(store.counts().signal_writes, [2, 0, 0, 0, 0, 0]);
+        assert_eq!(store.stats().signal_writes, [2, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -1585,7 +1585,7 @@ mod tests {
         let adapter = replica.lead();
         adapter.record(&worker, 0, &stating(0, 3.0, None), now, now);
         assert_eq!(replica.store.ranks(id), 0);
-        let counts = replica.store.memory.counts();
+        let counts = replica.store.memory.stats();
         assert_eq!(counts.signal_writes, [0; 6]);
     }
 

@@ -16,10 +16,13 @@ categories = ["multimedia::images", "science"]
 name = "llm_multimodal"
 
 [features]
-default = ["hf-hub"]
+default = ["hf-hub", "aac"]
 # Downloads model config files from the Hugging Face Hub (`hub`). Consumers that
 # resolve model files themselves can opt out with `default-features = false`.
 hf-hub = ["dep:hf-hub"]
+# Symphonia's AAC decoder. AAC is patent-licensed, so a distributor may leave it
+# out; AAC clips then go to the ffmpeg fallback.
+aac = ["symphonia/aac"]
 opencv-video = ["dep:opencv"]
 
 [dependencies]
@@ -41,7 +44,7 @@ ndarray = "0.17"
 once_cell = "1.21.4"
 rayon = "1.12"
 rustfft = "6.4"
-symphonia = { version = "0.6", default-features = false, features = ["all"] }
+symphonia = { version = "0.6", default-features = false, features = ["all-formats", "all-meta", "adpcm", "alac", "flac", "mp1", "mp2", "mp3", "pcm", "vorbis"] }
 opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "imgproc", "videoio"], optional = true }
 reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true, features = ["derive", "rc"] }

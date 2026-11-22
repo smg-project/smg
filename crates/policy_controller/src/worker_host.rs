@@ -45,20 +45,20 @@
 //! adapter does: the registry's subscribers hear the change, and a
 //! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
-//! holder ([`Standing`]). No credential and no connector is a row's fact. A
+//! holder ([`RowRevision`]). No credential and no connector is a row's fact. A
 //! host hands the holder its connector ([`Objects::with_connector`]). It
 //! keeps its workers' credentials in [`Credentials`] and hands the keeper
 //! to the holder ([`Objects::with_credentials`]). A credential is bound to
 //! the rows its registrations wrote: a row no registration of this host
 //! stated takes none. Where a registration's answer says so, the host has
 //! the holder lay the address's objects again ([`Objects::lay_again`]).
-//! [`registration_at_door_keeping`] makes these calls with the keeper the
-//! host's holder was built with.
+//! [`registration_into_store_keeping_credentials`] makes these calls with the
+//! keeper the host's holder was built with.
 //!
 //! A host whose registrations run in its own process needs none of that.
 //! Its registration built a whole object a row, and the holder keeps each
 //! as its row's ([`Objects::with_built_kept`]): the door hands them in
-//! with the write ([`Membership::found_rows`], [`Objects::handing`]). An
+//! with the write ([`MembershipWriter::found_rows`], [`Objects::handing`]). An
 //! object holds what the table does not carry, its credential first.
 //!
 //! # The adapters
@@ -80,22 +80,23 @@
 //! [`KvHost`] gives each subscription its row in the store. Every replica
 //! runs the adapter over its own streams. The adapter keeps what a row's
 //! stream showed of its cache groups, as the gateway's index does. A row
-//! above rank 0 of a data-parallel worker gets no feed yet ([`NoFeed`]).
+//! above rank 0 of a data-parallel worker gets no feed yet ([`SkipReason`]).
 //! The module `kv` names the decode's limits.
 //!
 //! # The door
 //!
-//! The host hands out a [`Membership`] door. A host without election uses
-//! [`StoreDoor`]. A replica that may lead uses the controller's door.
+//! The host hands out a [`MembershipWriter`] door. A host without election uses
+//! [`StoreMembershipWriter`]. A replica that may lead uses the controller's
+//! door.
 //!
-//! [`registration_at_door`] writes the created workers' rows, and hands
+//! [`registration_into_store`] writes the created workers' rows, and hands
 //! each built worker to the door with its write.
-//! [`removal_at_door`] marks the selected rows draining, waits for the
+//! [`removal_from_store`] marks the selected rows draining, waits for the
 //! workers to settle and removes their rows. The steps write the store
 //! through the door. [`Objects`] remains the registry's one writer.
 //!
 //! The health loop's refresh of a worker's engine has an entry of its own
-//! ([`Membership::refreshed`]). It asks no maker, writes the row's labels
+//! ([`MembershipWriter::refreshed`]). It asks no maker, writes the row's labels
 //! and no other fact, and hands the rebuilt worker in with the write.
 //!
 //! # What the module does not hold
@@ -107,40 +108,44 @@
 //! and ends them at the stop. It names nothing of the controller.
 
 mod credentials;
-mod door;
 mod found;
 mod health;
 mod kv;
 mod kv_feed;
 mod lead;
 mod loads;
+mod membership_writer;
 mod object;
 mod objects;
-pub mod steps;
+pub(crate) mod steps;
 
 pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
+#[cfg(feature = "controller")]
+pub(crate) use found::stated;
+pub use found::{facts, pairing_descriptor};
+pub use health::HealthAdapter;
+pub use kv::{KvAdapter, KvHost, SkipReason, SkippedSubscriptions};
+pub use kv_feed::KvFeed;
+pub use lead::{Lead, SoleLead};
+pub use loads::LoadAdapter;
 #[cfg(all(test, feature = "controller"))]
-pub(crate) use door::tests::{
+pub(crate) use membership_writer::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
     check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows,
 };
 #[cfg(feature = "controller")]
-pub(crate) use door::{
+pub(crate) use membership_writer::{
     drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
 };
-pub use door::{Expect, Membership, Over, Refused, Remover, StoreDoor, Wrote};
-pub use found::facts;
-#[cfg(feature = "controller")]
-pub(crate) use found::stated;
-pub use health::HealthAdapter;
-pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
-pub use kv_feed::KvFeed;
-pub use lead::{Lead, SoleLead};
-pub use loads::LoadAdapter;
+pub use membership_writer::{
+    MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
+    StoreMembershipWriter,
+};
 pub use object::object;
-pub use objects::{Members, Objects, Standing};
+pub use objects::{Members, Objects, RowRevision};
 pub use steps::{
-    maker_of, registration_at_door, registration_at_door_keeping, removal_at_door, remover_of,
-    DrainWorkersAtDoor, NoKeeper, RemoveWorkersAtDoor, Unasked, WriteWorkersAtDoor, DISCOVERY,
-    DRAIN_WORKERS_AT_DOOR_STEP, REMOVE_WORKERS_AT_DOOR_STEP, WRITE_WORKERS_AT_DOOR_STEP,
+    registrant_of, registration_into_store, registration_into_store_keeping_credentials,
+    removal_from_store, remover_of, DrainWorkersInStore, NoCredentials, RegistrantError,
+    RemoveWorkersFromStore, WriteWorkersToStore, DISCOVERY, DRAIN_WORKERS_IN_STORE_STEP,
+    REMOVE_WORKERS_FROM_STORE_STEP, WRITE_WORKERS_TO_STORE_STEP,
 };

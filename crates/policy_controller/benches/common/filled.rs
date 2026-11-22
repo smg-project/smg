@@ -4,11 +4,11 @@
 //! build would time pools with no rows, and no failure would say so. A
 //! bench that fills a store through its doors ends the fill here.
 
-use smg_policy_controller::{store::MemoryStore, Role};
+use smg_policy_controller::{engine::Role, store::MemoryStore};
 
 /// The pool of `model` and `role` lists `rows` members.
 pub fn filled(store: &MemoryStore, model: &str, role: Role, rows: usize) {
-    let listed = store.world().members(model, role);
+    let listed = store.snapshot().members(model, role);
     assert_eq!(
         listed,
         Some(rows),

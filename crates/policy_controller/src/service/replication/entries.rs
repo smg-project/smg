@@ -7,7 +7,7 @@
 
 /// How a standby comes to hold what an entry writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fate {
+pub enum EntryReplication {
     /// The store tells its journal: a standby applies the leader's event.
     Journaled,
     /// Never journaled: a standby rebuilds it itself, from the source named.
@@ -28,161 +28,248 @@ const PUBLISHED: &str = "every replica publishes its own world";
 const REPORTED: &str = "each engine's next load report states its values again";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
-pub const ENTRIES: &[(&str, &str, Fate)] = &[
-    ("WorkersStore", "upsert", Fate::Journaled),
-    ("WorkersStore", "upsert_by", Fate::Journaled),
-    ("WorkersStore", "patch", Fate::Journaled),
-    ("WorkersStore", "remove", Fate::Journaled),
-    ("WorkersStore", "set_status", Fate::Journaled),
-    ("WorkersStore", "get", Fate::Read),
-    ("WorkersStore", "by_key", Fate::Read),
-    ("WorkersStore", "epoch", Fate::Read),
-    ("WorkersStore", "snapshot", Fate::Read),
-    ("WorkersStore", "changes_since", Fate::Read),
+pub const ENTRIES: &[(&str, &str, EntryReplication)] = &[
+    ("WorkersStore", "upsert", EntryReplication::Journaled),
+    ("WorkersStore", "upsert_by", EntryReplication::Journaled),
+    ("WorkersStore", "patch", EntryReplication::Journaled),
+    ("WorkersStore", "remove", EntryReplication::Journaled),
+    ("WorkersStore", "set_status", EntryReplication::Journaled),
+    ("WorkersStore", "get", EntryReplication::Read),
+    ("WorkersStore", "by_key", EntryReplication::Read),
+    ("WorkersStore", "epoch", EntryReplication::Read),
+    ("WorkersStore", "all_rows", EntryReplication::Read),
+    ("WorkersStore", "changes_since", EntryReplication::Read),
     // Each replica counts the snapshots it takes.
-    ("WorkersStore", "history", Fate::Read),
+    ("WorkersStore", "history", EntryReplication::Read),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
     // standby's prober starts it again.
-    ("HealthSink", "probe_outcome", Fate::Journaled),
-    ("HealthSink", "connected", Fate::Journaled),
+    ("HealthSink", "probe_outcome", EntryReplication::Journaled),
+    ("HealthSink", "connected", EntryReplication::Journaled),
     // What the leader's own worker object knows is that replica's alone: a
     // standby holds none of it.
     (
         "HealthSink",
         "leader_bits",
-        Fate::Rebuilt("a new leader writes what its own worker objects know"),
+        EntryReplication::Rebuilt("a new leader writes what its own worker objects know"),
     ),
-    ("HealthSink", "gateway_veto", Fate::Rebuilt(HELLO)),
-    ("HealthSink", "gateway_veto_noted", Fate::Rebuilt(HELLO)),
-    ("HealthSink", "vetoed", Fate::Read),
+    (
+        "HealthSink",
+        "gateway_veto",
+        EntryReplication::Rebuilt(HELLO),
+    ),
+    (
+        "HealthSink",
+        "gateway_veto_noted",
+        EntryReplication::Rebuilt(HELLO),
+    ),
+    ("HealthSink", "vetoed", EntryReplication::Read),
     (
         "HealthSink",
         "completed",
-        Fate::Rebuilt("the gateways' reports of the last probe interval"),
+        EntryReplication::Rebuilt("the gateways' reports of the last probe interval"),
     ),
-    ("HealthSink", "completed_ok_since", Fate::Read),
-    ("LoadSink", "record", Fate::Journaled),
+    ("HealthSink", "completed_ok_since", EntryReplication::Read),
+    ("LoadSink", "record", EntryReplication::Journaled),
     // A report's rows are journaled. Its word that no report came, which
     // clears an engine's overload verdict, is in no entry and no cut: a
     // standby holds the verdict of the engine's last rows until its own
     // first poll.
-    ("LoadSink", "report", Fate::Journaled),
-    ("LoadSink", "report_sampled", Fate::Journaled),
-    ("LoadSink", "poll_mode", Fate::Read),
+    ("LoadSink", "report", EntryReplication::Journaled),
+    ("LoadSink", "report_sampled", EntryReplication::Journaled),
+    ("LoadSink", "poll_mode", EntryReplication::Read),
     // The report period is the load driver's own setting, told where the
     // driver is built: every replica builds its own.
     (
         "LoadSink",
         "heard_every",
-        Fate::Rebuilt("each replica's load driver tells its own report period"),
+        EntryReplication::Rebuilt("each replica's load driver tells its own report period"),
     ),
-    ("LoadSink", "load", Fate::Read),
-    ("LoadSink", "ranks", Fate::Read),
+    ("LoadSink", "load", EntryReplication::Read),
+    ("LoadSink", "ranks", EntryReplication::Read),
     // The load adapter of a host with no standby is the one caller.
     (
         "LoadSink",
         "evict",
-        Fate::NotYet("the first host with a standby beside the load adapter brings its event"),
+        EntryReplication::NotYet(
+            "the first host with a standby beside the load adapter brings its event",
+        ),
     ),
     (
         "LoadSink",
         "evict_unready",
-        Fate::Rebuilt("each replica's collector says its own reset, under its own lead"),
+        EntryReplication::Rebuilt(
+            "each replica's collector says its own reset, under its own lead",
+        ),
     ),
-    ("LoadSink", "publish_due", Fate::Read),
-    ("LoadSink", "publish", Fate::Rebuilt(PUBLISHED)),
-    ("LoadSink", "wake_with", Fate::Read),
-    ("SignalSink", "signal_columns", Fate::Read),
-    ("SignalSink", "signal_value", Fate::Rebuilt(REPORTED)),
-    ("KvEventSink", "admit", Fate::Rebuilt(SUBSCRIPTION)),
-    ("KvEventSink", "admit_through", Fate::Rebuilt(SUBSCRIPTION)),
-    ("KvEventSink", "reconnected", Fate::Rebuilt(SUBSCRIPTION)),
-    ("KvEventSink", "resync", Fate::Rebuilt(SUBSCRIPTION)),
-    ("KvEventSink", "cursor", Fate::Read),
-    ("KvEventSink", "removed", Fate::Rebuilt(SUBSCRIPTION)),
-    ("KvEventSink", "block_size", Fate::Read),
-    ("KvEventSink", "set_block_size", Fate::Rebuilt(SUBSCRIPTION)),
+    ("LoadSink", "publish_due", EntryReplication::Read),
+    ("LoadSink", "publish", EntryReplication::Rebuilt(PUBLISHED)),
+    ("LoadSink", "wake_with", EntryReplication::Read),
+    ("SignalSink", "signal_columns", EntryReplication::Read),
+    (
+        "SignalSink",
+        "signal_value",
+        EntryReplication::Rebuilt(REPORTED),
+    ),
+    (
+        "KvEventSink",
+        "admit",
+        EntryReplication::Rebuilt(SUBSCRIPTION),
+    ),
+    (
+        "KvEventSink",
+        "admit_through",
+        EntryReplication::Rebuilt(SUBSCRIPTION),
+    ),
+    (
+        "KvEventSink",
+        "reconnected",
+        EntryReplication::Rebuilt(SUBSCRIPTION),
+    ),
+    (
+        "KvEventSink",
+        "resync",
+        EntryReplication::Rebuilt(SUBSCRIPTION),
+    ),
+    ("KvEventSink", "cursor", EntryReplication::Read),
+    (
+        "KvEventSink",
+        "removed",
+        EntryReplication::Rebuilt(SUBSCRIPTION),
+    ),
+    ("KvEventSink", "block_size", EntryReplication::Read),
+    (
+        "KvEventSink",
+        "set_block_size",
+        EntryReplication::Rebuilt(SUBSCRIPTION),
+    ),
     (
         "KvEventSink",
         "forget_block_size",
-        Fate::Rebuilt(SUBSCRIPTION),
+        EntryReplication::Rebuilt(SUBSCRIPTION),
     ),
-    ("ReservationStore", "window", Fate::Read),
-    ("ReservationStore", "try_reserve", Fate::NotYet(PINS)),
-    ("ReservationStore", "release", Fate::NotYet(PINS)),
-    ("ReservationStore", "held", Fate::Read),
-    ("SessionsStore", "pin", Fate::NotYet(PINS)),
-    ("SessionsStore", "pin_no_earlier", Fate::NotYet(PINS)),
-    ("SessionsStore", "lookup", Fate::Read),
-    ("SessionsStore", "unpin", Fate::NotYet(PINS)),
-    ("SessionsStore", "drop_workers", Fate::NotYet(PINS)),
-    ("SessionsStore", "expire", Fate::NotYet(PINS)),
-    ("SessionsStore", "merge", Fate::Rebuilt(HELLO)),
-    ("SessionsStore", "len", Fate::Read),
-    ("SessionsStore", "is_empty", Fate::Read),
-    ("LeasesStore", "term", Fate::Read),
+    ("ReservationStore", "window", EntryReplication::Read),
+    (
+        "ReservationStore",
+        "try_reserve",
+        EntryReplication::NotYet(PINS),
+    ),
+    (
+        "ReservationStore",
+        "release",
+        EntryReplication::NotYet(PINS),
+    ),
+    ("ReservationStore", "held", EntryReplication::Read),
+    ("SessionsStore", "pin", EntryReplication::NotYet(PINS)),
+    (
+        "SessionsStore",
+        "pin_no_earlier",
+        EntryReplication::NotYet(PINS),
+    ),
+    ("SessionsStore", "lookup", EntryReplication::Read),
+    ("SessionsStore", "unpin", EntryReplication::NotYet(PINS)),
+    (
+        "SessionsStore",
+        "drop_workers",
+        EntryReplication::NotYet(PINS),
+    ),
+    ("SessionsStore", "expire", EntryReplication::NotYet(PINS)),
+    ("SessionsStore", "merge", EntryReplication::Rebuilt(HELLO)),
+    ("SessionsStore", "len", EntryReplication::Read),
+    ("SessionsStore", "is_empty", EntryReplication::Read),
+    ("LeasesStore", "term", EntryReplication::Read),
     // The term is told to the journal: every later position is under it.
-    ("LeasesStore", "set_term", Fate::Journaled),
-    ("LeasesStore", "issue", Fate::NotYet(PINS)),
-    ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
-    ("LeasesStore", "issue_decode", Fate::NotYet(PINS)),
-    ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
-    ("LeasesStore", "completed", Fate::NotYet(PINS)),
-    ("LeasesStore", "released", Fate::NotYet(PINS)),
-    ("LeasesStore", "get", Fate::Read),
-    ("LeasesStore", "sides", Fate::Read),
-    ("LeasesStore", "expire", Fate::NotYet(PINS)),
-    ("LeasesStore", "restore", Fate::Rebuilt(HELLO)),
-    ("LeasesStore", "drop_gateways", Fate::NotYet(PINS)),
-    ("LeasesStore", "live", Fate::Read),
+    ("LeasesStore", "set_term", EntryReplication::Journaled),
+    ("LeasesStore", "issue", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "issue_pair", EntryReplication::NotYet(PINS)),
+    (
+        "LeasesStore",
+        "issue_decode",
+        EntryReplication::NotYet(PINS),
+    ),
+    (
+        "LeasesStore",
+        "dispatched",
+        EntryReplication::Rebuilt(DISPATCHED),
+    ),
+    ("LeasesStore", "completed", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "released", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "get", EntryReplication::Read),
+    ("LeasesStore", "sides", EntryReplication::Read),
+    ("LeasesStore", "expire", EntryReplication::NotYet(PINS)),
+    ("LeasesStore", "restore", EntryReplication::Rebuilt(HELLO)),
+    (
+        "LeasesStore",
+        "drop_gateways",
+        EntryReplication::NotYet(PINS),
+    ),
+    ("LeasesStore", "live", EntryReplication::Read),
     // The store type's own entries. A generation's apply is its one write.
-    ("MemoryStore", "new", Fate::Read),
-    ("MemoryStore", "with_publish_window", Fate::Read),
-    ("MemoryStore", "journaled", Fate::Read),
-    ("MemoryStore", "followed", Fate::Read),
-    ("MemoryStore", "cut", Fate::Read),
-    ("MemoryStore", "rows_serving", Fate::Read),
+    ("MemoryStore", "new", EntryReplication::Read),
+    ("MemoryStore", "with_publish_window", EntryReplication::Read),
+    ("MemoryStore", "journaled", EntryReplication::Read),
+    ("MemoryStore", "followed", EntryReplication::Read),
+    ("MemoryStore", "checkpoint", EntryReplication::Read),
+    ("MemoryStore", "rows_serving", EntryReplication::Read),
     (
         "MemoryStore",
         "restore_from",
-        Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
+        EntryReplication::Rebuilt(
+            "the journal starts again: a reader re-syncs from this store's own snapshot",
+        ),
     ),
     (
         "MemoryStore",
         "watch_from",
-        Fate::Rebuilt("a follower takes the worker rows from a watch snapshot"),
+        EntryReplication::Rebuilt("a follower takes the worker rows from a watch snapshot"),
     ),
     // The three doors for a followed write, one a kind of the leader's
     // events: each is the standby's side of a journaled write.
-    ("MemoryStore", "follow", Fate::Journaled),
-    ("MemoryStore", "follow_load", Fate::Journaled),
-    ("MemoryStore", "follow_term", Fate::Journaled),
+    ("MemoryStore", "follow", EntryReplication::Journaled),
+    ("MemoryStore", "follow_load", EntryReplication::Journaled),
+    ("MemoryStore", "follow_term", EntryReplication::Journaled),
     // The generation's number is journaled, one of the watched kinds. The
     // document it runs from is its door's to hold: whoever sends the event
     // joins the two, and a standby applies the document through its own
     // door under the leader's number.
-    ("MemoryStore", "apply", Fate::Journaled),
-    ("MemoryStore", "follow_generation", Fate::Journaled),
-    ("MemoryStore", "follow_generation_place", Fate::Journaled),
-    ("MemoryStore", "world", Fate::Read),
-    ("MemoryStore", "build_view", Fate::Read),
-    ("MemoryStore", "with_world", Fate::Read),
-    ("MemoryStore", "build_pair", Fate::Read),
-    ("MemoryStore", "build_encode_pair", Fate::Read),
-    ("MemoryStore", "deciding", Fate::Read),
-    ("MemoryStore", "micros", Fate::Read),
-    ("MemoryStore", "publish_now", Fate::Rebuilt(PUBLISHED)),
-    ("MemoryStore", "counts", Fate::Read),
-    ("MemoryStore", "overload_flips", Fate::Read),
-    ("MemoryStore", "outside_lists", Fate::Read),
-    ("MemoryStore", "publication_allocations", Fate::Read),
-    ("MemoryStore", "publications", Fate::Read),
-    ("MemoryStore", "membership_builds", Fate::Read),
-    ("MemoryStore", "resyncs", Fate::Read),
-    ("MemoryStore", "indexed_blocks", Fate::Read),
-    ("MemoryStore", "lane_counts", Fate::Read),
-    ("MemoryStore", "unindexed_rows", Fate::Read),
+    ("MemoryStore", "apply", EntryReplication::Journaled),
+    (
+        "MemoryStore",
+        "follow_generation",
+        EntryReplication::Journaled,
+    ),
+    (
+        "MemoryStore",
+        "follow_generation_place",
+        EntryReplication::Journaled,
+    ),
+    ("MemoryStore", "snapshot", EntryReplication::Read),
+    ("MemoryStore", "build_view", EntryReplication::Read),
+    ("MemoryStore", "with_snapshot", EntryReplication::Read),
+    ("MemoryStore", "build_pair", EntryReplication::Read),
+    ("MemoryStore", "build_encode_pair", EntryReplication::Read),
+    ("MemoryStore", "deciding", EntryReplication::Read),
+    ("MemoryStore", "prompt_hashes", EntryReplication::Read),
+    ("MemoryStore", "micros", EntryReplication::Read),
+    (
+        "MemoryStore",
+        "publish_now",
+        EntryReplication::Rebuilt(PUBLISHED),
+    ),
+    ("MemoryStore", "stats", EntryReplication::Read),
+    ("MemoryStore", "overload_flips", EntryReplication::Read),
+    ("MemoryStore", "outside_lists", EntryReplication::Read),
+    (
+        "MemoryStore",
+        "publication_allocations",
+        EntryReplication::Read,
+    ),
+    ("MemoryStore", "publications", EntryReplication::Read),
+    ("MemoryStore", "membership_builds", EntryReplication::Read),
+    ("MemoryStore", "resyncs", EntryReplication::Read),
+    ("MemoryStore", "indexed_blocks", EntryReplication::Read),
+    ("MemoryStore", "lane_counts", EntryReplication::Read),
+    ("MemoryStore", "unindexed_rows", EntryReplication::Read),
 ];
 
 #[cfg(test)]
@@ -272,7 +359,7 @@ mod tests {
     #[test]
     fn a_fate_that_names_a_source_names_one() {
         for (of, entry, fate) in ENTRIES {
-            if let Fate::Rebuilt(source) | Fate::NotYet(source) = fate {
+            if let EntryReplication::Rebuilt(source) | EntryReplication::NotYet(source) = fate {
                 assert!(!source.is_empty(), "{of}::{entry}");
             }
         }

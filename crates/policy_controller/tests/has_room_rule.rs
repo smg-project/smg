@@ -4,9 +4,15 @@
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 use smg_policy_controller::{
-    document::spec::{Capacity, FilterSpec, FilterStage, HasRoomParams},
-    Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, LoadRow, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, Side, SpecError, Target, WorkerId, API_VERSION,
+    document::{
+        Capacity, FilterSpec, FilterStage, HasRoomParams, PolicySpec, SpecError, API_VERSION,
+    },
+    engine::{
+        Candidate, Constraints, Decision, Engine, Health, LoadRow, PoolFacts, RequestFacts,
+        Scratch, Target, WorkerId,
+    },
+    stages::Lifecycle,
+    tracking::{Lease, Side},
 };
 
 const NOW: u64 = 1_000_000;

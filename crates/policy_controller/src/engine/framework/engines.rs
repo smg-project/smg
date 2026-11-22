@@ -14,10 +14,10 @@ use super::{combine, run_single, trace_ordered, Buffers, Engine, Profile, Set, D
 use crate::{
     engine::{
         decision::{Decision, Pick, Targets, MAX_TARGETS},
+        sticky_sessions::SessionVerdict,
         view::{Candidate, Constraints, Engines, PoolFacts, RequestFacts},
     },
-    sessions::SessionVerdict,
-    stages::builtins::{draw_best, target_of},
+    stages::pickers::{draw_best, target_of},
     Draw,
 };
 

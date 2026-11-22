@@ -103,6 +103,11 @@ const SLACK: Duration = Duration::from_secs(3);
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The delay of a mock that must never answer within a case.
 const FOREVER: Duration = Duration::from_secs(3_600);
+/// More chats than a rotation over two workers needs to start one on each:
+/// the bound of a case that sends chats until one starts on a given worker.
+/// Where a rotation starts is its policy's own: classic starts at the first
+/// worker registered, the policy engine at a drawn one.
+const CHATS: usize = 4;
 /// How often a queued engine's gate lets a call through: five calls at once
 /// put the last one well past the bound, with an answer every turn.
 const TURN: Duration = Duration::from_millis(1_200);
@@ -1450,6 +1455,9 @@ fn the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_
     let decode = Engine::new(Behaviour::Answer(Duration::from_millis(50)));
     let (silent_calls, healthy_calls, decode_calls) =
         (silent.clone(), healthy.clone(), decode.clone());
+    let reached = silent.clone();
+    let mut chats = 0;
+    let sent = &mut chats;
     let rendered = render_after(|| async move {
         let silent_port = start_mock_engine(silent).await;
         let healthy_port = start_mock_engine(healthy).await;
@@ -1463,13 +1471,22 @@ fn the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_
             RuntimeType::Vllm,
         )
         .await;
-        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
-        assert_eq!(status, http::StatusCode::OK, "{body}");
-        assert!(body.contains("data: [DONE]"), "{body}");
-        assert!(
-            elapsed < BOUND + SLACK,
-            "one bound on the silent prefill, then the answer: {elapsed:?}"
-        );
+        // Round robin: chats go out until one starts on the silent
+        // prefill. Each is answered within one bound.
+        while reached.calls() == 0 {
+            assert!(
+                *sent < CHATS,
+                "none of {CHATS} chats started on the silent prefill"
+            );
+            let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+            assert_eq!(status, http::StatusCode::OK, "{body}");
+            assert!(body.contains("data: [DONE]"), "{body}");
+            assert!(
+                elapsed < BOUND + SLACK,
+                "one bound on the silent prefill, then the answer: {elapsed:?}"
+            );
+            *sent += 1;
+        }
     });
     assert_eq!(
         silent_calls.calls(),
@@ -1478,13 +1495,13 @@ fn the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_
     );
     assert_eq!(
         healthy_calls.calls(),
-        1,
-        "the retry went to the other prefill"
+        chats,
+        "the retry went to the other prefill, as each chat before it"
     );
     assert_eq!(
         decode_calls.calls(),
-        1,
-        "the decode partner served the retry"
+        chats,
+        "the decode partner served the retry, as each chat before it"
     );
     assert_eq!(
         worker_errors(&rendered, "prefill", "timeout"),

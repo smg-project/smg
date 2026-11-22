@@ -10,15 +10,14 @@ use std::sync::{
 
 use super::*;
 use crate::{
-    document::{spec, spec::PolicySpec},
+    document::spec::{self, PolicySpec},
     engine::{
-        framework,
-        framework::PairTable,
+        framework::{self, PairTable},
         view::{Health, MediaCounts, Role, WorkerId},
+        Pick,
     },
     load::signals::{SignalCell, SignalCells, SignalColumn},
-    tracking::counts::tests::Lent,
-    Pick,
+    tracking::in_flight::tests::Lent,
 };
 
 /// The `epd` plan with every side taking the row that holds fewer requests.
@@ -1362,15 +1361,15 @@ fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
     }
     let bed = Bed::new();
     let cx = Constraints::default();
-    let holders = [crate::NamedHolder {
+    let holders = [crate::engine::AffinityHolder {
         row: 1,
         overlap_blocks: 8,
         predicted_blocks: 0,
     }];
     let named = RequestFacts {
-        named: Some(crate::NamedAffinity {
+        named: Some(crate::engine::AffinityRows {
             holders: &holders,
-            ..crate::NamedAffinity::default()
+            ..crate::engine::AffinityRows::default()
         }),
         ..bed.asked().0
     };

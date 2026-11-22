@@ -372,6 +372,10 @@ impl LoadBalancingPolicy for ManualPolicy {
         "manual"
     }
 
+    fn honors_routing_key(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

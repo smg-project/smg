@@ -44,9 +44,16 @@ fn a_jpeg_stored_sideways_is_decoded_upright_like_the_engine_loader() {
     // Orientation 6: rotate 90 degrees clockwise for display, so the
     // 4x2 picture is a 2x4 one with the red half on top.
     let bytes = jpeg_with_orientation(6);
-    let size = encoded_image_size(&bytes, None).expect("size");
+    let (size, orientation) = encoded_image_size(&bytes, None).expect("size");
     assert_eq!((size.width, size.height), (2, 4));
-    let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
+    // As a frame decodes: with the tag its header read found.
+    let img = decode_frame_bytes(
+        &bytes,
+        None,
+        TransparencyPolicy::KeepAlpha,
+        Some(orientation),
+    )
+    .expect("decode");
     assert_eq!(img.dimensions(), (2, 4));
     assert!(is_red(img.get_pixel(0, 0)) && is_red(img.get_pixel(1, 0)));
     assert!(is_blue(img.get_pixel(0, 3)) && is_blue(img.get_pixel(1, 3)));
@@ -56,7 +63,7 @@ fn a_jpeg_stored_sideways_is_decoded_upright_like_the_engine_loader() {
 fn a_mirrored_jpeg_keeps_its_size_and_swaps_its_halves() {
     // Orientation 2: flipped horizontally.
     let bytes = jpeg_with_orientation(2);
-    let size = encoded_image_size(&bytes, None).expect("size");
+    let (size, _) = encoded_image_size(&bytes, None).expect("size");
     assert_eq!((size.width, size.height), (4, 2));
     let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
     assert!(is_blue(img.get_pixel(0, 0)) && is_red(img.get_pixel(3, 0)));
@@ -79,6 +86,6 @@ fn an_upright_jpeg_and_a_png_are_left_alone() {
             .dimensions(),
         (4, 2)
     );
-    let size = encoded_image_size(&png, None).expect("size");
+    let (size, _) = encoded_image_size(&png, None).expect("size");
     assert_eq!((size.width, size.height), (4, 2));
 }

@@ -3800,7 +3800,7 @@ mod tests {
     use tiktoken_rs::CoreBPE;
     use tokenizers::utils::SysRegex;
 
-    use super::*;
+    use super::{super::tests::pseudo_random, *};
 
     const GPT2: &str =
         r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
@@ -4039,13 +4039,6 @@ mod tests {
     fn oracle_matches(pattern: &str, text: &str) -> Vec<(usize, usize)> {
         let re = SysRegex::new(pattern).expect("the engine compiles the pattern");
         re.find_iter(text).collect()
-    }
-
-    fn pseudo_random(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
     }
 
     fn random_text(state: &mut u64, len: usize) -> String {

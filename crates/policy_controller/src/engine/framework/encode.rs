@@ -5,7 +5,7 @@
 //!
 //! Which encoders hand to which prefill is the store's fact: every encoder
 //! and every prefill carries its encode class
-//! ([`store::encoding`](crate::store::encoding)), and an item is placed
+//! ([`store`](crate::store)), and an item is placed
 //! over the encoders of the chosen prefill's class. Three sentences rule
 //! the rest. The pair is picked among the prefills whose class holds an
 //! open encoder that takes the request's media. A refusal's name comes

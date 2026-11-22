@@ -1,5 +1,5 @@
 //! The controller's policy source and replica over the operators' door
-//! ([`SpecDoor`]).
+//! ([`DocumentManager`]).
 //!
 //! A replica that follows a leader has one writer at this door, the log
 //! ([`Generations::following`]): it runs each generation its leader applied,
@@ -13,8 +13,8 @@
 //! source's entry reads the replica's fence there, as a decision reads it
 //! ([`Generations::under`]): the source writes while its replica leads.
 //! A watch that read under a lead that has since ended cannot publish
-//! those bytes ([`Applied::Waits`]). A replica that has yet to lead applies
-//! nothing of its own.
+//! those bytes ([`ApplyOutcome::Waits`]). A replica that has yet to lead
+//! applies nothing of its own.
 //!
 //! A replica under a shared lease applies no document at its start
 //! ([`Generations::defer`]): the start passes its file's document, and it
@@ -71,18 +71,18 @@ use super::{
 #[cfg(test)]
 pub(crate) use crate::document::operator::Validate;
 pub(crate) use crate::document::operator::{
-    Applied, Format, SpecRejected, DRY_RUNS_WAITING, MAX_DOCUMENT_BYTES, WRITES_WAITING,
+    ApplyOutcome, Format, SpecRejected, DRY_RUNS_WAITING, MAX_DOCUMENT_BYTES, WRITES_WAITING,
 };
 use crate::{
     document::{
         operator::{
-            above, over_bound, Checked, DryRun, Enforced, Held, Line, SpecDoor,
-            Unanswered as DoorUnanswered,
+            above, over_bound, Checked, DocumentManager, DryRun, EnforceOutcome, EnforceRefused,
+            Held, Line,
         },
         spec::{AppliedSpec, Digest},
     },
     service::{elector::Fence, proto},
-    stages::catalog::Catalog,
+    stages::registry::StageRegistry,
     store::{MemoryStore, Position},
 };
 
@@ -127,8 +127,8 @@ const DIGEST_TEXT_LEN: usize = "sha256:".len() + 64;
 /// verdict, a read no document.
 #[derive(Debug)]
 pub(crate) enum Unanswered {
-    /// The door refused the call.
-    Door(DoorUnanswered),
+    /// The document manager refused the call.
+    Manager(EnforceRefused),
     /// As many dry runs wait their turn as may ([`DRY_RUNS_WAITING`]).
     Full,
     /// The pass's thread did not end.
@@ -146,15 +146,15 @@ pub(crate) enum Unanswered {
     },
 }
 
-impl From<DoorUnanswered> for Unanswered {
-    fn from(refused: DoorUnanswered) -> Self {
-        Self::Door(refused)
+impl From<EnforceRefused> for Unanswered {
+    fn from(refused: EnforceRefused) -> Self {
+        Self::Manager(refused)
     }
 }
 
 /// The controller's spec source, with its replica's admissions.
 pub(crate) struct Generations {
-    door: SpecDoor,
+    door: DocumentManager,
     /// The start's document of a replica under a shared lease, in its
     /// source's form, from the start that passed it until the replica's
     /// first lead applies it or refuses it, or a followed generation
@@ -184,16 +184,16 @@ pub(crate) struct Generations {
 }
 
 impl Deref for Generations {
-    type Target = SpecDoor;
+    type Target = DocumentManager;
 
-    fn deref(&self) -> &SpecDoor {
+    fn deref(&self) -> &DocumentManager {
         &self.door
     }
 }
 
 impl Generations {
-    pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<Catalog>) -> Self {
-        Self::over(SpecDoor::new(store, catalog, Vec::new()))
+    pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<StageRegistry>) -> Self {
+        Self::over(DocumentManager::new(store, catalog, Vec::new()))
     }
 
     /// [`Generations::new`] with the validator as its argument: a case
@@ -201,13 +201,18 @@ impl Generations {
     #[cfg(test)]
     pub(crate) fn validating(
         store: Arc<MemoryStore>,
-        catalog: Arc<Catalog>,
+        catalog: Arc<StageRegistry>,
         validate: Validate,
     ) -> Self {
-        Self::over(SpecDoor::validating(store, catalog, Vec::new(), validate))
+        Self::over(DocumentManager::validating(
+            store,
+            catalog,
+            Vec::new(),
+            validate,
+        ))
     }
 
-    fn over(door: SpecDoor) -> Self {
+    fn over(door: DocumentManager) -> Self {
         Self {
             door,
             deferred: Mutex::new(None),
@@ -223,8 +228,12 @@ impl Generations {
     /// the lead that shows now ([`Generations::apply_under`]). A refusal
     /// applies nothing and the running generation stays; what a refusal
     /// means is its source's to say: a start refuses to start, and a source
-    /// that keeps running counts it ([`SpecDoor::reject`]).
-    pub(crate) fn apply(&self, document: Vec<u8>, format: Format) -> Result<Applied, SpecRejected> {
+    /// that keeps running counts it ([`DocumentManager::reject`]).
+    pub(crate) fn apply(
+        &self,
+        document: Vec<u8>,
+        format: Format,
+    ) -> Result<ApplyOutcome, SpecRejected> {
         self.apply_under(self.lead(), document, format)
     }
 
@@ -238,7 +247,7 @@ impl Generations {
         lead: Option<Leading>,
         document: Vec<u8>,
         format: Format,
-    ) -> Result<Applied, SpecRejected> {
+    ) -> Result<ApplyOutcome, SpecRejected> {
         self.apply_where(lead, document, format, true, |_| None)
     }
 
@@ -260,13 +269,14 @@ impl Generations {
         document: Vec<u8>,
         format: Format,
         news: bool,
-        unread: impl Fn(u64) -> Option<Applied>,
-    ) -> Result<Applied, SpecRejected> {
+        unread: impl Fn(u64) -> Option<ApplyOutcome>,
+    ) -> Result<ApplyOutcome, SpecRejected> {
         self.door.apply_notifying(
             document,
             format,
             |standing| {
-                unread(standing).or_else(|| (!self.leads(lead)).then_some(Applied::Waits(standing)))
+                unread(standing)
+                    .or_else(|| (!self.leads(lead)).then_some(ApplyOutcome::Waits(standing)))
             },
             |store, spec| store.apply_admitted(spec, || self.leads(lead)),
             |passed| {
@@ -296,7 +306,7 @@ impl Generations {
         self.door.bind_store(dir, || self.deferred.lock().is_some())
     }
 
-    /// [`SpecDoor::dry_run`] off the runtime's workers, one at a time. A
+    /// [`DocumentManager::dry_run`] off the runtime's workers, one at a time. A
     /// document at the bound validates for tens of milliseconds and holds
     /// tens of mebibytes, and the size bound budgets one pass beside an
     /// apply's: a second call waits its turn, in the order the calls came,
@@ -334,7 +344,7 @@ impl Generations {
             .unwrap_or_else(|join| Err(Unanswered::Unended(join)))
     }
 
-    /// [`SpecDoor::enforce`] off the runtime's workers, behind the write
+    /// [`DocumentManager::enforce`] off the runtime's workers, behind the write
     /// calls that came first: an apply validates for tens of milliseconds
     /// and syncs its file. No more calls wait than [`WRITES_WAITING`]: one
     /// past them is refused. A document over the bound and a guard longer
@@ -345,7 +355,7 @@ impl Generations {
         expected: String,
         document: Vec<u8>,
         format: Format,
-    ) -> Result<Enforced, Unanswered> {
+    ) -> Result<EnforceOutcome, Unanswered> {
         if expected.len() > DIGEST_TEXT_LEN {
             // It names no digest: the guard refuses it.
             self.guarded(&expected)?;
@@ -353,7 +363,7 @@ impl Generations {
         if let Some(len) = over_bound(&document) {
             let standing = self.guarded(&expected)?;
             let ran = Err(self.reject(SpecRejected::TooLarge(len)));
-            return Ok(Enforced {
+            return Ok(EnforceOutcome {
                 standing,
                 ran,
                 needs: None,
@@ -366,12 +376,12 @@ impl Generations {
         .await
     }
 
-    /// [`SpecDoor::roll_back`] off the runtime's workers, in the write
+    /// [`DocumentManager::roll_back`] off the runtime's workers, in the write
     /// calls' turn ([`Generations::in_turn`]).
     pub(crate) async fn roll_back_in_turn(
         self: &Arc<Self>,
         wanted: u64,
-    ) -> Result<Enforced, Unanswered> {
+    ) -> Result<EnforceOutcome, Unanswered> {
         self.in_turn(move |door| door.roll_back(wanted).map_err(Into::into))
             .await
     }
@@ -386,8 +396,8 @@ impl Generations {
     /// until then.
     async fn in_turn(
         self: &Arc<Self>,
-        write: impl FnOnce(&Self) -> Result<Enforced, Unanswered> + Send + 'static,
-    ) -> Result<Enforced, Unanswered> {
+        write: impl FnOnce(&Self) -> Result<EnforceOutcome, Unanswered> + Send + 'static,
+    ) -> Result<EnforceOutcome, Unanswered> {
         let Some(turn) = self.write_turn.take().await else {
             return Err(Unanswered::Waiting);
         };
@@ -410,7 +420,7 @@ impl Generations {
     }
 
     /// `GetPolicySpec`: the standing generation's document from memory
-    /// ([`SpecDoor::document`]), or, under a spec store, a generation on
+    /// ([`DocumentManager::document`]), or, under a spec store, a generation on
     /// file, read from its file off the runtime's workers and answered with
     /// the digest and the time it is listed under. It takes no lock an
     /// apply holds: the read waits on no validation and on no file's sync.
@@ -424,14 +434,14 @@ impl Generations {
         };
         let generation = not_held.asked;
         let Some(read) = self.retained(generation) else {
-            return Err(DoorUnanswered::NotHeld(not_held).into());
+            return Err(EnforceRefused::NotHeld(not_held).into());
         };
         let read = tokio::task::spawn_blocking(read);
         let unread = |why: String| Unanswered::Unread { generation, why };
         match read.await {
             Ok(Ok(document)) => Ok(wire::spec_document(document)),
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(DoorUnanswered::NotHeld(self.not_held(generation)).into())
+                Err(EnforceRefused::NotHeld(self.not_held(generation)).into())
             }
             Ok(Err(error)) => Err(unread(error.to_string())),
             Err(join) => Err(unread(join.to_string())),
@@ -500,7 +510,7 @@ impl Generations {
         // start says so, where the start of a store with no source sheds
         // by the binding.
         if standing.0 == 0 {
-            self.store.world().spec().mark_document_awaited();
+            self.store.snapshot().spec().mark_document_awaited();
         }
         drop(applying);
         Ok(())
@@ -579,11 +589,11 @@ impl Generations {
         let Some((document, format)) = self.deferred.lock().clone() else {
             return;
         };
-        let followed = |standing| (standing != 0).then_some(Applied::Unchanged(standing));
+        let followed = |standing| (standing != 0).then_some(ApplyOutcome::Unchanged(standing));
         match self.apply_where(self.lead(), document, format, false, followed) {
             // No term shows, or the lead ended under the pass: it waits on.
-            Ok(Applied::Waits(_)) => return,
-            Ok(Applied::Generation(_) | Applied::Unchanged(_)) => {}
+            Ok(ApplyOutcome::Waits(_)) => return,
+            Ok(ApplyOutcome::Generation(_) | ApplyOutcome::Unchanged(_)) => {}
             Err(rejected) => {
                 self.reject(rejected);
             }
@@ -941,7 +951,7 @@ pub(crate) mod tests {
             operator::{
                 needs_rows,
                 test_support::{document_of, standing, stock},
-                Counts, NotHeld, OnFile,
+                ApplyCounts, NotHeld, OnFile,
             },
             spec::{PolicySpec, SpecError},
         },
@@ -979,7 +989,7 @@ pub(crate) mod tests {
     fn yaml(
         generations: &Generations,
         document: impl Into<Vec<u8>>,
-    ) -> Result<Applied, SpecRejected> {
+    ) -> Result<ApplyOutcome, SpecRejected> {
         generations.apply(document.into(), Format::Yaml)
     }
 
@@ -1091,7 +1101,7 @@ pub(crate) mod tests {
     fn stalling<G: Gated>(
         document: &PolicySpec,
         digest: Digest,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<AppliedSpec, SpecError> {
         let gate = G::gate();
@@ -1176,7 +1186,10 @@ pub(crate) mod tests {
     async fn a_guard_is_read_once_the_turn_comes() {
         gate!(Here);
         let (gate, generations) = (Here::gate(), gated::<Here>());
-        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        assert_eq!(
+            yaml(&generations, LEAST_LOAD),
+            Ok(ApplyOutcome::Generation(1))
+        );
         let (_, first) = generations.standing();
         let first = first.expect("a digest stands").to_string();
         let run = |expected: &str| {
@@ -1192,14 +1205,14 @@ pub(crate) mod tests {
             applied
         };
         let (unguarded, guarded, applied) = tokio::join!(run(""), run(&first), beside);
-        assert_eq!(applied, Ok(Applied::Generation(2)));
+        assert_eq!(applied, Ok(ApplyOutcome::Generation(2)));
         // The first call read generation 1 before its pass stood.
         let unguarded = unguarded.expect("a verdict");
         assert_eq!(unguarded.would_run.map(|(number, _)| number), Ok(2));
         assert!(
             matches!(
                 guarded,
-                Err(Unanswered::Door(DoorUnanswered::Guarded(2, Some(_))))
+                Err(Unanswered::Manager(EnforceRefused::Guarded(2, Some(_))))
             ),
             "{guarded:?}"
         );
@@ -1233,7 +1246,7 @@ pub(crate) mod tests {
         let guard = format!("sha256:{}", "0".repeat(64));
         let small = generations.dry_run(&guard, LEAST_LOAD.as_bytes(), Format::Yaml);
         assert!(
-            matches!(small, Err(DoorUnanswered::Guarded(0, None))),
+            matches!(small, Err(EnforceRefused::Guarded(0, None))),
             "{small:?}"
         );
         let document = vec![b'#'; usize::try_from(over).expect("the bound fits")];
@@ -1243,7 +1256,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 large,
-                Err(Unanswered::Door(DoorUnanswered::Guarded(0, None)))
+                Err(Unanswered::Manager(EnforceRefused::Guarded(0, None)))
             ),
             "{large:?}"
         );
@@ -1256,7 +1269,10 @@ pub(crate) mod tests {
     async fn a_guard_longer_than_a_digest_waits_on_no_pass() {
         gate!(Here);
         let (gate, generations) = (Here::gate(), gated::<Here>());
-        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        assert_eq!(
+            yaml(&generations, LEAST_LOAD),
+            Ok(ApplyOutcome::Generation(1))
+        );
         let (_, standing) = generations.standing();
         let standing = standing.expect("a digest stands").to_string();
         assert_eq!(standing.len(), DIGEST_TEXT_LEN);
@@ -1276,7 +1292,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 refused,
-                Err(Unanswered::Door(DoorUnanswered::Guarded(1, Some(_))))
+                Err(Unanswered::Manager(EnforceRefused::Guarded(1, Some(_))))
             ),
             "{refused:?}"
         );
@@ -1350,7 +1366,7 @@ pub(crate) mod tests {
                 .expect("no guard")
         };
         let number = |run: DryRun| run.would_run.map(|(number, _)| number);
-        let counts = |applied| Counts {
+        let counts = |applied| ApplyCounts {
             applied,
             rejected: 0,
         };
@@ -1372,9 +1388,12 @@ pub(crate) mod tests {
         assert_eq!(number(dry(LEAST_LOAD.as_bytes())), Ok(1), "not reserved");
         assert_eq!(standing(&store), (0, None));
         assert!(!generations.bound());
-        assert_eq!(generations.counts(), counts(0));
+        assert_eq!(generations.apply_counts(), counts(0));
 
-        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        assert_eq!(
+            yaml(&generations, LEAST_LOAD),
+            Ok(ApplyOutcome::Generation(1))
+        );
         let again = dry(LEAST_LOAD.as_bytes());
         assert_eq!(again.standing, (1, Some(digest)));
         assert_eq!(again.would_run, Ok((1, digest)), "the standing document");
@@ -1384,10 +1403,10 @@ pub(crate) mod tests {
         assert_eq!(number(dry(&with_line(RANDOM, 9))), Ok(9));
         assert_eq!(number(dry(&with_line(LEAST_LOAD, 9))), Ok(9));
 
-        assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Generation(2)));
+        assert_eq!(yaml(&generations, RANDOM), Ok(ApplyOutcome::Generation(2)));
         assert_eq!(number(dry(LEAST_LOAD.as_bytes())), Ok(3), "an apply landed");
         assert_eq!(standing(&store).0, 2);
-        assert_eq!(generations.counts(), counts(2));
+        assert_eq!(generations.apply_counts(), counts(2));
     }
 
     /// The read call answers the source's bytes, the comment included, with
@@ -1408,7 +1427,7 @@ pub(crate) mod tests {
         let written = format!("# routed by load\n{LEAST_LOAD}").into_bytes();
         assert_eq!(
             yaml(&generations, written.clone()),
-            Ok(Applied::Generation(1))
+            Ok(ApplyOutcome::Generation(1))
         );
         let (_, Some(digest)) = standing(&store) else {
             panic!("an applied generation has a digest");
@@ -1462,7 +1481,10 @@ pub(crate) mod tests {
         for size in [2 << 10, 64 << 10, bound - 128] {
             let (document, bindings) = document_of(size);
             let (_store, generations) = generations();
-            assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+            assert_eq!(
+                yaml(&generations, LEAST_LOAD),
+                Ok(ApplyOutcome::Generation(1))
+            );
             let mut micros = Vec::with_capacity(ROUNDS);
             let mut diff = 0;
             for _ in 0..ROUNDS {
@@ -1513,8 +1535,8 @@ pub(crate) mod tests {
             .ran
     }
 
-    fn applied(applied: u64, rejected: u64) -> Counts {
-        Counts { applied, rejected }
+    fn applied(applied: u64, rejected: u64) -> ApplyCounts {
+        ApplyCounts { applied, rejected }
     }
 
     /// An enforce under a spec store: the document is on file under the
@@ -1544,7 +1566,7 @@ pub(crate) mod tests {
         // does.
         let needs = first.needs.map(wire::needs_diff).expect("the diff");
         assert_eq!(needs.before, Some(proto::NeedsSummary::default()));
-        let runs = wire::needs_summary(needs_rows(store.world().spec().engine()));
+        let runs = wire::needs_summary(needs_rows(store.snapshot().spec().engine()));
         assert_eq!(needs.after, Some(runs));
 
         // A JSON document is on file under its own form.
@@ -1555,7 +1577,7 @@ pub(crate) mod tests {
         assert_eq!(second.ran.map(|(number, _)| number), Ok(2));
         let both = BTreeSet::from([name_of(1, "yaml"), name_of(2, "json")]);
         assert_eq!(names(dir.path()), both);
-        assert_eq!(generations.counts(), applied(2, 0));
+        assert_eq!(generations.apply_counts(), applied(2, 0));
     }
 
     #[test]
@@ -1572,7 +1594,7 @@ pub(crate) mod tests {
 
         // A file's document applied first is a source too.
         let (_store, filed) = self::generations();
-        assert_eq!(yaml(&filed, LEAST_LOAD), Ok(Applied::Generation(1)));
+        assert_eq!(yaml(&filed, LEAST_LOAD), Ok(ApplyOutcome::Generation(1)));
         assert_eq!(filed.bind_store(open()), Err(StoreRefused::SecondSource));
         assert!(!filed.writable());
 
@@ -1589,7 +1611,7 @@ pub(crate) mod tests {
             yaml(&generations, LEAST_LOAD),
             Err(SpecRejected::SecondSource)
         );
-        assert_eq!(generations.counts(), applied(0, 0));
+        assert_eq!(generations.apply_counts(), applied(0, 0));
     }
 
     /// The bound of what waits: no more write calls are let in than the
@@ -1642,12 +1664,12 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 guarded,
-                Err(Unanswered::Door(DoorUnanswered::Guarded(0, None)))
+                Err(Unanswered::Manager(EnforceRefused::Guarded(0, None)))
             ),
             "{guarded:?}"
         );
         assert!(names(dir.path()).is_empty());
-        assert_eq!(generations.counts(), applied(0, 1));
+        assert_eq!(generations.apply_counts(), applied(0, 1));
     }
 
     /// The status a snapshot tells of the spec. No source: none. A file:
@@ -1855,7 +1877,7 @@ pub(crate) mod tests {
         std::fs::remove_file(dir.path().join(name_of(1, "yaml"))).expect("the file goes");
 
         let gone = generations.read(1).await;
-        let Err(Unanswered::Door(DoorUnanswered::NotHeld(not_held))) = gone else {
+        let Err(Unanswered::Manager(EnforceRefused::NotHeld(not_held))) = gone else {
             panic!("generation 1 has no file: {gone:?}");
         };
         assert_eq!((not_held.asked, not_held.standing), (1, 2));
@@ -1907,7 +1929,7 @@ pub(crate) mod tests {
         let (dir, store, generations) = stored();
         let (_, first) = enforce(&generations, LEAST_LOAD).expect("it runs");
         let (_, second) = enforce(&generations, RANDOM).expect("it runs");
-        let ran = wire::needs_summary(needs_rows(store.world().spec().engine()));
+        let ran = wire::needs_summary(needs_rows(store.snapshot().spec().engine()));
 
         let back = generations.roll_back(1).expect("on file");
         assert_eq!(back.standing, (2, Some(second)));
@@ -1917,14 +1939,14 @@ pub(crate) mod tests {
         assert_eq!(on_file, LEAST_LOAD.as_bytes());
         let needs = back.needs.map(wire::needs_diff).expect("the diff");
         assert_eq!(needs.before, Some(ran));
-        let runs = wire::needs_summary(needs_rows(store.world().spec().engine()));
+        let runs = wire::needs_summary(needs_rows(store.snapshot().spec().engine()));
         assert_eq!(needs.after, Some(runs));
 
         for same in [3, 1] {
             assert_eq!(roll_back(&generations, same), Ok((3, first)));
         }
         assert_eq!(names(dir.path()).len(), 3);
-        assert_eq!(generations.counts(), applied(3, 0));
+        assert_eq!(generations.apply_counts(), applied(3, 0));
     }
 
     /// The read call answers a generation on file by its number, with the
@@ -1963,7 +1985,7 @@ pub(crate) mod tests {
             (2, second.to_string())
         );
 
-        let Err(Unanswered::Door(DoorUnanswered::NotHeld(not_held))) = generations.read(7).await
+        let Err(Unanswered::Manager(EnforceRefused::NotHeld(not_held))) = generations.read(7).await
         else {
             panic!("generation 7 is not on file");
         };
@@ -2019,7 +2041,7 @@ pub(crate) mod tests {
         let generations = Arc::new(generations);
         assert_eq!(standing(&store).0, 2);
 
-        let Err(Unanswered::Door(DoorUnanswered::NotHeld(not_held))) = generations.read(1).await
+        let Err(Unanswered::Manager(EnforceRefused::NotHeld(not_held))) = generations.read(1).await
         else {
             panic!("generation 1 is no document");
         };
@@ -2065,13 +2087,13 @@ pub(crate) mod tests {
             wire::spec_document(standby.document(0).expect("held")),
             wire::spec_document(leader.document(0).expect("held"))
         );
-        assert_eq!(standby.counts().applied, 1);
+        assert_eq!(standby.apply_counts().applied, 1);
         // Told again, it changes nothing.
         followed(&standby, &told).expect("the standing one again");
         // Nor does an event with no document, whatever its number.
         followed(&standby, &worker_wire::generation_told(9)).expect("no document");
         assert_eq!(standing(&store), standing(&led));
-        assert_eq!(standby.counts().applied, 1);
+        assert_eq!(standby.apply_counts().applied, 1);
     }
 
     #[test]
@@ -2137,7 +2159,7 @@ pub(crate) mod tests {
         let refused = followed(&standby, &proto::GenerationEvent::default());
         assert_eq!(refused.expect_err("no number").path, NUMBER);
         assert_eq!(standing(&store), own);
-        assert_eq!(standby.counts().applied, 1);
+        assert_eq!(standby.apply_counts().applied, 1);
         // The same event with a document that runs is followed.
         told.document = push(LEAST_LOAD, "yaml");
         followed(&standby, &told).expect("above its own");
@@ -2150,7 +2172,7 @@ pub(crate) mod tests {
         door.defer(RANDOM.into(), Format::Yaml)
             .expect("a valid document");
         assert_eq!(standing(&store), (0, None), "passed, not applied");
-        assert_eq!(door.counts().applied, 0);
+        assert_eq!(door.apply_counts().applied, 0);
         door.at_take();
         assert_eq!(standing(&store).0, 1);
         assert_eq!(door.document(0).expect("held").document, RANDOM.as_bytes());
@@ -2162,7 +2184,7 @@ pub(crate) mod tests {
         yaml(&door, LEAST_LOAD).expect("a changed document");
         door.at_take();
         assert_eq!(standing(&store).0, 2);
-        assert_eq!(door.counts().applied, 2);
+        assert_eq!(door.apply_counts().applied, 2);
     }
 
     #[test]
@@ -2175,7 +2197,7 @@ pub(crate) mod tests {
         assert!(!door.bound());
         door.at_take();
         assert_eq!(standing(&store), (0, None));
-        let counts = door.counts();
+        let counts = door.apply_counts();
         assert_eq!((counts.applied, counts.rejected), (0, 0));
     }
 
@@ -2200,7 +2222,7 @@ pub(crate) mod tests {
         // the file as it stands then.
         standby.at_take();
         assert_eq!(standing(&store).0, 1);
-        assert_eq!(standby.counts().applied, 1);
+        assert_eq!(standby.apply_counts().applied, 1);
         assert_eq!(
             standby.document(0).expect("held").document,
             RANDOM.as_bytes()
@@ -2225,16 +2247,16 @@ pub(crate) mod tests {
                 None
             },
         );
-        assert_eq!(applied, Ok(Applied::Generation(1)));
+        assert_eq!(applied, Ok(ApplyOutcome::Generation(1)));
         assert_eq!(
             REPLICA_NOTICES.with(|notices| notices.replace(Some(0))),
             Some(2)
         );
 
-        let door = SpecDoor::new(Arc::new(MemoryStore::new()), stock(), Vec::new());
+        let door = DocumentManager::new(Arc::new(MemoryStore::new()), stock(), Vec::new());
         assert_eq!(
             door.apply(RANDOM.into(), Format::Yaml),
-            Ok(Applied::Generation(1))
+            Ok(ApplyOutcome::Generation(1))
         );
         let held = door.document(0).expect("the start's document");
         let status = door.status().expect("the start's status");
@@ -2253,7 +2275,7 @@ pub(crate) mod tests {
     #[test]
     fn an_event_over_the_held_bytes_of_another_generation_is_not_the_standing_one() {
         let (store, door) = generations();
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Generation(1)));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Generation(1)));
         let mut next: PolicySpec = serde_yaml::from_str(LEAST_LOAD).expect("a document");
         next.generation = 2;
         store
@@ -2305,7 +2327,10 @@ pub(crate) mod tests {
             .expect("a valid document");
         followed(&moved, &sent(&leader)).expect("above no generation");
         assert!(!moved.source_stood(), "another document than the source's");
-        assert!(matches!(yaml(&moved, RANDOM), Ok(Applied::Unchanged(2))));
+        assert!(matches!(
+            yaml(&moved, RANDOM),
+            Ok(ApplyOutcome::Unchanged(2))
+        ));
         assert!(moved.source_stood(), "the source handed what stands");
     }
 
@@ -2345,7 +2370,7 @@ pub(crate) mod tests {
         door.shown(Some(b"{ no policy"), Format::Yaml);
         assert!(!door.source_stood(), "a file that does not parse");
         assert_eq!(standing(&store).0, 2, "a hand applies nothing");
-        assert_eq!(door.counts(), applied(2, 0));
+        assert_eq!(door.apply_counts(), applied(2, 0));
         assert_eq!(
             door.document(0).expect("held").document,
             LEAST_LOAD.as_bytes()
@@ -2405,21 +2430,21 @@ pub(crate) mod tests {
         let mut elector = election();
         door.under(elector.fence());
         assert!(!door.source_writes(), "it has not led yet");
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Waits(0)));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Waits(0)));
         assert_eq!(standing(&store), (0, None));
         elector.tick(Instant::now()).expect("a take");
         assert!(door.source_writes());
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Generation(1)));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Generation(1)));
         // Its lead ends: a look that was in flight applies nothing.
         assert!(elector.release().expect("a release"), "it held the lease");
-        assert_eq!(yaml(&door, LEAST_LOAD), Ok(Applied::Waits(1)));
+        assert_eq!(yaml(&door, LEAST_LOAD), Ok(ApplyOutcome::Waits(1)));
         assert_eq!(standing(&store).0, 1);
-        assert_eq!(door.counts(), applied(1, 0));
+        assert_eq!(door.apply_counts(), applied(1, 0));
         // One that does not run waits all the same: it is not read, so it
         // is not refused.
         let unrun = LEAST_LOAD.replace("healthy", "no-such-stage");
-        assert_eq!(yaml(&door, unrun), Ok(Applied::Waits(1)));
-        assert_eq!(door.counts(), applied(1, 0));
+        assert_eq!(yaml(&door, unrun), Ok(ApplyOutcome::Waits(1)));
+        assert_eq!(door.apply_counts(), applied(1, 0));
         let (_, leader) = generations();
         yaml(&leader, LEAST_LOAD).expect("a valid document");
         yaml(&leader, bound_to(1)).expect("a changed document");
@@ -2442,7 +2467,7 @@ pub(crate) mod tests {
         fn ending(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             let left = LEAD.with_borrow_mut(|lead| lead.as_mut().map(Elector::release));
@@ -2459,9 +2484,9 @@ pub(crate) mod tests {
         elector.tick(Instant::now()).expect("a take");
         assert!(door.source_writes());
         LEAD.set(Some(elector));
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Waits(0)));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Waits(0)));
         assert_eq!(standing(&store), (0, None));
-        assert_eq!(door.counts(), applied(0, 0));
+        assert_eq!(door.apply_counts(), applied(0, 0));
     }
 
     /// A leader's generation this replica cannot follow is passed once: the
@@ -2475,7 +2500,7 @@ pub(crate) mod tests {
         fn counting(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             PASSES.with(|passes| passes.set(passes.get() + 1));
@@ -2503,7 +2528,7 @@ pub(crate) mod tests {
     /// take's road or by a followed generation's.
     #[test]
     fn the_unbound_start_awaits_a_deferred_document_alone() {
-        let awaits = |store: &MemoryStore| store.world().spec().awaits_document();
+        let awaits = |store: &MemoryStore| store.snapshot().spec().awaits_document();
         let (store, alone) = generations();
         assert!(!awaits(&store), "no source");
         yaml(&alone, RANDOM).expect("a valid document");
@@ -2582,7 +2607,7 @@ pub(crate) mod tests {
         fn faulting_again(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             let passed = PASSES.with(|passes| passes.replace(passes.get() + 1));
@@ -2595,7 +2620,7 @@ pub(crate) mod tests {
             .expect("a valid document");
         door.at_take();
         assert_eq!(standing(&store), (0, None));
-        assert_eq!(door.counts(), applied(0, 1));
+        assert_eq!(door.apply_counts(), applied(0, 1));
         assert!(door.deferred.lock().is_none(), "the bytes are let go");
         assert!(door.bound(), "a source all the same");
     }
@@ -2633,9 +2658,9 @@ pub(crate) mod tests {
             drop((held, loads));
             entering.join().expect("the entry's thread")
         });
-        assert_eq!(outcome, Ok(Applied::Waits(0)));
+        assert_eq!(outcome, Ok(ApplyOutcome::Waits(0)));
         assert_eq!(standing(&store), (0, None));
-        assert_eq!(door.counts(), applied(0, 0));
+        assert_eq!(door.apply_counts(), applied(0, 0));
         assert!(door.held.lock().is_none(), "no bytes are kept");
     }
 
@@ -2668,7 +2693,7 @@ pub(crate) mod tests {
         fn ending(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             if PASSES.with(|passes| passes.replace(passes.get() + 1)) == 1 {
@@ -2686,9 +2711,9 @@ pub(crate) mod tests {
         door.under(elector.fence());
         elector.tick(Instant::now()).expect("a take");
         LEAD.set(Some(elector));
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Generation(1)));
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Waits(1)));
-        assert_eq!(door.counts(), applied(1, 0));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Generation(1)));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Waits(1)));
+        assert_eq!(door.apply_counts(), applied(1, 0));
     }
 
     /// Bytes read under one term are not applied under the next: an entry
@@ -2704,7 +2729,7 @@ pub(crate) mod tests {
         fn retaking(
             document: &PolicySpec,
             digest: Digest,
-            catalog: &Catalog,
+            catalog: &StageRegistry,
             denied_headers: &[&str],
         ) -> Result<AppliedSpec, SpecError> {
             if PASSES.with(|passes| passes.replace(passes.get() + 1)) == 0 {
@@ -2723,11 +2748,11 @@ pub(crate) mod tests {
         elector.tick(Instant::now()).expect("a take");
         assert_eq!(door.lead(), Some(Leading::Term(1)));
         LEAD.set(Some(elector));
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Waits(0)));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Waits(0)));
         assert_eq!(standing(&store), (0, None));
         assert_eq!(door.lead(), Some(Leading::Term(2)), "it leads again");
         // Read again under the term that shows now, the bytes are applied.
-        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Generation(1)));
-        assert_eq!(door.counts(), applied(1, 0));
+        assert_eq!(yaml(&door, RANDOM), Ok(ApplyOutcome::Generation(1)));
+        assert_eq!(door.apply_counts(), applied(1, 0));
     }
 }

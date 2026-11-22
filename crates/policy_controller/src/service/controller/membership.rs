@@ -42,7 +42,7 @@
 //! would be the engine twice. A build without the worker host lays no
 //! ranks and refuses a width above one.
 //!
-//! A row has one maker ([`Maker`]), the control call or provider that
+//! A row has one maker ([`Registrant`]), the control call or provider that
 //! registered it. A registration keeps the maker while the URL stands.
 //! Wire upserts, replacements, patches and removals check the whole maker
 //! before checking the revision. An add is refused whenever the row stands.
@@ -83,17 +83,18 @@ use crate::{
         replication::Log,
     },
     store::{
-        membership::{self, life},
-        HealthSink, Kinds, Laid, Maker, MemoryStore, Position, WorkerRow, WorkerStatus,
+        membership::{self, life, WorkerFactsChange},
+        HealthSink, JournalKinds, MemoryStore, Position, Registrant, WorkerRow, WorkerStatus,
         WorkersStore,
     },
 };
 #[cfg(feature = "worker-host")]
 use crate::{
-    store::{membership::Past, WorkerFacts},
+    store::{membership::FactPastBound, WorkerFacts},
     worker_host::{
-        drain, lay, lay_one, lay_ready, refresh, stated, stating, take, Expect, Membership, Over,
-        Ready, Refused as HostRefused, Remover, Standing, Stated, Turn, Wrote,
+        drain, lay, lay_one, lay_ready, refresh, stated, stating, take, MembershipWriteOutcome,
+        MembershipWriteRefused, MembershipWriter, Over, Precondition, Ready, Remover, RowRevision,
+        Stated, Turn,
     },
 };
 
@@ -102,8 +103,8 @@ use crate::{
 const LEADS_NO_TERM: &str =
     "this replica's store does not lead the term the call was admitted under";
 
-/// The door over one store.
-pub(crate) struct Door {
+/// The control calls that write worker membership, over one store.
+pub(crate) struct MembershipCalls {
     store: Arc<MemoryStore>,
     /// Where this run's count of lives starts: below 2^39, drawn once.
     base: u64,
@@ -137,7 +138,7 @@ fn moved() -> Status {
 /// row's maker by its provider, never by its key, and never the URL. A
 /// caller of that provider under another key is told so: where a new worker
 /// took an address, its provider takes the old one away by the old key.
-fn made_by(row: &WorkerRow, caller: &Maker) -> Result<(), Status> {
+fn made_by(row: &WorkerRow, caller: &Registrant) -> Result<(), Status> {
     row.made_by(caller)
         .map_err(|not| Status::permission_denied(not.to_string()))
 }
@@ -148,7 +149,7 @@ const REGISTER: &str = "RegisterWorker";
 const PATCH: &str = "PatchWorker";
 const DEREGISTER: &str = "DeregisterWorker";
 
-impl Door {
+impl MembershipCalls {
     /// The door over `store` and the log it journals to. The count of lives
     /// starts at a draw for this run.
     pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>) -> Self {
@@ -169,7 +170,7 @@ impl Door {
     /// The log's place: read after a call's write, that write's own or one
     /// past it.
     fn place(&self) -> Position {
-        self.log.head(Kinds::Watched)
+        self.log.head(JournalKinds::Watched)
     }
 
     /// The number of the life a registration makes now, under `admitted`,
@@ -239,7 +240,7 @@ impl Door {
         request: &proto::RegisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         self.call(REGISTER, by, leading, |term| {
-            self.upsert(by, &Maker::Control, term, request)
+            self.upsert(by, &Registrant::Control, term, request)
         })
     }
 
@@ -247,7 +248,7 @@ impl Door {
     fn upsert(
         &self,
         by: &Principal,
-        maker: &Maker,
+        maker: &Registrant,
         admitted: u64,
         request: &proto::RegisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
@@ -323,19 +324,19 @@ impl Door {
                 // make the row is told so, and never that it stands unmoved.
                 made_by(&row, maker)?;
                 let laid = if mode == Mode::Replace {
-                    Laid::Another
+                    WorkerFactsChange::Another
                 } else {
-                    row.laid(&facts)
+                    row.compare_new_facts(&facts)
                 };
                 match laid {
-                    Laid::Unmoved => {
+                    WorkerFactsChange::Unmoved => {
                         let epoch = self.store.epoch();
                         let at = self.place();
                         let unmoved = worker_wire::relabelled(&row);
                         return Ok(told(REGISTER, by, unmoved, false, epoch, at));
                     }
-                    Laid::InPlace => {}
-                    Laid::Another => facts.incarnation = self.next_life(admitted)?,
+                    WorkerFactsChange::InPlace => {}
+                    WorkerFactsChange::Another => facts.incarnation = self.next_life(admitted)?,
                 }
                 Some(row)
             }
@@ -374,7 +375,7 @@ impl Door {
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         self.call(PATCH, by, leading, |_| {
-            self.relabel(by, &Maker::Control, request)
+            self.relabel(by, &Registrant::Control, request)
         })
     }
 
@@ -382,7 +383,7 @@ impl Door {
     fn relabel(
         &self,
         by: &Principal,
-        maker: &Maker,
+        maker: &Registrant,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(maker, request.worker_id, request.revision)?;
@@ -422,7 +423,7 @@ impl Door {
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         self.call(DEREGISTER, by, leading, |_| {
-            self.remove(by, &Maker::Control, request)
+            self.remove(by, &Registrant::Control, request)
         })
     }
 
@@ -431,7 +432,7 @@ impl Door {
     fn remove(
         &self,
         by: &Principal,
-        maker: &Maker,
+        maker: &Registrant,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(maker, request.worker_id, request.revision)?;
@@ -457,7 +458,7 @@ impl Door {
     /// The row under `id` when `maker` made it and `revision` is the one it
     /// stands at. The maker is tested first: a caller that did not make the
     /// row is told so whatever revision it read.
-    fn guarded(&self, maker: &Maker, id: u64, revision: u64) -> Result<WorkerRow, Status> {
+    fn guarded(&self, maker: &Registrant, id: u64, revision: u64) -> Result<WorkerRow, Status> {
         let row = self
             .store
             .get(WorkerId(id))
@@ -499,30 +500,38 @@ const AS_RANKS: &str =
 
 /// The host door's refusal as a call's answer and an audit line's words.
 #[cfg(feature = "worker-host")]
-fn refused(refusal: &HostRefused) -> Status {
+fn refused(refusal: &MembershipWriteRefused) -> Status {
     match refusal {
-        HostRefused::NotMaker(why) => Status::permission_denied(why.as_str()),
-        HostRefused::Past(past) => Status::invalid_argument(format!("{}: {}", past.fact, past.why)),
-        HostRefused::Absent => absent(),
-        HostRefused::NotLeading(why) => Status::unavailable(why.as_str()),
-        HostRefused::Moved => moved(),
-        HostRefused::Stands => Status::already_exists("a worker is registered under the URL"),
-        HostRefused::Draining => Status::failed_precondition(DRAINING),
-        HostRefused::OutOfScope => Status::permission_denied(HostRefused::OUT_OF_SCOPE),
-        HostRefused::NotLabelsAlone => Status::permission_denied(HostRefused::NOT_LABELS_ALONE),
+        MembershipWriteRefused::NotRegistrant(why) => Status::permission_denied(why.as_str()),
+        MembershipWriteRefused::Past(past) => {
+            Status::invalid_argument(format!("{}: {}", past.fact, past.why))
+        }
+        MembershipWriteRefused::Absent => absent(),
+        MembershipWriteRefused::NotLeading(why) => Status::unavailable(why.as_str()),
+        MembershipWriteRefused::Moved => moved(),
+        MembershipWriteRefused::Stands => {
+            Status::already_exists("a worker is registered under the URL")
+        }
+        MembershipWriteRefused::Draining => Status::failed_precondition(DRAINING),
+        MembershipWriteRefused::OutOfScope => {
+            Status::permission_denied(MembershipWriteRefused::OUT_OF_SCOPE)
+        }
+        MembershipWriteRefused::NotLabelsAlone => {
+            Status::permission_denied(MembershipWriteRefused::NOT_LABELS_ALONE)
+        }
     }
 }
 
 /// What a write made of its row, as its audit line names it, and the row.
 #[cfg(feature = "worker-host")]
-fn made(wrote: Wrote) -> (&'static str, WorkerId) {
+fn made(wrote: MembershipWriteOutcome) -> (&'static str, WorkerId) {
     match wrote {
-        Wrote::Registered(id) => ("registered", id),
-        Wrote::InPlace(id) => ("relabelled", id),
-        Wrote::Another { new, .. } => ("replaced", new),
-        Wrote::Unmoved(id) => ("nothing", id),
-        Wrote::Draining(id) => ("status", id),
-        Wrote::Removed(id) => ("removed", id),
+        MembershipWriteOutcome::Registered(id) => ("registered", id),
+        MembershipWriteOutcome::InPlace(id) => ("relabelled", id),
+        MembershipWriteOutcome::Another { new, .. } => ("replaced", new),
+        MembershipWriteOutcome::Unmoved(id) => ("nothing", id),
+        MembershipWriteOutcome::Draining(id) => ("status", id),
+        MembershipWriteOutcome::Removed(id) => ("removed", id),
     }
 }
 
@@ -532,7 +541,7 @@ fn made(wrote: Wrote) -> (&'static str, WorkerId) {
 /// first write leaves the lines of the writes that stand.
 #[cfg(feature = "worker-host")]
 struct CallTurn<'a> {
-    door: &'a Door,
+    door: &'a MembershipCalls,
     by: &'a Principal,
     term: u64,
     laid: RefCell<Vec<WorkerRow>>,
@@ -544,20 +553,20 @@ impl Turn for CallTurn<'_> {
         &self.door.store
     }
 
-    fn check_term(&self) -> Result<(), HostRefused> {
+    fn check_term(&self) -> Result<(), MembershipWriteRefused> {
         self.door
             .check_term(self.term)
-            .map_err(|status| HostRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
-    fn life(&self) -> Result<u64, HostRefused> {
+    fn life(&self) -> Result<u64, MembershipWriteRefused> {
         self.door
             .next_life(self.term)
-            .map_err(|status| HostRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
     /// The call's own rules spoke where each rank's facts were read.
-    fn room(&self, _: &WorkerFacts, _: &Maker) -> Result<(), HostRefused> {
+    fn room(&self, _: &WorkerFacts, _: &Registrant) -> Result<(), MembershipWriteRefused> {
         Ok(())
     }
 
@@ -565,7 +574,7 @@ impl Turn for CallTurn<'_> {
         self.laid.borrow_mut().push(row.clone());
     }
 
-    fn told(&self, wrote: Wrote) {
+    fn told(&self, wrote: MembershipWriteOutcome) {
         let (made, worker) = made(wrote);
         let (epoch, at) = (self.door.store.epoch(), self.door.place());
         audit_write(REGISTER, self.by, worker.0, made, epoch, at, None);
@@ -573,7 +582,7 @@ impl Turn for CallTurn<'_> {
 }
 
 #[cfg(feature = "worker-host")]
-impl Door {
+impl MembershipCalls {
     /// The write of a registration that states more than one rank, in the
     /// door's turn, from `maker`. Each rank's row is stated by the call's
     /// own rules, a rank at a time. The group's rule, the rows that leave
@@ -586,7 +595,7 @@ impl Door {
     fn upsert_ranks(
         &self,
         by: &Principal,
-        maker: &Maker,
+        maker: &Registrant,
         admitted: u64,
         request: &proto::RegisterWorkerRequest,
         spec: &proto::WorkerSpec,
@@ -614,13 +623,13 @@ impl Door {
                 (_, None) => None,
                 // An add asks its maker of no row: the group's rule says
                 // which standing ranks are the same add's.
-                (Mode::Add, Some(row)) => Some((row.id, row.laid(&facts))),
+                (Mode::Add, Some(row)) => Some((row.id, row.compare_new_facts(&facts))),
                 (mode, Some(row)) => {
                     made_by(row, maker)?;
                     let laid = if mode == Mode::Replace {
-                        Laid::Another
+                        WorkerFactsChange::Another
                     } else {
-                        row.laid(&facts)
+                        row.compare_new_facts(&facts)
                     };
                     Some((row.id, laid))
                 }
@@ -642,7 +651,7 @@ impl Door {
             // An add refused where a rank it states stands names that row,
             // as a call of one row does.
             match (&refusal, stood.iter().flatten().next()) {
-                (HostRefused::Stands, Some(row)) => stands(row),
+                (MembershipWriteRefused::Stands, Some(row)) => stands(row),
                 _ => refused(&refusal),
             }
         })?;
@@ -652,15 +661,15 @@ impl Door {
         for (rank, wrote) in wrote.into_iter().enumerate() {
             let old = stood.get(rank).and_then(Option::as_ref);
             let event = match wrote {
-                Wrote::Registered(_) => {
+                MembershipWriteOutcome::Registered(_) => {
                     let row = self.answered(laid.next(), request)?;
                     worker_wire::registered(&row)
                 }
-                Wrote::InPlace(_) => {
+                MembershipWriteOutcome::InPlace(_) => {
                     let row = self.answered(laid.next(), request)?;
                     worker_wire::relabelled(&row)
                 }
-                Wrote::Another { .. } => {
+                MembershipWriteOutcome::Another { .. } => {
                     // A fresh row is pending: any other status came over
                     // from the old life, read before a connect signal.
                     let written = laid.next().ok_or_else(moved)?;
@@ -668,12 +677,14 @@ impl Door {
                     let row = self.answered(Some(written), request)?;
                     worker_wire::replaced(old.ok_or_else(moved)?, &row, carried)
                 }
-                Wrote::Unmoved(_) => worker_wire::relabelled(old.ok_or_else(moved)?),
-                Wrote::Removed(id) => {
+                MembershipWriteOutcome::Unmoved(_) => {
+                    worker_wire::relabelled(old.ok_or_else(moved)?)
+                }
+                MembershipWriteOutcome::Removed(id) => {
                     let last = before.iter().find(|row| row.id == id);
                     worker_wire::removed(last.ok_or_else(moved)?)
                 }
-                Wrote::Draining(_) => return Err(moved()),
+                MembershipWriteOutcome::Draining(_) => return Err(moved()),
             };
             rows.extend(worker_wire::rank_row(event));
         }
@@ -701,11 +712,12 @@ impl Door {
     }
 }
 
-/// The host's door on a replica, sharing the turn of its control calls.
+/// A controller replica's own membership writer: the same calls for the
+/// program's own writers, sharing the turn of its control calls.
 #[cfg(feature = "worker-host")]
 #[cfg_attr(not(test), expect(dead_code, reason = "the host owns the door"))]
-pub(crate) struct Hosted {
-    door: Arc<Door>,
+pub(crate) struct ReplicaMembershipWriter {
+    door: Arc<MembershipCalls>,
     by: Principal,
     leading: Box<dyn Fn() -> Result<u64, Status> + Send + Sync>,
 }
@@ -715,13 +727,13 @@ pub(crate) struct Hosted {
     not(test),
     expect(dead_code, reason = "the host supplies the principal and fence")
 )]
-impl Hosted {
+impl ReplicaMembershipWriter {
     const REGISTRATION: &str = "worker registration";
 
     /// Open the host's door with the principal its calls name and the
     /// replica's read of the leading term.
     pub(crate) fn new(
-        door: Arc<Door>,
+        door: Arc<MembershipCalls>,
         by: Principal,
         leading: impl Fn() -> Result<u64, Status> + Send + Sync + 'static,
     ) -> Self {
@@ -736,15 +748,17 @@ impl Hosted {
         &self,
         call: &'static str,
         asker: Option<&str>,
-        write: impl FnOnce(u64) -> Result<T, HostRefused>,
-    ) -> Result<T, HostRefused> {
+        write: impl FnOnce(u64) -> Result<T, MembershipWriteRefused>,
+    ) -> Result<T, MembershipWriteRefused> {
         let turn = self.door.turn.lock();
         let term = match (self.leading)() {
             Ok(term) => term,
             Err(status) => {
                 drop(turn);
                 audit_refusal(call, &self.by, status.code(), status.message(), asker);
-                return Err(HostRefused::NotLeading(status.message().to_owned()));
+                return Err(MembershipWriteRefused::NotLeading(
+                    status.message().to_owned(),
+                ));
             }
         };
         match write(term) {
@@ -762,16 +776,16 @@ impl Hosted {
     /// turn and under the term it reads there.
     fn rows(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         rows: &[Stated<'_>],
-    ) -> Result<Vec<Wrote>, HostRefused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         self.call(Self::REGISTRATION, None, |term| {
-            lay(&HostedTurn { host: self, term }, maker, expect, rows)
+            lay(&ReplicaTurn { host: self, term }, maker, expect, rows)
         })
     }
 
-    fn audit(&self, call: &'static str, wrote: Wrote, asker: Option<&str>) {
+    fn audit(&self, call: &'static str, wrote: MembershipWriteOutcome, asker: Option<&str>) {
         let (made, worker) = made(wrote);
         audit_write(
             call,
@@ -788,11 +802,11 @@ impl Hosted {
         &self,
         call: &'static str,
         by: Remover<'_>,
-        write: impl FnOnce() -> Result<Wrote, HostRefused>,
-    ) -> Result<Wrote, HostRefused> {
+        write: impl FnOnce() -> Result<MembershipWriteOutcome, MembershipWriteRefused>,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         let asker = Some(match by {
-            Remover::Maker(Maker::Control) => "control call",
-            Remover::Maker(Maker::Provider(provider)) => provider.provider(),
+            Remover::Registrant(Registrant::Control) => "control call",
+            Remover::Registrant(Registrant::Provider(provider)) => provider.provider(),
             Remover::Provider(name) => name,
             Remover::Health(_) => "health",
         });
@@ -807,80 +821,91 @@ impl Hosted {
     not(test),
     expect(dead_code, reason = "the host reads the term for each registration")
 )]
-struct HostedTurn<'a> {
-    host: &'a Hosted,
+struct ReplicaTurn<'a> {
+    host: &'a ReplicaMembershipWriter,
     term: u64,
 }
 
 #[cfg(feature = "worker-host")]
-impl Turn for HostedTurn<'_> {
+impl Turn for ReplicaTurn<'_> {
     fn store(&self) -> &MemoryStore {
         &self.host.door.store
     }
 
-    fn check_term(&self) -> Result<(), HostRefused> {
+    fn check_term(&self) -> Result<(), MembershipWriteRefused> {
         self.host
             .door
             .check_term(self.term)
-            .map_err(|status| HostRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
-    fn life(&self) -> Result<u64, HostRefused> {
+    fn life(&self) -> Result<u64, MembershipWriteRefused> {
         self.host
             .door
             .next_life(self.term)
-            .map_err(|status| HostRefused::NotLeading(status.message().to_owned()))
+            .map_err(|status| MembershipWriteRefused::NotLeading(status.message().to_owned()))
     }
 
-    fn room(&self, facts: &WorkerFacts, maker: &Maker) -> Result<(), HostRefused> {
+    fn room(&self, facts: &WorkerFacts, maker: &Registrant) -> Result<(), MembershipWriteRefused> {
         worker_wire::wire_reach(facts.wire_modes, facts.reachable_from, "row.wire")
             .and_then(|()| worker_wire::carried(facts))
             .and_then(|()| worker_wire::room(facts, &facts.labels, maker, "row"))
             .map_err(|refusal| {
-                HostRefused::Past(Past {
+                MembershipWriteRefused::Past(FactPastBound {
                     fact: refusal.path,
                     why: refusal.why,
                 })
             })
     }
 
-    fn told(&self, wrote: Wrote) {
-        self.host.audit(Hosted::REGISTRATION, wrote, None);
+    fn told(&self, wrote: MembershipWriteOutcome) {
+        self.host
+            .audit(ReplicaMembershipWriter::REGISTRATION, wrote, None);
     }
 }
 
 #[cfg(feature = "worker-host")]
-impl Membership for Hosted {
+impl MembershipWriter for ReplicaMembershipWriter {
     fn found(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         url: &str,
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
-    ) -> Result<Wrote, HostRefused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.call(Self::REGISTRATION, None, |term| {
-            lay_one(&HostedTurn { host: self, term }, maker, expect, url, state)
+            lay_one(&ReplicaTurn { host: self, term }, maker, expect, url, state)
         })
     }
 
     // The controller builds each object from its row: the facts alone.
     fn found_rows(
         &self,
-        maker: &Maker,
-        expect: Expect,
+        maker: &Registrant,
+        expect: Precondition,
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
-    ) -> Result<Vec<Wrote>, HostRefused> {
+    ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
         stating(built, over, stated, |rows| self.rows(maker, expect, rows))
     }
 
-    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, HostRefused> {
+    fn drained(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: RowRevision,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.removal("worker drain", by, || {
             drain(&self.door.store, by, url, seen)
         })
     }
 
-    fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, HostRefused> {
+    fn gone(
+        &self,
+        by: Remover<'_>,
+        url: &str,
+        seen: RowRevision,
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         self.removal("worker removal", by, || {
             take(&self.door.store, by, url, seen)
         })
@@ -891,14 +916,14 @@ impl Membership for Hosted {
     // refuses a refresh that states one.
     fn refreshed(
         &self,
-        seen: Standing,
+        seen: RowRevision,
         built: &Arc<dyn Worker>,
         _: &Arc<dyn Worker>,
-    ) -> Result<Wrote, HostRefused> {
+    ) -> Result<MembershipWriteOutcome, MembershipWriteRefused> {
         const CALL: &str = "worker label refresh";
         self.call(CALL, None, |term| {
             refresh(
-                &HostedTurn { host: self, term },
+                &ReplicaTurn { host: self, term },
                 seen,
                 built.as_ref(),
                 stated,
@@ -982,8 +1007,8 @@ pub(crate) mod tests {
     use tonic::{Code, Status};
 
     #[cfg(feature = "worker-host")]
-    use super::Hosted;
-    use super::{Door, Position};
+    use super::ReplicaMembershipWriter;
+    use super::{MembershipCalls, Position};
     #[cfg(feature = "worker-host")]
     use crate::service::replication;
     use crate::{
@@ -996,7 +1021,7 @@ pub(crate) mod tests {
             },
             proto::{self, register_worker_request::Mode, worker_event::Event},
         },
-        store::{self, identity, Maker, MemoryStore, WorkerStatus, WorkersStore},
+        store::{self, identity, MemoryStore, Registrant, WorkerStatus, WorkersStore},
     };
     #[cfg(feature = "worker-host")]
     use crate::{
@@ -1004,8 +1029,9 @@ pub(crate) mod tests {
         store::{GatewayId, Reachability, WorkerFacts, WorkerRow},
         worker_host::{
             check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-            check_one_row, check_provider, check_rank_rows, check_refresh, Expect, FindOne,
-            Membership, Refused, Remover, Rows, Standing, Stated, StoreDoor, Wrote,
+            check_one_row, check_provider, check_rank_rows, check_refresh, FindOne,
+            MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Precondition,
+            Remover, RowRevision, Rows, Stated, StoreMembershipWriter,
         },
     };
 
@@ -1032,15 +1058,18 @@ pub(crate) mod tests {
     /// A door over a journaled store that stands in [`TERM`], its count
     /// starting at zero so a case's table reads [`life`]: the term's start
     /// is the log's first place, so a case's first write is its second.
-    fn door() -> (Arc<MemoryStore>, Door) {
+    fn door() -> (Arc<MemoryStore>, MembershipCalls) {
         door_in(TERM)
     }
 
     /// The same under another term.
-    fn door_in(term: u64) -> (Arc<MemoryStore>, Door) {
+    fn door_in(term: u64) -> (Arc<MemoryStore>, MembershipCalls) {
         let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         store::LeasesStore::set_term(store.as_ref(), term);
-        (Arc::clone(&store), Door::based(store, feed.log, 0))
+        (
+            Arc::clone(&store),
+            MembershipCalls::based(store, feed.log, 0),
+        )
     }
 
     /// A life's number at a door whose count starts at zero.
@@ -1827,7 +1856,7 @@ pub(crate) mod tests {
             self.log.carries_loads()
         }
 
-        fn head(&self, kinds: store::Kinds) -> Position {
+        fn head(&self, kinds: store::JournalKinds) -> Position {
             self.log.head(kinds)
         }
 
@@ -1864,9 +1893,9 @@ pub(crate) mod tests {
             log: Arc::clone(&feed.log),
             holds: AtomicUsize::new(0),
         });
-        let store = Arc::new(MemoryStore::journaled(journal).with_deciders(1));
+        let store = Arc::new(MemoryStore::journaled(journal).with_decision_slots(1));
         store::LeasesStore::set_term(store.as_ref(), TERM);
-        let door = Door::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        let door = MembershipCalls::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
 
         let refused = door
             .register(&operator(), under(TERM), &ask(wide(URL, 2), Mode::Add))
@@ -1894,16 +1923,16 @@ pub(crate) mod tests {
     /// A door whose journal loses the lead when told, with `width` ranks of
     /// [`URL`] registered under a lead that holds.
     #[cfg(feature = "worker-host")]
-    fn losing(width: u32) -> (Arc<MemoryStore>, Door, Arc<LosesTheLead>) {
+    fn losing(width: u32) -> (Arc<MemoryStore>, MembershipCalls, Arc<LosesTheLead>) {
         let (_, feed) = journaled_from(&LeasePlace::Process, 0);
         let journal = Arc::new(LosesTheLead {
             log: Arc::clone(&feed.log),
             holds: AtomicUsize::new(usize::MAX),
         });
         let handed = Arc::clone(&journal);
-        let store = Arc::new(MemoryStore::journaled(handed).with_deciders(1));
+        let store = Arc::new(MemoryStore::journaled(handed).with_decision_slots(1));
         store::LeasesStore::set_term(store.as_ref(), TERM);
-        let door = Door::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        let door = MembershipCalls::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
         door.register(&operator(), under(TERM), &ask(wide(URL, width), Mode::Add))
             .expect("the ranks registered under a held lead");
         (store, door, journal)
@@ -1961,15 +1990,15 @@ pub(crate) mod tests {
     /// and came back under a later term: the next leader's door, over the
     /// row the first attempt left.
     #[cfg(feature = "worker-host")]
-    fn led_again_behind_a_lost_add() -> (Arc<MemoryStore>, Door) {
+    fn led_again_behind_a_lost_add() -> (Arc<MemoryStore>, MembershipCalls) {
         let (_, feed) = journaled_from(&LeasePlace::Process, 0);
         let journal = Arc::new(LosesTheLead {
             log: Arc::clone(&feed.log),
             holds: AtomicUsize::new(0),
         });
-        let store = Arc::new(MemoryStore::journaled(journal).with_deciders(1));
+        let store = Arc::new(MemoryStore::journaled(journal).with_decision_slots(1));
         store::LeasesStore::set_term(store.as_ref(), TERM);
-        let door = Door::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
+        let door = MembershipCalls::based(Arc::clone(&store), Arc::clone(&feed.log), 0);
         let lost = door
             .register(&operator(), under(TERM), &ask(wide(URL, 3), Mode::Add))
             .expect_err("the lead was lost at the second rank");
@@ -1977,7 +2006,7 @@ pub(crate) mod tests {
             (lost.code(), lost.message()),
             (Code::Unavailable, super::LEADS_NO_TERM)
         );
-        assert_eq!((store.epoch(), store.snapshot().1.len()), (1, 1));
+        assert_eq!((store.epoch(), store.all_rows().1.len()), (1, 1));
         store::LeasesStore::set_term(store.as_ref(), TERM + 2);
         (store, door)
     }
@@ -2006,7 +2035,7 @@ pub(crate) mod tests {
             "{made:?}"
         );
         assert_eq!(store.by_key(&format!("{URL}@0")).as_ref(), Some(&first));
-        assert_eq!((store.epoch(), store.snapshot().1.len()), (3, 3));
+        assert_eq!((store.epoch(), store.all_rows().1.len()), (3, 3));
 
         let whole = add().expect_err("the engine stands whole");
         assert_eq!(whole.code(), Code::AlreadyExists);
@@ -2035,7 +2064,7 @@ pub(crate) mod tests {
             .register(&operator(), under(TERM + 2), &ask(labelled, Mode::Add))
             .expect_err("the first rank stands with other labels");
         assert_eq!(refused.code(), Code::AlreadyExists);
-        assert_eq!((store.epoch(), store.snapshot().1.len()), (1, 1));
+        assert_eq!((store.epoch(), store.all_rows().1.len()), (1, 1));
     }
 
     /// A registration states at most 64 ranks. At the bound, with every rank
@@ -2090,7 +2119,7 @@ pub(crate) mod tests {
         let watched = |after: Position| {
             let mut entries = Vec::new();
             door.log
-                .read(store::Kinds::Watched, after, 64, &mut entries)
+                .read(store::JournalKinds::Watched, after, 64, &mut entries)
                 .expect("the log holds the call's writes");
             entries
                 .iter()
@@ -2210,8 +2239,8 @@ pub(crate) mod tests {
     }
 
     /// A provider's maker for one worker.
-    fn found(key: &str) -> Maker {
-        Maker::provider("cluster", key).expect("a whole maker")
+    fn found(key: &str) -> Registrant {
+        Registrant::provider("cluster", key).expect("a whole maker")
     }
 
     #[test]
@@ -2225,7 +2254,7 @@ pub(crate) mod tests {
         );
         assert_eq!(by_hand.maker, None);
         let held = store.get(WorkerId(by_hand.id)).expect("the row");
-        assert_eq!(held.maker, Maker::Control);
+        assert_eq!(held.maker, Registrant::Control);
         // A provider's registration makes the row its own, and the answer
         // shows whose it is.
         let maker = found("pods/a");
@@ -2442,11 +2471,11 @@ pub(crate) mod tests {
     #[test]
     fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written() {
         use super::super::worker_wire;
-        use crate::store::{EncodeHandoff, EncodeOffer, PairingDescriptor};
+        use crate::store::{pairing::PairingDescriptor, EncodeHandoff, EncodeOffer};
         type State = fn(&mut WorkerFacts);
 
         let (store, door) = door();
-        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
         let maker = found("pods/a");
         let epoch = store.epoch();
         let lost: [(&str, State); 9] = [
@@ -2479,7 +2508,7 @@ pub(crate) mod tests {
                 state(&mut facts);
                 facts
             });
-            let Err(Refused::Past(past)) = answer else {
+            let Err(MembershipWriteRefused::Past(past)) = answer else {
                 panic!("{fact}: wrong answer: {answer:?}")
             };
             assert_eq!(past.fact, fact);
@@ -2509,12 +2538,12 @@ pub(crate) mod tests {
             }
         };
         let (store, door) = door();
-        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
         let maker = found("pods/a");
         let epoch = store.epoch();
         for wire in [WireModes::ZMQ, WireModes::GRPC.union(WireModes::ZMQ)] {
             let answer = hosted.found_one(&maker, URL, &stated(wire, Reachability::Any));
-            let Err(Refused::Past(past)) = answer else {
+            let Err(MembershipWriteRefused::Past(past)) = answer else {
                 panic!("{wire:?}: wrong answer: {answer:?}")
             };
             assert_eq!(past.fact, "row.wire");
@@ -2531,32 +2560,32 @@ pub(crate) mod tests {
 
         // A store held in process serves one gateway, and takes the row.
         let lone = Arc::new(MemoryStore::default());
-        let wrote = StoreDoor::new(Arc::clone(&lone)).found_one(
+        let wrote = StoreMembershipWriter::new(Arc::clone(&lone)).found_one(
             &maker,
             URL,
             &stated(WireModes::ZMQ, Reachability::Any),
         );
         let row = lone.by_key(URL).expect("the row in process");
-        assert_eq!(wrote, Ok(Wrote::Registered(row.id)));
+        assert_eq!(wrote, Ok(MembershipWriteOutcome::Registered(row.id)));
     }
 
     #[cfg(feature = "worker-host")]
-    fn standing(row: &WorkerRow) -> Standing {
-        Standing {
+    fn standing(row: &WorkerRow) -> RowRevision {
+        RowRevision {
             row: row.id,
             revision: row.revision,
         }
     }
 
     #[cfg(feature = "worker-host")]
-    impl Rows for Hosted {
+    impl Rows for ReplicaMembershipWriter {
         fn rows(
             &self,
-            maker: &Maker,
-            expect: Expect,
+            maker: &Registrant,
+            expect: Precondition,
             rows: &[Stated<'_>],
-        ) -> Result<Vec<Wrote>, Refused> {
-            Hosted::rows(self, maker, expect, rows)
+        ) -> Result<Vec<MembershipWriteOutcome>, MembershipWriteRefused> {
+            ReplicaMembershipWriter::rows(self, maker, expect, rows)
         }
     }
 
@@ -2565,7 +2594,11 @@ pub(crate) mod tests {
         let (store, door) = door();
         (
             store,
-            Box::new(Hosted::new(Arc::new(door), operator(), under(TERM))),
+            Box::new(ReplicaMembershipWriter::new(
+                Arc::new(door),
+                operator(),
+                under(TERM),
+            )),
         )
     }
 
@@ -2628,7 +2661,7 @@ pub(crate) mod tests {
     fn a_provider_acting_as_maker_takes_only_its_own_guarded_row() {
         let (store, door) = door();
         let door = Arc::new(door);
-        let hosted = Hosted::new(Arc::clone(&door), operator(), under(TERM));
+        let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
         let maker = found("pods/a");
         hosted
             .found_one(&maker, URL, &|_| found_facts())
@@ -2638,8 +2671,9 @@ pub(crate) mod tests {
         door.register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
             .expect("registered");
         let epoch = store.epoch();
-        let denied = |answer: Result<Wrote, Refused>, whose: &str| {
-            let Err(Refused::NotMaker(why)) = answer else {
+        let denied = |answer: Result<MembershipWriteOutcome, MembershipWriteRefused>,
+                      whose: &str| {
+            let Err(MembershipWriteRefused::NotRegistrant(why)) = answer else {
                 panic!("wrong refusal: {answer:?}")
             };
             assert!(why.contains(whose), "{why}");
@@ -2648,38 +2682,43 @@ pub(crate) mod tests {
         };
         // Another maker's row stays: a control call's, and this provider's
         // own under another key, which is told so.
-        let by = Remover::Maker(&maker);
+        let by = Remover::Registrant(&maker);
         let seen = standing(&made);
         let control = store.by_key(other).expect("the control row");
         denied(hosted.gone(by, other, standing(&control)), "a control call");
         denied(
-            hosted.gone(Remover::Maker(&found("pods/b")), URL, seen),
+            hosted.gone(Remover::Registrant(&found("pods/b")), URL, seen),
             "provider cluster's under another key",
         );
         // A caller of another provider is told whose the row is, and
         // nothing of a key.
-        let stranger = Maker::provider("nodes", "pods/a").expect("a whole maker");
+        let stranger = Registrant::provider("nodes", "pods/a").expect("a whole maker");
         denied(
-            hosted.gone(Remover::Maker(&stranger), URL, seen),
+            hosted.gone(Remover::Registrant(&stranger), URL, seen),
             "provider cluster's: its worker",
         );
         // No row under the URL is not found, and a replica that does not
         // lead refuses by name. None of the five wrote.
         assert_eq!(
             hosted.gone(by, "grpc://10.0.0.9:8000", seen),
-            Err(Refused::Absent)
+            Err(MembershipWriteRefused::Absent)
         );
         let follower = || -> Result<u64, Status> {
             Err(Status::failed_precondition("this replica does not lead"))
         };
-        let follower = Hosted::new(Arc::clone(&door), operator(), follower);
+        let follower = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), follower);
         assert_eq!(
             follower.gone(by, URL, seen),
-            Err(Refused::NotLeading("this replica does not lead".to_owned()))
+            Err(MembershipWriteRefused::NotLeading(
+                "this replica does not lead".to_owned()
+            ))
         );
         assert_eq!(store.epoch(), epoch);
         // The maker's own call takes the row away and answers it removed.
-        assert_eq!(hosted.gone(by, URL, seen), Ok(Wrote::Removed(made.id)));
+        assert_eq!(
+            hosted.gone(by, URL, seen),
+            Ok(MembershipWriteOutcome::Removed(made.id))
+        );
         assert!(store.get(made.id).is_none());
         assert_eq!(store.epoch(), epoch + 1);
         // The old guard still names the previous row at this URL.
@@ -2688,7 +2727,10 @@ pub(crate) mod tests {
             .expect("found again");
         let again = store.by_key(URL).expect("the new row");
         assert_ne!(again.id, made.id);
-        assert_eq!(hosted.gone(by, URL, seen), Err(Refused::Moved));
+        assert_eq!(
+            hosted.gone(by, URL, seen),
+            Err(MembershipWriteRefused::Moved)
+        );
         assert_eq!(store.by_key(URL), Some(again));
     }
 
@@ -2700,22 +2742,24 @@ pub(crate) mod tests {
         let (store, door) = door();
         let door = Arc::new(door);
         let maker = found("pods/a");
-        Hosted::new(Arc::clone(&door), operator(), under(TERM))
+        ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM))
             .found_one(&maker, URL, &|_| found_facts())
             .expect("registered");
         let row = store.by_key(URL);
         let seen = standing(row.as_ref().expect("the registered row"));
-        let by = Remover::Maker(&maker);
+        let by = Remover::Registrant(&maker);
         let epoch = store.epoch();
         let at = door.place();
         let reads = Arc::new(AtomicUsize::new(0));
         let fence_reads = Arc::clone(&reads);
-        let hosted = Hosted::new(Arc::clone(&door), operator(), move || {
+        let hosted = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), move || {
             assert!(door.turn.is_locked(), "the fence is read inside the turn");
             fence_reads.fetch_add(1, Ordering::Relaxed);
             Err(Status::failed_precondition("this replica does not lead"))
         });
-        let refused = Err(Refused::NotLeading("this replica does not lead".to_owned()));
+        let refused = Err(MembershipWriteRefused::NotLeading(
+            "this replica does not lead".to_owned(),
+        ));
         assert_eq!(
             hosted.found_one(&maker, URL, &|_| panic!(
                 "a follower does not ask for facts"
@@ -2733,22 +2777,24 @@ pub(crate) mod tests {
     #[cfg(feature = "worker-host")]
     #[test]
     fn a_providers_registration_numbers_its_life_under_the_term_the_log_leads() {
-        use super::{HostedTurn, Turn};
-        use crate::store::membership::Past;
+        use super::{ReplicaTurn, Turn};
+        use crate::store::membership::FactPastBound;
 
         let (store, door) = door_in(TERM + 1);
         let door = Arc::new(door);
         let maker = found("pods/a");
-        let stale = Hosted::new(Arc::clone(&door), operator(), under(TERM));
-        let refusal = Err(Refused::NotLeading(super::LEADS_NO_TERM.to_owned()));
+        let stale = ReplicaMembershipWriter::new(Arc::clone(&door), operator(), under(TERM));
+        let refusal = Err(MembershipWriteRefused::NotLeading(
+            super::LEADS_NO_TERM.to_owned(),
+        ));
         assert_eq!(stale.found_one(&maker, URL, &|_| found_facts()), refusal);
         assert_eq!(store.epoch(), 0);
 
-        let leading = Hosted::new(door, operator(), under(TERM + 1));
+        let leading = ReplicaMembershipWriter::new(door, operator(), under(TERM + 1));
         let number = life(TERM + 1, 0);
         assert_eq!(
             leading.found_one(&maker, URL, &|_| found_facts()),
-            Ok(Wrote::Registered(identity(URL, number)))
+            Ok(MembershipWriteOutcome::Registered(identity(URL, number)))
         );
         let row = store.by_key(URL).expect("the registered row");
         assert_eq!(row.facts.incarnation, number);
@@ -2761,7 +2807,7 @@ pub(crate) mod tests {
         let new = life(TERM + 1, 1);
         assert_eq!(
             leading.found_one(&maker, URL, &|_| replaced()),
-            Ok(Wrote::Another {
+            Ok(MembershipWriteOutcome::Another {
                 old: row.id,
                 new: identity(URL, new)
             })
@@ -2775,7 +2821,7 @@ pub(crate) mod tests {
             new
         );
 
-        let turn = HostedTurn {
+        let turn = ReplicaTurn {
             host: &leading,
             term: TERM + 1,
         };
@@ -2785,29 +2831,31 @@ pub(crate) mod tests {
         };
         assert_eq!(
             turn.room(&heavy, &maker),
-            Err(Refused::Past(Past {
+            Err(MembershipWriteRefused::Past(FactPastBound {
                 fact: "row",
                 why: "a row is at most 16384 bytes on the wire",
             }))
         );
 
         let (store, door) = door_in(TERM);
-        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
         let state = |_: Option<&WorkerFacts>| {
             store::LeasesStore::set_term(store.as_ref(), TERM + 1);
             found_facts()
         };
         assert_eq!(hosted.found_one(&maker, URL, &state), refusal);
-        assert_eq!(store.snapshot(), (0, Vec::new()));
+        assert_eq!(store.all_rows(), (0, Vec::new()));
         // A life is asked a row at a time: once the term has moved the turn
         // makes none, at whichever row of a registration asks it.
-        let turn = HostedTurn {
+        let turn = ReplicaTurn {
             host: &hosted,
             term: TERM,
         };
         assert_eq!(
             turn.life(),
-            Err(Refused::NotLeading(super::LEADS_NO_TERM.to_owned()))
+            Err(MembershipWriteRefused::NotLeading(
+                super::LEADS_NO_TERM.to_owned()
+            ))
         );
     }
 
@@ -2817,29 +2865,29 @@ pub(crate) mod tests {
         let (replica, door) = door();
         let local = Arc::new(MemoryStore::default());
         let maker = found("pods/a");
-        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
-        let lone = StoreDoor::new(Arc::clone(&local));
+        let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
+        let lone = StoreMembershipWriter::new(Arc::clone(&local));
         let write = |door: &dyn Rows, store: &MemoryStore| {
-            let by = Remover::Maker(&maker);
+            let by = Remover::Registrant(&maker);
             assert_eq!(
                 door.gone(
                     by,
                     URL,
-                    Standing {
+                    RowRevision {
                         row: WorkerId(0),
                         revision: 0
                     }
                 ),
-                Err(Refused::Absent)
+                Err(MembershipWriteRefused::Absent)
             );
             let registered = door
                 .found_one(&maker, URL, &|_| found_facts())
                 .expect("registered");
             let first = store.by_key(URL).expect("the first row");
-            assert_eq!(registered, Wrote::Registered(first.id));
+            assert_eq!(registered, MembershipWriteOutcome::Registered(first.id));
             assert_eq!(
                 door.found_one(&maker, URL, &|_| found_facts()),
-                Ok(Wrote::Unmoved(first.id))
+                Ok(MembershipWriteOutcome::Unmoved(first.id))
             );
             let refresh = || WorkerFacts {
                 max_running: Some(8),
@@ -2847,7 +2895,7 @@ pub(crate) mod tests {
             };
             assert_eq!(
                 door.found_one(&maker, URL, &|_| refresh()),
-                Ok(Wrote::InPlace(first.id))
+                Ok(MembershipWriteOutcome::InPlace(first.id))
             );
             let refreshed = store.by_key(URL).expect("the refreshed row");
             let wrote = door.found_one(&maker, URL, &|_| WorkerFacts {
@@ -2857,16 +2905,25 @@ pub(crate) mod tests {
             let fresh = store.by_key(URL).expect("the new row");
             assert_eq!(
                 wrote,
-                Ok(Wrote::Another {
+                Ok(MembershipWriteOutcome::Another {
                     old: first.id,
                     new: fresh.id
                 })
             );
             let seen = standing(&fresh);
-            assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(fresh.id)));
+            assert_eq!(
+                door.drained(by, URL, seen),
+                Ok(MembershipWriteOutcome::Draining(fresh.id))
+            );
             let draining = store.by_key(URL).expect("the draining row");
-            assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Unmoved(fresh.id)));
-            assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(fresh.id)));
+            assert_eq!(
+                door.drained(by, URL, seen),
+                Ok(MembershipWriteOutcome::Unmoved(fresh.id))
+            );
+            assert_eq!(
+                door.gone(by, URL, seen),
+                Ok(MembershipWriteOutcome::Removed(fresh.id))
+            );
             assert_eq!(store.by_key(URL), None);
             [first, refreshed, fresh, draining].map(|row| {
                 assert_eq!(row.id, identity(URL, row.facts.incarnation));
@@ -3232,7 +3289,7 @@ pub(crate) mod tests {
             revision: row.revision,
         };
         let told = door
-            .relabel(&operator(), &Maker::Control, &patch)
+            .relabel(&operator(), &Registrant::Control, &patch)
             .expect("patched");
         assert_eq!(row_of(&told).status, proto::WorkerStatus::Draining as i32);
         // A registration over a draining row is the URL's next incarnation,
@@ -3472,17 +3529,23 @@ pub(crate) mod tests {
         door.found_one(&maker, URL, &|_| found_facts())
             .expect("registered");
         let row = store.by_key(URL).expect("the row health saw");
-        let seen = Standing {
+        let seen = RowRevision {
             row: row.id,
             revision: row.revision,
         };
         assert_eq!(
             door.drained(Remover::Health(UnhealthyRemovalScope::Disabled), URL, seen),
-            Err(Refused::OutOfScope)
+            Err(MembershipWriteRefused::OutOfScope)
         );
         let by = Remover::Health(UnhealthyRemovalScope::DiscoveryOwned);
-        assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row.id)));
-        assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row.id)));
+        assert_eq!(
+            door.drained(by, URL, seen),
+            Ok(MembershipWriteOutcome::Draining(row.id))
+        );
+        assert_eq!(
+            door.gone(by, URL, seen),
+            Ok(MembershipWriteOutcome::Removed(row.id))
+        );
 
         let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
         let calls: Vec<_> = logged.lines().skip(1).collect();
@@ -3519,14 +3582,14 @@ pub(crate) mod tests {
             Arc::new(worker.label("tier", tier).build())
         };
         let first = built("m", "gold");
-        door.found_built(&Maker::Control, Expect::Nothing, &first, None)
+        door.found_built(&Registrant::Control, Precondition::Absent, &first, None)
             .expect("registered");
         let row = store.by_key(HTTP).expect("the registered row");
         let seen = standing(&row);
         let stray = door.refreshed(seen, &built("other", "gold"), &first);
-        assert_eq!(stray, Err(Refused::NotLabelsAlone));
+        assert_eq!(stray, Err(MembershipWriteRefused::NotLabelsAlone));
         let wrote = door.refreshed(seen, &built("m", "silver"), &first);
-        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
 
         let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
         let calls: Vec<_> = logged.lines().skip(1).collect();
@@ -3538,7 +3601,10 @@ pub(crate) mod tests {
             "{logged}"
         );
         assert!(calls[0].contains("code=PermissionDenied"), "{logged}");
-        assert!(calls[0].contains(Refused::NOT_LABELS_ALONE), "{logged}");
+        assert!(
+            calls[0].contains(MembershipWriteRefused::NOT_LABELS_ALONE),
+            "{logged}"
+        );
         assert!(calls[1].contains("made=\"relabelled\""), "{logged}");
         assert!(!logged.contains(HTTP), "{logged}");
     }
@@ -3565,13 +3631,13 @@ pub(crate) mod tests {
             (offered.transport(), offered.version()),
             (Some("nixl"), Some("1"))
         );
-        let wrote = door.found_built(&Maker::Control, Expect::Nothing, &first, None);
+        let wrote = door.found_built(&Registrant::Control, Precondition::Absent, &first, None);
         assert!(wrote.is_ok(), "{wrote:?}");
         let row = store.by_key(HTTP).expect("the registered row");
         assert_eq!(row.facts.pairing, None);
 
         let wrote = door.refreshed(standing(&row), &built("2"), &first);
-        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        assert_eq!(wrote, Ok(MembershipWriteOutcome::InPlace(row.id)));
         let refreshed = store.by_key(HTTP).expect("the refreshed row");
         assert_eq!(refreshed.facts.pairing, None);
         let version = refreshed.facts.labels.get("version");
@@ -3591,7 +3657,7 @@ pub(crate) mod tests {
         let _kept = tracing::subscriber::set_default(subscriber);
 
         let (store, door) = door();
-        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let hosted = ReplicaMembershipWriter::new(Arc::new(door), operator(), under(TERM));
         let key = "private/provider-key";
         let maker = found(key);
         let rank_urls = ["grpc://10.0.0.5:8000@0", "grpc://10.0.0.5:8000@1"];
@@ -3609,17 +3675,17 @@ pub(crate) mod tests {
             state: &states[rank],
         });
         hosted
-            .rows(&maker, Expect::Anything, &ranks)
+            .rows(&maker, Precondition::Any, &ranks)
             .expect("registered ranks");
         let [first, second] = rank_urls.map(|url| store.by_key(url).expect("a rank").id.0);
         hosted
-            .rows(&maker, Expect::Anything, &ranks)
+            .rows(&maker, Precondition::Any, &ranks)
             .expect("unmoved ranks");
 
         hosted
             .rows(
                 &maker,
-                Expect::Anything,
+                Precondition::Any,
                 &[Stated {
                     url: URL,
                     state: &|_| found_facts(),
@@ -3643,11 +3709,11 @@ pub(crate) mod tests {
         let row = store.by_key(URL).expect("the replaced row");
         let new = row.id.0;
         let seen = standing(&row);
-        let by = Remover::Maker(&maker);
+        let by = Remover::Registrant(&maker);
         hosted.drained(by, URL, seen).expect("drained");
         hosted.drained(by, URL, seen).expect("unmoved");
         hosted
-            .gone(Remover::Maker(&found("another/key")), URL, seen)
+            .gone(Remover::Registrant(&found("another/key")), URL, seen)
             .expect_err("another maker");
         hosted
             .gone(Remover::Provider("cluster"), URL, seen)
@@ -3889,7 +3955,7 @@ pub(crate) mod tests {
         let drawn: Vec<u64> = (0..64)
             .map(|_| {
                 let (store, feed) = journaled(&LeasePlace::Process, 1);
-                Door::new(store, feed.log).base
+                MembershipCalls::new(store, feed.log).base
             })
             .collect();
         assert!(drawn.iter().all(|&base| base < BOUND), "{drawn:?}");
@@ -3906,7 +3972,7 @@ pub(crate) mod tests {
         let run = || {
             let (store, feed) = journaled(&LeasePlace::Process, 1);
             store::LeasesStore::set_term(store.as_ref(), 1);
-            let door = Door::new(Arc::clone(&store), feed.log);
+            let door = MembershipCalls::new(Arc::clone(&store), feed.log);
             let first = row_of(
                 &door
                     .register(&operator(), under(1), &ask(spec(URL), Mode::Add))

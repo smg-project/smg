@@ -49,7 +49,7 @@ use k8s_openapi::api::coordination::v1::Lease;
 use kube::{core::Status, Client, Config};
 use parking_lot::Mutex;
 use smg_policy_controller::service::elector::{
-    ElectionSettings, Elector, KubernetesLease, Tick, TERM_ANNOTATION,
+    ElectionSettings, Elector, KubernetesLease, TickOutcome, TERM_ANNOTATION,
 };
 
 const ROLE: &str = "SMG_ELECTOR_K8S_CELL_ROLE";
@@ -256,7 +256,7 @@ fn log(line: &str) {
 /// instant the tick runs on is taken before `before`, so a fence it opens
 /// closes no later than `before` plus the renew deadline, and no earlier
 /// than `before` itself.
-fn step(candidate: &mut Candidate, identity: &str) -> Tick {
+fn step(candidate: &mut Candidate, identity: &str) -> TickOutcome {
     let now = Instant::now();
     let before = wall_micros();
     let tick = candidate.elector.tick(now).expect("a tick");
@@ -319,14 +319,14 @@ fn taker(url: &str, identity: &str) {
     while start.elapsed() < BROKEN {
         sleep_to_grid();
         match step(&mut taker, identity) {
-            Tick::Acquired { .. } => {
+            TickOutcome::Acquired { .. } => {
                 for _ in 0..2 {
                     thread::sleep(settings().renew_period);
                     step(&mut taker, identity);
                 }
                 return;
             }
-            Tick::Following { term: 2, .. } => return,
+            TickOutcome::Following { term: 2, .. } => return,
             _ => {}
         }
     }

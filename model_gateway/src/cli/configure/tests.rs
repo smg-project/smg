@@ -9,13 +9,13 @@
 use std::{borrow::Cow, fs, path::Path};
 
 use clap::Parser;
-use smg_policy_controller::{PolicySpec, SpecError, PRESETS};
+use smg_policy_controller::document::{PolicySpec, RoutingSettingsError, SpecError, PRESETS};
 
 use super::{
     super::{url_port::CommandLine, Cli, CliArgs, Commands},
     PolicySpecPrint,
 };
-use crate::config::{PolicyDocumentError, RouterConfig, RoutingMode};
+use crate::config::{RouterConfig, RoutingMode};
 
 /// The urls of a side that the binary reads ahead of clap, each with its
 /// bootstrap port.
@@ -276,7 +276,9 @@ fn verdict(name: &str, item: &str) -> Result<Verdict, String> {
     one_routing_part(&argv, &whole)?;
     let document = match whole {
         Ok(document) => document,
-        Err(PolicyDocumentError::Unsaid { setting, .. }) => return Ok(Verdict::Refused(setting)),
+        Err(RoutingSettingsError::UnsupportedSetting { setting, .. }) => {
+            return Ok(Verdict::Refused(setting))
+        }
         Err(other) => return Err(format!("no document: {other}")),
     };
     let (_, expected) = fenced(item, "## Expected spec");
@@ -600,7 +602,7 @@ fn document(context: &[&str], given: &[String]) -> Result<Converted, String> {
 }
 
 /// A command line's document, or the setting of it that no document says.
-type Converted = Result<PolicySpec, PolicyDocumentError>;
+type Converted = Result<PolicySpec, RoutingSettingsError>;
 
 /// The document a flag's value landed in: one the value moved.
 fn landed<'a>(with: &'a Converted, without: &Converted) -> Result<&'a PolicySpec, String> {
@@ -632,7 +634,9 @@ impl Row {
                 Err(other) => Err(format!("the controller refuses its document: {other}")),
             },
             Fate::Refused(setting) => match &with {
-                Err(PolicyDocumentError::Unsaid { setting: named, .. }) if *named == setting => {
+                Err(RoutingSettingsError::UnsupportedSetting { setting: named, .. })
+                    if *named == setting =>
+                {
                     Ok(())
                 }
                 Ok(_) | Err(_) => Err(format!("it is not refused with {setting} named: {with:?}")),

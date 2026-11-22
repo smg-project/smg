@@ -24,18 +24,23 @@ use std::{
 };
 
 use smg_policy_controller::{
-    engine::{decider, decider::Decider},
+    document::Needs,
+    engine::{
+        Binding, Candidate, Constraints, Decision, DecisionSlot, Engine, Health, Identity,
+        PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch, ShedReason,
+        Target, WeightedScorer, WorkerId,
+    },
     plugins::{
-        shared::OpenDecisions,
+        shared::{BreakerSpec, Failure, OpenDecisions, Reveal},
         wasm::{
-            Abi, Bound, BreakerSpec, EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec,
-            Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
+            Abi, LoadError, Plugin, PluginBinding, PluginSpec, Runtime, WasmFilter, WasmPicker,
+            WasmScorer, World,
         },
     },
-    stages::builtins::{Best, Healthy, LeastRequests, PowerOfTwo, SessionAffinity},
-    Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Identity, Lease, Lifecycle,
-    Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch,
-    ShedReason, Side, Target, Weighted, WorkerId,
+    policies::power_of_two::PowerOfTwo,
+    stages::{Best, Healthy, LeastRequests, Lifecycle, SessionAffinity},
+    tracking::{EventKind, EventSet, Lease, Side},
+    Draw,
 };
 use support::wasm_guest::{self as guest, canonical, counter, mode};
 use wit_component::{ComponentEncoder, StringEncoding};
@@ -265,9 +270,9 @@ fn load_slow(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, mode: u8) -
 /// fallback: the one profile of its build that binds the plugin.
 fn plugin_profile(
     plugin: &Arc<Plugin>,
-    filter_fallback: Option<Box<dyn smg_policy_controller::Filter>>,
-    scorer_fallback: Option<Box<dyn smg_policy_controller::Scorer>>,
-    picker_fallback: Option<Box<dyn smg_policy_controller::Picker>>,
+    filter_fallback: Option<Box<dyn smg_policy_controller::engine::Filter>>,
+    scorer_fallback: Option<Box<dyn smg_policy_controller::engine::Scorer>>,
+    picker_fallback: Option<Box<dyn smg_policy_controller::engine::Picker>>,
 ) -> Profile {
     bound_profile(
         plugin.bind(),
@@ -279,10 +284,10 @@ fn plugin_profile(
 
 /// A profile whose three stages share `bound`, each with the given fallback.
 fn bound_profile(
-    bound: Arc<Bound>,
-    filter_fallback: Option<Box<dyn smg_policy_controller::Filter>>,
-    scorer_fallback: Option<Box<dyn smg_policy_controller::Scorer>>,
-    picker_fallback: Option<Box<dyn smg_policy_controller::Picker>>,
+    bound: Arc<PluginBinding>,
+    filter_fallback: Option<Box<dyn smg_policy_controller::engine::Filter>>,
+    scorer_fallback: Option<Box<dyn smg_policy_controller::engine::Scorer>>,
+    picker_fallback: Option<Box<dyn smg_policy_controller::engine::Picker>>,
 ) -> Profile {
     Profile {
         name: "plugin".into(),
@@ -290,7 +295,7 @@ fn bound_profile(
             Arc::clone(&bound),
             filter_fallback,
         ))],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(Arc::clone(&bound), scorer_fallback)),
             weight: 1.0,
         }],
@@ -621,12 +626,12 @@ fn band_guests() -> [(&'static str, Vec<u8>); 2] {
 
 fn band_engine(
     plugin: &Arc<Plugin>,
-    fallback: Option<Box<dyn smg_policy_controller::Scorer>>,
+    fallback: Option<Box<dyn smg_policy_controller::engine::Scorer>>,
 ) -> Engine {
     single_engine(Profile {
         name: "band".into(),
         filters: vec![],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(plugin.bind(), fallback)),
             weight: 1.0,
         }],
@@ -764,7 +769,7 @@ fn a_score_answer_keeps_its_band_with_its_scores() {
         } else {
             mode::LEAST_IN_FLIGHT
         };
-        let expected = band.unwrap_or(smg_policy_controller::TieBand::NORMALIZED.0);
+        let expected = band.unwrap_or(smg_policy_controller::engine::TieBand::NORMALIZED.0);
         for (world, component) in guest::guests_with_band(band.unwrap_or_default()) {
             let plugin = load(&runtime, world, component, guest_mode);
             let scorer = WasmScorer::new(plugin.bind(), None);
@@ -833,7 +838,7 @@ fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
         let engine = single_engine(Profile {
             name: "two-draw".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
                 weight: 1.0,
             }],
@@ -1535,12 +1540,15 @@ fn the_lifecycle_reaches_the_plugin_once_per_profile_on_the_hosts_clock() {
         "three adapters of one profile, one observe"
     );
     assert_eq!(counter_value(&plugin, counter::OBSERVE_NOW), 424_242);
-    engine.on_released(&lease, smg_policy_controller::ReleaseReason::ClientGone);
-    engine.on_membership(&smg_policy_controller::Membership::Snapshot(&[
+    engine.on_released(
+        &lease,
+        smg_policy_controller::tracking::ReleaseReason::ClientGone,
+    );
+    engine.on_membership(&smg_policy_controller::tracking::Membership::Snapshot(&[
         WorkerId(1),
         WorkerId(2),
     ]));
-    engine.on_signal(&smg_policy_controller::Signal::GatewayVeto {
+    engine.on_signal(&smg_policy_controller::tracking::Signal::GatewayVeto {
         worker: WorkerId(1),
         until_micros: 500_000,
     });
@@ -1748,7 +1756,7 @@ fn a_profile_of_built_ins_holds_no_scope_and_a_plugin_profile_does() {
     let native = Profile {
         name: "native".into(),
         filters: vec![Box::new(Healthy)],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -2082,12 +2090,15 @@ fn a_module_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     let tell = |engine: &Engine| {
         let lease = Lease::default();
         engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
-        engine.on_released(&lease, smg_policy_controller::ReleaseReason::ClientGone);
-        engine.on_membership(&smg_policy_controller::Membership::Snapshot(&[
+        engine.on_released(
+            &lease,
+            smg_policy_controller::tracking::ReleaseReason::ClientGone,
+        );
+        engine.on_membership(&smg_policy_controller::tracking::Membership::Snapshot(&[
             WorkerId(1),
             WorkerId(2),
         ]));
-        engine.on_signal(&smg_policy_controller::Signal::GatewayVeto {
+        engine.on_signal(&smg_policy_controller::tracking::Signal::GatewayVeto {
             worker: WorkerId(1),
             until_micros: 500_000,
         });
@@ -2439,7 +2450,7 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
         profile
             .filters
             .push(Box::new(SaysWhenAsked(Arc::clone(&asked))));
-        profile.scorers.push(Weighted {
+        profile.scorers.push(WeightedScorer {
             scorer: Box::new(ReadsTheClockWhenAsked(Arc::clone(&scored))),
             weight: 1.0,
         });
@@ -2543,7 +2554,7 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
 struct SaysWhenAsked(Arc<std::sync::OnceLock<std::time::Instant>>);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl smg_policy_controller::Filter for SaysWhenAsked {
+impl smg_policy_controller::engine::Filter for SaysWhenAsked {
     fn name(&self) -> &'static str {
         "says-when-asked"
     }
@@ -2565,7 +2576,7 @@ struct ReadsTheClockWhenAsked(Arc<std::sync::OnceLock<std::time::Duration>>);
 impl Lifecycle for ReadsTheClockWhenAsked {}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl smg_policy_controller::Scorer for ReadsTheClockWhenAsked {
+impl smg_policy_controller::engine::Scorer for ReadsTheClockWhenAsked {
     fn name(&self) -> &'static str {
         "reads-the-clock-when-asked"
     }
@@ -2576,10 +2587,10 @@ impl smg_policy_controller::Scorer for ReadsTheClockWhenAsked {
         _: &[Candidate],
         _: &[u32],
         out: &mut [f32],
-    ) -> smg_policy_controller::TieBand {
+    ) -> smg_policy_controller::engine::TieBand {
         self.0.get_or_init(bound_clock);
         out.fill(0.0);
-        smg_policy_controller::TieBand::NORMALIZED
+        smg_policy_controller::engine::TieBand::NORMALIZED
     }
 }
 
@@ -2688,7 +2699,7 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_
     let profile = Profile {
         name: "two".into(),
         filters: vec![],
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
             weight: 1.0,
         }],
@@ -2892,7 +2903,7 @@ fn runtimes_built_over_the_same_open_decisions_draw_one_remainder_and_apart_draw
         let engine = single_engine(Profile {
             name: "two".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(scorer.bind(), None)),
                 weight: 1.0,
             }],
@@ -3015,7 +3026,7 @@ fn a_new_builds_first_decision_on_a_thread_is_not_the_old_builds_last() {
 #[derive(Debug)]
 struct PanicsAtItsOpen(AtomicBool);
 
-impl smg_policy_controller::Filter for PanicsAtItsOpen {
+impl smg_policy_controller::engine::Filter for PanicsAtItsOpen {
     fn name(&self) -> &'static str {
         "panics-at-its-open"
     }
@@ -3024,12 +3035,12 @@ impl smg_policy_controller::Filter for PanicsAtItsOpen {
         true
     }
 
-    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+    fn scope(&self) -> Option<&dyn smg_policy_controller::engine::DecisionScope> {
         Some(self)
     }
 }
 
-impl smg_policy_controller::DecisionScope for PanicsAtItsOpen {
+impl smg_policy_controller::engine::DecisionScope for PanicsAtItsOpen {
     fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
         assert!(
             !self.0.swap(false, Ordering::Relaxed),
@@ -3136,7 +3147,7 @@ impl StoresAtItsOpen {
     }
 }
 
-impl smg_policy_controller::Filter for StoresAtItsOpen {
+impl smg_policy_controller::engine::Filter for StoresAtItsOpen {
     fn name(&self) -> &'static str {
         "stores-at-its-open"
     }
@@ -3145,12 +3156,12 @@ impl smg_policy_controller::Filter for StoresAtItsOpen {
         true
     }
 
-    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+    fn scope(&self) -> Option<&dyn smg_policy_controller::engine::DecisionScope> {
         Some(self)
     }
 }
 
-impl smg_policy_controller::DecisionScope for StoresAtItsOpen {
+impl smg_policy_controller::engine::DecisionScope for StoresAtItsOpen {
     fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
         self.counts.opens.fetch_add(1, Ordering::Relaxed);
         assert!(
@@ -3181,11 +3192,11 @@ fn a_scope_is_closed_only_after_its_open_returned() {
     let (before, opened_before) = StoresAtItsOpen::stage(false);
     let (panics, panicked) = StoresAtItsOpen::stage(true);
     let (after, never_reached) = StoresAtItsOpen::stage(false);
-    let filters: Vec<Box<dyn smg_policy_controller::Filter>> = vec![before, panics, after];
+    let filters: Vec<Box<dyn smg_policy_controller::engine::Filter>> = vec![before, panics, after];
     let engine = single_engine(Profile {
         name: "host-scopes".into(),
         filters,
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -3233,7 +3244,7 @@ struct PanicsAtItsClose {
     panics_once: AtomicBool,
 }
 
-impl smg_policy_controller::Filter for PanicsAtItsClose {
+impl smg_policy_controller::engine::Filter for PanicsAtItsClose {
     fn name(&self) -> &'static str {
         "panics-at-its-close"
     }
@@ -3242,12 +3253,12 @@ impl smg_policy_controller::Filter for PanicsAtItsClose {
         true
     }
 
-    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+    fn scope(&self) -> Option<&dyn smg_policy_controller::engine::DecisionScope> {
         Some(self)
     }
 }
 
-impl smg_policy_controller::DecisionScope for PanicsAtItsClose {
+impl smg_policy_controller::engine::DecisionScope for PanicsAtItsClose {
     fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
         self.counts.opens.fetch_add(1, Ordering::Relaxed);
     }
@@ -3275,11 +3286,12 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
     });
     let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
     let (panics, panicked) = StoresAtItsOpen::stage(true);
-    let filters: Vec<Box<dyn smg_policy_controller::Filter>> = vec![close_panics, after_it, panics];
+    let filters: Vec<Box<dyn smg_policy_controller::engine::Filter>> =
+        vec![close_panics, after_it, panics];
     let engine = single_engine(Profile {
         name: "host-scopes".into(),
         filters,
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -3330,11 +3342,11 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
 }
 
 /// A profile of the host's own stages, in their order.
-fn host_profile(filters: Vec<Box<dyn smg_policy_controller::Filter>>) -> Profile {
+fn host_profile(filters: Vec<Box<dyn smg_policy_controller::engine::Filter>>) -> Profile {
     Profile {
         name: "host-scopes".into(),
         filters,
-        scorers: vec![Weighted {
+        scorers: vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }],
@@ -3357,7 +3369,7 @@ fn close_panics_once() -> (Box<PanicsAtItsClose>, Arc<ScopeCounts>) {
 #[derive(Debug)]
 struct ClosePanicsWith(u32, AtomicBool);
 
-impl smg_policy_controller::Filter for ClosePanicsWith {
+impl smg_policy_controller::engine::Filter for ClosePanicsWith {
     fn name(&self) -> &'static str {
         "close-panics-with"
     }
@@ -3366,12 +3378,12 @@ impl smg_policy_controller::Filter for ClosePanicsWith {
         true
     }
 
-    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+    fn scope(&self) -> Option<&dyn smg_policy_controller::engine::DecisionScope> {
         Some(self)
     }
 }
 
-impl smg_policy_controller::DecisionScope for ClosePanicsWith {
+impl smg_policy_controller::engine::DecisionScope for ClosePanicsWith {
     fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
 
     fn close(&self) {
@@ -3386,7 +3398,7 @@ impl smg_policy_controller::DecisionScope for ClosePanicsWith {
 #[derive(Debug)]
 struct PanicsAtItsKeep(AtomicBool);
 
-impl smg_policy_controller::Filter for PanicsAtItsKeep {
+impl smg_policy_controller::engine::Filter for PanicsAtItsKeep {
     fn name(&self) -> &'static str {
         "panics-at-its-keep"
     }
@@ -3684,7 +3696,7 @@ impl Drop for DropPanics {
 #[derive(Debug)]
 struct ClosePanicsWithADrop(AtomicBool);
 
-impl smg_policy_controller::Filter for ClosePanicsWithADrop {
+impl smg_policy_controller::engine::Filter for ClosePanicsWithADrop {
     fn name(&self) -> &'static str {
         "close-panics-with-a-drop"
     }
@@ -3693,12 +3705,12 @@ impl smg_policy_controller::Filter for ClosePanicsWithADrop {
         true
     }
 
-    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+    fn scope(&self) -> Option<&dyn smg_policy_controller::engine::DecisionScope> {
         Some(self)
     }
 }
 
-impl smg_policy_controller::DecisionScope for ClosePanicsWithADrop {
+impl smg_policy_controller::engine::DecisionScope for ClosePanicsWithADrop {
     fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
 
     fn close(&self) {
@@ -3778,7 +3790,7 @@ impl ClosePanicsWithACount {
     }
 }
 
-impl smg_policy_controller::Filter for ClosePanicsWithACount {
+impl smg_policy_controller::engine::Filter for ClosePanicsWithACount {
     fn name(&self) -> &'static str {
         "close-panics-with-a-count"
     }
@@ -3787,12 +3799,12 @@ impl smg_policy_controller::Filter for ClosePanicsWithACount {
         true
     }
 
-    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+    fn scope(&self) -> Option<&dyn smg_policy_controller::engine::DecisionScope> {
         Some(self)
     }
 }
 
-impl smg_policy_controller::DecisionScope for ClosePanicsWithACount {
+impl smg_policy_controller::engine::DecisionScope for ClosePanicsWithACount {
     fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
 
     fn close(&self) {
@@ -3925,7 +3937,7 @@ struct TellsThePick(Arc<PastThePick>);
 
 impl Lifecycle for TellsThePick {}
 
-impl smg_policy_controller::Picker for TellsThePick {
+impl smg_policy_controller::engine::Picker for TellsThePick {
     fn name(&self) -> &'static str {
         "tells-the-pick"
     }
@@ -3936,13 +3948,15 @@ impl smg_policy_controller::Picker for TellsThePick {
         candidates: &[Candidate],
         kept: &[u32],
         scores: &[f32],
-        band: smg_policy_controller::TieBand,
-        out: &mut smg_policy_controller::Targets,
+        band: smg_policy_controller::engine::TieBand,
+        out: &mut smg_policy_controller::engine::Targets,
     ) {
         if self.0.armed.load(Ordering::Relaxed) {
             self.0.picked.store(true, Ordering::Relaxed);
         }
-        smg_policy_controller::Picker::pick(&Best, facts, candidates, kept, scores, band, out);
+        smg_policy_controller::engine::Picker::pick(
+            &Best, facts, candidates, kept, scores, band, out,
+        );
     }
 }
 
@@ -4012,7 +4026,7 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
         let engine = single_engine(Profile {
             name: "one-stage".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
                 weight: 1.0,
             }],
@@ -4100,7 +4114,7 @@ impl LeftLent {
         let engine = single_engine(Profile {
             name: "one-stage".into(),
             filters: vec![],
-            scorers: vec![Weighted {
+            scorers: vec![WeightedScorer {
                 scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
                 weight: 1.0,
             }],
@@ -4118,7 +4132,7 @@ impl LeftLent {
             scope
                 .spawn(|| {
                     left.place.get_or_default().set(true);
-                    let _turn = Decider::new(1).enter();
+                    let _turn = DecisionSlot::new(1).enter();
                     decide(&left.engine, &left.candidates, 1)
                 })
                 .join()
@@ -4142,7 +4156,7 @@ impl LeftLent {
     /// its catch-up made.
     fn heard_as_decider_1(&self) -> u64 {
         let before = self.plugin.stats().observed;
-        let _turn = Decider::new(1).enter();
+        let _turn = DecisionSlot::new(1).enter();
         assert!(
             matches!(decide(&self.engine, &self.candidates, 1), Decision::Pick(_)),
             "decider 1 decides"
@@ -4154,7 +4168,7 @@ impl LeftLent {
     /// the first makes an instance, and the second hears the list, one
     /// member told between them. Two more members are told behind them.
     fn two_turns_then_two_members(&self) -> [u64; 2] {
-        use smg_policy_controller::Membership;
+        use smg_policy_controller::tracking::Membership;
         let anew = self.heard_as_decider_1();
         self.engine.on_membership(&Membership::Added(WorkerId(102)));
         let listed = self.heard_as_decider_1();
@@ -4176,7 +4190,7 @@ fn a_thread_under_no_name_gives_back_the_state_its_place_was_left_with() {
     let pair = || {
         LeftLent::by_a_thread_that_exited("left-lent").taken(|left| {
             let own = left.plugin.is_warm();
-            let _turn = Decider::new(1).enter();
+            let _turn = DecisionSlot::new(1).enter();
             (own, left.plugin.is_warm())
         })
     };
@@ -4207,7 +4221,9 @@ fn a_state_given_back_late_does_not_replace_the_one_at_rest() {
         let left = LeftLent::by_a_thread_that_exited("came-late");
         let anew = left.heard_as_decider_1();
         left.engine
-            .on_membership(&smg_policy_controller::Membership::Added(WorkerId(102)));
+            .on_membership(&smg_policy_controller::tracking::Membership::Added(
+                WorkerId(102),
+            ));
         let behind = left.heard_as_decider_1();
         let (shared, own) = left.taken(|left| left.plugin.is_warm());
         (
@@ -4278,7 +4294,7 @@ fn a_turn_under_the_same_name_in_a_place_left_lent_runs_on_the_state_at_rest() {
 /// come late, and that next decision would hear the list again.
 #[test]
 fn a_hold_is_checked_by_the_open_that_reaches_the_bring_behind_an_open_breaker() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     const START: u64 = 1_000_000;
     const COOL_DOWN: u64 = 1_000_000;
     // The host's clock is the case's own: the cool-down ends when the
@@ -4317,7 +4333,7 @@ fn a_hold_is_checked_by_the_open_that_reaches_the_bring_behind_an_open_breaker()
         let engine = pair_engine(vec![prefill, decode], 1);
         let (shared, paired) = left.taken(|left| {
             let before = left.plugin.stats();
-            let _turn = Decider::new(1).enter();
+            let _turn = DecisionSlot::new(1).enter();
             let _ = pair_decide(&engine);
             let after = left.plugin.stats();
             (
@@ -4359,7 +4375,7 @@ fn an_event_told_under_the_same_name_in_a_place_left_lent_reaches_the_state_at_r
         let before = left.two_turns_then_two_members();
         let (shared, told) = left.taken(|left| {
             let before = left.plugin.stats().observed;
-            let _turn = Decider::new(1).enter();
+            let _turn = DecisionSlot::new(1).enter();
             left.engine
                 .on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
             left.plugin.stats().observed - before
@@ -4399,7 +4415,7 @@ fn a_named_warm_up_leaves_the_state_at_its_deciders_rest() {
         let plugin = &plugin;
         scope.spawn(move || {
             {
-                let _turn = Decider::new(1).enter();
+                let _turn = DecisionSlot::new(1).enter();
                 plugin.warm().expect("decider 1 warms");
             }
             warmed.send(()).expect("the case waits for the warm-up");
@@ -4409,7 +4425,7 @@ fn a_named_warm_up_leaves_the_state_at_its_deciders_rest() {
         first_warmed.recv().expect("the first thread warmed");
         let warm = scope
             .spawn(move || {
-                let _turn = Decider::new(1).enter();
+                let _turn = DecisionSlot::new(1).enter();
                 plugin.is_warm()
             })
             .join();
@@ -5381,7 +5397,7 @@ fn a_scorer_held_short_of_late_through_half_a_window_before_a_spinner_stays_shut
         guest::record_guest(),
         mode::SPIN_IN_SCORE,
     );
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -6147,7 +6163,7 @@ fn a_spinner_behind_an_honest_scorer_opens_its_breaker_at_the_window_in_either_o
             guest::record_guest(),
             mode::SPIN_IN_SCORE,
         );
-        let scorer = |plugin: &Arc<Plugin>| Weighted {
+        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
             scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
             weight: 1.0,
         };
@@ -6254,7 +6270,7 @@ fn three_honest_quarters_and_a_spinner_charge_nobody_in_a_try(made: u32) -> bool
         &mut Scratch::new(),
     );
     let burn = (burners[0].stats().fuel_used - before) / 3;
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -6363,11 +6379,11 @@ fn an_init_the_remainder_clamps_is_the_decisions_budget_spent_and_the_close_rebu
         name: "clamped-init".into(),
         filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
         scorers: vec![
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(bound.clone(), None)),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
                 weight: 1.0,
             },
@@ -6477,11 +6493,11 @@ fn decide_on_a_cold_slot(
         name: "cold-init".into(),
         filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
         scorers: vec![
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(bound.clone(), None)),
                 weight: 1.0,
             },
-            Weighted {
+            WeightedScorer {
                 scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
                 weight: 1.0,
             },
@@ -7689,11 +7705,11 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged_in_a_
     let engine = single_engine(Profile {
         name: "clamped".into(),
         filters: vec![Box::new(WasmFilter::new(bound.clone(), None))],
-        scorers: std::iter::once(Weighted {
+        scorers: std::iter::once(WeightedScorer {
             scorer: Box::new(WasmScorer::new(bound.clone(), None)),
             weight: 1.0,
         })
-        .chain(neighbours.iter().map(|neighbour| Weighted {
+        .chain(neighbours.iter().map(|neighbour| WeightedScorer {
             scorer: Box::new(WasmScorer::new(neighbour.bind(), None)),
             weight: 1.0,
         }))
@@ -7775,7 +7791,7 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     let spinner = loaded(&runtime, slow_calibration);
     // What one `init` of the spinner costs: the load made one instance.
     let init_fuel = spinner.stats().fuel_used;
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -7872,7 +7888,7 @@ fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_
             guest::record_guest(),
             mode::SPIN_IN_CONSTRUCTOR,
         );
-        let scorer = |plugin: &Arc<Plugin>| Weighted {
+        let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
             scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
             weight: 1.0,
         };
@@ -7999,7 +8015,7 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
     hog.fuel_per_micro = SLOW_CALIBRATION;
     hog.budget_micros = SLOW_FRAME_MICROS;
     let hog = loaded(&runtime, hog);
-    let scorer = |plugin: &Arc<Plugin>| Weighted {
+    let scorer = |plugin: &Arc<Plugin>| WeightedScorer {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
     };
@@ -8059,11 +8075,11 @@ fn a_third_stage_spinner_behind_its_own_cheap_stages_opens_at_the_window() {
             mode::SPIN_IN_PICK,
         );
         let bound = spinner.bind();
-        let own = Weighted {
+        let own = WeightedScorer {
             scorer: Box::new(WasmScorer::new(bound.clone(), None)),
             weight: 1.0,
         };
-        let other = Weighted {
+        let other = WeightedScorer {
             scorer: Box::new(WasmScorer::new(honest.bind(), None)),
             weight: 1.0,
         };
@@ -8233,7 +8249,7 @@ fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
     reading.needs.affinity = true;
     let plugin = loaded(&runtime, reading);
     let scorers = || {
-        vec![Weighted {
+        vec![WeightedScorer {
             scorer: Box::new(LeastRequests),
             weight: 1.0,
         }]
@@ -8261,7 +8277,7 @@ fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
 /// asked behind the filter, behind a scorer and behind the picker.
 #[test]
 fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
-    use smg_policy_controller::{Filter, Picker, Scorer, Targets, TieBand};
+    use smg_policy_controller::engine::{Filter, Picker, Scorer, Targets, TieBand};
 
     #[derive(Debug)]
     struct ColumnReader;
@@ -8389,7 +8405,7 @@ fn a_named_deciders_instance_is_its_names_on_whichever_thread_acts_as_it() {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _turn = Decider::new(number).enter();
+                    let _turn = DecisionSlot::new(number).enter();
                     if dispatch {
                         engine.on_dispatched(
                             &Lease::default(),
@@ -8452,7 +8468,7 @@ fn a_threads_own_instance_stands_aside_while_it_acts_as_a_named_decider() {
     dispatch();
     assert_eq!(pick(), Some(101), "the thread's own instance heard it");
     {
-        let _turn = Decider::new(5).enter();
+        let _turn = DecisionSlot::new(5).enter();
         assert_eq!(pick(), Some(100), "the named decider's heard nothing");
         dispatch();
         dispatch();
@@ -8586,7 +8602,7 @@ fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
             std::thread::scope(|scope| {
                 scope
                     .spawn(|| {
-                        let _turn = Decider::new(4).enter();
+                        let _turn = DecisionSlot::new(4).enter();
                         pair()
                     })
                     .join()
@@ -8617,7 +8633,7 @@ fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
 /// the list as it stands first.
 #[test]
 fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(&runtime, "fed", guest::record_guest(), mode::COUNT_MEMBERS);
     let engine = plugin_engine(&plugin);
@@ -8627,7 +8643,7 @@ fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _turn = Decider::new(number).enter();
+                    let _turn = DecisionSlot::new(number).enter();
                     pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
                 })
                 .join()
@@ -8678,7 +8694,7 @@ fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
 /// lease's event is heard before it.
 #[test]
 fn an_instance_made_anew_hears_the_membership_as_it_stands() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(&runtime, "anew", guest::record_guest(), mode::COUNT_MEMBERS);
     let engine = plugin_engine(&plugin);
@@ -8727,7 +8743,7 @@ fn an_instance_made_anew_hears_the_membership_as_it_stands() {
 /// hears one call for the word, and counts the members it counted.
 #[test]
 fn a_guest_level_with_the_feed_hears_the_models_a_worker_left() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(&runtime, "left", guest::record_guest(), mode::COUNT_MEMBERS);
     let engine = plugin_engine(&plugin);
@@ -8749,7 +8765,7 @@ fn a_guest_level_with_the_feed_hears_the_models_a_worker_left() {
 /// the list as it stands, as one snapshot.
 #[test]
 fn an_instance_behind_more_than_the_feed_keeps_hears_one_snapshot() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(
         &runtime,
@@ -8807,7 +8823,7 @@ fn an_instance_behind_more_than_the_feed_keeps_hears_one_snapshot() {
 /// plugin's own, not the fallback's.
 #[test]
 fn a_warm_up_whose_telling_faults_leaves_the_next_decision_the_plugins_own() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(
         &runtime,
@@ -8914,7 +8930,7 @@ fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try(
 #[derive(Clone, Copy, Debug)]
 enum Inside {
     /// Acts as another decider and warms the plugin there.
-    WarmsAs(Decider),
+    WarmsAs(DecisionSlot),
     /// Ends the thread's name and tells a dispatch under none.
     TellsUnderNoName,
     /// Hands the membership feed one worker that comes.
@@ -8922,12 +8938,12 @@ enum Inside {
     /// Moves the case's own clock to a time, in microseconds.
     MovesTheClock(&'static AtomicU64, u64),
     /// Lets another thread take a whole turn as a decider, and exit.
-    TurnsElsewhereAs(Decider),
+    TurnsElsewhereAs(DecisionSlot),
 }
 
 thread_local! {
     /// The name a case's thread holds, where a scope of the host can end it.
-    static HELD_NAME: std::cell::RefCell<Option<decider::Acting>> =
+    static HELD_NAME: std::cell::RefCell<Option<smg_policy_controller::engine::DecisionSlotGuard>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -8947,7 +8963,7 @@ impl std::fmt::Debug for ActsInside {
     }
 }
 
-impl smg_policy_controller::Filter for ActsInside {
+impl smg_policy_controller::engine::Filter for ActsInside {
     fn name(&self) -> &'static str {
         "acts-inside"
     }
@@ -8956,12 +8972,12 @@ impl smg_policy_controller::Filter for ActsInside {
         true
     }
 
-    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+    fn scope(&self) -> Option<&dyn smg_policy_controller::engine::DecisionScope> {
         Some(self)
     }
 }
 
-impl smg_policy_controller::DecisionScope for ActsInside {
+impl smg_policy_controller::engine::DecisionScope for ActsInside {
     fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
         match self.does {
             Inside::WarmsAs(other) => {
@@ -8975,7 +8991,7 @@ impl smg_policy_controller::DecisionScope for ActsInside {
             }
             Inside::HandsAMember(worker) => {
                 self.tells
-                    .on_membership(&smg_policy_controller::Membership::Added(worker));
+                    .on_membership(&smg_policy_controller::tracking::Membership::Added(worker));
             }
             Inside::MovesTheClock(clock, to) => clock.store(to, Ordering::Relaxed),
             Inside::TurnsElsewhereAs(other) => {
@@ -9026,8 +9042,8 @@ fn a_thread_that_turns_to_another_name_gives_the_held_one_back_first() {
         mode::COUNT_DISPATCHES,
     );
     let plain = Arc::new(plugin_engine(&plugin));
-    let turning = engine_that(&plugin, &plain, Inside::WarmsAs(Decider::new(6)));
-    let first = Decider::new(5);
+    let turning = engine_that(&plugin, &plain, Inside::WarmsAs(DecisionSlot::new(6)));
+    let first = DecisionSlot::new(5);
     {
         let _turn = first.enter();
         for _ in 0..2 {
@@ -9074,7 +9090,7 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
     let pick = |seed| pick_ids(&decide(&plain, &pool(4), seed)).first().copied();
     // The thread is a decider of its own: its instance heard nothing.
     assert_eq!(pick(1), Some(100));
-    let first = Decider::new(5);
+    let first = DecisionSlot::new(5);
     HELD_NAME.set(Some(first.enter()));
     for _ in 0..2 {
         plain.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
@@ -9082,7 +9098,7 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
     // The plugin's scope brings the first decider's instance. The host's
     // scope then ends the name and tells a dispatch under none.
     let _ = decide(&ending, &pool(4), 2);
-    assert_eq!(Decider::acting(), None, "the scope ended the name");
+    assert_eq!(DecisionSlot::acting(), None, "the scope ended the name");
     assert_eq!(pick(3), Some(101), "the thread's own instance heard it");
     let as_first = std::thread::scope(|scope| {
         scope
@@ -9113,7 +9129,7 @@ fn both_opens_of_a_pair_decide_on_the_instance_its_bring_brought() {
         mode::COUNT_DISPATCHES,
     );
     let plain = Arc::new(plugin_engine(&plugin));
-    let first = Decider::new(5);
+    let first = DecisionSlot::new(5);
     // The first side's profile: the plugin's scope opens and brings the
     // decider's instance, then the host's scope lets another thread take a
     // turn as that decider. The second side's open follows it.
@@ -9147,7 +9163,7 @@ fn both_opens_of_a_pair_decide_on_the_instance_its_bring_brought() {
 /// instance: it is heard at the next decision's first open.
 #[test]
 fn a_change_handed_between_a_pairs_opens_is_heard_at_the_next_decision() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(
         &runtime,
@@ -9183,7 +9199,7 @@ fn a_change_handed_between_a_pairs_opens_is_heard_at_the_next_decision() {
 /// as it stands before the side reads it.
 #[test]
 fn a_pair_that_straddles_the_cool_down_hears_the_feed_at_the_open_that_reaches_it() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     const START: u64 = 1_000_000;
     const COOL_DOWN: u64 = 1_000_000;
     // The host's clock is the case's own: the cool-down ends when the first
@@ -9266,7 +9282,7 @@ fn own_pick(plugin: &Plugin, engine: &Engine) -> Option<u64> {
 /// membership is the membership as the host told it.
 #[test]
 fn a_change_told_ahead_of_a_leases_event_is_heard_ahead_of_it() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(
         &runtime,
@@ -9291,7 +9307,7 @@ fn a_change_told_ahead_of_a_leases_event_is_heard_ahead_of_it() {
 /// told them, each by its own kind.
 #[test]
 fn an_instance_behind_hears_a_relabelling_and_a_resize_each_as_told() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(&runtime, "kinds", guest::record_guest(), mode::COUNT_KINDS);
     let engine = plugin_engine(&plugin);
@@ -9312,7 +9328,7 @@ fn an_instance_behind_hears_a_relabelling_and_a_resize_each_as_told() {
 /// hears the list as it stands.
 #[test]
 fn the_feeds_list_holds_a_worker_once_and_takes_an_unknown_ones_replacement() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let runtime = runtime();
     let plugin = load(
         &runtime,
@@ -9355,7 +9371,7 @@ fn a_thread_that_acted_under_a_name_alone_only_tells_under_none() {
         scope
             .spawn(|| {
                 {
-                    let _turn = Decider::new(3).enter();
+                    let _turn = DecisionSlot::new(3).enter();
                     let _ = decide(&engine, &pool(4), 1);
                 }
                 let decided = plugin.stats();
@@ -9393,7 +9409,7 @@ fn a_named_deciders_latency_window_is_one_on_whichever_thread_acts_as_it() {
     // A cold decision's `init` is slow by its own fuel. A warm decision
     // brings the ring once and gives it back once.
     let decide_as_eight = |seed: u64, cold: bool| {
-        let _turn = Decider::new(8).enter();
+        let _turn = DecisionSlot::new(8).enter();
         if cold {
             plugin.forget_instance();
         }
@@ -9463,7 +9479,7 @@ fn a_warm_up_that_asks_first_warms_every_named_decider() {
     );
     assert!(plugin.is_warm(), "the thread that loaded, by the load's");
     for name in 0..3 {
-        let _turn = Decider::new(name).enter();
+        let _turn = DecisionSlot::new(name).enter();
         assert!(!plugin.is_warm(), "decider {name} holds none yet");
         plugin.warm().expect("it warms");
         assert!(plugin.is_warm(), "decider {name} holds its own");
@@ -9481,7 +9497,7 @@ fn a_warm_up_that_asks_first_warms_every_named_decider() {
 /// the feed hears the two in the host's order, one call each.
 #[test]
 fn an_instance_behind_hears_the_models_a_worker_left_ahead_of_its_relabelling() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let models = ["m-chat".to_owned(), "m-embed".to_owned()];
     for (world, component) in [
         ("left-record", guest::record_guest()),
@@ -9538,7 +9554,7 @@ fn a_module_of_an_older_minor_is_refused_by_the_range() {
 /// models a worker left among the changes it missed.
 #[test]
 fn an_instance_that_hears_a_snapshot_for_what_it_missed_hears_no_left_word() {
-    use smg_policy_controller::Membership;
+    use smg_policy_controller::tracking::Membership;
     let models = ["m-chat".to_owned(), "m-embed".to_owned()];
     let runtime = runtime();
     let plugin = load(&runtime, "behind", guest::record_guest(), mode::COUNT_LEFT);

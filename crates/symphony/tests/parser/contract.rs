@@ -348,6 +348,10 @@ fn llama_nemotron() -> Box<dyn Parser> {
     ))
 }
 
+fn command() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Command.format(), Declared::default()))
+}
+
 fn function_gemma() -> Box<dyn Parser> {
     Box::new(Engine::new(
         Table::FunctionGemma.format(),
@@ -571,6 +575,11 @@ fn gpt_oss_template() -> Box<dyn Parser> {
             .stop_tokens(["<|return|>", "<|endoftext|>", "<|call|>"]),
         Declared::default(),
     ))
+}
+
+/// The crate's own gpt-oss table, which no registry row lists yet.
+fn gpt_oss_table() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::gpt_oss(), Declared::default()))
 }
 
 fn space() -> Class {
@@ -1087,6 +1096,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::LlamaNemotron),
     },
     Subject {
+        name: "command",
+        new: command,
+        outputs: COMMAND_OUTPUTS,
+        table: Some(Table::Command),
+    },
+    Subject {
         name: "function gemma",
         new: function_gemma,
         outputs: FUNCTION_GEMMA_OUTPUTS,
@@ -1102,6 +1117,12 @@ const FORMATS: &[Subject] = &[
         name: "gpt-oss test template, its calls as a shape",
         new: gpt_oss_template,
         outputs: GPT_OSS_OUTPUTS,
+        table: None,
+    },
+    Subject {
+        name: "gpt-oss table, not listed yet",
+        new: gpt_oss_table,
+        outputs: GPT_OSS_TABLE_OUTPUTS,
         table: None,
     },
     Subject {
@@ -1211,6 +1232,29 @@ const GPT_OSS_OUTPUTS: &[&str] = &[
     "<|channel|>commentary to=functions.f<|message|>{} trailing",
     "",
     "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Paris\", \"days\": ,}",
+];
+
+/// The gpt-oss table: a call under either order of its header and on the analysis channel, a
+/// preamble, the model's own tools under either order, a recipient that is no function, a header
+/// with no channel, a marker that names no tool, a header the end leaves unfinished, a call a
+/// start marker ends, and nothing.
+const GPT_OSS_TABLE_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>User asks for the weather.<|end|><|start|>assistant\
+     <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+     {\"city\": \"Paris\", \"days\": 3}",
+    " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Par",
+    "<|channel|>analysis to=functions.get-weather.v2 <|constrain|>json<|message|>{}",
+    "<|channel|>commentary<|message|>Looking it up.<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    " to=python<|channel|>analysis<|message|>print(1)<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    "<|channel|>analysis to=browser.search code<|message|>{\"query\": \"x\"}",
+    "<|channel|>commentary to=repo_browser.print_tree <|constrain|>json<|message|>{\"path\": \".\"}",
+    "<|message|>Plain.<|end|> after",
+    "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+    "<|channel|>commentary to=functions.get_weather json",
+    "<|channel|>commentary to=functions.get_weather json<|message|><|start|>assistant",
+    "",
 ];
 
 /// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
@@ -1590,6 +1634,18 @@ const MISTRAL_OUTPUTS: &[&str] = &[
     // A trailing comma and a value left out, at a call its object's brace closes.
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", }",
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": ,}[TOOL_CALLS]get_stock_price[ARGS]{}",
+];
+
+/// Command's turn: the thought, the list of calls and the answer, each between its own markers;
+/// an answer with no marker, the list cut, and prose where the list should be.
+const COMMAND_OUTPUTS: &[&str] = &[
+    "<|START_THINKING|>The user asks about Paris.<|END_THINKING|><|START_ACTION|>[\n    \
+     {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}},\n    \
+     {\"tool_call_id\": \"1\", \"tool_name\": \"get_stock_price\", \"parameters\": {}}\n]<|END_ACTION|>",
+    "<|START_THINKING|>No tool is needed.<|END_THINKING|><|START_RESPONSE|>Hello!<|END_RESPONSE|>",
+    "Hello!",
+    "<|START_ACTION|>[\n    {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
+    "<|START_ACTION|>not a list<|END_ACTION|>",
 ];
 
 /// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before

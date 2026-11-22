@@ -364,6 +364,9 @@ struct PushedFile {
     /// until a flush finds the pusher `Ready`: that one writes every
     /// rank's series, publishes the report and clears the mark.
     series_held: bool,
+    /// The pusher stands in the flush's queue: a record of the same window
+    /// queues it once.
+    queued: bool,
 }
 
 impl PushedFile {
@@ -373,6 +376,7 @@ impl PushedFile {
             report: WorkerLoadResponse::default(),
             pusher: Arc::clone(pusher),
             series_held: false,
+            queued: false,
         }
     }
 
@@ -484,15 +488,17 @@ pub struct WorkerMonitor<G> {
     /// pushed nothing since the poll began ([`Self::lay_polled`]).
     /// A record's readers borrow it, and the coalesced publish copies it
     /// once per window, so a record builds no report of its own. This map
-    /// and the one below are keyed by the worker's URL, a string of the
-    /// gateway's own, and every record looks its worker up in each: they
-    /// hash with FxHash. The sink is called under this map's lock at a
-    /// record and at a poll's answer: the lock rule of [`LoadSink`]. Each
-    /// report stands with the incarnation that started it ([`PushedFile`]).
+    /// is keyed by the worker's URL, a string of the gateway's own, and
+    /// every record looks its worker up in it: it hashes with FxHash. The
+    /// sink is called under this map's lock at a record and at a poll's
+    /// answer: the lock rule of [`LoadSink`]. Each report stands with the
+    /// incarnation that started it ([`PushedFile`]).
     pushed_reports: Mutex<FxHashMap<String, PushedFile>>,
     /// The workers whose report changed since the last coalesced publish,
-    /// each with the incarnation that pushed, for the publish fence.
-    pending_pushed: Mutex<FxHashMap<String, Arc<dyn Worker>>>,
+    /// each the incarnation that pushed, for the publish fence. A file's
+    /// mark keeps its pusher here once a window, so a record hashes no URL
+    /// and copies no key for it.
+    pending_pushed: Mutex<Vec<Arc<dyn Worker>>>,
     pushed_notify: Arc<Notify>,
     pushed_flush_task: Mutex<Option<JoinHandle<()>>>,
     /// The sink [`Self::new`] built, for the cases that read its receipts.
@@ -642,7 +648,7 @@ impl<G: Generation> WorkerMonitor<G> {
             eviction_flush_task: Mutex::new(None),
             liveness_sweep_task: Mutex::new(None),
             pushed_reports: Mutex::new(FxHashMap::default()),
-            pending_pushed: Mutex::new(FxHashMap::default()),
+            pending_pushed: Mutex::new(Vec::new()),
             pushed_notify: Arc::new(Notify::new()),
             pushed_flush_task: Mutex::new(None),
             #[cfg(test)]
@@ -709,10 +715,10 @@ impl<G: Generation> WorkerMonitor<G> {
         // its series under that sentinel.
         let ready =
             runtime.map_or_else(|| worker.status(), |state| state.status()) == WorkerStatus::Ready;
-        if !reports
-            .get(url)
-            .is_some_and(|file| Arc::ptr_eq(&file.pusher, worker))
-        {
+        let mut on_file = reports
+            .get_mut(url)
+            .filter(|file| Arc::ptr_eq(&file.pusher, worker));
+        if on_file.is_none() {
             // A report is on file for the registry's worker at its URL
             // alone, by identity, and holds that worker's records alone.
             // Its status is not read: a worker that is not `Ready` still
@@ -737,9 +743,10 @@ impl<G: Generation> WorkerMonitor<G> {
                 self.sink.forget(&left.pusher);
                 self.clear_series(&reports, &left.pusher, Some(&left.report));
             }
+            on_file = reports.get_mut(url);
         }
         // On file: made just above when it was not.
-        let Some(file) = reports.get_mut(url) else {
+        let Some(file) = on_file else {
             return;
         };
         let report = &mut file.report;
@@ -802,15 +809,10 @@ impl<G: Generation> WorkerMonitor<G> {
         // poll feeds the cache (`poll_group_once`).
         //
         // The window's publish takes the report once, under the incarnation
-        // that pushed last.
-        {
-            let mut pending = self.pending_pushed.lock();
-            if pending
-                .get(url)
-                .is_none_or(|source| !Arc::ptr_eq(source, worker))
-            {
-                pending.insert(url.to_string(), Arc::clone(worker));
-            }
+        // that pushed last: the file's pusher, queued once a window.
+        if !file.queued {
+            file.queued = true;
+            self.pending_pushed.lock().push(Arc::clone(worker));
         }
         drop(reports);
         self.start_pushed_flusher();
@@ -1176,29 +1178,36 @@ impl<G: Generation> WorkerMonitor<G> {
     /// writes its held series and publishes its row, with no record since.
     pub(crate) fn flush_pushed(&self) {
         let mut reports = self.pushed_reports.lock();
-        let changed: Vec<(String, Arc<dyn Worker>)> = self.pending_pushed.lock().drain().collect();
-        if changed.is_empty() {
+        let mut pending = self.pending_pushed.lock();
+        if pending.is_empty() {
             return;
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let mut fresh: Vec<PushedReport> = Vec::with_capacity(changed.len());
-        let mut held: Vec<(String, Arc<dyn Worker>)> = Vec::new();
-        for (url, worker) in changed {
+        let mut fresh: Vec<PushedReport> = Vec::with_capacity(pending.len());
+        let mut held: Vec<Arc<dyn Worker>> = Vec::new();
+        for worker in pending.drain(..) {
+            // A worker whose file went to the next worker at its URL has
+            // nothing here: that one queued itself.
             let Some(file) = reports
-                .get_mut(url.as_str())
-                .filter(|file| !file.report.loads.is_empty())
+                .get_mut(worker.url())
+                .filter(|file| Arc::ptr_eq(&file.pusher, &worker))
             else {
                 continue;
             };
+            file.queued = false;
+            if file.report.loads.is_empty() {
+                continue;
+            }
             if file.series_held {
                 if !self.load_state.is_current_incarnation(&worker) {
                     // Held still, and the fence would refuse it: it stays
                     // queued for the flush that finds its worker `Ready`.
-                    held.push((url, worker));
+                    file.queued = true;
+                    held.push(worker);
                     continue;
                 }
                 for at in 0..file.report.loads.len() {
-                    file.write_rank_series(at, url.as_str(), worker.model_id());
+                    file.write_rank_series(at, worker.url(), worker.model_id());
                 }
                 file.series_held = false;
             }
@@ -1215,17 +1224,16 @@ impl<G: Generation> WorkerMonitor<G> {
                 }),
             ));
         }
+        // Under the hold of the reports still: no record has queued one of
+        // these workers since the drain above.
+        pending.extend(held);
+        drop(pending);
         if !fresh.is_empty() {
             // No URL is pruned. A report the fence admits overwrites its
             // worker's row, and a row of another worker it overwrites ends
             // there. A refused one leaves the row to the eviction, which
             // writes the sentinel of the series with it.
             self.publish_rows(&reports, &[], fresh);
-        }
-        if !held.is_empty() {
-            // Under the hold of the reports still: no record has queued
-            // one of these workers since the drain above.
-            self.pending_pushed.lock().extend(held);
         }
     }
 
@@ -1522,13 +1530,12 @@ impl<G: Generation> WorkerMonitor<G> {
                     self.clear_series(&reports, worker, Some(&file.report));
                 }
                 // Its place in the flush's queue goes too, where a held
-                // report waits: the queue keeps no worker that is gone.
-                let mut pending = self.pending_pushed.lock();
-                if pending
-                    .get(url)
-                    .is_some_and(|source| Arc::ptr_eq(source, worker))
-                {
-                    pending.remove(url);
+                // report waits. A worker whose file its successor took
+                // over keeps its place until the next flush, which skips it.
+                if report.is_some_and(|file| file.queued) {
+                    self.pending_pushed
+                        .lock()
+                        .retain(|queued| !Arc::ptr_eq(queued, worker));
                 }
             }
         }

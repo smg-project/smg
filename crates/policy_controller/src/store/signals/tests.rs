@@ -11,13 +11,18 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    engine::door::{Door, Request},
-    store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, SignalSink, Taken,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+    document::{AppliedSpec, Needs, PolicySpec, API_VERSION},
+    engine::{
+        store_backed_engine::{Request, StoreBackedEngine},
+        Candidate, Constraints, LoadRow, Phase, RequestFacts, Role, Scorer, TieBand, WireModes,
+        WorkerId,
     },
-    AppliedSpec, Candidate, Catalog, Constraints, Lifecycle, LoadRow, Needs, Phase, PolicySpec,
-    RequestFacts, Role, Scorer, SignalColumn, TieBand, WireModes, WorkerId, API_VERSION,
+    load::SignalColumn,
+    stages::{Lifecycle, StageRegistry},
+    store::{
+        GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, SignalSink, SignalWriteOutcome,
+        ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore,
+    },
 };
 
 const POOL: &str = "work";
@@ -105,7 +110,7 @@ impl Scorer for SeesCells {
 }
 
 struct Stages {
-    catalog: Catalog,
+    catalog: StageRegistry,
     read: Read,
     saw_cells: Arc<Mutex<Vec<bool>>>,
 }
@@ -114,7 +119,7 @@ fn stages() -> Stages {
     let read = Read::default();
     let saw_cells = Arc::<Mutex<Vec<bool>>>::default();
     let (kept, seen) = (Arc::clone(&read), Arc::clone(&saw_cells));
-    let mut catalog = Catalog::builtin();
+    let mut catalog = StageRegistry::builtin();
     catalog
         .scorer_with("by-value", move |build| {
             let named: Named = build.params()?;
@@ -211,7 +216,7 @@ fn fleet(stages: &Stages) -> (Arc<MemoryStore>, [WorkerId; 3]) {
     (store, ids)
 }
 
-fn write(store: &MemoryStore, id: WorkerId, value: f64, at: Instant) -> Taken {
+fn write(store: &MemoryStore, id: WorkerId, value: f64, at: Instant) -> SignalWriteOutcome {
     store.signal_value(id, 0, &store.signal_column(QUEUE), REQUESTS, value, at)
 }
 
@@ -229,7 +234,7 @@ fn foreign(stages: &Stages, name: &str, unit: &str) -> SignalColumn {
 /// `role`, by worker: a cell's value and its sample instant, or none.
 fn lent(store: &MemoryStore, role: Role) -> Vec<(WorkerId, Held)> {
     store.deciding(|world| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GATEWAY,
             now: Instant::now(),
             pinned: None,
@@ -243,8 +248,8 @@ fn lent(store: &MemoryStore, role: Role) -> Vec<(WorkerId, Held)> {
         let block = view.signal_cells.expect("the publication's block");
         assert!(block.fits(view.candidates.len()), "one cell a row a signal");
         let cells = block.cells().chunks(block.signals());
-        let of = |cells: &[crate::SignalCell]| {
-            let held = |cell: &crate::SignalCell| {
+        let of = |cells: &[crate::load::SignalCell]| {
+            let held = |cell: &crate::load::SignalCell| {
                 (!cell.is_none()).then_some((cell.value, cell.sampled_at_micros))
             };
             cells.iter().map(held).collect()
@@ -276,7 +281,12 @@ fn request(id: &[u8]) -> Request<'_> {
 }
 
 /// The worker one decision of `request` picks.
-fn picked(door: &Door, gateway: GatewayId, request: &Request<'_>, now: Instant) -> WorkerId {
+fn picked(
+    door: &StoreBackedEngine,
+    gateway: GatewayId,
+    request: &Request<'_>,
+    now: Instant,
+) -> WorkerId {
     let decided = door.decide(gateway, request, now).expect("a decision");
     let pick = decided.decision.pick().expect("a pick");
     pick.targets.first().expect("a target").id
@@ -300,7 +310,7 @@ fn a_written_value_stands_at_its_rows_place_in_the_next_publication_and_a_decisi
     let stages = stages();
     let (store, [a, b, c]) = fleet(&stages);
     let at = Instant::now();
-    assert_eq!(write(&store, b, 7.0, at), Taken::Written);
+    assert_eq!(write(&store, b, 7.0, at), SignalWriteOutcome::Written);
     assert_eq!(
         values(&store),
         by_id([(a, None), (b, Some(7.0)), (c, None)])
@@ -312,7 +322,7 @@ fn a_written_value_stands_at_its_rows_place_in_the_next_publication_and_a_decisi
     assert_eq!(sampled, [(7.0, store.micros(at))]);
 
     // The decision is handed the publication's own block.
-    let door = Door::new(Arc::clone(&store));
+    let door = StoreBackedEngine::new(Arc::clone(&store));
     assert_eq!(picked(&door, GATEWAY, &request(b"r-1"), at), b);
     assert_eq!(
         stages.read_of(QUEUE),
@@ -335,7 +345,10 @@ fn fleet_with(
     });
     stages.apply(&store, &queue_document(4));
     for (id, value) in ids.into_iter().zip([10.0, 20.0, 30.0]) {
-        assert_eq!(write(&store, id, value, Instant::now()), Taken::Written);
+        assert_eq!(
+            write(&store, id, value, Instant::now()),
+            SignalWriteOutcome::Written
+        );
     }
     (store, ids)
 }
@@ -362,7 +375,7 @@ fn rows_written_for_a_gateway_read_their_own_values_at_their_new_places() {
             ..facts
         });
         moves += moved(ids, local);
-        let door = Door::new(Arc::clone(&store));
+        let door = StoreBackedEngine::new(Arc::clone(&store));
         let mut expected = [
             (ids[0], Some(10.0)),
             (ids[1], Some(20.0)),
@@ -403,7 +416,7 @@ fn rows_a_gateways_wires_leave_read_their_own_values_at_their_new_places() {
             ..facts
         });
         moves += moved(ids, cut);
-        let door = Door::new(Arc::clone(&store));
+        let door = StoreBackedEngine::new(Arc::clone(&store));
         let mut asked = request(b"wired");
         asked.constraints.wire_modes = WireModes::GRPC;
         let most = if cut == 2 { ids[1] } else { ids[2] };
@@ -449,9 +462,9 @@ fn each_side_of_a_pair_reads_its_own_pools_values() {
         .chain(decodes)
         .zip([11.0, 12.0, 61.0, 62.0]);
     for (id, value) in stated {
-        assert_eq!(write(&store, id, value, at), Taken::Written);
+        assert_eq!(write(&store, id, value, at), SignalWriteOutcome::Written);
     }
-    let door = Door::new(Arc::clone(&store));
+    let door = StoreBackedEngine::new(Arc::clone(&store));
     let mut asked = request(b"pair");
     asked.facts.phase = Phase::Prefill;
     let decided = door.decide(GATEWAY, &asked, at).expect("a pair's decision");
@@ -479,25 +492,43 @@ fn a_write_that_is_not_taken_says_what_became_of_it_and_is_counted() {
         foreign(&stages, "depth", REQUESTS),
     );
     let write = |id, column, unit, value, at| store.signal_value(id, 0, column, unit, value, at);
-    assert_eq!(write(a, &queue, REQUESTS, 5.0, at), Taken::Written);
-    assert_eq!(write(a, &depth, REQUESTS, 5.0, at), Taken::Undeclared);
-    assert_eq!(write(a, &queue, "tokens", 5.0, at), Taken::WrongUnit);
-    assert_eq!(write(a, &queue, REQUESTS, f64::NAN, at), Taken::OutOfRange);
+    assert_eq!(
+        write(a, &queue, REQUESTS, 5.0, at),
+        SignalWriteOutcome::Written
+    );
+    assert_eq!(
+        write(a, &depth, REQUESTS, 5.0, at),
+        SignalWriteOutcome::Undeclared
+    );
+    assert_eq!(
+        write(a, &queue, "tokens", 5.0, at),
+        SignalWriteOutcome::WrongUnit
+    );
+    assert_eq!(
+        write(a, &queue, REQUESTS, f64::NAN, at),
+        SignalWriteOutcome::OutOfRange
+    );
     assert_eq!(
         write(a, &queue, REQUESTS, f64::INFINITY, at),
-        Taken::OutOfRange
+        SignalWriteOutcome::OutOfRange
     );
     assert_eq!(
         write(WorkerId(u64::MAX), &queue, REQUESTS, 5.0, at),
-        Taken::NotAMember
+        SignalWriteOutcome::NotAMember
     );
     let before = at
         .checked_sub(Duration::from_millis(1))
         .expect("a millisecond");
-    assert_eq!(write(a, &queue, REQUESTS, 9.0, before), Taken::Older);
+    assert_eq!(
+        write(a, &queue, REQUESTS, 9.0, before),
+        SignalWriteOutcome::Older
+    );
     // One count a kind, in the outcomes' order, and the value taken stands.
-    assert_eq!(Taken::EACH.map(Taken::label)[1], "undeclared");
-    assert_eq!(store.counts().signal_writes, [1, 1, 1, 2, 1, 1]);
+    assert_eq!(
+        SignalWriteOutcome::EACH.map(SignalWriteOutcome::label)[1],
+        "undeclared"
+    );
+    assert_eq!(store.stats().signal_writes, [1, 1, 1, 2, 1, 1]);
     assert_eq!(
         values(&store),
         by_id([(a, Some(5.0)), (b, None), (c, None)])
@@ -515,12 +546,19 @@ fn a_value_past_the_magnitude_bound_is_refused_and_counted() {
     let at = Instant::now();
     let past = f64::from_bits(1e15_f64.to_bits() + 1);
     assert!(past > 1e15 && past.is_finite());
-    assert_eq!(write(&store, a, 1e15, at), Taken::Written);
-    assert_eq!(write(&store, b, -1e15, at), Taken::Written);
+    assert_eq!(write(&store, a, 1e15, at), SignalWriteOutcome::Written);
+    assert_eq!(write(&store, b, -1e15, at), SignalWriteOutcome::Written);
     for value in [past, -past, f64::MAX, f64::NEG_INFINITY] {
-        assert_eq!(write(&store, c, value, at), Taken::OutOfRange, "{value}");
+        assert_eq!(
+            write(&store, c, value, at),
+            SignalWriteOutcome::OutOfRange,
+            "{value}"
+        );
     }
-    assert_eq!(store.counts().signal_writes[Taken::OutOfRange.place()], 4);
+    assert_eq!(
+        store.stats().signal_writes[SignalWriteOutcome::OutOfRange.place()],
+        4
+    );
     assert_eq!(
         values(&store),
         by_id([(a, Some(1e15)), (b, Some(-1e15)), (c, None)])
@@ -535,7 +573,7 @@ fn a_value_stated_for_another_rank_reaches_no_row() {
     // for that rank, as a load record would be, and on no row.
     let queue = store.signal_column(QUEUE);
     let taken = store.signal_value(a, 1, &queue, REQUESTS, 7.0, Instant::now());
-    assert_eq!(taken, Taken::Written);
+    assert_eq!(taken, SignalWriteOutcome::Written);
     assert_eq!(values(&store), by_id([(a, None), (b, None), (c, None)]));
 }
 
@@ -546,18 +584,18 @@ fn of_two_sources_the_newer_sample_stands_whichever_arrives_last() {
     let early = Instant::now();
     let late = early + Duration::from_millis(10);
     // The newer first: the older is dropped.
-    assert_eq!(write(&store, a, 5.0, late), Taken::Written);
-    assert_eq!(write(&store, a, 3.0, early), Taken::Older);
+    assert_eq!(write(&store, a, 5.0, late), SignalWriteOutcome::Written);
+    assert_eq!(write(&store, a, 3.0, early), SignalWriteOutcome::Older);
     // The older first: the newer takes its place.
-    assert_eq!(write(&store, b, 3.0, early), Taken::Written);
-    assert_eq!(write(&store, b, 5.0, late), Taken::Written);
+    assert_eq!(write(&store, b, 3.0, early), SignalWriteOutcome::Written);
+    assert_eq!(write(&store, b, 5.0, late), SignalWriteOutcome::Written);
     let cells = lent(&store, Role::Single);
     for id in [a, b] {
         let held = cells.iter().find(|(row, _)| *row == id).expect("the row");
         assert_eq!(held.1, [Some((5.0, store.micros(late)))], "{id:?}");
     }
     // Two values of one instant: the last one written stands.
-    assert_eq!(write(&store, a, 8.0, late), Taken::Written);
+    assert_eq!(write(&store, a, 8.0, late), SignalWriteOutcome::Written);
     let cells = lent(&store, Role::Single);
     let held = cells.iter().find(|(row, _)| *row == a).expect("the row");
     assert_eq!(held.1, [Some((8.0, store.micros(late)))]);
@@ -576,8 +614,8 @@ fn a_value_stands_until_its_signals_maximum_age_ends_it() {
         ),
     );
     let at = Instant::now();
-    assert_eq!(write(&store, a, 7.0, at), Taken::Written);
-    let door = Door::new(Arc::clone(&store));
+    assert_eq!(write(&store, a, 7.0, at), SignalWriteOutcome::Written);
+    let door = StoreBackedEngine::new(Arc::clone(&store));
     // At exactly its maximum age the value is read.
     picked(
         &door,
@@ -610,7 +648,7 @@ fn a_value_stands_until_its_signals_maximum_age_ends_it() {
 fn a_value_that_rides_one_record_in_ten_is_read_between_them_under_its_own_instant() {
     let stages = stages();
     let (store, [a, b, c]) = fleet(&stages);
-    let door = Door::new(Arc::clone(&store));
+    let door = StoreBackedEngine::new(Arc::clone(&store));
     let start = Instant::now();
     let record = |nth: u32| {
         let at = start + Duration::from_millis(100) * nth;
@@ -623,7 +661,7 @@ fn a_value_that_rides_one_record_in_ten_is_read_between_them_under_its_own_insta
     };
     // The first record carries the value, and the nine behind it none.
     let first = record(0);
-    assert_eq!(write(&store, a, 9.0, first), Taken::Written);
+    assert_eq!(write(&store, a, 9.0, first), SignalWriteOutcome::Written);
     let mut last = first;
     for nth in 1..10 {
         last = record(nth);
@@ -658,8 +696,8 @@ fn a_new_document_keeps_a_name_it_declares_again_and_starts_a_changed_unit_empty
     let at = Instant::now();
     let write =
         |name, unit, value| store.signal_value(a, 0, &store.signal_column(name), unit, value, at);
-    assert_eq!(write("depth", "items", 3.0), Taken::Written);
-    assert_eq!(write("heat", "celsius", 71.0), Taken::Written);
+    assert_eq!(write("depth", "items", 3.0), SignalWriteOutcome::Written);
+    assert_eq!(write("heat", "celsius", 71.0), SignalWriteOutcome::Written);
 
     // A name before both moves the columns, and one unit changes.
     let after = json!({
@@ -679,12 +717,12 @@ fn a_new_document_keeps_a_name_it_declares_again_and_starts_a_changed_unit_empty
     let cells = |id| &held.iter().find(|(row, _)| *row == id).expect("the row").1;
     assert_eq!(*cells(a), [None, None, Some((71.0, store.micros(at)))]);
     assert_eq!(*cells(b), [None, None, None]);
-    let door = Door::new(Arc::clone(&store));
+    let door = StoreBackedEngine::new(Arc::clone(&store));
     assert_eq!(picked(&door, GATEWAY, &request(b"r-1"), at), a);
     assert_eq!(stages.read_of("heat"), by_id([(a, Some(71.0)), (b, None)]));
     // The table went under the new columns too: a write lands at them.
-    assert_eq!(write("depth", "items", 4.0), Taken::WrongUnit);
-    assert_eq!(write("depth", "blocks", 4.0), Taken::Written);
+    assert_eq!(write("depth", "items", 4.0), SignalWriteOutcome::WrongUnit);
+    assert_eq!(write("depth", "blocks", 4.0), SignalWriteOutcome::Written);
     let held = lent(&store, Role::Single);
     let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
     assert_eq!(cells[..2], [None, Some((4.0, store.micros(at)))]);
@@ -701,8 +739,8 @@ fn a_new_document_that_changes_a_signals_reduction_starts_the_name_empty() {
     let at = Instant::now();
     let write =
         |name, unit, value| store.signal_value(a, 0, &store.signal_column(name), unit, value, at);
-    assert_eq!(write("depth", "items", 3.0), Taken::Written);
-    assert_eq!(write("heat", "celsius", 71.0), Taken::Written);
+    assert_eq!(write("depth", "items", 3.0), SignalWriteOutcome::Written);
+    assert_eq!(write("heat", "celsius", 71.0), SignalWriteOutcome::Written);
 
     // The same names under the same units: one signal's ranks are made
     // one another way.
@@ -717,7 +755,7 @@ fn a_new_document_that_changes_a_signals_reduction_starts_the_name_empty() {
     let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
     assert_eq!(**cells, [None, Some((71.0, store.micros(at)))]);
     // The next report states the name again.
-    assert_eq!(write("depth", "items", 4.0), Taken::Written);
+    assert_eq!(write("depth", "items", 4.0), SignalWriteOutcome::Written);
     let held = lent(&store, Role::Single);
     let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
     assert_eq!(cells[0], Some((4.0, store.micros(at))));
@@ -748,14 +786,14 @@ fn a_write_under_a_column_read_before_a_document_lands_only_where_it_is_continue
     stages.apply(&store, &document(5, after, score));
     let write = |column, unit, value| store.signal_value(a, 0, column, unit, value, at);
     // Made as a sum, under a column that is now a maximum: refused.
-    assert_eq!(write(&depth, "items", 3.0), Taken::Undeclared);
+    assert_eq!(write(&depth, "items", 3.0), SignalWriteOutcome::Undeclared);
     // Continued: taken, at the column's new place.
-    assert_eq!(write(&heat, "celsius", 71.0), Taken::Written);
-    let counts = store.counts().signal_writes;
+    assert_eq!(write(&heat, "celsius", 71.0), SignalWriteOutcome::Written);
+    let counts = store.stats().signal_writes;
     assert_eq!(
         (
-            counts[Taken::Written.place()],
-            counts[Taken::Undeclared.place()]
+            counts[SignalWriteOutcome::Written.place()],
+            counts[SignalWriteOutcome::Undeclared.place()]
         ),
         (1, 1)
     );
@@ -789,9 +827,12 @@ fn a_write_read_under_the_generation_before_lands_only_where_its_column_is_conti
     stages.apply(&store, &document(5, after, score));
     let write = |column, value, read| store.signal_write(a, 0, column, value, at, read);
     // Made as a sum, under a column that is now a maximum: not taken.
-    assert_eq!(write(&depth, 3.0, depth_read), Taken::Undeclared);
+    assert_eq!(
+        write(&depth, 3.0, depth_read),
+        SignalWriteOutcome::Undeclared
+    );
     // Continued: taken, at the column's new place.
-    assert_eq!(write(&heat, 71.0, heat_read), Taken::Written);
+    assert_eq!(write(&heat, 71.0, heat_read), SignalWriteOutcome::Written);
     let held = lent(&store, Role::Single);
     let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
     assert_eq!(**cells, [None, None, Some((71.0, store.micros(at)))]);
@@ -802,7 +843,7 @@ fn a_refused_document_moves_no_value() {
     let stages = stages();
     let (store, [a, b, c]) = fleet(&stages);
     let at = Instant::now();
-    assert_eq!(write(&store, a, 7.0, at), Taken::Written);
+    assert_eq!(write(&store, a, 7.0, at), SignalWriteOutcome::Written);
     // The standing generation's own number, under other columns.
     let document: PolicySpec = serde_json::from_value(document(
         4,
@@ -824,7 +865,7 @@ fn a_refused_document_moves_no_value() {
         values(&store),
         by_id([(a, Some(7.0)), (b, None), (c, None), (d, None)])
     );
-    assert_eq!(write(&store, a, 8.0, at), Taken::Written);
+    assert_eq!(write(&store, a, 8.0, at), SignalWriteOutcome::Written);
 }
 
 #[test]
@@ -833,12 +874,12 @@ fn a_worker_that_leaves_and_joins_again_starts_with_no_value() {
     let (store, [a, b, c]) = fleet(&stages);
     let at = Instant::now();
     for id in [a, b] {
-        assert_eq!(write(&store, id, 7.0, at), Taken::Written);
+        assert_eq!(write(&store, id, 7.0, at), SignalWriteOutcome::Written);
     }
     // The first leaves and joins again as its next incarnation.
     let row = WorkersStore::get(&*store, a).expect("the row");
     assert!(store.remove(a, row.revision).is_some());
-    assert_eq!(write(&store, a, 8.0, at), Taken::NotAMember);
+    assert_eq!(write(&store, a, 8.0, at), SignalWriteOutcome::NotAMember);
     let again = join(
         &store,
         WorkerFacts {
@@ -862,7 +903,7 @@ fn a_profile_that_reads_no_signal_is_handed_no_cells() {
         wire_modes: WireModes::GRPC,
         ..facts
     });
-    let door = Door::new(Arc::clone(&store));
+    let door = StoreBackedEngine::new(Arc::clone(&store));
     picked(&door, GATEWAY, &request(b"r-1"), Instant::now());
     assert_eq!(stages.read_of(QUEUE).len(), 3, "the profile that reads one");
     // The same signals under a profile whose stage resolves none: the
@@ -900,7 +941,7 @@ fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_t
     );
     assert!(store.signal_columns().is_empty());
     store.deciding(|world| {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GATEWAY,
             now: Instant::now(),
             pinned: None,
@@ -924,8 +965,8 @@ fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_t
         });
         told.recv_timeout(Duration::from_secs(10))
     });
-    assert_eq!(answered, Ok(Taken::Undeclared));
-    assert_eq!(store.counts().signal_writes, [0, 1, 0, 0, 0, 0]);
+    assert_eq!(answered, Ok(SignalWriteOutcome::Undeclared));
+    assert_eq!(store.stats().signal_writes, [0, 1, 0, 0, 0, 0]);
 }
 
 #[test]
@@ -936,7 +977,10 @@ fn a_window_of_moved_cells_allocates_no_block_past_the_second() {
     let mut blocks = Vec::new();
     for nth in 0..6u32 {
         let at = start + Duration::from_millis(u64::from(nth));
-        assert_eq!(write(&store, a, f64::from(nth), at), Taken::Written);
+        assert_eq!(
+            write(&store, a, f64::from(nth), at),
+            SignalWriteOutcome::Written
+        );
         blocks.push(store.publication_allocations());
     }
     assert_eq!(

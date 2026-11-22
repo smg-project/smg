@@ -35,14 +35,18 @@ use kv_index::{compute_content_hash, request_prefix_hashes, ContentHash};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    load::load_report,
-    store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, KvEvent, KvEventSink, MemoryStore, Named, Naming,
-        Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+    document::{AppliedSpec, PolicySpec},
+    engine::{
+        AffinityFacts, Candidate, Constraints, Decision, Engine, HashKind, Health, LoadRow, Phase,
+        PoolFacts, RequestFacts, Role, Scratch, ShedReason, SignalSource, Target, WorkerId,
     },
-    AffinityFacts, AppliedSpec, Candidate, Constraints, Decision, Engine, HashKind, Health, Lease,
-    Lifecycle, LoadRow, Phase, PolicySpec, PoolFacts, RequestFacts, Role, Scratch, ShedReason,
-    Side, SignalSource, Target, TransportClass, WorkerId,
+    stages::Lifecycle,
+    store::{
+        AffinityQuery, AffinityRowsBuffers, BatchFacts, BatchOutcome, GatewayId, KvEvent,
+        KvEventSink, MemoryStore, Signals, StoredBlock, ViewBuffers, ViewQuery, WorkerFacts,
+        WorkerStatus, WorkersStore,
+    },
+    tracking::{Lease, Side, TransportClass},
 };
 
 use crate::{same_outcome, Outcome, Recorded, Replayed};
@@ -286,7 +290,7 @@ fn wire(report: Report) -> WorkerLoadResponse {
 /// the instant it was sampled.
 fn load_row(report: Report) -> LoadRow {
     let now = Instant::now();
-    load_report::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
+    smg_policy_controller::load::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
 }
 
 /// The worker the row lists at `i`, as the view names it.
@@ -331,7 +335,7 @@ struct Served {
     /// The number of each worker's last batch.
     sequence: Vec<u64>,
     view: ViewBuffers,
-    named: Named,
+    named: AffinityRowsBuffers,
 }
 
 impl Served {
@@ -369,7 +373,7 @@ impl Served {
             ids,
             sequence: vec![0; workers],
             view: ViewBuffers::default(),
-            named: Named::default(),
+            named: AffinityRowsBuffers::default(),
         }
     }
 
@@ -403,7 +407,7 @@ impl Served {
             .map(|&id| (0, store.indexed_blocks(id, 0) as u32))
             .collect();
         store.deciding(|world| {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GATEWAY,
                 now: Instant::now(),
                 pinned: None,
@@ -413,16 +417,19 @@ impl Served {
             let read = world
                 .view(MODEL, Role::Single, &ask, false, view)
                 .expect("the pool of the row's model");
-            let naming = Naming {
+            let naming = AffinityQuery {
                 gateway: GATEWAY,
                 block_hashes: &hashes,
                 namespace_seed: 0,
                 seed,
-                cap: world.spec().engine().named_for(MODEL, Phase::Single),
+                cap: world
+                    .spec()
+                    .engine()
+                    .affinity_rows_cap(MODEL, Phase::Single),
                 wires: None,
                 now_micros: read.built.now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, read.candidates, named);
+            world.fill_affinity_rows(MODEL, Role::Single, &naming, read.candidates, named);
             for holder in named.affinity().holders {
                 let id = read.candidates[holder.row as usize].id;
                 let place = ids
@@ -656,7 +663,7 @@ impl<'a> Bed<'a> {
         self.pool[place].in_flight -= 1;
         self.engine.on_completed(
             &lease,
-            &smg_policy_controller::Outcome {
+            &smg_policy_controller::tracking::Outcome {
                 side: Side::Single,
                 served: target.id,
                 status: 200,

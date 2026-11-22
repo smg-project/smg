@@ -2310,11 +2310,14 @@ mod tests {
     fn policy_file(
         name: &str,
     ) -> Result<
-        (tempfile::NamedTempFile, smg_policy_controller::PolicySpec),
+        (
+            tempfile::NamedTempFile,
+            smg_policy_controller::document::PolicySpec,
+        ),
         Box<dyn std::error::Error>,
     > {
         let file = tempfile::NamedTempFile::new()?;
-        let document = smg_policy_controller::PolicySpec::preset(name)?;
+        let document = smg_policy_controller::document::PolicySpec::preset(name)?;
         serde_yaml::to_writer(file.as_file(), &document)?;
         Ok((file, document))
     }
@@ -5913,28 +5916,31 @@ mod tests {
         assert_eq!(listener.runtime_worker_threads, Some(2));
     }
 
-    /// `configure` validates the configuration once, through the builder's
-    /// `build()`: a second pass over the same value repeats every file read
-    /// of the validators (the scheduler YAML, the log-directory probe) for no
-    /// second opinion. An inotify watch on the scheduler file counts the
-    /// read-only opens `configure` closes; the count does not depend on
-    /// timing, since the events queue until they are read. The watch takes
-    /// the opens as well: the kernel folds two identical queued events into
-    /// one, and the open between two closes keeps them apart.
+    /// Observe real scheduler-file opens through the original configure path.
+    /// Keep the fixture on an anonymous inode so unrelated traversal of named
+    /// temporary files cannot open it. CLOEXEC keeps its owner descriptor out
+    /// of the subprocesses other CLI tests start in the same test process.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn configure_reads_the_scheduler_file_once() {
-        use std::mem::MaybeUninit;
+    fn scheduler_read_events_after_configuration(
+        configure_calls: usize,
+    ) -> (usize, usize, Vec<u32>) {
+        use std::{io::Write, mem::MaybeUninit, os::fd::AsRawFd};
 
-        use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
+        use rustix::fs::{
+            inotify::{self, CreateFlags, ReadFlags, WatchFlags},
+            memfd_create, MemfdFlags,
+        };
 
-        let dir = tempfile::tempdir().unwrap();
-        let scheduler = dir.path().join("scheduler.yaml");
-        std::fs::write(&scheduler, "{}\n").unwrap();
+        let mut scheduler_file = std::fs::File::from(
+            memfd_create("smg-scheduler-config-read-oracle", MemfdFlags::CLOEXEC).unwrap(),
+        );
+        scheduler_file.write_all(b"{}\n").unwrap();
+        assert!(scheduler_file.metadata().unwrap().is_file());
+        let scheduler = format!("/proc/self/fd/{}", scheduler_file.as_raw_fd());
         let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
         inotify::add_watch(
             &watch,
-            &scheduler,
+            scheduler.as_str(),
             WatchFlags::OPEN | WatchFlags::CLOSE_NOWRITE,
         )
         .unwrap();
@@ -5942,19 +5948,31 @@ mod tests {
         let cli = cli_args_from(&[
             "--priority-scheduler-enabled",
             "--priority-scheduler-config",
-            scheduler.to_str().unwrap(),
+            scheduler.as_str(),
         ]);
-        cli.configure(vec![], vec![]).expect("configures");
+        for _ in 0..configure_calls {
+            cli.configure(vec![], vec![]).expect("configures");
+        }
 
-        // Every read-only open `configure` made has closed by now; the
-        // non-blocking read drains what queued and stops at an empty queue.
+        // Count and drain every event. OPEN prevents identical queued CLOSE
+        // events from coalescing when the witness configures twice.
         let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
         let mut events = inotify::Reader::new(&watch, &mut buf);
         let mut reads = 0;
+        let mut opens = 0;
+        let mut observed_events = Vec::new();
         loop {
             match events.next() {
                 Ok(event) => {
-                    if event.events().contains(ReadFlags::CLOSE_NOWRITE) {
+                    let flags = event.events();
+                    // Keep a bounded diagnostic prefix, but count and drain every event.
+                    if observed_events.len() < 32 {
+                        observed_events.push(flags.bits());
+                    }
+                    if flags.contains(ReadFlags::OPEN) {
+                        opens += 1;
+                    }
+                    if flags.contains(ReadFlags::CLOSE_NOWRITE) {
                         reads += 1;
                     }
                 }
@@ -5962,6 +5980,32 @@ mod tests {
                 Err(error) => panic!("reading the inotify events: {error}"),
             }
         }
-        assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
+        (reads, opens, observed_events)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_reads_the_scheduler_file_once() {
+        let (reads, opens, observed_events) = scheduler_read_events_after_configuration(1);
+        assert_eq!(
+            reads, 1,
+            "configure read the scheduler file {reads} times; observed {opens} opens; \
+             event flag prefix {observed_events:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scheduler_read_observer_detects_repeated_configuration() {
+        let (reads, opens, observed_events) = scheduler_read_events_after_configuration(2);
+        assert_eq!(
+            reads, 2,
+            "two configurations must read twice; observed {reads} closes and {opens} opens; \
+             event flag prefix {observed_events:?}"
+        );
+        assert_eq!(
+            opens, 2,
+            "two configurations must open twice; event flag prefix {observed_events:?}"
+        );
     }
 }

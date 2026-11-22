@@ -34,7 +34,7 @@ use smg_worker::{
     worker::WorkerStatus as ObjectStatus,
 };
 
-use super::{object::status, Lead, Objects, Standing};
+use super::{object::status, Lead, Objects, RowRevision};
 use crate::store::{HealthSink as StoreHealthSink, HealthWrite, LeaderBits};
 
 /// The health sink for a replica that keeps its workers in the store.
@@ -112,7 +112,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing) -> HealthWrite,
+        write_row: impl FnOnce(&S, RowRevision) -> HealthWrite,
     ) -> HealthWrite {
         self.fenced(worker_id, revision, |store, standing, _| {
             let write = write_row(store, standing);
@@ -129,7 +129,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         &self,
         worker_id: &ObjectId,
         revision: u64,
-        write_row: impl FnOnce(&S, Standing, &dyn Worker) -> (HealthWrite, Option<ObjectStatus>),
+        write_row: impl FnOnce(&S, RowRevision, &dyn Worker) -> (HealthWrite, Option<ObjectStatus>),
     ) -> HealthWrite {
         if !self.leads() {
             return HealthWrite::Stale;
@@ -214,8 +214,8 @@ mod tests {
     use crate::{
         engine::view::Role,
         store::{
-            membership::life, Ask, GatewayId, HealthPolicy, MemoryStore, ViewBuffers, WorkerFacts,
-            WorkerPatch, WorkerStatus as RowStatus, WorkersStore,
+            membership::life, GatewayId, HealthPolicy, MemoryStore, ViewBuffers, ViewQuery,
+            WorkerFacts, WorkerPatch, WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
     };
@@ -275,7 +275,7 @@ mod tests {
         /// Whether a decision reads the worker as doubted: the stalled bit
         /// of its row in the model's pool, as any gateway is handed it.
         fn doubted(&self) -> bool {
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: Instant::now(),
                 pinned: None,

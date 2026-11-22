@@ -8,7 +8,7 @@
 //! The document has an `apiVersion` and no `kind`: its forms are a file and
 //! the API. An unknown field is refused by name, never ignored. The one
 //! exception is the parameters of a scorer or filter a host registers, which
-//! its factory's own type reads ([`crate::StageBuild::params`]). A field this
+//! its factory's own type reads ([`crate::stages::StageBuild::params`]). A field this
 //! build cannot honour yet (a stage, a plan, a matcher or a binding rule of a
 //! later step) is checked in shape like every other field and then refused
 //! by name as not in this build, so a document written against the published
@@ -36,32 +36,38 @@ use serde::{
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
-    bucket::Bucket,
     document::routing_key::KeySources,
     engine::{
         framework::{
-            Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
+            Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer,
+            WeightedScorer,
         },
-        terms::{signal_named, Term, SIGNAL_FAMILY},
-        view::{threshold_permille, HashKind, Phase, MAX_REPORT_AGE_MS},
+        sticky_sessions::SessionRule,
+        view::{blocks_within, threshold_permille, HashKind, Phase, MAX_LOAD_REPORT_AGE_MS},
     },
     load::{
-        reports::Reports,
+        load_report_reader::LoadReportReader,
         signals::{column_named, SignalColumn},
     },
-    ring::ConsistentHash,
-    sessions::SessionRule,
-    stages::{
-        builtins::{
-            has_room_rule, with_report_age, FewestSessions, HasRoomRule, HasRoomSignals, LeastCost,
-            LeastCostSent, LeastCostSignals, LeastLoad, LeastRequests, ResidentWork, SampledBest,
-            SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
-            DEFAULT_THROUGHPUT,
-        },
-        catalog::{profile_sent, Catalog, FilterFactory, Found, PickerFactory, StageBuild},
+    policies::{
+        self,
+        bucket::Bucket,
+        cache_aware::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
+        consistent_hashing::ConsistentHash,
+        least_load::LeastLoad,
     },
-    tracking::sent::SentCredit,
+    stages::{
+        cost_terms::{signal_named, CostTerm, SIGNAL_FAMILY},
+        filters::{has_room_rule, HasRoomRule, HasRoomSignals},
+        pickers::SampledBest,
+        registry::{profile_sent, FilterFactory, Found, PickerFactory, StageBuild, StageRegistry},
+        scorers::{
+            with_load_report_age_limit, FewestSessions, LeastCost, LeastCostSignals,
+            LeastCostWithDispatches, LeastRequests, ResidentWork, SessionAffinity,
+            DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        },
+    },
+    tracking::dispatch_credit::DispatchCredit,
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -85,7 +91,7 @@ pub const MAX_HEADERS: usize = 256;
 /// Header names no routing key source may carry: the credentials of
 /// [`DENIED_HEADERS`]. `cookie` may be a source, and stays off every
 /// allow-list: a key read from it leaves as its fingerprint alone
-/// ([`DerivedKey`](crate::DerivedKey)). A host's tenant header is refused
+/// ([`DerivedKey`](crate::document::DerivedKey)). A host's tenant header is refused
 /// here as there.
 pub const DENIED_KEY_HEADERS: [&str; 6] = [
     "authorization",
@@ -172,7 +178,7 @@ pub const PICKERS: [&str; 9] = [
 
 /// The stock build's catalog: what [`PolicySpec::validate`] resolves a
 /// stage name in.
-static STOCK: LazyLock<Catalog> = LazyLock::new(Catalog::builtin);
+static STOCK: LazyLock<StageRegistry> = LazyLock::new(StageRegistry::builtin);
 
 /// A sampling picker compares its draws by the profile's scorers, so it
 /// needs at least one.
@@ -206,6 +212,19 @@ pub struct Needs {
     /// place. A stage that reads a prefix by either kind sets this beside
     /// `token_hashes`.
     pub text_hashes: bool,
+    /// The request's size
+    /// ([`RequestFacts::prompt_tokens`](crate::engine::RequestFacts::prompt_tokens)).
+    /// A stage that places by it declares this. A host that reads every
+    /// request's prompt counts it and states it always. A host that can
+    /// send a request on without reading its prompt reads the prompt where
+    /// this is declared, and may state zero where it is not: a stage that
+    /// read the size undeclared there would place every request as an
+    /// empty one, with no error. Where a request states its prompt's token
+    /// ids ahead of its body, their count stands for the size, up to the
+    /// host's cap on such a list. A plugin is shown the size where its own
+    /// row declares this, and zero otherwise, whatever the host read.
+    #[serde(default)]
+    pub prompt_size: bool,
     /// Load reports per worker.
     pub loads: bool,
     /// KV events into an index. A stage that declares this beside
@@ -227,45 +246,45 @@ pub struct Needs {
     pub active_sessions: bool,
     /// The request's own key's in-flight count per worker (a sessions rule
     /// with an in-flight cap). A host that writes it says so on the request
-    /// ([`RequestFacts::session_counted`](crate::RequestFacts::session_counted)).
+    /// ([`RequestFacts::session_counted`](crate::engine::RequestFacts::session_counted)).
     pub session_in_flight: bool,
     /// The affinity column
-    /// ([`RequestFacts::affinity`](crate::RequestFacts::affinity)): one
-    /// [`AffinityFacts`](crate::AffinityFacts) a candidate. A stage that
+    /// ([`RequestFacts::affinity`](crate::engine::RequestFacts::affinity)): one
+    /// [`AffinityFacts`](crate::engine::AffinityFacts) a candidate. A stage that
     /// reads any of the five declares this, whatever feeds them: `events`
     /// asks for the index and the hash fields for the request's hashes, and
     /// neither stands for the column. A host fills the column where this is
     /// declared and may hand an empty column elsewhere. Rows it names in
-    /// the column's place ([`NamedAffinity`](crate::NamedAffinity)) answer
-    /// the crate's own affinity stages and no other reader: a named row
-    /// says its two depths and nothing of its age, growth or index size, so
-    /// a host fills the column for a profile with a stage that reads those,
-    /// a guest's among them. The engine checks the column's shape, never
-    /// its presence: an unfilled column reads as nothing held for every
-    /// candidate and nothing is refused. What holds a host to the need is
-    /// the builder of its view, by a case of its own.
+    /// the column's place ([`AffinityRows`](crate::engine::AffinityRows))
+    /// answer the crate's own affinity stages and no other reader: a named row
+    /// says its two depths and nothing of its age, growth or index size, so a
+    /// host fills the column for a profile with a stage that reads those, a
+    /// guest's among them. The engine checks the column's shape, never its
+    /// presence: an unfilled column reads as nothing held for every candidate
+    /// and nothing is refused. What holds a host to the need is the builder of
+    /// its view, by a case of its own.
     pub affinity: bool,
     /// The sample of a picker that decides a large pool by a draw of this
     /// many rows and the rows the host names; `0` for none. A host that can
     /// name the request's holders and the pool's warming rows
-    /// ([`NamedAffinity`](crate::NamedAffinity)) hands those in the
+    /// ([`AffinityRows`](crate::engine::AffinityRows)) hands those in the
     /// column's place, each list capped at this many rows: the holders by
     /// depth, whole depth groups from the deepest while they fit and the
     /// group at the cap's edge by a uniform draw from the decision's seed;
     /// the warming rows by that draw over their whole list. A host that
     /// cannot fills the column, and the pool is read whole. The cap of a
     /// decision is its own profile's, which
-    /// [`Engine::sample_for`](crate::Engine::sample_for) says: the engine's
+    /// [`Engine::sample_for`](crate::engine::Engine::sample_for) says: the engine's
     /// summary holds the largest sample of every profile, and a decode
     /// worker's needs the larger of its two profiles'.
     pub sample: u32,
     /// The signal cells beside the rows
-    /// ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)).
+    /// ([`RequestFacts::signal_cells`](crate::engine::RequestFacts::signal_cells)).
     /// A stage that keeps a signal's column declares this, and no other
     /// stage does: the validator holds every stage a catalog adds to both.
     /// One a factory builds under a build context resolves its column
     /// there
-    /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)).
+    /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)).
     /// One built with no context resolves none, so it declares none.
     /// A host hands the cells where this is declared and none elsewhere.
     pub signal_cells: bool,
@@ -278,6 +297,29 @@ impl Needs {
         self.token_hashes || self.text_hashes
     }
 
+    /// Whether a host that feeds `fed` feeds everything these declare. The
+    /// sample is no feed: a host that names no rows fills the column.
+    #[must_use]
+    pub fn within(self, fed: Self) -> bool {
+        let declared = [
+            (self.text, fed.text),
+            (self.token_hashes, fed.token_hashes),
+            (self.text_hashes, fed.text_hashes),
+            (self.prompt_size, fed.prompt_size),
+            (self.loads, fed.loads),
+            (self.events, fed.events),
+            (self.sent_prefixes, fed.sent_prefixes),
+            (self.ring, fed.ring),
+            (self.headers, fed.headers),
+            (self.media, fed.media),
+            (self.active_sessions, fed.active_sessions),
+            (self.session_in_flight, fed.session_in_flight),
+            (self.affinity, fed.affinity),
+            (self.signal_cells, fed.signal_cells),
+        ];
+        declared.iter().all(|&(need, feed)| feed || !need)
+    }
+
     /// Both sides' needs: what a host feeding either of two stage sets must
     /// feed.
     pub(crate) fn or(self, other: Self) -> Self {
@@ -285,6 +327,7 @@ impl Needs {
             text: self.text || other.text,
             token_hashes: self.token_hashes || other.token_hashes,
             text_hashes: self.text_hashes || other.text_hashes,
+            prompt_size: self.prompt_size || other.prompt_size,
             loads: self.loads || other.loads,
             events: self.events || other.events,
             sent_prefixes: self.sent_prefixes || other.sent_prefixes,
@@ -337,12 +380,12 @@ pub struct ViewSpec {
     /// `least-cost` and the KV-pressure gates of `prefix-affinity` and
     /// `warmup-slice` treat older reports as missing. A report exactly at
     /// the limit still counts. A host-registered stage reads a report
-    /// under the limit through its build context's `reports()`, and one
-    /// that reads the row's report itself sees it at any age. Overload
-    /// verdicts can still reflect older reports, and plugins interpret
-    /// report age themselves. Omit it to use reports of any age.
+    /// under the limit through its build context's `load_report_reader()`,
+    /// and one that reads the row's report itself sees it at any age.
+    /// Overload verdicts can still reflect older reports, and plugins
+    /// interpret report age themselves. Omit it to use reports of any age.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
+    #[schemars(range(min = 1, max = MAX_LOAD_REPORT_AGE_MS))]
     pub max_report_age_ms: Option<u64>,
     /// The worker labels a stage may read, each a selector of one label
     /// key: `key` (the worker carries the label, whatever its value) or
@@ -830,7 +873,7 @@ pub struct LeastCostParams {
         "minProperties" = 1,
         "propertyNames" = {
             "anyOf": [
-                { "enum": Term::NAMES.map(|(name, _)| name) },
+                { "enum": CostTerm::NAMES.map(|(name, _)| name) },
                 { "pattern": signal_pattern() }
             ]
         },
@@ -1194,7 +1237,7 @@ fn signal_pattern() -> String {
 
 /// The names `has-room` may sum: every term's, and the request's size.
 fn room_fields() -> Vec<&'static str> {
-    let mut names: Vec<_> = Term::NAMES.iter().map(|&(name, _)| name).collect();
+    let mut names: Vec<_> = CostTerm::NAMES.iter().map(|&(name, _)| name).collect();
     names.push(HasRoomRule::REQUEST_TOKENS);
     names.sort_unstable();
     names
@@ -2387,7 +2430,7 @@ pub struct SignalSpec {
     /// under a longer limit it would read as fresh. Absent: a value does
     /// not end by its age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
+    #[schemars(range(min = 1, max = MAX_LOAD_REPORT_AGE_MS))]
     pub max_age_ms: Option<u32>,
     /// How one row's value is made where its report holds several ranks.
     /// Absent: the sum.
@@ -2796,7 +2839,7 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
     at.number(
         "max_report_age_ms",
         view.max_report_age_ms,
-        |ms| (1..=u64::from(MAX_REPORT_AGE_MS)).contains(&ms),
+        |ms| (1..=u64::from(MAX_LOAD_REPORT_AGE_MS)).contains(&ms),
         "a whole number from 1 to 3599999",
     )?;
     if view.boundaries.first() == Some(&0) {
@@ -2939,7 +2982,7 @@ fn check_signals(signals: &BTreeMap<String, SignalSpec>) -> Result<(), SpecError
         }
         match spec.max_age_ms {
             Some(0) => return Err(at().bad("max_age_ms", 0, "above zero")),
-            Some(ms) if ms > MAX_REPORT_AGE_MS => {
+            Some(ms) if ms > MAX_LOAD_REPORT_AGE_MS => {
                 return Err(at().bad("max_age_ms", ms, "a whole number from 1 to 3599999"));
             }
             _ => {}
@@ -2963,7 +3006,7 @@ fn resolve_signals(signals: &BTreeMap<String, SignalSpec>) -> Arc<[SignalColumn]
 /// What a term's written name reads: a field of this build, or a signal
 /// the document declares.
 enum Named {
-    Field(Term),
+    Field(CostTerm),
     Signal(SignalColumn),
 }
 
@@ -2981,7 +3024,7 @@ fn named_term(
         Some(signal) => column_named(signals, signal)
             .map(|column| Named::Signal(column.clone()))
             .ok_or_else(|| at.bad(terms, name, "a signal the document declares")),
-        None => Term::named(name)
+        None => CostTerm::named(name)
             .map(Named::Field)
             .ok_or_else(|| at.bad(terms, name, "a field this build reads")),
     }
@@ -3142,7 +3185,7 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
 fn least_cost_of(
     p: &LeastCostParams,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     max_age_ms: Option<u64>,
     at: &At,
 ) -> Result<Box<dyn Scorer>, SpecError> {
@@ -3215,11 +3258,11 @@ fn least_cost_of(
             reads_sent.then(sent),
             signal_terms.into_boxed_slice(),
         );
-        with_report_age(scorer, max_age_ms)
+        with_load_report_age_limit(scorer, max_age_ms)
     } else if reads_sent {
-        with_report_age(LeastCostSent::new(scorer, sent()), max_age_ms)
+        with_load_report_age_limit(LeastCostWithDispatches::new(scorer, sent()), max_age_ms)
     } else {
-        with_report_age(scorer, max_age_ms)
+        with_load_report_age_limit(scorer, max_age_ms)
     })
 }
 
@@ -3331,12 +3374,12 @@ fn scorer_of(
     gates: Gates,
     view: &ViewSpec,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     at: &At,
 ) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
     let max_age = view.max_report_age_ms;
     Ok(match stage {
-        ScoreStage::LeastLoad(p) => Resolved::Built(with_report_age(
+        ScoreStage::LeastLoad(p) => Resolved::Built(with_load_report_age_limit(
             LeastLoad::of_profile(
                 p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
                 p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
@@ -3361,13 +3404,15 @@ fn scorer_of(
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
-        ScoreStage::PrefixAffinity(p) => {
-            Resolved::Built(with_report_age(PrefixAffinity::new(p, gates), max_age))
-        }
+        ScoreStage::PrefixAffinity(p) => Resolved::Built(with_load_report_age_limit(
+            PrefixAffinity::new(p, gates),
+            max_age,
+        )),
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
-        ScoreStage::WarmupSlice(p) => {
-            Resolved::Built(with_report_age(WarmupSlice::new(p, gates), max_age))
-        }
+        ScoreStage::WarmupSlice(p) => Resolved::Built(with_load_report_age_limit(
+            WarmupSlice::new(p, gates),
+            max_age,
+        )),
         ScoreStage::Bucket(p) => built_scorer(Bucket::new(p)),
         ScoreStage::ConsistentHash(p) => {
             let ring = ConsistentHash::new(p.bounded_load.as_ref());
@@ -3376,7 +3421,7 @@ fn scorer_of(
                 None => ring,
             })
         }
-        ScoreStage::ResidentWork(p) => Resolved::Built(with_report_age(
+        ScoreStage::ResidentWork(p) => Resolved::Built(with_load_report_age_limit(
             ResidentWork::new(p.request_tokens),
             max_age,
         )),
@@ -3396,7 +3441,7 @@ fn picker_of(
     at: &At,
     from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
-    sent: &mut Option<Arc<SentCredit>>,
+    sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     let named = pick.name();
     let path = || format!("{}.pick.{named}", at.0);
@@ -3404,7 +3449,7 @@ fn picker_of(
     // picker has no weight: the map is the factory's whole.
     let made = |build: &PickerFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<SentCredit>>| {
+                sent: &mut Option<Arc<DispatchCredit>>| {
         in_key_order(&mut params);
         let picker = StageBuild::built(
             &params,
@@ -3518,8 +3563,8 @@ fn no_cells_without_a_context(
 /// out, and the document's signals, resolved, which it answers from.
 #[derive(Clone, Copy)]
 struct StageInputs<'a> {
-    catalog: &'a Catalog,
-    reports: Reports,
+    catalog: &'a StageRegistry,
+    reports: LoadReportReader,
     signals: &'a [SignalColumn],
 }
 
@@ -3543,7 +3588,7 @@ fn filtered<'a>(
     index: usize,
     from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
-    sent: &mut Option<Arc<SentCredit>>,
+    sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Filtered<'a>, SpecError> {
     let name = entry.name();
     let path = || format!("{}.filter[{index}].{name}", at.0);
@@ -3551,7 +3596,7 @@ fn filtered<'a>(
     // A filter has no weight: the map is the factory's whole.
     let made = |build: &FilterFactory,
                 mut params: serde_json::Map<String, serde_json::Value>,
-                sent: &mut Option<Arc<SentCredit>>| {
+                sent: &mut Option<Arc<DispatchCredit>>| {
         in_key_order(&mut params);
         let filter = StageBuild::built(
             &params,
@@ -3627,7 +3672,7 @@ fn filter_of(
     stage: &FilterStage,
     view: &ViewSpec,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
     match stage {
@@ -3641,7 +3686,7 @@ fn filter_of(
 fn has_room_of(
     p: &HasRoomParams,
     signals: &[SignalColumn],
-    sent: impl FnOnce() -> Arc<SentCredit>,
+    sent: impl FnOnce() -> Arc<DispatchCredit>,
     max_age_ms: Option<u64>,
     at: &At,
 ) -> Result<Box<dyn Filter>, SpecError> {
@@ -3735,7 +3780,7 @@ enum Scored {
     /// defaults.
     Typed(ScoreStage),
     /// A scorer the catalog built, with its weight.
-    Built(Weighted),
+    Built(WeightedScorer),
 }
 
 /// The stage a score entry stands for. The catalog is asked for the name
@@ -3747,7 +3792,7 @@ fn scored(
     at: &At,
     from: StageInputs<'_>,
     sent_ttl_ms: Option<u32>,
-    sent: &mut Option<Arc<SentCredit>>,
+    sent: &mut Option<Arc<DispatchCredit>>,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
     let Some(found) = from.catalog.find_scorer(name) else {
@@ -3780,14 +3825,16 @@ fn scored(
                 },
             }),
         },
-        (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(Weighted {
+        (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(WeightedScorer {
             scorer,
             weight: 1.0,
         })),
-        (ScoreSpec::Added { written, .. }, Found::Built(scorer)) => Ok(Scored::Built(Weighted {
-            scorer,
-            weight: added_weight(written, &at.sub(name))?,
-        })),
+        (ScoreSpec::Added { written, .. }, Found::Built(scorer)) => {
+            Ok(Scored::Built(WeightedScorer {
+                scorer,
+                weight: added_weight(written, &at.sub(name))?,
+            }))
+        }
         (entry, Found::With(build)) => {
             let at = at.sub(name);
             let mut params = if let ScoreSpec::Added { written, .. } = entry {
@@ -3818,7 +3865,7 @@ fn scored(
                     reason: format!("scorer registered as {name:?} answers the name {answers:?}"),
                 });
             }
-            Ok(Scored::Built(Weighted { scorer, weight }))
+            Ok(Scored::Built(WeightedScorer { scorer, weight }))
         }
         // Only a document built in code: the parser reads a built-in's key
         // into its parameter struct.
@@ -3936,7 +3983,7 @@ fn check_profile(
     from: StageInputs<'_>,
     deferred: &mut Deferred,
     depth: &mut HashDepth,
-    sent_credits: &mut Vec<Arc<SentCredit>>,
+    sent_credits: &mut Vec<Arc<DispatchCredit>>,
 ) -> Result<Option<(Profile, bool)>, SpecError> {
     let catalog = from.catalog;
     let gates = gates_of(p, view);
@@ -3983,7 +4030,7 @@ fn check_profile(
                     ScoreStage::ConsistentHash(ring)
                         if ring.prefix_tokens.is_none() && ring.bounded_load.is_none()
                 );
-                scorers.push(Weighted {
+                scorers.push(WeightedScorer {
                     scorer,
                     weight: stage.weight(),
                 });
@@ -4702,12 +4749,8 @@ fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
         ..KeySourceSpec::default()
     };
     let sources = match name {
-        "prefix_hash" => vec![header(MANUAL_SESSION_HEADER, false)],
-        "consistent_hashing" => vec![
-            header(MANUAL_SESSION_HEADER, false),
-            header("x-forwarded-for", true),
-            header("cookie", true),
-        ],
+        "prefix_hash" => policies::prefix_hash::key_sources(header),
+        "consistent_hashing" => policies::consistent_hashing::key_sources(header),
         _ => return None,
     };
     Some(RoutingKeySpec {
@@ -4716,190 +4759,27 @@ fn preset_routing_key(name: &str) -> Option<RoutingKeySpec> {
     })
 }
 
-fn standard_filters() -> Vec<FilterSpec> {
-    vec![
-        "healthy".into(),
-        "not-overloaded".into(),
-        "not-tried".into(),
-    ]
-}
-
-/// The load metric the `power_of_two` preset compares its candidates by:
-/// one form of the preset each.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PowerOfTwoMetric {
-    /// Two draws, the lower expected wait: the preset under its bare name.
-    ExpectedWait,
-    /// Two draws, the fewer requests in flight, the expected wait between
-    /// equal counts.
-    Requests,
-    /// The fewest requests in flight over every candidate, the expected wait
-    /// between equal counts.
-    LeastRequests,
-    /// The least resident work over every candidate, each request priced at
-    /// `request_tokens` context tokens.
-    ResidentTokens { request_tokens: u32 },
-}
-
 impl PolicySpec {
-    /// The `power_of_two` preset in the form its load metric names, bound to
-    /// every model and phase: the count forms compare the requests in flight
-    /// before the score through the count-first pickers, and the resident
-    /// form scores every candidate and takes the best, with no draw of two.
-    pub fn power_of_two(metric: PowerOfTwoMetric) -> Result<Self, SpecError> {
-        const NAME: &str = "power_of_two";
-        let mut spec = Self::preset(NAME)?;
-        let profile = spec.profiles.get_mut(NAME).ok_or(SpecError::Empty)?;
-        match metric {
-            PowerOfTwoMetric::ExpectedWait => {}
-            PowerOfTwoMetric::Requests => profile.pick = "power-of-two-count-first".into(),
-            PowerOfTwoMetric::LeastRequests => profile.pick = "count-first".into(),
-            PowerOfTwoMetric::ResidentTokens { request_tokens } => {
-                profile.score = vec![ScoreStage::ResidentWork(ResidentWorkParams {
-                    weight: 1.0,
-                    request_tokens,
-                })
-                .into()];
-                profile.pick = "best".into();
-            }
-        }
-        Ok(spec)
-    }
-
     /// A spec of one preset profile bound to every model and phase.
     pub fn preset(name: &str) -> Result<Self, SpecError> {
         let profile = match name {
-            "random" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "random".into(),
-                sent_ttl_ms: None,
-            },
-            "round_robin" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "round-robin".into(),
-                sent_ttl_ms: None,
-            },
-            "passthrough" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "passthrough".into(),
-                sent_ttl_ms: None,
-            },
-            // The expected-wait form: two draws compared by least-load.
-            "power_of_two" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["least-load".into()],
-                pick: "power-of-two".into(),
-                sent_ttl_ms: None,
-            },
-            "least_load" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["least-load".into()],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
-            // The ring owner of the decision's key (an encode item's content
-            // hash, a request's routing key), the ring's next members as the
-            // alternates; a request with no session key is placed by its
-            // client's key, and one with neither is the picker's draw.
-            "consistent_hashing" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["consistent-hash".into()],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
-            // The ring owner of the request's key: its routing key, else its
-            // prefix at 256 tokens. An owner past the bounded-load rule is
-            // passed over and a request with no key has no owner: the
-            // fewest requests in flight take both. The ring's weight is by
-            // arithmetic: an owner leads the ring's next member by a
-            // quarter of the stage's score and the count ranges over one
-            // whole score, so any weight past four keeps a kept owner above
-            // the least loaded worker. The pick names no sample: the owner
-            // must be among the rows scored, so the pool is read whole.
-            "prefix_hash" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![
-                    ScoreStage::ConsistentHash(ConsistentHashParams {
-                        weight: 8.0,
-                        prefix_tokens: Some(256),
-                        bounded_load: Some(BoundedLoadParams {
-                            factor: Some(1.25),
-                            abs_margin: Some(10),
-                        }),
-                    })
-                    .into(),
-                    "least-requests".into(),
-                ],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
-            // Sticky sessions over a random assignment: a key stays with the
-            // first worker it was placed on, no in-flight cap, the first
-            // worker back in the lead when it recovers; the idle TTL of four
-            // hours swept each minute, as the keyed policy of today. The
-            // picker leaves the placement to the rule, so another assignment
-            // is the rule's one field and no other profile.
-            "manual" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![],
-                pick: "manual".into(),
-                sent_ttl_ms: None,
-            },
-            // Affinity first, the expected wait within the group: the slice
-            // and the diversion over everything when due, the holder tiers
-            // over the load, the fleet gate configuring both. The weights
-            // are ranks: each stage's values are 0, 0.5 or 1, so a stage
-            // outweighs everything after it.
-            "cache_aware" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec![
-                    ScoreStage::WarmupSlice(WarmupSliceParams {
-                        weight: 8.0,
-                        ..WarmupSliceParams::default()
-                    })
-                    .into(),
-                    ScoreStage::PrefixAffinity(PrefixAffinityParams {
-                        weight: 4.0,
-                        ..PrefixAffinityParams::default()
-                    })
-                    .into(),
-                    "kv-pressure".into(),
-                    "least-load".into(),
-                ],
-                // A large pool is decided by a draw of sixteen rows and the
-                // rows the host names: its holders and its warming rows.
-                pick: PickStage::Best(BestParams { sample: 16 }).into(),
-                sent_ttl_ms: None,
-            },
-            // Prefill placement by request size: the worker whose range of
-            // sizes holds the prompt, the least booked survivor when the
-            // balance rule spills, each at the stage's defaults; any other
-            // phase is the picker's draw.
-            "bucket" => ProfileSpec {
-                filter: standard_filters(),
-                score: vec!["bucket".into()],
-                pick: "best".into(),
-                sent_ttl_ms: None,
-            },
+            "random" => policies::random::profile(),
+            "round_robin" => policies::round_robin::profile(),
+            "passthrough" => policies::passthrough::profile(),
+            "power_of_two" => policies::power_of_two::profile(),
+            "least_load" => policies::least_load::profile(),
+            "consistent_hashing" => policies::consistent_hashing::profile(),
+            "prefix_hash" => policies::prefix_hash::profile(),
+            "manual" => policies::manual::profile(),
+            "cache_aware" => policies::cache_aware::profile(),
+            "bucket" => policies::bucket::profile(),
             other => return Err(SpecError::UnknownPreset(other.to_string())),
         };
         let manual = name == "manual";
-        let sessions = manual.then(|| SessionsSpec {
-            sticky_header: MANUAL_SESSION_HEADER.into(),
-            headers: vec![],
-            ttl_s: 14_400,
-            sweep_s: 60,
-            assignment: Assignment::Random,
-            inflight_cap: u16::MAX,
-            issue_session_id: false,
-            recovery: Recovery::Original,
-        });
+        let sessions = manual.then(policies::manual::sessions);
         let view = ViewSpec {
             headers: if manual {
-                vec![MANUAL_SESSION_HEADER.into()]
+                policies::manual::view_headers()
             } else {
                 vec![]
             },
@@ -4999,11 +4879,11 @@ impl PolicySpec {
     /// honour (a stage, a plan, a matcher or a binding rule of a later step)
     /// is then refused by name as [`SpecError::NotInBuild`], and so is a
     /// stage that needs the lifecycle's calls
-    /// ([`crate::Lifecycle::needs_lifecycle`]) under the standalone
+    /// ([`crate::stages::Lifecycle::needs_lifecycle`]) under the standalone
     /// controller, which makes the membership call alone.
     pub fn validate_in(
         &self,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<Engine, SpecError> {
         let (engine, _, _) = self.built(catalog, denied_headers)?;
@@ -5015,7 +4895,7 @@ impl PolicySpec {
     /// resolved.
     fn built(
         &self,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<(Engine, HashDepth, Arc<[SignalColumn]>), SpecError> {
         if let Some(kind) = &self.kind {
@@ -5062,7 +4942,7 @@ impl PolicySpec {
         // signal's column from the document's, resolved once.
         let from = StageInputs {
             catalog,
-            reports: Reports::new(self.view.max_report_age_ms),
+            reports: LoadReportReader::new(self.view.max_report_age_ms),
             signals: &signal_columns,
         };
         for (name, profile) in &self.profiles {
@@ -5347,9 +5227,9 @@ fn index_matching<'a>(
 ///
 /// One invariant: **a decision reads its rows, its engine and its number
 /// in one load.** A store publishes every world under one of these
-/// ([`World::spec`](crate::store::World::spec)), so no reader pairs one
-/// generation's engine with rows published under another. The number is the
-/// engine's own, the document's `generation` line: there is no second
+/// ([`StoreSnapshot::spec`](crate::store::StoreSnapshot::spec)), so no reader
+/// pairs one generation's engine with rows published under another. The number
+/// is the engine's own, the document's `generation` line: there is no second
 /// holder.
 ///
 /// A document becomes one by validation alone ([`AppliedSpec::validate`]):
@@ -5422,7 +5302,7 @@ impl AppliedSpec {
     /// generation whose number is above the standing one.
     pub fn validate_in(
         document: &PolicySpec,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
         let built = document.built(catalog, denied_headers)?;
@@ -5437,7 +5317,7 @@ impl AppliedSpec {
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,
-        catalog: &Catalog,
+        catalog: &StageRegistry,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
         let built = document.built(catalog, denied_headers)?;
@@ -5497,7 +5377,7 @@ impl AppliedSpec {
 
     /// The document's signals, resolved, in column order: a signal's place
     /// here is its column's number. What a stage's build answered from
-    /// ([`StageBuild::signal_column`](crate::StageBuild::signal_column)),
+    /// ([`StageBuild::signal_column`](crate::stages::StageBuild::signal_column)),
     /// and the one reading of the names for a store that keeps the cells.
     /// Empty for a document that declares none and for the unbound start.
     pub fn signal_columns(&self) -> &[SignalColumn] {
@@ -5620,7 +5500,7 @@ impl AppliedSpec {
     /// from: those of the first binding that matches it, a pair request's
     /// by its prefill lookup. The host reads the request by them
     /// ([`KeySources::derive`]) and hands the engine the one key
-    /// ([`RequestFacts::session_key`](crate::RequestFacts::session_key)).
+    /// ([`RequestFacts::session_key`](crate::engine::RequestFacts::session_key)).
     /// `None` where no binding matches or the binding names no source: the
     /// request carries no key.
     #[must_use]
@@ -5680,7 +5560,7 @@ struct LabelSelector {
 
 /// What one worker's registration reads as under a generation's lists.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Listed {
+pub struct ViewListPositions {
     /// The position of the worker's engine family, from 1; `0` when the
     /// list does not name it.
     pub engine_kind: u16,
@@ -5731,16 +5611,16 @@ impl ViewLists {
     /// A worker's three fields under these lists, from the engine family,
     /// the zone and the labels of its registration.
     #[must_use]
-    pub fn listed(
+    pub fn positions(
         &self,
         engine: &str,
         zone: Option<&str>,
         labels: &BTreeMap<String, String>,
-    ) -> Listed {
+    ) -> ViewListPositions {
         let engine_at = self.engines.get(engine).copied();
         let zone = zone.filter(|zone| !zone.is_empty());
         let zone_at = zone.and_then(|zone| self.zones.get(zone).copied());
-        Listed {
+        ViewListPositions {
             engine_kind: engine_at.unwrap_or(0),
             zone: zone_at.unwrap_or(0),
             labels: self.met(labels),
@@ -5777,7 +5657,8 @@ impl ViewLists {
 mod tests {
     use super::*;
     use crate::{
-        Candidate, Constraints, Filter, Lifecycle, PoolFacts, RequestFacts, Targets, TieBand,
+        engine::{Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand},
+        stages::Lifecycle,
     };
 
     #[test]
@@ -5860,7 +5741,7 @@ mod tests {
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
         use HashKind::{Text, Token};
 
-        use crate::engine::door::tests::sent_prefixes::use_sent_prefixes;
+        use crate::engine::store_backed_engine::tests::sent_prefixes::use_sent_prefixes;
         let preset = |name: &str| {
             let mut document = PolicySpec::preset(name).expect("a preset of this build");
             document.generation = 1;
@@ -5901,8 +5782,9 @@ mod tests {
         #[cfg(feature = "controller")]
         {
             let digest = keyed.digest().expect("the document digests");
-            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin(), &[])
-                .expect("the preset validates");
+            let applied =
+                AppliedSpec::validate_digested(&keyed, digest, &StageRegistry::builtin(), &[])
+                    .expect("the preset validates");
             assert_eq!(applied.block_hashes_read(Token, 0), 8);
         }
         // A stage with no depth of its own reads to the view's cap.
@@ -6006,7 +5888,7 @@ mod tests {
 
     #[test]
     fn a_stage_that_names_no_depth_reads_the_block_hashes_to_the_cap() {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter("hashing-filter", || Box::new(ReadsHashes("hashing-filter")))
             .and_then(|catalog| {
@@ -6287,7 +6169,7 @@ mod tests {
         #[derive(Debug)]
         struct Scoped;
 
-        impl crate::DecisionScope for Scoped {
+        impl crate::engine::DecisionScope for Scoped {
             fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
             fn close(&self) {}
         }
@@ -6301,7 +6183,7 @@ mod tests {
             fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
                 true
             }
-            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+            fn scope(&self) -> Option<&dyn crate::engine::DecisionScope> {
                 Some(self)
             }
         }
@@ -6319,7 +6201,7 @@ mod tests {
             ) -> TieBand {
                 TieBand::NORMALIZED
             }
-            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+            fn scope(&self) -> Option<&dyn crate::engine::DecisionScope> {
                 Some(self)
             }
         }
@@ -6338,12 +6220,12 @@ mod tests {
                 _: &mut Targets,
             ) {
             }
-            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+            fn scope(&self) -> Option<&dyn crate::engine::DecisionScope> {
                 Some(self)
             }
         }
 
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .filter("scoped-filter", || Box::new(Scoped))
             .and_then(|catalog| catalog.scorer("scoped-scorer", || Box::new(Scoped)))
@@ -6445,6 +6327,9 @@ mod tests {
             assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().text_hashes, hashes, "{name}");
             assert!(!engine.needs().text, "{name}");
+            // The request's size is counted where a stage places by it: a
+            // host that sends a request on unread reads it for that stage.
+            assert_eq!(engine.needs().prompt_size, name == "bucket", "{name}");
             // The affinity stage's source is left out: it reads each worker
             // by what it has, its cache events or the prefixes sent to it.
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
@@ -6979,7 +6864,7 @@ mod tests {
         };
         let cx = Constraints::default();
         let mut scratch = Scratch::new();
-        let first = |decision: &crate::Decision| {
+        let first = |decision: &crate::engine::Decision| {
             decision
                 .pick()
                 .expect("a pick")
@@ -7440,11 +7325,11 @@ mod tests {
         let lists = applied.lists();
         assert!(!lists.is_empty());
         let held = labels(&[("tier", "gold"), ("note", "a=b")]);
-        let gold = lists.listed("beta", Some("west"), &held);
+        let gold = lists.positions("beta", Some("west"), &held);
         assert_eq!((gold.engine_kind, gold.zone, gold.labels), (2, 2, 0b111));
         assert!(!gold.engine_outside && !gold.zone_outside);
         let held = labels(&[("tier", "silver"), ("note", "a")]);
-        let silver = lists.listed("alpha", Some("east"), &held);
+        let silver = lists.positions("alpha", Some("east"), &held);
         assert_eq!(
             (silver.engine_kind, silver.zone, silver.labels),
             (1, 1, 0b001)
@@ -7454,20 +7339,23 @@ mod tests {
         let mixed = spec_with_view(r#"{"labels":["z","b=1","m","b","a=2","q=x"]}"#);
         let mixed = AppliedSpec::validate(&mixed).expect("the document validates");
         let held = labels(&[("a", "2"), ("b", "1"), ("c", "9"), ("m", ""), ("q", "y")]);
-        assert_eq!(mixed.lists().listed("", None, &held).labels, 0b01_1110);
+        assert_eq!(mixed.lists().positions("", None, &held).labels, 0b01_1110);
         // A name the list does not hold reads 0 and says so. No name reads
         // 0 and is not outside.
-        let stray = lists.listed("gamma", Some("north"), &labels(&[]));
+        let stray = lists.positions("gamma", Some("north"), &labels(&[]));
         assert_eq!((stray.engine_kind, stray.zone, stray.labels), (0, 0, 0));
         assert!(stray.engine_outside && stray.zone_outside);
         for zone in [None, Some("")] {
-            assert_eq!(lists.listed("", zone, &labels(&[])), Listed::default());
+            assert_eq!(
+                lists.positions("", zone, &labels(&[])),
+                ViewListPositions::default()
+            );
         }
         // No list: every worker reads 0 and none is outside.
         let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
         assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
-        let read = none.lists().listed("beta", Some("west"), &held);
-        assert_eq!(read, Listed::default());
+        let read = none.lists().positions("beta", Some("west"), &held);
+        assert_eq!(read, ViewListPositions::default());
     }
 
     #[test]
@@ -7524,46 +7412,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_power_of_two_preset_has_four_forms_by_its_load_metric() {
-        let form = |metric| {
-            let spec = PolicySpec::power_of_two(metric).expect("a preset");
-            let engine = spec.validate().expect("validates");
-            assert!(engine.needs().loads, "{metric:?}");
-            let profile = spec.profiles["power_of_two"].clone();
-            (profile.score, profile.pick.name().to_string())
-        };
-        let least_load: Vec<ScoreSpec> = vec!["least-load".into()];
-        assert_eq!(
-            form(PowerOfTwoMetric::ExpectedWait),
-            (least_load.clone(), "power-of-two".to_string())
-        );
-        assert_eq!(
-            form(PowerOfTwoMetric::Requests),
-            (least_load.clone(), "power-of-two-count-first".to_string())
-        );
-        assert_eq!(
-            form(PowerOfTwoMetric::LeastRequests),
-            (least_load, "count-first".to_string())
-        );
-        let resident: Vec<ScoreSpec> = vec![ScoreStage::ResidentWork(ResidentWorkParams {
-            weight: 1.0,
-            request_tokens: 2048,
-        })
-        .into()];
-        assert_eq!(
-            form(PowerOfTwoMetric::ResidentTokens {
-                request_tokens: 2048
-            }),
-            (resident, "best".to_string())
-        );
-        // A request priced at nothing is a form too: the tokens alone.
-        PolicySpec::power_of_two(PowerOfTwoMetric::ResidentTokens { request_tokens: 0 })
-            .expect("a preset")
-            .validate()
-            .expect("the tokens alone");
-    }
-
     /// A document that names no source reads each worker by what it has:
     /// its stage asks a host for cache events and for the prefixes sent.
     #[test]
@@ -7584,11 +7432,11 @@ mod tests {
         let spec = spec_with_score(
             r#"{"least-cost":{"terms":{"load.running":7},"unreported":"missing-as-zero"}}"#,
         );
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let entry = &spec.profiles["p"].score[0];
         let from = StageInputs {
             catalog: &catalog,
-            reports: Reports::new(None),
+            reports: LoadReportReader::new(None),
             signals: &[],
         };
         let Scored::Typed(stage) = scored(
@@ -8452,7 +8300,7 @@ mod tests {
         let derived = rule
             .derive(|name| (name == "x-session-id").then_some(&b"s-1"[..]), None)
             .expect("a key");
-        assert_eq!(derived.key, crate::Identity::plain("s-1"));
+        assert_eq!(derived.key, crate::engine::Identity::plain("s-1"));
         assert!(AppliedSpec::unbound()
             .key_sources_for("chat/a", Phase::Single)
             .is_none());
@@ -9144,7 +8992,7 @@ mod tests {
     /// default (1.5, plus the margin) it spills.
     #[test]
     fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
-        use crate::{
+        use crate::engine::{
             AffinityFacts, Candidate, Constraints, Health, PoolFacts, RequestFacts, Scratch,
             WorkerId,
         };
@@ -9449,7 +9297,10 @@ mod tests {
 
     #[test]
     fn validate_in_builds_the_registered_scorer_for_a_store_decision() {
-        use crate::{store::MemoryStore, Health, PoolFacts, Scratch, WorkerId};
+        use crate::{
+            engine::{Health, PoolFacts, Scratch, WorkerId},
+            store::MemoryStore,
+        };
 
         const SCORER: &str = "prefer-idle";
 
@@ -9481,7 +9332,7 @@ mod tests {
             }
         }
 
-        let mut catalog = Catalog::builtin();
+        let mut catalog = StageRegistry::builtin();
         catalog
             .scorer(SCORER, || Box::new(PreferIdle))
             .expect("a free scorer name");
@@ -9527,7 +9378,7 @@ mod tests {
     #[test]
     fn validate_in_refuses_headers_the_host_denies() {
         let document = spec_with_view(r#"{"headers":["x-private-context"]}"#);
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let denied = ["X-Private-Context"];
         let expected = SpecError::DeniedHeader {
             path: "view.headers[0]".into(),
@@ -9548,7 +9399,7 @@ mod tests {
     fn validate_in_preserves_the_stock_generation_digest_and_depth() {
         let mut document = spec_with_score(r#"{"consistent-hash":{"prefix_tokens":143}}"#);
         document.generation = 47;
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let applied = AppliedSpec::validate_in(&document, &catalog, &[])
             .expect("a stock scorer validates in the stock catalog");
         let stock = AppliedSpec::validate_with(&document, &[]).expect("a stock scorer validates");
@@ -9566,7 +9417,7 @@ mod tests {
         use crate::store::{MemoryStore, StaleGeneration};
 
         let document = spec_with_view("{}");
-        let catalog = Catalog::builtin();
+        let catalog = StageRegistry::builtin();
         let validate = |document: &PolicySpec| {
             AppliedSpec::validate_in(document, &catalog, &[]).expect("the document validates")
         };
@@ -9588,7 +9439,7 @@ mod tests {
                 offered: 0,
             })
         );
-        assert_eq!(store.world().spec().generation(), standing);
+        assert_eq!(store.snapshot().spec().generation(), standing);
     }
 
     /// A digest handed on is the generation's, as given: the door's apply
@@ -9602,8 +9453,9 @@ mod tests {
             .digest()
             .expect("a digest");
         assert_ne!(document.digest(), Ok(handed));
-        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin(), &[])
-            .expect("a preset validates");
+        let applied =
+            AppliedSpec::validate_digested(&document, handed, &StageRegistry::builtin(), &[])
+                .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
     }
 
@@ -9616,8 +9468,9 @@ mod tests {
         let mut document = PolicySpec::preset("least_load").expect("a preset");
         document.plans.pd_pair.pairing = Pairing::Strict;
         let digest = document.digest().expect("a digest");
-        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin(), &[])
-            .expect("a preset validates");
+        let handed =
+            AppliedSpec::validate_digested(&document, digest, &StageRegistry::builtin(), &[])
+                .expect("a preset validates");
         assert_eq!(handed.pairing(), Pairing::Strict);
         let own = AppliedSpec::validate(&document).expect("a preset validates");
         assert_eq!(own.pairing(), Pairing::Strict);
@@ -9662,12 +9515,12 @@ mod tests {
     /// reads another count beside lent rows, and parts here. The same
     /// lists hold each stock stage to its word on what the gateways
     /// report of leases
-    /// ([`Filter::refuses_by_reports`](crate::Filter::refuses_by_reports)).
+    /// ([`Filter::refuses_by_reports`](crate::engine::Filter::refuses_by_reports)).
     #[test]
     fn every_catalog_stage_reads_a_lent_count_as_a_rows_own() {
         use crate::{
-            engine::view::Identity, tracking::counts::tests::Lent, Health, PoolFacts, Scratch,
-            WorkerId,
+            engine::{view::Identity, Health, PoolFacts, Scratch, WorkerId},
+            tracking::in_flight::tests::Lent,
         };
         let sessions = r#""score":["fewest-sessions"]"#;
         let scored = |pick: &str| format!(r#"{{{sessions},"pick":{pick}}}"#);

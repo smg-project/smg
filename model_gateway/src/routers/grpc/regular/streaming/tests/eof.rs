@@ -20,7 +20,7 @@ use smg_grpc_client::{
 };
 use smg_policy_controller::{
     store::{GatewayId, LeasesStore, MemoryStore},
-    tracking::lease::TransportClass,
+    tracking::TransportClass,
 };
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},

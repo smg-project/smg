@@ -2557,15 +2557,25 @@ fn pil_resample_both<const C: usize>(
 /// Pillow-exact BICUBIC resize (RGB8), matching
 /// `PIL.Image.resize(.., BICUBIC)`.
 pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bicubic)
+}
+
+/// `image` as RGB8 (read where it stands when it already is), resized the
+/// way Pillow resizes it with `filter`.
+fn resize_pil_image(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    filter: PilResizeFilter,
+) -> DynamicImage {
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
-        PilResizeFilter::Bicubic,
+        filter,
         KernelQuantization::Pillow,
     );
     #[expect(
@@ -2728,24 +2738,7 @@ fn mul_div_255(value: u8, alpha: u8) -> u8 {
 /// Pillow-exact LANCZOS resize (RGB8), matching
 /// `PIL.Image.resize(.., LANCZOS)`.
 pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
-        out_w,
-        out_h,
-        PilResizeFilter::Lanczos,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Lanczos)
 }
 
 /// Pillow-exact BILINEAR resize (RGB8), matching
@@ -2755,23 +2748,7 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let (in_w, in_h, rgb) = rgb_bytes(image);
-    let output = resize_pil_bytes::<3>(
-        &rgb,
-        in_w as u32,
-        in_h as u32,
-        out_w,
-        out_h,
-        PilResizeFilter::Bilinear,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bilinear)
 }
 
 /// `data` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled to
@@ -3337,33 +3314,63 @@ fn torch_aa_passes(
     let (out_w, out_h) = (x.bounds.len(), y.bounds.len());
     let in_h = data.len() / (in_w * 3);
 
+    // The width pass takes the source rows a band at a time. A tap has one
+    // weight and one offset for every row, so with the rows of a band side by
+    // side a tap is a few vector steps over all of them, and a byte goes
+    // through `sample` once instead of once a tap. `band` holds one source
+    // pixel of every row, each as RGB and a fourth value that stays zero:
+    // three values a pixel take fewer instructions and less memory, but
+    // measured slower on downscales. A last band of fewer rows leaves the
+    // rows past its own as the band before filled them; those are summed
+    // and never copied out. A value still adds its own taps in the order
+    // above, so no bit moves.
+    const BAND: usize = 8;
     let mut rows = plain_f32(in_h * out_w * 3);
+    let mut band = plain_f32(in_w * BAND * 4);
+    let (band, _) = band.as_chunks_mut::<4>();
+    let (band, _) = band.as_chunks_mut::<BAND>();
+    let mut sums = plain_f32(out_w * BAND * 4);
+    let (sums, _) = sums.as_chunks_mut::<4>();
+    let (sums, _) = sums.as_chunks_mut::<BAND>();
     for (src, dst) in data
-        .chunks_exact(in_w * 3)
-        .zip(rows.chunks_exact_mut(out_w * 3))
+        .chunks(BAND * in_w * 3)
+        .zip(rows.chunks_mut(BAND * out_w * 3))
     {
-        let (pixels, _) = src.as_chunks::<3>();
-        let (outs, _) = dst.as_chunks_mut::<3>();
-        for (out, (&(start, count), weights)) in outs.iter_mut().zip(x.bounds.iter().zip(x.weights))
+        for (src, row) in src.chunks_exact(in_w * 3).zip(0..BAND) {
+            let (pixels, _) = src.as_chunks::<3>();
+            for (values, pixel) in band.iter_mut().zip(pixels) {
+                for (channel, (value, &byte)) in values[row].iter_mut().zip(pixel).enumerate() {
+                    *value = sample(channel, byte);
+                }
+            }
+        }
+        for (sum, (&(start, count), weights)) in sums.iter_mut().zip(x.bounds.iter().zip(x.weights))
         {
-            let mut taps = weights[..count].iter().zip(&pixels[start..start + count]);
-            let mut acc = [0.0_f32; 3];
-            if let Some((&weight, pixel)) = taps.next() {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum = weight * sample(channel, byte);
+            let mut taps = weights[..count].iter().zip(&band[start..start + count]);
+            let mut acc = [[0.0_f32; 4]; BAND];
+            if let Some((&weight, values)) = taps.next() {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a = weight * v;
                 }
             }
-            for (&weight, pixel) in taps.by_ref().take(torch_aa_plain_until(count)) {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum += weight * sample(channel, byte);
+            for (&weight, values) in taps.by_ref().take(torch_aa_plain_until(count)) {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a += weight * v;
                 }
             }
-            for (&weight, pixel) in taps {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum = weight.mul_add(sample(channel, byte), *sum);
+            for (&weight, values) in taps {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a = weight.mul_add(v, *a);
                 }
             }
-            *out = acc;
+            *sum = acc;
+        }
+        for (dst, row) in dst.chunks_exact_mut(out_w * 3).zip(0..BAND) {
+            let (outs, _) = dst.as_chunks_mut::<3>();
+            for (out, sum) in outs.iter_mut().zip(sums.iter()) {
+                let [r, g, b, _] = sum[row];
+                *out = [r, g, b];
+            }
         }
     }
 

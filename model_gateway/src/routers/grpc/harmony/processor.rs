@@ -242,6 +242,7 @@ impl HarmonyResponseProcessor {
             model_id: &chat_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: None,
+            dispatch_wait: None,
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),

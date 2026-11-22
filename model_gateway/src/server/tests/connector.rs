@@ -8,11 +8,6 @@ use std::{
 
 use async_trait::async_trait;
 use mock_worker::config::SchedulerWire;
-use smg_policy_controller::{
-    engine::view::{Role, WireModes},
-    store::{HealthPolicy, LoadSink, Maker, WorkerFacts},
-    worker_host::{Expect, Membership, Wrote},
-};
 use smg_worker::{
     common_proto::KvEventBatch,
     connection::engine::{AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
@@ -25,8 +20,8 @@ use smg_worker::{
     registry::RemoteWorkerState,
     test_support::NoEngine,
     worker::{
-        NamedValue, ProfileOptions, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
-        WorkerLoadResponse, WorkerSpec, WorkerUpdateRequest,
+        ProfileOptions, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse,
+        WorkerSpec, WorkerUpdateRequest,
     },
     workflow::{
         CreateLocalWorkerStep, DetectConnectionModeStep, DetectRuntimeStep, DiscoverMetadataStep,
@@ -38,13 +33,13 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
 use super::super::{build_app_context, Extensions, ServerConfig};
 use crate::{
     app_context::AppContext,
-    config::RouterConfig,
-    policy_controller::{
-        engine::Ask,
-        feed::signal_tests::{stages, values_read, Read, SINGLE, SLOTS},
-    },
-    routers::grpc::backend_client::{
-        get_backend_client, BackendConnector, BasicWorkerBuilder, Fronted,
+    config::{PolicyConfig, RouterConfig},
+    routers::{
+        common::{
+            placement::{select_single, PlacementInputs},
+            snapshot::RoutingPool,
+        },
+        grpc::backend_client::{get_backend_client, BackendConnector, BasicWorkerBuilder, Fronted},
     },
     workflow::{
         data::{WorkerRegistrationMode, WorkerUpdateWorkflowData, WorkerWorkflowData},
@@ -62,10 +57,11 @@ const HOST_URL: &str = "grpc://worker.invalid:53177";
 const MODEL_ID: &str = "sample-model";
 
 /// A host's connection to one engine. Its load answer states the
-/// engine's free slots by name where the host knows the count.
+/// requests waiting in the engine's queue: the host's count where it knows
+/// one.
 #[derive(Debug, Default)]
 struct HostConnection {
-    free_slots: Option<f64>,
+    waiting: Option<i32>,
 }
 
 #[async_trait]
@@ -97,16 +93,9 @@ impl EngineConnection for HostConnection {
     }
 
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        let stated = self.free_slots.map(|free| NamedValue {
-            name: SLOTS.into(),
-            unit: "slots".into(),
-            value: free,
-            age_ms: None,
-        });
         let rank = SchedulerLoadSnapshot {
             num_running_reqs: 37,
-            num_waiting_reqs: 29,
-            values: stated.into_iter().collect(),
+            num_waiting_reqs: self.waiting.unwrap_or(29),
             ..Default::default()
         };
         Ok(WorkerLoadResponse {
@@ -171,29 +160,49 @@ impl EngineConnector for HostConnector {
     }
 }
 
-/// The host's engines that state their free slots, each at its address,
-/// the least first.
-const STATING: [(&str, f64); 3] = [
-    ("grpc://first.invalid:53177", 10.0),
-    ("grpc://second.invalid:53177", 40.0),
-    ("grpc://third.invalid:53177", 70.0),
+/// The host's engines, each at its address, and the requests each states
+/// waiting in its queue.
+const QUEUES: [(&str, i32); 3] = [
+    ("grpc://first.invalid:53177", 9),
+    ("grpc://second.invalid:53177", 1),
+    ("grpc://third.invalid:53177", 5),
 ];
 
-/// The host owns the [`STATING`] addresses, with no listener at any.
+/// The host owns the [`QUEUES`] addresses, with no listener at any. Its
+/// engines state the table's queues moved `turn` addresses along, so the
+/// shortest queue stands at each address in some turn.
 #[derive(Debug)]
-struct StatingConnector;
+struct QueueConnector {
+    turn: usize,
+}
+
+impl QueueConnector {
+    /// The address whose engine states the table's shortest queue.
+    fn shortest(&self) -> &'static str {
+        let (least, _) = (0..QUEUES.len())
+            .map(|at| (at, self.queue_at(at)))
+            .min_by_key(|&(_, waiting)| waiting)
+            .unwrap();
+        QUEUES[least].0
+    }
+
+    /// The queue the engine at the table's place `at` states.
+    fn queue_at(&self, at: usize) -> i32 {
+        QUEUES[(at + self.turn) % QUEUES.len()].1
+    }
+}
 
 #[async_trait]
-impl EngineConnector for StatingConnector {
+impl EngineConnector for QueueConnector {
     async fn connect_grpc(
         &self,
         url: &str,
         _: RuntimeType,
     ) -> Result<Arc<dyn EngineConnection>, String> {
-        let engine = STATING.iter().find(|(address, _)| *address == url);
-        let &(_, free) = engine.ok_or_else(|| format!("the host has no engine at {url}"))?;
+        let engine = QUEUES.iter().position(|(address, _)| *address == url);
+        let at = engine.ok_or_else(|| format!("the host has no engine at {url}"))?;
         Ok(Arc::new(HostConnection {
-            free_slots: Some(free),
+            waiting: Some(self.queue_at(at)),
         }))
     }
 
@@ -560,119 +569,157 @@ async fn the_load_port_publishes_the_host_connections_report() {
     assert_eq!(report.loads[0].num_waiting_reqs, 29);
 }
 
-/// The gateway's context under the document of one declared signal, with
-/// the host's stage beside what else the host adds, and what that stage's
-/// decisions read.
-async fn signal_gateway(extensions: Extensions) -> (Arc<AppContext>, Read) {
+/// The gateway's context with the policy controller picked and no
+/// controller's address, under `policy`: it decides in its own process,
+/// over the worker data a gateway keeps with the setting off.
+async fn gateway_in_process(policy: PolicyConfig, extensions: Extensions) -> Arc<AppContext> {
     let router = RouterConfig {
         policy_controller: true,
-        policy_spec: Some(serde_yaml::from_str(SINGLE).unwrap()),
+        policy,
         ..RouterConfig::default()
     };
-    let (stages, read) = stages().unwrap();
-    let app = build_app_context(&ServerConfig::minimal(router), extensions.stages(stages))
+    let app = build_app_context(&ServerConfig::minimal(router), extensions)
         .await
         .unwrap();
-    (app, read)
+    assert!(app.in_process.is_some());
+    app
 }
 
-/// The address the policy engine places a request on after one poll of
-/// `engines`, each an address, its engine kind and the free slots it states,
-/// the least first. A ready gRPC row is laid for each at the feed's door. The
-/// load monitor polls their group once, each engine through its
-/// connection, and the feed's sink hands the store what the answers state
-/// by name. The decision then read each engine's own value: a tie's draw
-/// places no request here.
-async fn placed_after_one_poll(
-    app: &AppContext,
-    read: &Read,
-    engines: &[(String, &str, f64)],
-) -> String {
-    let door: &dyn Membership = &*app.policy_feed.as_ref().unwrap().door;
-    for (url, kind, _) in engines {
-        let facts = WorkerFacts {
-            key: url.clone(),
-            engine: url.clone(),
-            role: Role::Single,
-            wire_modes: WireModes::GRPC,
-            engine_kind: (*kind).to_owned(),
-            models: vec![MODEL_ID.to_owned()],
-            dp_size: 1,
-            max_running: Some(64),
-            health: HealthPolicy {
-                probes: false,
-                ..HealthPolicy::default()
-            },
-            ..WorkerFacts::default()
-        };
-        let wrote = door.found(&Maker::Control, Expect::Nothing, url, &|_| facts.clone());
-        assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
-    }
-    let (first, _, _) = &engines[0];
-    let worker = app.worker_registry.get_by_url(first).unwrap();
+/// One poll of `worker`'s group by the gateway's load monitor, each of the
+/// group's engines through its own connection.
+async fn poll_once(app: &AppContext, worker: &dyn Worker) {
     let key = WorkerGroupKey {
         model_id: worker.model_id().into(),
         worker_type: *worker.worker_type(),
         connection_mode: *worker.connection_mode(),
     };
     assert_eq!(key.connection_mode, ConnectionMode::Grpc);
-
     let monitor = app.worker_monitor.as_ref().unwrap();
-    let now = Instant::now();
-    poll_group_once_for_test(monitor, &key, Duration::from_secs(11), now).await;
-    let store = app.policy_store.as_ref().unwrap();
-    // The cases run no publication loop: they show what waits at its instant.
-    if let Some(due) = store.publish_due() {
-        store.publish(due);
+    poll_group_once_for_test(monitor, &key, Duration::from_secs(11), Instant::now()).await;
+}
+
+/// With the policy controller picked and no controller's address, a
+/// placement follows what a host's connections state in their polled load
+/// answers. The gateway's context is built with the host's connector, and
+/// each engine registers through it. The load monitor polls each engine
+/// through its connection and publishes the answers. `least_load` reads
+/// that feed, and the gateway's placement puts the request on the engine
+/// that states the shortest queue: at each of the three addresses in turn,
+/// so the placement follows the answers and not the engines' order.
+#[tokio::test]
+async fn a_placement_follows_the_queue_a_host_connections_polled_answer_states() {
+    let least_load: PolicyConfig =
+        serde_json::from_value(serde_json::json!({ "type": "least_load" })).unwrap();
+    for turn in 0..QUEUES.len() {
+        let host = QueueConnector { turn };
+        let shortest = host.shortest();
+        let host = Extensions::new().connector(Arc::new(host));
+        let app = gateway_in_process(least_load.clone(), host).await;
+        let mut first = None;
+        for (url, _) in QUEUES {
+            let worker = register_grpc(&app, url).await;
+            first.get_or_insert(worker);
+        }
+        poll_once(&app, first.unwrap().as_ref()).await;
+
+        let placed = select_single(
+            &app.worker_registry,
+            &app.policy_registry,
+            MODEL_ID,
+            RoutingPool::GrpcPipelineRegular,
+            None,
+            PlacementInputs::default(),
+        )
+        .unwrap();
+        assert_eq!(placed.url(), shortest, "turn {turn}");
+        assert_host_connection(placed.as_ref()).await;
     }
-    // One value an engine was taken, and none dropped.
-    let taken = u64::try_from(engines.len()).unwrap();
-    assert_eq!(store.counts().signal_writes, [taken, 0, 0, 0, 0, 0]);
-
-    let policy_engine = app.policy_engine.as_ref().unwrap();
-    let ask = Ask::of(b"polled", MODEL_ID);
-    let placed = policy_engine
-        .place(&ask, now + Duration::from_millis(10))
-        .await;
-    let stated: Vec<_> = engines.iter().map(|&(_, _, free)| Some(free)).collect();
-    assert_eq!(values_read(read), stated);
-    placed.unwrap().worker().url().to_owned()
 }
 
-/// Under a document that declares a signal, the values a host's connections
-/// state in their polled load answers decide a placement. The gateway's
-/// context is built with the host's connector and the host's stage, and the
-/// policy engine places on the engine that states the most.
+/// On each stock gRPC wire an engine states a value by name in its answer
+/// to a load poll. With the policy controller picked and no controller's
+/// address, the gateway's own client reads the list and the load monitor
+/// publishes it: the feed the gateway's policies read holds each engine's
+/// own value under its name.
 #[tokio::test]
-async fn a_placement_follows_the_values_a_host_connections_polled_answer_states() {
-    let host = Extensions::new().connector(Arc::new(StatingConnector));
-    let (app, read) = signal_gateway(host).await;
-    let engines = STATING.map(|(url, free)| (url.to_owned(), "generic", free));
-    let (most, _) = STATING[2];
-    assert_eq!(placed_after_one_poll(&app, &read, &engines).await, most);
-    let worker = app.worker_registry.get_by_url(most).unwrap();
-    assert_host_connection(worker.as_ref()).await;
-}
-
-/// The same under the gateway's own connector, on each stock gRPC wire: an
-/// engine states its free slots in its answer to a load poll, the stock
-/// client reads the list, and the policy engine places on the engine that
-/// states the most.
-#[tokio::test]
-async fn a_placement_follows_the_values_a_stock_grpc_polls_answer_states() {
+async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name() {
+    const NAME: &str = "free_slots";
+    const UNIT: &str = "slots";
     for wire in [
         SchedulerWire::TokenSpeed,
         SchedulerWire::Vllm,
         SchedulerWire::Sglang,
     ] {
-        let (app, read) = signal_gateway(Extensions::new()).await;
+        let app = gateway_in_process(PolicyConfig::RoundRobin, Extensions::new()).await;
         let mut engines = Vec::new();
-        for (_, free) in STATING {
-            let url = mock_grpc_engine_stating(wire, SLOTS, "slots", free).await;
-            engines.push((url, wire.as_str(), free));
+        for free in [10.0, 40.0, 70.0] {
+            let url = mock_grpc_engine_stating(wire, NAME, UNIT, free).await;
+            // The engine listens and the registration's probes dial it:
+            // they get time enough on a loaded host.
+            let mut registering = registration(&app, &url);
+            registering.data.config.health.timeout_secs = Some(30);
+            let worker = register_grpc_from(&app, &url, registering).await;
+            engines.push((worker, free));
         }
-        let placed = placed_after_one_poll(&app, &read, &engines).await;
-        let (most, _, _) = &engines[2];
-        assert_eq!(&placed, most, "{wire:?}");
+        let (first, _) = &engines[0];
+        poll_once(&app, first.as_ref()).await;
+
+        let feed = app.worker_monitor.as_ref().unwrap().subscribe();
+        let published = feed.borrow();
+        for (worker, free) in &engines {
+            let report = published.get(worker.url()).unwrap();
+            let stated: Vec<_> = report
+                .loads
+                .iter()
+                .flat_map(|rank| &rank.values)
+                .map(|value| (&*value.name, &*value.unit, value.value))
+                .collect();
+            assert_eq!(stated, [(NAME, UNIT, *free)], "{wire:?}");
+        }
+    }
+}
+
+/// A worker learned from a peer registers through no workflow. The policy
+/// registry builds a model's own policy at a local registration and keeps
+/// it while a local worker serves the model, so a model that only peers'
+/// workers serve has none: the placement reads the default policy for it.
+/// With the policy controller picked and no controller's address that is as
+/// with the setting off.
+///
+/// This case changes when the policy engine decides a profile that places
+/// otherwise than a rotation: under a supplied document, a model no local
+/// worker serves is then placed by the profile of its own binding.
+#[tokio::test]
+async fn a_model_only_a_peers_worker_serves_is_placed_by_the_default_policy() {
+    for picked in [false, true] {
+        let router = RouterConfig {
+            policy_controller: picked,
+            policy: PolicyConfig::RoundRobin,
+            ..RouterConfig::default()
+        };
+        let host = Extensions::new().connector(Arc::new(HostConnector));
+        let app = build_app_context(&ServerConfig::minimal(router), host)
+            .await
+            .unwrap();
+        assert_eq!(app.in_process.is_some(), picked);
+        let worker = import_worker(&app);
+        // The model the peer's worker serves, as its specification names it.
+        let model = worker.model_id().to_owned();
+        assert!(!app.worker_registry.serves_model_locally(&model));
+
+        let policies = &app.policy_registry;
+        assert!(policies.get_policy(&model).is_none(), "picked {picked}");
+        let read = policies.get_policy_or_default(&model);
+        assert!(Arc::ptr_eq(&read, &policies.get_default_policy()));
+        let placed = select_single(
+            &app.worker_registry,
+            policies,
+            &model,
+            RoutingPool::GrpcPipelineRegular,
+            None,
+            PlacementInputs::default(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&placed, &worker), "picked {picked}");
     }
 }

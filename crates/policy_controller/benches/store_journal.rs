@@ -60,12 +60,12 @@ use criterion::{
 #[cfg(feature = "worker-host")]
 use smg_policy_controller::worker_host::{Members, Objects};
 use smg_policy_controller::{
+    engine::{LoadRow, Role, SignalSource, WorkerId},
     service::replication::Log,
     store::{
-        Ask, GatewayId, Kinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        GatewayId, JournalKinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position,
+        ViewBuffers, ViewQuery, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    LoadRow, Role, SignalSource, WorkerId,
 };
 #[cfg(feature = "worker-host")]
 use smg_worker::registry::WorkerRegistry;
@@ -186,7 +186,7 @@ fn load_write(c: &mut Criterion) {
             if let Some(log) = &pool.log {
                 // The cell is held to what it claims: a log that carries
                 // load rows was told every write, and the other none.
-                let told = log.head(Kinds::All).seq - log.head(Kinds::Watched).seq;
+                let told = log.head(JournalKinds::All).seq - log.head(JournalKinds::Watched).seq;
                 match loads {
                     Some(0) => assert_eq!(told, 0),
                     _ => assert!(turn == 0 || told >= turn),
@@ -297,7 +297,7 @@ fn view_build(c: &mut Criterion) {
     for (kind, loads) in KINDS {
         for n in SIZES {
             let pool = pool_of(n, loads);
-            let ask = Ask {
+            let ask = ViewQuery {
                 gateway: GatewayId(1),
                 now: pool.opened + Duration::from_secs(1),
                 pinned: None,
@@ -353,31 +353,31 @@ fn read(c: &mut Criterion) {
     // The store took term 1 before its first write: every position stands
     // under it.
     let after = Position {
-        seq: log.head(Kinds::All).seq - 2_048,
+        seq: log.head(JournalKinds::All).seq - 2_048,
         term: 1,
     };
     for events in [16usize, 256] {
         let mut out = Vec::with_capacity(events);
         // Checked ahead of the timed id: a filtered run skips its routine.
-        log.read(Kinds::All, after, events, &mut out)
+        log.read(JournalKinds::All, after, events, &mut out)
             .expect("retained");
         assert_eq!(out.len(), events);
         group.bench_with_input(BenchmarkId::from_parameter(events), &events, |b, _| {
             b.iter(|| {
-                log.read(Kinds::All, black_box(after), events, &mut out)
+                log.read(JournalKinds::All, black_box(after), events, &mut out)
                     .expect("retained");
                 black_box(out.len())
             });
         });
     }
-    let head = log.head(Kinds::Watched);
+    let head = log.head(JournalKinds::Watched);
     let mut out = Vec::with_capacity(16);
-    log.read(Kinds::Watched, head, 16, &mut out)
+    log.read(JournalKinds::Watched, head, 16, &mut out)
         .expect("retained");
     assert!(out.is_empty(), "the reader is at the head");
     group.bench_function("watched_at_head", |b| {
         b.iter(|| {
-            log.read(Kinds::Watched, black_box(head), 16, &mut out)
+            log.read(JournalKinds::Watched, black_box(head), 16, &mut out)
                 .expect("retained");
             black_box(out.len())
         });
@@ -387,11 +387,14 @@ fn read(c: &mut Criterion) {
 
 fn cut(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/cut");
-    for (kind, kinds) in [("watched", Kinds::Watched), ("every", Kinds::All)] {
+    for (kind, kinds) in [
+        ("watched", JournalKinds::Watched),
+        ("every", JournalKinds::All),
+    ] {
         for n in SIZES {
             let pool = pool_of(n, Some(LOADS));
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
-                b.iter(|| black_box(pool.store.cut(black_box(kinds))));
+                b.iter(|| black_box(pool.store.checkpoint(black_box(kinds))));
             });
         }
     }
@@ -406,7 +409,7 @@ fn load_write_drained(c: &mut Criterion) {
         let stop = Arc::new(AtomicBool::new(false));
         // The reader's start, taken before the first write: whatever the
         // run writes stands after it.
-        let mut place = log.head(Kinds::All);
+        let mut place = log.head(JournalKinds::All);
         let reader = {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
@@ -416,10 +419,13 @@ fn load_write_drained(c: &mut Criterion) {
                     // Asked before the read: one read follows the last
                     // write, so a run of one write is read too.
                     let asked = stop.load(Ordering::Relaxed);
-                    if log.read(Kinds::All, place, Log::BATCH, &mut out).is_err() {
+                    if log
+                        .read(JournalKinds::All, place, Log::BATCH, &mut out)
+                        .is_err()
+                    {
                         // The ring passed the reader: it starts again at
                         // the head, as a standby does from a snapshot.
-                        place = log.head(Kinds::All);
+                        place = log.head(JournalKinds::All);
                     } else if let Some(last) = out.last() {
                         place = last.at;
                         read += out.len() as u64;

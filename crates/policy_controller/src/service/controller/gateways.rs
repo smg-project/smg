@@ -231,7 +231,7 @@ struct Replaced {
 }
 
 /// A standing session's place in the table. Its drop is the session's end.
-pub(crate) struct Seat {
+pub(crate) struct SessionPlace {
     gateways: Arc<Gateways>,
     gateway: GatewayId,
     session: u64,
@@ -284,7 +284,7 @@ impl Row {
     }
 }
 
-impl Seat {
+impl SessionPlace {
     /// Resolves when a newer session of the gateway took this one's place.
     pub(crate) async fn superseded(&self) {
         self.superseded.wake.notified().await;
@@ -325,7 +325,7 @@ impl Seat {
     }
 }
 
-impl Drop for Seat {
+impl Drop for SessionPlace {
     fn drop(&mut self) {
         // A no-op after `end`: the row's period started there.
         self.gateways
@@ -458,7 +458,7 @@ impl Gateways {
         subject: &str,
         term: u64,
         now: Instant,
-    ) -> Result<Seat, Refused> {
+    ) -> Result<SessionPlace, Refused> {
         let mut table = self.table.lock();
         let Some(session) = table.sessions.checked_add(1) else {
             return Err(Refused::Exhausted);
@@ -535,7 +535,7 @@ impl Gateways {
         let superseded = Arc::clone(&row.superseded);
         let deadline = self.deadline(row, now);
         Self::set_deadline(&mut table, gateway, deadline);
-        Ok(Seat {
+        Ok(SessionPlace {
             gateways: Arc::clone(self),
             gateway,
             session,
@@ -903,7 +903,9 @@ pub(crate) mod tests {
 
     use tokio::{sync::watch, task::JoinSet, time::timeout};
 
-    use super::{over_kinds, DropPause, Gateways, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX};
+    use super::{
+        over_kinds, DropPause, Gateways, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX,
+    };
     use crate::{
         document::spec::{AppliedSpec, PolicySpec},
         engine::view::{Role, WorkerId},
@@ -912,11 +914,11 @@ pub(crate) mod tests {
                 self,
                 tests::{a_completed, worker},
             },
-            elector::{ElectionSettings, Elector, Tick},
+            elector::{ElectionSettings, Elector, TickOutcome},
         },
         store::{
-            Ask, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            SessionsStore, ViewBuffers, WorkersStore,
+            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, PickRecord,
+            SessionsStore, ViewBuffers, ViewQuery, WorkersStore,
         },
         tracking::lease::{Lease, LeaseId},
     };
@@ -972,7 +974,7 @@ pub(crate) mod tests {
         subject: &str,
         term: u64,
         now: Instant,
-    ) -> Seat {
+    ) -> SessionPlace {
         gateways
             .welcome(gateway, subject, term, now)
             .expect("the table takes the Hello")
@@ -988,7 +990,7 @@ pub(crate) mod tests {
             gateway,
             request: id,
             target: WorkerId(7),
-            picked: Picked::default(),
+            picked: PickRecord::default(),
             decode: None,
             term: 0,
             issued_at: now,
@@ -1037,7 +1039,7 @@ pub(crate) mod tests {
 
         let (_elector, store, gateways, t0) = ceiled(GRACE, ROWS as usize);
         let gone = welcomed(&gateways, GatewayId(1), "gateway-1", TERM, t0);
-        let standing: Vec<Seat> = (2..=ROWS)
+        let standing: Vec<SessionPlace> = (2..=ROWS)
             .map(|id| welcomed(&gateways, GatewayId(id), &format!("gateway-{id}"), TERM, t0))
             .collect();
 
@@ -1339,7 +1341,7 @@ pub(crate) mod tests {
         let retaken = t0 + 3 * GRACE;
         assert_eq!(
             elector.tick(retaken).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         assert_eq!(gateways.sweep(retaken), 0);
         assert!(gateways.presence(A, retaken + GRACE - MS).is_some());
@@ -1370,7 +1372,7 @@ pub(crate) mod tests {
         let landed = closed + GRACE;
         assert_eq!(
             elector.tick(landed).expect("the renewal"),
-            Tick::Renewed { term: TERM }
+            TickOutcome::Renewed { term: TERM }
         );
         assert_eq!(gateways.sweep(landed), 0);
         assert!(gateways.presence(A, landed + GRACE - MS).is_some());
@@ -1393,7 +1395,7 @@ pub(crate) mod tests {
         let retaken = t0 + 3 * GRACE;
         assert_eq!(
             elector.tick(retaken).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         let seat = welcomed(&gateways, A, "gateway-a", 2, retaken);
         assert_eq!(store.live(A), 1, "its lease stands through the gap");
@@ -1515,7 +1517,7 @@ pub(crate) mod tests {
         let again = t0 + MS;
         assert_eq!(
             elector.tick(again).expect("the take"),
-            Tick::Acquired { term: 2 }
+            TickOutcome::Acquired { term: 2 }
         );
         let stands = welcomed(&gateways, A, "gateway-a", 2, again);
 
@@ -1784,7 +1786,7 @@ pub(crate) mod tests {
         worker: WorkerId,
         now: Instant,
     ) -> (bool, bool) {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway,
             now,
             pinned: None,
@@ -2147,7 +2149,7 @@ pub(crate) mod tests {
 
     /// Fills the seat's note to its ceiling of [`VETOES_MAX`] ends on newly
     /// registered workers ([`full_list`]). Returns the workers.
-    fn filled(store: &MemoryStore, seat: &Seat, t0: Instant) -> Vec<WorkerId> {
+    fn filled(store: &MemoryStore, seat: &SessionPlace, t0: Instant) -> Vec<WorkerId> {
         let workers: Vec<WorkerId> = (0..VETOES_MAX / KINDS_MAX)
             .map(|n| worker(store, &format!("http://w{n}:8000")))
             .collect();

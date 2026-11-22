@@ -17,13 +17,15 @@ use std::time::{Duration, Instant};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    load::load_report,
+    document::{AppliedSpec, PolicySpec},
+    engine::{Constraints, Engine, LoadRow, RequestFacts, Role, Scratch, SignalSource, WorkerId},
+    policies::power_of_two::PowerOfTwoMetric,
+    stages::Lifecycle,
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, ViewQuery, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Constraints, Engine, Lease, Lifecycle, LoadRow, PolicySpec, PowerOfTwoMetric,
-    RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
+    tracking::{Lease, Side},
 };
 
 /// What these rows record, as a sheet's head names it: the rank the
@@ -214,7 +216,7 @@ fn load_row(figures: Figures, at: Instant) -> LoadRow {
         }],
         ..WorkerLoadResponse::default()
     };
-    load_report::load_row(&wire, Role::Single, at, at, SignalSource::Poll)
+    smg_policy_controller::load::load_row(&wire, Role::Single, at, at, SignalSource::Poll)
 }
 
 /// The store with the row's worker in it and the engine that decides over
@@ -324,7 +326,7 @@ impl Bed {
     /// dispatched, as a host commits it: the rank it took, or `None` where
     /// the decision names no row.
     fn pick(&mut self, cost: u32, now: Instant, seed: u64) -> Option<u16> {
-        let ask = Ask {
+        let ask = ViewQuery {
             gateway: GatewayId(1),
             now,
             pinned: None,
@@ -335,7 +337,7 @@ impl Bed {
         let (engine, out, scratch) = (&self.engine, &mut self.out, &mut self.scratch);
         // The rows as the store lends them, with the pool's engines beside
         // them: the door a host decides through.
-        let target = self.store.with_world(|world| {
+        let target = self.store.with_snapshot(|world| {
             let view = world.view(MODEL, Role::Single, &ask, false, out)?;
             let facts = RequestFacts {
                 model: MODEL,

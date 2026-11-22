@@ -13,7 +13,7 @@
 //! [`Watcher::open_on`]).
 //!
 //! **One stream at a time.** A stream is followed through the watcher
-//! ([`Following`]), which borrows it: the watcher takes that stream's
+//! ([`WatchStream`]), which borrows it: the watcher takes that stream's
 //! events and no other's, and opens its next stream only once this one is
 //! dropped. A snapshot's pages carry no page number, so a page of a stream let
 //! go would read as a first page.
@@ -26,7 +26,7 @@
 //! that names models is told some changes only, so the watcher's request
 //! names none.
 //!
-//! **A lost place.** The watcher loses its place ([`Lost`]) at the
+//! **A lost place.** The watcher loses its place ([`WatchPositionLost`]) at the
 //! controller's own word (`SnapshotRequired`), at an event the wire's
 //! conversion refuses, at one out of its order (a page where the tail is
 //! due, a place not past the last) and at one that does not land where the
@@ -42,12 +42,12 @@ use crate::{
         controller::worker_wire::{self, Refused},
         proto::{self, worker_event::Event},
     },
-    store::{Cut, MemoryStore, Position, WorkerRow, WorkersStore},
+    store::{MemoryStore, Position, StoreCheckpoint, WorkerRow, WorkersStore},
 };
 
 /// Why a watcher lost its place in the watch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Lost {
+pub enum WatchPositionLost {
     /// The controller's word: the watch cannot go on from the place asked.
     Required,
     /// A field the wire's conversion refuses.
@@ -97,27 +97,28 @@ pub struct Watcher {
     snapshots: u64,
 }
 
-/// One stream of the watch as its watcher follows it. It borrows the
+/// One stream of the watch as its watcher follows it. It also writes each
+/// event into the watcher's store. It borrows the
 /// watcher: the watcher takes this stream's events and no other's, and
 /// opens its next stream only once this one is dropped.
 #[derive(Debug)]
-pub struct Following<'w> {
+pub struct WatchStream<'w> {
     watcher: &'w mut Watcher,
     watch: Watch,
 }
 
 /// Why a stream is followed no further.
 #[derive(Debug)]
-pub enum Ended {
+pub enum WatchStreamEnd {
     /// The watcher lost its place: its next stream starts from a snapshot.
-    Lost(Lost),
+    Lost(WatchPositionLost),
     /// The client's error on the stream: what the watcher held stands, and
     /// its next stream goes on after its place, or starts the snapshot
     /// again where the stream was cut inside one.
     Client(client::Error),
 }
 
-impl Following<'_> {
+impl WatchStream<'_> {
     /// Takes the stream's next event into the store, at the instant it is
     /// read. `Ok(true)`: an event was taken. `Ok(false)`: the controller
     /// ended the stream with no error, and the place stands. The wait
@@ -125,17 +126,17 @@ impl Following<'_> {
     ///
     /// # Errors
     ///
-    /// [`Ended`]: the watcher lost its place, or the stream ended with an
+    /// [`WatchStreamEnd`]: the watcher lost its place, or the stream ended with an
     /// error.
-    pub async fn next(&mut self) -> Result<bool, Ended> {
+    pub async fn next(&mut self) -> Result<bool, WatchStreamEnd> {
         match self.watch.next().await {
             Ok(Some(event)) => self
                 .watcher
                 .take(&event, Instant::now())
                 .map(|()| true)
-                .map_err(Ended::Lost),
+                .map_err(WatchStreamEnd::Lost),
             Ok(None) => Ok(false),
-            Err(error) => Err(Ended::Client(error)),
+            Err(error) => Err(WatchStreamEnd::Client(error)),
         }
     }
 
@@ -146,8 +147,8 @@ impl Following<'_> {
     }
 }
 
-fn unread(refused: Refused) -> Lost {
-    Lost::Unread {
+fn unread(refused: Refused) -> WatchPositionLost {
+    WatchPositionLost::Unread {
         path: refused.path,
         why: refused.why,
     }
@@ -158,7 +159,8 @@ impl Watcher {
     /// A snapshot keeps the store's leases and session pins, and gateway
     /// vetoes for workers still present. Use a store with no journal, since
     /// the places in a watch can skip. A journaled store takes a snapshot
-    /// only at a place its journal accepts ([`Lost::Apart`] otherwise).
+    /// only at a place its journal accepts ([`WatchPositionLost::Apart`]
+    /// otherwise).
     #[must_use]
     pub fn new(store: Arc<MemoryStore>) -> Self {
         Self {
@@ -200,22 +202,22 @@ impl Watcher {
     ///
     /// The client's: the open had no answer inside its bound, or the
     /// controller refused it.
-    pub async fn open(&mut self, client: &mut Client) -> Result<Following<'_>, client::Error> {
+    pub async fn open(&mut self, client: &mut Client) -> Result<WatchStream<'_>, client::Error> {
         self.open_with(move |request| client.watch_workers(request))
             .await
     }
 
     /// Opens the watch as [`Self::open`] does, on the link's channel.
-    pub async fn open_on(&mut self, link: &Link) -> Result<Following<'_>, client::Error> {
+    pub async fn open_on(&mut self, link: &Link) -> Result<WatchStream<'_>, client::Error> {
         self.open_with(|request| link.watch_workers(request)).await
     }
 
     async fn open_with<F: Future<Output = Result<Watch, client::Error>>>(
         &mut self,
         open: impl FnOnce(proto::WatchWorkersRequest) -> F,
-    ) -> Result<Following<'_>, client::Error> {
+    ) -> Result<WatchStream<'_>, client::Error> {
         let watch = open(self.request()).await?;
-        Ok(Following {
+        Ok(WatchStream {
             watcher: self,
             watch,
         })
@@ -225,7 +227,7 @@ impl Watcher {
     /// tail after the last event taken, or a snapshot first where the
     /// watcher holds no place. A stream cut inside a snapshot starts that
     /// snapshot again: the pages taken so far are let go. The stream it
-    /// opens borrows the watcher ([`Following`]), so the events taken next
+    /// opens borrows the watcher ([`WatchStream`]), so the events taken next
     /// are that stream's.
     fn request(&mut self) -> proto::WatchWorkersRequest {
         let at = self.at().unwrap_or_default();
@@ -247,10 +249,10 @@ impl Watcher {
     ///
     /// # Errors
     ///
-    /// [`Lost`]: the watcher holds no place now and lets the stream go.
+    /// [`WatchPositionLost`]: the watcher holds no place now and lets the stream go.
     /// Every later event of it is refused until the next stream, which
     /// starts from a snapshot.
-    fn take(&mut self, told: &proto::WorkerEvent, now: Instant) -> Result<(), Lost> {
+    fn take(&mut self, told: &proto::WorkerEvent, now: Instant) -> Result<(), WatchPositionLost> {
         let taken = self.taken(told, now);
         if taken.is_err() {
             self.stands = Stands::LetGo;
@@ -258,22 +260,22 @@ impl Watcher {
         taken
     }
 
-    fn taken(&mut self, told: &proto::WorkerEvent, now: Instant) -> Result<(), Lost> {
+    fn taken(&mut self, told: &proto::WorkerEvent, now: Instant) -> Result<(), WatchPositionLost> {
         let at = Position {
             seq: told.seq,
             term: told.term,
         };
         match told.event.as_ref() {
             Some(Event::Snapshot(page)) => self.page(at, told.membership_epoch, page, now),
-            Some(Event::SnapshotRequired(_)) => Err(Lost::Required),
+            Some(Event::SnapshotRequired(_)) => Err(WatchPositionLost::Required),
             Some(event) => {
                 // The tail follows a snapshot's last page, never a page,
                 // and each of its places is past the last.
                 let Stands::At(held) = self.stands else {
-                    return Err(Lost::Order);
+                    return Err(WatchPositionLost::Order);
                 };
                 if at.seq <= held.seq || at.term < held.term {
-                    return Err(Lost::Order);
+                    return Err(WatchPositionLost::Order);
                 }
                 if !matches!(event, Event::Needs(_)) {
                     let (epoch, change, row) =
@@ -284,13 +286,13 @@ impl Watcher {
                     // nothing: it landed where the epoch moved to its own.
                     // One at the epoch the store held already moves none.
                     if before == epoch || WorkersStore::epoch(&*self.store) != epoch {
-                        return Err(Lost::Apart);
+                        return Err(WatchPositionLost::Apart);
                     }
                 }
                 self.stands = Stands::At(at);
                 Ok(())
             }
-            None => Err(Lost::Unread {
+            None => Err(WatchPositionLost::Unread {
                 path: "event",
                 why: "an event this build does not know",
             }),
@@ -304,14 +306,16 @@ impl Watcher {
         epoch: u64,
         page: &proto::WorkerSnapshot,
         now: Instant,
-    ) -> Result<(), Lost> {
+    ) -> Result<(), WatchPositionLost> {
         // A snapshot starts where the watcher stands nowhere. A page at a
         // place held is out of its order: a stream that resumes is told
         // the tail or the controller's word, and no page follows the tail.
         let mut staged = match mem::replace(&mut self.stands, Stands::Nowhere) {
             // Every page of one snapshot stands at its place.
             Stands::Inside(staged) if staged.at == at && staged.epoch == epoch => staged,
-            Stands::Inside(_) | Stands::At(_) | Stands::LetGo => return Err(Lost::Order),
+            Stands::Inside(_) | Stands::At(_) | Stands::LetGo => {
+                return Err(WatchPositionLost::Order)
+            }
             Stands::Nowhere => Staged {
                 at,
                 epoch,
@@ -327,14 +331,14 @@ impl Watcher {
             self.stands = Stands::Inside(staged);
             return Ok(());
         }
-        let cut = Cut {
+        let cut = StoreCheckpoint {
             at,
             epoch,
             rows: staged.rows,
             loads: Vec::new(),
         };
         if !self.store.watch_from(cut) {
-            return Err(Lost::Apart);
+            return Err(WatchPositionLost::Apart);
         }
         self.snapshots += 1;
         self.stands = Stands::At(at);
@@ -350,7 +354,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{Lost, Watcher};
+    use super::{WatchPositionLost, Watcher};
     use crate::{
         engine::view::WorkerId,
         service::{
@@ -359,8 +363,9 @@ mod tests {
             replication::Log,
         },
         store::{
-            GatewayId, Kinds, LeaseRecord, LeaseState, LeasesStore, MembershipChange, MemoryStore,
-            Picked, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+            GatewayId, JournalKinds, LeaseRecord, LeaseState, LeasesStore, MembershipChange,
+            MemoryStore, PickRecord, Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+            WorkersStore,
         },
         tracking::lease::{Lease, LeaseId},
     };
@@ -427,7 +432,7 @@ mod tests {
 
         /// The snapshot of the store as it stands, `rows` a page.
         fn pages(&self, rows: usize) -> Vec<proto::WorkerEvent> {
-            let cut = self.store.cut(Kinds::Watched);
+            let cut = self.store.checkpoint(JournalKinds::Watched);
             let mut chunks: Vec<&[WorkerRow]> = cut.rows.chunks(rows).collect();
             if chunks.is_empty() {
                 chunks.push(&[]);
@@ -450,7 +455,7 @@ mod tests {
     /// What two stores must agree on: the epoch, and each row's id, facts,
     /// status and revision. An admission instant crosses as an age.
     fn held(store: &MemoryStore) -> (u64, Vec<(WorkerId, WorkerFacts, WorkerStatus, u64)>) {
-        let (epoch, mut rows) = WorkersStore::snapshot(store);
+        let (epoch, mut rows) = WorkersStore::all_rows(store);
         rows.sort_by_key(|row| row.id.0);
         let rows = rows
             .into_iter()
@@ -540,7 +545,7 @@ mod tests {
         let _untold = told.event(change, None);
         let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
         let event = told.event(change, None);
-        assert_eq!(watcher.take(&event, now), Err(Lost::Apart));
+        assert_eq!(watcher.take(&event, now), Err(WatchPositionLost::Apart));
         assert_eq!(watcher.at(), None);
         assert_eq!(watcher.request().resume_seq, 0);
         for page in told.pages(2) {
@@ -569,7 +574,7 @@ mod tests {
                 gateway,
                 request: 1,
                 target: id,
-                picked: Picked::default(),
+                picked: PickRecord::default(),
                 decode: None,
                 term: 0,
                 issued_at: now,
@@ -580,7 +585,7 @@ mod tests {
         assert_eq!(leases.live(gateway), 1);
 
         let word = worker_wire::start_again(Position::default());
-        assert_eq!(watcher.take(&word, now), Err(Lost::Required));
+        assert_eq!(watcher.take(&word, now), Err(WatchPositionLost::Required));
         assert_eq!(watcher.request().resume_seq, 0);
         assert_eq!(watcher.take(&told.pages(8)[0], now), Ok(()));
         assert_eq!(watcher.snapshots(), 2);
@@ -602,10 +607,18 @@ mod tests {
         let event = told.event(change, None);
 
         let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
-        assert_eq!(watcher.take(&event, now), Err(Lost::Order), "no snapshot");
+        assert_eq!(
+            watcher.take(&event, now),
+            Err(WatchPositionLost::Order),
+            "no snapshot"
+        );
         assert_eq!(watcher.request().resume_seq, 0);
         assert_eq!(watcher.take(&pages[0], now), Ok(()));
-        assert_eq!(watcher.take(&event, now), Err(Lost::Order), "inside one");
+        assert_eq!(
+            watcher.take(&event, now),
+            Err(WatchPositionLost::Order),
+            "inside one"
+        );
         // A page of a snapshot at another place, and one of another epoch.
         let (seq, epoch) = (pages[0].seq, pages[0].membership_epoch);
         for (seq, epoch) in [(seq + 1, epoch), (seq, epoch + 1)] {
@@ -616,12 +629,20 @@ mod tests {
                 last: true,
             };
             let other = worker_wire::event(Event::Snapshot(page), seq, epoch, TERM);
-            assert_eq!(watcher.take(&other, now), Err(Lost::Order), "another's");
+            assert_eq!(
+                watcher.take(&other, now),
+                Err(WatchPositionLost::Order),
+                "another's"
+            );
         }
         // A page at a place held.
         let mut watcher = watching(&told, 8);
         let again = told.pages(8);
-        assert_eq!(watcher.take(&again[0], now), Err(Lost::Order), "held");
+        assert_eq!(
+            watcher.take(&again[0], now),
+            Err(WatchPositionLost::Order),
+            "held"
+        );
         // An event of a kind this build does not know.
         let mut watcher = watching(&told, 8);
         let unknown = proto::WorkerEvent {
@@ -631,7 +652,7 @@ mod tests {
         };
         let lost = watcher.take(&unknown, now);
         assert!(
-            matches!(lost, Err(Lost::Unread { path: "event", .. })),
+            matches!(lost, Err(WatchPositionLost::Unread { path: "event", .. })),
             "{lost:?}"
         );
 
@@ -646,7 +667,7 @@ mod tests {
         );
         assert_eq!(
             watcher.take(&ranks, now),
-            Err(Lost::Unread {
+            Err(WatchPositionLost::Unread {
                 path: "membership.ranks",
                 why: "a registration's answer rides no watch",
             })
@@ -655,7 +676,7 @@ mod tests {
 
         let mut watcher = watching(&told, 8);
         let word = worker_wire::start_again(Position::default());
-        assert_eq!(watcher.take(&word, now), Err(Lost::Required));
+        assert_eq!(watcher.take(&word, now), Err(WatchPositionLost::Required));
         assert_eq!(watcher.at(), None);
         assert_eq!(held(watcher.store()), held(&told.store), "the rows stand");
     }
@@ -685,19 +706,29 @@ mod tests {
         let page = worker_wire::event(Event::Snapshot(blank), told.seq + 1, 9, TERM);
         let mut watcher = watching(&told, 8);
         let word = worker_wire::start_again(Position::default());
-        assert_eq!(watcher.take(&word, now), Err(Lost::Required));
+        assert_eq!(watcher.take(&word, now), Err(WatchPositionLost::Required));
         assert_eq!(watcher.request().resume_seq, 0);
         let lost = watcher.take(&page, now);
-        assert!(matches!(lost, Err(Lost::Unread { .. })), "{lost:?}");
+        assert!(
+            matches!(lost, Err(WatchPositionLost::Unread { .. })),
+            "{lost:?}"
+        );
         assert_eq!(held(watcher.store()), held(&told.store), "the rows stand");
         let later = told.pages(8);
-        assert_eq!(watcher.take(&later[0], now), Err(Lost::Order), "let go");
+        assert_eq!(
+            watcher.take(&later[0], now),
+            Err(WatchPositionLost::Order),
+            "let go"
+        );
 
         let mut watcher = watching(&told, 8);
         let blank = Event::Registered(proto::WorkerRow::default());
         let blank = worker_wire::event(blank, told.seq + 1, 9, TERM);
         let lost = watcher.take(&blank, now);
-        assert!(matches!(lost, Err(Lost::Unread { .. })), "{lost:?}");
+        assert!(
+            matches!(lost, Err(WatchPositionLost::Unread { .. })),
+            "{lost:?}"
+        );
         assert_eq!(watcher.at(), None);
         assert_eq!(held(watcher.store()), held(&told.store), "the rows stand");
     }
@@ -724,9 +755,12 @@ mod tests {
         let blank = worker_wire::event(Event::Snapshot(blank), seq, epoch, TERM);
         assert_eq!(watcher.take(&pages[0], now), Ok(()));
         let lost = watcher.take(&blank, now);
-        assert!(matches!(lost, Err(Lost::Unread { .. })), "{lost:?}");
+        assert!(
+            matches!(lost, Err(WatchPositionLost::Unread { .. })),
+            "{lost:?}"
+        );
         for page in &pages[2..] {
-            assert_eq!(watcher.take(page, now), Err(Lost::Order));
+            assert_eq!(watcher.take(page, now), Err(WatchPositionLost::Order));
         }
         assert_eq!(watcher.at(), None);
         assert_eq!(held(watcher.store()), before, "the rows stand");
@@ -749,7 +783,10 @@ mod tests {
         // A place under no term, which a log takes from nobody.
         let mut page = told.pages(8).remove(0);
         page.term = 0;
-        assert_eq!(watcher.take(&page, Instant::now()), Err(Lost::Apart));
+        assert_eq!(
+            watcher.take(&page, Instant::now()),
+            Err(WatchPositionLost::Apart)
+        );
         assert_eq!(watcher.at(), None);
         assert_eq!(held(&store).1, Vec::new(), "the store stays empty");
     }
@@ -774,7 +811,7 @@ mod tests {
     #[test]
     fn a_place_not_past_the_last_and_an_epoch_held_already_lose_the_place() {
         let now = Instant::now();
-        let lost = |watcher: &mut Watcher, event: &proto::WorkerEvent, by: Lost| {
+        let lost = |watcher: &mut Watcher, event: &proto::WorkerEvent, by: WatchPositionLost| {
             let rows = held(watcher.store());
             assert_eq!(watcher.take(event, now), Err(by));
             assert_eq!(watcher.at(), None);
@@ -783,23 +820,23 @@ mod tests {
         };
 
         let (_, mut watcher, event) = followed();
-        lost(&mut watcher, &event, Lost::Order);
+        lost(&mut watcher, &event, WatchPositionLost::Order);
 
         let (told, mut watcher, _) = followed();
         let epoch = WorkersStore::epoch(&told.store);
         let needs = Event::Needs(proto::NeedsSummary::default());
         let needs = worker_wire::event(needs, told.seq - 1, epoch, TERM);
-        lost(&mut watcher, &needs, Lost::Order);
+        lost(&mut watcher, &needs, WatchPositionLost::Order);
 
         let (mut told, mut watcher, _) = followed();
         let change = WorkersStore::upsert(&told.store, facts("grpc://10.0.0.3:8000", 1));
         let mut older = told.event(change, None);
         older.term = TERM - 1;
-        lost(&mut watcher, &older, Lost::Order);
+        lost(&mut watcher, &older, WatchPositionLost::Order);
 
         let (_, mut watcher, event) = followed();
         let mut again = event;
         again.seq += 1;
-        lost(&mut watcher, &again, Lost::Apart);
+        lost(&mut watcher, &again, WatchPositionLost::Apart);
     }
 }

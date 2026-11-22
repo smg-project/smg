@@ -18,9 +18,9 @@ use crate::{
             ZoneCapacity,
         },
     },
-    plugins::shared::shown_hashes,
+    plugins::shared::{shown_hashes, shown_size},
     tracking::{
-        counts::with_counts,
+        in_flight::with_counts,
         lease::{
             Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass,
         },
@@ -253,7 +253,7 @@ pub(crate) fn request<'a>(
         priority: facts.priority,
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
-        prompt_tokens: facts.prompt_tokens,
+        prompt_tokens: shown_size(facts, needs),
         block_hashes: shown_hashes(facts, needs),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
@@ -723,7 +723,8 @@ impl Packed {
         put(buf, REQ_TENANT, &tenant_hash.to_le_bytes());
         put(buf, REQ_SESSION_KEY, &session_hash.to_le_bytes());
         put(buf, REQ_BUDGET, &facts.budget_micros.to_le_bytes());
-        put(buf, REQ_PROMPT_TOKENS, &facts.prompt_tokens.to_le_bytes());
+        let size = shown_size(facts, needs);
+        put(buf, REQ_PROMPT_TOKENS, &size.to_le_bytes());
         put(buf, REQ_MAX_OUTPUT, &facts.max_output_tokens.to_le_bytes());
         put(buf, REQ_PRIORITY, &facts.priority.to_le_bytes());
         put(buf, REQ_HASH_COUNT, &hash_count.to_le_bytes());
@@ -1040,8 +1041,8 @@ mod tests {
     use super::{layout::*, *};
     use crate::{
         document::spec::MAX_BLOCK_HASHES,
-        engine::view::{Header, MediaCounts, NamedAffinity, NamedHolder, WorkerId},
-        plugins::wasm::config::HeaderSet,
+        engine::view::{AffinityHolder, AffinityRows, Header, MediaCounts, WorkerId},
+        plugins::shared::config::HeaderSet,
     };
 
     fn candidate_row() -> Candidate {
@@ -1183,13 +1184,13 @@ mod tests {
     #[test]
     fn both_fills_give_a_named_holder_its_depth_and_every_other_row_nothing() {
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
-                holders: &[NamedHolder {
+            named: Some(AffinityRows {
+                holders: &[AffinityHolder {
                     row: 1,
                     overlap_blocks: 17,
                     predicted_blocks: 0,
                 }],
-                ..NamedAffinity::default()
+                ..AffinityRows::default()
             }),
             ..RequestFacts::default()
         };
@@ -1219,7 +1220,7 @@ mod tests {
     /// table, the rows themselves reading zero.
     #[test]
     fn both_fills_give_a_row_the_count_its_request_reads() {
-        use crate::tracking::counts::tests::Lent;
+        use crate::tracking::in_flight::tests::Lent;
         let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
         for (row, position) in rows.iter_mut().zip(0..) {
             row.position = position;
@@ -1441,6 +1442,41 @@ mod tests {
         assert_eq!(record.block_hashes, &longer[..3]);
     }
 
+    /// Both forms carry the request's size for a row that declares it, and
+    /// zero for a row that does not, whatever else it declares. A plugin
+    /// that reads the size undeclared reads zero at once: of a request its
+    /// host read whole as of one its host sent on unread.
+    #[test]
+    fn a_view_carries_the_requests_size_its_row_declares() {
+        let facts = RequestFacts {
+            prompt_tokens: 512,
+            ..RequestFacts::default()
+        };
+        let sized = Needs {
+            prompt_size: true,
+            ..Needs::default()
+        };
+        let other = Needs {
+            token_hashes: true,
+            text_hashes: true,
+            loads: true,
+            ..Needs::default()
+        };
+        for (needs, shown) in [(sized, 512), (other, 0), (Needs::default(), 0)] {
+            let record = request(&facts, &Exposure::default(), needs, &[], &[]);
+            assert_eq!(record.prompt_tokens, shown, "{needs:?}");
+            let mut packed = Packed::default();
+            packed
+                .fill_request(&facts, &Exposure::default(), needs)
+                .expect("the request packs");
+            assert_eq!(
+                le_u32(&packed.request, REQ_PROMPT_TOKENS),
+                shown,
+                "{needs:?}"
+            );
+        }
+    }
+
     /// The two u64 sections are written a section at a time: every hash and
     /// every tried id sits at its own eight bytes, little-endian and in
     /// order, the tried ids after the hashes, at any length of either, in
@@ -1498,7 +1534,7 @@ mod tests {
         ];
         let facts = RequestFacts {
             model: "twelve-bytes",
-            model_fingerprint: crate::ModelFingerprint::NONE,
+            model_fingerprint: crate::engine::ModelFingerprint::NONE,
             namespace_seed: 1,
             tenant: Identity::plain("acme"),
             priority: -7,
@@ -1532,6 +1568,8 @@ mod tests {
             named: None,
             signal_cells: None,
             client_key: 0,
+            ring: None,
+            ring_awaited: false,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,
@@ -1641,7 +1679,7 @@ mod tests {
     fn a_session_key_the_plugin_is_not_shown_makes_no_session() {
         let facts = RequestFacts {
             model: "model-a",
-            model_fingerprint: crate::ModelFingerprint::of("model-b"),
+            model_fingerprint: crate::engine::ModelFingerprint::of("model-b"),
             session_key: Identity::plain("conversation-7"),
             ..RequestFacts::default()
         };

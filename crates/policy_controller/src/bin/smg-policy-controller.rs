@@ -4,7 +4,7 @@
 
 use std::process::ExitCode;
 
-use smg_policy_controller::{service::controller, Catalog};
+use smg_policy_controller::{service::controller, stages::StageRegistry};
 
 /// The process's allocator, the one the gateway's binary registers, on the
 /// targets the gateway registers it. A burst of registrations builds the
@@ -61,5 +61,5 @@ pub static MALLOC_CONF: &[u8; 100] = SETTINGS;
 pub static MALLOC_CONF: &[u8; 77] = SETTINGS_WITHOUT_THREAD;
 
 fn main() -> ExitCode {
-    controller::run(Catalog::builtin())
+    controller::run(StageRegistry::builtin())
 }

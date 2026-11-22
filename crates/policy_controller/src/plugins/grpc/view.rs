@@ -18,11 +18,11 @@ use crate::{
     },
     plugins::shared::{
         config::{Exposure, Reveal},
-        shown_hashes,
+        shown_hashes, shown_size,
     },
     service::proto,
     tracking::{
-        counts::with_counts,
+        in_flight::with_counts,
         lease::{wire, Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal},
     },
 };
@@ -224,7 +224,7 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto
         priority: facts.priority,
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
-        prompt_tokens: facts.prompt_tokens,
+        prompt_tokens: shown_size(facts, needs),
         block_hashes: shown_hashes(facts, needs).to_vec(),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
@@ -693,7 +693,7 @@ mod tests {
         since, since_of, Answer, Invalid, FILTER, PICK, SCORE,
     };
     use crate::{
-        engine::{door, view::WorkerId},
+        engine::{store_backed_engine, view::WorkerId},
         tracking::lease::Membership,
     };
 
@@ -1019,6 +1019,7 @@ mod tests {
             text: true,
             token_hashes: false,
             text_hashes: false,
+            prompt_size: true,
             loads: true,
             events: true,
             sent_prefixes: true,
@@ -1047,6 +1048,51 @@ mod tests {
         );
     }
 
+    /// A frame carries the request's size for a row that declares it, and
+    /// zero for a row that does not, whatever else it declares. A plugin
+    /// that reads the size undeclared reads zero at once: of a request its
+    /// host read whole as of one its host sent on unread.
+    #[test]
+    fn a_frame_carries_the_requests_size_its_row_declares() {
+        use crate::{
+            document::spec::Needs,
+            engine::view::{PoolFacts, RequestFacts},
+            plugins::shared::config::Exposure,
+        };
+
+        let sent = |needs: Needs| {
+            let facts = RequestFacts {
+                model: "m",
+                prompt_tokens: 512,
+                ..RequestFacts::default()
+            };
+            super::decide(
+                1,
+                &facts,
+                &[],
+                &PoolFacts::default(),
+                &Exposure::default(),
+                needs,
+            )
+            .request
+            .expect("a frame carries its request")
+            .prompt_tokens
+        };
+        let sized = Needs {
+            prompt_size: true,
+            ..Needs::default()
+        };
+        let other = Needs {
+            token_hashes: true,
+            text_hashes: true,
+            loads: true,
+            ..Needs::default()
+        };
+        assert_eq!(sent(sized), 512);
+        assert_eq!(sent(other), 0);
+        assert_eq!(sent(Needs::default()), 0);
+    }
+
     /// The frame carries each candidate's requests in flight as the
     /// request's facts read them: the lent count where the host lends a
     /// table, the rows themselves reading zero.
@@ -1056,7 +1102,7 @@ mod tests {
             document::spec::Needs,
             engine::view::{Candidate, PoolFacts, RequestFacts},
             plugins::shared::config::Exposure,
-            tracking::counts::tests::Lent,
+            tracking::in_flight::tests::Lent,
         };
 
         let mut rows: Vec<Candidate> = (0..)
@@ -1183,9 +1229,9 @@ mod tests {
     /// lifted, and none for a pick no rule made.
     #[test]
     fn the_views_trace_carries_the_lifted_veto() {
-        use crate::engine::decision::{Lifted, Trace};
+        use crate::engine::decision::{LiftedVeto, Trace};
         let steered = Trace {
-            lifted: Lifted::Overload,
+            lifted: LiftedVeto::Overload,
             ..Trace::default()
         };
         assert_eq!(steered.wire().lifted, proto::LiftedVeto::Overload as i32);
@@ -1203,7 +1249,7 @@ mod tests {
             engine::decision::ShedReason, plugins::shared::config::Exposure, tracking::lease::Lease,
         };
 
-        let shed = door::shed(ShedReason::NoEndpoints, "wires", 0, 0);
+        let shed = store_backed_engine::shed(ShedReason::NoEndpoints, "wires", 0, 0);
         let decision = super::decision(&shed, &Lease::default(), &Exposure::default());
         assert_eq!(
             decision.trace.expect("a trace").encode_to_vec(),

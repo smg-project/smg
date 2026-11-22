@@ -1,0 +1,418 @@
+{
+  "_doc": "The wider class list of the release comparison: 59 image files, every container, sampling, bit depth, orientation and size the maker writes, one file a class. run.py parity compares what two builds write for each of them on two wires and under two alpha policies, digests only; nothing is timed. The files are written by make_images.py beside this file.",
+  "classes": [
+    {
+      "name": "aspect-10000x10-jpeg",
+      "kind": "image",
+      "files": [
+        "aspect-10000x10-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "aspect-2000x40-jpeg",
+      "kind": "image",
+      "files": [
+        "aspect-2000x40-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "aspect-3x900-jpeg",
+      "kind": "image",
+      "files": [
+        "aspect-3x900-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "aspect-4000x15-jpeg",
+      "kind": "image",
+      "files": [
+        "aspect-4000x15-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "aspect-40x2000-jpeg",
+      "kind": "image",
+      "files": [
+        "aspect-40x2000-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "bmp-24",
+      "kind": "image",
+      "files": [
+        "bmp-24.bmp"
+      ]
+    },
+    {
+      "name": "gif-animated-10",
+      "kind": "image",
+      "files": [
+        "gif-animated-10.gif"
+      ]
+    },
+    {
+      "name": "gif-static",
+      "kind": "image",
+      "files": [
+        "gif-static.gif"
+      ]
+    },
+    {
+      "name": "ico-64",
+      "kind": "image",
+      "files": [
+        "ico-64.ico"
+      ]
+    },
+    {
+      "name": "jpeg-baseline-420-q90",
+      "kind": "image",
+      "files": [
+        "jpeg-baseline-420-q90.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-baseline-422-q85",
+      "kind": "image",
+      "files": [
+        "jpeg-baseline-422-q85.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-baseline-444-q95",
+      "kind": "image",
+      "files": [
+        "jpeg-baseline-444-q95.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-cmyk",
+      "kind": "image",
+      "files": [
+        "jpeg-cmyk.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-1",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-1.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-2",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-2.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-3",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-3.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-4",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-4.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-5",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-5.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-6",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-6.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-6-tall",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-6-tall.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-7",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-7.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-exif-orientation-8",
+      "kind": "image",
+      "files": [
+        "jpeg-exif-orientation-8.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-grayscale",
+      "kind": "image",
+      "files": [
+        "jpeg-grayscale.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-icc-srgb",
+      "kind": "image",
+      "files": [
+        "jpeg-icc-srgb.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-optimized-q75",
+      "kind": "image",
+      "files": [
+        "jpeg-optimized-q75.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-progressive-q90",
+      "kind": "image",
+      "files": [
+        "jpeg-progressive-q90.jpg"
+      ]
+    },
+    {
+      "name": "jpeg-q100-444",
+      "kind": "image",
+      "files": [
+        "jpeg-q100-444.jpg"
+      ]
+    },
+    {
+      "name": "png-1bit",
+      "kind": "image",
+      "files": [
+        "png-1bit.png"
+      ]
+    },
+    {
+      "name": "png-exif-orientation-6",
+      "kind": "image",
+      "files": [
+        "png-exif-orientation-6.png"
+      ]
+    },
+    {
+      "name": "png-gray16",
+      "kind": "image",
+      "files": [
+        "png-gray16.png"
+      ]
+    },
+    {
+      "name": "png-gray8",
+      "kind": "image",
+      "files": [
+        "png-gray8.png"
+      ]
+    },
+    {
+      "name": "png-icc-srgb",
+      "kind": "image",
+      "files": [
+        "png-icc-srgb.png"
+      ]
+    },
+    {
+      "name": "png-la8",
+      "kind": "image",
+      "files": [
+        "png-la8.png"
+      ]
+    },
+    {
+      "name": "png-palette",
+      "kind": "image",
+      "files": [
+        "png-palette.png"
+      ]
+    },
+    {
+      "name": "png-palette-trns",
+      "kind": "image",
+      "files": [
+        "png-palette-trns.png"
+      ]
+    },
+    {
+      "name": "png-rgb8",
+      "kind": "image",
+      "files": [
+        "png-rgb8.png"
+      ]
+    },
+    {
+      "name": "png-rgba8",
+      "kind": "image",
+      "files": [
+        "png-rgba8.png"
+      ]
+    },
+    {
+      "name": "size-1024x768-jpeg",
+      "kind": "image",
+      "files": [
+        "size-1024x768-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-1024x768-png",
+      "kind": "image",
+      "files": [
+        "size-1024x768-png.png"
+      ]
+    },
+    {
+      "name": "size-16x16-jpeg",
+      "kind": "image",
+      "files": [
+        "size-16x16-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-1920x1080-jpeg",
+      "kind": "image",
+      "files": [
+        "size-1920x1080-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-1920x1080-png",
+      "kind": "image",
+      "files": [
+        "size-1920x1080-png.png"
+      ]
+    },
+    {
+      "name": "size-1x1-jpeg",
+      "kind": "image",
+      "files": [
+        "size-1x1-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-256x256-jpeg",
+      "kind": "image",
+      "files": [
+        "size-256x256-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-256x256-png",
+      "kind": "image",
+      "files": [
+        "size-256x256-png.png"
+      ]
+    },
+    {
+      "name": "size-2x2-jpeg",
+      "kind": "image",
+      "files": [
+        "size-2x2-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-3840x2160-png",
+      "kind": "image",
+      "files": [
+        "size-3840x2160-png.png"
+      ]
+    },
+    {
+      "name": "size-4096x2304-jpeg",
+      "kind": "image",
+      "files": [
+        "size-4096x2304-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-640x480-jpeg",
+      "kind": "image",
+      "files": [
+        "size-640x480-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-64x64-jpeg",
+      "kind": "image",
+      "files": [
+        "size-64x64-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-7x5-jpeg",
+      "kind": "image",
+      "files": [
+        "size-7x5-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "size-8192x8192-jpeg",
+      "kind": "image",
+      "files": [
+        "size-8192x8192-jpeg.jpg"
+      ]
+    },
+    {
+      "name": "tiff-exif-orientation-3",
+      "kind": "image",
+      "files": [
+        "tiff-exif-orientation-3.tiff"
+      ]
+    },
+    {
+      "name": "tiff-lzw",
+      "kind": "image",
+      "files": [
+        "tiff-lzw.tiff"
+      ]
+    },
+    {
+      "name": "tiff-uncompressed",
+      "kind": "image",
+      "files": [
+        "tiff-uncompressed.tiff"
+      ]
+    },
+    {
+      "name": "webp-exif-orientation-6",
+      "kind": "image",
+      "files": [
+        "webp-exif-orientation-6.webp"
+      ]
+    },
+    {
+      "name": "webp-lossless",
+      "kind": "image",
+      "files": [
+        "webp-lossless.webp"
+      ]
+    },
+    {
+      "name": "webp-lossy-alpha",
+      "kind": "image",
+      "files": [
+        "webp-lossy-alpha.webp"
+      ]
+    },
+    {
+      "name": "webp-lossy-q80",
+      "kind": "image",
+      "files": [
+        "webp-lossy-q80.webp"
+      ]
+    }
+  ]
+}

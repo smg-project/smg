@@ -272,8 +272,9 @@ pub(crate) fn assign(
 /// ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call the conversation
 /// established without a tool inventory comes back as a call under either parser.
 ///
-/// `constraint` is the older registry's where the table built none (`WorkerConstraint::table`);
-/// the table's own is never passed, whatever kind its backend's spelling gave it.
+/// `constraint` is one no table built (`WorkerConstraint::table`): the older registry's where
+/// the table has no tag, or the forced call's JSON schema where the table's tag opens with free
+/// text; the table's own is never passed, whatever kind its backend's spelling gave it.
 ///
 /// Under a JSON-schema constraint (the forced call the older registry writes where the table has
 /// no tag for it) the output has none of the table's call markers: it is the model's thought,

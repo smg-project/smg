@@ -7,23 +7,25 @@ use std::{
 
 use axum::{
     body::BodyDataStream,
+    http::header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     routing::{post, MethodRouter},
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    document::spec::{KeySourceSpec, RoutingKeySpec},
+    document::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec},
+    engine::{worker_id, PolicyEngine as OwnEngine},
+    policies::power_of_two::PowerOfTwoMetric,
     store::{
         GatewayId, HealthSink, LeasesStore, MemoryStore, WorkerStatus as RowStatus, WorkersStore,
     },
-    AppliedSpec, PolicySpec, PowerOfTwoMetric,
 };
 use smg_worker::test_support::RefusedAddress;
 use tokio::{net::TcpListener, time::timeout};
 
 use super::{
-    tests::{fixed_status_upstream, streamed_request},
+    tests::{fixed_status_upstream, spawn_capture_stub, streamed_request},
     *,
 };
 use crate::{
@@ -584,7 +586,7 @@ fn a_failed_placement_adds_its_row_each_time() -> Case {
         &workers[0],
         StatusCode::OK.into_response(),
         false,
-        Some(row),
+        || Some(row),
     );
     assert!(tried_rows.lock().is_empty());
     for _ in 0..2 {
@@ -593,7 +595,7 @@ fn a_failed_placement_adds_its_row_each_time() -> Case {
             &workers[0],
             StatusCode::SERVICE_UNAVAILABLE.into_response(),
             false,
-            Some(row),
+            || Some(row),
         );
     }
     assert_eq!(*tried_rows.lock(), [row, row]);
@@ -1015,27 +1017,315 @@ async fn a_streamed_transcription_holds_its_lease_to_its_last_frame() -> Case {
     Ok(())
 }
 
+/// A gateway that follows a controller hands every body that would stream
+/// back to the buffered path: its streamed path does not ask the controller.
 #[tokio::test]
-async fn a_body_that_would_stream_takes_the_buffered_path_under_the_policy_engine() -> Case {
+async fn a_body_that_would_stream_takes_the_buffered_path_under_a_followed_controller() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
     let (policy_engine, _, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
     let hosted = router(registry, Some(policy_engine));
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let request = {
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        hosted
-            .route_streaming_request(streamed_request(&[GENERATE_BODY]), GENERATE, false)
-            .await
-    }
-    .err()
-    .ok_or("the router did not hand back the request")?;
+    let (handed_back, counted) = streamed(&hosted, streamed_request(&[GENERATE_BODY])).await;
+    let request = handed_back
+        .err()
+        .ok_or("the router did not hand back the request")?;
     assert_eq!(
         to_bytes(request.into_body(), 1024).await?.as_ref(),
         GENERATE_BODY
     );
-    assert!(recorder.handle().render().lines().any(|line| {
-        line == r#"smg_router_request_body_path_total{path="buffered",reason="placed_by_controller"} 1"#
-    }));
+    assert_eq!(counted, [("buffered", "placed_by_controller", 1)]);
+    Ok(())
+}
+
+/// The regular router of a gateway that decides in its own process: the
+/// policy engine of the stock document `preset`, over one ready worker of
+/// [`MODEL`] a URL in the router's own registry. No store stands behind it.
+fn own_router(preset: &str, urls: &[&str]) -> Case<Router> {
+    let registry = Arc::new(WorkerRegistry::new());
+    for url in urls {
+        let worker = BasicWorkerBuilder::new(*url)
+            .status(WorkerStatus::Ready)
+            .model(ModelCard::new(MODEL))
+            .build();
+        registry
+            .register(Arc::new(worker))
+            .ok_or("the worker did not register")?;
+    }
+    let mut document = PolicySpec::preset(preset)?;
+    document.generation = 1;
+    let engine = Arc::new(OwnEngine::new(AppliedSpec::validate(&document)?));
+    let policy_engine = PolicyEngine::own(engine, Arc::clone(&registry));
+    // The app's task fills a list's hash ring off the path of a request,
+    // and no request does: this bed has no such task, and fills the ring of
+    // its one list here.
+    assert!(policy_engine.fill_rings(MODEL));
+    Ok(router(registry, Some(policy_engine)))
+}
+
+/// A retry names the worker of a failed attempt as tried where its route
+/// kept no placement of it. Under the engine of this process a place owes
+/// nothing and is its worker alone to its route: the worker is named by the
+/// id a whole decision names it by. The classic line names no row.
+#[test]
+fn a_retry_names_the_worker_of_a_placement_its_route_did_not_keep() -> Case {
+    let hosted = own_router("round_robin", &["http://127.0.0.1:1"])?;
+    let worker = hosted.worker_registry.get_all().pop().ok_or("no worker")?;
+    assert_eq!(
+        hosted.tried_row(&worker, None),
+        Some(worker_id(worker.as_ref()))
+    );
+    let classic = router(Arc::clone(&hosted.worker_registry), None);
+    assert_eq!(classic.tried_row(&worker, None), None);
+    Ok(())
+}
+
+/// `request` put to `router`'s streamed path on the generate route, with
+/// what the body-path counter counted for it: each path and reason, and how
+/// many requests.
+async fn streamed(
+    router: &Router,
+    request: Request<Body>,
+) -> (
+    Result<Response, Request<Body>>,
+    Vec<(&'static str, &'static str, u32)>,
+) {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let answer = {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        router
+            .route_streaming_request(request, GENERATE, false)
+            .await
+    };
+    let rendered = recorder.handle().render();
+    let mut counted = Vec::new();
+    for path in ["streamed", "buffered"] {
+        for reason in [
+            "pure_forward",
+            "placed_by_controller",
+            "policy_needs_text",
+            "no_available_worker",
+        ] {
+            let series = format!(
+                r#"smg_router_request_body_path_total{{path="{path}",reason="{reason}"}} "#
+            );
+            let count = rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(series.as_str())?.parse().ok());
+            if let Some(count) = count {
+                counted.push((path, reason, count));
+            }
+        }
+    }
+    (answer, counted)
+}
+
+/// `request` under the routing key `key`.
+fn keyed(mut request: Request<Body>, name: &'static str, key: &str) -> Case<Request<Body>> {
+    request
+        .headers_mut()
+        .insert(name, HeaderValue::from_str(key)?);
+    Ok(request)
+}
+
+/// The classic line streams a body no policy reads. So does a gateway that
+/// decides in its own process: the policy engine places the request from its
+/// headers, the body reaches the worker in the chunks it came in and is
+/// never read whole, and the body path counts it streamed. The engine
+/// decides each request: its rotation gives each worker its turn, and its
+/// decisions are counted.
+#[tokio::test]
+async fn a_body_no_placement_reads_is_streamed_where_the_engine_of_this_process_places() -> Case {
+    const ANSWER: &str = r#"{"text":"ok"}"#;
+    let (a, seen_a) = spawn_capture_stub("application/json", ANSWER).await;
+    let (b, seen_b) = spawn_capture_stub("application/json", ANSWER).await;
+    let router = own_router("round_robin", &[&a, &b])?;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    for _ in 0..2 {
+        let request = streamed_request(&[b"{\"text\":\"", b"hello\"}"]);
+        let response = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            router
+                .route_streaming_request(request, GENERATE, false)
+                .await
+        }
+        .map_err(|_| "the router buffered the request")?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await?.as_ref(),
+            ANSWER.as_bytes()
+        );
+    }
+    for seen in [seen_a, seen_b] {
+        let sent = seen.lock().await.take();
+        let (headers, body) = sent.ok_or("a worker took no turn of the rotation")?;
+        assert_eq!(body.as_ref(), b"{\"text\":\"hello\"}");
+        assert!(
+            headers.get(CONTENT_LENGTH).is_none(),
+            "the body was read whole ahead of the send"
+        );
+        let encoding = headers.get(TRANSFER_ENCODING);
+        assert_eq!(
+            encoding.and_then(|value| value.to_str().ok()),
+            Some("chunked")
+        );
+    }
+    let rendered = recorder.handle().render();
+    let counted = |series: &str, labels: &[&str]| {
+        rendered.lines().any(|line| {
+            line.starts_with(series)
+                && labels.iter().all(|label| line.contains(label))
+                && line.ends_with(" 2")
+        })
+    };
+    assert!(
+        counted(
+            "smg_router_request_body_path_total{",
+            &[r#"path="streamed""#, r#"reason="pure_forward""#]
+        ),
+        "{rendered}"
+    );
+    assert!(
+        counted(
+            "smg_policy_decisions_total{",
+            &[r#"outcome="pick""#, r#"mode="embedded""#]
+        ),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+/// A request keyed by a header is streamed too: its key is not in its body.
+/// Under the hash ring one key keeps one worker. Under `manual` the key's
+/// first request is assigned at random, its dispatch on the streamed path
+/// makes the key's pin, and every later request of the key follows the pin.
+#[tokio::test]
+async fn a_request_keyed_by_a_header_is_streamed_to_its_keys_worker() -> Case {
+    for preset in ["consistent_hashing", "manual"] {
+        let mut urls = Vec::new();
+        let mut hits = Vec::new();
+        for _ in 0..3 {
+            let (url, hit) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+            urls.push(url);
+            hits.push(hit);
+        }
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let router = own_router(preset, &urls)?;
+        for _ in 0..12 {
+            let request = keyed(
+                streamed_request(&[GENERATE_BODY]),
+                "x-smg-routing-key",
+                "conv",
+            )?;
+            let (answer, counted) = streamed(&router, request).await;
+            let response = answer.map_err(|_| "the router buffered a keyed request")?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(counted, [("streamed", "pure_forward", 1)], "{preset}");
+        }
+        let hits: Vec<usize> = hits.iter().map(|hit| hit.load(Ordering::SeqCst)).collect();
+        assert!(hits.contains(&12), "{preset}: the key moved: {hits:?}");
+    }
+    Ok(())
+}
+
+/// A document whose placement reads the prompt keeps the body readable, as
+/// a classic policy that needs the text does: the request goes back to the
+/// buffered path with its body whole. A valid tokens hint states the prompt
+/// in a header, so a hinted request is streamed, and the prefix ring keeps
+/// one hint on one worker. The bucket stage reads no hash of the prompt and
+/// places by its size, which it declares: the body is kept for it too, where
+/// a streamed request would state a size of zero.
+#[tokio::test]
+async fn a_document_that_reads_the_prompt_buffers_the_body_unless_a_hint_states_it() -> Case {
+    let hint: Vec<String> = (1..=64_u32).map(|id| id.to_string()).collect();
+    let hint = hint.join(",");
+    for preset in ["cache_aware", "prefix_hash", "bucket"] {
+        let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let router = own_router(preset, &[&a, &b])?;
+        let (handed_back, counted) = streamed(&router, streamed_request(&[GENERATE_BODY])).await;
+        let request = handed_back
+            .err()
+            .ok_or("the router streamed a body its placement reads")?;
+        assert_eq!(
+            to_bytes(request.into_body(), 1024).await?.as_ref(),
+            GENERATE_BODY
+        );
+        assert_eq!(counted, [("buffered", "policy_needs_text", 1)], "{preset}");
+
+        for _ in 0..8 {
+            let request = keyed(
+                streamed_request(&[GENERATE_BODY]),
+                "x-smg-routing-tokens",
+                &hint,
+            )?;
+            let (answer, counted) = streamed(&router, request).await;
+            let response = answer.map_err(|_| "the router buffered a hinted request")?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(counted, [("streamed", "pure_forward", 1)], "{preset}");
+        }
+        let hits = [hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst)];
+        assert_eq!(hits[0] + hits[1], 8, "{preset}");
+        if preset == "prefix_hash" {
+            assert!(hits.contains(&8), "the hint's requests spread: {hits:?}");
+        }
+    }
+    Ok(())
+}
+
+/// A request the engine places on no worker goes back to the buffered path
+/// with its body whole, counted as the classic line counts a selection that
+/// finds no worker: the buffered path answers it.
+#[tokio::test]
+async fn a_request_the_engine_does_not_place_goes_back_to_the_buffered_path() -> Case {
+    let router = own_router("round_robin", &["http://127.0.0.1:1"])?;
+    for worker in router.worker_registry.get_all() {
+        worker.set_status(WorkerStatus::NotReady);
+    }
+    let (handed_back, counted) = streamed(&router, streamed_request(&[GENERATE_BODY])).await;
+    let request = handed_back
+        .err()
+        .ok_or("the router streamed to a worker that is not ready")?;
+    assert_eq!(
+        to_bytes(request.into_body(), 1024).await?.as_ref(),
+        GENERATE_BODY
+    );
+    assert_eq!(counted, [("buffered", "no_available_worker", 1)]);
+    Ok(())
+}
+
+/// A request that names its worker reads the buffered path's refusal on the
+/// streamed path too, where the model's classic policy holds it to that
+/// worker: no worker is asked, no body is read for it, and it is counted on
+/// neither body path. Under a policy that reads no target the header
+/// changes nothing.
+#[tokio::test]
+async fn a_streamed_request_that_names_its_worker_is_refused_by_name() -> Case {
+    for (policy, refused) in [
+        (PolicyConfig::ConsistentHashing, true),
+        (PolicyConfig::RoundRobin, false),
+    ] {
+        let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+        let mut router = own_router("round_robin", &[&url])?;
+        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
+        let request = keyed(
+            streamed_request(&[GENERATE_BODY]),
+            "x-smg-target-worker",
+            "0",
+        )?;
+        let (answer, counted) = streamed(&router, request).await;
+        let response = answer.map_err(|_| "the router buffered the request")?;
+        if refused {
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "not_decided_by_policy_controller"
+            );
+            assert!(counted.is_empty(), "{counted:?}");
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(counted, [("streamed", "pure_forward", 1)]);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), usize::from(!refused));
+    }
     Ok(())
 }
 

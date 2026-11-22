@@ -241,6 +241,24 @@ impl LlavaProcessor {
         self
     }
 
+    /// Refuse a patch size of zero: the token count divides by it.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        if self.patch_size == 0 {
+            return Err(TransformError::ShapeError(
+                "LLaVA patch_size must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The side of the square target: the configured size, else the model's
+    /// image size.
+    fn target_side(&self) -> u32 {
+        self.transforms
+            .target_size
+            .map_or(self.image_size, |(h, _w)| h)
+    }
+
     /// Process a single image through the LLaVA 1.5 pipeline.
     ///
     /// The processing flow depends on `self.aspect_ratio`:
@@ -250,11 +268,7 @@ impl LlavaProcessor {
         let transforms = &self.transforms;
         let filter = transforms.filter;
 
-        // Get target size from config or use default
-        let target_size = transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let target_size = self.target_side();
 
         // Get crop size (may be different from target_size)
         let crop_size = transforms.crop_size.map(|(h, _w)| h).unwrap_or(target_size);
@@ -368,11 +382,7 @@ impl VisionPreProcessor for LlavaProcessor {
     fn calculate_num_tokens(&self, _width: u32, _height: u32) -> Result<usize, TransformError> {
         // For LLaVA 1.5, token count is based on processed image size and patch size
         let patch_size = self.patch_size;
-        let image_size = self
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let image_size = self.target_side();
 
         let patches_per_side = image_size / patch_size;
         Ok((patches_per_side * patches_per_side) as usize)
@@ -383,11 +393,7 @@ impl VisionPreProcessor for LlavaProcessor {
     }
 
     fn get_processed_size(&self) -> Option<(u32, u32)> {
-        let size = self
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let size = self.target_side();
         Some((size, size))
     }
 }
@@ -438,6 +444,30 @@ impl LlavaNextProcessor {
     pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
         self.base.transforms = LlavaTransforms::new(config);
         self
+    }
+
+    /// Refuse a size of zero the token count, the anyres grid or the sample
+    /// crops divide by.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        self.base.validate()?;
+        let crop = self.sample_crop();
+        let zero = if self.base.image_size == 0 {
+            "image_size"
+        } else if crop.0 == 0 || crop.1 == 0 {
+            "crop_size (or size, when it is absent)"
+        } else {
+            return Ok(());
+        };
+        Err(TransformError::ShapeError(format!(
+            "LLaVA-NeXT {zero} must be positive"
+        )))
+    }
+
+    /// The crop a sample ends as, `(height, width)`: `crop_size`, else the
+    /// square target.
+    fn sample_crop(&self) -> (u32, u32) {
+        let target = self.base.target_side();
+        self.base.transforms.crop_size.unwrap_or((target, target))
     }
 
     /// Create a new LLaVA-NeXT processor with default settings.
@@ -514,13 +544,13 @@ impl LlavaNextProcessor {
         resize_and_pad_image(image, target, self.base.transforms.filter)
     }
 
-    /// Divide image into crops of specified size.
+    /// Divide image into square crops of `side`.
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the processor; keeps API consistent"
     )]
-    fn divide_to_samples(&self, image: &DynamicImage, crop_size: (u32, u32)) -> Vec<DynamicImage> {
-        divide_to_samples(image, crop_size)
+    fn divide_to_samples(&self, image: &DynamicImage, side: u32) -> Vec<DynamicImage> {
+        divide_to_samples(image, side)
     }
 
     /// A patch's pixels as the model takes them: resized to the target size
@@ -529,11 +559,7 @@ impl LlavaNextProcessor {
         let transforms = &self.base.transforms;
         let filter = transforms.filter;
 
-        // Get target size for patches
-        let target_size = transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let target_size = self.base.target_side();
 
         // Resize patch to target size (a crop of that size stays as it is)
         let resized = if transforms.do_resize {
@@ -580,17 +606,9 @@ impl VisionPreProcessor for LlavaNextProcessor {
         let mut item_sizes = Vec::with_capacity(images.len());
 
         let filter = self.base.transforms.filter;
-        let target_size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
-        let crop_size = self
-            .base
-            .transforms
-            .crop_size
-            .unwrap_or((target_size, target_size));
+        let target_size = self.base.target_side();
+        // The reference cuts squares of the crop height.
+        let (sample_side, _) = self.sample_crop();
 
         for image in images {
             let original_size = image.dimensions();
@@ -602,7 +620,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
                 resize_as_reference(image, target_size, target_size, filter).into_owned();
 
             let mut samples = vec![image_original_resize];
-            samples.extend(self.divide_to_samples(&image_padded, crop_size));
+            samples.extend(self.divide_to_samples(&image_padded, sample_side));
 
             samples_per_image.push(samples);
 
@@ -637,12 +655,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         let original_size = (width, height);
 
         // Use effective geometry from config, falling back to base defaults.
-        let image_size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let image_size = self.base.target_side();
         let patch_size = self.base.patch_size;
 
         // Base feature tokens (from original resized image through ViT).
@@ -692,12 +705,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
     fn get_processed_size(&self) -> Option<(u32, u32)> {
         // LLaVA-NeXT has variable output size based on crops
         // Return the base patch size
-        let size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let size = self.base.target_side();
         Some((size, size))
     }
 }
@@ -866,20 +874,20 @@ fn resize_as_reference(
     })
 }
 
-/// Divide image into crops of specified size.
-fn divide_to_samples(image: &DynamicImage, crop_size: (u32, u32)) -> Vec<DynamicImage> {
+/// Divide image into square crops of `side`.
+fn divide_to_samples(image: &DynamicImage, side: u32) -> Vec<DynamicImage> {
     let (width, height) = image.dimensions();
     let mut samples = Vec::new();
 
-    for y in (0..height).step_by(crop_size.1 as usize) {
-        for x in (0..width).step_by(crop_size.0 as usize) {
+    for y in (0..height).step_by(side as usize) {
+        for x in (0..width).step_by(side as usize) {
             let patch = match image {
                 // Row copies out of the image's own bytes; the generic crop
                 // fills a zeroed image pixel by pixel.
                 DynamicImage::ImageRgb8(rgb) => {
-                    DynamicImage::ImageRgb8(crop_rgb(rgb, x, y, crop_size.0, crop_size.1))
+                    DynamicImage::ImageRgb8(crop_rgb(rgb, x, y, side, side))
                 }
-                other => other.crop_imm(x, y, crop_size.0, crop_size.1),
+                other => other.crop_imm(x, y, side, side),
             };
             samples.push(patch);
         }
@@ -1093,10 +1101,28 @@ mod tests {
         assert!(result.encoder_input.shape()[1] > 1);
     }
 
+    /// The anyres cut is a square of the crop height, whatever the crop
+    /// width: a 672x672 image gives four samples beside the resized
+    /// original, each center-cropped to the crop.
+    #[test]
+    fn the_anyres_cut_is_a_square_of_the_crop_height() {
+        let config = PreProcessorConfig::from_json(
+            r#"{"crop_size": {"height": 336, "width": 224}, "do_center_crop": true,
+                "do_resize": true, "size": {"shortest_edge": 336}}"#,
+        )
+        .unwrap();
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
+
+        let image = create_test_image(672, 672, Rgb([128, 128, 128]));
+        let result = processor.preprocess(&[&image]).unwrap();
+
+        assert_eq!(result.encoder_input.shape(), &[1, 5, 3, 336, 224]);
+    }
+
     #[test]
     fn test_divide_to_samples() {
         let image = create_test_image(672, 672, Rgb([128, 128, 128]));
-        let samples = divide_to_samples(&image, (336, 336));
+        let samples = divide_to_samples(&image, 336);
 
         // 672x672 / 336x336 = 2x2 = 4 patches
         assert_eq!(samples.len(), 4);
@@ -1179,7 +1205,7 @@ mod tests {
         // A grid of whole crops, a grid the image's edges clip, a column.
         for (width, height) in [(672, 672), (700, 500), (336, 1008)] {
             let image = DynamicImage::ImageRgb8(gradient(width, height, 5));
-            let samples = divide_to_samples(&image, (336, 336));
+            let samples = divide_to_samples(&image, 336);
             let mut expected = Vec::new();
             for y in (0..height).step_by(336) {
                 for x in (0..width).step_by(336) {
@@ -1238,7 +1264,7 @@ mod tests {
             let best_resolution = processor.select_best_resolution(image.dimensions());
             let padded = processor.resize_and_pad_image(image, best_resolution);
             let mut samples = vec![resize_as_reference(image, 336, 336, filter).into_owned()];
-            samples.extend(processor.divide_to_samples(&padded, (336, 336)));
+            samples.extend(processor.divide_to_samples(&padded, 336));
             for (j, sample) in samples.iter().enumerate() {
                 expected
                     .slice_mut(ndarray::s![i, j, .., .., ..])

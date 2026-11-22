@@ -11,7 +11,7 @@
 //! exist. A link takes a name once and replaces none, so no write puts a
 //! file over a generation on file, whoever wrote it; a number on file in
 //! the other form is refused where the write finds it. The door
-//! ([`SpecDoor`]) persists a document here and only then calls the
+//! ([`DocumentManager`]) persists a document here and only then calls the
 //! store's entry, one apply at a time: one process writes the directory,
 //! under the door's lock alone.
 //!
@@ -77,7 +77,7 @@
 //! the read call reads its file through the directory itself ([`read_at`]),
 //! under no lock of the door.
 //!
-//! [`SpecDoor`]: super::SpecDoor
+//! [`DocumentManager`]: super::DocumentManager
 
 #![cfg_attr(
     not(any(test, feature = "controller")),

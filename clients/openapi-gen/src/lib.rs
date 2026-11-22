@@ -1725,7 +1725,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         "type": "object",
         "description": "A worker row by the field names of the controller's contract; a fact the row does not state is null",
         "properties": {
-            "id": {"type": "string", "description": "Sixteen hex digits, as the controller's messages print a worker"},
+            "id": {"type": "string", "description": "Sixteen hex digits, as the controller's messages print a worker. A gateway that decides in its own process derives them from the worker's address alone, so they stay as they are when the address registers again"},
             "registration_key": {"type": "string", "description": "The address a gateway dials, without its userinfo"},
             "incarnation": {"type": "integer"},
             "engine": {"type": "string", "description": "The engine the row belongs to: one for the ranks of a data-parallel engine"},
@@ -1738,7 +1738,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             "labels": {"type": "object", "additionalProperties": {"type": "string"}},
             "zone": nullable("string"),
             "status": {"type": "string", "enum": ["pending", "ready", "not_ready", "failed", "draining"]},
-            "revision": {"type": "integer", "description": "Counts the row's stated facts"},
+            "revision": {"type": "integer", "description": "Counts the row's stated facts. In a gateway that decides in its own process it counts the worker's replacements at its address"},
             "reachable": {
                 "type": "object",
                 "description": "Either `any`, true, or `gateway_id`, the one gateway that holds a host-local wire",
@@ -1795,7 +1795,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                     "failure_threshold", "success_threshold", "check_interval_ms", "timeout_ms", "disabled"
                 ]
             },
-            "admitted_age_ms": {"type": "integer", "description": "The row's age at the read, in milliseconds"},
+            "admitted_age_ms": {"type": "integer", "description": "In milliseconds at the read: the row's age where the gateway follows a controller, and the time since the worker last became routable where it decides in its own process"},
             "maker": {
                 "type": ["object", "null"],
                 "description": "The provider that made the row, its key without a userinfo; null for a control call's row",
@@ -1815,7 +1815,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         PathItem {
             get: Some(operation(
                 "getPolicySnapshot",
-                "The worker rows the policy controller's store holds, in registration key order: the admin role alone, mounted only with control-plane authentication",
+                "The workers the policy controller decides over, in registration key order, the gateway's own workers or the policy store's rows under a controller's address: the admin role alone, mounted only with control-plane authentication",
                 Some(vec![
                     // Model ids, comma separated: the rows that serve one.
                     optional_query_param("models"),

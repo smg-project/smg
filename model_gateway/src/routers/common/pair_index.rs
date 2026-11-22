@@ -6,14 +6,15 @@
 //! Placement then reads a prefill's partner list instead of comparing
 //! descriptors on the request path.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use smg_policy_controller::engine::PartnerClasses;
 use smg_worker::{
     identity::basic::Worker,
     pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
 };
 
-use crate::routers::common::snapshot::RoutingPool;
+use crate::routers::common::{pair_classes, snapshot::RoutingPool};
 
 /// A shared, immutable list of workers, as the routing snapshot holds them.
 type Workers = Arc<[Arc<dyn Worker>]>;
@@ -103,6 +104,9 @@ pub(crate) struct PdPairIndex {
     pub partners: Vec<Arc<[Arc<dyn Worker>]>>,
     /// Set when both pools have workers and no pair is compatible.
     pub refusal: Option<PairingRefusal>,
+    /// The pair classes of the two pools ([`Self::classes`]): empty until
+    /// the policy engine first decides a pair over this index.
+    classes: OnceLock<PartnerClasses>,
 }
 
 impl PdPairIndex {
@@ -158,6 +162,7 @@ impl PdPairIndex {
             prefill: prefill.into(),
             partners,
             refusal,
+            classes: OnceLock::new(),
         }
     }
 
@@ -165,6 +170,23 @@ impl PdPairIndex {
     /// least one pair is compatible. Availability is not consulted.
     pub(crate) fn can_pair(&self) -> bool {
         !self.prefill.is_empty()
+    }
+
+    /// The class of every worker of the two pools, in each pool's order,
+    /// and the table of the classes that pair: these partner lists, as the
+    /// policy engine's pair decision reads them. Numbered at the first call
+    /// and kept with the index, so a membership pays for it once and a
+    /// gateway whose pairs no engine decides never does. A call that
+    /// arrives during the first waits for it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the policy engine's pair decision asks, once it stands on the gateway's lists"
+        )
+    )]
+    pub(crate) fn classes(&self) -> &PartnerClasses {
+        self.classes.get_or_init(|| pair_classes::of(self))
     }
 
     /// An index over two empty pools of `wire`.
@@ -176,6 +198,7 @@ impl PdPairIndex {
             prefill: Arc::from([]),
             partners: Vec::new(),
             refusal: None,
+            classes: OnceLock::new(),
         }
     }
 }
