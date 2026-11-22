@@ -21,7 +21,7 @@ use std::{
 use metrics::Counter;
 use smg_policy_controller::engine::{ShadowKind, SHADOW_ROWS};
 use tokio::{
-    task::JoinHandle,
+    task::{spawn_blocking, JoinHandle},
     time::{interval, MissedTickBehavior},
 };
 
@@ -93,10 +93,17 @@ fn turn(policy_engine: &PolicyEngine, series: &mut Series, now: Instant) {
 /// Start the timer of `policy_engine`: one turn every [`EVERY`], on no
 /// request's path.
 ///
+/// A turn is made on a thread that may block, never on a thread that serves
+/// requests ([`off_the_runtime`]). The engine of this process keeps the
+/// prefixes it sent in prefix trees, and a turn evicts a tree that grew past
+/// its bound: that pass walks the whole tree, as the classic policy's
+/// eviction does on a thread of its own. The series go to the turn's thread
+/// and come back with it, so one turn runs at a time.
+///
 /// The task holds the policy engine weakly. It ends at the first tick behind
 /// the policy engine's last holder: nothing stops it by hand, and it keeps no
 /// context alive. A turn writes this process's store and series alone, so a
-/// shutdown waits for none.
+/// shutdown waits for no turn but one that has begun.
 #[expect(
     clippy::disallowed_methods,
     reason = "a turn writes this process's store and series alone and the task ends behind its policy engine: a shutdown waits for neither"
@@ -113,15 +120,34 @@ pub(crate) fn start(policy_engine: &Arc<PolicyEngine>) -> JoinHandle<()> {
             let Some(policy_engine) = policy_engine.upgrade() else {
                 break;
             };
-            turn(&policy_engine, &mut series, Instant::now());
+            let shown = off_the_runtime(move || {
+                turn(&policy_engine, &mut series, Instant::now());
+                series
+            });
+            // The turn panicked, or the runtime is shutting down and made
+            // no turn: the timer ends with it.
+            let Some(shown) = shown.await else {
+                break;
+            };
+            series = shown;
         }
     })
+}
+
+/// Runs `work` on a thread that may block, off the threads that serve
+/// requests, and hands back what it returned. `None` where it panicked, or
+/// where the runtime is shutting down and ran nothing.
+async fn off_the_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    spawn_blocking(work).await.ok()
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         sync::Arc,
+        thread,
         time::{Duration, Instant},
     };
 
@@ -132,7 +158,7 @@ mod tests {
         store::{GatewayId, LeasesStore, MemoryStore},
     };
 
-    use super::{start, turn, Series, EVERY};
+    use super::{off_the_runtime, start, turn, Series, EVERY};
     use crate::{
         observability::metrics::test_support::render_with_recorder,
         policy_controller::engine::{
@@ -150,8 +176,10 @@ mod tests {
         let (policy_engine, store, _workers) = bed(&["http://w0:8000"]);
         let policy_engine = Arc::new(policy_engine);
         let _timer = start(&policy_engine);
-        // The timer's task takes its first turn and waits for its tick.
+        // The timer's task takes its first turn, on a thread of its own,
+        // and waits for its tick.
         tokio::task::yield_now().await;
+        assert!(turned(&policy_engine).await, "the first turn ended");
 
         let issued = Instant::now()
             .checked_sub(Duration::from_secs(60))
@@ -163,7 +191,32 @@ mod tests {
         // Held time moves past the tick, and the timer makes its turn.
         tokio::time::advance(EVERY).await;
         tokio::task::yield_now().await;
+        assert!(turned(&policy_engine).await, "the turn ended");
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    }
+
+    /// Waits for the turn the timer began: a turn is made on a thread of
+    /// its own and holds the policy engine until it ends, beside the one
+    /// handle its case keeps. `false` where a turn outlasts five seconds.
+    async fn turned(policy_engine: &Arc<PolicyEngine>) -> bool {
+        for _ in 0..5_000 {
+            if Arc::strong_count(policy_engine) == 1 {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    /// The timer's work runs off the threads that serve requests: on a
+    /// runtime of one thread it is another thread than the one every task
+    /// of the runtime runs on.
+    #[tokio::test]
+    async fn the_timers_work_runs_off_the_threads_that_serve_requests() {
+        let serving = thread::current().id();
+        let ran_on = off_the_runtime(|| thread::current().id()).await;
+        assert!(ran_on.is_some_and(|ran_on| ran_on != serving), "{ran_on:?}");
     }
 
     /// The timer holds its policy engine weakly: it runs while the policy

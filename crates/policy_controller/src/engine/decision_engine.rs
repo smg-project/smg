@@ -462,6 +462,11 @@ pub trait DecisionEngine {
 
     /// One pass of the engine's clock at `now`, about once a second: what
     /// lives past its end is ended, and what was told of it is said.
+    ///
+    /// A pass may take its time. An engine that keeps the prefixes it sent
+    /// in prefix trees evicts a tree past its bound by a walk of the whole
+    /// tree. A host calls it where that holds up no request: off the
+    /// threads that serve them.
     fn sweep(&self, now: Instant) -> SweepOutcome;
 
     /// Reads the document in force. A host names a profile, reads a
