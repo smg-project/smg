@@ -548,8 +548,13 @@ impl JobHost for AppContext {
                 }
                 let engines = workflow_engines(context)?;
 
-                let timeout_duration =
-                    Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
+                // The startup delay stands ahead of the run's first probe:
+                // a wait that left it out would end that much before the run.
+                let timeout_duration = Duration::from_secs(
+                    context.router_config.worker_startup_timeout_secs
+                        + context.router_config.worker_startup_delay_secs
+                        + 30,
+                );
 
                 let workflow_data = create_worker_workflow_data(
                     (**config).clone(),
@@ -582,18 +587,60 @@ impl JobHost for AppContext {
                 );
 
                 let label = Job::workflow_label(&config.url);
-                let state = engines
-                    .worker_registration
-                    .wait_for_terminal_state(instance_id, &label, timeout_duration)
-                    .await?;
-                let outcome = wfaas::completion_outcome(&state, &label);
+                let engine = &engines.worker_registration;
+                let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
+                // A POST's wait ends at the job's own deadline: the engine's
+                // timeout reclaims a state that has just ended, and the cancel
+                // below needs it. The outer `Err` is that deadline alone.
+                let waited = if create_only {
+                    tokio::time::timeout(
+                        timeout_duration,
+                        engine.wait_for_terminal_state(instance_id, &label, Duration::MAX),
+                    )
+                    .await
+                } else {
+                    Ok(engine
+                        .wait_for_terminal_state(instance_id, &label, timeout_duration)
+                        .await)
+                };
+                let (state, outcome) = match waited {
+                    Ok(Ok(state)) => {
+                        let outcome = wfaas::completion_outcome(&state, &label);
+                        (state, outcome)
+                    }
+                    // The wait's own failure. No job cleans up after a cancel
+                    // of a registration that is not a POST's, so its run is
+                    // left to finish.
+                    Ok(Err(failure)) => return Err(failure),
+                    // A POST's wait that ends first cancels its run: left
+                    // going, the run would register the worker under a job
+                    // that already failed. A cancelled run ends with the
+                    // attempt it is in, whose bound is within the wait, and
+                    // its end is read as any other. The job writes the
+                    // engine's words for the wait that ended.
+                    Err(_) => {
+                        let waited_out = format!(
+                            "Workflow timeout after {}s for {label}",
+                            timeout_duration.as_secs()
+                        );
+                        engine.cancel_workflow(instance_id).await.map_err(|e| {
+                            format!("{waited_out}; its run could not be cancelled: {e:?}")
+                        })?;
+                        let state = engine
+                            .wait_for_terminal_state(instance_id, &label, timeout_duration)
+                            .await
+                            .map_err(|e| {
+                                format!("{waited_out}; its cancelled run did not end: {e}")
+                            })?;
+                        (state, Err(format!("{waited_out}; its run was cancelled")))
+                    }
+                };
                 // A POST's registration that put its worker in the registry
                 // and did not finish (a DELETE's cancel landing after the
                 // registry step, a later step's failure) leaves no worker
                 // behind: it goes out through the removal job, as a DELETE of
                 // a live worker sends it. A startup or discovery registration
                 // is its own pass's to reconcile.
-                let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
                 match outcome {
                     Err(failure) if create_only => {
                         // The registry says what this registration left in it
@@ -612,9 +659,11 @@ impl JobHost for AppContext {
                                 failure
                             }
                         } else {
-                            // Only a DELETE can cancel a registration. If a
-                            // step failed, the cleanup is part of the job
-                            // that asked for the registration.
+                            // A registration is cancelled by a DELETE, or by
+                            // its own job at its wait's end, and a POST's job
+                            // is the API's too. If a step failed, the cleanup
+                            // is part of the job that asked for the
+                            // registration.
                             let asker = if state.status == WorkflowStatus::Cancelled {
                                 WorkerJobAsker::Api
                             } else {
@@ -3394,6 +3443,161 @@ mod tests {
             failure.contains("leave through a queued removal"),
             "the outcome does not name the removal: {failure}"
         );
+    }
+
+    /// A `POST`'s registration job whose wait ends before its run cancels
+    /// the run: left going, the run probed on and registered a worker that
+    /// answered later, under a job that had already failed. The run of any
+    /// other registration is left to finish. The cancel finds the run's
+    /// state whatever it reads at the wait's end: in the third case a
+    /// `DELETE` cancelled the run half a second earlier with a probe still
+    /// out, a state the engine's own timeout reclaims. The worker here
+    /// accepts and never answers, so the run outlasts the wait.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_posts_registration_job_ends_the_run_it_stops_waiting_for() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+            workflow::WorkflowEngines,
+        };
+
+        for (kind, registration_mode, asker, delay_secs, deleted_at, cancels) in [
+            (
+                "a POST's",
+                WorkerRegistrationMode::CreateOnly,
+                WorkerJobAsker::Api,
+                0,
+                None,
+                true,
+            ),
+            (
+                "a startup",
+                WorkerRegistrationMode::Upsert,
+                WorkerJobAsker::Startup,
+                0,
+                None,
+                false,
+            ),
+            (
+                "a POST's, cancelled by a DELETE as its wait ends,",
+                WorkerRegistrationMode::CreateOnly,
+                WorkerJobAsker::Api,
+                0,
+                Some(Duration::from_millis(49_500)),
+                true,
+            ),
+            // The engine counts a step's delay on the real clock, which the
+            // paused clock here outruns: this run is cancelled before its
+            // first probe, and the case holds the length of the wait alone.
+            (
+                "a POST's, under a startup delay,",
+                WorkerRegistrationMode::CreateOnly,
+                WorkerJobAsker::Api,
+                5,
+                None,
+                true,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port of the system's choice");
+            let url = format!(
+                "http://{}",
+                listener.local_addr().expect("the bound address")
+            );
+            let probes = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&probes);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test fixture: the stub lives as long as the test's runtime"
+            )]
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((connection, _)) = listener.accept().await {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    held.push(connection);
+                }
+            });
+            // A startup timeout of twenty seconds: the job waits fifty, and
+            // the case's startup delay on top.
+            let router_config = RouterConfig {
+                worker_startup_timeout_secs: 20,
+                worker_startup_check_interval_secs: 2,
+                worker_startup_delay_secs: delay_secs,
+                ..RouterConfig::default()
+            };
+            let context =
+                app_context_for_tests(router_config.clone(), Arc::new(WorkerRegistry::new()), None);
+            assert!(
+                context
+                    .workflow_engines
+                    .set(WorkflowEngines::new(&router_config))
+                    .is_ok(),
+                "the engines are set once"
+            );
+            // Each probe outlasts its step's bound of twenty seconds: with
+            // the pause of two seconds between probes, the third is out from
+            // second 44 to second 64, across the end of the wait.
+            let mut spec = WorkerSpec::new(url.as_str());
+            spec.health.timeout_secs = Some(30);
+            let job = Job::AddWorker {
+                asker,
+                config: Box::new(spec),
+                registration_mode,
+            };
+
+            let marks = DashSet::new();
+            let (job_end, ()) = tokio::join!(execute_job(&job, &context, &marks, None), async {
+                if let Some(at) = deleted_at {
+                    tokio::time::sleep(at).await;
+                    let engine = &workflow_engines(&context)
+                        .expect("set above")
+                        .worker_registration;
+                    let runs = engine
+                        .state_store()
+                        .list_all()
+                        .await
+                        .expect("the store lists its states");
+                    engine
+                        .cancel_workflow(runs.first().expect("the run's state").instance_id)
+                        .await
+                        .expect("the run is in the store");
+                }
+            });
+            let failure = job_end.expect_err("the wait ends before the run");
+
+            // A job that cancelled its run has read the run's end, and that
+            // read takes the state out of the store.
+            let runs_left = workflow_engines(&context)
+                .expect("set above")
+                .worker_registration
+                .state_store()
+                .list_all()
+                .await
+                .expect("the store lists its states")
+                .len();
+            let probes_at_the_jobs_end = probes.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let probed_on = probes.load(Ordering::SeqCst) > probes_at_the_jobs_end;
+            // The engine's words for a wait that ended first, which a POST's
+            // job writes itself.
+            let waited_out = format!(
+                "Workflow timeout after {}s for {}",
+                50 + delay_secs,
+                Job::workflow_label(&url)
+            );
+            let expected = if cancels {
+                format!("{waited_out}; its run was cancelled")
+            } else {
+                waited_out
+            };
+            assert_eq!(
+                (failure.as_str(), probed_on, runs_left),
+                (expected.as_str(), !cancels, usize::from(!cancels)),
+                "{kind} registration after its job failed"
+            );
+        }
     }
 
     /// What `a_delete_setting` builds: the context, its queue and registry,
