@@ -1,0 +1,62 @@
+# The gateway's integration cases known to differ when the test run turns the policy controller on
+# (SMG_TEST_POLICY_CONTROLLER=on in the environment: every context the test harness builds is then built as
+# `--policy-controller` with no controller's address builds it). `scripts/ci_rust_tests.sh policy-controller
+# <shard>` holds the run to this list.
+#
+# One line a case, tab separated: test binary, case as `cargo test` prints it, kind, why.
+#   fails    the case fails with the policy controller on. The run leaves it out, then runs it alone,
+#            where it must still fail.
+#   classic  the case passes, and a classic policy places one of its requests where the policy engine is
+#            to place it.
+#
+# Lines are deleted, not added. The change that cures a case deletes its line: the run is red on a line
+# whose case passes now, or whose requests no classic policy places any more. It is red, too, on a case
+# that fails or that a classic policy places and that has no line here.
+api_tests	api::messages_threads_test::test_v1_messages_thread_turns_of_one_lineage_pin_to_one_worker_under_the_override	fails	the start refuses the routing-key override with the policy controller on
+grpc_pd_admission_test	a_reported_window_of_one_sheds_the_overlapping_request	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_admission_test	an_unreported_window_admits_overlapping_requests	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_fanout_test::a_single_sample_is_one_choice	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_fanout_test::chat_continuous_usage_is_opt_in_for_single_and_multiple_choices	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_fanout_test::n_samples_come_back_as_n_choices_through_a_room_based_pd_pair	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_fanout_test::streamed_samples_carry_every_choice_index	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_grouped_dp_room_test::a_sticky_keys_pd_rooms_carry_its_prefill_rank	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_kv_store_connector_test::a_store_pair_runs_prefill_then_decode_with_no_handoff_params	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_prefill_addition_test::a_prefill_worker_that_joins_during_traffic_takes_its_share_of_the_sizes	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_prefill_removal_test::a_draining_prefill_workers_size_range_goes_to_its_neighbour_at_once	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_tests	grpc_pd::grpc_pd_prefill_removal_test::requests_in_a_removed_prefill_workers_size_range_still_find_a_worker	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	a_held_header_decode_side_stays_in_the_decode_phase	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	sequential_dispatch_phases_add_up_to_the_pd_ttft	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	the_chat_route_anchors_at_the_prefill_dispatch_under_held_headers	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	the_chat_route_anchors_its_ttft_at_the_prefill_dispatch	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	the_completions_route_anchors_at_the_prefill_dispatch_under_held_headers	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	the_completions_route_anchors_its_ttft_at_the_prefill_dispatch	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	the_messages_route_anchors_at_the_prefill_dispatch_under_held_headers	classic	a prefill/decode gateway: a classic policy places each side
+grpc_pd_ttft_phases_test	the_messages_route_anchors_its_ttft_at_the_prefill_dispatch	classic	a prefill/decode gateway: a classic policy places each side
+grpc_tests	grpc::grpc_context_length_test::pd_batched_completion_is_bounded_per_prompt	classic	a prefill/decode gateway: a classic policy places each side
+grpc_tests	grpc::grpc_context_length_test::pd_budget_is_bound_by_the_decode_window_not_the_prefill_window	classic	a prefill/decode gateway: a classic policy places each side
+grpc_tests	grpc::grpc_context_length_test::pd_prompt_within_the_window_is_forwarded	classic	a prefill/decode gateway: a classic policy places each side
+grpc_tests	grpc::grpc_context_length_test::pd_without_an_advertised_window_forwards_as_before	classic	a prefill/decode gateway: a classic policy places each side
+http_tests	http::relay_dump_test::the_disaggregated_router_relays_the_decode_streams_byte_for_byte	classic	a prefill/decode gateway: a classic policy places each side
+http_tests	http::tenant_rate_limiting_pd_test::a_buffered_success_settles_the_usage_its_body_reports	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+http_tests	http::tenant_rate_limiting_pd_test::a_completions_batch_reserves_every_prompt_under_a_text_reading_policy	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+http_tests	http::tenant_rate_limiting_pd_test::a_denial_the_tenant_can_wait_out_carries_retry_after	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+http_tests	http::tenant_rate_limiting_pd_test::a_retried_request_reserves_once_and_settles_its_final_answer	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+http_tests	http::tenant_rate_limiting_pd_test::a_streamed_answer_resolves_when_its_body_drops	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+http_tests	http::tenant_rate_limiting_pd_test::an_opted_out_endpoint_never_reserves	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+http_tests	http::tenant_rate_limiting_pd_test::the_refusal_is_the_regular_routers_answer	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+http_tests	http::tenant_rate_limiting_pd_test::without_a_tenant_policy_requests_are_served_as_before	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+routing_tests	routing::header_routing_hints_test::header_routing_hints_tests::test_routing_key_hint_pins_prefix_hash_worker_across_prompts	classic	a hash ring policy (prefix_hash or consistent_hashing) places the request
+routing_tests	routing::header_routing_hints_test::header_routing_hints_tests::test_target_worker_hint_indexes_the_available_workers	classic	a hash ring policy (prefix_hash or consistent_hashing) places the request
+routing_tests	routing::manual_routing_test::manual_min_group_tests::test_min_group_concurrent_distribution	classic	the manual policy places the request
+routing_tests	routing::manual_routing_test::manual_min_group_tests::test_min_group_mixed_concurrent_routing	classic	the manual policy places the request
+routing_tests	routing::manual_routing_test::manual_min_group_tests::test_min_group_sticky_routing	classic	the manual policy places the request
+routing_tests	routing::manual_routing_test::manual_routing_tests::test_manual_routing_consistency	classic	the manual policy places the request
+routing_tests	routing::manual_routing_test::manual_routing_tests::test_manual_routing_with_header	classic	the manual policy places the request
+routing_tests	routing::manual_routing_test::manual_routing_tests::test_manual_routing_without_header	classic	the manual policy places the request
+routing_tests	routing::pd_routing_test::pd_routing_tests::test_pd_mode_basic_routing	classic	a prefill/decode gateway: a classic policy places each side
+routing_tests	routing::prefix_hash_test::prefix_hash_tests::test_distinct_prompts_spread_across_workers	classic	a hash ring policy (prefix_hash or consistent_hashing) places the request
+routing_tests	routing::prefix_hash_test::prefix_hash_tests::test_repeated_prompt_pins_to_one_worker	classic	a hash ring policy (prefix_hash or consistent_hashing) places the request
+routing_tests	routing::stream_relay_disconnect_test::pd_decode_relay_closes_upstream_when_client_disconnects_during_prefill	fails	a prefill/decode router built by hand over a regular-mode context: the engine's document plans no pair
+routing_tests	routing::stream_request_body_test::routing_key_override_buffers_and_prefers_header_over_fresh_rids	fails	the start refuses the routing-key override with the policy controller on

@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -586,6 +587,257 @@ class RunModeTests(unittest.TestCase):
         done, calls = self.run_tokenizer(failing_calls=set())
         self.assertEqual(len(calls), 2, done.stderr)
         self.assertEqual(done.returncode, 0, done.stderr)
+
+
+KNOWN = REPO / "model_gateway" / "tests" / "policy_controller_known.tsv"
+
+# A stand-in for cargo: the metadata of a gateway whose test binaries are the scenario's, and
+# `cargo test` over them as libtest answers it (--exact, --skip and names; a binary's cases one
+# line each; status 101 where a case fails). A case with a `policy` writes the line of a classic
+# pick to the file SMG_TEST_CLASSIC_PICKS names, as the gateway's test build does.
+CARGO_STUB = r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+
+scenario = json.load(open(os.environ["CARGO_STUB_SCENARIO"]))
+args = sys.argv[1:]
+picks = os.environ.get("SMG_TEST_CLASSIC_PICKS")
+with open(os.environ["CARGO_STUB_CALLS"], "a") as calls:
+    switch = os.environ.get("SMG_TEST_POLICY_CONTROLLER")
+    calls.write(json.dumps({"args": " ".join(args), "switch": switch, "picks": bool(picks)}) + "\n")
+if args[0] == "metadata":
+    targets = [{"name": name, "kind": ["test"]} for name in scenario]
+    print(json.dumps({"packages": [{"name": "smg", "targets": targets}]}))
+    sys.exit(0)
+split = args.index("--") if "--" in args else len(args)
+cargo_args, test_args = args[:split], args[split + 1 :]
+binaries = [cargo_args[i + 1] for i, arg in enumerate(cargo_args) if arg == "--test"]
+skips = {test_args[i + 1] for i, arg in enumerate(test_args) if arg == "--skip"}
+names = [
+    arg
+    for i, arg in enumerate(test_args)
+    if not arg.startswith("--") and (i == 0 or test_args[i - 1] != "--skip")
+]
+status = 0
+for binary in binaries:
+    executable = f"{binary}-0123456789abcdef"
+    print(f"     Running tests/{binary}.rs (target/debug/deps/{executable})", flush=True)
+    for case, facts in scenario[binary].items():
+        if case in skips or (names and case not in names):
+            continue
+        print(f"test {case} ... {facts['result']}", flush=True)
+        if facts["result"] == "FAILED":
+            status = 101
+        if picks and "policy" in facts:
+            with open(picks, "a") as file:
+                file.write(f"{executable}\t{case}\t{facts['policy']}\n")
+sys.exit(status)
+"""
+
+
+class PolicyControllerRunTests(unittest.TestCase):
+    """`policy-controller <shard>` runs a gateway shard's tests once more with the policy
+    controller on and holds the run to the list of the cases known to differ."""
+
+    # Four test binaries: by name, shard 1 of 3 is dealt alpha_tests and gamma_tests.
+    SCENARIO = {
+        "alpha_tests": {
+            "one::passes": {"result": "ok"},
+            "one::refused": {"result": "FAILED"},
+            "one::pair": {"result": "ok", "policy": "random"},
+        },
+        "beta_tests": {"two::other": {"result": "FAILED"}},
+        "delta_tests": {"three::plain": {"result": "ok"}},
+        "gamma_tests": {"plain": {"result": "ok"}},
+    }
+    LIST = (
+        "# a comment\n"
+        "alpha_tests\tone::pair\tclassic\ta pair gateway\n"
+        "alpha_tests\tone::refused\tfails\tthe start refuses it\n"
+        "beta_tests\ttwo::other\tfails\tanother shard's\n"
+    )
+
+    def run_shard(
+        self, scenario: dict | None = None, listed: str | None = None, shard: str = "gateway-1"
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            stubs = Path(tmp) / "bin"
+            stubs.mkdir()
+            stub = stubs / "cargo"
+            stub.write_text(CARGO_STUB)
+            stub.chmod(0o755)
+            calls = Path(tmp) / "calls"
+            calls.write_text("")
+            scenario_file = Path(tmp) / "scenario.json"
+            scenario_file.write_text(json.dumps(self.SCENARIO if scenario is None else scenario))
+            known = Path(tmp) / "known.tsv"
+            known.write_text(self.LIST if listed is None else listed)
+            done = subprocess.run(
+                ["bash", str(SCRIPT), "policy-controller", shard],
+                capture_output=True,
+                text=True,
+                cwd=REPO,
+                env={
+                    "PATH": f"{stubs}:{Path(sys.executable).parent}:/usr/bin:/bin",
+                    "CARGO_STUB_CALLS": str(calls),
+                    "CARGO_STUB_SCENARIO": str(scenario_file),
+                    "POLICY_CONTROLLER_KNOWN": str(known),
+                },
+            )
+            return done, [json.loads(line) for line in calls.read_text().splitlines()]
+
+    def changed(self, binary: str, case: str, **facts: str) -> dict:
+        """The scenario with one case's facts replaced (no facts: the case is gone)."""
+        scenario = json.loads(json.dumps(self.SCENARIO))
+        if facts:
+            scenario[binary][case] = facts
+        else:
+            del scenario[binary][case]
+        return scenario
+
+    def test_a_run_that_matches_the_list_is_green(self):
+        done, calls = self.run_shard()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("policy controller on, gateway-1: OK", done.stdout)
+        self.assertEqual(
+            calls[1:],
+            [
+                # The binary with a case listed as failing runs alone, without that case ...
+                {
+                    "args": "test --no-fail-fast -p smg --test alpha_tests "
+                    "-- --exact --skip one::refused",
+                    "switch": "on",
+                    "picks": True,
+                },
+                # ... the others run as the shard runs them ...
+                {
+                    "args": "test --no-fail-fast -p smg --test gamma_tests",
+                    "switch": "on",
+                    "picks": True,
+                },
+                # ... and the listed case runs alone after them, its picks not written down.
+                {
+                    "args": "test --no-fail-fast -p smg --test alpha_tests -- --exact one::refused",
+                    "switch": "on",
+                    "picks": False,
+                },
+            ],
+        )
+
+    def test_the_run_deals_the_binaries_as_the_shards_do(self):
+        binaries = []
+        for index in (1, 2, 3):
+            _, calls = self.run_shard(shard=f"gateway-{index}")
+            dealt = {
+                name for call in calls[1:] for name in re.findall(r"--test (\S+)", call["args"])
+            }
+            binaries.append(sorted(dealt))
+        self.assertEqual(
+            binaries, [["alpha_tests", "gamma_tests"], ["beta_tests"], ["delta_tests"]]
+        )
+
+    def assert_red(self, done: subprocess.CompletedProcess[str], problem: str) -> None:
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(f"policy controller on, gateway-1: PROBLEM: {problem}", done.stdout)
+        self.assertIn("policy controller on, gateway-1: FAILED, 1 problem(s)", done.stdout)
+
+    def test_a_failure_the_list_does_not_name_is_red(self):
+        done, _ = self.run_shard(self.changed("gamma_tests", "plain", result="FAILED"))
+        self.assert_red(
+            done,
+            "gamma_tests plain: fails with the policy controller on, and the list does not name it",
+        )
+
+    def test_a_listed_failure_that_passes_now_is_red_until_its_line_is_deleted(self):
+        done, _ = self.run_shard(self.changed("alpha_tests", "one::refused", result="ok"))
+        self.assert_red(
+            done,
+            "alpha_tests one::refused: passes now with the policy controller on: "
+            "delete its line from the list",
+        )
+
+    def test_a_listed_failure_its_binary_no_longer_runs_is_red(self):
+        done, _ = self.run_shard(self.changed("alpha_tests", "one::refused"))
+        self.assert_red(
+            done,
+            "alpha_tests one::refused: listed as failing, and its binary does not run it "
+            "(renamed, removed or ignored): delete or correct its line",
+        )
+
+    def test_a_classic_pick_in_a_case_the_list_does_not_name_is_red(self):
+        done, _ = self.run_shard(self.changed("gamma_tests", "plain", result="ok", policy="manual"))
+        self.assert_red(
+            done,
+            "gamma_tests plain: a classic policy (manual) places a request with the policy "
+            "controller on, and the list does not name the case",
+        )
+
+    def test_a_listed_case_no_classic_policy_places_any_more_is_red(self):
+        done, _ = self.run_shard(self.changed("alpha_tests", "one::pair", result="ok"))
+        self.assert_red(
+            done,
+            "alpha_tests one::pair: no classic policy places its requests with the policy "
+            "controller on any more: delete its line from the list",
+        )
+
+    def test_a_line_that_names_no_test_binary_or_is_malformed_is_red(self):
+        done, _ = self.run_shard(listed=self.LIST + "nowhere_tests\tx\tfails\twhy\n")
+        self.assert_red(
+            done, "line 5 of the list names nowhere_tests, which is no test binary of the gateway"
+        )
+        done, _ = self.run_shard(listed=self.LIST + "alpha_tests\tone::passes\tsometimes\twhy\n")
+        self.assert_red(
+            done,
+            "line 5 of the list is not <binary> <case> <fails|classic> <why>, tab separated",
+        )
+
+    def test_only_a_gateway_integration_shard_runs_with_the_policy_controller_on(self):
+        for shard in ("gateway-unit", "kv"):
+            done, calls = self.run_shard(shard=shard)
+            self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+            self.assertIn("only a gateway integration shard", done.stderr)
+            self.assertEqual([call["args"].split()[0] for call in calls], ["metadata"])
+
+    def test_the_gateway_integration_shards_carry_the_step_and_the_workflow_runs_it(self):
+        needs = {row["shard"]: row["needs"] for row in shard_table()}
+        for shard in ("gateway-1", "gateway-2", "gateway-3"):
+            self.assertEqual(needs[shard], "policy-controller")
+        self.assertEqual(needs["gateway-unit"], "ffmpeg")
+        workflow = WORKFLOW.read_text()
+        step = workflow.split("- name: Run the gateway's tests with the policy controller on", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        for line in (
+            "if: contains(matrix.needs, 'policy-controller')",
+            "bash scripts/ci_rust_tests.sh policy-controller ${{ matrix.shard }}",
+        ):
+            self.assertIn(line, step)
+        # Behind the shard's own run: the binaries are the ones that run built.
+        self.assertLess(
+            workflow.index("- name: Run the Rust tests"),
+            workflow.index("- name: Run the gateway's tests with the policy controller on"),
+        )
+
+    def test_the_list_names_cases_the_gateways_tests_hold(self):
+        sources = [path.read_text() for path in (REPO / "model_gateway" / "tests").rglob("*.rs")]
+        rows = []
+        for line in KNOWN.read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            self.assertEqual(len(fields), 4, line)
+            binary, case, kind, why = fields
+            self.assertIn(kind, ("fails", "classic"), line)
+            self.assertTrue(why, line)
+            self.assertTrue((REPO / "model_gateway" / "tests" / f"{binary}.rs").is_file(), line)
+            # The case's function is in a test source: a renamed case leaves its line behind.
+            name = case.rsplit("::", 1)[-1]
+            self.assertTrue(
+                any(re.search(rf"\bfn {re.escape(name)}\s*\(", text) for text in sources),
+                f"no test source holds `fn {name}`: {line}",
+            )
+            rows.append((binary, case))
+        self.assertEqual(rows, sorted(set(rows)), "the list is sorted and names a case once")
 
 
 if __name__ == "__main__":

@@ -514,6 +514,20 @@ jobs:
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
 
+      # A gateway integration shard's tests once more with `--policy-controller`
+      # on in every context the test harness builds. The binaries are the ones
+      # the step above ran: the harness reads SMG_TEST_POLICY_CONTROLLER when a
+      # test runs. The step is red on a case that fails with it on and on a
+      # request a classic policy places with it on, unless
+      # model_gateway/tests/policy_controller_known.tsv names the case; a line
+      # whose case is cured is red until it is deleted.
+      - name: Run the gateway's tests with the policy controller on
+        if: contains(matrix.needs, 'policy-controller')
+        timeout-minutes: ${{ matrix.test_timeout }}
+        run: |
+          source "$HOME/.cargo/env"
+          bash scripts/ci_rust_tests.sh policy-controller ${{ matrix.shard }}
+
       # The example controller where a user stands: its own script writes it
       # outside the workspace as a repository of its own, with the crate
       # named by git as the guide's line names it and the repository's lock.

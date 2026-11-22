@@ -10,6 +10,8 @@
 #   ci_rust_tests.sh commands <shard>      the shard's cargo test invocations, one per line
 #   ci_rust_tests.sh build <shard>         compile the shard's tests (cargo test --no-run)
 #   ci_rust_tests.sh run <shard>           run the shard's tests
+#   ci_rust_tests.sh policy-controller <shard>  run a gateway integration shard's tests once more with the policy
+#                                          controller on, held to model_gateway/tests/policy_controller_known.tsv
 #   ci_rust_tests.sh lint <leg>            one lint configuration: all-features (clippy with every feature, then
 #                                          the workspace's rustdoc under -D warnings), self-hosted, anthropic-only,
 #                                          default-build (the default feature set compiles without OpenCV)
@@ -37,12 +39,13 @@ shopt -s inherit_errexit
 
 GATEWAY_SHARDS=3
 
-# shard | path filter | extra setup (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures, policy-guest, policy-import) | test step timeout (minutes)
+# shard | path filter | extra steps (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures, policy-guest, policy-import,
+#   policy-controller: the shard's tests once more with the policy controller on) | test step timeout (minutes)
 SHARDS='
 gateway-unit rust-gateway    ffmpeg                 20
-gateway-1    rust-gateway    -                      20
-gateway-2    rust-gateway    -                      20
-gateway-3    rust-gateway    -                      20
+gateway-1    rust-gateway    policy-controller      20
+gateway-2    rust-gateway    policy-controller      20
+gateway-3    rust-gateway    policy-controller      20
 bindings     rust-bindings   -                      20
 tokenizer    rust-tokenizer  -                      20
 multimodal   rust-multimodal golden,ffmpeg,turbojpeg 20
@@ -240,6 +243,163 @@ run_commands() {
     return "$status"
 }
 
+# The gateway's integration cases known to differ with the policy controller on: one line a case (test
+# binary, case, `fails` or `classic`, why), beside the tests it names.
+POLICY_CONTROLLER_KNOWN=${POLICY_CONTROLLER_KNOWN:-model_gateway/tests/policy_controller_known.tsv}
+
+# The cases of a test binary that the list names under a kind, one per line.
+known_cases() {
+    local kind=$1 target=$2
+    awk -F '\t' -v k="$kind" -v t="$target" '!/^#/ && $1 == t && $3 == k { print $2 }' "$POLICY_CONTROLLER_KNOWN"
+}
+
+# A gateway integration shard's tests once more with the policy controller on in every context the test
+# harness builds (SMG_TEST_POLICY_CONTROLLER=on: the harness reads it when a test runs, so these are the
+# binaries `build` made). The run is held to the list of the cases known to differ, in three parts, and
+# every part runs:
+#   1. each binary without its cases listed as `fails`: a failure here is a case the list does not name;
+#   2. each binary's cases listed as `fails`, alone: every one still fails, or its line is deleted;
+#   3. the picks a classic policy made in part 1 (SMG_TEST_CLASSIC_PICKS: the gateway's test build writes
+#      one line a pick where its policy registry holds the policy engine) against the cases listed as
+#      `classic`: a pick in a case the list does not name is red, and so is a listed case with no pick.
+# The change that cures a case deletes its line: the list only shrinks.
+policy_controller_run() {
+    local shard=$1 index every targets target names skips plain="" work status=0
+    case "$shard" in
+        gateway-[0-9]*) index=${shard#gateway-} ;;
+        *) echo "ci_rust_tests.sh: only a gateway integration shard (gateway-1 to gateway-$GATEWAY_SHARDS) runs with the policy controller on, not '$shard'" >&2; exit 2 ;;
+    esac
+    [ "$index" -ge 1 ] && [ "$index" -le "$GATEWAY_SHARDS" ] || { echo "no gateway shard $index" >&2; exit 2; }
+    [ -f "$POLICY_CONTROLLER_KNOWN" ] || { echo "ci_rust_tests.sh: no list at $POLICY_CONTROLLER_KNOWN" >&2; exit 2; }
+    # The shard's binaries, as test_selectors deals them. Assigned before use: a failed metadata read
+    # fails the run instead of emptying it.
+    every=$(test_targets smg)
+    targets=$(printf '%s\n' "$every" | awk -v i="$index" -v n="$GATEWAY_SHARDS" 'NR % n == i % n')
+    work=$(mktemp -d)
+    : > "$work/picks"
+    : > "$work/part1"
+    export SMG_TEST_POLICY_CONTROLLER=on
+
+    echo "== The policy controller on, part 1 of 3: the tests of $shard, without the cases the list names as failing =="
+    for target in $targets; do
+        names=$(known_cases fails "$target")
+        if [ -z "$names" ]; then
+            plain="$plain --test $target"
+            continue
+        fi
+        # A binary with listed cases runs alone: --skip with --exact leaves out exactly those names, and
+        # another binary may hold a case of the same name.
+        skips=$(printf '%s\n' "$names" | awk '{ printf " --skip %s", $1 }')
+        # shellcheck disable=SC2086
+        (set -x; SMG_TEST_CLASSIC_PICKS="$work/picks" cargo test --no-fail-fast -p smg --test "$target" -- --exact$skips) 2>&1 | tee -a "$work/part1" || status=$?
+    done
+    if [ -n "$plain" ]; then
+        # shellcheck disable=SC2086
+        (set -x; SMG_TEST_CLASSIC_PICKS="$work/picks" cargo test --no-fail-fast -p smg$plain) 2>&1 | tee -a "$work/part1" || status=$?
+    fi
+
+    echo "== The policy controller on, part 2 of 3: the cases the list names as failing, alone (each is expected to FAIL) =="
+    for target in $targets; do
+        names=$(known_cases fails "$target")
+        [ -n "$names" ] || continue
+        # shellcheck disable=SC2086
+        (set -x; cargo test --no-fail-fast -p smg --test "$target" -- --exact $names) > "$work/fails.$target" 2>&1 || true
+        cat "$work/fails.$target"
+    done
+
+    echo "== The policy controller on, part 3 of 3: the run of $shard against $POLICY_CONTROLLER_KNOWN =="
+    # shellcheck disable=SC2086
+    python3 -c '
+import re
+import sys
+from pathlib import Path
+
+known, work, shard, part1_status, every, *targets = sys.argv[1:]
+work = Path(work)
+every = set(every.split())
+problems = []
+
+# The list: (binary, case) -> kind.
+listed = {}
+for number, line in enumerate(Path(known).read_text().splitlines(), 1):
+    if not line.strip() or line.startswith("#"):
+        continue
+    fields = line.split("\t")
+    if len(fields) != 4 or not all(fields) or fields[2] not in ("fails", "classic"):
+        problems.append(f"line {number} of the list is not <binary> <case> <fails|classic> <why>, tab separated")
+        continue
+    binary, case, kind, _why = fields
+    if binary not in every:
+        problems.append(f"line {number} of the list names {binary}, which is no test binary of the gateway")
+    elif (binary, case) in listed:
+        problems.append(f"line {number} of the list names {binary} {case} a second time")
+    listed[(binary, case)] = kind
+mine = {key: kind for key, kind in listed.items() if key[0] in targets}
+
+
+def results(text):
+    """(binary, case) -> ok, FAILED or ignored: the binary of a Running line of cargo, then its test lines."""
+    found = {}
+    binary = None
+    for line in text.splitlines():
+        running = re.match(r"\s*Running .*\((?:[^)]*/)?([^/)]+?)(?:-[0-9a-f]{16})?\)\s*$", line)
+        if running:
+            binary = running.group(1)
+            continue
+        test = re.match(r"test (\S+)(?: - should panic)? \.\.\. (ok|FAILED|ignored)\b", line)
+        if test and binary:
+            found[(binary, test.group(1))] = test.group(2)
+    return found
+
+
+# Part 1: nothing fails but the cases left out of it.
+part1 = results((work / "part1").read_text())
+failed = sorted(key for key, result in part1.items() if result == "FAILED")
+for binary, case in failed:
+    problems.append(f"{binary} {case}: fails with the policy controller on, and the list does not name it")
+if part1_status != "0" and not failed:
+    problems.append("a test command of part 1 failed and its output names no failing case (a build error, a crash, a timeout)")
+
+# Part 2: every case listed as failing still fails.
+for (binary, case), kind in sorted(mine.items()):
+    if kind != "fails":
+        continue
+    output = work / f"fails.{binary}"
+    result = results(output.read_text()).get((binary, case)) if output.exists() else None
+    if result == "ok":
+        problems.append(f"{binary} {case}: passes now with the policy controller on: delete its line from the list")
+    elif result != "FAILED":
+        problems.append(f"{binary} {case}: listed as failing, and its binary does not run it (renamed, removed or ignored): delete or correct its line")
+
+# Part 3: a classic policy picks in the cases listed as classic, and in no other.
+picked = {}
+for line in (work / "picks").read_text().splitlines():
+    fields = line.split("\t")
+    if len(fields) != 3:
+        problems.append(f"a line of the picks file is not <executable> <thread> <policy>, tab separated: {line}")
+        continue
+    binary = re.sub(r"-[0-9a-f]{16}$", "", fields[0])
+    picked.setdefault((binary, fields[1]), set()).add(fields[2])
+for (binary, case), policies in sorted(picked.items()):
+    if mine.get((binary, case)) != "classic":
+        names = ", ".join(sorted(policies))
+        problems.append(f"{binary} {case}: a classic policy ({names}) places a request with the policy controller on, and the list does not name the case")
+for (binary, case), kind in sorted(mine.items()):
+    if kind == "classic" and (binary, case) not in picked:
+        problems.append(f"{binary} {case}: no classic policy places its requests with the policy controller on any more: delete its line from the list")
+
+kinds = list(mine.values())
+failing, classic = kinds.count("fails"), kinds.count("classic")
+print(f"policy controller on, {shard}: {len(targets)} test binaries, {len(part1)} cases run in part 1; the list names {failing} of their cases as failing and {classic} as placed by a classic policy")
+for problem in problems:
+    print(f"policy controller on, {shard}: PROBLEM: {problem}")
+print(f"policy controller on, {shard}: " + ("OK" if not problems else f"FAILED, {len(problems)} problem(s)"))
+sys.exit(1 if problems else 0)
+' "$POLICY_CONTROLLER_KNOWN" "$work" "$shard" "$status" "$every" $targets || status=1
+    rm -rf "$work"
+    return "$status"
+}
+
 # Every set of the discovery crate's four provider features but the empty one, a comma list
 # a line, and each set that does not hold the file provider once more with the directory
 # watch (`file` names `fs-watch`): the 23 distinct builds a host can name.
@@ -373,9 +533,10 @@ case "$mode" in
     commands) shard_row "$2" >/dev/null; ! metadata_shard "$2" || load_metadata; commands_of "$2" ;;
     build)    shard_row "$2" >/dev/null; ! metadata_shard "$2" || load_metadata; run_commands "$2" build ;;
     run)      shard_row "$2" >/dev/null; ! metadata_shard "$2" || load_metadata; run_commands "$2" run ;;
+    policy-controller) shard_row "$2" >/dev/null; load_metadata; policy_controller_run "$2" ;;
     lint)     lint "${2:-}" ;;
     check)    load_metadata; check ;;
     *)
-        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
         exit 2 ;;
 esac
