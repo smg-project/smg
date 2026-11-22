@@ -6,11 +6,12 @@
 //! ([`Checked`]), the worker lists the controller hands for the frame's
 //! model, and what a controller alone knows of the decision.
 //!
-//! **Nothing is derived here.** A frame's routing key, its seed and the
-//! block hashes of its prompt were made once, by the gateway that asks, and
-//! the frame carries them. They are read by the one reader of a frame
-//! ([`Checked::facts`], [`Checked::constraints`]), as they are read for the
-//! engine over stored records.
+//! **No seed and no block hash is made here.** A frame's routing key, its
+//! seed and the block hashes of its prompt were made once, by the gateway
+//! that asks, and the frame carries them. They are read by the one reader
+//! of a frame ([`Checked::facts`], [`Checked::constraints`]), as they are
+//! read for the engine over stored records. That reader fingerprints a
+//! tenant or a session key the frame carries in the clear, at each read.
 //!
 //! **What a controller adds.** The block hashes are cut at the depth the
 //! deciding document reads of them. The budget is what is left of the
@@ -24,14 +25,25 @@
 //!   dialed whole on the wires a request states. The maker's caller states
 //!   them as places instead ([`FrameRequest::held_to`]): a worker that
 //!   shares no wire with the gateway is no place.
-//! - A subset hint. No stage reads a positive one, and the engine would
-//!   decline the request that states it. A hint of 0 is a decision over no
-//!   candidates: its answer is the caller's to give, before it asks the
-//!   engine.
+//! - A positive subset hint. No stage of the crate reads one, and the
+//!   engine would decline the request that states it. A hint of 0 is a
+//!   decision over no candidates, and the maker keeps it. Its answer is
+//!   the caller's to give before it asks the engine
+//!   (`GatewayPlaces::taken`), and the engine refuses a frame whose caller
+//!   gave none: it declines a single request, and it sheds a pair as the
+//!   engine over stored records sheds it.
 //! - A plain request ([`RequestMaker::plain`]). Every decision of a
-//!   controller is a whole one and names its alternates. A gateway's
-//!   dispatch names a target of the answer by its index, and a gateway
-//!   cannot ask again for the price of a call.
+//!   controller is a whole one, with the alternates its pass finds. A
+//!   gateway's dispatch names a target of the answer by its index, and a
+//!   gateway cannot ask again for the price of a call.
+//!
+//! **What stays the caller's.** The lists are the ones read from the frame
+//! itself ([`Lists::of`](super::wire::Lists::of)): the two are handed
+//! apart. A frame that carries its prompt as text
+//! ([`Checked::has_text`]) is refused before its request is made: the
+//! maker makes a request of any checked frame. And the worker lists state
+//! the store's ids: a frame names the workers it tried and the ones it
+//! excludes by them.
 
 use std::time::Duration;
 
@@ -80,8 +92,10 @@ pub(crate) struct FrameRequest<'a> {
 impl<'a> FrameRequest<'a> {
     /// `frame` as a request over `workers`, the lists its controller hands
     /// for the frame's model, with `left` of its budget at the decision.
-    /// `lists` are the frame's own lists as its decider read them
-    /// ([`Lists::of`](super::wire::Lists::of)).
+    /// `lists` are the lists its decider read from this frame
+    /// ([`Lists::of`](super::wire::Lists::of)) and from no other: the two
+    /// are handed apart, and a request made of one frame and another
+    /// frame's lists bears that frame's headers and exclusions.
     ///
     /// The request may take every place of its list, and no position is
     /// held back ([`Self::held_to`]).
@@ -128,7 +142,8 @@ impl<'a> FrameRequest<'a> {
 }
 
 // `plain` keeps the trait's answer: a controller's request is never plain.
-// `loads` keeps it too: the engine reads the snapshot it holds itself.
+// `loads` keeps it too: the engine reads the newest snapshot its own task
+// keeps.
 impl RequestMaker for FrameRequest<'_> {
     fn model(&self) -> &str {
         self.frame.model()
@@ -142,9 +157,10 @@ impl RequestMaker for FrameRequest<'_> {
             constraints: Constraints {
                 // The gateway's wires are the caller's to state, as places.
                 wire_modes: WireModes::NONE,
-                // No stage reads a positive hint, and a hint of 0 is the
-                // caller's to answer before the engine is asked.
-                subset_hint: None,
+                // No stage of the crate reads a positive hint. A hint of 0
+                // is kept: the engine refuses a frame whose caller did not
+                // answer it.
+                subset_hint: frame.subset().filter(|&hint| hint == 0),
                 places: self.places,
                 stalled: self.stalled,
                 held: self.held,

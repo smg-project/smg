@@ -9,7 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smg_worker::{identity::basic::Worker, test_support::ready_worker};
+use smg_worker::{
+    identity::{basic::Worker, builder::BasicWorkerBuilder},
+    test_support::{no_health_check, ready_worker},
+    worker::{WorkerSpec, WorkerStatus, WorkerType},
+};
 
 use super::FrameRequest;
 use crate::{
@@ -17,11 +21,13 @@ use crate::{
     engine::{
         decision::{Decision, ShedReason, MAX_TARGETS, SUBSET_HINT},
         decision_engine::{Decided, Plain, Request, RequestMaker, WorkerLists},
+        pair_classes::PartnerClasses,
         policy_engine::{PolicyEngine, PoolMembers},
         view::{
-            fingerprint, Constraints, HashKind, Header, Identity, MediaCounts, Phase, RequestFacts,
-            WireModes, WorkerId,
+            fingerprint, Constraints, FixedFacts, HashKind, Header, Identity, MediaCounts, Phase,
+            RequestFacts, WireModes, WorkerId,
         },
+        PairAdmission, PairLists,
     },
     service::{
         controller::wire::{tests::full, Checked, Lists},
@@ -52,6 +58,32 @@ fn pool(workers: usize) -> Arc<[Arc<dyn Worker>]> {
     (0..workers)
         .map(|at| ready_worker(&format!("http://worker-{at}:8000"), MODEL))
         .collect()
+}
+
+/// A ready worker of `worker_type`, a side of a pair.
+fn typed(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
+    let worker = <BasicWorkerBuilder>::from_spec(WorkerSpec {
+        worker_type,
+        ..WorkerSpec::new(url)
+    })
+    .health_config(no_health_check())
+    .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
+/// A host's admission with every prefill free and every decode's room open.
+#[derive(Debug)]
+struct Open;
+
+impl PairAdmission for Open {
+    fn has_capacity(&self, _: usize) -> bool {
+        true
+    }
+
+    fn has_room(&self, _: usize) -> bool {
+        true
+    }
 }
 
 /// A frame that states its model and its seed, and what `edit` writes.
@@ -132,13 +164,24 @@ fn places(decided: &Decided) -> Vec<u32> {
     }
 }
 
+/// The reason and the stage of an answer that sheds its request.
+fn shed_of(decided: Decided) -> (ShedReason, &'static str) {
+    let Decided::Whole(whole, _) = decided else {
+        panic!("a whole decision");
+    };
+    match whole.decision {
+        Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+        other => panic!("a shed, not {other:?}"),
+    }
+}
+
 /// Every field of a frame reaches the request its maker makes, as it
 /// reaches the request of the engine over stored records
 /// (`Checked::read`, and its case over the same frame in the wire's own
-/// cases). Four things are a controller's own and not the frame's: the
-/// budget is what is left, the wires and the subset hint are not stated,
-/// and the places and held-back positions are the ones the maker was
-/// handed.
+/// cases). Three things are a controller's own and not the frame's: the
+/// budget is what is left, the wires are not stated, and the places and
+/// held-back positions are the ones the maker was handed. Of the subset
+/// hint a 0 alone is stated.
 #[test]
 fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     // A ring keyed by the prompt reads a text's hashes: the frame's three
@@ -201,10 +244,10 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
     );
     assert!(constraints.overload_lifted);
     assert!(!constraints.decode_later);
-    // The frame states the wires 0b110 and a hint of 0: neither is said
-    // to the engine.
+    // The frame states the wires 0b110 and a hint of 0: the wires are not
+    // said to the engine, and the 0 is.
     assert_eq!(constraints.wire_modes, WireModes::NONE);
-    assert_eq!(constraints.subset_hint, None);
+    assert_eq!(constraints.subset_hint, Some(0));
     assert_eq!(constraints.places, Some(&may_take[..]));
     assert_eq!(
         (constraints.stalled, constraints.held),
@@ -226,6 +269,14 @@ fn every_field_of_a_frame_reaches_the_request_its_maker_makes() {
         WorkerLists::None,
     );
     assert_eq!(long.make(&spec).facts.budget_micros, u32::MAX);
+    // A part of a microsecond left is not told: the whole ones are.
+    let part = FrameRequest::new(
+        &frame,
+        &lists,
+        Duration::from_nanos(1_999),
+        WorkerLists::None,
+    );
+    assert_eq!(part.make(&spec).facts.budget_micros, 1);
 }
 
 /// A decider reads frame after frame onto the same buffers: a later frame's
@@ -325,6 +376,174 @@ fn the_hashes_past_what_the_document_reads_are_cut_and_the_first_kept() {
     assert_eq!(read(&preset("random")), Vec::<u64>::new());
 }
 
+/// The depth is counted in the frame's own blocks and in its own kind of
+/// hash (`AppliedSpec::block_hashes_read`): a document that reads 256
+/// tokens of a prompt reads sixteen blocks of 16 tokens and four of 64,
+/// eight of the view's 32 where the frame states no size, and of a text
+/// the bytes of as many tokens.
+#[test]
+fn the_hashes_are_cut_in_blocks_of_the_frames_own_size_and_kind() {
+    let mut keyed = preset("prefix_hash");
+    keyed.view.block_size = Some(32);
+    let spec = applied(&keyed);
+    let read = |kind: proto::HashKind, block_size: u32| {
+        let frame = frame_of(7, |frame| {
+            let facts = frame.facts.as_mut().expect("the frame has facts");
+            facts.block_hashes = (1..=40).collect();
+            facts.hash_kind = kind.into();
+            facts.block_size = block_size;
+        });
+        let mut buffers = Lists::default();
+        let lists = buffers.of(&frame);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::None);
+        maker.make(&spec).facts.block_hashes.len()
+    };
+    let tokens = |block_size: u32| read(proto::HashKind::Token, block_size);
+    assert_eq!((tokens(0), tokens(16), tokens(64)), (8, 16, 4));
+    // A text's blocks are sized in bytes, four to a token, and a frame that
+    // carries a text's hashes states their size.
+    let text = |block_size: u32| read(proto::HashKind::Text, block_size);
+    assert_eq!((text(32), text(64)), (32, 16));
+}
+
+/// A hint of 0 is a decision over no candidates. Main sheds such a frame
+/// `NoEndpoints` under `subset-hint` (`emptied` in the engine over stored
+/// records). The maker keeps the 0, so the answer cannot be lost: the
+/// frame's caller gives it before it asks the engine
+/// (`GatewayPlaces::taken`), and the engine declines the single request of
+/// a caller that did not, where it would have picked a worker.
+#[test]
+fn a_hint_of_0_reaches_the_engine_which_refuses_a_single_request_not_answered_for_it() {
+    let engine = engine("random");
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let frame = frame_of(7, |frame| {
+        frame.constraints = Some(proto::Constraints {
+            subset_hint: Some(0),
+            ..proto::Constraints::default()
+        });
+    });
+    let mut buffers = Lists::default();
+    let lists = buffers.of(&frame);
+    let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(&members));
+    let spec = applied(&preset("random"));
+    assert_eq!(maker.make(&spec).constraints.subset_hint, Some(0));
+    assert_eq!(
+        shed_of(decided(&engine, &maker, Instant::now())),
+        (ShedReason::PolicyDeclined, SUBSET_HINT)
+    );
+}
+
+/// A pair's frame is decided over the two lists its controller hands for
+/// it: its answer names a prefill and that prefill's decode. One that
+/// hints a subset of 0 is shed `NoEndpoints` under `subset-hint`, as main
+/// sheds it, and a positive hint decides as none.
+#[test]
+fn a_pairs_frame_is_decided_over_its_two_lists_and_shed_where_it_hints_0() {
+    let mut document =
+        PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
+    document.generation = 1;
+    let engine = PolicyEngine::new(applied(&document));
+    let side = |name: &str, worker_type: WorkerType, count: usize| -> Arc<[Arc<dyn Worker>]> {
+        (0..count)
+            .map(|at| typed(format!("grpc://{name}-{at}:9000"), worker_type))
+            .collect()
+    };
+    let prefills = side("prefill", WorkerType::Prefill, 2);
+    let decodes = side("decode", WorkerType::Decode, 3);
+    let (prefill, decode) = (
+        engine.pool_members(&prefills),
+        engine.pool_members(&decodes),
+    );
+    // Every prefill pairs with every decode.
+    let all = [0_u32, 1, 2];
+    let classes = PartnerClasses::number(3, [&all[..], &all[..]]);
+    let pair = PairLists {
+        prefill: &prefill,
+        decode: &decode,
+        classes: &classes,
+        admission: &Open,
+    };
+    let now = Instant::now();
+    let asked = |hint: Option<u32>| {
+        let frame = frame_of(7, |frame| {
+            let facts = frame.facts.as_mut().expect("the frame has facts");
+            facts.phase = proto::Phase::Prefill.into();
+            frame.constraints = Some(proto::Constraints {
+                subset_hint: hint,
+                ..proto::Constraints::default()
+            });
+        });
+        let mut buffers = Lists::default();
+        let lists = buffers.of(&frame);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Pair(pair));
+        decided(&engine, &maker, now)
+    };
+    for hint in [None, Some(2)] {
+        let Decided::Whole(whole, _) = asked(hint) else {
+            panic!("a whole decision");
+        };
+        let pick = whole.decision.pick().expect("a pick");
+        let first = pick.targets.first().expect("a target");
+        assert!(first.pair.is_some(), "a prefill with its decode: {first:?}");
+    }
+    assert_eq!(
+        shed_of(asked(Some(0))),
+        (ShedReason::NoEndpoints, SUBSET_HINT)
+    );
+}
+
+/// A frame names the workers it tried and the ones it excludes by the
+/// store's ids (`Lists::of`). Over a list whose records state those ids
+/// (`FixedFacts::id`) an excluded worker is no target and each target
+/// bears its worker's id from the store. Over records that carry an
+/// address's fingerprint the same frame excludes nobody.
+#[test]
+fn a_frame_names_a_worker_by_the_stores_id_over_a_list_that_states_it() {
+    let engine = engine("random");
+    let list = pool(4);
+    // The store's id of the worker at each place of the list.
+    let stored = |place: usize| WorkerId(1_000 + place as u64);
+    let mut place = 0;
+    let stating = engine.pool_members_with_fixed_facts(&list, |_| {
+        place += 1;
+        FixedFacts {
+            id: Some(stored(place - 1)),
+            ..FixedFacts::default()
+        }
+    });
+    let silent = engine.pool_members(&list);
+    let now = Instant::now();
+    let asked = |members: &PoolMembers, seed: u64| {
+        let frame = frame_of(seed, |frame| {
+            frame.constraints = Some(proto::Constraints {
+                excluded: vec![stored(1).0, stored(2).0],
+                ..proto::Constraints::default()
+            });
+        });
+        let mut buffers = Lists::default();
+        let lists = buffers.of(&frame);
+        let maker = FrameRequest::new(&frame, &lists, LEFT, WorkerLists::Single(members));
+        let Decided::Whole(whole, _) = decided(&engine, &maker, now) else {
+            panic!("a whole decision");
+        };
+        let pick = whole.decision.pick().expect("a pick");
+        pick.targets.iter().copied().collect::<Vec<_>>()
+    };
+    let mut unstated = Vec::new();
+    for seed in 0..32 {
+        for target in asked(&stating, seed) {
+            assert!([0, 3].contains(&target.position), "seed {seed}: {target:?}");
+            assert_eq!(target.id, stored(target.position as usize), "seed {seed}");
+        }
+        unstated.extend(asked(&silent, seed).iter().map(|target| target.position));
+    }
+    assert!(
+        unstated.contains(&1) && unstated.contains(&2),
+        "{unstated:?}"
+    );
+}
+
 /// A positive subset hint reaches no stage, as on main, where the
 /// deciding threads say so of the engine over stored records: the frame
 /// decides as one that states none. The engine over worker lists declines
@@ -367,16 +586,10 @@ fn a_positive_subset_hint_reaches_no_stage() {
         },
         members: &members,
     };
-    let Decided::Whole(whole, _) = decided(&engine, &stated, now) else {
-        panic!("a whole decision");
-    };
-    match whole.decision {
-        Decision::Shed(shed) => assert_eq!(
-            (shed.reason, shed.emptied_by),
-            (ShedReason::PolicyDeclined, SUBSET_HINT)
-        ),
-        other => panic!("a shed, not {other:?}"),
-    }
+    assert_eq!(
+        shed_of(decided(&engine, &stated, now)),
+        (ShedReason::PolicyDeclined, SUBSET_HINT)
+    );
 }
 
 /// One frame and the equal request stated ahead decide alike over one list

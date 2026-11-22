@@ -45,6 +45,8 @@ pub(crate) mod election;
 mod floor;
 #[cfg(feature = "in-process")]
 mod frame_request;
+#[cfg(all(feature = "in-process", feature = "worker-host"))]
+mod gateway_places;
 mod gateways;
 mod generations;
 #[cfg(all(test, feature = "worker-host"))]
