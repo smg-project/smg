@@ -6,7 +6,7 @@
 //! caller states the model, its list and a prompt of the size the plain
 //! request states, and says the dispatch and the end of the placement it is
 //! answered. It lends no load snapshot: the engine reads its own. The
-//! result line's last word names the entry asked (`entry=`).
+//! result line names the entry asked (`entry=`).
 //!
 //! [`PolicyEngine::place`]: smg_policy_controller::engine::PolicyEngine::place
 

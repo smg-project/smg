@@ -34,7 +34,7 @@ use smg_worker::{
 };
 use tokio::runtime::Builder;
 
-use super::{measure, plain, reports, Host, Run, Shadowed, Stated, MODEL};
+use super::{measure, plain, reports, Cell, Host, Run, Shadowed, Stated, MODEL};
 
 /// The pair document of the preset `name` on both sides.
 pub(super) fn of(name: &str) -> PolicySpec {
@@ -144,7 +144,11 @@ impl Decodes {
     /// where the decision is leased.
     fn place(&self, host: &Host, seed: u64) -> Option<u32> {
         let stated = StatedPair {
-            stated: Stated { host, seed },
+            stated: Stated {
+                host,
+                seed,
+                prompt: None,
+            },
             decodes: self,
         };
         let dated = OnceCell::new();
@@ -197,7 +201,13 @@ impl Decodes {
 /// says whether it did. The cell's request reads nothing the cell makes
 /// behind its engine, and none is made ahead of that.
 pub(super) fn runs(run: &Run) -> bool {
-    let (name, document, request, behind) = run.cell;
+    let Cell {
+        behind,
+        document,
+        name,
+        request,
+        ..
+    } = run.cell;
     if !name.starts_with("pair_") {
         return false;
     }
@@ -261,7 +271,7 @@ pub(super) fn runs(run: &Run) -> bool {
     let converted = || host.members.conversions() + decode_side.members.conversions();
     measure(
         run,
-        engine,
+        &host,
         upkeep,
         || feed.publish(&loads),
         converted,

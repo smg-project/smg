@@ -459,14 +459,35 @@ a prompt, where classic asks by every block. Two conversations alike in their fi
 then tie. A local probe showed it (18 of 32 next turns kept, where classic kept every one); the
 cluster run did not.
 
-**The engine as designed [planned].** It follows classic's rule above: one request reads one
-record. For B and C it keeps trees of the same two types from the kv-index crate, and decides
-inside the tree's one walk as classic does. The host hands the request's entry already named
-under its cache partition, so the naming stays written once, in the host. The hash table leaves
-the single decision. A prefill-decode pair reads no record of sent prefixes in the engine today;
-classic keeps trees for each side, and the engine gets the same in a later change. Nothing outside
-the policy crate changes until the gateway's integration, which calls classic's own two naming
-functions.
+**The engine as designed [partly].** It follows classic's rule above: one request reads one
+record. For B and C the engine keeps no tree of its own. The host lends its own trees, through
+the trait it already answers for cache events (`CacheIndexes`). The engine decides inside the
+lent tree's one walk, as classic does, and the walk stores the request once, for the worker the
+decision names.
+
+- **[built]** A single request that hands token ids, for a model with no index of cache events,
+  under a profile that reads sent prefixes and names the holders' rows, as the `cache_aware`
+  preset does: the host lends its token tree (`CacheIndexes::token_tree`) and hands the
+  request's entry already named under its cache partition (`RequestMaker::token_key`), so the
+  naming stays written once, in the host. The engine calls the tree's walk alone. The tree's size
+  bound and a worker that left stay the host's to keep.
+- **[built]** A host that lends no tree, or names no entry, is decided by the hash table as
+  before.
+- **[planned]** A request placed by the one call (`PolicyEngine::place`) hands its entry too.
+  Until then that call's own maker names none, so such a request is decided by the hash table,
+  whatever its host lends.
+- **[planned]** A request given as text is decided the same way in the host's string tree.
+- **[planned]** The hash table leaves the single decision. Until then a model with an index of
+  cache events reads the index and the hash table together, as today.
+- A prefill-decode pair reads no record of sent prefixes in the engine today. Classic keeps
+  trees for each side. **[planned]** The engine reads the host's trees for each side.
+
+A decision of the engine publishes no insert to other gateways.
+
+One change was made outside the policy crate first **[built]**: classic's trees moved out of
+its policy object into one store type of the kv-index crate (`ModelTrees`), with no behaviour
+change. Classic's policy object keeps its trees in that type. The engine's host keeps the trees
+it lends in the same type **[planned]**.
 
 ### 4.6 Who writes and who reads
 
@@ -476,7 +497,7 @@ functions.
 | the worker object's state | health checker, load monitor, load guard (on a controller, the leases on file), outcomes | yes | yes, once for each decision |
 | `LoadSnapshot` | the load monitor | `least_load`, `cache_aware`, `power_of_two` | yes, the latest snapshot |
 | the index of cache events | the workers' event streams | `cache_aware` | yes, through `CacheIndex` |
-| the two trees | the deciding policy | `cache_aware` | **[planned]** trees of its own, same types |
+| the two trees | the deciding policy: classic's, or the engine inside the tree's walk | `cache_aware` | the host's own trees, lent: the token tree **[built]**, the string tree **[planned]** |
 
 ## 5. The engine
 
@@ -798,7 +819,8 @@ the kept one. `GatewayId` is still defined in the store.
   a cap asks `session_counted` of its host today.
 - The trait's method that the kept engine answers with a constant, `decide_encode_pair`, is built
   or removed.
-- The record of sent prefixes becomes the two trees (section 4.5).
+- The record of sent prefixes leaves the single decision. The two trees a request is then
+  decided in are the host's own, lent (section 4.5).
 
 `signal_cells` stays, and it is built for a single request: where the request's profile reads a
 named signal, the kept engine fills the field itself, from the reports of the load snapshot the
@@ -907,7 +929,7 @@ At start:
 | The host does | With |
 |---|---|
 | builds the engine from the document | `PolicyEngine::new(spec)` |
-| hands its index of cache events | `engine.affinity().set_indexes(indexes)`; the host implements `CacheIndexes` and `CacheIndex` |
+| hands its index of cache events | `engine.affinity().set_indexes(indexes)`; the host implements `CacheIndexes` and `CacheIndex`. The same hand-over also lends the token tree, where the host keeps one (`CacheIndexes::token_tree`) |
 | keeps the engine's value beside each published worker list | `engine.pool_members(list)`, or `engine.pool_members_with_fixed_facts(list, facts_of)` where the host knows a fact of its workers that their objects do not hold |
 | hands its worker registry, once | `engine.set_registry(registry)`; the host implements `Members`, and the worker crate's registry is one. The engine's task then tells the policies a worker that joined or was removed, by the registry's events (the table below) |
 | or, where it hands no registry, tells the engine itself | `engine.forget(address)` when a worker is removed and `engine.joined(address)` when one joins; a removal and a registration at one address in that order |
@@ -937,7 +959,7 @@ that closed. The session table is told nothing: a pin on a worker that is gone s
 session's idle time or two other workers end it.
 
 For each request the host implements a small trait and calls the engine. A host writes `model`
-and `make`; the other three methods have default bodies:
+and `make`; the other four methods have default bodies:
 
 ```rust
 // engine/decision_engine.rs
@@ -947,6 +969,7 @@ pub trait RequestMaker {
     fn plain(&self) -> Option<Plain>;                 // what a plain request states, if it is plain
     fn workers(&self) -> WorkerLists<'_>;             // the worker list, a pair's two lists, or an encode request's three
     fn loads(&self) -> Option<&Arc<LoadSnapshot>>;    // a request's snapshot of the host's own; without one the engine reads its own
+    fn token_key(&self, page: usize) -> Option<TokenKey<'_>>; // the prompt's entry in the host's token tree, where the host lends one
 }
 
 pub enum WorkerLists<'a> {
@@ -1174,7 +1197,7 @@ The design adds no second mechanism where one exists.
 | load reports | the load monitor's `LoadSnapshot` | nothing |
 | which worker holds a prompt, by cache events | the kv-index crate's index, through two traits | the gateway's two readers of its index for those traits, about 130 lines (section 9.2) |
 | which prefill pairs with which decode | the gateway's pair index (`PdPairIndex`) | the pair classes read from it, one file of 290 lines (section 9.2) |
-| which worker was sent a prompt | the kv-index crate's two tree types | the engine's own trees of those types |
+| which worker was sent a prompt | the host's own trees, of the kv-index crate's two tree types | one more question on the trait the host already answers for cache events |
 | a request's lifetime on a worker | the load guard every route keeps | one optional field (decision 4) |
 | the place where a worker is chosen | classic's five placement functions | one call in each |
 | the rank inside a worker that stands for several | the load monitor's rank cache and the gateway's sticky pin, asked after the pick | nothing |
@@ -1225,7 +1248,9 @@ request ──> route (HTTP or gRPC, any family)
 
 - **Start.** One function builds the engine from the routing settings or a supplied document and
   hands it the registry's events, the load monitor's channel and the cache-event monitor. With
-  the engine on, no classic policy object is built.
+  the engine on, no classic policy object is built. So the start function owns the trees the
+  engine is lent **[planned]**: it keeps them, runs their size pass on a timer and tells them a
+  worker that left.
 - **Each request.** The five functions ask the engine. They fill `PlaceRequest` from the inputs
   they already take. No route changes for this.
 - **The request's end.** The placement stays with the request's load guard, which every route
@@ -1595,7 +1620,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | The stage interfaces and a builder's own stages | **[built]** | |
 | The engine over worker lists (`PolicyEngine`) | **[partly]** | refuses a subset hint, a pair's demand, mixed protocols; no recorded line replays through it |
 | `round_robin`, `random`, `passthrough`, `least_load`, `power_of_two` on that engine | **[partly]** | no sheet over a healthy pool for four of them |
-| `cache_aware` on that engine | **[partly]** | its own record has three faults; the two trees are planned |
+| `cache_aware` on that engine | **[partly]** | a single request whose maker names its entry by token ids (`RequestMaker::token_key`) is decided in the host's token tree, where the host lends it, the model has no index of cache events and the profile reads sent prefixes and names the holders' rows, as the preset does: the record's first two faults do not reach it. Every other request the engine names the holders of reads the engine's own record, with its three faults: a request placed by `PolicyEngine::place` is one, until that call hands the entry. The string tree is planned |
 | `consistent_hashing`, `prefix_hash` on that engine | **[partly]** | the crate's ring places a routing key on another worker than classic's ring (decision 3) |
 | `manual` and sticky sessions on that engine | **[partly]** | their sheets replay through the decision function, not through the engine |
 | `bucket` on that engine | **[partly]** | the same |
@@ -1623,7 +1648,7 @@ All eleven at a glance. An answer can be as short as the numbers with their lett
 
 | # | Decision | Recommended | Needed for |
 |---|---|---|---|
-| 1 | The name of a cache partition | (a) the host hands the entry already named | the two trees of `cache_aware` (in work, crate only) |
+| 1 | The name of a cache partition | (a) the host hands the entry already named | the host's two trees, read for `cache_aware` (the token tree's entry is built) |
 | 2 | Recorders for the sheets that are missing | (a) new recorders beside classic's code, for the ring, the sticky override and `least_load`; (b) a crate test that names classic's rule, for `round_robin`, `random` and `passthrough` | proof against classic for those policies |
 | 3 | The hash ring | (a) the host lends its ring now; (b) one shared ring with the controller's switch | `consistent_hashing` and `prefix_hash` |
 | 4 | Where a placement stays during a request | (a) inside the load guard | the gateway's integration (stage 3) |
@@ -1637,8 +1662,8 @@ All eleven at a glance. An answer can be as short as the numbers with their lett
 
 ### Decision 1: the name of a cache partition
 
-*Needed for:* the two-tree record of `cache_aware`. The engine must name a request's tree entry
-as classic does.
+*Needed for:* the host's two trees, which the engine reads for `cache_aware` (section 4.5). A
+request's entry in a tree must be named as classic names it.
 
 | Option | Cost |
 |---|---|
@@ -1791,14 +1816,14 @@ The crate first (rule 7). Each stage ends with a test, and the next does not sta
 
 ### Stage 1, the first changes
 
-Each is one small change inside the crate, with its proof. Change 2 is a series of six, each
-behind the one before.
+Each is one small change inside the crate, with its proof. Change 2 is a series, each behind
+the one before.
 
 | # | Change | Proof inside the crate |
 |---|---|---|
 | 0 | Two doc links that break the docs build with default features | the docs build, before and after |
 | 1 | The bench of the engine over worker objects, with `passthrough` decided by one pick | the bench's cells before and after |
-| 2 | `cache_aware` keeps what it sent in the two trees: the host hands the entry; a tokenized request inside the token tree's walk; the trees' bound and eviction; a text request; the choice between the three records; the old record leaves | crate cases that fail before; the bench's cell; classic's `cache_aware` sheet through the engine once change 3's replay over worker objects is on main |
+| 2 | `cache_aware` reads and writes the host's two trees: the host lends its token tree and hands the entry, and a tokenized request is decided inside that tree's walk; a text request; the choice between the three records; the old record leaves | crate cases that fail before; the bench's cell; classic's `cache_aware` sheet through the engine once change 3's replay over worker objects is on main |
 | 3 | A pinned session is followed first, as classic does | two crate cases that fail before; the bench's cell; the 18 recorded sticky lines through the engine over worker objects, which prove the reads from the worker object |
 | 4 | A request can be held to some workers of its list | its cases |
 | 5 | A decode decided again keeps its first decode | a failing case at the service's entry |

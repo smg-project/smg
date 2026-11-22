@@ -40,12 +40,12 @@ pub use decision::{
     Decision, LiftedVeto, Overlap, OverlapSource, Pair, Pick, PlacedBy, Queue, ShadowKind, Shed,
     ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
-#[cfg(feature = "in-process")]
-pub use decision_engine::WorkerLists;
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
     HeldDecision, HeldDecode, Leased, Plain, Request, RequestMaker, SweepOutcome,
 };
+#[cfg(feature = "in-process")]
+pub use decision_engine::{TokenKey, WorkerLists};
 pub use decision_slot::{DecisionSlot, DecisionSlotGuard};
 pub use demands::{DemandFacts, Demands, References, UnmetDemand};
 pub use explain::{DecisionNames, DecisionRecord};

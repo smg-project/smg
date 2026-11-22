@@ -39,6 +39,9 @@
 //! cell twice under callgrind with one caller and two values of
 //! `--decisions`, and divide the difference of the counts by the difference
 //! of the decisions. The setup and the untimed decisions are in both runs.
+//! Count with `--upkeep-thread 0`: the engine's task then takes its first
+//! step and no thread of its own turns it. With that thread, the counts of
+//! one binary differ from run to run by the allocator's locks.
 
 #![expect(
     clippy::expect_used,
@@ -47,6 +50,8 @@
     reason = "a bench binary: it stops on a broken setup and prints its result"
 )]
 
+#[path = "in_process/conversations.rs"]
+mod conversations;
 #[path = "../tests/common/counting_alloc.rs"]
 mod counting_alloc;
 #[path = "in_process/pair.rs"]
@@ -61,6 +66,7 @@ mod signals;
 #[cfg(any(target_env = "msvc", target_env = "musl"))]
 use std::alloc::System as Allocator;
 use std::{
+    borrow::Cow,
     cell::OnceCell,
     collections::HashMap,
     env,
@@ -80,7 +86,7 @@ use smg_policy_controller::{
     document::{AppliedSpec, PolicySpec, ShadowSpec},
     engine::{
         Constraints, Decided, Identity, Phase, Plain, PolicyEngine, PoolMembers, Request,
-        RequestFacts, RequestMaker, WorkerId, WorkerLists,
+        RequestFacts, RequestMaker, TokenKey, WorkerId, WorkerLists,
     },
     policies::consistent_hashing::LentRing,
     store::GatewayId,
@@ -96,7 +102,10 @@ use smg_worker::{
 // it, with its calls counted: what a decision costs depends on it.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 use tikv_jemallocator::Jemalloc as Allocator;
-use tokio::{runtime::Builder, time::sleep};
+use tokio::{
+    runtime::{Builder, Runtime},
+    time::sleep,
+};
 
 #[global_allocator]
 static GLOBAL: Counting<Allocator> = Counting(Allocator);
@@ -119,56 +128,135 @@ const MODEL: &str = "bench-model";
 /// Decisions a caller makes untimed first: the buffers a thread keeps.
 const CALLER_WARM: u64 = 256;
 
-/// A cell: its name, its document, the request of one turn of its callers
-/// by the turn's seed, and what the cell makes once behind its engine. The
-/// request is plain for every seed or for none: the bench asks it once a
-/// cell.
-type Cell = (
-    &'static str,
-    fn() -> PolicySpec,
-    fn(u64) -> Request<'static>,
-    fn(&PolicyEngine),
-);
+/// One caller's turns as a cell makes them whose callers make their own:
+/// the host, the start every caller waits at, the caller's timed decisions
+/// and its number in, and what [`stretch`] says of the turns out.
+type Turns = fn(&Host, &Barrier, u64, u64) -> (u64, u64, u64);
 
-/// The cells. A change that moves a policy's cost adds its entry here.
-const CELLS: [Cell; 12] = [
-    ("round_robin", || preset("round_robin"), plain, |_| ()),
-    ("random", || preset("random"), plain, |_| ()),
-    ("passthrough", || preset("passthrough"), plain, |_| ()),
-    ("power_of_two", || preset("power_of_two"), plain, |_| ()),
-    ("least_load", || preset("least_load"), plain, |_| ()),
-    ("bucket", || preset("bucket"), plain, |_| ()),
-    (
-        "cache_aware_sessions",
-        || sessions_over("cache_aware"),
-        session,
-        sessions,
-    ),
-    (
-        "consistent_hashing",
-        || preset("consistent_hashing"),
-        keyed,
-        |_| (),
-    ),
-    (
-        "pair_least_load",
-        || pair::of("least_load"),
-        pair::request,
-        |_| (),
-    ),
-    (
-        "pair_round_robin",
-        || pair::of("round_robin"),
-        pair::request,
-        |_| (),
-    ),
-    (
-        "pair_round_robin_later",
-        || pair::of("round_robin"),
-        pair::later,
-        |_| (),
-    ),
-    ("signal_cost", signals::document, plain, |_| ()),
+/// A cell, by its parts in the order of their names. An entry of [`CELLS`]
+/// names its own parts over [`Cell::PLAIN`], whose parts do nothing: a new
+/// part is one field here and one line there, and no other cell's entry
+/// changes.
+#[derive(Clone, Copy)]
+struct Cell {
+    /// What the cell makes once behind its engine.
+    behind: fn(&PolicyEngine),
+    /// One caller's turns, where the cell's callers make their own in the
+    /// place of the run's `decide`.
+    caller: Option<Turns>,
+    /// The cell's document.
+    document: fn() -> PolicySpec,
+    /// What the cell asks of a run ahead of its callers: it stops there a
+    /// run its callers could not make.
+    fits: fn(&Run),
+    /// The cell's name, as `--cell` states it.
+    name: &'static str,
+    /// The request of one turn of the cell's callers by the turn's seed. It
+    /// is plain for every seed or for none: the bench asks it once a cell.
+    request: fn(u64) -> Request<'static>,
+    /// The words the cell adds at the end of its result line.
+    words: fn() -> String,
+}
+
+impl Cell {
+    /// A cell of plain requests that makes nothing behind its engine, whose
+    /// callers ask the run's `decide`, which takes every run and whose line
+    /// gains no word. An entry names itself and its document.
+    const PLAIN: Self = Self {
+        behind: |_| (),
+        caller: None,
+        document: || preset("round_robin"),
+        fits: |_| (),
+        name: "",
+        request: plain,
+        words: String::new,
+    };
+
+    /// The cell `name` names.
+    fn named(name: &str) -> Self {
+        let named = CELLS.iter().find(|cell| cell.name == name);
+        *named.unwrap_or_else(|| panic!("no cell {name}"))
+    }
+}
+
+/// The cells, in the order of their names. A change that moves a policy's
+/// cost adds its entry here.
+const CELLS: &[Cell] = &[
+    Cell {
+        name: "bucket",
+        document: || preset("bucket"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware",
+        document: || preset("cache_aware"),
+        behind: conversations::lends,
+        caller: Some(conversations::caller),
+        fits: conversations::fits,
+        words: conversations::words,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "cache_aware_sessions",
+        document: || sessions_over("cache_aware"),
+        behind: sessions,
+        request: session,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "consistent_hashing",
+        document: || preset("consistent_hashing"),
+        request: keyed,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "least_load",
+        document: || preset("least_load"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "pair_least_load",
+        document: || pair::of("least_load"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "pair_round_robin",
+        document: || pair::of("round_robin"),
+        request: pair::request,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "pair_round_robin_later",
+        document: || pair::of("round_robin"),
+        request: pair::later,
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "passthrough",
+        document: || preset("passthrough"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "power_of_two",
+        document: || preset("power_of_two"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "random",
+        document: || preset("random"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "round_robin",
+        document: || preset("round_robin"),
+        ..Cell::PLAIN
+    },
+    Cell {
+        name: "signal_cost",
+        document: signals::document,
+        ..Cell::PLAIN
+    },
 ];
 
 /// A built-in preset as a cell's document.
@@ -312,27 +400,31 @@ enum Shadowed {
 
 /// One run, as the switches state it.
 struct Run {
-    cell: Cell,
-    workers: usize,
     callers: usize,
+    cell: Cell,
     decisions: u64,
     /// The entry asked for a request: the bench's `place` file reads it.
     entry: String,
-    publish_ms: u64,
     overloaded: bool,
+    publish_ms: u64,
     shadow: Shadowed,
+    /// Whether a thread of its own turns the engine's task behind its first
+    /// step.
+    upkeep_thread: bool,
+    workers: usize,
 }
 
 fn run() -> Run {
     let mut run = Run {
-        cell: CELLS[0],
-        workers: 64,
         callers: 1,
+        cell: Cell::named("round_robin"),
         decisions: 1_000_000,
         entry: "decide_at".to_owned(),
-        publish_ms: 0,
         overloaded: false,
+        publish_ms: 0,
         shadow: Shadowed::No,
+        upkeep_thread: true,
+        workers: 64,
     };
     let mut switches = env::args().skip(1);
     while let Some(switch) = switches.next() {
@@ -343,16 +435,12 @@ fn run() -> Run {
         let value = switches.next().expect("a value behind each switch");
         let number = || value.parse::<u64>().expect("a number");
         match switch.as_str() {
-            "--cell" => {
-                let named = CELLS.iter().find(|cell| cell.0 == value);
-                run.cell = *named.unwrap_or_else(|| panic!("no cell {value}"));
-            }
-            "--workers" => run.workers = number() as usize,
             "--callers" => run.callers = number() as usize,
+            "--cell" => run.cell = Cell::named(&value),
             "--decisions" => run.decisions = number(),
             "--entry" => run.entry = place::named(&value),
-            "--publish-ms" => run.publish_ms = number(),
             "--overloaded" => run.overloaded = number() != 0,
+            "--publish-ms" => run.publish_ms = number(),
             "--shadow" => {
                 run.shadow = match value.as_str() {
                     "twin" => Shadowed::Twin,
@@ -360,6 +448,8 @@ fn run() -> Run {
                     other => panic!("no shadow {other}"),
                 };
             }
+            "--upkeep-thread" => run.upkeep_thread = number() != 0,
+            "--workers" => run.workers = number() as usize,
             other => panic!("no switch {other}"),
         }
     }
@@ -389,6 +479,8 @@ fn reports(workers: &[Arc<dyn Worker>]) -> HashMap<String, WorkerLoadResponse> {
 struct Stated<'a> {
     host: &'a Host,
     seed: u64,
+    /// The turn's prompt, where the cell's callers hold conversations.
+    prompt: Option<&'a conversations::Turn<'a>>,
 }
 
 impl RequestMaker for Stated<'_> {
@@ -397,7 +489,18 @@ impl RequestMaker for Stated<'_> {
     }
 
     fn make<'w>(&'w self, _: &'w AppliedSpec) -> Request<'w> {
-        (self.host.request)(self.seed)
+        let Some(prompt) = self.prompt else {
+            return (self.host.request)(self.seed);
+        };
+        // The conversation so far, as its host hashed it: the first blocks
+        // of its full prompt.
+        let mut request: Request<'w> = (self.host.request)(self.seed);
+        let facts = &mut request.facts;
+        prompt.hashes.write_to(facts);
+        let blocks = prompt.tokens.len() / facts.block_size as usize;
+        facts.block_hashes = &facts.block_hashes[..blocks];
+        facts.prompt_tokens = prompt.tokens.len() as u32;
+        request
     }
 
     fn plain(&self) -> Option<Plain> {
@@ -406,6 +509,11 @@ impl RequestMaker for Stated<'_> {
 
     fn workers(&self) -> WorkerLists<'_> {
         WorkerLists::Single(&self.host.members)
+    }
+
+    fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+        let tokens = Cow::Borrowed(self.prompt?.tokens);
+        Some(TokenKey { tokens, marker: 0 })
     }
 }
 
@@ -422,8 +530,12 @@ struct Host {
 impl Host {
     /// One request by the engine's one entry: the place in the list it was
     /// sent to, with the dispatch and the end told where a decision is leased.
-    fn place(&self, seed: u64) -> Option<u32> {
-        let stated = Stated { host: self, seed };
+    fn place(&self, seed: u64, prompt: Option<&conversations::Turn<'_>>) -> Option<u32> {
+        let stated = Stated {
+            host: self,
+            seed,
+            prompt,
+        };
         // The instant the engine dated the decision at, where it dated one.
         let dated = OnceCell::new();
         let clock = || *dated.get_or_init(Instant::now);
@@ -462,13 +574,41 @@ impl Host {
     }
 }
 
+/// One caller's turns by `turn`: its first untimed, then, behind the start
+/// every caller waits at, its timed ones as one stretch. Says how many of
+/// those were placed, the stretch in nanoseconds and its allocations.
+fn stretch<T>(
+    start: &Barrier,
+    decisions: u64,
+    mut turn: impl FnMut(u64) -> Option<T>,
+) -> (u64, u64, u64) {
+    for at in 0..CALLER_WARM {
+        black_box(turn(at));
+    }
+    start.wait();
+    let (allocated, started) = (calls(), Instant::now());
+    let mut took = 0;
+    for at in CALLER_WARM..CALLER_WARM + decisions {
+        took += u64::from(black_box(turn(at)).is_some());
+    }
+    let nanos = started.elapsed().as_nanos() as u64;
+    (took, nanos, (calls() - allocated) as u64)
+}
+
 fn main() {
     let run = run();
     // A pair's cell hands two lists: its run is its file's.
     if pair::runs(&run) {
         return;
     }
-    let (_, document, request, behind) = run.cell;
+    let Cell {
+        behind,
+        document,
+        fits,
+        request,
+        ..
+    } = run.cell;
+    fits(&run);
     let workers: Arc<[Arc<dyn Worker>]> = (0..run.workers)
         .map(|at| ready_worker(&format!("http://worker-{at:04}:8000"), MODEL))
         .collect();
@@ -524,24 +664,39 @@ fn main() {
     // The one call a host makes for a request, where the run asks it.
     if place::asked(&run, &host) {
         let rule = ruled::stated(&run);
-        measure(&run, engine, upkeep, publish, converted, |_| {
+        measure(&run, &host, upkeep, publish, converted, |_| {
             place::one(&host, rule)
         });
         return;
     }
-    measure(&run, engine, upkeep, publish, converted, |seed| {
-        host.place(seed)
+    measure(&run, &host, upkeep, publish, converted, |seed| {
+        host.place(seed, None)
     });
 }
 
+/// What turns the engine's task behind its first step: a thread of its own,
+/// as a host's runtime does, or nothing (`--upkeep-thread 0`). A runtime
+/// that no thread takes is given back, and its caller keeps it to the run's
+/// end. Nothing reads a publication then, so such a run publishes once.
+fn turned(run: &Run, upkeep: Runtime) -> Option<Runtime> {
+    if run.upkeep_thread {
+        thread::spawn(move || upkeep.block_on(pending::<()>()));
+        return None;
+    }
+    assert_eq!(run.publish_ms, 0, "the task's thread reads a publication");
+    Some(upkeep)
+}
+
 /// The run's decisions, each made by `decide`, and the run's one line.
-/// `upkeep` is the runtime the task of `engine` was spawned on. `publish`
-/// publishes the reports again, as a new snapshot, and `converted` says how
-/// many times the cell's lists had their reports converted so far.
+/// `host` is the cell's host: `upkeep` is the runtime its engine's task was
+/// spawned on, and a cell whose callers make turns of their own asks it.
+/// `publish` publishes the reports again, as a new snapshot, and
+/// `converted` says how many times the cell's lists had their reports
+/// converted so far.
 fn measure(
     run: &Run,
-    engine: &PolicyEngine,
-    upkeep: tokio::runtime::Runtime,
+    host: &Host,
+    upkeep: Runtime,
     publish: impl Fn() + Sync,
     converted: impl Fn() -> u64,
     decide: impl Fn(u64) -> Option<u32> + Sync,
@@ -551,8 +706,8 @@ fn measure(
     // the engine's snapshot, each try a request of its own. A list converts
     // its reports once its requests have looked up as many as it holds, so
     // the tries follow the list's length. A thread of its own turns the
-    // runtime from then on.
-    let read = || !engine.spec().needs().loads || converted() > 0;
+    // runtime from then on, where the run has one (`turned`).
+    let read = || !host.engine.spec().needs().loads || converted() > 0;
     for probe in 0..1_000 + run.workers as u64 {
         if read() {
             break;
@@ -563,7 +718,7 @@ fn measure(
         black_box(decide(mix(probe)));
     }
     assert!(read(), "the engine's task keeps the reports at hand");
-    thread::spawn(move || upkeep.block_on(pending::<()>()));
+    let _upkeep = turned(run, upkeep);
     // The list's first requests, untimed: what they build once.
     for turn in 0..(run.workers as u64 * 8).max(4_096) {
         assert!(decide(mix(turn)).is_some(), "a worker takes it");
@@ -578,17 +733,14 @@ fn measure(
     let wall = thread::scope(|scope| {
         let one_caller = |caller: u64| {
             let seed = |turn: u64| mix(caller << 40 | turn);
-            for turn in 0..CALLER_WARM {
-                black_box(decide(seed(turn)));
-            }
-            start.wait();
-            let (allocated, started) = (calls(), Instant::now());
-            let mut took = 0;
-            for turn in CALLER_WARM..CALLER_WARM + run.decisions {
-                took += u64::from(black_box(decide(black_box(seed(turn)))).is_some());
-            }
-            busy_nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            allocations.fetch_add((calls() - allocated) as u64, Ordering::Relaxed);
+            // A cell whose callers make turns of their own times them
+            // itself; any other caller asks the run's `decide`.
+            let (took, nanos, allocated) = match run.cell.caller {
+                Some(turns) => turns(host, &start, run.decisions, caller),
+                None => stretch(&start, run.decisions, |turn| decide(black_box(seed(turn)))),
+            };
+            busy_nanos.fetch_add(nanos, Ordering::Relaxed);
+            allocations.fetch_add(allocated, Ordering::Relaxed);
             placed.fetch_add(took, Ordering::Relaxed);
             *left.lock() -= 1;
             end.notify_one();
@@ -617,7 +769,7 @@ fn measure(
     assert_eq!(placed.into_inner(), total, "a worker takes it");
     print!(
         "cell={} workers={} callers={} overloaded={} publish_ms={} publications={} conversions={} allocations_per_decision={:.4} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
-        run.cell.0,
+        run.cell.name,
         run.workers,
         run.callers,
         run.overloaded,
@@ -630,6 +782,7 @@ fn measure(
         total as f64 / wall.as_secs_f64(),
         busy_nanos.into_inner() as f64 / total as f64,
     );
-    // The words a file of its own adds, and the line's end.
-    println!("{}", place::word());
+    // The words a file of its own adds, then the cell's, and the line's end.
+    print!("{}", place::word());
+    println!("{}", (run.cell.words)());
 }

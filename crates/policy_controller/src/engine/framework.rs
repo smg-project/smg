@@ -4980,7 +4980,10 @@ impl Engine {
 
     /// What some decision of `phase` may read, over every binding that
     /// covers the phase: the host's answer to "does any regular placement
-    /// read the request text" and its kin, read at apply.
+    /// read the request text" and its kin, read at apply. A single decision
+    /// over a host's worker lists skips its list's affinity table on this
+    /// answer alone, so it never says less than [`Self::needs_for`] says of
+    /// a request of the phase.
     pub fn needs_for_phase(&self, phase: Phase) -> Needs {
         self.phase_needs[slot(phase)]
     }
