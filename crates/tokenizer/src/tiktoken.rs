@@ -2589,7 +2589,9 @@ mod tests {
         let dir = tekken::testing::dir_with(&file.to_string());
         let path = dir.path().join(tekken::FILE_NAME);
         let read = tekken::read(&path).unwrap();
-        assert!(NativeEncoder::from_ranks(&read.ranks, &read.pattern, &[]).is_ok());
+        let mut specials: Vec<_> = read.specials.into_iter().collect();
+        specials.sort();
+        assert!(NativeEncoder::from_ranks(&read.ranks, &read.pattern, &specials).is_ok());
         assert!(TiktokenTokenizer::from_tekken_file(&path).is_err());
     }
 
