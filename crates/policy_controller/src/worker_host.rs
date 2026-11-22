@@ -45,7 +45,9 @@
 //! adapter does: the registry's subscribers hear the change, and a
 //! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
-//! holder ([`RowRevision`]). No credential and no connector is a row's fact. A
+//! holder ([`RowRevision`]), with every fact of the row the object does not
+//! hold as stated: inside the crate the two together state the row
+//! (`Objects::row_of`). No credential and no connector is a row's fact. A
 //! host hands the holder its connector ([`Objects::with_connector`]). It
 //! keeps its workers' credentials in [`Credentials`] and hands the keeper
 //! to the holder ([`Objects::with_credentials`]). A credential is bound to
@@ -117,6 +119,7 @@ mod loads;
 mod membership_writer;
 mod object;
 mod objects;
+mod remainder;
 pub(crate) mod steps;
 
 pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
