@@ -97,6 +97,16 @@ fn asking(registry: &Arc<WorkerRegistry>, tokens: Vec<u32>) -> RequestContext {
     ctx
 }
 
+/// A first attempt whose prompt is `text`, with no token ids.
+fn asking_by_text(registry: &Arc<WorkerRegistry>, text: &str) -> RequestContext {
+    let mut ctx = prepared_ctx(Arc::clone(registry), None);
+    ctx.state.preparation = Some(PreparationOutput::Generate {
+        original_text: Some(text.to_owned()),
+        token_ids: Vec::new(),
+    });
+    ctx
+}
+
 /// The place in `workers` of the worker `stage` selects for a first attempt
 /// whose prompt is the token ids `tokens`.
 async fn placed_at(
@@ -105,7 +115,16 @@ async fn placed_at(
     workers: &[Arc<dyn Worker>],
     tokens: Vec<u32>,
 ) -> usize {
-    let mut ctx = asking(registry, tokens);
+    placed(stage, workers, asking(registry, tokens)).await
+}
+
+/// The place in `workers` of the worker `stage` selects for the attempt
+/// `ctx`.
+async fn placed(
+    stage: &WorkerSelectionStage,
+    workers: &[Arc<dyn Worker>],
+    mut ctx: RequestContext,
+) -> usize {
     stage.execute(&mut ctx).await.expect("a worker");
     let chosen = single(ctx.state.workers.as_ref());
     let at = workers
@@ -372,6 +391,43 @@ async fn a_conversations_next_turn_goes_back_to_its_worker() {
         let begins = 100_000_000 * other;
         let prompt: Vec<u32> = (begins..begins + 1_024).collect();
         others.push(placed_at(&stage, &registry, &workers, prompt).await);
+    }
+    assert!(others.iter().any(|&at| at != others[0]), "{others:?}");
+}
+
+/// A request with no token ids is held to its worker by its text. The stage
+/// states the text beside the ids on its ask, and the engine walks and
+/// writes its record of sent prefixes by the text, as the classic policy
+/// does where a request has no ids: an ask that stated the ids alone would
+/// read no record, and the turns would scatter. Other texts are not held to
+/// that worker.
+#[tokio::test]
+async fn a_conversation_with_no_token_ids_goes_back_to_its_worker() {
+    // A text of `bytes` bytes that differs from another speaker's within
+    // its first eight.
+    let said = |speaker: u32, bytes: usize| -> String {
+        let word = format!("{speaker:07}:");
+        word.chars().cycle().take(bytes).collect()
+    };
+    let registry = Arc::new(WorkerRegistry::new());
+    let workers: Vec<Arc<dyn Worker>> = (0..4)
+        .map(|at| {
+            let url = format!("grpc://worker-{at}:8000");
+            listed(&registry, &url, RuntimeType::Vllm, None, UNLABELED)
+        })
+        .collect();
+    let stage = own_stage_under("cache_aware", &registry, PolicyConfig::RoundRobin);
+    let mut conversation = said(0, 4_096);
+    let first = placed(&stage, &workers, asking_by_text(&registry, &conversation)).await;
+    for turn in 1..=16_u32 {
+        conversation.push_str(&said(turn, 256));
+        let next = placed(&stage, &workers, asking_by_text(&registry, &conversation)).await;
+        assert_eq!(next, first, "turn {turn}");
+    }
+    let mut others = Vec::new();
+    for other in 1..=16_u32 {
+        let prompt = said(1_000 * other, 4_096);
+        others.push(placed(&stage, &workers, asking_by_text(&registry, &prompt)).await);
     }
     assert!(others.iter().any(|&at| at != others[0]), "{others:?}");
 }
