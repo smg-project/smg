@@ -285,6 +285,20 @@ fn reason_index(why: MalformedReason) -> usize {
     }
 }
 
+/// Whether the reader hands a run of `why` over one event a piece of the stream, so that the
+/// next event of that reason goes on with it; every other reason is held whole, an event a run.
+fn streamed_a_piece_at_a_time(why: MalformedReason) -> bool {
+    match why {
+        MalformedReason::TextBetweenCalls
+        | MalformedReason::TextBetweenTags
+        | MalformedReason::TextInPlaceOfTheList
+        | MalformedReason::TextAfterTheArguments
+        | MalformedReason::TextAfterTheList => true,
+        // The crate's enum is open: a reason this build does not know counts an event a run.
+        _ => false,
+    }
+}
+
 /// The `reason` label of a malformed run.
 pub(crate) fn reason_label(why: MalformedReason) -> &'static str {
     REASONS[reason_index(why)]
@@ -352,7 +366,7 @@ pub(crate) struct FirstRun {
     pub why: &'static str,
     /// Where it starts in the output, in bytes.
     pub at: usize,
-    /// Its length in bytes: the event's own, and the bytes a syntax refused right after it.
+    /// Its length in bytes: its events' own, and the bytes a syntax refused with them.
     pub bytes: usize,
 }
 
@@ -378,7 +392,11 @@ pub(crate) struct Tally {
     reasons: Option<Box<[u32; REASONS.len()]>>,
     malformed_bytes: u64,
     first: Option<FirstRun>,
-    /// The event before the next is the first run's: refused bytes that follow it are its size.
+    /// The reason of the run the last event belongs to: where the reader hands a run over one
+    /// event a piece of the stream ([`streamed_a_piece_at_a_time`]), the next malformed event of
+    /// this reason is the same run.
+    run: Option<MalformedReason>,
+    /// That run is the first run: what follows of it is its size.
     announced: bool,
     /// The next call to start names a function the request did not declare: its `UnknownTool`
     /// event came right before it, and the first such call is the `unknown_tool` line's.
@@ -434,6 +452,7 @@ impl Tally {
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
         let announced = std::mem::take(&mut self.announced);
         let naming = std::mem::take(&mut self.naming);
+        let run = self.run.take();
         match event {
             Event::Content(text) | Event::Reasoning(text) => {
                 self.shown += text.text.len() as u64;
@@ -452,11 +471,27 @@ impl Tally {
                 self.shown += text.text.len() as u64;
                 self.markers_past_the_end += 1;
             }
+            // An event that goes on with the run before it (a word of an answer that came whole,
+            // a character of one that came by character) is that run, not a new one.
+            Event::Malformed { text, why }
+                if run == Some(*why) && streamed_a_piece_at_a_time(*why) =>
+            {
+                self.shown += text.text.len() as u64;
+                self.malformed_bytes += text.text.len() as u64;
+                self.run = run;
+                if announced {
+                    self.announced = true;
+                    if let Some(first) = &mut self.first {
+                        first.bytes += text.text.len();
+                    }
+                }
+            }
             Event::Malformed { text, why } => {
                 self.shown += text.text.len() as u64;
                 self.reasons
                     .get_or_insert_with(|| Box::new([0; REASONS.len()]))[reason_index(*why)] += 1;
                 self.malformed_bytes += text.text.len() as u64;
+                self.run = Some(*why);
                 // The event of no bytes before a call to a function the request did not declare:
                 // the call starts next, and the first such call is the `unknown_tool` line's. The
                 // malformed line's first run is one the table refused or kept as content, never
@@ -485,7 +520,10 @@ impl Tally {
                 why: DropReason::MalformedCall,
             } => {
                 self.malformed_bytes += text.text.len() as u64;
+                // A run goes on over the bytes it refuses.
+                self.run = run;
                 if announced {
+                    self.announced = true;
                     if let Some(first) = &mut self.first {
                         first.bytes += text.text.len();
                     }
@@ -572,6 +610,7 @@ impl Tally {
         // did not see as such: an announced run is never a call's events.
         self.announced = false;
         self.naming = false;
+        self.run = None;
         self.at += bytes_of(event);
     }
 
@@ -1230,7 +1269,9 @@ impl Sampler {
 mod tests {
     use serde_json::Value;
     use smg_external_router::metrics::handles::force_on_this_thread;
-    use symphony::{DropReason, FinishReason, Text};
+    use symphony::{
+        Declared, DropReason, Engine, EngineFinish, Events, FinishReason, Input, Parser, Text,
+    };
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{
@@ -1315,6 +1356,86 @@ mod tests {
     }
 
     #[test]
+    fn a_run_counts_once_however_the_stream_cut_the_output() {
+        // One output a reason that arrives in pieces, each through its own table: a run of free
+        // text is an event a word when it comes whole, an event a character by character.
+        let tally_of = |table: &str, prompt: &str, pieces: &[&str]| {
+            let table = Table::named(table).expect("a table of that name");
+            let mut engine = Engine::new(table.format(), Declared::default());
+            let mut tally = Tally::default();
+            let prompt = Input::Prompt {
+                token_ids: &[],
+                text: prompt,
+            };
+            let deltas = pieces.iter().copied().map(|text| Input::Delta {
+                token_ids: &[],
+                text,
+                spans: &[],
+            });
+            let end = Input::End {
+                finish: EngineFinish::Stop,
+            };
+            for input in std::iter::once(prompt).chain(deltas).chain([end]) {
+                let mut events = Events::new();
+                engine.feed(input, &mut events).expect("the reader");
+                for event in events.drain() {
+                    tally.see(&event, false);
+                }
+            }
+            tally
+        };
+        for (table, prompt, output, runs, reasons) in [
+            (
+                "qwen3_tagged",
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                "<tool_call>\n{\"name\": \"check\", \"arguments\": {\"n\": 97}}\n</tool_call>",
+                2,
+                "text_between_tags,call_without_function_tag",
+            ),
+            (
+                "deepseek_v4.1",
+                "",
+                "<｜DSML｜ calls>\nFirst the number.\n</｜DSML｜ calls>",
+                1,
+                "text_between_calls",
+            ),
+            (
+                "command",
+                "",
+                "<|START_ACTION|>check the number 97<|END_ACTION|>",
+                1,
+                "text_in_place_of_the_list",
+            ),
+            (
+                "function_gemma",
+                "",
+                "<start_function_call>call:check{n:97} is the call<end_function_call>",
+                1,
+                "text_after_the_arguments",
+            ),
+            (
+                "mistral",
+                "",
+                "[TOOL_CALLS] [{\"name\": \"check\", \"arguments\": {\"n\": 97}}] is the list",
+                1,
+                "text_after_the_list",
+            ),
+        ] {
+            let whole = tally_of(table, prompt, &[output]);
+            let characters: Vec<&str> = output.split_inclusive(|_: char| true).collect();
+            let cut = tally_of(table, prompt, &characters);
+            assert_eq!(
+                (whole.malformed(), cut.malformed()),
+                (runs, runs),
+                "{table}"
+            );
+            assert_eq!(whole.reasons_seen(), reasons, "{table}");
+            assert_eq!(cut.reasons, whole.reasons, "{table}");
+            assert_eq!(cut.first, whole.first, "{table}");
+        }
+    }
+
+    #[test]
     fn refused_bytes_size_the_run_that_announced_them() {
         // The refuse order: the event of no bytes, then the bytes it refuses; a second refused
         // run's bytes count, but are not the first run's.
@@ -1389,7 +1510,6 @@ mod tests {
         // Through the keyed table itself: a call whose key tag never opened. The assembler refuses
         // the tags and the value behind events of no bytes; the tally counts the runs and sizes
         // them by the refused bytes, the first by the bytes right after it.
-        use symphony::{Declared, Engine, EngineFinish, Events, Input, Parser};
         let output =
             "</think>At once:<tool_call>f</arg_key><arg_value>1975</arg_value></tool_call>";
         let mut engine = Engine::new(Table::Glm.format(), Declared::default());
@@ -1512,7 +1632,6 @@ mod tests {
         // marker the model wrote inside its thought. The markers are framing, the thoughts are
         // reasoning, the JSON is the content, and the tally sees no malformed run: the output
         // counts as clean, under no reason.
-        use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
         let json = "{\"city\": \"Oslo\"}";
         for output in [
             format!(
