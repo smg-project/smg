@@ -39,7 +39,6 @@ use openai_protocol::{
     common::{Function, Tool},
     model_card::ModelCard,
 };
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
 use smg::{
     app_context::AppContext,
@@ -63,7 +62,6 @@ use smg_worker::{
 };
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
-use tool_parser::ParserFactory as ToolParserFactory;
 
 /// Test context for directly testing mock workers without full router setup.
 pub struct WorkerTestContext {
@@ -457,8 +455,9 @@ impl AppTestContext {
 /// family below: registries, storage backends, worker monitor, job queue,
 /// workflow engines, OpenAI-mode external worker registration, and MCP
 /// orchestrator startup are identical across all of them. Only the
-/// tokenizer registry, parser factories, rate-limit manager, and MCP config
-/// vary by caller, so those are the only parameters.
+/// tokenizer registry, whether the legacy parser factories are built, the
+/// rate-limit manager, and MCP config vary by caller, so those are the only
+/// parameters.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -467,8 +466,7 @@ impl AppTestContext {
 async fn build_test_app_context(
     config: RouterConfig,
     tokenizer_registry: Arc<TokenizerRegistry>,
-    reasoning_parser_factory: Option<ReasoningParserFactory>,
-    tool_parser_factory: Option<ToolParserFactory>,
+    legacy_parsers: bool,
     rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
     mcp_config: smg_mcp::McpConfig,
     storages: Option<StorageBundle>,
@@ -547,8 +545,10 @@ async fn build_test_app_context(
             .rate_limiter(rate_limiter)
             .rate_limit_manager(rate_limit_manager)
             .tokenizer_registry(tokenizer_registry)
-            .reasoning_parser_factory(reasoning_parser_factory)
-            .tool_parser_factory(tool_parser_factory)
+            // `Default` builds each factory: naming its type would make this
+            // crate depend on the legacy parser crates.
+            .reasoning_parser_factory(legacy_parsers.then(Default::default))
+            .tool_parser_factory(legacy_parsers.then(Default::default))
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)
@@ -679,8 +679,7 @@ pub fn create_test_context_with_rate_limiter(
         build_test_app_context(
             config,
             tokenizer_registry,
-            Some(ReasoningParserFactory::new()),
-            Some(ToolParserFactory::new()),
+            true,
             rate_limit_manager,
             empty_mcp_config(),
             None,
@@ -752,8 +751,7 @@ pub fn create_test_context_with_storages(
         build_test_app_context(
             config,
             tokenizer_registry,
-            Some(ReasoningParserFactory::new()),
-            Some(ToolParserFactory::new()),
+            true,
             tenant_rate_limit_manager,
             empty_mcp_config(),
             Some(storages),
@@ -769,8 +767,7 @@ pub fn create_test_context_with_parsers(
     Box::pin(build_test_app_context(
         config,
         Arc::new(TokenizerRegistry::new()),
-        Some(ReasoningParserFactory::new()),
-        Some(ToolParserFactory::new()),
+        true,
         None,
         empty_mcp_config(),
         None,
@@ -794,8 +791,7 @@ pub fn create_test_context_with_mcp_config(
         build_test_app_context(
             config,
             Arc::new(TokenizerRegistry::new()),
-            None,
-            None,
+            false,
             None,
             mcp_config,
             None,
