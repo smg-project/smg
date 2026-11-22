@@ -560,6 +560,8 @@ impl ViewFacts {
             reach: self.reach,
             reported: self.unreported == 0,
             engines: Engines::default(),
+            // The store keeps no word a list: its rotations go by name.
+            word: None,
         }
     }
 }

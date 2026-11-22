@@ -7,6 +7,8 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
+use std::sync::atomic::AtomicU64;
+
 use super::demands::DemandFacts;
 use crate::{load::signals, tracking::in_flight};
 
@@ -1513,6 +1515,16 @@ pub struct PoolFacts<'a> {
     /// candidates are then the rows the list's positions name. Empty by
     /// default, and every decision then reads rows alone.
     pub engines: Engines<'a>,
+    /// The pool's own word, where the host keeps one beside the list of
+    /// workers the candidates are and lends it to the decision: the word a
+    /// pick over that list alone counts its turns in
+    /// ([`PoolWord::word`](crate::engine::PoolWord::word)). A picker that
+    /// takes turns counts a draw's turn in it too, and looks no rotation up
+    /// by the pool's name. Every request over one list then turns one
+    /// rotation, and two lists turn two, whatever else they share. `None`:
+    /// such a picker finds its rotation by the pool's name, with
+    /// [`Self::reach`] in it. In-process only.
+    pub word: Option<&'a AtomicU64>,
 }
 
 #[cfg(test)]

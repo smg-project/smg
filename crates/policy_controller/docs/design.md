@@ -827,7 +827,7 @@ the decode side adds `has-room`.
 |---|---|---|---|
 | `random` | none | `random` | nothing: it draws from the decision's seed |
 | `passthrough` | none | `passthrough` | nothing: the first survivor |
-| `round_robin` | none | `round-robin` | one counter for each worker list; for the full pass, one rotation for each set of surviving workers, in a fixed table |
+| `round_robin` | none | `round-robin` | one counter for each worker list, which the one pick and a single request's draw over 16 workers or more both turn; in a fixed table, one rotation for each set of surviving workers and one for each pool whose draw is handed no list counter |
 | `power_of_two` | `least-load` | `power-of-two` | what was dispatched to each worker since its last load report |
 | `least_load` | `least-load` | `best` | the same |
 | `consistent_hashing` | `consistent-hash` | `best` | one hash ring, of the workers its decisions have read |
