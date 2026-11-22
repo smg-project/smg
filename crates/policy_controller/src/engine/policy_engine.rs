@@ -81,7 +81,7 @@ use crate::{
     policies::consistent_hashing::PoolRing,
     stages::Lifecycle,
     store::{pairing::Refusal, GatewayId},
-    tracking::lease::{EventKind, EventSet, Said, Side},
+    tracking::lease::{EventKind, EventSet, Membership, Said, Side},
 };
 
 /// The engine of one policy document, for a gateway that decides in its own
@@ -100,7 +100,8 @@ pub struct PolicyEngine {
     clock: DecisionClock,
     /// How many whole decisions panicked ([`DecisionEngine::faults`]).
     faults: AtomicU64,
-    /// How many words of a lease panicked in a stage that heard them.
+    /// How many words of a lease and changes of membership panicked in a
+    /// stage that heard them.
     unheard: AtomicU64,
     /// The id of the last lease issued. A pick that is issued one writes
     /// it: one atomic step, on cache lines of its own.
@@ -280,12 +281,49 @@ impl PolicyEngine {
 
     /// The worker at `address` left its pool or was replaced: the records
     /// of sent prefixes forget it, so no later request is named a worker
-    /// that is gone. The gateway says it where it tells its classic
-    /// policies. A worker no record holds costs one lookup a model.
+    /// that is gone, and the document's stages are told
+    /// ([`Membership::Removed`]) under the id every decision knew the
+    /// worker by. A stage that keeps a range, a count or a credit of the
+    /// worker drops it. The session table is not told: a session's pin
+    /// stands on a worker that is gone, however long, and is a routable pin
+    /// again once the worker is back. A host says it at a removal, where it
+    /// tells its classic policies.
+    ///
+    /// In the records a worker none of them holds costs one lookup a model.
+    /// Every stage is told whatever the records hold, and one that keeps a
+    /// state of workers takes its lock or copies its table for it: the call
+    /// belongs at a change of membership, off a request's path.
+    ///
+    /// A worker and the one that replaces it at one address share one id.
+    /// A host that replaces a worker says this first and [`Self::joined`]
+    /// behind it: said the other way round, the worker that serves is left
+    /// told gone.
     pub fn forget(&self, address: &str) {
-        // The id every decision knew the worker by ([`records::worker_id`]).
-        self.affinity
-            .forget(WorkerId(fingerprint(address.as_bytes())));
+        let id = WorkerId(fingerprint(address.as_bytes()));
+        self.affinity.forget(id);
+        self.told(&Membership::Removed(id));
+    }
+
+    /// The worker at `address` joined: the document's stages are told
+    /// ([`Membership::Added`]) under the id every decision names the worker
+    /// by. A stage that keeps a pruned worker out for a while lists a
+    /// worker back at the address it left at once. A host says it at a
+    /// registration, where it tells its classic policies.
+    pub fn joined(&self, address: &str) {
+        let id = WorkerId(fingerprint(address.as_bytes()));
+        self.told(&Membership::Added(id));
+    }
+
+    /// Tells the document's stages one change of membership, on the calling
+    /// thread, and not the session table. A stage that panics at it is held
+    /// here and counted ([`Self::unheard`]): the registration or the removal
+    /// goes on.
+    fn told(&self, change: &Membership<'_>) {
+        let engine = self.spec.engine();
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| engine.membership_stages(change))) {
+            release(payload);
+            self.unheard.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The clock of the engine's decisions. A caller that makes a list's
@@ -295,10 +333,11 @@ impl PolicyEngine {
         &self.clock
     }
 
-    /// How many words of a lease (its dispatch, its end, its release)
-    /// panicked in a stage that heard them. The word stands as said: the
-    /// request it is of goes on, and the stages after the one that
-    /// panicked did not hear it.
+    /// How many words of a lease (its dispatch, its end, its release) and
+    /// changes of membership panicked in a stage that heard them. The word
+    /// stands as said: the request, the registration or the removal it is
+    /// of goes on, and the stages after the one that panicked did not hear
+    /// it.
     #[must_use]
     pub fn unheard(&self) -> u64 {
         self.unheard.load(Ordering::Relaxed)

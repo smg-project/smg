@@ -6970,6 +6970,25 @@ impl Engine {
             }
         }
     }
+
+    /// The stages' part of a change of membership
+    /// ([`Lifecycle::on_membership`]): the tallies of sends and each
+    /// profile's scorers and its picker hear it, and the session table does
+    /// not. The engine over a host's worker lists tells this part alone. It
+    /// names a worker by its address, so a session's pin stands on a worker
+    /// that is gone, however long, and is a routable pin again once the
+    /// worker is back.
+    pub(crate) fn membership_stages(&self, change: &Membership<'_>) {
+        for credit in &self.sent_credits {
+            credit.membership(change);
+        }
+        for profile in &self.profiles {
+            for w in &profile.scorers {
+                w.scorer.on_membership(change);
+            }
+            profile.picker.on_membership(change);
+        }
+    }
 }
 
 impl Lifecycle for Engine {
@@ -7030,15 +7049,7 @@ impl Lifecycle for Engine {
             Membership::Snapshot(workers) => self.sessions.returned_all(workers),
             _ => {}
         }
-        for credit in &self.sent_credits {
-            credit.membership(change);
-        }
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_membership(change);
-            }
-            profile.picker.on_membership(change);
-        }
+        self.membership_stages(change);
     }
 
     fn on_signal(&self, signal: &Signal) {
