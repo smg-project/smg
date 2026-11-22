@@ -523,10 +523,24 @@ fn a_workers_handles_are_not_shared_with_another_worker_at_its_address() {
     }
 }
 
-/// The registry's registration and removal hooks are what move the
-/// worker-set generation the kept counters are checked against.
+/// The registry's hooks are what move the worker-set generation the kept
+/// counters are checked against: a removal, and the registration the store
+/// reports a kept no-op handle to. A first registration is not one.
 #[test]
-fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
+fn a_removal_or_the_registration_after_it_drops_the_kept_worker_counters() {
+    let store = WorkerSeries::with_exporter_quantiles();
+    assert!(!store.activate("http://first"), "a first registration");
+    store.retire("http://w", gone("http://w"));
+    assert!(store.activate("http://w"), "the end of a retirement");
+    store.retire("http://w", gone("http://w"));
+    store.run_upkeep();
+    assert!(store.activate("http://first"), "the upkeep forgot one");
+    assert!(!store.activate("http://first"), "the registration after it");
+
+    // The hooks, on the process's store. The witness is held, so no other
+    // test's upkeep forgets the address before it registers again.
+    series::installed_or_default();
+    let (_removed, witness) = held("http://gone");
     let worker = WorkerHandles::new("http://w");
     let keeps = || {
         handles::Kept::current(&worker.kept)
@@ -537,13 +551,13 @@ fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
     let _ = handles::Kept::current(&worker.kept)
         .requests
         .set(metrics::Counter::noop());
-    Metrics::remove_worker_metrics("http://gone", gone("http://gone"));
+    Metrics::remove_worker_metrics("http://gone", witness);
     assert!(!keeps(), "a removal");
     let _ = handles::Kept::current(&worker.kept)
         .requests
         .set(metrics::Counter::noop());
-    Metrics::worker_registered("http://new");
-    assert!(!keeps(), "a registration");
+    Metrics::worker_registered("http://gone");
+    assert!(!keeps(), "the registration after it");
 }
 
 /// The breaker's outcome counter is a per-worker series: through kept
