@@ -1,13 +1,13 @@
 //! A worker's load: its requests in flight, the monitor that polls the
 //! workers and takes their pushed records, the port between it and the sink
 //! of what a load means for routing, the load snapshots it publishes,
-//! the loan of a snapshot to a decision, the fleet's capacity, and the
+//! their per-thread reader for a decision, the fleet's capacity, and the
 //! merge of the metrics scraped from the workers into one exposition.
 
 pub mod capacity;
 pub mod inflight;
-pub mod lend;
 pub mod metrics_aggregator;
 pub mod monitor;
 pub mod port;
+pub mod snapshot_reader;
 pub mod state;

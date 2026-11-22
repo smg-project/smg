@@ -25,8 +25,8 @@
 //! monitor publishes a fresh `Arc` at each change and never needs to be a
 //! snapshot's only holder, so a thread's keep slows no publication.
 //!
-//! **A loan stays on its thread** ([`Lent`]): it is taken out of the
-//! thread's keep and put back at its drop, so no reference count moves.
+//! **A loan stays on its thread** ([`LoadSnapshotLoan`]): it is taken out of
+//! the thread's keep and put back at its drop, so no reference count moves.
 
 use std::{
     cell::Cell,
@@ -41,7 +41,7 @@ use crate::load::state::{LoadReceiver, LoadSnapshot};
 /// ([`Self::read`]): an ask is then lent no snapshot, and its records
 /// carry no report.
 #[derive(Debug, Default)]
-pub struct Loads {
+pub struct LoadSnapshotReader {
     feed: OnceLock<LoadReceiver>,
 }
 
@@ -53,11 +53,11 @@ struct Seen {
 
 thread_local! {
     /// What this thread last saw of the feed it last read. An ask takes it
-    /// out for as long as it decides ([`Lent`]) and puts it back.
+    /// out for as long as it decides ([`LoadSnapshotLoan`]) and puts it back.
     static SEEN: Cell<Option<Seen>> = const { Cell::new(None) };
 }
 
-impl Loads {
+impl LoadSnapshotReader {
     /// Reads `feed` from here on: the monitor's channel, handed once, at
     /// the host's start. A second hand-over is ignored.
     pub fn read(&self, feed: LoadReceiver) {
@@ -82,9 +82,9 @@ impl Loads {
     /// current snapshot all the same, and nothing panics (the case
     /// `an_ask_made_while_a_loan_stands_reads_the_channel_itself`).
     #[inline]
-    pub fn lend(&self) -> Lent {
+    pub fn lend(&self) -> LoadSnapshotLoan {
         let Some(feed) = self.feed.get() else {
-            return Lent(None, PhantomData);
+            return LoadSnapshotLoan(None, PhantomData);
         };
         // The thread's own receiver of this feed, or its first read of it.
         let mine = SEEN.take().filter(|seen| seen.receiver.same_channel(feed));
@@ -97,7 +97,7 @@ impl Loads {
         if seen.receiver.has_changed().unwrap_or(false) {
             seen.snapshot = Arc::clone(&seen.receiver.borrow_and_update());
         }
-        Lent(Some(seen), PhantomData)
+        LoadSnapshotLoan(Some(seen), PhantomData)
     }
 }
 
@@ -107,7 +107,7 @@ impl Loads {
 /// It cannot leave its thread. A loan that crossed to another thread would
 /// be put back into that thread's keep, whose receiver would then answer
 /// "seen" for a snapshot it never read.
-pub struct Lent(Option<Seen>, PhantomData<*const ()>);
+pub struct LoadSnapshotLoan(Option<Seen>, PhantomData<*const ()>);
 
 // A loan is not `Send`, held at compile time: were it `Send`, both of the
 // two blanket answers below would fit and the line would not compile.
@@ -117,10 +117,10 @@ const _: fn() = || {
     }
     impl<T: ?Sized> StaysOnItsThread<()> for T {}
     impl<T: ?Sized + Send> StaysOnItsThread<u8> for T {}
-    let _ = <Lent as StaysOnItsThread<_>>::held;
+    let _ = <LoadSnapshotLoan as StaysOnItsThread<_>>::held;
 };
 
-impl Lent {
+impl LoadSnapshotLoan {
     /// The snapshot, as the monitor published it. `None` where no feed was
     /// handed.
     #[inline]
@@ -129,7 +129,7 @@ impl Lent {
     }
 }
 
-impl Drop for Lent {
+impl Drop for LoadSnapshotLoan {
     #[inline]
     fn drop(&mut self) {
         if let Some(seen) = self.0.take() {
@@ -146,7 +146,7 @@ mod tests {
     use crate::load::state::{one_rank_load, TestFeed};
 
     /// A feed `loads` reads from here on, where it reads none yet.
-    fn fed(loads: &Loads) -> TestFeed {
+    fn fed(loads: &LoadSnapshotReader) -> TestFeed {
         TestFeed::attached_to(|receiver| loads.read(receiver.expect("the feed's receiver")))
     }
 
@@ -162,7 +162,7 @@ mod tests {
     /// first one's place.
     #[test]
     fn an_ask_is_lent_the_snapshot_last_published() {
-        let loads = Loads::default();
+        let loads = LoadSnapshotReader::default();
         assert!(loads.lend().snapshot().is_none(), "no feed is read yet");
         let feed = fed(&loads);
         publish(&feed, "http://worker-0:8000");
@@ -187,7 +187,7 @@ mod tests {
     /// is lent its own feed's snapshot.
     #[test]
     fn a_thread_that_reads_two_feeds_is_lent_each_ones_own() {
-        let (one, other) = (Loads::default(), Loads::default());
+        let (one, other) = (LoadSnapshotReader::default(), LoadSnapshotReader::default());
         let (feed_one, feed_other) = (fed(&one), fed(&other));
         publish(&feed_one, "http://one:8000");
         publish(&feed_other, "http://other:8000");
@@ -206,7 +206,7 @@ mod tests {
     /// lent it.
     #[test]
     fn a_feed_whose_monitor_is_gone_lends_its_last_snapshot() {
-        let loads = Loads::default();
+        let loads = LoadSnapshotReader::default();
         let feed = fed(&loads);
         publish(&feed, "http://worker-0:8000");
         let first = Arc::clone(loads.lend().snapshot().expect("a snapshot"));
@@ -221,7 +221,7 @@ mod tests {
     /// ask is lent the snapshot again.
     #[test]
     fn an_ask_made_while_a_loan_stands_reads_the_channel_itself() {
-        let loads = Loads::default();
+        let loads = LoadSnapshotReader::default();
         let feed = fed(&loads);
         publish(&feed, "http://worker-0:8000");
         let outer = loads.lend();
@@ -245,7 +245,7 @@ mod tests {
     /// the ask that holds one keeps the snapshot it was lent to its end.
     #[test]
     fn a_loan_stands_while_its_ask_decides() {
-        let loads = Loads::default();
+        let loads = LoadSnapshotReader::default();
         let feed = fed(&loads);
         publish(&feed, "http://worker-0:8000");
         let lent = loads.lend();

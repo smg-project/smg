@@ -69,7 +69,7 @@ use smg_policy_controller::{
 use smg_worker::{
     identity::basic::{Worker, WorkerLoadGuard, WorkerType},
     load::{
-        lend as loads,
+        snapshot_reader::LoadSnapshotReader,
         state::{LoadReceiver, LoadSnapshot},
     },
 };
@@ -346,7 +346,7 @@ struct Made<'r, 'a> {
     /// decides it: the policy engine's value of the ask's pool.
     members: Option<&'r PoolMembers>,
     /// The load monitor's snapshot for this ask, where the engine of this
-    /// process reads load reports: lent once an ask ([`loads::Loads`]).
+    /// process reads load reports: lent once an ask ([`LoadSnapshotReader`]).
     loads: Option<&'r Arc<LoadSnapshot>>,
     /// Where the key of the last making came from, under the label the
     /// gateway counts it by. The door may make the request a second time,
@@ -716,7 +716,7 @@ pub(crate) struct PolicyEngine {
     /// The load monitor's feed, where the engine of this process decides
     /// under a document that reads load reports
     /// ([`Self::read_loads`]).
-    loads: loads::Loads,
+    loads: LoadSnapshotReader,
     /// The memberships whose hash rings stand, where the engine of this
     /// process places by a ring.
     standing: Standing,
@@ -790,7 +790,7 @@ impl PolicyEngine {
         Self {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::Held(objects),
-            loads: loads::Loads::default(),
+            loads: LoadSnapshotReader::default(),
             standing: Standing::new(false),
         }
     }
@@ -803,7 +803,7 @@ impl PolicyEngine {
         Self {
             door: Arc::new(Decider::Own(engine)),
             workers: Workers::Listed(registry),
-            loads: loads::Loads::default(),
+            loads: LoadSnapshotReader::default(),
             standing: Standing::new(rings),
         }
     }
@@ -958,7 +958,7 @@ impl PolicyEngine {
         Self {
             door: Arc::new(Decider::Followed(StoreBackedEngine::new(store))),
             workers: Workers::AtKey(registry),
-            loads: loads::Loads::default(),
+            loads: LoadSnapshotReader::default(),
             standing: Standing::new(false),
         }
     }
