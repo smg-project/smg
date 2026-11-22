@@ -3739,6 +3739,10 @@ struct FiledDecode {
     /// How many calls issued the side. An undo names the count it issued
     /// under, so it undoes its own issue alone.
     issues: u8,
+    /// The index of the pick's target the prefill's dispatch took: 0, the
+    /// pick's first, until that dispatch names another target the side's
+    /// pick holds ([`Self::taken_decode`]).
+    taken: u8,
 }
 
 /// One issue of a chosen decode side, for a caller that may undo it
@@ -3768,7 +3772,17 @@ impl FiledDecode {
             booked,
             filed_chosen,
             issues: 0,
+            taken: 0,
         }
+    }
+
+    /// The decode, with its rank, of the target the prefill's dispatch
+    /// took ([`Self::taken`]): the one a decode decided again behind that
+    /// prefill starts from. Every target of a pair's pick names the one
+    /// prefill, so the index its dispatch names says which decode its
+    /// host took.
+    fn taken_decode(&self) -> Option<(WorkerId, u16)> {
+        self.side.target_at(self.taken)
     }
 }
 
@@ -4319,6 +4333,12 @@ impl Leases {
         match dispatch.side {
             Side::Prefill if held.record.state.is_issued() => {
                 held.record.state = LeaseState::Dispatched { at };
+                // The target the prefill went to stays with the decode
+                // side, for a decode decided again behind it. An index
+                // the pick holds no target at moves nothing.
+                if decode.side.target_at(dispatch.target_index).is_some() {
+                    decode.taken = dispatch.target_index;
+                }
             }
             Side::Decode if decode.side.state.is_issued() => {
                 let side = &mut decode.side;
@@ -4764,9 +4784,10 @@ impl MemoryStore {
     /// The pair of the lease a decode call names, where the lease still
     /// takes a decode side: its prefill is dispatched and held and its
     /// decode side is chosen. The prefill's worker comes first, then the
-    /// worker and the rank of the decode the lease's first decision chose.
-    /// The call reads this before it decides, and its issue tests the same
-    /// again under its own turn.
+    /// worker and the rank of the decode the lease's first decision chose
+    /// for the target the prefill's dispatch took: the pick's first
+    /// target, or the one that dispatch named. The call reads this before
+    /// it decides, and its issue tests the same again under its own turn.
     pub(crate) fn held_pair(
         &self,
         gateway: GatewayId,
@@ -4774,10 +4795,7 @@ impl MemoryStore {
     ) -> Result<(WorkerId, Option<(WorkerId, u16)>), DecodeRefused> {
         self.turn_of(self.file_of(lease))
             .chosen_decode(&(gateway, lease))
-            .map(|(held, decode)| {
-                let chosen = decode.side.target_at(decode.side.target_index);
-                (held.record.target, chosen)
-            })
+            .map(|(held, decode)| (held.record.target, decode.taken_decode()))
     }
 
     /// The one issue behind the doors: a single's lease with no `pair`,
