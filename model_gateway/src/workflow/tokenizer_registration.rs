@@ -563,7 +563,16 @@ async fn fetch_tokenizer_from_worker(
         ));
     }
 
-    let mut failures = Vec::new();
+    // A failed job keeps this error, so it names the first failure alone: a
+    // fleet that cannot serve the tokenizer would name every worker in each.
+    let mut first_failure: Option<String> = None;
+    let mut keep_first = |failure: String| {
+        if first_failure.is_none() {
+            first_failure = Some(failure);
+        } else {
+            debug!("Tokenizer fetch for model '{model_id}' failed on a further worker: {failure}");
+        }
+    };
     let worker_count = workers.len();
 
     for worker in workers {
@@ -577,7 +586,7 @@ async fn fetch_tokenizer_from_worker(
         let bundle = match fetch_bundle(worker.as_ref()).await {
             Ok(bundle) => bundle,
             Err(failure) => {
-                failures.push(failure);
+                keep_first(failure);
                 continue;
             }
         };
@@ -590,16 +599,16 @@ async fn fetch_tokenizer_from_worker(
             chat_template_path,
         ) {
             Ok(tokenizer) => return Ok(tokenizer),
-            Err(e) => failures.push(format!(
+            Err(e) => keep_first(format!(
                 "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
                 worker.redacted_url(),
             )),
         };
     }
 
-    let failures_summary = failures.join("; ");
+    let first_failure = first_failure.unwrap_or_default();
     Err(format!(
-        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} ready or pending gRPC worker(s): {failures_summary}"
+        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} ready or pending gRPC worker(s), first failure: {first_failure}"
     ))
 }
 
@@ -1193,5 +1202,42 @@ mod tests {
         assert!(app_context.tokenizer_registry.get_by_name("m").is_none());
         assert_eq!(app_context.tokenizer_registry.len(), 0);
         assert!(!app_context.worker_loaded_tokenizers.contains("t1"));
+    }
+
+    /// A failed job keeps the fetch error: it names the first failure, not
+    /// one for every worker asked.
+    #[tokio::test]
+    async fn a_failed_fetch_names_its_first_failure_alone() {
+        let workers = WorkerRegistry::new();
+        let urls = [
+            "grpc://127.0.0.1:9",
+            "grpc://127.0.0.1:11",
+            "grpc://127.0.0.1:13",
+        ];
+        for url in urls {
+            workers
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .model(ModelCard::new("m"))
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .expect("register worker");
+        }
+        let error = fetch_tokenizer_from_worker(&app_context(workers), "t", "m", None)
+            .await
+            .err()
+            .expect("no worker serves a tokenizer");
+        assert!(
+            error.contains("from 3 ready or pending gRPC worker(s), first failure: "),
+            "{error}"
+        );
+        let named = urls
+            .iter()
+            .filter(|url| error.contains(&format!("{url} (runtime")))
+            .count();
+        assert_eq!(named, 1, "{error}");
     }
 }
