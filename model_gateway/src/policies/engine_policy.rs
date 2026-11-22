@@ -120,14 +120,14 @@ impl LoadBalancingPolicy for EnginePolicy {
 /// This type goes with the registry's classic build for such a place, once
 /// no policy's classic object has a reader left there.
 #[derive(Debug)]
-pub struct DecidedByEngine {
+pub(crate) struct DecidedByEngine {
     name: &'static str,
     asked: AtomicBool,
 }
 
 impl DecidedByEngine {
     /// The object for the place of the classic policy `name`.
-    pub fn of(name: &'static str) -> Self {
+    pub(crate) fn of(name: &'static str) -> Self {
         Self {
             name,
             asked: AtomicBool::new(false),
@@ -901,7 +901,12 @@ mod tests {
                 "Policy `manual` of every model (single requests): the policy engine decides it \
                  by its whole pass (the profile `manual`); no classic policy is built",
             );
-            let asked = said("Policy `manual`: a route asked the classic policy for a worker");
+            // The ask is an error's line, once.
+            let asked = lines
+                .iter()
+                .filter(|line| line.contains("ERROR"))
+                .filter(|line| line.contains("Policy `manual`: a route asked the classic policy"))
+                .count();
             match (not_built, asked) {
                 (1, 1) => Ok(()),
                 counts => Err(format!("{counts:?} lines")),

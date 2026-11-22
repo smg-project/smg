@@ -83,20 +83,23 @@ impl Side {
     }
 }
 
-/// The policies whose classic object nothing reads where the routers ask
-/// the engine for every request of the document. Under such a document the
-/// registry builds none of them: it holds the policy's name alone
-/// ([`DecidedByEngine`]).
+/// Whether nothing reads the classic object of `config`'s policy where the
+/// routers ask the engine for every request of the document. Under such a
+/// document the registry builds no such object: it holds the policy's name
+/// alone ([`DecidedByEngine`]).
 ///
-/// A policy joins once its last reader there is gone: no placement asks
-/// it, no route reads its type, and nothing needs the state it keeps or
-/// the task it starts. When every policy has joined, this list goes with
-/// the classic build of that arm ([`PolicyRegistry::policy_at`]).
+/// A policy joins the match once its last reader there is gone: no
+/// placement asks it, no route reads its type, and nothing needs the state
+/// it keeps or the task it starts. When every policy has joined, this
+/// question goes with the classic build of that arm
+/// ([`PolicyRegistry::policy_at`]).
 ///
 /// `manual`: the keys' pins are the engine's session table and its pass
 /// drops the idle ones, in the place of the policy's own map and its
 /// eviction task.
-const NO_CLASSIC_OBJECT: [&str; 1] = ["manual"];
+const fn no_classic_object(config: &PolicyConfig) -> bool {
+    matches!(config, PolicyConfig::Manual { .. })
+}
 
 /// The policy engine a registry's policies ask, with its document's origin.
 #[derive(Clone, Debug)]
@@ -363,7 +366,8 @@ impl PolicyRegistry {
     /// ask the engine for each request's whole decision under the document:
     /// the start log's line for a policy the engine does not pick by itself
     /// says who decides it by that, and the classic object of a policy
-    /// nothing reads there is not built ([`DecidedByEngine`]).
+    /// nothing reads there is not built: the registry then holds the
+    /// policy's name alone.
     pub fn with_policy_engine(
         default_policy_config: PolicyConfig,
         routing_key_override: RoutingKeyOverrideConfig,
@@ -1145,7 +1149,7 @@ impl PolicyRegistry {
     /// pick by itself says the engine decides it by its whole pass: the
     /// classic policy is built all the same, for a route with no arm to
     /// the engine, but for a policy nothing reads there
-    /// ([`NO_CLASSIC_OBJECT`]), of which the registry holds the name alone.
+    /// ([`no_classic_object`]), of which the registry holds the name alone.
     fn policy_at(
         asked: Option<&AskedEngine>,
         config: &PolicyConfig,
@@ -1160,7 +1164,7 @@ impl PolicyRegistry {
         match asked.engine.place(model, phase) {
             Place::Alone(profile) => Self::engine_object(asked, profile, name, &place),
             Place::NotAlone { profile, stage } => {
-                if asked.whole && NO_CLASSIC_OBJECT.contains(&name) {
+                if asked.whole && no_classic_object(config) {
                     info!(
                         "Policy `{name}` of {place}: the policy engine decides it by its whole \
                          pass (the profile `{profile}`); no classic policy is built"
