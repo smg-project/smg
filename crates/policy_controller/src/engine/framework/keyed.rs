@@ -174,6 +174,11 @@ impl Engine {
         }
         let mut targets = Targets::new();
         targets.push(target_of(&pinned));
+        // The rule's pin placed the request, as in the whole decision. The
+        // engine over worker lists writes no record behind this entry's
+        // answer: the word is here so a followed pin says the same on both
+        // paths.
+        targets.by_rule();
         Some(Decision::Pick(Pick {
             targets,
             trace: trace(index, facts, rows.generation(), [(pinned.id, 1.0)]),

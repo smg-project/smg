@@ -5988,6 +5988,8 @@ impl Engine {
                 dp_rank: c.dp_rank,
                 pair: None,
             });
+            // The rule's pin placed the request: no stage was asked.
+            targets.by_rule();
             let mut trace = Trace {
                 profile: index,
                 survivors: Survivors::counted(buf.kept.len() as u32),
@@ -6043,6 +6045,11 @@ impl Engine {
         }
         let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
         if let Decision::Pick(pick) = &mut decision {
+            // Under any assignment but `delegate` the rule's own stage
+            // placed the key: no stage of the profile was asked.
+            if placing != Assignment::Delegate {
+                pick.targets.by_rule();
+            }
             if WRITE_SESSIONS {
                 pick.session_verdict = SessionVerdict::Pinned;
             }
@@ -6260,6 +6267,10 @@ impl Engine {
         }
         let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
         if let Decision::Pick(pick) = &mut decision {
+            // As a key with no pin: the rule's own stage placed it.
+            if placing != Assignment::Delegate {
+                pick.targets.by_rule();
+            }
             let taken = pick.targets.first().map(|target| target.id);
             let under_the_cap = |id: WorkerId| {
                 buf.kept.iter().any(|&k| {
@@ -6363,7 +6374,9 @@ impl Engine {
     /// assignment's stage over the same survivors. The assignment is the
     /// one that places ([`placed_by`]): every caller hands the binding's
     /// placing assignment, which the engine's build wrote for a binding
-    /// under a rule and for one under none.
+    /// under a rule and for one under none. Who placed the pick
+    /// ([`Targets::by_rule`]) is its caller's word: a rule's, for its key
+    /// alone.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -14144,6 +14157,40 @@ mod tests {
             1,
             "the respill moved the pin"
         );
+    }
+
+    /// Who placed a keyed request's pick, at each place the whole decision
+    /// answers under a sessions rule. A key with no pin and a pin at its cap
+    /// are placed by the profile's stages under `delegate` and by the rule's
+    /// own stage under its own assignment. A pin followed is the rule's
+    /// under both.
+    #[test]
+    fn a_keyed_pick_says_who_placed_it() {
+        use decision::PlacedBy;
+        for (assignment, placed) in [
+            (Assignment::Delegate, PlacedBy::Stages),
+            (Assignment::MinLoad, PlacedBy::Rule),
+        ] {
+            let engine = session_engine(SessionRule {
+                assignment,
+                ..SESSIONS
+            });
+            let mut pool = vec![candidate(0, 0), candidate(1, 3), candidate(2, 3)];
+            let by = |decision: &Decision| decision.pick().expect("a pick").placed_by();
+            let new = decide_keyed(&engine, &pool, 7, 10);
+            assert_eq!(by(&new), placed, "{assignment:?}: a key with no pin");
+            assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+            let pinned = decide_keyed(&engine, &pool, 7, 20);
+            assert_eq!(by(&pinned), PlacedBy::Rule, "{assignment:?}: a pin");
+            // The pin at its cap and the busiest: the request is placed
+            // again, on a worker under the cap.
+            pool[0].session_in_flight = 2;
+            pool[0].in_flight = 9;
+            let again = decide_keyed(&engine, &pool, 7, 30);
+            let pick = again.pick().expect("the respill places");
+            assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+            assert_eq!(by(&again), placed, "{assignment:?}: a pin at its cap");
+        }
     }
 
     /// A respill's commit fronts the worker it lands on, the first target or
