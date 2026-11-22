@@ -4833,7 +4833,7 @@ mod tests {
         let (prefill_url, _) = spawn_recording_stub(list).await;
         let (decode_url, _) = spawn_recording_stub(list).await;
         let router = create_test_pd_router();
-        register_pd_pair(&router, prefill_url, decode_url);
+        register_pd_pair(&router, prefill_url, decode_url.clone());
 
         let rerank: RerankRequest = serde_json::from_value(json!({
             "model": "m",
@@ -4850,7 +4850,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().contains_key("x-smg-routed-worker-id"));
+        assert_eq!(response.headers()["x-smg-routed-worker-id"], decode_url);
         let answer = json_of(response).await;
         assert_eq!(answer["object"], "rerank");
         assert_eq!(answer["id"], "my-rid");

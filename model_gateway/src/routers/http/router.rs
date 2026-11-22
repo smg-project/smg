@@ -3977,10 +3977,11 @@ mod tests {
     #[tokio::test]
     async fn a_worker_body_cut_short_in_transit_is_a_502_read_failure() {
         let req = rerank_request();
-        let upstream = Response::new(Body::from_stream(stream::iter([
+        let mut upstream = Response::new(Body::from_stream(stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"[{\"index\": 0, \"score\": 0.9}")),
             Err(std::io::Error::other("connection cut")),
         ])));
+        header_utils::insert_routed_worker_id(upstream.headers_mut(), "http://worker");
         let response = Router::build_rerank_response(
             RerankResponseSpec::from(&req),
             None,
@@ -3989,6 +3990,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()["x-smg-routed-worker-id"],
+            "http://worker"
+        );
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"
