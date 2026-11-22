@@ -83,6 +83,19 @@ use tikv_jemallocator::Jemalloc as Allocator;
 #[global_allocator]
 static GLOBAL: Counting<Allocator> = Counting(Allocator);
 
+/// A gateway's settings of that allocator, in the symbol it reads as it
+/// starts: a copy of the controller binary's line, held to it by a case
+/// (`tests/binary.rs`). An Apple target keeps the allocator's own settings.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_env = "musl"),
+    not(target_vendor = "apple")
+))]
+#[expect(unsafe_code, reason = "the allocator reads this symbol")]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
+
 const MODEL: &str = "bench-model";
 
 /// Decisions a caller makes untimed first: the buffers a thread keeps.

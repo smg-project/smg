@@ -301,7 +301,8 @@ fn report_into(
 /// list keeps the rows of one snapshot (`PoolRecords::reported`): one
 /// decision that writes every record of the list and finds the list holds
 /// none of its snapshot converts the list's reports, and leaves the rows
-/// for the decisions behind it ([`PoolRecords::convert`]).
+/// for the decisions behind it ([`PoolRecords::convert`]). So does the
+/// draw that pays the last of the list's length ([`LookUps`]).
 ///
 /// The rows are of one snapshot and one list, and are read by a decision
 /// that holds that snapshot and that list and by no other
@@ -380,8 +381,8 @@ pub struct PoolRecords {
     /// lists name the engine kinds and the labels.
     generation: u64,
     /// The list's rows with the reports of one load snapshot written
-    /// ([`Reported`]), and none before a decision wrote every record under
-    /// a snapshot.
+    /// ([`Reported`]), and none before a decision converted the list's
+    /// reports ([`Self::convert`]).
     ///
     /// Read by one load of the slot through the calling thread's own
     /// protection: no lock, and no write another thread reads. Written by
@@ -868,8 +869,10 @@ impl<'a> Singly<'a> {
             }
             None => {
                 *row = *fixed;
+                if self.live.loads.is_some() {
+                    self.looked_up.set(self.looked_up.get() + 1);
+                }
                 self.live.write(worker.as_ref(), row);
-                self.looked_up.set(self.looked_up.get() + 1);
             }
         }
     }
