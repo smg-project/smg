@@ -46,13 +46,14 @@
 //!   tubelets of `video_temporal_patch_size`.
 //!
 //! [`NemotronOmniProcessor::reference`] serves any of these geometries in the
-//! engine's own tensors: `pixel_values_flat` as `(tiles, 3, S, S)` with
-//! `image_num_patches`, or as one `(1, 3, H, W)` batch per dynamic-resolution
-//! image with `imgs_sizes` and `num_tokens_per_image`, and
-//! `pixel_values_flat_video` as `(frames, 3, H, W)` with `video_num_patches`,
-//! the sampled `frames_indices` and `frame_duration_ms`.
+//! engine's own tensors: `pixel_values_flat` as dynamic-resolution
+//! `(patches, 3 * p * p)` rows or tiled `(tiles, 3, S, S)` pixels with
+//! `image_num_patches`, dynamic-resolution images additionally carrying
+//! `imgs_sizes` and `num_tokens_per_image`, and `pixel_values_flat_video` as
+//! `(frames, 3, H, W)` with `video_num_patches`, the sampled `frames_indices`
+//! and `frame_duration_ms`.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::borrow::Cow;
 
 use image::DynamicImage;
 use ndarray::{Array2, ArrayD, IxDyn};
@@ -60,7 +61,7 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::ModelSpecificValue,
-    types::{FieldLayout, RgbFrameRef, VideoSamplingInfo},
+    types::{RgbFrameRef, VideoSamplingInfo},
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{
@@ -102,7 +103,8 @@ const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 const DEFAULT_MAX_NUM_TILES: usize = 12;
 /// A dynamic-resolution image's reference tensors beside its pixels, one
 /// entry per image.
-pub(crate) const DYNAMIC_IMAGE_SIDE_TENSORS: [&str; 2] = ["imgs_sizes", "num_tokens_per_image"];
+pub(crate) const DYNAMIC_IMAGE_SIDE_TENSORS: [&str; 3] =
+    ["imgs_sizes", "num_tokens_per_image", "image_num_patches"];
 
 /// Whether a checkpoint config value equals the one this port implements,
 /// comparing numbers by value (`16` and `16.0` are the same).
@@ -810,44 +812,57 @@ impl NemotronOmniProcessor {
         ))
     }
 
-    /// Reference: one batch per dynamic-resolution image, sized together
-    /// under the call's budget.
+    /// Reference: one patch-flat batch of a call's dynamic-resolution images,
+    /// sized together under the call's budget.
     fn preprocess_dynamic(
         &self,
         images: &[&DynamicImage],
         context: &VisionPreprocessingContext,
-    ) -> Result<Vec<PreprocessedEncoderInputs>, TransformError> {
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let sizes: Vec<_> = images
             .iter()
             .map(|image| (image.width(), image.height()))
             .collect();
         let p = self.geometry.patch_size;
         let shuffle = self.geometry.shuffle();
-        self.plan_grids(&sizes, context.token_budget)?
-            .into_iter()
-            .zip(images)
-            .map(|((rows, cols), image)| {
-                let (width, height, raw) = Self::rgb_on_white(image);
-                let (out_w, out_h) = (cols * p, rows * p);
-                let resized = Self::resized(&raw, (width, height), (out_w, out_h))?;
-                let mut pixels = Vec::with_capacity(3 * out_w * out_h);
-                self.push_window(&mut pixels, &resized, out_w, (0, 0, out_w, out_h));
-                let tokens = rows * cols / (shuffle * shuffle);
-                Ok(PreprocessedEncoderInputs::new(
-                    Self::encoder_input(pixels, [1, 3, out_h, out_w])?,
-                    vec![tokens],
-                    vec![(image.width(), image.height())],
-                )
-                .with_extra(
-                    "imgs_sizes",
-                    ModelSpecificValue::TupleVec(vec![(out_h as u32, out_w as u32)]),
-                )
+        let planned = self.plan_grids(&sizes, context.token_budget)?;
+        let total_patches: usize = planned.iter().map(|&(rows, cols)| rows * cols).sum();
+        let mut pixels = Vec::with_capacity(total_patches * 3 * p * p);
+        let mut feature_token_counts = Vec::with_capacity(images.len());
+        let mut item_sizes = Vec::with_capacity(images.len());
+        let mut resized_sizes = Vec::with_capacity(images.len());
+        let mut tokens_per_image = Vec::with_capacity(images.len());
+        let mut patches_per_image = Vec::with_capacity(images.len());
+        for (image, &(rows, cols)) in images.iter().zip(&planned) {
+            let (width, height, raw) = Self::rgb_on_white(image);
+            let (out_w, out_h) = (cols * p, rows * p);
+            let resized = Self::resized(&raw, (width, height), (out_w, out_h))?;
+            for row in 0..rows {
+                for column in 0..cols {
+                    self.push_window(&mut pixels, &resized, out_w, (column * p, row * p, p, p));
+                }
+            }
+            let tokens = rows * cols / (shuffle * shuffle);
+            feature_token_counts.push(tokens);
+            item_sizes.push((image.width(), image.height()));
+            resized_sizes.push((out_h as u32, out_w as u32));
+            tokens_per_image.push(tokens as i64);
+            patches_per_image.push((rows * cols) as i64);
+        }
+        let encoder_input = Array2::from_shape_vec((total_patches, 3 * p * p), pixels)
+            .map_err(|e| TransformError::ShapeError(format!("dynamic image patches: {e}")))?;
+        Ok(
+            PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
+                .with_extra("imgs_sizes", ModelSpecificValue::TupleVec(resized_sizes))
                 .with_extra(
                     "num_tokens_per_image",
-                    ModelSpecificValue::IntVec(vec![tokens as i64]),
-                ))
-            })
-            .collect()
+                    ModelSpecificValue::IntVec(tokens_per_image),
+                )
+                .with_extra(
+                    "image_num_patches",
+                    ModelSpecificValue::int_1d(patches_per_image),
+                ),
+        )
     }
 
     /// Reference: one clip's frames, resized to the clip's frame size, with
@@ -938,9 +953,8 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         self.preprocess_with_context(images, &VisionPreprocessingContext::default())
     }
 
-    /// One batch: packed and tiled images always join; reference
-    /// dynamic-resolution images only when they share a size (see
-    /// [`preprocess_items_with_context`](Self::preprocess_items_with_context)).
+    /// One batch: packed and tiled images always join, and reference
+    /// dynamic-resolution images join as flat patches whatever their sizes.
     #[expect(
         clippy::expect_used,
         reason = "the patch buffer is filled from the planned grids it is reshaped by"
@@ -950,18 +964,13 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         images: &[&DynamicImage],
         context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if self.layout == Layout::Reference {
-            let mut batches = self.preprocess_items_with_context(images, context)?;
-            if batches.len() == 1 {
-                return Ok(batches.remove(0));
-            }
-            let layouts = HashMap::from(
-                DYNAMIC_IMAGE_SIDE_TENSORS.map(|key| (key.to_string(), FieldLayout::Batched)),
-            );
-            return PreprocessedEncoderInputs::concat(batches, &layouts)
-                .map_err(|e| TransformError::ShapeError(format!("{e:#}")));
-        }
         TransformError::if_empty(images)?;
+        if self.layout == Layout::Reference {
+            return match self.geometry.dynamic {
+                Some(_) => self.preprocess_dynamic(images, context),
+                None => self.preprocess_tiled(images),
+            };
+        }
         let sizes: Vec<_> = images
             .iter()
             .map(|image| (image.width(), image.height()))
@@ -1010,19 +1019,6 @@ impl VisionPreProcessor for NemotronOmniProcessor {
                     ModelSpecificValue::int_1d(patches_per_image),
                 ),
         )
-    }
-
-    fn preprocess_items_with_context(
-        &self,
-        images: &[&DynamicImage],
-        context: &VisionPreprocessingContext,
-    ) -> Result<Vec<PreprocessedEncoderInputs>, TransformError> {
-        TransformError::if_empty(images)?;
-        match (self.layout, self.geometry.dynamic) {
-            (Layout::Packed, _) => Ok(vec![self.preprocess_with_context(images, context)?]),
-            (Layout::Reference, Some(_)) => self.preprocess_dynamic(images, context),
-            (Layout::Reference, None) => Ok(vec![self.preprocess_tiled(images)?]),
-        }
     }
 
     fn preprocess_video(
@@ -1491,40 +1487,42 @@ mod tests {
         );
     }
 
-    /// Reference dynamic images: one `(1, 3, H, W)` batch per image with its
-    /// grid in pixels and its token count, sized together under the budget.
+    /// Reference dynamic images: one flat patch batch whatever their sizes,
+    /// with each image's resized grid, token count and patch count.
     #[test]
-    fn sizes_dynamic_images_one_batch_each() {
+    fn sizes_dynamic_images_into_one_flat_batch() {
         let processor = processor("omni");
         let images = [
             &DynamicImage::new_rgb8(640, 480),
             &DynamicImage::new_rgb8(1920, 1080),
         ];
         let context = |token_budget| VisionPreprocessingContext { token_budget };
-        let batches = processor
-            .preprocess_items_with_context(&images, &context(None))
+        let out = processor
+            .preprocess_with_context(&images, &context(None))
             .unwrap();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].encoder_input.shape(), &[1, 3, 480, 640]);
-        assert_eq!(batches[1].encoder_input.shape(), &[1, 3, 1088, 1920]);
-        assert_eq!(batches[1].feature_token_counts, [2040]);
+        assert_eq!(out.encoder_input.shape(), &[9360, 3 * 16 * 16]);
+        assert_eq!(out.feature_token_counts, [300, 2040]);
         assert_eq!(
-            ints(batches[1].model_specific.get("imgs_sizes")),
-            vec![1088, 1920]
+            ints(out.model_specific.get("imgs_sizes")),
+            vec![480, 640, 1088, 1920]
         );
         assert_eq!(
-            ints(batches[1].model_specific.get("num_tokens_per_image")),
-            vec![2040]
+            ints(out.model_specific.get("num_tokens_per_image")),
+            vec![300, 2040]
+        );
+        assert_eq!(
+            ints(out.model_specific.get("image_num_patches")),
+            vec![1200, 8160]
         );
         let budgeted = processor
-            .preprocess_items_with_context(&images[..1], &context(Some(303)))
+            .preprocess_with_context(&images[..1], &context(Some(303)))
             .unwrap();
-        assert_eq!(budgeted[0].encoder_input.shape(), &[1, 3, 480, 608]);
-        // Two images of one size still join into one batch.
+        assert_eq!(budgeted.encoder_input.shape(), &[1140, 3 * 16 * 16]);
+        // Two images of one size also join into one flat batch.
         let joined = processor
             .preprocess_with_context(&[images[0], images[0]], &context(None))
             .unwrap();
-        assert_eq!(joined.encoder_input.shape(), &[2, 3, 480, 640]);
+        assert_eq!(joined.encoder_input.shape(), &[2400, 3 * 16 * 16]);
     }
 
     /// Tile grids of `find_closest_aspect_ratio` at the default 12 tiles.

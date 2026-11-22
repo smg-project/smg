@@ -10,7 +10,7 @@
 //! at sampled positions and through their sums, within tolerances that cover
 //! the float resize order and the pure-Rust FFT. The fixture holds pixels
 //! packed (`(patches, 3 * 16 * 16)` rows); the reference-layout processor's
-//! `(n, 3, H, W)` pixels are packed the same way to compare.
+//! rows carry the same values in the same order.
 #![allow(clippy::expect_used, clippy::panic)]
 #![expect(clippy::print_stdout, reason = "integration tests: diagnostic output")]
 
@@ -193,7 +193,7 @@ fn images_match_the_reference_tiler() {
             IMAGE_TOL,
         );
 
-        // The reference layout holds the same pixels as `(1, 3, H, W)`.
+        // The reference layout holds the same patches as `(patches, 3 * p * p)`.
         let out = reference.preprocess(&[&image]).expect("image preprocesses");
         assert_eq!(
             out.feature_token_counts,
@@ -203,17 +203,23 @@ fn images_match_the_reference_tiler() {
         let [height, width] = [case.rows, case.cols].map(|v| v as u32 * PATCH as u32);
         assert_eq!(
             out.encoder_input.shape(),
-            [1, 3, height as usize, width as usize],
+            [(case.rows * case.cols) as usize, 3 * PATCH * PATCH],
             "{name}: reference shape"
         );
         assert!(
             matches!(out.model_specific.get("imgs_sizes"), Some(ModelSpecificValue::TupleVec(sizes)) if sizes == &[(height, width)]),
             "{name}: reference size"
         );
+        assert_per_item(
+            &name,
+            &out,
+            "image_num_patches",
+            (case.rows * case.cols) as usize,
+        );
         let values = out.encoder_input.as_f32();
         compare(
             &name,
-            &packed(values.as_slice().expect("standard layout"), values.shape()),
+            values.as_slice().expect("standard layout"),
             &case.summary,
             IMAGE_TOL,
         );
