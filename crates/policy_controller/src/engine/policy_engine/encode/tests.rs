@@ -187,7 +187,8 @@ impl Host {
             keys,
             ..EncodeItems::default()
         };
-        let (spec, clock, now) = (self.engine.spec(), self.engine.clock(), Instant::now());
+        let document = self.engine.document.load();
+        let (spec, clock, now) = (&document.spec, self.engine.clock(), Instant::now());
         let loads = self.loads.as_ref();
         let decision = lists.decide(spec, loads, clock, now, &mut request, items, placed);
         assert_eq!(request.facts.now_micros, clock.micros(now));

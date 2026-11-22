@@ -475,13 +475,20 @@ The engine is in `engine/`.
 A process has one engine object. It is built once from the policy document and holds the
 document's stages and what they remember. It holds no worker.
 
+A later document takes the first one's place whole while the engine runs (`PolicyEngine::apply`).
+From then on the engine holds that document's stages and what they remember.
+
 ```rust
 // engine/policy_engine.rs
 pub struct PolicyEngine {
-    spec: AppliedSpec,    // the validated document: profiles, bindings, stage objects and their state
+    document: ArcSwap<InForce>, // what is held of the document in force, swapped whole at an
+                          // apply: the validated document (profiles, bindings, stage objects and
+                          // their state), which lease events its stages need, read once, and
+                          // the number a list's value is made under
+    replaced: Mutex<Option<Arc<InForce>>>, // the lock of an apply, and the document that stood
+                          // before the one in force, kept until the next apply
     clock: DecisionClock, // one clock for every decision and every load report's age
     leases: OwnWord,      // the id of the last lease issued: one atomic counter
-    hears: EventSet,      // which lease events the document's stages need, read once at start
     affinity: Affinity,   // cache affinity: the host's index of cache events, and the engine's own
                           // record of the prefixes it sent, one for each model
     epochs: AtomicU64,    // how many list values were made

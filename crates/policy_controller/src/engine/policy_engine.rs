@@ -3,29 +3,13 @@
 //! The gateway keeps its workers where it keeps them with the classic
 //! policies: its registry publishes one shared list of worker objects a
 //! model at each membership change, and a worker's health and its vetoes
-//! live on the worker object. The gateway's classic placement pass holds
-//! the rules of a placement: which workers a request may take, what a retry
-//! skips and what becomes of a pool no worker of which passes. This front
-//! gives that pass its pick:
+//! live on the worker object. This front decides over those lists:
 //!
 //! - **Once a membership.** [`PolicyEngine::pool_members`] makes the
 //!   engine's value of a pool's shared list: the list's handle and the
 //!   pool's own word. The gateway keeps the value beside the list it was
 //!   made from, for as long as that list stands. No worker is read for it
 //!   and nothing of a worker is copied.
-//! - **Once a place.** The gateway builds one policy for each place it
-//!   places for: a model and a phase. [`PolicyEngine::place`] finds the
-//!   place's profile by the document's own bindings, there and at no
-//!   request.
-//! - **Once a request.** [`PolicyEngine::pick`] asks for one pick over the
-//!   pool, under a profile the engine picks by its picker alone
-//!   ([`Place::Alone`]). The pick is the picker's own rule: a rotation
-//!   turns the pool's own word and reads the worker the turn lands on, a
-//!   scan reads the pool's workers in order up to the first that passes.
-//!   Each read is the pass's own test of a worker: no row, no table, no
-//!   request fact, no lock, and nothing allocated. A list nothing is kept
-//!   of (a part of a pool, as the pass narrowed it) is passed over once
-//!   ([`PolicyEngine::pick_among`]).
 //!
 //! **A whole decision.** A gateway whose routers ask the engine for the
 //! whole decision asks through [`DecisionEngine`], as it asks a controller's
@@ -38,11 +22,17 @@
 //! single's binding names a shadow, that profile decides after the whole
 //! decision and its decision is counted ([`with_shadow`]).
 //!
+//! **A new document.** [`PolicyEngine::apply`] puts a new document in force
+//! while the engine runs. What the engine holds of a document is one value,
+//! swapped whole. A decision loads it once, at its entry, and ends under it,
+//! so no answer mixes two documents.
+//!
 //! The engine keeps no worker list, no health and no count of requests in
 //! flight. What it keeps is its stages' own: a rotation, and for the stages
 //! that read who holds a prompt, the record of the prefixes it sent
 //! ([`overlap`]).
 
+mod document;
 pub(super) mod encode;
 mod keys;
 pub mod overlap;
@@ -62,9 +52,12 @@ use std::{
     time::Instant,
 };
 
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 use rustc_hash::FxHasher;
 use smg_worker::{identity::basic::Worker, runtime::RoutingState};
 
+pub(super) use self::document::InForce;
 use self::overlap::{Affinity, PoolAffinity};
 use super::{
     decision::ShadowKind,
@@ -73,8 +66,8 @@ use super::{
         RequestMaker, SweepOutcome, WorkerLists,
     },
     framework::{
-        release, AloneProfile, EncodeItems, EncodePlaced, NotAlone, Picker, Place, PoolWord,
-        ShadowRows, SHADOWS,
+        release, AloneProfile, EncodeItems, EncodePlaced, Picker, Place, PoolWord, ShadowRows,
+        SHADOWS,
     },
     lease_events,
     prompt_hashes::{HashSeeds, PromptHashes},
@@ -86,31 +79,27 @@ use super::{
 use crate::{
     document::spec::AppliedSpec,
     names::intern,
-    stages::Lifecycle,
     store::GatewayId,
     tracking::lease::{EventKind, EventSet, Membership, Said, Side},
 };
 
-/// How many documents the engines of this process took so far.
-static APPLIED: AtomicU64 = AtomicU64::new(0);
-
-/// The number of the next document an engine of this process takes: each
-/// is drawn here, so no two applied documents share one.
-fn next_applied() -> u64 {
-    APPLIED.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-/// The engine of one policy document, for a gateway that decides in its own
-/// process.
+/// The engine of a gateway that decides in its own process, under the
+/// policy document in force.
 ///
-/// Built once, at the gateway's start, from the document in force. It holds
-/// the document's stages and their state, and no worker.
+/// Built once, at the gateway's start, from the document in force then. It
+/// holds that document's stages and their state, and no worker. A later
+/// document takes its place while the engine runs ([`Self::apply`]).
 #[derive(Debug)]
 pub struct PolicyEngine {
-    spec: AppliedSpec,
-    /// The number of the document the engine decides under
-    /// ([`Self::applied`]).
-    applied: u64,
+    /// The document in force with what is read of it once and its number
+    /// ([`Self::applied`]): one value, swapped whole at an apply. A decision
+    /// loads it once, at its entry.
+    document: ArcSwap<InForce>,
+    /// The lock of an apply, which no decision takes, and the document
+    /// that stood before the one in force. It is let go at the next apply,
+    /// by the applying thread: a decision that began under it is not the
+    /// one that frees it.
+    replaced: Mutex<Option<Arc<InForce>>>,
     /// The pools made so far: each draws the place its turns start at from
     /// its number.
     epochs: AtomicU64,
@@ -129,16 +118,13 @@ pub struct PolicyEngine {
     /// The id of the last lease issued. A pick that is issued one writes
     /// it: one atomic step, on cache lines of its own.
     leases: OwnWord,
-    /// The kinds of event the document takes ([`Lifecycle::hears`]), read
-    /// once, here. A document that takes no word on a lease
-    /// ([`EventSet::LEASE`]) costs a request no lease, no id and no word,
-    /// and its plain requests are answered a place ([`Decided::Alone`]).
-    hears: EventSet,
     /// The session table, one for the engine's life: the pins of every key
-    /// a sessions rule placed. The document's engine reads and writes it
-    /// through a pointer ([`AppliedSpec::share_sessions`]), so a pin
-    /// outlives the document it was made under. It has the host's shards
-    /// whatever the first document rules: no table ever takes its place.
+    /// a sessions rule placed. Each document's engine reads and writes it
+    /// through a pointer, handed where the engine takes the document, at
+    /// its start and at an apply ([`AppliedSpec::share_sessions`]), so a
+    /// pin outlives the document it was made under. It has the host's
+    /// shards whatever the first document rules: no table ever takes its
+    /// place.
     sessions: Arc<SessionTable>,
     /// What the affinity stages read across decisions: the host's indexes
     /// of cache events, once it handed them, and the engine's record of the
@@ -148,10 +134,6 @@ pub struct PolicyEngine {
     /// and the newest snapshot the engine's own task keeps at hand
     /// ([`Self::run`]).
     loads: task::Loads,
-    /// Whether a binding of the document names a shadow profile
-    /// ([`SHADOWS`]), read once, here. A whole decision of a single request
-    /// pays one test of it, and a place picked alone pays none.
-    any_shadow: bool,
     /// The shadow decisions counted so far ([`DecisionEngine::shadowed`]),
     /// by binding and kind. The table is allocated at the first of them: a
     /// document that names no shadow keeps none.
@@ -174,14 +156,14 @@ type ShadowWord = (u32, ShadowRows);
 pub struct PoolMembers {
     workers: Arc<[Arc<dyn Worker>]>,
     /// The pool's own word, for the picker that places over the pool by
-    /// itself ([`PolicyEngine::pick`]): a rotation counts its turns here.
+    /// itself ([`InForce::pick`]): a rotation counts its turns here.
     rotation: OwnWord,
     /// What a whole decision reads of the list beside its workers' live
     /// state ([`Self::records`]): made with the list where its host says
     /// facts of its workers
     /// ([`PolicyEngine::pool_members_with_fixed_facts`]), and else at the
     /// list's first whole decision, and by no pick a placement pass asks
-    /// ([`PolicyEngine::pick`]).
+    /// ([`InForce::pick`]).
     records: OnceLock<PoolRecords>,
     /// The wires the list's workers are dialed on ([`Self::wires`]): read
     /// of their registrations at the first whole decision over the list.
@@ -306,20 +288,19 @@ impl PoolMembers {
 }
 
 impl PolicyEngine {
-    /// The engine of `spec`, the document in force.
+    /// The engine of `spec`, the document in force at its start. The
+    /// engine's session table is made here and handed to the document's
+    /// engine: a key that engine placed before this call is lost with the
+    /// table it was made with.
     #[must_use]
     pub fn new(mut spec: AppliedSpec) -> Self {
-        let hears = spec.engine().hears();
-        let any_shadow = spec.engine().seat_flags() & SHADOWS != 0;
         // The table takes the document's two times where the document's
         // engine takes the pointer.
         let sessions = Arc::new(SessionTable::new(0).with_shards(shards_for_this_host()));
         spec.share_sessions(Arc::clone(&sessions));
         Self {
-            hears,
-            any_shadow,
-            spec,
-            applied: next_applied(),
+            document: ArcSwap::from_pointee(InForce::of(spec)),
+            replaced: Mutex::new(None),
             epochs: AtomicU64::new(0),
             clock: DecisionClock::new(),
             faults: AtomicU64::new(0),
@@ -379,12 +360,13 @@ impl PolicyEngine {
         self.told(&Membership::Added(id));
     }
 
-    /// Tells the document's stages one change of membership, on the calling
-    /// thread, and not the session table. A stage that panics at it is held
-    /// here and counted ([`Self::unheard`]): the registration or the removal
-    /// goes on.
+    /// Tells the stages of the document in force one change of membership,
+    /// on the calling thread, and not the session table. A stage that
+    /// panics at it is held here and counted ([`Self::unheard`]): the
+    /// registration or the removal goes on.
     fn told(&self, change: &Membership<'_>) {
-        let engine = self.spec.engine();
+        let document = self.document.load();
+        let engine = document.spec.engine();
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| engine.membership_stages(change))) {
             release(payload);
             self.unheard.fetch_add(1, Ordering::Relaxed);
@@ -408,18 +390,15 @@ impl PolicyEngine {
         self.unheard.load(Ordering::Relaxed)
     }
 
-    /// The document the engine decides under.
-    #[must_use]
-    pub fn spec(&self) -> &AppliedSpec {
-        &self.spec
-    }
-
-    /// The number of the document the engine decides under, which no other
-    /// applied document of the process has. A list's value is made under it
-    /// and read under it alone ([`Self::members_of`]), and nothing else
-    /// reads it.
+    /// The number of the document in force, which no other applied document
+    /// of the process has: each document an engine takes, at its start or at
+    /// an apply, draws its own. A list's value is made under it and read
+    /// under it alone ([`Self::members_of`]), and nothing else reads it. For
+    /// a case that tells two documents apart: an ask reads the number of the
+    /// value it loaded ([`Self::in_force`]).
+    #[cfg(test)]
     pub(super) fn applied(&self) -> u64 {
-        self.applied
+        self.document.load().applied
     }
 
     /// How many values of a list the engine made so far, for a case that
@@ -469,130 +448,49 @@ impl PolicyEngine {
     /// request that states a demand is then held to the workers of the
     /// list that meet it ([`PoolRecords::meeting`]).
     ///
-    /// The list's records are made of the answers at this call, and not at
-    /// the list's first whole decision: a list's records are also made
-    /// with no request at hand, by a pick that is noted. So the cost grows
-    /// with the list, once a list, off the path of a request: a wave of
-    /// registrations pays it once for each list published.
+    /// The list's records are made of the answers at this call, under the
+    /// document in force, and not at the list's first whole decision: a
+    /// list's records are also made with no request at hand, by a pick
+    /// that is noted. So the cost grows with the list, once a list, off
+    /// the path of a request: a wave of registrations pays it once for
+    /// each list published.
     #[must_use]
     pub fn pool_members_with_fixed_facts(
         &self,
         pool: &Arc<[Arc<dyn Worker>]>,
         facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
     ) -> PoolMembers {
-        let records = PoolRecords::with_fixed_facts(pool, &self.spec, &self.clock, facts_of);
+        self.members_under(&self.document.load(), pool, facts_of)
+    }
+
+    /// [`Self::pool_members_with_fixed_facts`] under `document`, the value
+    /// its caller loaded: the list's records are made of that document.
+    pub(super) fn members_under(
+        &self,
+        document: &InForce,
+        pool: &Arc<[Arc<dyn Worker>]>,
+        facts_of: impl FnMut(&Arc<dyn Worker>) -> FixedFacts,
+    ) -> PoolMembers {
+        let records = PoolRecords::with_fixed_facts(pool, &document.spec, &self.clock, facts_of);
         PoolMembers {
             records: OnceLock::from(records),
             ..self.pool_members(pool)
         }
     }
 
-    /// What the document holds for one place the gateway builds a policy
-    /// for, `model` at `phase` ([`Engine::place_for`]). The first binding that
-    /// matches names the place's profile. The answer is that profile where
-    /// one pick of its picker is its whole decision ([`Place::Alone`]),
-    /// the stage of it that asks more where it is not
-    /// ([`Place::NotAlone`]), [`Place::Unbound`] where no binding names
-    /// the model for the phase, and [`Place::NoSide`] where the binding
-    /// that names it plans no request of the phase. A policy that serves
-    /// every model is asked for with the empty model id, which the
-    /// bindings of every model alone match.
-    ///
-    /// Asked where the gateway builds the place's policy, and at no
-    /// request: a policy's name finds nothing here.
-    ///
-    /// [`Engine::place_for`]: super::framework::Engine::place_for
-    #[must_use]
-    pub fn place(&self, model: &str, phase: Phase) -> Place<'_> {
-        self.spec.engine().place_for(model, phase)
-    }
-
-    /// The name of `profile` as the document writes it, as a label that
-    /// lives as long as the process: a caller that counts its picks under
-    /// the profile's name hands it to a metric. One allocation a distinct
-    /// name.
+    /// The name of `profile` as the document in force writes it, as a
+    /// label that lives as long as the process: a caller that counts its
+    /// picks under the profile's name hands it to a metric. One allocation
+    /// a distinct name. `profile` is a position in one document: a number
+    /// read under a document that was replaced since names another
+    /// profile here, or none.
     #[must_use]
     pub fn profile_label(&self, profile: AloneProfile) -> &'static str {
-        let profiles = self.spec.engine().profiles();
+        let document = self.document.load();
+        let profiles = document.spec.engine().profiles();
         profiles
             .get(usize::from(profile.0))
             .map_or("", |profile| intern(&profile.name))
-    }
-
-    /// The first place a binding of the document names whose profile the
-    /// engine does not decide by one pick ([`Engine::not_alone`]). `None`
-    /// where it decides every place of the document so. A gateway that
-    /// starts under a document its operator supplied refuses the start by
-    /// what this names: nothing else would decide that place.
-    ///
-    /// [`Engine::not_alone`]: super::framework::Engine::not_alone
-    #[must_use]
-    pub fn not_alone(&self) -> Option<NotAlone<'_>> {
-        self.spec.engine().not_alone()
-    }
-
-    /// One pick under `profile` over `members`, the value this engine made
-    /// of a pool ([`Self::pool_members`]): the place in the pool's list of
-    /// the worker picked. `None` where no worker of the pool passes.
-    ///
-    /// The entry for a caller that holds every other rule of a placement
-    /// itself, as a gateway's classic placement pass does: which workers a
-    /// request may take, what a retry skips, and what becomes of a pool no
-    /// worker of which passes. The picker's rule runs over the pool, whose
-    /// own word is kept in `members`, and each worker the rule asks is read
-    /// once and tested by `admits`, the caller's own test of a worker's
-    /// read: the one its pass asks of every candidate, so the rule of a
-    /// lifted veto has one home. No row is read, no table looked up, no
-    /// lock taken and nothing allocated. Where a rotation's turns all land
-    /// on refused workers the pool is passed over once, as
-    /// [`Self::pick_among`] passes over a list. A rule that asked every
-    /// worker and kept none is not followed by that pass.
-    #[must_use]
-    pub fn pick(
-        &self,
-        profile: AloneProfile,
-        members: &PoolMembers,
-        admits: impl Fn(RoutingState) -> bool + Copy,
-    ) -> Option<usize> {
-        let picker = self.picker_of(profile)?;
-        pick_by(picker, &members.workers, &members.rotation.0, admits)
-    }
-
-    /// One pick under `profile` among `workers`, a list this engine keeps
-    /// nothing of (a part of a pool, as a caller narrowed it): the place in
-    /// `workers` of the worker picked. `None` where no worker passes.
-    ///
-    /// The list is passed over once, a read and the caller's test
-    /// (`admits`) each, and the picker picks among the workers that pass: a
-    /// rotation turns
-    /// the one their set keeps, named by the workers' handles. The list of
-    /// them is the calling thread's own: nothing is allocated after a
-    /// thread's first picks.
-    #[must_use]
-    pub fn pick_among(
-        &self,
-        profile: AloneProfile,
-        workers: &[Arc<dyn Worker>],
-        admits: impl Fn(RoutingState) -> bool + Copy,
-    ) -> Option<usize> {
-        among(self.picker_of(profile)?, workers, admits)
-    }
-
-    /// The picker of `profile`.
-    #[inline]
-    fn picker_of(&self, profile: AloneProfile) -> Option<&dyn Picker> {
-        let profiles = self.spec.engine().profiles();
-        Some(profiles.get(usize::from(profile.0))?.picker.as_ref())
-    }
-
-    /// The request `maker` makes, as this engine decides it: with no pins of
-    /// record lent ([`Constraints::pins`](super::view::Constraints::pins)).
-    /// Its session table is the only one it reads, whatever the entry.
-    #[inline(always)]
-    fn made<'w>(&'w self, maker: &'w impl RequestMaker) -> Request<'w> {
-        let mut request = maker.make(&self.spec);
-        request.constraints.pins = None;
-        request
     }
 
     /// A whole decision under the engine's catch: a panic in it costs its
@@ -644,6 +542,10 @@ impl PolicyEngine {
     /// that lease ([`Lifecycle::on_decision_issued`] of the document's
     /// engine), as a controller's service does in its store.
     ///
+    /// The document is the one in force at the call, loaded once: a pick
+    /// names its generation, and its issue is that document's stages' to
+    /// hear, where it still stands ([`AppliedSpec::issuing`]).
+    ///
     /// The request is made once and decided whole, at `now`, as
     /// [`Self::decide_at`] decides a request that is not plain
     /// ([`RequestMaker::plain`]): a single over its host's list, a pair at
@@ -677,17 +579,24 @@ impl PolicyEngine {
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
         self.caught(|| {
-            let mut request = self.made(maker);
+            let document = self.document.load();
+            let document: &InForce = &document;
+            let mut request = document.made(maker);
             match (request.facts.phase, maker.workers()) {
                 (Phase::Single, WorkerLists::Single(members)) => {
-                    Ok(self.decide_made(maker, &mut request, members, now, &mut None))
+                    Ok(self.decide_made(document, maker, &mut request, members, now, &mut None))
                 }
                 // A pair is decided at its prefill, over its host's two
                 // lists.
-                (Phase::Prefill, WorkerLists::Pair(lists)) => {
-                    Ok(pair::decide(self, &lists, &mut request, None, now))
-                }
-                (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(self, &request)),
+                (Phase::Prefill, WorkerLists::Pair(lists)) => Ok(pair::decide(
+                    self,
+                    document,
+                    &lists,
+                    &mut request,
+                    None,
+                    now,
+                )),
+                (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(document, &request)),
                 (Phase::Decode | Phase::Encode, _) => Err(DecisionRefused::PairSide),
             }
         })
@@ -719,20 +628,22 @@ impl PolicyEngine {
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
         self.caught(|| {
-            let mut request = self.made(maker);
+            let document = self.document.load();
+            let document: &InForce = &document;
+            let mut request = document.made(maker);
             Ok(match maker.workers() {
                 WorkerLists::Pair(lists) => {
-                    pair::decide(self, &lists, &mut request, Some(held), now)
+                    pair::decide(self, document, &lists, &mut request, Some(held), now)
                 }
-                _ => single::over_none(self, &request),
+                _ => single::over_none(document, &request),
             })
         })
     }
 
-    /// A made single request's whole decision over its host's list, for
-    /// every entry that decides one. It reads the snapshot the request
-    /// gives where it gives one, and the newest the engine's own task
-    /// keeps at hand otherwise.
+    /// A made single request's whole decision over its host's list under
+    /// `document`, for every entry that decides one. It reads the snapshot
+    /// the request gives where it gives one, and the newest the engine's
+    /// own task keeps at hand otherwise.
     ///
     /// Under a binding that names a shadow, the shadow profile decides
     /// behind the live one ([`with_shadow::decide`]). What it said is
@@ -742,6 +653,7 @@ impl PolicyEngine {
     #[inline]
     fn decide_made<'a>(
         &self,
+        document: &InForce,
         maker: &impl RequestMaker,
         request: &mut Request<'a>,
         members: &'a PoolMembers,
@@ -758,34 +670,45 @@ impl PolicyEngine {
         };
         // Under a document that names a shadow the list's word says
         // whether this binding does.
-        if self.any_shadow {
-            if let Some(binding) = members.shadow(&self.spec, request.facts.model) {
+        if document.any_shadow {
+            if let Some(binding) = members.shadow(&document.spec, request.facts.model) {
                 let (decision, shadow) =
-                    with_shadow::decide(self, request, members, loads, now, binding);
+                    with_shadow::decide(self, document, request, members, loads, now, binding);
                 *said = shadow;
                 return decision;
             }
         }
-        single::decide(self, request, members, loads, now, single::WithoutShadow)
+        single::decide(
+            self,
+            document,
+            request,
+            members,
+            loads,
+            now,
+            single::WithoutShadow,
+        )
     }
 
     /// The decision's pass: the place it answers, or its whole decision
     /// written into `whole` with whether the request made stated the later
-    /// decode.
+    /// decode. The document in force is loaded once, here: the decision
+    /// ends under it, whatever is applied meanwhile.
     fn placed_or(
         &self,
         maker: &impl RequestMaker,
         clock: impl FnOnce() -> Instant,
         whole: &mut Option<(DecideOutcome, bool)>,
     ) -> Result<Option<AlonePick>, DecisionRefused> {
+        let document = self.document.load();
+        let document: &InForce = &document;
         // A plain request of a place one pick decides is decided ahead
         // of its making: the pick reads no fact of it.
         let mut picked = None;
         if let (Some(plain), WorkerLists::Single(members)) = (maker.plain(), maker.workers()) {
-            if let Some(pick) = single::alone(self, maker.model(), plain, members) {
+            if let Some(pick) = single::alone(document, maker.model(), plain, members) {
                 // No stage takes a word of the request: the place is
                 // the whole answer.
-                if !self.hears.intersects(EventSet::LEASE) {
+                if !document.hears.intersects(EventSet::LEASE) {
                     return Ok(Some(pick));
                 }
                 picked = Some((pick, members, plain));
@@ -793,20 +716,22 @@ impl PolicyEngine {
         }
         let now = clock();
         if let Some((pick, members, plain)) = picked {
-            if let Some(decided) = single::noted(self, pick, members, plain, now) {
+            if let Some(decided) = single::noted(self, document, pick, members, plain, now) {
                 *whole = Some((decided, false));
                 return Ok(None);
             }
         }
-        let mut request = self.made(maker);
+        let mut request = document.made(maker);
         let later = request.constraints.decode_later;
         let decided = match (request.facts.phase, maker.workers()) {
             (Phase::Single, WorkerLists::Single(members)) => {
                 let mut said = None;
-                let decision = self.decide_made(maker, &mut request, members, now, &mut said);
+                let decision =
+                    self.decide_made(document, maker, &mut request, members, now, &mut said);
                 // What a shadow said is counted behind the lease's issue.
                 if let Some(said) = said {
-                    let decided = with_shadow::issued(self, decision, &request, now, said);
+                    let decided =
+                        with_shadow::issued(self, document, decision, &request, now, said);
                     *whole = Some((decided, later));
                     return Ok(None);
                 }
@@ -815,16 +740,16 @@ impl PolicyEngine {
             // A pair is decided at its prefill, over its host's two
             // lists.
             (Phase::Prefill, WorkerLists::Pair(lists)) => {
-                let decided = pair::decided(self, &lists, &mut request, None, now);
+                let decided = pair::decided(self, document, &lists, &mut request, None, now);
                 *whole = Some((decided, later));
                 return Ok(None);
             }
             // A request that hands no list of its own is decided over
             // no worker.
-            (Phase::Single | Phase::Prefill, _) => single::over_none(self, &request),
+            (Phase::Single | Phase::Prefill, _) => single::over_none(document, &request),
             (Phase::Decode | Phase::Encode, _) => return Err(DecisionRefused::PairSide),
         };
-        let decided = single::issued(self, decided, &request, now);
+        let decided = single::issued(self, document, decided, &request, now);
         *whole = Some((decided, later));
         Ok(None)
     }
@@ -868,12 +793,17 @@ impl DecisionEngine for PolicyEngine {
         now: Instant,
     ) -> Result<DecideOutcome, DecisionRefused> {
         self.caught(|| {
-            let mut request = self.made(maker);
+            let document = self.document.load();
+            let document: &InForce = &document;
+            let mut request = document.made(maker);
             Ok(match maker.workers() {
                 WorkerLists::Pair(lists) => {
-                    pair::decided(self, &lists, &mut request, Some(held), now)
+                    pair::decided(self, document, &lists, &mut request, Some(held), now)
                 }
-                _ => single::issued(self, single::over_none(self, &request), &request, now),
+                _ => {
+                    let none = single::over_none(document, &request);
+                    single::issued(self, document, none, &request, now)
+                }
             })
         })
     }
@@ -899,10 +829,15 @@ impl DecisionEngine for PolicyEngine {
             Said::Completed(_) => EventKind::Completed,
             Said::Released(..) => EventKind::Released,
         };
-        if held.lease.side == Side::Single && !self.hears.contains(kind) {
+        let document = self.document.load();
+        if held.lease.side == Side::Single && !document.hears.contains(kind) {
             return;
         }
-        let engine = self.spec.engine();
+        // A lease of a document replaced since: no stage of the document
+        // in force heard its issue, and none hears a word of it.
+        let Some(engine) = document.spec.issuing(held.lease) else {
+            return;
+        };
         let tell = || match held.lease.side {
             Side::Single => lease_events::single(engine, held, said),
             // A pair's guard holds its prefill side's lease.
@@ -927,8 +862,9 @@ impl DecisionEngine for PolicyEngine {
         SweepOutcome::default()
     }
 
+    // The document in force at the call, for the length of `read`.
     fn with_spec<R>(&self, read: impl FnOnce(&AppliedSpec) -> R) -> R {
-        read(&self.spec)
+        read(&self.document.load().spec)
     }
 
     // By the block size the model's cache events taught the host's index,
@@ -942,7 +878,8 @@ impl DecisionEngine for PolicyEngine {
         seeds: HashSeeds,
     ) -> PromptHashes {
         let size = self.affinity.block_size(model);
-        PromptHashes::under_document(&self.spec, size, tokens, text, seeds)
+        let document = self.document.load();
+        PromptHashes::under_document(&document.spec, size, tokens, text, seeds)
     }
 
     fn faults(&self) -> u64 {
@@ -961,9 +898,9 @@ impl DecisionEngine for PolicyEngine {
     }
 }
 
-/// [`PolicyEngine::pick`] by one test of a worker's read, compiled once a
-/// test: the picker's own pick over the pool's word, then the pass where
-/// that pick left the pool open.
+/// One pick over a pool ([`InForce::pick`]) by one test of a worker's read,
+/// compiled once a test: the picker's own pick over the pool's word, then
+/// the pass where that pick left the pool open.
 #[inline(always)]
 fn pick_by(
     picker: &dyn Picker,
@@ -988,8 +925,8 @@ fn pick_by(
     among(picker, workers, admits)
 }
 
-/// [`PolicyEngine::pick_among`] by one test of a worker's read: the workers
-/// of `workers` that pass, listed in the thread's list, their set named by
+/// The pass of a pick by one test of a worker's read: the workers of
+/// `workers` that pass, listed in the thread's list, their set named by
 /// their handles' addresses in the list's order (one word hashed a worker,
 /// and nothing of a worker read for it), and the picker's pick among them.
 #[inline(always)]
@@ -1057,11 +994,58 @@ mod tests {
 
     const MODEL: &str = "model-a";
 
-    fn engine_of(document: &PolicySpec) -> PolicyEngine {
-        PolicyEngine::new(AppliedSpec::validate(document).expect("the document validates"))
+    /// An engine with the document it was made under, held as a decision
+    /// holds it: what a case asks of that document, it asks here.
+    struct Made {
+        engine: PolicyEngine,
+        document: Arc<InForce>,
     }
 
-    fn preset(name: &str) -> PolicyEngine {
+    impl std::ops::Deref for Made {
+        type Target = PolicyEngine;
+
+        fn deref(&self) -> &PolicyEngine {
+            &self.engine
+        }
+    }
+
+    impl Made {
+        fn spec(&self) -> &AppliedSpec {
+            &self.document.spec
+        }
+
+        fn place(&self, model: &str, phase: Phase) -> Place<'_> {
+            self.spec().engine().place_for(model, phase)
+        }
+
+        fn pick(
+            &self,
+            profile: AloneProfile,
+            members: &PoolMembers,
+            admits: impl Fn(RoutingState) -> bool + Copy,
+        ) -> Option<usize> {
+            self.document.pick(profile, members, admits)
+        }
+
+        /// A pick among a list the engine keeps nothing of: the pass alone.
+        fn pick_among(
+            &self,
+            profile: AloneProfile,
+            workers: &[Arc<dyn Worker>],
+            admits: impl Fn(RoutingState) -> bool + Copy,
+        ) -> Option<usize> {
+            among(self.document.picker_of(profile)?, workers, admits)
+        }
+    }
+
+    fn engine_of(document: &PolicySpec) -> Made {
+        let spec = AppliedSpec::validate(document).expect("the document validates");
+        let engine = PolicyEngine::new(spec);
+        let document = engine.document.load_full();
+        Made { engine, document }
+    }
+
+    fn preset(name: &str) -> Made {
         let mut document = PolicySpec::preset(name).expect("a built-in preset");
         document.generation = 1;
         engine_of(&document)
@@ -1075,7 +1059,7 @@ mod tests {
 
     /// The profile of the model's single placements, which the engine picks
     /// alone.
-    fn alone(engine: &PolicyEngine) -> AloneProfile {
+    fn alone(engine: &Made) -> AloneProfile {
         match engine.place(MODEL, Phase::Single) {
             Place::Alone(profile) => profile,
             other => panic!("not picked alone: {other:?}"),
@@ -1083,7 +1067,7 @@ mod tests {
     }
 
     /// Round robin's preset with `filter` added to its profile's filters.
-    fn round_robin_with(filter: &str) -> PolicyEngine {
+    fn round_robin_with(filter: &str) -> Made {
         let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
         let profile = document
             .profiles
@@ -1111,7 +1095,7 @@ mod tests {
         });
         assert_eq!(asked.get(), 4, "asked at the call, once a worker");
         let sees = |members: &PoolMembers| {
-            let fixed = members.records(&engine.spec, &engine.clock).fixed();
+            let fixed = members.records(engine.spec(), &engine.clock).fixed();
             fixed.iter().map(|row| row.vision).collect::<Vec<_>>()
         };
         assert_eq!(sees(&members), [false, true, false, false]);
@@ -1267,7 +1251,7 @@ mod tests {
     /// not decided so.
     #[test]
     fn a_document_is_decided_whole_where_each_place_is_picked_alone_or_fed() {
-        let whole = |engine: &PolicyEngine, fed: Needs| engine.spec().engine().single_and_fed(fed);
+        let whole = |engine: &Made, fed: Needs| engine.spec().engine().single_and_fed(fed);
         let nothing = Needs::default();
         for name in ["round_robin", "random", "passthrough"] {
             assert!(whole(&preset(name), nothing), "{name}");

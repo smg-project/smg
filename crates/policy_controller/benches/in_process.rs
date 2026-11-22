@@ -442,7 +442,9 @@ fn main() {
     // its reports once its requests have looked up as many as it holds, so
     // the tries follow the list's length. A thread of its own turns the
     // runtime from then on.
-    let read = || !engine.spec().needs().loads || host.members.conversions() > 0;
+    let reads_reports =
+        smg_policy_controller::engine::DecisionEngine::with_spec(engine, |spec| spec.needs().loads);
+    let read = || !reads_reports || host.members.conversions() > 0;
     for probe in 0..1_000 + run.workers as u64 {
         if read() {
             break;

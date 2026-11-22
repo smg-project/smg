@@ -195,8 +195,8 @@ use crate::{
         explain::{DecisionRecord, SampleCount, Samples},
         framework::{release, Engine},
         store_backed_engine::{
-            decide_in, decider_of, decode_in, entry, issue, issue_decode, issue_pair, issuing,
-            pair_in, past_mark, summed, Buffers, DecisionCall, Entry, Part, RequestForm, StorePins,
+            decide_in, decider_of, decode_in, entry, issue, issue_decode, issue_pair, pair_in,
+            past_mark, summed, Buffers, DecisionCall, Entry, Part, RequestForm, StorePins,
         },
         view::fingerprint,
     },
@@ -1196,8 +1196,9 @@ const fn busy_of(refused: DecodeRefused) -> Reason {
 /// side stands as the call found it and its booking is freed
 /// ([`MemoryStore::unissue_decode`]), then the engine that heard the issue
 /// is told the side's release, once: the engine of the lease's generation
-/// ([`issuing`]), where it still stands. A side that moved since was ended
-/// or issued anew by another hand, and nothing is told of it here.
+/// ([`AppliedSpec::issuing`](crate::document::spec::AppliedSpec::issuing)),
+/// where it still stands. A side that moved since was ended or issued anew
+/// by another hand, and nothing is told of it here.
 fn take_back(
     store: &MemoryStore,
     world: &StoreSnapshot,
@@ -1207,7 +1208,7 @@ fn take_back(
     reason: ReleaseReason,
 ) {
     if store.unissue_decode(gateway, lease.id, issue) {
-        if let Some(engine) = issuing(world.spec(), lease) {
+        if let Some(engine) = world.spec().issuing(lease) {
             engine.on_released(lease, reason);
         }
     }

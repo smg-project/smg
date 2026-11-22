@@ -1666,10 +1666,11 @@ pub(crate) fn issue_decode<A: RequestForm>(
     let spec = world.spec();
     store.issue_decided_decode(taken.gateway, lease, booking, taken.now, |lease| {
         // The lease keeps the generation of its first decision, and the
-        // engine of that generation alone hears its words ([`issuing`]).
+        // engine of that generation alone hears its words
+        // ([`AppliedSpec::issuing`]).
         // Behind a reload the engine of this instant decided the side and
         // hears nothing of the lease.
-        let Some(engine) = issuing(spec, lease) else {
+        let Some(engine) = spec.issuing(lease) else {
             return;
         };
         // The issue is dated at this call ([`issued_later`]).
@@ -2385,20 +2386,10 @@ pub(crate) fn told(
     store.call_faulted()
 }
 
-/// The engine that hears a lease's words under `spec`: the one of the
-/// generation the lease was issued under, where that generation still
-/// stands. A later generation's engine heard no issue of the lease and
-/// hears nothing of it: no dispatch, no end, and no issue of a side a call
-/// decides later.
-#[inline]
-pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
-    (spec.generation() == lease.generation).then(|| spec.engine())
-}
-
 /// What [`told`] tells, under its catch.
 fn tell(store: &MemoryStore, world: &StoreSnapshot, found: &Sides, said: Said) {
     let spec = world.spec();
-    let issuing = || issuing(spec, &found.record.lease);
+    let issuing = || spec.issuing(&found.record.lease);
     match said {
         Said::Dispatched(dispatch, at) => {
             // The side the frame names: its lease, and its worker at

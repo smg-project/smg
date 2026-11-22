@@ -428,11 +428,17 @@ fn what_a_shadow_said_names_its_binding_its_kind_and_its_first_target() {
     let list = pool(3);
     let (engine, _) = bed(Rule::Place(0), Rule::Place(1));
     let members = engine.pool_members(&list);
-    let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
+    let word = engine
+        .document
+        .load()
+        .spec
+        .engine()
+        .shadow_for(MODEL, Phase::Single);
     let word = word.expect("the binding's shadow");
     let mut asked = request(7);
     let now = Instant::now();
-    let (decision, said) = super::decide(&engine, &mut asked, &members, None, now, word);
+    let document = engine.in_force();
+    let (decision, said) = super::decide(&engine, &document, &mut asked, &members, None, now, word);
     // The shadow's picker takes the row behind the live pick's: the live
     // pick's alternate.
     let pick = decision.pick().expect("a pick");
@@ -567,7 +573,12 @@ fn a_shadow_writes_nothing_to_the_record_of_sent_prefixes() {
         PolicySpec::preset("cache_aware").expect("a built-in preset"),
         &stages,
     );
-    let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
+    let word = engine
+        .document
+        .load()
+        .spec
+        .engine()
+        .shadow_for(MODEL, Phase::Single);
     assert_eq!(word, Some((0, ShadowRows::Unnamed)));
 
     let list = pool(8);
@@ -622,7 +633,12 @@ fn a_shadow_that_reads_no_affinity_runs_without_the_live_profiles_rows() {
     let own = document.profiles.get_mut("cache_aware");
     *own.expect("the preset's profile") = live;
     let engine = engine_of(document, &stages);
-    let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
+    let word = engine
+        .document
+        .load()
+        .spec
+        .engine()
+        .shadow_for(MODEL, Phase::Single);
     assert_eq!(word, Some((0, ShadowRows::Unnamed)));
 
     let list = pool(4);
@@ -655,7 +671,12 @@ fn a_shadow_that_reads_the_live_profiles_rows_is_handed_them() {
     let own = document.profiles.get_mut("cache_aware");
     *own.expect("the preset's profile") = live;
     let engine = engine_of(document, &stages);
-    let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
+    let word = engine
+        .document
+        .load()
+        .spec
+        .engine()
+        .shadow_for(MODEL, Phase::Single);
     assert_eq!(word, Some((0, ShadowRows::Same)));
 
     let list = pool(4);
@@ -688,7 +709,12 @@ fn a_shadow_with_other_affinity_rows_than_the_live_profile_is_skipped() {
         let mut twin = profile_of("cache_aware");
         turn(&mut twin);
         let engine = engine_of(with_shadow_profile(live, twin), &stages);
-        let word = engine.spec().engine().shadow_for(MODEL, Phase::Single);
+        let word = engine
+            .document
+            .load()
+            .spec
+            .engine()
+            .shadow_for(MODEL, Phase::Single);
         let _ = placed(&engine, &pool(3), request(7));
         (word.map(|(_, rows)| rows), kinds(&engine))
     };
@@ -770,7 +796,7 @@ fn a_shadow_under_a_sessions_rule_moves_no_session_pin() {
         (owner, SessionVerdict::Pinned)
     );
     assert_eq!(kinds(&engine), [1, 1, 0, 0]);
-    assert_eq!(engine.spec().engine().sessions().len(), 1);
+    assert_eq!(engine.document.load().spec.engine().sessions().len(), 1);
     assert_eq!((engine.faults(), engine.unheard()), (0, 0));
 }
 

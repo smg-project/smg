@@ -48,9 +48,11 @@ pub(super) struct Loads {
 
 impl fmt::Debug for Loads {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Read ahead of the formatter's writes: no lock is held across one.
+        let (hand_overs, at_hand) = (self.feed.lock().0, self.newest.load().is_some());
         f.debug_struct("Loads")
-            .field("hand_overs", &self.feed.lock().0)
-            .field("at_hand", &self.newest.load().is_some())
+            .field("hand_overs", &hand_overs)
+            .field("at_hand", &at_hand)
             .finish()
     }
 }
@@ -95,9 +97,11 @@ impl PolicyEngine {
     /// subscription. A host hands it at its start, and again where it
     /// builds another monitor: a channel ends with its monitor. Of two
     /// hand-overs the newest stands: a later one replaces the one before.
-    /// An engine whose document reads no load report
-    /// ([`Needs::loads`](crate::document::spec::Needs::loads)) keeps none,
-    /// and no decision of it reads a report.
+    /// An engine whose document in force reads no load report
+    /// ([`Needs::loads`](crate::document::spec::Needs::loads)) keeps none:
+    /// its task has no snapshot at hand, and a decision reads a report only
+    /// where its request gives a snapshot, until a channel is handed under
+    /// a document that reads them ([`Self::apply`]).
     ///
     /// The engine's task reads the channel ([`Self::run`]). A single
     /// request's decision reads the snapshot its request gives where it
@@ -106,7 +110,7 @@ impl PolicyEngine {
     /// the newest the task keeps at hand otherwise. A pair's decision
     /// reads no load report.
     pub fn set_loads(&self, loads: LoadReceiver) {
-        if self.spec.needs().loads {
+        if self.document.load().spec.needs().loads {
             let mut feed = self.loads.feed.lock();
             *feed = (feed.0 + 1, Some(loads));
             self.loads.handed.store(true, Ordering::Relaxed);

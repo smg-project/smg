@@ -17,8 +17,8 @@ use super::*;
 use crate::{
     document::spec::{AppliedSpec, PolicySpec},
     engine::{
-        Constraints, PolicyEngine, PoolMembers, Request, RequestFacts, RequestMaker, WorkerId,
-        WorkerLists,
+        Constraints, DecisionEngine, PolicyEngine, PoolMembers, Request, RequestFacts,
+        RequestMaker, WorkerId, WorkerLists,
     },
     store::{MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
     worker_host::Objects,
@@ -147,10 +147,11 @@ fn each_role_is_lent_in_the_registrys_order_with_its_rows_facts() {
     assert!(!ptr::eq(single.cell, prefill.cell));
 
     let engine = engine();
-    let records = engine
-        .members_of(single)
-        .records(engine.spec(), engine.clock());
-    let take_images: Vec<bool> = records.fixed().iter().map(|row| row.vision).collect();
+    let members = engine.members_of(single);
+    let take_images: Vec<bool> = DecisionEngine::with_spec(&engine, |spec| {
+        let records = members.records(spec, engine.clock());
+        records.fixed().iter().map(|row| row.vision).collect()
+    });
     assert_eq!(take_images, [false, true]);
 }
 

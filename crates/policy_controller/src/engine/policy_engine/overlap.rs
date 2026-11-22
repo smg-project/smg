@@ -224,6 +224,16 @@ impl Affinity {
         records.values().map(left_out).sum()
     }
 
+    /// The placements the records hold, every model's together, those of
+    /// the workers that left and are not yet swept among them: what a case
+    /// counts against a sweep.
+    #[cfg(test)]
+    pub(super) fn placements(&self) -> usize {
+        let records = self.records.lock();
+        let held = |record: &Arc<PrefixRecord>| record.predictor.read().len();
+        records.values().map(held).sum()
+    }
+
     /// The record of `model`, made at its first asking and held to `bound`
     /// placements.
     fn record_of(&self, model: &str, bound: usize) -> Arc<PrefixRecord> {

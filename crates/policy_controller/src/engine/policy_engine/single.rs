@@ -54,7 +54,7 @@ use std::{
 
 use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot, runtime::RoutingState};
 
-use super::{keys, overlap, PolicyEngine, PoolMembers};
+use super::{keys, overlap, InForce, PolicyEngine, PoolMembers};
 use crate::{
     engine::{
         decision::{Decision, Shed, ShedReason, Trace, SUBSET_HINT, WIRES},
@@ -94,9 +94,10 @@ const NO_STAGE: &str = "none";
 /// It ends in the place picked. It reads no fact of a request, so none is
 /// made ahead of it, and nothing a host is handed of a pick is built here.
 /// Under a document that takes no word on a lease the place is the whole
-/// answer. Under any other the pick is noted ([`noted`]).
+/// answer. Under any other the pick is noted ([`noted`]). `document` is the
+/// one its decision loaded.
 pub(super) fn alone(
-    own: &PolicyEngine,
+    document: &InForce,
     model: &str,
     plain: Plain,
     members: &PoolMembers,
@@ -108,12 +109,12 @@ pub(super) fn alone(
     if !plain.wires.is_empty() && !plain.wires.contains(members.wires()) {
         return None;
     }
-    let profile = members.alone(&own.spec, model)?;
-    let position = own.pick(profile, members, |state: RoutingState| state.eligible())?;
+    let profile = members.alone(&document.spec, model)?;
+    let position = document.pick(profile, members, |state: RoutingState| state.eligible())?;
     Some(AlonePick {
         place: u32::try_from(position).ok()?,
         profile: profile.0,
-        generation: own.spec.generation(),
+        generation: document.spec.generation(),
     })
 }
 
@@ -126,6 +127,7 @@ pub(super) fn alone(
 /// the place.
 pub(super) fn noted(
     own: &PolicyEngine,
+    document: &InForce,
     pick: AlonePick,
     members: &PoolMembers,
     plain: Plain,
@@ -135,7 +137,10 @@ pub(super) fn noted(
     let worker = members.workers().get(position)?;
     // The list's records name each worker once a list: a pick reads the id
     // there and hashes no address.
-    let id = *members.records(&own.spec, &own.clock).ids().get(position)?;
+    let id = *members
+        .records(&document.spec, &own.clock)
+        .ids()
+        .get(position)?;
     let dp_rank = records::worker_rank(worker.as_ref());
     let lease = Lease {
         id: LeaseId(own.leases.0.fetch_add(1, Ordering::Relaxed) + 1),
@@ -157,8 +162,9 @@ pub(super) fn noted(
         }),
         decode_session: Session::NONE,
     };
-    if own.hears.contains(EventKind::Issued) {
-        own.spec
+    if document.hears.contains(EventKind::Issued) {
+        document
+            .spec
             .engine()
             .on_decision_issued(&lease, &decided.decision);
     }
@@ -218,19 +224,20 @@ impl WholeDecision for WithoutShadow {
 /// demands emptied is shed over a store's rows.
 pub(super) fn decide(
     own: &PolicyEngine,
+    document: &InForce,
     request: &mut Request<'_>,
     members: &PoolMembers,
     loads: Option<&Arc<LoadSnapshot>>,
     now: Instant,
     whole: impl WholeDecision,
 ) -> Decision {
-    let spec = &own.spec;
+    let spec = &document.spec;
     let cx = request.constraints;
     if cx.subset_hint.is_some() {
-        return declined(own, request, SUBSET_HINT);
+        return declined(document, request, SUBSET_HINT);
     }
     if !cx.wire_modes.is_empty() && !cx.wire_modes.contains(members.wires()) {
-        return declined(own, request, WIRES);
+        return declined(document, request, WIRES);
     }
     let records = members.records(spec, &own.clock);
     // The calling thread's list of places, where the request states a
@@ -248,7 +255,7 @@ pub(super) fn decide(
             }
             Err(unmet) => {
                 MEETING.set(meeting.unwrap_or_default());
-                return shed(own, request, ShedReason::NoEndpoints, unmet.stage());
+                return shed(document, request, ShedReason::NoEndpoints, unmet.stage());
             }
         }
     };
@@ -313,8 +320,8 @@ fn held<'a>(
 
 /// The answer for a request whose host handed no list: a pool of no worker,
 /// which no stage emptied.
-pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
-    shed(own, request, ShedReason::NoEndpoints, NO_STAGE)
+pub(super) fn over_none(document: &InForce, request: &Request<'_>) -> Decision {
+    shed(document, request, ShedReason::NoEndpoints, NO_STAGE)
 }
 
 /// The answer for a request that states what no stage of this engine runs,
@@ -323,12 +330,12 @@ pub(super) fn over_none(own: &PolicyEngine, request: &Request<'_>) -> Decision {
 /// of the whole pass kept the pass from being inlined, 43 instructions a
 /// decision.
 #[cold]
-pub(super) fn declined(own: &PolicyEngine, request: &Request<'_>, stage: &'static str) -> Decision {
-    shed(own, request, ShedReason::PolicyDeclined, stage)
+pub(super) fn declined(document: &InForce, request: &Request<'_>, stage: &'static str) -> Decision {
+    shed(document, request, ShedReason::PolicyDeclined, stage)
 }
 
 fn shed(
-    own: &PolicyEngine,
+    document: &InForce,
     request: &Request<'_>,
     reason: ShedReason,
     emptied_by: &'static str,
@@ -340,7 +347,7 @@ fn shed(
         wait_allowed: false,
         trace: Trace {
             seed: request.facts.seed,
-            generation: own.spec.generation(),
+            generation: document.spec.generation(),
             ..Trace::default()
         },
     })
@@ -357,12 +364,13 @@ fn shed(
 /// taken, and its guard owes the engine nothing.
 pub(super) fn issued(
     own: &PolicyEngine,
+    document: &InForce,
     decision: Decision,
     request: &Request<'_>,
     now: Instant,
 ) -> DecideOutcome {
     let facts = &request.facts;
-    let leased = own.hears.intersects(EventSet::LEASE);
+    let leased = document.hears.intersects(EventSet::LEASE);
     let noted = decision.pick().filter(|_| leased);
     let lease = noted.and_then(|pick| {
         let first = pick.targets.first()?;
@@ -379,9 +387,9 @@ pub(super) fn issued(
             tokens: facts.prompt_tokens,
         })
     });
-    let issue = own.hears.contains(EventKind::Issued);
+    let issue = document.hears.contains(EventKind::Issued);
     if let Some(lease) = lease.as_ref().filter(|_| issue) {
-        own.spec.engine().on_decision_issued(lease, &decision);
+        document.spec.engine().on_decision_issued(lease, &decision);
     }
     DecideOutcome {
         decision,
@@ -619,7 +627,8 @@ pub(crate) mod tests {
     #[test]
     fn a_place_picked_under_a_document_that_takes_a_word_is_noted() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place(MODEL, Phase::Single);
+        let document = engine.document.load();
+        let place = document.spec.engine().place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = engine.pool_members(&list);
@@ -704,7 +713,7 @@ pub(crate) mod tests {
             id: place(worker).map(|at| wide(at as u64)),
             ..FixedFacts::default()
         });
-        let records = members.records(&engine.spec, &engine.clock);
+        let records = members.records(&engine.document.load().spec, &engine.clock);
         let stated: Vec<WorkerId> = (0..4).map(wide).collect();
         assert_eq!(records.ids(), stated);
         for (row, worker) in records.fixed().iter().zip(list.iter()) {
@@ -733,7 +742,7 @@ pub(crate) mod tests {
             .iter()
             .map(|worker| worker_id(worker.as_ref()))
             .collect();
-        let records = unsaid.records(&engine.spec, &engine.clock);
+        let records = unsaid.records(&engine.document.load().spec, &engine.clock);
         assert_eq!(records.ids(), prints);
     }
 
@@ -756,7 +765,7 @@ pub(crate) mod tests {
             .iter()
             .map(|worker| worker_id(worker.as_ref()))
             .collect();
-        let records = members.records(&engine.spec, &engine.clock);
+        let records = members.records(&engine.document.load().spec, &engine.clock);
         assert_eq!(records.ids(), prints);
 
         // The stock sessions rule: a key's first request is placed and
@@ -1278,7 +1287,8 @@ pub(crate) mod tests {
     #[test]
     fn a_decision_without_a_lease_takes_no_id_and_tells_no_stage() {
         let (engine, heard) = hearing_as(false, true, EventSet::LEASE);
-        let place = engine.place(MODEL, Phase::Single);
+        let document = engine.document.load();
+        let place = document.spec.engine().place_for(MODEL, Phase::Single);
         assert!(matches!(place, Place::Alone(_)), "{place:?}");
         let list = pool(4);
         let members = engine.pool_members(&list);
@@ -1316,7 +1326,9 @@ pub(crate) mod tests {
             issued_micros: 0,
             tokens: 0,
         };
-        engine.spec().engine().on_decision_issued(&lease, &decision);
+        let document = engine.document.load();
+        let stages = document.spec.engine();
+        stages.on_decision_issued(&lease, &decision);
         assert_eq!(heard.lock().as_slice(), [("issued", first.id, 0)]);
     }
 
@@ -2391,7 +2403,7 @@ pub(crate) mod tests {
                 takes: EventSet::NONE,
             }))
         });
-        assert_eq!(engine.hears, EventSet::LEASE);
+        assert_eq!(engine.document.load().hears, EventSet::LEASE);
         assert_eq!(
             told(&engine, &heard),
             ["issued", "dispatched", "completed", "issued", "released"]
@@ -2468,7 +2480,8 @@ pub(crate) mod tests {
     fn a_worker_said_gone_and_back_at_its_address_serves_its_sessions_again() {
         let (engine, both) = (preset("manual"), pool(2));
         let start = Instant::now();
-        let absence = Duration::from_micros(engine.spec.engine().pins_absence_micros());
+        let document = engine.document.load();
+        let absence = Duration::from_micros(document.spec.engine().pins_absence_micros());
         // The key's request over `list` in quarter `turn`: its worker.
         let sent = |list: &Arc<[Arc<dyn Worker>]>, turn: u32| {
             let members = engine.pool_members(list);

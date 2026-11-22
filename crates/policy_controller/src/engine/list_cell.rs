@@ -33,7 +33,7 @@ use std::{
 use smg_worker::identity::basic::Worker;
 
 use super::{
-    policy_engine::{PolicyEngine, PoolMembers},
+    policy_engine::{InForce, PolicyEngine, PoolMembers},
     view::FixedFacts,
 };
 
@@ -85,9 +85,9 @@ struct Made {
 }
 
 impl Made {
-    /// The value of a lent list, made by `engine` under the document whose
-    /// number is `under`.
-    fn of(engine: &PolicyEngine, lent: LentList<'_>, under: u64) -> Self {
+    /// The value of a lent list, made by `engine` of `document` and under
+    /// its number: the document in force as the list's ask loaded it.
+    fn of(engine: &PolicyEngine, document: &InForce, lent: LentList<'_>) -> Self {
         assert!(
             lent.facts
                 .is_none_or(|facts| facts.len() == lent.workers.len()),
@@ -97,8 +97,8 @@ impl Made {
         let mut stated = lent.facts.unwrap_or_default().iter();
         let facts_of = |_: &Arc<dyn Worker>| stated.next().copied().unwrap_or_default();
         Self {
-            under,
-            members: engine.pool_members_with_fixed_facts(lent.workers, facts_of),
+            under: document.applied,
+            members: engine.members_under(document, lent.workers, facts_of),
             next: ListCell::default(),
         }
     }
@@ -191,11 +191,14 @@ impl PolicyEngine {
     /// check stands in the fill and costs a read nothing: a cell that
     /// holds the value is read with no look at the facts.
     pub fn members_of<'a>(&self, lent: LentList<'a>) -> &'a PoolMembers {
-        let (number, mut cell) = (self.applied(), lent.cell);
+        // One load an ask: the number compared and the document a value is
+        // made of are the same document's, whatever is applied meanwhile.
+        let document = self.in_force();
+        let mut cell = lent.cell;
         let members = loop {
-            let make = || Box::new(Made::of(self, lent, number));
+            let make = || Box::new(Made::of(self, &document, lent));
             let made = cell.0.get_or_init(make);
-            if made.under == number {
+            if made.under == document.applied {
                 break &made.members;
             }
             cell = &made.next;
@@ -224,7 +227,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::document::spec::{AppliedSpec, PolicySpec};
+    use crate::{
+        document::spec::{AppliedSpec, PolicySpec},
+        engine::DecisionEngine,
+    };
 
     const MODEL: &str = "model-a";
 
@@ -337,9 +343,15 @@ mod tests {
         }
     }
 
+    /// The stock document the cases decide under, as `generation`.
+    fn stock(generation: u64) -> AppliedSpec {
+        let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+        document.generation = generation;
+        AppliedSpec::validate(&document).expect("the preset validates")
+    }
+
     fn engine() -> PolicyEngine {
-        let document = PolicySpec::preset("round_robin").expect("a built-in preset");
-        PolicyEngine::new(AppliedSpec::validate(&document).expect("the preset validates"))
+        PolicyEngine::new(stock(0))
     }
 
     fn regular(at: usize) -> Arc<dyn Worker> {
@@ -351,10 +363,23 @@ mod tests {
         cell.0.get().map(|made| &made.members)
     }
 
+    /// The step of a cell's read that reaches `members`: one for the value
+    /// the cell took first.
+    fn step_of(cell: &ListCell, members: &PoolMembers) -> Option<usize> {
+        let (mut cell, mut step) = (cell, 1);
+        while let Some(made) = cell.0.get() {
+            if ptr::eq(&made.members, members) {
+                return Some(step);
+            }
+            (cell, step) = (&made.next, step + 1);
+        }
+        None
+    }
+
     /// Whether each worker takes images, as the list's records under
     /// `engine` say it, by the worker's place.
     fn take_images(engine: &PolicyEngine, members: &PoolMembers) -> Vec<bool> {
-        let records = members.records(engine.spec(), engine.clock());
+        let records = engine.with_spec(|spec| members.records(spec, engine.clock()));
         records.fixed().iter().map(|row| row.vision).collect()
     }
 
@@ -514,6 +539,61 @@ mod tests {
         assert!(size_of::<ListCell>() <= 2 * size_of::<usize>());
     }
 
+    /// A list that stands across an apply keeps the earlier document's
+    /// value in its cell, where a decision under way reads it. The engine's
+    /// value under the applied document is made behind it, and read one
+    /// step later for each document applied while the list stands. A list
+    /// the program publishes again behind an apply has an empty cell: the
+    /// engine's value is its first, read at the first step.
+    #[test]
+    fn a_list_published_again_behind_an_apply_is_read_at_the_first_step() {
+        let (engine, program) = (engine(), Program::of(&[regular(0), regular(1)]));
+        let standing = program.published();
+        let before = engine.members_of(standing.all());
+        assert_eq!(step_of(&standing.all_cell, before), Some(1));
+        for (generation, step) in [(1, 2), (2, 3)] {
+            engine
+                .apply(stock(generation))
+                .expect("a higher generation");
+            let behind = engine.members_of(standing.all());
+            assert_eq!(step_of(&standing.all_cell, behind), Some(step));
+            assert!(ptr::eq(engine.members_of(standing.all()), behind));
+            let records = behind.records(&stock(0), engine.clock());
+            assert_eq!(records.generation(), generation, "of the document applied");
+        }
+        let first = first_of(&standing.all_cell).expect("a filled cell");
+        assert!(ptr::eq(first, before), "the earlier value stands");
+
+        // A membership change publishes the model's lists again.
+        let registered = program.registry.register(regular(2));
+        assert!(registered.is_some(), "a new worker registers");
+        let again = program.published();
+        let served = engine.members_of(again.all());
+        assert_eq!(step_of(&again.all_cell, served), Some(1));
+        assert_eq!(engine.values_made(), 4, "one value a document a list");
+    }
+
+    /// An ask makes its value of the document it loaded and under that
+    /// document's number, whatever is applied before the value is made: the
+    /// list's records name the generation the ask loaded.
+    #[test]
+    fn a_value_is_made_of_the_document_its_ask_loaded() {
+        let (engine, (list, _)) = (engine(), stated_list((0..3).map(regular).collect()));
+        let cell = ListCell::default();
+        let lent = LentList {
+            workers: &list,
+            cell: &cell,
+            facts: None,
+        };
+        let loaded = engine.in_force();
+        engine.apply(stock(1)).expect("a higher generation");
+        let made = Made::of(&engine, &loaded, lent);
+        assert_eq!(made.under, loaded.applied);
+        assert_ne!(made.under, engine.applied(), "not the number in force");
+        let records = made.members.records(&stock(2), engine.clock());
+        assert_eq!(records.generation(), 0, "of the document the ask loaded");
+    }
+
     /// Engines that ask one empty cell at once each get one value: two
     /// askers of one engine read the same value, and no two engines share
     /// one.
@@ -561,8 +641,8 @@ mod tests {
         };
         let mut cell = ListCell::default();
         for under in 0..20_000 {
-            let mut made = Box::new(Made::of(&engine, lent, under));
-            made.next = cell;
+            let mut made = Box::new(Made::of(&engine, &engine.in_force(), lent));
+            (made.under, made.next) = (under, cell);
             cell = ListCell(OnceLock::from(made));
         }
         let small = thread::Builder::new().stack_size(64 * 1024);

@@ -35,7 +35,7 @@ use smg_worker::{identity::basic::Worker, load::state::LoadSnapshot};
 
 use super::{
     single::{self, WholeDecision},
-    PolicyEngine, PoolMembers,
+    InForce, PolicyEngine, PoolMembers,
 };
 use crate::engine::{
     decision::Decision,
@@ -83,12 +83,13 @@ impl WholeDecision for WithShadow<'_> {
 #[inline(never)]
 pub(super) fn issued(
     own: &PolicyEngine,
+    document: &InForce,
     decision: Decision,
     request: &Request<'_>,
     now: Instant,
     said: Shadowed,
 ) -> DecideOutcome {
-    let decided = single::issued(own, decision, request, now);
+    let decided = single::issued(own, document, decision, request, now);
     count(own, said);
     decided
 }
@@ -108,6 +109,7 @@ pub(super) fn issued(
 #[inline(never)]
 pub(super) fn decide(
     own: &PolicyEngine,
+    document: &InForce,
     request: &mut Request<'_>,
     members: &PoolMembers,
     loads: Option<&Arc<LoadSnapshot>>,
@@ -119,7 +121,7 @@ pub(super) fn decide(
         binding,
         outcome: &mut outcome,
     };
-    let decision = single::decide(own, request, members, loads, now, whole);
+    let decision = single::decide(own, document, request, members, loads, now, whole);
     let said = match outcome {
         Shadow::Said(said) => Some(said),
         Shadow::NotDue => None,

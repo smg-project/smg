@@ -1,9 +1,8 @@
 //! The decision engine: the stages run over one request's candidate workers,
 //! what a decision reads (the view) and what it returns, and the engine that
 //! decides over the policy store. Behind the `in-process` feature,
-//! `PolicyEngine` is the engine in a gateway's own process: it gives the
-//! gateway's own placement its pick over the gateway's worker objects, read
-//! in place.
+//! `PolicyEngine` is the engine in a gateway's own process: it decides a
+//! gateway's requests over the gateway's worker objects, read in place.
 //!
 //! [`PromptHashes`] are the block hashes of a request's prompt, made under
 //! its [`HashSeeds`]. A caller writes them into the request facts of the

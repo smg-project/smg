@@ -69,7 +69,7 @@ use crate::{
             DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
         },
     },
-    tracking::dispatch_credit::DispatchCredit,
+    tracking::{dispatch_credit::DispatchCredit, lease::Lease},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -5434,6 +5434,15 @@ impl AppliedSpec {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The engine that hears the words of `lease` under this document: its
+    /// own, where the lease was issued under this generation. A later
+    /// generation's engine heard no issue of the lease and hears nothing of
+    /// it: no dispatch, no end, and no issue of a side a call decides later.
+    #[inline]
+    pub(crate) fn issuing(&self, lease: &Lease) -> Option<&Engine> {
+        (self.generation() == lease.generation).then(|| self.engine())
     }
 
     /// The document's engine reads and writes `table` from here on

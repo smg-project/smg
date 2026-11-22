@@ -237,7 +237,8 @@ fn the_engines_pass_drops_the_session_keys_past_their_end() {
     first.dispatched(now);
     first.completed(&served(pinned.id), now);
     drop(first);
-    let sessions = engine.spec().engine().sessions();
+    let document = engine.document.load_full();
+    let sessions = document.spec.engine().sessions();
     assert_eq!(sessions.len(), 1);
     // The stock rule forgets a key at its first sweep, one a minute, four
     // hours after its last request.
@@ -332,7 +333,7 @@ fn the_session_table_is_the_engines_own_under_every_document() {
         let engine = preset(name);
         let own = &*engine.sessions;
         assert!(
-            std::ptr::eq(engine.spec().engine().sessions(), own),
+            std::ptr::eq(engine.document.load().spec.engine().sessions(), own),
             "{name}: the document's engine reads the engine's table"
         );
         assert_eq!(own.shards(), shards_for_this_host(), "{name}");

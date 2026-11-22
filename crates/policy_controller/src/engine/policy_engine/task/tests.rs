@@ -27,6 +27,7 @@ use crate::{
     engine::{
         decision_engine::{DecisionEngine, Request, RequestMaker, SweepOutcome, WorkerLists},
         policy_engine::{PolicyEngine, PoolMembers},
+        prompt_hashes::HashSeeds,
         view::{Constraints, Identity, RequestFacts, WorkerId},
     },
     store::GatewayId,
@@ -38,12 +39,16 @@ use crate::{
 
 const MODEL: &str = "model-a";
 
+/// A stock document as `generation`.
+fn stock(name: &str, generation: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset(name).expect("a built-in preset");
+    document.generation = generation;
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
 /// The engine of a stock document, as a host that spawns its task holds it.
 fn preset(name: &str) -> Arc<PolicyEngine> {
-    let mut document = PolicySpec::preset(name).expect("a built-in preset");
-    document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the document validates");
-    Arc::new(PolicyEngine::new(spec))
+    Arc::new(PolicyEngine::new(stock(name, 1)))
 }
 
 fn url(at: usize) -> String {
@@ -237,6 +242,31 @@ async fn a_later_hand_over_replaces_the_channel() {
     task.abort();
 }
 
+/// Two hand-overs between two runs of the upkeep leave the one handed
+/// last: the task takes it at its next run, and the monitor of the one
+/// before, which it never followed, is not heard.
+#[tokio::test(start_paused = true)]
+async fn two_hand_overs_between_two_upkeeps_leave_the_last() {
+    let engine = preset("least_load");
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let task = running(&engine).await;
+    let (first, channel) = monitor(&reports(4, 2));
+    engine.set_loads(channel);
+    let (_second, channel) = monitor(&reports(4, 3));
+    engine.set_loads(channel);
+    sleep(Duration::from_secs(1)).await;
+    for seed in 0..32 {
+        let place = picked(&engine, &asks(seed, &members, None));
+        assert_eq!(place, 3, "seed {seed}: the channel handed last");
+    }
+    first.publish(&reports(4, 0));
+    settle().await;
+    let place = picked(&engine, &asks(7, &members, None));
+    assert_eq!(place, 3, "the first monitor was never followed");
+    task.abort();
+}
+
 /// A decision reads the snapshot its request gives where it gives one, and
 /// the engine's own otherwise: a host that still hands a snapshot is
 /// answered by it, whatever the task holds.
@@ -307,7 +337,8 @@ async fn the_task_runs_the_upkeep_with_no_call_of_its_host() {
     first.dispatched(now);
     first.completed(&served(pinned.id), now);
     drop(first);
-    let sessions = engine.spec().engine().sessions();
+    let document = engine.document.load_full();
+    let sessions = document.spec.engine().sessions();
     assert_eq!(sessions.len(), 1);
     // The stock rule idles a key four hours and sweeps once a minute: the
     // key ends at the first sweep at or after its idle time, and the pass
@@ -316,6 +347,86 @@ async fn the_task_runs_the_upkeep_with_no_call_of_its_host() {
     assert_eq!(sessions.len(), 1, "inside the idle time");
     sleep(Duration::from_secs(600)).await;
     assert_eq!(sessions.len(), 0, "past its end");
+    task.abort();
+}
+
+/// The stock sessions rule with its idle time and its sweep interval set,
+/// as `generation`.
+fn ruled(ttl_s: u32, sweep_s: u32, generation: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+    document.generation = generation;
+    let rule = document.bindings[0].sessions.as_mut();
+    let rule = rule.expect("the stock rule");
+    (rule.ttl_s, rule.sweep_s) = (ttl_s, sweep_s);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// The engine's table takes the applied document's two times and keeps its
+/// keys, and the task's upkeep runs on behind the apply. A key pinned under
+/// the document before ends at that document's sweep, on the hour, and the
+/// table's own hourly pass is due half an hour later. Under the applied
+/// document's interval of ten seconds the key leaves within ten seconds of
+/// its end, by the task's own pass.
+#[tokio::test(start_paused = true)]
+async fn a_key_of_the_document_before_leaves_at_a_pass_of_the_applied_document() {
+    const SECOND: u64 = 1_000_000;
+    // Idle after a minute, swept once an hour.
+    let engine = Arc::new(PolicyEngine::new(ruled(60, 3_600, 1)));
+    // The task starts half an hour into the engine's clock, and the table's
+    // first pass with it: its hourly passes fall on the half hours.
+    sleep(Duration::from_secs(1_800)).await;
+    let task = running(&engine).await;
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let mut keyed = asks(51, &members, None);
+    keyed.request.facts.session_key = Identity::hashed(51);
+    let now = tokio::time::Instant::now().into_std();
+    let mut first = DecisionGuard::decide_under(engine.as_ref(), GatewayId::LOCAL, &keyed, now)
+        .expect("a decision");
+    let pinned = first.take(0).expect("the first target");
+    first.dispatched(now);
+    first.completed(&served(pinned.id), now);
+    drop(first);
+    let table = &engine.sessions;
+    let times = || (table.sweep_micros(), table.absence_micros());
+    assert_eq!(times(), (3_600 * SECOND, 60 * SECOND));
+
+    // Idle after half a minute, swept every ten seconds.
+    let two = ruled(30, 10, 2);
+    engine.apply(two).expect("a higher generation");
+    assert_eq!(
+        times(),
+        (10 * SECOND, 30 * SECOND),
+        "the applied document's"
+    );
+    assert_eq!(table.len(), 1, "the table keeps its keys");
+    sleep(Duration::from_secs(1_700)).await;
+    assert_eq!(table.len(), 1, "ahead of the key's end, on the hour");
+    sleep(Duration::from_secs(120)).await;
+    assert_eq!(table.len(), 0, "gone at a pass of the applied document");
+    task.abort();
+}
+
+/// The task's upkeep takes the step of the records of sent prefixes too:
+/// the placements of a worker told gone wait in the record, and leave it at
+/// the task's next runs, with no call of the host.
+#[tokio::test(start_paused = true)]
+async fn the_upkeep_takes_the_step_of_the_sent_prefixes() {
+    let engine = preset("cache_aware");
+    let list = pool(8);
+    let members = engine.pool_members(&list);
+    let task = running(&engine).await;
+    let tokens: Vec<u32> = (0..1_024).collect();
+    let hashes = engine.prompt_hashes(MODEL, Some(&tokens), None, HashSeeds::PLAIN);
+    let mut sent = asks(7, &members, None);
+    hashes.write_to(&mut sent.request.facts);
+    let place = picked(&engine, &sent) as usize;
+    let held = engine.affinity.placements();
+    assert!(held > 0, "the prompt's blocks are recorded for its worker");
+    engine.forget(list[place].url());
+    assert_eq!(engine.affinity.placements(), held, "they wait for a sweep");
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(engine.affinity.placements(), 0, "taken out by the task");
     task.abort();
 }
 
