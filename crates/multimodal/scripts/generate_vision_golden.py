@@ -14,6 +14,10 @@ Usage:
     # Use specific image
     python crates/multimodal/scripts/generate_vision_golden.py \
         --image crates/multimodal/tests/fixtures/images/square.jpg
+
+Requires transformers==5.20.2, torch==2.15.0, torchvision==0.29.2, pillow==13.0.0,
+numpy==2.5.4 and scipy==1.18.1: the versions the CI step "Generate vision golden
+fixtures" of .github/workflows/pr-test-rust.yml installs. Change both together.
 """
 
 import argparse
