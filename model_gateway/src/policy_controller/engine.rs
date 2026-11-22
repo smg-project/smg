@@ -1479,38 +1479,32 @@ impl PolicyEngine {
         }
     }
 
-    /// A regular attempt's worker at `now`: the ask and the commit, three
-    /// asks at most. After the third the attempt has no worker.
+    /// A regular attempt's worker at `now`, under no rule of a route: the
+    /// ask and the commit, three asks at most. After the third the attempt
+    /// has no worker. The entry of the cases, which date a decision: the
+    /// attempt's first decision is dated at the instant handed, and a later
+    /// ask of the attempt reads the clock.
+    #[cfg(test)]
     pub(crate) async fn place(&self, ask: &Ask<'_>, now: Instant) -> Result<Placed, Unplaced> {
-        self.place_where(ask, |_| true, now).await
-    }
-
-    /// A regular attempt's worker at `now` on a route with a rule of its
-    /// own: as [`PolicyEngine::place`], over [`PolicyEngine::commit_where`].
-    /// Where the engine of this process decides, the ask and the commit are
-    /// one pass over the registry's list ([`Self::place_listed`]).
-    pub(crate) async fn place_where(
-        &self,
-        ask: &Ask<'_>,
-        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
-        now: Instant,
-    ) -> Result<Placed, Unplaced> {
+        let holds = |_: &dyn Worker| true;
         {
-            // The attempt's first decision is dated at the instant handed.
-            // A later ask of the attempt reads the clock.
             let handed = Cell::new(Some(now));
             let clock = || handed.take().unwrap_or_else(Instant::now);
-            if let Some(placed) = self.place_here(ask, &holds, clock) {
+            if let Some(placed) = self.place_here(ask, holds, clock) {
                 return placed;
             }
         }
         self.place_followed(ask, &holds, now).await
     }
 
-    /// [`Self::place_where`] for a route that hands a clock and no instant.
-    /// `clock` is read where the attempt's decision is dated, and not at
-    /// all where the engine of this process answers a place: a request
-    /// nothing is dated for reads no clock.
+    /// A regular attempt's worker on a route with a rule of its own, which
+    /// hands a clock: the ask, and the commit over
+    /// [`PolicyEngine::commit_where`], three asks at most. Where the engine
+    /// of this process decides, the ask and the commit are one pass over
+    /// the registry's list ([`Self::place_listed`]). `clock` is read where
+    /// the attempt's decision is dated, and not at all where the engine of
+    /// this process answers a place: a request nothing is dated for reads
+    /// no clock.
     pub(crate) async fn place_at(
         &self,
         ask: &Ask<'_>,
@@ -1560,7 +1554,7 @@ impl PolicyEngine {
 
     /// A regular attempt's worker where `engine`, the engine of this
     /// process, decides over the lists `registry` publishes: the ask and
-    /// the commit of [`PolicyEngine::place_where`] in one pass on the
+    /// the commit of [`PolicyEngine::place_at`] in one pass on the
     /// calling thread, three asks at most.
     ///
     /// Each ask reads the list the registry publishes for the ask's pool

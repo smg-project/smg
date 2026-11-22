@@ -960,10 +960,10 @@ async fn a_target_the_routes_rule_refuses_is_passed_over() {
     let (policy_engine, _store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
     for turn in 0..8u8 {
         let placed = policy_engine
-            .place_where(
+            .place_at(
                 &first(&[turn]),
                 |worker| worker.url() != "http://w0:8000",
-                Instant::now(),
+                Instant::now,
             )
             .await
             .expect("the worker the rule holds");
@@ -975,7 +975,7 @@ async fn a_target_the_routes_rule_refuses_is_passed_over() {
 async fn a_rule_that_refuses_every_target_ends_the_attempt_and_its_leases() {
     let (policy_engine, store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
     let unplaced = policy_engine
-        .place_where(&first(b"r1"), |_| false, Instant::now())
+        .place_at(&first(b"r1"), |_| false, Instant::now)
         .await
         .err();
     assert_eq!(unplaced, Some(Unplaced::NoTargetHolds));

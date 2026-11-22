@@ -365,7 +365,7 @@ async fn a_routes_rule_narrows_the_attempt_to_the_workers_it_holds() {
             ..Ask::of(&id, MODEL)
         };
         let placed = policy_engine
-            .place_where(&ask, &holds, Instant::now())
+            .place_at(&ask, &holds, Instant::now)
             .await
             .expect("a worker the rule holds");
         let at = held
@@ -386,7 +386,7 @@ async fn a_routes_rule_narrows_the_attempt_to_the_workers_it_holds() {
             ..Ask::of(&id, MODEL)
         };
         let unplaced = policy_engine
-            .place_where(&ask, |_| false, Instant::now())
+            .place_at(&ask, |_| false, Instant::now)
             .await
             .err();
         assert!(

@@ -125,9 +125,9 @@ use smg::{
     routers::{
         common::{
             bench_support::{
-                attach_loads, policies_asking_the_engine, route_classic, route_engine, route_http,
-                route_pair, route_records, set_pair_sides, thread_allocated_bytes, CellPlacer,
-                EngineObject, EngineOverRecords, Route,
+                attach_loads, policies_asking_the_engine, route_pair, route_records, route_single,
+                set_pair_sides, thread_allocated_bytes, CellPlacer, EngineObject,
+                EngineOverRecords, Route,
             },
             snapshot::WorkerRegistry,
         },
@@ -485,10 +485,15 @@ impl Conversation {
 /// policies (the classic ones, or the objects that ask the engine), the
 /// policy engine's whole decision over records, or the gateway's own engine
 /// object, which the routers ask for the whole decision.
+///
+/// A single request of the policies or of the engine object goes through
+/// the one placing call, on either route: such a cell holds who places
+/// ([`CellPlacer`]), chosen once here as a router chooses where it is built.
+/// A pair cell holds none: its two side policies place the pair.
 enum Decider {
-    Policies(Arc<PolicyRegistry>),
+    Policies(Arc<PolicyRegistry>, Option<CellPlacer>),
     Records(EngineOverRecords),
-    Engine(EngineObject),
+    Engine(CellPlacer),
 }
 
 /// The load feed of a cell and the reports it publishes: one a worker.
@@ -588,10 +593,12 @@ fn build(cell: &Cell) -> Built {
             if cell.reports {
                 attach_loads(&policies, receiver);
             }
-            Decider::Policies(policies)
+            let placer = (!cell.pair).then(|| CellPlacer::classic(&policies));
+            Decider::Policies(policies, placer)
         }
         None if cell.path == "engine" => {
-            Decider::Engine(EngineObject::of(&config, &registry, receiver).unwrap())
+            let object = EngineObject::of(&config, &registry, receiver).unwrap();
+            Decider::Engine(CellPlacer::engine(&object))
         }
         None => Decider::Records(EngineOverRecords::of(&config, receiver).unwrap()),
     });
@@ -608,7 +615,7 @@ fn build(cell: &Cell) -> Built {
                 .iter()
                 .map(|model| EngineObject::conversions(&registry, model, route))
                 .sum(),
-            Decider::Policies(_) => 0,
+            Decider::Policies(..) => 0,
         })
     };
     let (route, pair) = (cell.route, cell.pair);
@@ -616,16 +623,6 @@ fn build(cell: &Cell) -> Built {
         !(pair && cell.keys != 0),
         "a pair cell sends no routing key"
     );
-    // A single request on the regular HTTP route goes through the one
-    // placing call, by whoever the cell's path says places: chosen once
-    // here, as the router chooses where it is built.
-    let placer = match &*decider {
-        Decider::Policies(policies) if route == Route::Http && !pair => {
-            Some(CellPlacer::classic(policies))
-        }
-        Decider::Engine(object) if route == Route::Http => Some(CellPlacer::engine(object)),
-        Decider::Policies(_) | Decider::Engine(_) | Decider::Records(_) => None,
-    };
     assert!(
         !(cell.grow > 0 && cell.models > 1),
         "a growing conversation is one model's"
@@ -637,20 +634,16 @@ fn build(cell: &Cell) -> Built {
             0 => None,
             count => keys.get((turn % count as u64) as usize),
         };
-        if let Some(placer) = &placer {
-            return route_http(&registry, placer, model, Some(tokens), headers);
-        }
         match &*decider {
-            Decider::Policies(policies) if pair => {
-                route_pair(&registry, policies, model, Some(tokens))
+            Decider::Policies(_, Some(placer)) | Decider::Engine(placer) => {
+                route_single(&registry, placer, model, route, Some(tokens), headers)
             }
-            Decider::Policies(policies) => {
-                route_classic(&registry, policies, model, route, Some(tokens), headers)
+            Decider::Policies(policies, None) => {
+                route_pair(&registry, policies, model, Some(tokens))
             }
             Decider::Records(engine) => {
                 route_records(&registry, engine, model, route, Some(tokens), headers)
             }
-            Decider::Engine(object) => route_engine(&registry, object, model, route, Some(tokens)),
         }
     });
     Built {
