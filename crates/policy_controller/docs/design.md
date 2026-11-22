@@ -501,9 +501,10 @@ dropped with the old list.
 
 A host that knows a fact of its workers that their objects do not hold asks through
 `PolicyEngine::pool_members_with_fixed_facts` instead. It says the fact once for each worker, at
-that call, and the engine writes it into the worker's record (5.3). The one such fact today is
-whether a worker takes images. That entry makes the list's records at the call, where
-`pool_members` leaves them to their first use.
+that call, and the engine writes it into the worker's record (5.3). Two such facts stand today:
+whether a worker takes images, and the id the host knows the worker by where it keeps ids of its
+own. That entry makes the list's records at the call, where `pool_members` leaves them to their
+first use.
 
 ```rust
 // engine/policy_engine.rs
@@ -530,7 +531,7 @@ each worker, 64-byte aligned, in a buffer that belongs to the deciding thread.
 pub struct Candidate {
     // identity: does not change while the list lives
     pub position: u32,       // the worker's place in the host's list; a decision names workers by it
-    pub id: WorkerId,        // a 64-bit fingerprint of the worker's address
+    pub id: WorkerId,        // the id its host states, or a 64-bit fingerprint of the worker's address
     pub key: u32,            // stable identity used by hash-based placement
     pub role: Role,          // regular, prefill, decode or encode
     pub dp_rank: u16,        // data-parallel rank; a rank is a candidate of its own

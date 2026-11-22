@@ -267,12 +267,13 @@ impl PolicyEngine {
     /// The worker at `address` left its pool or was replaced: the records
     /// of sent prefixes forget it, so no later request is named a worker
     /// that is gone, and the document's stages are told
-    /// ([`Membership::Removed`]) under the id every decision knew the
-    /// worker by. A stage that keeps a range, a count or a credit of the
-    /// worker drops it. The session table is not told: a session's pin
-    /// stands on a worker that is gone, however long, and is a routable pin
-    /// again once the worker is back. A host says it at a removal, where it
-    /// tells its classic policies.
+    /// ([`Membership::Removed`]). Both name the worker by the fingerprint
+    /// of its address: the id every decision knew it by, where its program
+    /// states none ([`FixedFacts::id`]). A stage that keeps a range, a
+    /// count or a credit of the worker drops it. The session table is not
+    /// told: a session's pin stands on a worker that is gone, however long,
+    /// and is a routable pin again once the worker is back. A host says it
+    /// at a removal, where it tells its classic policies.
     ///
     /// In the records a worker none of them holds costs one lookup a model.
     /// Every stage is told whatever the records hold, and one that keeps a
@@ -290,10 +291,11 @@ impl PolicyEngine {
     }
 
     /// The worker at `address` joined: the document's stages are told
-    /// ([`Membership::Added`]) under the id every decision names the worker
-    /// by. A stage that keeps a pruned worker out for a while lists a
-    /// worker back at the address it left at once. A host says it at a
-    /// registration, where it tells its classic policies.
+    /// ([`Membership::Added`]) under the fingerprint of its address, the id
+    /// every decision names the worker by where its program states none
+    /// ([`FixedFacts::id`]). A stage that keeps a pruned worker out for a
+    /// while lists a worker back at the address it left at once. A host
+    /// says it at a registration, where it tells its classic policies.
     pub fn joined(&self, address: &str) {
         let id = WorkerId(fingerprint(address.as_bytes()));
         self.told(&Membership::Added(id));
@@ -361,7 +363,8 @@ impl PolicyEngine {
     }
 
     /// [`Self::pool_members`], for a program that knows anything of its
-    /// workers beside their objects ([`FixedFacts`]): whether a worker
+    /// workers beside their objects ([`FixedFacts`]): the id it names a
+    /// worker by where it keeps ids of its own, or whether a worker
     /// takes images. Such a program calls this one for every list.
     /// `facts_of` is asked once a worker, in the list's order, here, and
     /// never at a decision: every fact a program says of a worker is a
@@ -866,6 +869,7 @@ mod tests {
             asked.set(asked.get() + 1);
             FixedFacts {
                 vision: Arc::ptr_eq(worker, &list[1]),
+                ..FixedFacts::default()
             }
         });
         assert_eq!(asked.get(), 4, "asked at the call, once a worker");

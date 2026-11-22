@@ -810,7 +810,8 @@ pub struct Candidate {
 
 /// What a program says of a worker for the half of its record that no
 /// request changes, where the worker object holds no such fact: whether
-/// the worker takes images. A host that keeps such a fact beside its
+/// the worker takes images, and the id the program knows the worker by
+/// where it keeps ids of its own. A host that keeps such a fact beside its
 /// workers tells it to what writes the workers' records, once a list: a
 /// gateway of its own registrations, a controller of the stored worker an
 /// object stands for. The default says nothing. Further facts add their
@@ -820,6 +821,30 @@ pub struct Candidate {
 pub struct FixedFacts {
     /// Whether the worker takes images ([`Candidate::vision`]).
     pub vision: bool,
+    /// The id the program knows the worker by ([`Candidate::id`]): a
+    /// controller's id of the stored worker an object stands for. A
+    /// decision's targets name the worker by it, and so does every state
+    /// the engine writes from a decision. `None` for the fingerprint of
+    /// the worker's address, which a gateway's own process names a worker
+    /// by. A program states an id for every worker of its lists or for
+    /// none: one id space a program. A stated id is never `WorkerId(0)`:
+    /// zero reads as absent wherever an id travels (a lease, a trace, a
+    /// session's pins), so a zero stated here states none.
+    pub id: Option<WorkerId>,
+}
+
+impl FixedFacts {
+    /// The id the engine knows the worker by: the one stated
+    /// ([`Self::id`]), or `address`, the fingerprint of the worker's
+    /// address, where none is stated or the one stated is zero. A list's
+    /// records are written by it, so no record carries zero for an id.
+    #[must_use]
+    pub fn id_or(&self, address: WorkerId) -> WorkerId {
+        match self.id {
+            Some(id) if id != WorkerId(0) => id,
+            _ => address,
+        }
+    }
 }
 
 /// How far back the store's decision clock starts.
