@@ -45,6 +45,11 @@ pub(crate) const PAD: &str = "<pad>";
 /// `tiktoken.rs`).
 pub(crate) const PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// The most special ids a configuration may name: a bound of this reader,
+/// beyond the checks of the reference reader. A load keeps a slot for every
+/// special id the configuration names. The files in use name 1,000.
+const MAX_SPECIAL_TOKENS: usize = 1 << 16;
+
 /// The special tokens of a file that lists none: the reference reader's
 /// list for the versions up to v7, which predate the `special_tokens` block.
 const DEPRECATED_SPECIAL_TOKENS: [&str; 20] = [
@@ -415,6 +420,11 @@ fn vocabulary(file: File<'_>) -> Result<Vocabulary> {
     }
     let offset = TokenIdType::try_from(num_special)
         .context("default_num_special_tokens does not fit an id")?;
+    if num_special > MAX_SPECIAL_TOKENS {
+        bail!(
+            "default_num_special_tokens {num_special} is above the bound of {MAX_SPECIAL_TOKENS}"
+        );
+    }
     // Four characters of base64 decode to three bytes at the most.
     let bytes = vocab
         .iter()
@@ -887,6 +897,16 @@ mod tests {
         refused(
             testing::tekken_json(&testing::MERGES, Some(&[(0, "<unk>")]), 3, 300, "v13"),
             "the configuration needs 297",
+        );
+        refused(
+            testing::tekken_json(
+                &testing::MERGES,
+                Some(&[(0, "<unk>")]),
+                MAX_SPECIAL_TOKENS + 1,
+                MAX_SPECIAL_TOKENS + 261,
+                "v13",
+            ),
+            "default_num_special_tokens 65537 is above the bound of 65536",
         );
         // `hello` rewritten as `he`, a token the file lists already: the
         // reader passes it; the load refuses it and names the file as the
