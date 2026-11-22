@@ -955,9 +955,9 @@ mod tests {
         assert_eq!(size_of::<DecisionGuard<Arc<StoreBackedEngine>>>(), HELD);
         assert_eq!(size_of::<DecisionGuard<&StoreBackedEngine>>(), HELD);
         // A placement is the handle and what its host reads of the answer:
-        // two worker pointers, the routing key and the profile.
+        // two worker pointers, the routing key and the profile's label.
         #[cfg(feature = "in-process")]
-        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 56);
+        assert_eq!(size_of::<crate::tracking::Placement<'_>>(), HELD + 64);
     }
 
     /// A request that is served: its lease is booked at the issue, moves

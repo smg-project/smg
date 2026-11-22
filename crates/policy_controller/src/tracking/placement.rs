@@ -38,9 +38,7 @@ use super::{
 };
 use crate::{
     engine::{
-        decision_engine::{AlonePick, DecideOutcome},
-        policy_engine::PolicyEngine,
-        records::worker_id,
+        decision_engine::DecideOutcome, policy_engine::PolicyEngine, records::worker_id,
         view::WorkerId,
     },
     store::GatewayId,
@@ -63,9 +61,13 @@ pub struct Placement<'a> {
     /// host's in-flight counters. `None` where none was derived. Neither
     /// constructor derives one: the call that places the request writes it.
     pub routing_key: Option<&'a str>,
-    /// The profile whose picker picked, by its place in the document: what
-    /// a host counts the decision under.
-    pub profile: u16,
+    /// The profile whose picker picked, by its label: the profile's name as
+    /// the document writes it, as a string that lives as long as the
+    /// process. What a host counts the decision under. The call that
+    /// decided writes it, so it names the profile of the document that
+    /// decided, whatever document is in force later. The empty label for a
+    /// decision made ahead of every profile.
+    pub profile: &'static str,
     /// The pick's lease: a pair's always, a single request's where a stage
     /// of the document takes a word of a request. `None` for an answer of
     /// which nothing is owed.
@@ -73,17 +75,20 @@ pub struct Placement<'a> {
 }
 
 impl Placement<'_> {
-    /// The placement of a place ([`AlonePick`]): `worker` is the worker at
-    /// the pick's place in the list its host handed. Nothing is owed of
-    /// it, so it holds no lease, takes no id and reads no clock. The one
-    /// call for a request makes it ([`PolicyEngine::place`]).
+    /// The placement of a place
+    /// ([`AlonePick`](crate::engine::decision_engine::AlonePick)): `worker`
+    /// is the worker at the pick's place in the list its host handed, and
+    /// `profile` the label of the pick's profile, which the call that
+    /// decided read ([`PolicyEngine::label_at`]). Nothing is owed of it, so
+    /// it holds no lease, takes no id and reads no clock. The one call for
+    /// a request makes it ([`PolicyEngine::place`]).
     #[must_use]
-    pub(crate) fn alone(worker: Arc<dyn Worker>, pick: AlonePick) -> Self {
+    pub(crate) fn alone(worker: Arc<dyn Worker>, profile: &'static str) -> Self {
         Self {
             worker,
             decode: None,
             routing_key: None,
-            profile: pick.profile,
+            profile,
             held: None,
         }
     }
@@ -116,7 +121,9 @@ impl Placement<'_> {
         decode: Option<Arc<dyn Worker>>,
     ) -> Option<Self> {
         let pick = decided.decision.pick();
-        let profile = pick.map(|pick| pick.trace.profile);
+        // Read here, in the call that decided: the trace's number is a
+        // position in the document that decided.
+        let profile = pick.map(|pick| engine.label_at(pick.trace.profile));
         let target = pick.and_then(|pick| pick.targets.as_slice().get(index).copied());
         // Held ahead of every refusal below: a lease ends at this guard's
         // drop where the placement is not made.
@@ -209,6 +216,11 @@ impl Placement<'_> {
     /// pair's decode side. No lease stands for an encode side, so its end
     /// says nothing, as its send says nothing: it ends no side of the
     /// request.
+    ///
+    /// An end said of a side whose send was never said says the send
+    /// first, at the same instant: the stages hear a request's events in
+    /// their order, and one that times a request from its dispatch reads a
+    /// span of zero for it.
     pub fn ended(&mut self, side: Side, outcome: Outcome) {
         let Some(held) = &mut self.held else {
             return;

@@ -603,13 +603,12 @@ fn a_header_map_hands_the_documents_sources_their_values() {
 /// on the pick's own read of it: a worker that is not ready, which the pick
 /// passes over, is never the answer. Nothing is owed of such a placement,
 /// no routing value is derived for it, and it names the profile that
-/// picked.
+/// picked by its label.
 #[test]
 fn a_plain_request_is_placed_on_the_worker_at_its_place() {
     let engine = hosted(preset("round_robin"));
-    let Place::Alone(profile) = engine.place_for(MODEL, Phase::Single) else {
-        panic!("one pick decides the place");
-    };
+    let alone = matches!(engine.place_for(MODEL, Phase::Single), Place::Alone(_));
+    assert!(alone, "one pick decides the place");
     let list = pool(4);
     let members = engine.pool_members(&list);
     let headers = [("x-conversation", "talk-7")];
@@ -628,7 +627,7 @@ fn a_plain_request_is_placed_on_the_worker_at_its_place() {
         assert!(!placement.owes_events() && placement.decode.is_none());
         assert_eq!(
             (placement.profile, placement.routing_key),
-            (profile.0, None)
+            ("round_robin", None)
         );
     }
     assert_eq!(turns, [2; 4], "every worker takes its turn");
@@ -637,6 +636,74 @@ fn a_plain_request_is_placed_on_the_worker_at_its_place() {
     for turn in 0..8 {
         let placement = engine.place(&request).expect("a placement");
         assert!(!Arc::ptr_eq(&placement.worker, &list[1]), "turn {turn}");
+    }
+}
+
+/// A preset's document with a spare profile of another name ahead of the
+/// bound one, so that the bound profile is the document's second.
+fn spared(name: &str) -> &'static PolicyEngine {
+    let mut document = PolicySpec::preset(name).expect("a built-in preset");
+    document.generation = 1;
+    let spare = document.profiles[name].clone();
+    document.profiles.insert("a_spare".to_owned(), spare);
+    hosted(engine_of(&document))
+}
+
+/// One request of `engine` placed over a list of four workers, as the
+/// request keeps it.
+fn placed(engine: &'static PolicyEngine) -> Placement<'static> {
+    let list = pool(4);
+    let members = engine.pool_members(&list);
+    let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+    engine.place(&request).expect("a placement").kept()
+}
+
+/// A placement names the profile that picked by its label: the profile's
+/// name as its document writes it, one string a name for the life of the
+/// process. A place's placement holds it, and a whole decision's. Two
+/// engines of one document name the same string. An engine of another
+/// document, whose profile at the same position has another name, names
+/// its own.
+#[test]
+fn a_placement_names_the_profile_that_picked_by_its_label() {
+    // Where one pick decides the place, the position of the profile that
+    // picks: the second in each document, behind the spare one.
+    let alone_at = |engine: &PolicyEngine| match engine.place_for(MODEL, Phase::Single) {
+        Place::Alone(profile) => Some(profile.0),
+        _ => None,
+    };
+    let (turns, again) = (spared("round_robin"), spared("round_robin"));
+    let (passes, draws) = (spared("passthrough"), spared("random"));
+    let at = [alone_at(turns), alone_at(passes), alone_at(draws)];
+    assert_eq!(at, [Some(1), Some(1), None]);
+
+    let first = placed(turns);
+    assert_eq!(first.profile, "round_robin");
+    let same = ptr::eq(first.profile, placed(again).profile);
+    assert!(same, "one string a name");
+    // The other document's second profile has another name.
+    assert_eq!(placed(passes).profile, "passthrough");
+    // A whole decision's placement names its profile the same way.
+    assert_eq!(placed(draws).profile, "random");
+}
+
+/// Placing a request asks the process's table of names for nothing: the
+/// label a placement holds is read from the engine's own list, which the
+/// engine made at its start. A place's placement, and a whole decision's.
+#[test]
+fn placing_a_request_asks_the_table_of_names_for_nothing() {
+    let asked = || crate::names::ASKED.with(Cell::get);
+    for name in ["round_robin", "random"] {
+        let engine = hosted(preset(name));
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        let request = PlaceRequest::of(MODEL, WorkerLists::Single(&members));
+        let before = asked();
+        for _ in 0..8 {
+            let placement = engine.place(&request).expect("a placement");
+            assert_eq!(placement.profile, name);
+        }
+        assert_eq!(asked(), before, "{name}");
     }
 }
 
