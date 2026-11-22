@@ -307,20 +307,29 @@ fn a_shadow_of_another_outcome_changes_nothing_of_the_live_answer() {
 /// A request that states what no stage here runs is refused under that
 /// stage's name, as it is where no shadow is named. No profile decided it:
 /// the shadow's picker does not run, and no shadow decision is counted.
+/// A request whose demand no worker of the list meets is shed ahead of
+/// the decision alike, under the demand's stage.
 #[test]
 fn a_request_refused_ahead_of_the_decision_has_no_shadow() {
     let list = pool(3);
     let (engine, seen) = bed(Rule::Place(0), Rule::Place(1));
-    let mut stated = request(7);
-    stated.constraints.demands = Demands {
-        vision: true,
-        ..Demands::default()
-    };
-    let shed = match placed(&engine, &list, stated) {
+    let shed = |stated| match placed(&engine, &list, stated) {
         Decision::Shed(shed) => Ok((shed.reason, shed.emptied_by)),
         decision => Err(decision.pick().is_some()),
     };
-    assert_eq!(shed, Ok((ShedReason::PolicyDeclined, "demands")));
+    let mut hinted = request(7);
+    hinted.constraints.subset_hint = Some(2);
+    assert_eq!(
+        shed(hinted),
+        Ok((ShedReason::PolicyDeclined, "subset-hint"))
+    );
+    // The list's host said nothing of its workers: none takes images.
+    let mut demanding = request(7);
+    demanding.constraints.demands = Demands {
+        vision: true,
+        ..Demands::default()
+    };
+    assert_eq!(shed(demanding), Ok((ShedReason::NoEndpoints, "vision")));
     assert_eq!(seen.shadows(), 0);
     assert_eq!(kinds(&engine), [0; 4]);
 }

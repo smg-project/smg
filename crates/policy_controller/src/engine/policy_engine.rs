@@ -438,8 +438,11 @@ impl PolicyEngine {
     ///
     /// For a program that knows nothing of its workers beside their
     /// objects. Under this value every worker states nothing: none takes
-    /// images. A program that knows any such fact calls
-    /// [`Self::pool_members_with_fixed_facts`].
+    /// images, none meets a demand for a runtime or for media by
+    /// reference, and each holds a request of any size. A program that
+    /// knows any such fact calls [`Self::pool_members_with_fixed_facts`].
+    /// Whether a worker registered a data-parallel rank is read off its
+    /// object under either.
     #[must_use]
     pub fn pool_members(&self, pool: &Arc<[Arc<dyn Worker>]>) -> PoolMembers {
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed) + 1;
@@ -458,11 +461,13 @@ impl PolicyEngine {
 
     /// [`Self::pool_members`], for a program that knows anything of its
     /// workers beside their objects ([`FixedFacts`]): the id it names a
-    /// worker by where it keeps ids of its own, or whether a worker
-    /// takes images. Such a program calls this one for every list.
-    /// `facts_of` is asked once a worker, in the list's order, here, and
-    /// never at a decision: every fact a program says of a worker is a
-    /// field of that one answer.
+    /// worker by where it keeps ids of its own, whether a worker takes
+    /// images, or what it states for a request's hard demands. Such a
+    /// program calls this one for every list. `facts_of` is asked once a
+    /// worker, in the list's order, here, and never at a decision: every
+    /// fact a program says of a worker is a field of that one answer. A
+    /// request that states a demand is then held to the workers of the
+    /// list that meet it ([`PoolRecords::meeting`]).
     ///
     /// The list's records are made of the answers at this call, and not at
     /// the list's first whole decision: a list's records are also made

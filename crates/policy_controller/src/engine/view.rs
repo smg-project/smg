@@ -7,6 +7,7 @@
 //! into the spec's declared lists (zones, engine kinds, connectors, labels,
 //! headers) are the same positions here.
 
+use super::demands::DemandFacts;
 use crate::{load::signals, tracking::in_flight};
 
 /// The stable identity of a candidate: a hash of the registration key and the
@@ -815,12 +816,13 @@ pub struct Candidate {
 
 /// What a program says of a worker for the half of its record that no
 /// request changes, where the worker object holds no such fact: whether
-/// the worker takes images, and the id the program knows the worker by
-/// where it keeps ids of its own. A host that keeps such a fact beside its
-/// workers tells it to what writes the workers' records, once a list: a
-/// gateway of its own registrations, a controller of the stored worker an
-/// object stands for. The default says nothing. Further facts add their
-/// fields, so a host starts from the default and sets what it knows.
+/// the worker takes images, the id the program knows the worker by where
+/// it keeps ids of its own, and what the worker states for a request's
+/// hard demands. A host that keeps such a fact beside its workers tells it
+/// to what writes the workers' records, once a list: a gateway of its own
+/// registrations, a controller of the stored worker an object stands for.
+/// The default says nothing. Further facts add their fields, so a host
+/// starts from the default and sets what it knows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FixedFacts {
@@ -836,6 +838,11 @@ pub struct FixedFacts {
     /// zero reads as absent wherever an id travels (a lease, a trace, a
     /// session's pins), so a zero stated here states none.
     pub id: Option<WorkerId>,
+    /// What the worker states for a request's hard demands: its entry of
+    /// the column beside the records. Whether the worker registered a
+    /// rank ([`DemandFacts::ranked`]) is not said here: the worker's
+    /// object holds it, and the records read it there.
+    pub demands: DemandFacts,
 }
 
 impl FixedFacts {
