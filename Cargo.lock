@@ -4067,6 +4067,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hf-hub",
  "http",
+ "memchr",
  "minijinja",
  "minijinja-contrib",
  "openai-protocol",
