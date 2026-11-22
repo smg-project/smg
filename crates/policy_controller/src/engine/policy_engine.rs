@@ -658,8 +658,12 @@ impl PolicyEngine {
     /// another process and cannot ask again cheaply.
     ///
     /// A binding's shadow decides behind the live decision, as under the
-    /// leasing entry. What it said is dropped here: the entry's caller
-    /// does not count it yet.
+    /// leasing entry. What it said is answered beside the decision and
+    /// counted nowhere here: the caller counts it once its own filing of
+    /// the lease stands, and a shed's, which files none, all the same
+    /// ([`Self::count_shadow`]). So a decision whose issue fails counts
+    /// none under either entry. A pair's prefill answers no word: no
+    /// shadow runs on a pair's side here yet.
     ///
     /// # Errors
     ///
@@ -678,12 +682,13 @@ impl PolicyEngine {
         &self,
         maker: &impl RequestMaker,
         now: Instant,
-    ) -> Result<super::decision::Decision, DecisionRefused> {
+    ) -> Result<(super::decision::Decision, Option<Shadowed>), DecisionRefused> {
         self.caught(|| {
             let mut request = self.made(maker);
-            match (request.facts.phase, maker.workers()) {
+            let mut said = None;
+            let decision = match (request.facts.phase, maker.workers()) {
                 (Phase::Single, WorkerLists::Single(members)) => {
-                    Ok(self.decide_made(maker, &mut request, members, now, &mut None))
+                    Ok(self.decide_made(maker, &mut request, members, now, &mut said))
                 }
                 // A pair is decided at its prefill, over its host's two
                 // lists.
@@ -694,7 +699,8 @@ impl PolicyEngine {
                 }
                 (Phase::Single | Phase::Prefill, _) => Ok(single::over_none(self, &request)),
                 (Phase::Decode | Phase::Encode, _) => Err(DecisionRefused::PairSide),
-            }
+            };
+            decision.map(|decision| (decision, said))
         })
     }
 

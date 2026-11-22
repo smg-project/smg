@@ -2256,7 +2256,7 @@ mod tests {
         for call in 0..6 {
             let asks = bare.asks(&classes, false);
             let decision = bare.engine.decide_without_lease(&asks, now);
-            let decision = decision.expect("a decision");
+            let (decision, _) = decision.expect("a decision");
             let outcome = leased(&leasing, &leasing.asks(&classes, false), now);
             assert!(outcome.lease.is_some(), "the leasing entry issues its pick");
             assert!(!named(&decision).is_empty(), "call {call}: a pick");
@@ -2266,7 +2266,7 @@ mod tests {
         // behind the target each engine's first decision names.
         let asks = bare.asks(&classes, true);
         let first = bare.engine.decide_without_lease(&asks, now);
-        let first = first.expect("a decision");
+        let (first, _) = first.expect("a decision");
         let theirs = leasing.asks(&classes, true);
         let outcome = leased(&leasing, &theirs, now);
         assert_eq!(named(&first), named(&outcome.decision));
@@ -2355,11 +2355,11 @@ mod tests {
         };
         let both = WireModes::HTTP.union(WireModes::GRPC);
         let first = host.engine.decide_without_lease(&stating(both), now);
-        let held = target_at(&first.expect("a decision"), 0);
+        let held = target_at(&first.expect("a decision").0, 0);
         for wires in [WireModes::NONE, both, both.union(WireModes::ZMQ)] {
             let asks = stating(wires);
             let decision = host.engine.decide_without_lease(&asks, now);
-            let decision = decision.expect("a decision");
+            let (decision, _) = decision.expect("a decision");
             assert!(decision.pick().is_some(), "{wires:?}: {decision:?}");
             let again = host.engine.decide_decode_without_lease(&asks, &held, now);
             let again = again.expect("a decision");
@@ -2370,7 +2370,7 @@ mod tests {
         for wires in [WireModes::HTTP, WireModes::GRPC, WireModes::ZMQ] {
             let asks = stating(wires);
             let decision = host.engine.decide_without_lease(&asks, now);
-            assert_eq!(shed_for(&decision.expect("a decision")), declined);
+            assert_eq!(shed_for(&decision.expect("a decision").0), declined);
             let again = host.engine.decide_decode_without_lease(&asks, &held, now);
             assert_eq!(shed_for(&again.expect("a decision")), declined);
             assert_eq!(shed_for(&leased(&host, &asks, now).decision), declined);
@@ -2404,7 +2404,7 @@ mod tests {
         let alone: &Request<'_> = &asks.0;
         let none = (ShedReason::NoEndpoints, "none");
         let prefill = host.engine.decide_without_lease(alone, now);
-        assert_eq!(shed_for(&prefill.expect("a decision")), none);
+        assert_eq!(shed_for(&prefill.expect("a decision").0), none);
         assert_eq!(shed_for(&leased(&host, alone, now).decision), none);
         let again = host.engine.decide_decode_without_lease(alone, &target, now);
         assert_eq!(shed_for(&again.expect("a decision")), none);
@@ -2774,7 +2774,7 @@ mod tests {
         for seed in 0..32 {
             let asks = host.asks_by(&classes, (seed, true), Some(queues(2, 1)));
             let first = host.engine.decide_without_lease(&asks, now);
-            let first = first.expect("a decision");
+            let (first, _) = first.expect("a decision");
             assert_eq!(host.picked(&first), (2, 1), "seed {seed}");
             let held = target_at(&first, 0);
             let call = host.asks_by(&classes, (seed, true), Some(queues(0, 3)));
