@@ -915,12 +915,13 @@ impl Format {
     /// into or out of the frame (`Self::message_framing`): a table whose thought is framed by
     /// them alone (Inkling's, whose kind markers also move between the bodies) shows none, and
     /// neither does the variant [`Self::without_calls`] made of it. Where the turn starts in its
-    /// own wrapper (Kimi K3's message), the markers on a row between that wrapper and the answer
-    /// (the response tags, the message close) frame the answer, not the thought, and stay
-    /// dropped: the thought keeps its two tags and the answer comes back bare. A state's own
-    /// text rows stay with it: a trimmed stay is still trimmed, a framing state's text still
-    /// dropped; and a tag the end cut short is still dropped, as the legacy parsers drop it on
-    /// both their paths.
+    /// own wrapper (Kimi K3's message), the markers with a row between that wrapper and the
+    /// answer (the response tags, the message close) frame the answer, not the thought, and stay
+    /// dropped on every row they move: the think tags the model wrote stay and the answer comes
+    /// back bare, and a thought that the response tag itself ends runs straight into the answer.
+    /// A state's own text rows stay with it: a trimmed stay is still trimmed, a framing state's
+    /// text still dropped; and a tag the end cut short is still dropped, as the legacy parsers
+    /// drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
     /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
@@ -2275,6 +2276,31 @@ mod tests {
         );
         assert_eq!(reasoning, "");
         assert_eq!(calls, 1);
+        // A request without tools reads by the table without its calls first: the call's
+        // markers are text there, and the answer's frame is dropped the same way.
+        let both = crate::formats::kimi_k3()
+            .without_calls()
+            .without_reasoning();
+        let (content, _, calls) = said(&events(both, KIMI_OPENER, KIMI_TURN));
+        assert_eq!(
+            content,
+            concat!(
+                "<|open|>think<|sep|>a thought<|close|>think<|sep|>an answer",
+                "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+                "<|open|>argument key=\"q\" type=\"string\"<|sep|>x<|close|>argument<|sep|>",
+                "<|close|>call<|sep|><|close|>tools<|sep|>"
+            )
+        );
+        assert_eq!(calls, 0);
+        // The flag is the marker's, not the row's: a response tag that itself ends the thought
+        // is dropped too, and the thought runs straight into the answer.
+        let joined = "<|open|>think<|sep|>a plan<|open|>response<|sep|>an answer";
+        let out = events(
+            crate::formats::kimi_k3().without_reasoning(),
+            KIMI_OPENER,
+            joined,
+        );
+        assert_eq!(said(&out).0, "<|open|>think<|sep|>a planan answer");
         // A tag the end cut short is dropped, shown or not: the legacy parsers drop it on both
         // paths, so a response the length cut inside its closing tag ends the same way.
         let cut = "<|open|>response<|sep|>an answer<|close|>response";
