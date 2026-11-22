@@ -205,14 +205,15 @@ async fn create_only_checks_the_hosts_registry() {
 
 /// A worker registered through the API keeps every spec field the
 /// request carried, not only the ones this step copies by hand: the
-/// provider, the KV block size, the resilience overrides (the per-model
-/// retry config is derived from them at registration), the pairing
-/// protocol and the load-monitor interval all have consumers.
+/// provider, the zone, the KV block size, the resilience overrides (the
+/// per-model retry config is derived from them at registration), the
+/// pairing protocol and the load-monitor interval all have consumers.
 #[tokio::test]
 async fn api_registered_worker_keeps_the_fields_the_spec_accepted() {
     let mut spec = WorkerSpec::new("http://worker:8000");
     spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
     spec.provider = Some(ProviderType::OpenAI);
+    spec.zone = Some("east".to_string());
     spec.kv_block_size = Some(64);
     spec.pairing_protocol = Some("cluster-blue".to_string());
     spec.load_monitor_interval_secs = Some(3);
@@ -236,6 +237,7 @@ async fn api_registered_worker_keeps_the_fields_the_spec_accepted() {
     let spec = &worker.metadata().spec;
     assert_eq!(spec.url, "http://worker:8000");
     assert_eq!(spec.provider, Some(ProviderType::OpenAI));
+    assert_eq!(spec.zone.as_deref(), Some("east"));
     assert_eq!(spec.kv_block_size, Some(64));
     assert_eq!(spec.pairing_protocol.as_deref(), Some("cluster-blue"));
     assert_eq!(spec.load_monitor_interval_secs, Some(3));

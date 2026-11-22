@@ -226,6 +226,12 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
+    /// Set the zone the worker runs in ([`WorkerSpec::zone`]).
+    pub fn zone(mut self, zone: impl Into<String>) -> Self {
+        self.spec.zone = Some(zone.into());
+        self
+    }
+
     /// Set the resolved health check configuration.
     ///
     /// This is the fully-resolved config (router defaults + per-worker overrides)

@@ -62,7 +62,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
-        zone: standing.zone.clone(),
+        zone: spec.zone.clone(),
         pairing: standing.pairing.clone(),
         encode: standing.encode.clone(),
         vision: standing.vision,
@@ -242,6 +242,7 @@ mod tests {
                 dp_rank: 1,
                 dp_size: 2,
                 labels: [("tier".to_owned(), "gold".to_owned())].into(),
+                zone: Some("east".to_owned()),
                 bootstrap_port: Some(8_998),
                 kv_block_size: Some(32),
                 drain_settle_secs: Some(30),
@@ -270,17 +271,20 @@ mod tests {
         }
     }
 
+    /// A fact the object does not carry is the standing row's. One it
+    /// carries is its own: the zone its registration states stands over the
+    /// standing row's.
     #[test]
     fn a_fact_the_object_does_not_carry_is_the_standing_rows() {
         let spec = WorkerSpec {
             priority: 19,
+            zone: Some("east".to_owned()),
             ..WorkerSpec::new(URL.to_owned())
         };
         let worker = <BasicWorkerBuilder>::from_spec(spec).build();
         let bare = facts(&worker, None);
         let expected = WorkerFacts {
             incarnation: 19,
-            zone: Some("east".to_owned()),
             pairing: Some(Arc::new(PairingDescriptor {
                 protocol: Some("pd".to_owned()),
                 ..Default::default()
@@ -313,6 +317,7 @@ mod tests {
             key: "http://old".to_owned(),
             role: Role::Decode,
             labels: [("old".to_owned(), "label".to_owned())].into(),
+            zone: Some("west".to_owned()),
             ..expected.clone()
         };
         let defaults = WorkerFacts::default();
@@ -323,6 +328,7 @@ mod tests {
                 engine: URL.to_owned(),
                 wire_modes: WireModes::HTTP,
                 dp_size: 1,
+                zone: Some("east".to_owned()),
                 health: bare.health,
                 ..defaults
             }

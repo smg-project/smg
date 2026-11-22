@@ -1074,6 +1074,32 @@ fn spec_bytes(url: &str, model: &str, worker_type: WorkerType) -> Vec<u8> {
     serde_json::to_vec(&worker.metadata().spec).unwrap()
 }
 
+/// A peer's worker imports with the zone its owner stated. A spec that
+/// states a key this build does not know still imports from the spec, with
+/// that key unread: so a peer built before the zone imports a zoned worker
+/// as one in no zone, and does not fall back to the minimal worker.
+#[test]
+fn an_import_keeps_its_owners_zone_and_a_key_this_build_does_not_know_is_unread() {
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let owned = BasicWorkerBuilder::new(url)
+        .model(ModelCard::new("m1"))
+        .zone("east")
+        .build();
+    let mut spec = serde_json::to_value(&owned.metadata().spec).unwrap();
+    spec["a_key_of_a_later_build"] = serde_json::json!({"any": 1});
+    let published = serde_json::to_vec(&spec).unwrap();
+    registry.on_remote_worker_state(&remote_state("peer-w1", url, true, published));
+    let id = registry.get_id_by_url(url).expect("the import");
+    let import = registry.get(&id).unwrap();
+    assert_eq!(import.metadata().spec.zone.as_deref(), Some("east"));
+    assert_eq!(
+        import.model_id(),
+        "m1",
+        "built from the spec: the minimal worker would name the state's model"
+    );
+}
+
 #[test]
 fn a_newer_state_on_the_imports_own_key_rebuilds_the_import_from_its_spec() {
     // The owner replaced the worker in place (a new model and role under the

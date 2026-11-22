@@ -11,8 +11,8 @@
 //!
 //! - **Once a membership.** [`PoolRecords::new`] reads what a worker's
 //!   registration states and no request changes: its id, its key, its role,
-//!   its rank, its wire, and its engine kind and labels as the document
-//!   lists them. It lists the pool's engines and numbers the pool. The
+//!   its rank, its wire, and its engine kind, zone and labels as the
+//!   document lists them. It lists the pool's engines and numbers the pool. The
 //!   gateway keeps the value beside the list it was made from. No live
 //!   value of a worker is in it.
 //! - **Once a load snapshot.** A snapshot is published whole and never
@@ -373,7 +373,7 @@ pub struct PoolRecords {
     /// The pool's number among the engine's pools ([`Engines::pool`]).
     number: u32,
     /// The generation of the document the records were read under: its
-    /// lists name the engine kinds and the labels.
+    /// lists name the engine kinds, the zones and the labels.
     generation: u64,
     /// The list's rows with the reports of one load snapshot written
     /// ([`Reported`]), and none before a decision wrote every record under
@@ -422,8 +422,7 @@ impl PoolRecords {
                         .iter()
                         .map(|(name, value)| (name.clone(), value.clone()))
                         .collect();
-                    // A worker object states no zone.
-                    Some(lists.positions(kind, None, &labels))
+                    Some(lists.positions(kind, spec.zone.as_deref(), &labels))
                 };
                 Candidate {
                     position,
@@ -435,6 +434,7 @@ impl PoolRecords {
                     dp_size: u16::try_from(spec.dp_size.unwrap_or(1)).unwrap_or(u16::MAX),
                     wire_modes: WireModes::from(spec.connection_mode),
                     engine_kind: listed.map_or(0, |listed| listed.engine_kind),
+                    zone: listed.map_or(0, |listed| listed.zone),
                     labels: listed.map_or(0, |listed| listed.labels),
                     // No admission window is the record's to know: both
                     // bits read open, and a caller that holds a window
@@ -515,8 +515,8 @@ impl PoolRecords {
     }
 
     /// The fixed half of each worker's record, by its place in the list:
-    /// its position, id, key, role, rank, wire, engine kind and labels, and
-    /// every live field at rest.
+    /// its position, id, key, role, rank, wire, engine kind, zone and
+    /// labels, and every live field at rest.
     #[must_use]
     pub fn fixed(&self) -> &[Candidate] {
         &self.fixed

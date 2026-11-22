@@ -40,7 +40,7 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         dp_rank,
         dp_size,
         labels,
-        zone: _,
+        zone,
         pairing: _,
         encode: _,
         vision: _,
@@ -69,6 +69,7 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
+    spec.zone.clone_from(zone);
     spec.kv_block_size = kv_block_size.and_then(|size| usize::try_from(size).ok());
     spec.bootstrap_port = *bootstrap_port;
     let address = dial_address(&row.facts);
@@ -206,6 +207,7 @@ mod tests {
             dp_rank: 1,
             dp_size: 2,
             labels: BTreeMap::from([("tier".to_string(), "gold".to_string())]),
+            zone: Some("east".to_string()),
             kv_block_size: Some(32),
             bootstrap_port: Some(8_998),
             health: HealthPolicy {
@@ -232,6 +234,7 @@ mod tests {
         assert_eq!((made.dp_rank(), made.dp_size()), (Some(1), Some(2)));
         let labels = HashMap::from([("tier".to_string(), "gold".to_string())]);
         assert_eq!(spec.labels, labels);
+        assert_eq!(spec.zone.as_deref(), Some("east"));
         assert_eq!(spec.kv_block_size, Some(32));
         assert_eq!(made.bootstrap_port(), Some(8_998));
         let checks = &made.metadata().health_config;
@@ -272,6 +275,7 @@ mod tests {
             assert_eq!((made.dp_rank(), made.dp_size()), (None, None));
             assert_eq!((spec.kv_block_size, made.bootstrap_port()), (None, None));
             assert!(spec.labels.is_empty());
+            assert_eq!(spec.zone, None);
         }
     }
 

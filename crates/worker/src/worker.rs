@@ -802,6 +802,13 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
 
+    /// The zone the worker runs in: a region, a rack, or any other failure
+    /// domain, as its registration names it. A routing policy that tells
+    /// zones apart reads it, and nothing else does. Absent or empty: the
+    /// worker is in no zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+
     /// Worker priority (higher = preferred).
     #[serde(default = "default_priority")]
     pub priority: u32,
@@ -929,6 +936,7 @@ impl std::fmt::Debug for WorkerSpec {
             runtime_type,
             provider,
             labels,
+            zone,
             priority,
             cost,
             api_key,
@@ -972,6 +980,7 @@ impl std::fmt::Debug for WorkerSpec {
             .field("runtime_type", runtime_type)
             .field("provider", provider)
             .field("labels", labels)
+            .field("zone", zone)
             .field("priority", priority)
             .field("cost", cost)
             .field("api_key", &api_key.is_some().then_some(REDACTED_API_KEY))
@@ -1013,6 +1022,7 @@ impl WorkerSpec {
             runtime_type: RuntimeType::default(),
             provider: None,
             labels: HashMap::new(),
+            zone: None,
             priority: DEFAULT_WORKER_PRIORITY,
             cost: DEFAULT_WORKER_COST,
             api_key: None,
@@ -2483,6 +2493,54 @@ mod overload_update_tests {
             token_usage: Some(1.0),
         };
         assert!(!update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use serde_json::json;
+
+    use super::WorkerSpec;
+
+    /// A spec that states no zone is written as it was before the field:
+    /// no key. A spec written before the field reads as in no zone.
+    #[test]
+    fn a_spec_in_no_zone_writes_no_key_and_an_older_spec_reads_as_in_none() {
+        let spec: WorkerSpec = serde_json::from_value(json!({"url": "http://w:1"})).unwrap();
+        assert_eq!(spec.zone, None);
+        let out = serde_json::to_value(&spec).unwrap();
+        assert!(out.get("zone").is_none());
+        assert_eq!(
+            out,
+            serde_json::to_value(WorkerSpec::new("http://w:1")).unwrap()
+        );
+    }
+
+    /// A zone is stated under its own key and reads back.
+    #[test]
+    fn a_zone_is_written_under_its_own_key_and_reads_back() {
+        let mut spec = WorkerSpec::new("http://w:1");
+        spec.zone = Some("east".to_owned());
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["zone"], "east");
+        let read: WorkerSpec = serde_json::from_value(out).unwrap();
+        assert_eq!(read.zone.as_deref(), Some("east"));
+        assert!(format!("{spec:?}").contains(r#"zone: Some("east")"#));
+    }
+
+    /// A reader takes a spec that states a key it does not know, and leaves
+    /// that key unread. So a reader built before the zone reads a spec that
+    /// states one as a worker in no zone, and refuses nothing.
+    #[test]
+    fn a_reader_leaves_a_key_it_does_not_know_unread() {
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "zone": "east",
+            "a_key_of_a_later_build": {"any": 1},
+        }))
+        .unwrap();
+        assert_eq!(spec.url, "http://w:1");
+        assert_eq!(spec.zone.as_deref(), Some("east"));
     }
 }
 

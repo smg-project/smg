@@ -146,6 +146,55 @@ fn a_record_states_its_workers_registration_by_its_place_in_the_list() {
     assert!(!pool.fixed()[1].health.healthy);
 }
 
+/// A record names its worker's zone by the zone's place in the document's
+/// list, from 1, as its registration states it. A worker that states no
+/// zone, an empty one or one the list does not name reads 0. The label bits
+/// stand beside it, read of the same registration. Under a document that
+/// lists nothing every record reads 0.
+#[test]
+fn a_record_names_its_workers_zone_by_its_place_in_the_documents_list() {
+    let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+    document.view.zones = vec!["east".to_owned(), "west".to_owned()];
+    document.view.labels = vec!["tier=gold".to_owned()];
+    let spec = applied_of(document);
+    let clock = DecisionClock::new();
+    let registered = |at: usize, zone: Option<&str>, tier: &str| -> Arc<dyn Worker> {
+        let mut stated = WorkerSpec::new(url(at));
+        stated.zone = zone.map(str::to_owned);
+        stated.labels.insert("tier".to_owned(), tier.to_owned());
+        Arc::new(
+            <BasicWorkerBuilder>::from_spec(stated)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let workers = vec![
+        registered(0, Some("west"), "gold"),
+        registered(1, Some("east"), "plain"),
+        registered(2, None, "gold"),
+        registered(3, Some("north"), "plain"),
+        registered(4, Some(""), "plain"),
+    ];
+    let pool = PoolRecords::new(&workers, &spec, &clock);
+    let read = |rows: &[Candidate]| -> Vec<(u16, u64)> {
+        rows.iter().map(|row| (row.zone, row.labels)).collect()
+    };
+    let stated = [(2, 1), (1, 0), (0, 1), (0, 0), (0, 0)];
+    assert_eq!(read(pool.fixed()), stated);
+
+    // A decision's records carry it: every record of a whole write, and
+    // one worker's record read alone.
+    let live = Live::at(spec.engine(), &clock, Instant::now(), None, None);
+    let mut rows = Vec::new();
+    let (rows, _) = pool.write(&workers, &live, &mut rows);
+    assert_eq!(read(rows), stated);
+    let alone = pool.read(&workers, &live, 0).expect("the first worker");
+    assert_eq!((alone.zone, alone.labels), (2, 1));
+
+    let unlisted = PoolRecords::new(&workers, &applied("least_load"), &clock);
+    assert!(unlisted.fixed().iter().all(|row| row.zone == 0));
+}
+
 #[test]
 fn a_record_states_what_its_worker_object_says_at_the_decision() {
     let spec = applied("least_load");
