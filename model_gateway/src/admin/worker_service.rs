@@ -17,6 +17,7 @@ use openai_protocol::worker::{
 };
 use serde_json::json;
 use smg_auth::AuditResource;
+use smg_policy_controller::store::WorkerFacts;
 use smg_service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL};
 use smg_worker::{
     health::manager::MAX_PROBE_DELAY,
@@ -55,6 +56,9 @@ fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
 /// worker but a mistake or a probe, and every log line and metric label
 /// derived from the URL would carry them.
 const MAX_WORKER_URL_BYTES: usize = 2048;
+/// Longest zone a registration states: the policy controller's own bound
+/// of a zone, so a zone this API takes its store and its registration take.
+const MAX_ZONE_BYTES: usize = WorkerFacts::NAME_BYTES;
 /// Most labels a worker carries (an engine reports a few dozen); held at
 /// registration, at the admin check of a PATCH and again where the PATCH
 /// merges into the worker.
@@ -101,14 +105,15 @@ pub(crate) fn control_character_refusal<'a>(
 }
 
 /// The bounds a registration body must satisfy before any job is queued:
-/// the URL's length, and no control character in it, in a model's id or in
-/// a parser's name; the labels' count, charset and size, the shape of the
-/// labels the routers read as numbers or booleans and none under the prefix
-/// reserved for discovery; the fields the routers rely on (a positive,
-/// finite cost; a KV block size and a data-parallel size of at least 1; a
-/// rank only with a size and below it; a bootstrap port that is a port); a
-/// probe interval and a probe timeout the health schedule can hold. A
-/// violation is a `400 Bad Request` naming the field.
+/// the URL's length, and no control character in it, in a model's id, in
+/// a parser's name or in the zone; the zone's length; the labels' count,
+/// charset and size, the shape of the labels the routers read as numbers
+/// or booleans and none under the prefix reserved for discovery; the
+/// fields the routers rely on (a positive, finite cost; a KV block size
+/// and a data-parallel size of at least 1; a rank only with a size and
+/// below it; a bootstrap port that is a port); a probe interval and a
+/// probe timeout the health schedule can hold. A violation is a
+/// `400 Bad Request` naming the field.
 fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
         return Err(bad_request(format!(
@@ -117,11 +122,24 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
         )));
     }
     // Log lines and a failed job's text write these as they came, so a line
-    // break in one would start a line of the caller's choosing.
+    // break in one would start a line of the caller's choosing. A zone is
+    // held to the same: an operator's page and every mesh peer read it.
     let of_models = spec.models.iter().flat_map(logged_strings);
-    let strings = std::iter::once(("url", Some(spec.url.as_str()))).chain(of_models);
+    let strings = std::iter::once(("url", Some(spec.url.as_str())))
+        .chain(of_models)
+        .chain(std::iter::once(("zone", spec.zone.as_deref())));
     if let Some(refusal) = control_character_refusal(strings) {
         return Err(bad_request(refusal));
+    }
+    if let Some(zone) = spec
+        .zone
+        .as_deref()
+        .filter(|zone| zone.len() > MAX_ZONE_BYTES)
+    {
+        return Err(bad_request(format!(
+            "zone is {} bytes long; at most {MAX_ZONE_BYTES} are accepted",
+            zone.len()
+        )));
     }
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;
@@ -1766,6 +1784,8 @@ mod tests {
             (json!({"url": url, "dp_rank": 1}), "dp_rank"),
             (json!({"url": url, "dp_rank": 2, "dp_size": 2}), "dp_rank"),
             (json!({"url": url, "bootstrap_port": 0}), "bootstrap_port"),
+            (json!({"url": url, "zone": "z".repeat(257)}), "zone"),
+            (json!({"url": url, "zone": "east\nwest"}), "zone"),
             (
                 json!({"url": format!("grpc://{}:1", "a".repeat(2049))}),
                 "url",
@@ -1789,6 +1809,7 @@ mod tests {
         // every dp-aware rank worker; only a discovered one is divided per rank.
         let spec: WorkerSpec = serde_json::from_value(json!({
             "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
+            "zone": "z".repeat(256),
             "labels": {
                 "max_running_requests": "256", "max_num_seqs": "70000",
                 "supports_vision": "true", "served_model_name": "m"

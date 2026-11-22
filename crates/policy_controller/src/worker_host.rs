@@ -27,7 +27,7 @@
 //! | `models` | `models`, one card an id; no id is the wildcard |
 //! | `dp_rank`, `dp_size` | `dp_size` where the width is above one, and `dp_rank` with it unless the row is the engine whole: under its engine's own address at rank 0; else neither |
 //! | `labels` | `labels` |
-//! | `zone` | `zone`, as written |
+//! | `zone` | `zone`, as written. An object's empty zone reads back as none |
 //! | `kv_block_size` | `kv_block_size` |
 //! | `bootstrap_port` | `bootstrap_port` |
 //! | `health` | the health checks: the two thresholds, the interval and the timeout in whole seconds, the checks off where the policy's probes are |

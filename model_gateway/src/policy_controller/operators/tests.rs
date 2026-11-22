@@ -553,11 +553,11 @@ async fn a_snapshots_ask_keeps_the_served_calls_bounds() -> Case {
 
 /// Where the gateway decides in its own process a worker is told as its
 /// object states it. Its id is the one the policy crate derives from its
-/// address, under no stored life. Its status is the object's and its
-/// pairing facts are its own. Its maker is the discovery source's, under
-/// the address it was registered at, where it carries a provenance label.
-/// A hosted provider's worker is not told, and a worker that names no
-/// model is told under no model's name.
+/// address, under no stored life. Its status is the object's, and its
+/// pairing facts and its zone are its own. Its maker is the discovery
+/// source's, under the address it was registered at, where it carries a
+/// provenance label. A hosted provider's worker is not told, and a worker
+/// that names no model is told under no model's name.
 #[tokio::test]
 async fn a_snapshot_tells_a_worker_as_its_object_states_it() -> Case {
     let state = state(picked()).await?;
@@ -565,6 +565,7 @@ async fn a_snapshot_tells_a_worker_as_its_object_states_it() -> Case {
         .label(DISCOVERY_PROVIDER_LABEL, "finder")
         .label("pairing_protocol", "p1")
         .label("version", "v1")
+        .zone("zone-a")
         .status(WorkerStatus::Ready);
     register(&state, found)?;
     let plain = worker("http://plain.example", &["m"]).status(WorkerStatus::NotReady);
@@ -598,6 +599,8 @@ async fn a_snapshot_tells_a_worker_as_its_object_states_it() -> Case {
     assert_eq!(found_row["pairing"]["version"], "v1");
     assert_eq!(plain_row["pairing"], Value::Null);
     assert_eq!(found_row["labels"][DISCOVERY_PROVIDER_LABEL], "finder");
+    assert_eq!(found_row["zone"], "zone-a");
+    assert_eq!(plain_row["zone"], Value::Null);
 
     let (_, _, by_model) = answered(&app, snapshot("?models=m")?).await?;
     let served = by_model["rows"].as_array().ok_or("no rows")?;

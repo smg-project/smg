@@ -805,7 +805,7 @@ pub struct WorkerSpec {
     /// The zone the worker runs in: a region, a rack, or any other failure
     /// domain, as its registration names it. A routing policy that tells
     /// zones apart reads it, and nothing else does. Absent or empty: the
-    /// worker is in no zone.
+    /// worker is in no zone, and each reader takes an empty zone as none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
 
@@ -3075,6 +3075,6 @@ mod debug_tests {
             .filter_map(|line| line.strip_prefix("    "))
             .filter(|line| line.starts_with(|c: char| c.is_ascii_lowercase()))
             .count();
-        assert_eq!(field_count, 30);
+        assert_eq!(field_count, 31);
     }
 }

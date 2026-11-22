@@ -62,7 +62,9 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
-        zone: spec.zone.clone(),
+        // An empty zone is no zone, as the controller's registration
+        // writes it: no row states an empty one.
+        zone: spec.zone.clone().filter(|zone| !zone.is_empty()),
         pairing: standing.pairing.clone(),
         encode: standing.encode.clone(),
         vision: standing.vision,
@@ -334,6 +336,23 @@ mod tests {
             }
         );
         assert_eq!(facts(&worker, Some(&old)), expected);
+    }
+
+    /// A registration that states an empty zone is in no zone: its row
+    /// states none, and a standing row's zone does not come back for it.
+    #[test]
+    fn an_empty_zone_reads_back_as_no_zone() {
+        let spec = WorkerSpec {
+            zone: Some(String::new()),
+            ..WorkerSpec::new(URL.to_owned())
+        };
+        let worker = <BasicWorkerBuilder>::from_spec(spec).build();
+        let standing = WorkerFacts {
+            zone: Some("west".to_owned()),
+            ..WorkerFacts::default()
+        };
+        assert_eq!(facts(&worker, None).zone, None);
+        assert_eq!(facts(&worker, Some(&standing)).zone, None);
     }
 
     /// A worker of `runtime` with `labels`.
