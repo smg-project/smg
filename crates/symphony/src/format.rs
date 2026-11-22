@@ -2517,6 +2517,15 @@ mod tests {
     }
 
     #[test]
+    fn without_reasoning_shows_a_close_the_thought_and_the_answer_share() {
+        // A template's one close for its answer and its thought: its row out of the thought moves
+        // the engine, so it stays shown though its other row stays in the content.
+        let shared = two_states().transition("content", "close", "content");
+        let (content, reasoning, _) = said(&events(shared.without_reasoning(), "", "<a>Hm.</a>OK"));
+        assert_eq!((content.as_str(), reasoning.as_str()), ("<a>Hm.</a>OK", ""));
+    }
+
+    #[test]
     fn a_stop_row_names_an_arguments_state() {
         let format = Format::new("stop")
             .terminal("open", "<call>")
