@@ -299,22 +299,24 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// veto, then the liveness veto. A worker over its thresholds is alive and
 /// busy; a doubted one may be gone. Each lift runs the profile's filters
 /// once more, and the rows such a pass keeps are the usable ones. So a hard
-/// filter listed behind a veto does not hide such a pool, and the answer
-/// does not turn on the order a document lists its hard filters in. The
-/// retry's tried list is set aside for those passes, as the gateway's
-/// fallback sets it aside: a worker an earlier attempt tried is taken again
-/// when it holds the fewest requests. On a retry one pass reads the list
-/// first: the one that lifts the overload veto over a chosen prefill's
-/// partners. The profile's soft filter then keeps to the partners the
-/// request has not tried while one is left, as the gateway's pair selection
-/// does. That pass stands where every partner it keeps passes that filter's
-/// own test: not tried, and not one the host just failed to reach. Where it
-/// keeps another or nobody, the pass with the list set aside decides. A
-/// first attempt names no tried worker, and takes that pass alone. The pair
-/// presets list the soft filter behind the room filter, the order the
-/// gateway narrows in. The host's list of workers it just failed to reach
-/// stays in every pass: the soft filter passes over such a worker while
-/// another usable one stands, and takes it as the last resort.
+/// filter listed behind a veto does not hide such a pool. The retry's tried
+/// list is set aside for those passes, as the gateway's fallback sets it
+/// aside: a worker an earlier attempt tried is taken again when it holds
+/// the fewest requests. On a retry one pass reads the list first: the one
+/// that lifts the overload veto over a chosen prefill's partners. The
+/// profile's soft filter then keeps to the partners the request has not
+/// tried while one is left, as the gateway's pair selection does. That pass
+/// stands where it keeps a partner, unless that filter stood aside in it.
+/// The partners it keeps then fail the filter's own test, each tried or
+/// one the host just failed to reach, and the pass with the list set aside
+/// decides, as it does where the pass keeps nobody. Under a profile that
+/// lists no such filter the pass stands as its hard filters leave it. A
+/// request that names no tried worker takes the pass with the list set
+/// aside alone. The pair presets list the soft filter behind the room
+/// filter, the order the gateway narrows in. The host's list of workers it
+/// just failed to reach stays in every pass: the soft filter passes over
+/// such a worker while another usable one stands, and takes it as the last
+/// resort.
 ///
 /// The overload veto is lifted under [`AllVetoed::Steer`], where it stood
 /// in the emptied pass and a row reads as over its thresholds. Under a veto
@@ -378,14 +380,19 @@ pub(super) fn emptied(
         };
         // On a retry a chosen prefill's partners keep to the ones the
         // request has not tried while one is left: their pass reads the
-        // tried list first, and stands where every partner it keeps passes
-        // the soft filter's own test. With no tried list it is the pass
-        // below, and is not run.
+        // tried list first. It stands where it keeps a partner, unless the
+        // profile's soft filter stood aside in it: the partners it keeps
+        // then fail that filter's own test. Under a profile that lists the
+        // filter they pass it all or none, so `all` and `any` are one
+        // answer here. A profile that lists no such filter has none that
+        // stood aside. With no tried list the pass is the one below, and
+        // is not run.
         let untried = |&at: &u32| NotTried.keep(facts, &candidates[at as usize], &pass);
+        let listed = || profile.filters.iter().any(|f| f.name() == NotTried.name());
         if set.class.is_some()
             && !facts.tried.is_empty()
             && filter(profile, facts, &pass, buf, set.shedding()).is_none()
-            && buf.kept.iter().all(untried)
+            && (!listed() || buf.kept.iter().all(untried))
         {
             buf.lifted = LiftedVeto::Overload;
             return emptied_by;
@@ -1573,14 +1580,15 @@ mod tests {
     /// (`model_gateway/src/routers/common/placement.rs:1562-1570`), and
     /// places this pair.
     ///
-    /// The partners' pass sets the list aside too where reading it keeps a
-    /// partner the host just failed to reach. Under a profile that lists
-    /// `not-tried` behind the hard filter, the request then goes to a tried
-    /// partner the host can reach. Under one that lists no `not-tried` no
-    /// filter reads the host's list: the fewest in flight of all takes the
-    /// request, as before a retry read the tried list. The gateway keeps
-    /// one list for a tried worker and one it failed to reach (`was_tried`,
-    /// `:1177-1179` there), and tells no such states apart.
+    /// The partners' pass sets the list aside too where the profile's
+    /// `not-tried` stood aside in it. Behind the hard filter that filter
+    /// keeps a partner the host just failed to reach alone, and the request
+    /// goes to the tried partners the host can reach. Under a profile that
+    /// lists no `not-tried` no filter stood aside and none reads the host's
+    /// list: the hard filter's pass stands as it keeps, and no tried
+    /// partner comes back beside an unreachable one. The gateway keeps one
+    /// list for a tried worker and one it failed to reach (`was_tried`,
+    /// `:1177-1179` there) and takes the partner outside it (`:1568-1570`).
     #[test]
     fn a_tried_decode_still_opens_its_prefill() {
         /// Refuses a worker an earlier attempt tried: a hard filter.
@@ -1622,15 +1630,21 @@ mod tests {
         listed.push(Box::new(NotTried));
         let listed = pair_engine_of(false, [vetoes(), listed]);
         assert_eq!(given(&listed, &decodes, &ids[..2], &ids[2..]), [0, 1]);
-        // One tried, one the host failed to reach and one neither, under
-        // the hard filter alone. The pass that reads the list keeps the
-        // last two, and does not stand.
-        assert_eq!(given(&engine, &decodes, &ids[..1], &ids[1..2]), [0, 1, 2]);
+        // Under the hard filter alone its pass stands on the two partners
+        // it keeps. The host just failed to reach the first, which is the
+        // tried one, and the third: the second takes the request, as in
+        // the gateway, and the first does not come back.
+        let gone = [ids[0], ids[2]];
+        assert_eq!(given(&engine, &decodes, &ids[..1], &gone), [1, 2]);
+        // That profile reads no host list: an unreachable second partner
+        // stays ahead of the third by its load, where the gateway's one
+        // list leaves the third alone.
+        assert_eq!(given(&engine, &decodes, &ids[..1], &ids[1..2]), [1, 2]);
     }
 
     /// A retry over partners all over their thresholds keeps to the ones the
     /// request has not tried while one is left. The fewest in flight among
-    /// those takes it, and the others of them stand behind as alternates.
+    /// those takes it, and the next fewest of them stand behind it.
     /// With every partner tried the list narrows nobody. A tried partner
     /// with a room stays ahead of untried ones with none. The gateway's own
     /// pair selection orders a pick's partners so: the rooms, the untried
@@ -1684,10 +1698,11 @@ mod tests {
     /// holds the fewest requests, and under a binding that sheds they are
     /// shed as saturated. Partners doubted on every worker go to the fewest
     /// requests under either word, and never to one a hold stands on. A
-    /// first attempt's partners are filtered once under the lifted veto: a
-    /// filter behind the veto is asked about each once, and its refusal
-    /// stands. The gateway's own selection asks no decode again, so these
-    /// answers are the engine's own.
+    /// request that names no tried worker takes one pass under the lifted
+    /// overload veto: with no doubt among its partners, a filter behind the
+    /// veto is asked about each once, and its refusal stands. The gateway's
+    /// own selection asks no decode again, so these answers are the
+    /// engine's own.
     #[test]
     fn a_decode_asked_for_a_held_prefill_is_put_to_the_rule() {
         let prefills = [classed(free(0, 0), 1)];
