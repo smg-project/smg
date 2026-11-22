@@ -1815,7 +1815,8 @@ async fn parallel_sides_answered(
 
 /// One side failed while its partner was still dispatching: the verdict is
 /// recorded against the side that answered and becomes the response, and the
-/// partner is retired off the request path.
+/// partner is retired off the request path, or dropped when it is a prefill
+/// side behind its request's encode watch.
 fn parallel_side_failed_first(
     sides: &PdSides<'_>,
     side: PdSide,
@@ -1826,7 +1827,8 @@ fn parallel_side_failed_first(
     let status = error.breaker_status();
     // Only the side that answered is recorded: the abandoned one has
     // said nothing about its worker yet, and `retire_pd_side` records
-    // it when it finally does.
+    // it when it finally does. A prefill partner behind an encode watch
+    // is dropped and records nothing.
     let (label, partner_label, partner_worker) = match side {
         PdSide::Prefill => {
             record_silence_outcome(workers, sides.ledger, error);
@@ -4039,7 +4041,8 @@ pub(crate) mod tests {
     /// dispatches behind its request's encode watch: the prefill side is
     /// dropped, not retired. Its call is cancelled, its worker is neither
     /// sampled nor counted for it, and the request's encode sends end once
-    /// the request lets go of the watch.
+    /// the request lets go of the watch. With no encode stage the prefill
+    /// side is retired as before.
     #[test]
     fn a_prefill_side_behind_an_encode_watch_is_dropped_when_its_decode_partner_fails_first() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -4142,6 +4145,22 @@ pub(crate) mod tests {
                     send_ended.try_recv(),
                     Err(oneshot::error::TryRecvError::Closed),
                     "the send in flight is dropped with the supervisor"
+                );
+
+                // A request with no encode stage keeps the retirement.
+                let (awaited, call) = oneshot::channel::<()>();
+                parallel_side_failed_first(
+                    &PdSides::of(&workers, &ledger, &tokenspeed_request(1, None), false),
+                    PdSide::Decode,
+                    &error,
+                    Box::pin(async move {
+                        let _call = call;
+                        std::future::pending().await
+                    }),
+                );
+                assert!(
+                    !awaited.is_closed(),
+                    "with no encode watch the prefill side is retired: its call is still awaited"
                 );
             });
         });
