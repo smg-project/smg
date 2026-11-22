@@ -33,7 +33,11 @@ use super::{
     remainder::RowRemainder,
 };
 #[cfg(feature = "in-process")]
-use crate::engine::{FixedFacts, LentList, Role};
+use crate::{
+    document::spec::Pairing,
+    engine::{FixedFacts, LentList, PartnerClasses, Role},
+    store::pairing::{Member, PairClasses},
+};
 use crate::{
     engine::view::WorkerId,
     store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
@@ -251,6 +255,13 @@ pub struct Objects<G> {
     /// time.
     read_to: Mutex<Place>,
     held: RwLock<Held>,
+    /// How many times a kept object's entry moved in place in what a
+    /// generation's pair classes are derived from: the row's wires, its
+    /// engine kind or its pairing descriptor. Stepped under the entry's
+    /// write lock, and read by an ask with no lock
+    /// ([`Self::pair_classes`]).
+    #[cfg(feature = "in-process")]
+    moved_in_place: AtomicU64,
     /// How many members of a generation the holder held no row's object
     /// for when it cut the generation's lists ([`Self::unstated`]).
     #[cfg(feature = "in-process")]
@@ -351,6 +362,8 @@ impl<G: Generation> Objects<G> {
             unhanded: AtomicU64::new(0),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
+            #[cfg(feature = "in-process")]
+            moved_in_place: AtomicU64::new(0),
             #[cfg(feature = "in-process")]
             unstated: AtomicU64::new(0),
         }
@@ -978,7 +991,17 @@ impl<G: Generation> Objects<G> {
         let Some(laid) = entry.and_then(|id| held.rows.get_mut(id)) else {
             return;
         };
-        laid.remainder = Arc::new(RowRemainder::of(row));
+        let remainder = RowRemainder::of(row);
+        // What a generation's pair classes are derived from moves here with
+        // no publish: the next ask derives them again.
+        #[cfg(feature = "in-process")]
+        if remainder.wire_modes != laid.remainder.wire_modes
+            || remainder.engine_kind != laid.remainder.engine_kind
+            || remainder.pairing != laid.remainder.pairing
+        {
+            self.moved_in_place.fetch_add(1, Relaxed);
+        }
+        laid.remainder = Arc::new(remainder);
         held.state(row);
     }
 
@@ -1163,8 +1186,10 @@ impl Objects<Members> {
     /// registration path starts another life where the image bit differs,
     /// which publishes. A raw store write that moves the bit in place is
     /// not published where the holder keeps a handed-in object: the object
-    /// stands as it was handed in, and its generation's lists as far
-    /// behind, until the model's next membership change.
+    /// stands as it was handed in, and a generation keeps the bit its
+    /// first ask read. One first asked before the holder follows the write
+    /// lends the old bit until the model's next membership change. One
+    /// first asked after that lends the row's new bit.
     ///
     /// A member the holder holds no row's object for is left out of the
     /// lists and counted ([`Self::unstated`]). So every worker lent states
@@ -1243,6 +1268,85 @@ impl Objects<Members> {
             })
         });
         stated.collect()
+    }
+}
+
+#[cfg(feature = "in-process")]
+impl Objects<Members> {
+    /// The pair classes of `generation`'s prefill and decode lists under
+    /// the pairing mode `mode`: each worker's class by its place in the
+    /// list AS LENT ([`Self::lent`]), and the table of the classes that
+    /// pair. A member the lists leave out has no place and no class: a
+    /// caller numbers nothing by the generation's own members.
+    ///
+    /// The verdicts are the store's own pairing rule and no other
+    /// ([`PairClasses::derive`]), over one member for each lent worker,
+    /// made of what the worker's row states: its wires, its engine kind and
+    /// its pairing descriptor. A lent worker whose row's object was
+    /// replaced or ended before a set is derived pairs with nobody in that
+    /// set: class `0`. A set that stands is not derived again for a worker
+    /// that goes later. The generation is the registry's old one by then,
+    /// and its classes stand as its lists do.
+    ///
+    /// A write that hands no object in leaves a kept object standing, and
+    /// publishes nothing. Such a write can move the row's engine kind and
+    /// its descriptor in place, and a raw store write its wires too: every
+    /// registration path starts another life where the wires differ. So
+    /// the holder counts those moves, of any model's row, and a generation
+    /// keeps each set of classes under its mode and the count its ask
+    /// read. An ask reads the count with one atomic load. Where a set
+    /// stands under it, the ask is a walk of the sets made before it, one
+    /// step each, and takes no lock. Where none stands, the ask derives
+    /// one: behind the cut of the lists, it reads the holder's entry once,
+    /// under its read lock, and runs the rule with that lock let go. Its
+    /// work grows with the two lists and with the pairs of offers that
+    /// differ among them. The sets made before stay where they are until
+    /// the generation falls: one for each such move a later ask saw, and
+    /// for each mode asked. A decision under way keeps the set it read.
+    ///
+    /// The holder calls nothing of the engine while it writes its entry,
+    /// and an ask holds no lock while it takes the entry's.
+    #[must_use]
+    pub fn pair_classes<'a>(&self, generation: &'a Members, mode: Pairing) -> &'a PartnerClasses {
+        // Read ahead of the entry: a set kept under this count is derived
+        // from an entry at least as new, since the count steps under the
+        // entry's write lock.
+        let moved = self.moved_in_place.load(Relaxed);
+        generation.pair_classes((moved, mode), || self.derive_pairs(generation, mode))
+    }
+
+    /// The classes of `generation`'s two lists as lent, derived now.
+    fn derive_pairs(&self, generation: &Members, mode: Pairing) -> PartnerClasses {
+        /// A row as the rule reads it.
+        fn member(row: &Arc<RowRemainder>) -> Member<'_> {
+            let descriptor = row.pairing.as_deref();
+            Member::new(
+                row.standing.row,
+                row.wire_modes,
+                &row.engine_kind,
+                descriptor,
+            )
+        }
+        let lists = [Role::Prefill, Role::Decode].map(|role| self.lent(generation, role));
+        // What the row of each lent worker states, where the row's object
+        // still stands for it: read under the entry's lock, which is let
+        // go before the rule runs.
+        let stated = {
+            let held = self.held.read();
+            lists.map(|list| -> Vec<Option<Arc<RowRemainder>>> {
+                let facts = list.facts.unwrap_or_default();
+                let row = |(worker, fact): (&Arc<dyn Worker>, &FixedFacts)| {
+                    let laid = held.rows.get(held.objects.get(&fact.id?)?)?;
+                    Arc::ptr_eq(&laid.object, worker).then(|| Arc::clone(&laid.remainder))
+                };
+                list.workers.iter().zip(facts).map(row).collect()
+            })
+        };
+        let members = [&stated[0], &stated[1]]
+            .map(|side| side.iter().flatten().map(member).collect::<Vec<_>>());
+        let derived = PairClasses::derive(&members[0], &members[1], mode);
+        let stands = |side: usize| stated[side].iter().map(Option::is_some);
+        derived.by_place(stands(0), stands(1))
     }
 }
 
@@ -1602,48 +1706,147 @@ mod tests {
     /// The named limit of the lists a holder lends. A kept object's row
     /// whose image bit a raw store write moves in place is restated with
     /// no publish: the object stands as it was handed in, and its
-    /// generation keeps the bit its first ask read. No registration path
-    /// writes so: each starts another life where the bit differs. The
-    /// model's next membership change publishes a generation that reads
-    /// the row as it stands.
+    /// generation keeps the bit its first ask read. One first asked before
+    /// the holder follows the write lends the old bit, and one first asked
+    /// after that lends the row's new bit. No registration path writes so:
+    /// each starts another life where the bit differs. The model's next
+    /// membership change publishes a generation that reads the row as it
+    /// stands.
     #[cfg(feature = "in-process")]
     #[test]
-    fn a_kept_objects_bit_moved_in_place_stands_until_the_next_publish() {
+    fn a_kept_objects_bit_moved_in_place_is_lent_as_its_generations_first_ask_read_it() {
         use crate::engine::Role;
 
+        // Where the generation's first ask falls: ahead of the write, between
+        // the write and the holder's follow, or behind the follow.
+        for first_ask in [
+            "ahead of the write",
+            "ahead of the follow",
+            "behind the follow",
+        ] {
+            let (replica, door) = handing();
+            let first = built(A, KEY_A);
+            registered(&replica, &door, &first, Precondition::Any).expect("the first write");
+            let registry = replica.objects.registry();
+            let generation = || {
+                registry
+                    .model_generation("m")
+                    .expect("the model's generation")
+            };
+            let bit = |generation: &Members| {
+                let list = replica.objects.lent(generation, Role::Single);
+                list.facts.expect("the holder lends facts")[0].vision
+            };
+            let before = generation();
+            if first_ask == "ahead of the write" {
+                assert!(!bit(&before));
+            }
+
+            let mut facts = replica.row(A).facts;
+            facts.vision = true;
+            let change = replica.store.upsert(facts);
+            assert!(matches!(change, MembershipChange::Relabelled { .. }));
+            if first_ask == "ahead of the follow" {
+                assert!(!bit(&before));
+            }
+            replica.follow();
+            assert!(Arc::ptr_eq(&replica.at(A), &first), "the object is kept");
+            assert!(Arc::ptr_eq(&before, &generation()), "nothing is published");
+            let new = first_ask == "behind the follow";
+            assert_eq!(bit(&before), new, "a first ask {first_ask}");
+
+            let second = built(B, KEY_B);
+            registered(&replica, &door, &second, Precondition::Any).expect("a join");
+            let after = generation();
+            assert!(!Arc::ptr_eq(&before, &after), "a join publishes");
+            assert!(bit(&after), "the next generation reads the row");
+        }
+    }
+
+    /// What the pairing rule reads of a kept object's row moves in place
+    /// where a writer hands nothing in: its pairing descriptor, its engine
+    /// kind, and by a raw store write its wires. The object stands and
+    /// nothing is published. The generation's pair classes follow all the
+    /// same: the next ask derives them again from the rows as they stand,
+    /// and an ask under way keeps the set it read. A move of what the rule
+    /// does not read derives nothing.
+    #[cfg(feature = "in-process")]
+    #[test]
+    fn a_kept_objects_pairing_facts_moved_in_place_move_the_next_asks_pair_classes() {
+        use std::ptr;
+
+        use crate::{
+            document::spec::Pairing,
+            engine::{PartnerClasses, WireModes},
+            store::pairing::PairingDescriptor,
+        };
+
         let (replica, door) = handing();
-        let first = built(A, KEY_A);
-        registered(&replica, &door, &first, Precondition::Any).expect("the first write");
+        let side = |url: &str, role: WorkerType| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(url).model(ModelCard::new("m"));
+            Arc::new(worker.worker_type(role).build())
+        };
+        let (prefill, decode) = (side(A, WorkerType::Prefill), side(B, WorkerType::Decode));
+        for built in [&prefill, &decode] {
+            registered(&replica, &door, built, Precondition::Any).expect("a registration");
+        }
+        // A write of `url`'s row that hands nothing in.
+        let write = |url: &str, change: &dyn Fn(&mut WorkerFacts)| {
+            let mut facts = replica.row(url).facts;
+            change(&mut facts);
+            let change = replica.store.upsert(facts);
+            assert!(matches!(change, MembershipChange::Relabelled { .. }));
+            replica.follow();
+        };
+        let over = |transport: &str| {
+            Some(Arc::new(PairingDescriptor {
+                transport: Some(transport.to_string()),
+                ..PairingDescriptor::default()
+            }))
+        };
+        for url in [A, B] {
+            write(url, &|facts| {
+                facts.wire_modes = WireModes::HTTP;
+                facts.engine_kind = "one".to_string();
+                facts.pairing = over("one");
+            });
+        }
         let registry = replica.objects.registry();
         let generation = || {
             registry
                 .model_generation("m")
                 .expect("the model's generation")
         };
-        let bit = |generation: &Members| {
-            let list = replica.objects.lent(generation, Role::Single);
-            list.facts.expect("the holder lends facts")[0].vision
-        };
-        let before = generation();
-        assert!(!bit(&before));
+        let stands = generation();
+        let ask = || replica.objects.pair_classes(&stands, Pairing::Lenient);
+        let classes = |set: &PartnerClasses| (set.prefills().to_vec(), set.decodes().to_vec());
+        let (paired, apart) = ((vec![1], vec![1]), (vec![0], vec![0]));
+        let under_way = ask();
+        assert_eq!(classes(under_way), paired, "one kind over one transport");
 
-        let mut facts = replica.row(A).facts;
-        facts.vision = true;
-        let change = replica.store.upsert(facts);
-        assert!(matches!(change, MembershipChange::Relabelled { .. }));
+        write(A, &|facts| facts.pairing = over("another"));
+        assert!(Arc::ptr_eq(&replica.at(A), &prefill), "the object is kept");
+        assert!(Arc::ptr_eq(&stands, &generation()), "nothing is published");
+        let next = ask();
+        assert_eq!(classes(next), apart, "two transports");
+        assert_eq!(classes(under_way), paired, "an ask under way keeps its own");
+        assert!(ptr::eq(next, ask()), "a set that stands is derived once");
+
+        write(A, &|facts| facts.pairing = over("one"));
+        assert_eq!(classes(ask()), paired, "one transport again");
+        write(A, &|facts| facts.engine_kind = "another".to_string());
+        assert_eq!(classes(ask()), apart, "two engine kinds");
+        write(A, &|facts| facts.engine_kind = "one".to_string());
+        assert_eq!(classes(ask()), paired, "one engine kind again");
+        write(A, &|facts| facts.wire_modes = WireModes::GRPC);
+        let last = ask();
+        assert_eq!(classes(last), apart, "the HTTP wire alone beside another");
+
+        // A label is no fact of the rule: its move derives nothing.
+        replica.patch(A, labels("gold"));
         replica.follow();
-        assert!(Arc::ptr_eq(&replica.at(A), &first), "the object is kept");
-        assert!(Arc::ptr_eq(&before, &generation()), "nothing is published");
-        assert!(
-            !bit(&before),
-            "the generation keeps what its first ask read"
-        );
-
-        let second = built(B, KEY_B);
-        registered(&replica, &door, &second, Precondition::Any).expect("a join");
-        let after = generation();
-        assert!(!Arc::ptr_eq(&before, &after), "a join publishes");
-        assert!(bit(&after), "the next generation reads the row");
+        assert!(ptr::eq(last, ask()));
+        assert!(Arc::ptr_eq(&stands, &generation()), "nothing was published");
     }
 
     /// A row moved by a writer that hands nothing in keeps its handed

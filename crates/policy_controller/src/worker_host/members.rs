@@ -1,6 +1,7 @@
 //! What a holder keeps of a registry's generation: the members, and where
 //! the build holds the engine over worker lists, the members by role, each
-//! role's list with its cell, its facts and its reach.
+//! role's list with its cell, its facts and its reach, and the pair classes
+//! of its prefill and decode lists.
 
 use std::sync::Arc;
 #[cfg(feature = "in-process")]
@@ -29,6 +30,10 @@ use crate::engine::{FixedFacts, LentList, ListCell, Role};
 #[derive(Debug)]
 pub struct Members {
     members: Arc<[Arc<dyn Worker>]>,
+    /// The pair classes of the prefill and decode lists, each set under the
+    /// pairing mode and the holder's count of in-place moves its ask read.
+    #[cfg(feature = "in-process")]
+    pairs: pairs::PairSets,
     #[cfg(feature = "in-process")]
     by_role: ByRole,
 }
@@ -37,6 +42,8 @@ impl Generation for Members {
     fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
         Self {
             members,
+            #[cfg(feature = "in-process")]
+            pairs: pairs::PairSets::default(),
             #[cfg(feature = "in-process")]
             by_role: ByRole::default(),
         }
@@ -156,6 +163,11 @@ impl Members {
         }
     }
 }
+
+#[cfg(feature = "in-process")]
+mod pairs;
+#[cfg(feature = "in-process")]
+pub use pairs::OpenAdmission;
 
 #[cfg(test)]
 mod tests;

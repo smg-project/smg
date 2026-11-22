@@ -50,6 +50,7 @@ use crate::{
     engine::{
         framework::PairTable,
         view::{WireModes, WorkerId},
+        PartnerClasses,
     },
 };
 
@@ -448,6 +449,35 @@ impl PairClasses {
     /// names the two pools' keys and what they disagree on.
     pub fn derive(prefills: &[Member<'_>], decodes: &[Member<'_>], mode: Pairing) -> Self {
         Derivation::default().whole(prefills, decodes, mode)
+    }
+
+    /// The classes as an engine over worker lists reads them
+    /// ([`PartnerClasses`]): each worker's class by its place in the
+    /// caller's list, with this derivation's table, which they take.
+    ///
+    /// `prefills` and `decodes` say, for each place of the caller's two
+    /// lists in order, whether the worker there was among the members
+    /// derived. The members derived stand in the lists' order, so each
+    /// takes its class as derived. A worker that was not among them takes
+    /// class `0`, which pairs with nobody.
+    #[must_use]
+    pub fn by_place(
+        self,
+        prefills: impl IntoIterator<Item = bool>,
+        decodes: impl IntoIterator<Item = bool>,
+    ) -> PartnerClasses {
+        fn side(derived: &[(WorkerId, u32)], given: impl IntoIterator<Item = bool>) -> Box<[u32]> {
+            let mut derived = derived.iter();
+            let mut next = || derived.next().map_or(0, |&(_, class)| class);
+            let class = |given: bool| if given { next() } else { 0 };
+            given.into_iter().map(class).collect()
+        }
+        PartnerClasses::derived(
+            side(&self.prefills, prefills),
+            side(&self.decodes, decodes),
+            self.ends,
+            self.listed,
+        )
     }
 
     /// Each prefill with its class, in the order given: `0` for a prefill

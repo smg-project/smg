@@ -123,6 +123,30 @@ impl PartnerClasses {
         }
     }
 
+    /// The classes as a pairing rule derived them, with its table: each
+    /// prefill's class and each decode's in their lists' order, where
+    /// prefill class `k`'s list ends in `listed` (at `k - 1`), and the
+    /// lists one after another, the decode classes each prefill class
+    /// pairs with, ascending.
+    ///
+    /// For a rule that numbers as [`Self::number`] does: each side's
+    /// classes from `1`, `0` for a worker that pairs with nobody, and every
+    /// decode class named by some list.
+    #[must_use]
+    pub(crate) fn derived(
+        prefills: Box<[u32]>,
+        decodes: Box<[u32]>,
+        ends: Box<[u32]>,
+        listed: Box<[u32]>,
+    ) -> Self {
+        Self {
+            prefills,
+            decodes,
+            ends,
+            listed,
+        }
+    }
+
     /// Each prefill's class, in the prefill list's order: what a caller
     /// writes into that list's records
     /// ([`Candidate::pair_class`](super::view::Candidate::pair_class)).
