@@ -1289,6 +1289,22 @@ and it has served traffic on a cluster beside classic.
 
 Each is the maintainer's. Work inside the crate goes on where a decision is not needed for it.
 
+All eleven at a glance. An answer can be as short as the numbers with their letters.
+
+| # | Decision | Recommended | Needed for |
+|---|---|---|---|
+| 1 | The name of a cache partition | (a) the host hands the entry already named | the two trees of `cache_aware` (in work, crate only) |
+| 2 | Recorders for the sheets that are missing | (a) new recorders beside classic's code, for the ring, the sticky override and `least_load` | proof against classic for those policies |
+| 3 | The hash ring | (a) the host lends its ring now; (b) one shared ring with the controller's switch | `consistent_hashing` and `prefix_hash` |
+| 4 | Where a placement stays during a request | (a) inside the load guard | the gateway's integration (stage 3) |
+| 5 | How the controller comes onto the one engine | (a) whole, in one switch | stage 4 |
+| 6 | No answer in time under a controller | (b) the gateway decides by itself with the same engine | stage 5 |
+| 7 | Shadow and explain | (a) built on the kept engine before the old one is deleted | stage 4 |
+| 8 | User stages in WebAssembly and over gRPC | (a) left as library code | nothing now |
+| 9 | The gateway's options | three with stage 3, the address and TLS options with stage 5 | stages 3 and 5 |
+| 10 | What the controller needs in the worker crate | one list type, and a load monitor that can be stopped | stage 4 |
+| 11 | The crate in CI and in the published set | (a) the feature in the crate's default build; (a) out of the published set until stage 3 | CI's run of the kept engine's tests; stage 0 |
+
 ### Decision 1: the name of a cache partition
 
 *Needed for:* the two-tree record of `cache_aware`. The engine must name a request's tree entry
