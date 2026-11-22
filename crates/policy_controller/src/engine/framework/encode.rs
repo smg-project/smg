@@ -429,8 +429,9 @@ impl Engine {
     /// reads no encoder and places none.
     ///
     /// What this side cannot read truly is declined. A request with items
-    /// under an encode profile that shows its rows to a plugin names
-    /// `encode-scope`: no scope is opened over the encoders offered to a
+    /// names `encode-column` when a column of the encode pool is not one
+    /// entry a row, and `encode-scope` under an encode profile that shows its
+    /// rows to a plugin: no scope is opened over the encoders offered to a
     /// key. A pair column of another length than its pool names
     /// `affinity-column` before a cut, as the pair entry names it. So does
     /// a column on the request, or rows named on it, before a stage of the
@@ -523,9 +524,13 @@ impl Engine {
         };
         let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
         let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
-        if encode.facts.len() != encode.encoders.len()
-            || encode.prefill_classes.len() != pools.prefills.len()
-            || !column_fits(encode.affinity, encode.encoders)
+        // The encode pool's columns are read for a request's items alone: a
+        // request with none is answered whatever its host handed in them.
+        let needs = !items.keys.is_empty();
+        if needs
+            && (encode.facts.len() != encode.encoders.len()
+                || encode.prefill_classes.len() != pools.prefills.len()
+                || !column_fits(encode.affinity, encode.encoders))
         {
             return declined(ENCODE_COLUMN);
         }
@@ -549,7 +554,6 @@ impl Engine {
         // a short set, so past this line nothing says a host's wrong shape.
         debug_assert_cells(pools.prefill_signal_cells, pools.prefills);
         debug_assert_cells(pools.decode_signal_cells, pools.decodes);
-        let needs = !items.keys.is_empty();
         // A profile that shows its rows to a plugin answers inside a scope
         // opened over the rows of one decision. None is opened over the
         // encoders offered to a key, so no stage of such a profile is asked.

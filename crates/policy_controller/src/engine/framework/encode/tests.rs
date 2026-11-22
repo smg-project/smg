@@ -285,6 +285,56 @@ fn a_request_without_items_reads_no_encoder_and_places_none() {
     assert_eq!(bed.placed(), ((0, 0), vec![], false));
 }
 
+/// The encode entry's answer to a request with no item that is handed an
+/// empty encode pool beside the bed's pair pools, and what it placed.
+fn over_an_empty_encode_pool(bed: &Bed, items: EncodeItems<'_>) -> (Decision, EncodePlaced) {
+    let (facts, pool) = bed.asked();
+    let cx = Constraints::default();
+    let (mut scratch, mut placed) = (Scratch::new(), EncodePlaced::new());
+    let decision = engine().decide_encode_pair(
+        &facts,
+        &pool,
+        bed.pools(),
+        EncodePool::default(),
+        items,
+        &cx,
+        &cx,
+        &cx,
+        &mut scratch,
+        &mut placed,
+    );
+    (decision, placed)
+}
+
+/// A request with no item is answered whatever its host handed in the
+/// encode pool's columns: over an empty encode pool beside real prefills it
+/// takes its pair, and no encoder is placed. The classic router reads no
+/// encoder for such a request: each of its reads stands behind the test
+/// that the request has items
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2131`,
+/// `:2149`, `:2187` and `:2215` on main cbefc9565).
+#[test]
+fn a_request_without_items_is_answered_whatever_the_encode_pools_columns_hold() {
+    let bed = Bed::new();
+    let (decision, placed) = over_an_empty_encode_pool(&bed, EncodeItems::default());
+    assert_eq!(decision, bed.pair(&engine()));
+    assert!(placed.encoders().is_empty());
+}
+
+/// So is one that asks images of its decode: the bed's decode takes them,
+/// and the pair is the pair entry's.
+#[test]
+fn a_request_without_items_that_asks_images_of_its_decode_reads_no_encode_column() {
+    let bed = Bed::new();
+    let items = EncodeItems {
+        decode_images: true,
+        ..EncodeItems::default()
+    };
+    let (decision, placed) = over_an_empty_encode_pool(&bed, items);
+    assert_eq!(decision, bed.pair(&engine()));
+    assert!(placed.encoders().is_empty());
+}
+
 #[test]
 fn the_one_key_is_placed_under_a_class_that_pushes_and_under_no_other() {
     let mut bed = Bed::new();
