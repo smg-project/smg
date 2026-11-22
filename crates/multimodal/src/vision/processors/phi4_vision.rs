@@ -222,12 +222,12 @@ impl Phi4VisionProcessor {
     /// Dynamic preprocess: calculate target dimensions and create attention mask.
     ///
     /// Takes the image's crop grid `(w_crops, h_crops)` from `target_crops`.
-    /// Returns (processed_image, attention_mask, target_h_crops, target_w_crops)
+    /// Returns (processed_image, attention_mask)
     fn dynamic_preprocess(
         &self,
         image: &DynamicImage,
         (target_w_crops, target_h_crops): (usize, usize),
-    ) -> (DynamicImage, Array2<u32>, usize, usize) {
+    ) -> (DynamicImage, Array2<u32>) {
         let (orig_w, orig_h) = image.dimensions();
         let target_width = self.base_resolution * target_w_crops as u32;
         let target_height = self.base_resolution * target_h_crops as u32;
@@ -279,7 +279,7 @@ impl Phi4VisionProcessor {
         // Pad to target dimensions (white padding on right/bottom)
         let padded = self.pad_image(&resized, target_width, target_height);
 
-        (padded, attention_mask, target_h_crops, target_w_crops)
+        (padded, attention_mask)
     }
 
     /// Pad image to target dimensions with white padding.
@@ -363,7 +363,8 @@ impl Phi4VisionProcessor {
         values: &mut Vec<f32>,
     ) -> SingleImageResult {
         // Step 1: Dynamic preprocess (resize, pad, create attention mask)
-        let (hd_image, attention_mask, h_crops, w_crops) = self.dynamic_preprocess(image, grid);
+        let (w_crops, h_crops) = grid;
+        let (hd_image, attention_mask) = self.dynamic_preprocess(image, grid);
 
         let hd_h = hd_image.height();
         let hd_w = hd_image.width();
