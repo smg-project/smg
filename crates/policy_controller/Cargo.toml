@@ -312,6 +312,12 @@ name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
 required-features = ["controller", "worker-host"]
 
+# A program that decides in its own process: it starts the engine and
+# serves each request by the one call the engine has for a request.
+[[example]]
+name = "in_process"
+required-features = ["in-process"]
+
 [[test]]
 name = "binary"
 required-features = ["controller", "worker-host"]
@@ -327,6 +333,12 @@ required-features = ["controller", "worker-host"]
 [[test]]
 name = "spec_store"
 required-features = ["controller", "worker-host"]
+
+# The program of the `in_process` example, driven by cases: the example's
+# own module, taken in as it stands.
+[[test]]
+name = "caller"
+required-features = ["in-process"]
 
 # Replays recorded rows through the load report conversion under `ingest`.
 [[test]]
