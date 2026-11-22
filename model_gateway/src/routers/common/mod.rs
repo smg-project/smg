@@ -262,8 +262,9 @@ pub mod bench_support {
             start_in_process,
         },
         routers::common::{
-            pair_index::{PdPairIndex, PdWire},
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            pair_index::{PairSides, PdPairIndex, PdWire},
+            pair_lists::PairNarrowing,
+            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
     };
 
@@ -590,12 +591,21 @@ pub mod bench_support {
     /// worker the request went to (`placed_on`), and `None` where it had
     /// no pair.
     ///
+    /// Under a document that picks a pair's decode after its prefill, the
+    /// decode is decided again between the two dispatch words, as a route
+    /// that sends the prefill first decides it when the prefill has
+    /// answered, and the decode's words are those of the decode that
+    /// decision left. With `narrowed`, the request may take every second
+    /// decode alone, as a route's own rule narrows a request: each decision
+    /// is made over lists built for that request.
+    ///
     /// What [`route_pair`] does under the classic policies, with the engine
     /// deciding the whole pair through the object the routers hold.
     pub fn route_engine_pair(
         object: &EngineObject,
         model: &str,
         tokens: Option<&[u32]>,
+        narrowed: bool,
     ) -> Option<usize> {
         let hashes = object.0.hashes(model, &Prompt::of(tokens, None));
         let id = mark();
@@ -606,17 +616,27 @@ pub mod bench_support {
             hashes: Some(&hashes),
             ..Ask::of(&id, model)
         };
+        let every_second = |_: &ModelWorkerSnapshot, index: &PdPairIndex| -> Option<PairSides> {
+            let decodes = index.decode_pool.iter().step_by(2).cloned().collect();
+            Some([Arc::clone(&index.prefill_pool), decodes])
+        };
+        let among: Option<PairNarrowing<'_>> = if narrowed { Some(&every_second) } else { None };
         // With no prefill limit the arm's future is ready at its first poll.
-        let placing = pin!(object.0.place_pair(&ask, None, None));
+        let placing = pin!(object.0.place_pair_among(&ask, |_| true, among, None, None));
         let Poll::Ready(Ok((mut placed, prefill))) =
             placing.poll(&mut Context::from_waker(Waker::noop()))
         else {
             return None;
         };
-        let decode = placed.decode().map(Arc::clone)?;
         let went = placed_on(placed.worker());
         let now = Instant::now();
         placed.dispatched(now);
+        // A decode that waits is decided again here, where a route's prefill
+        // has answered.
+        if placed.decode_waits() {
+            placed.decode_again(&object.0, &ask, |_| true, now);
+        }
+        let decode = placed.decode().map(Arc::clone)?;
         placed.decode_dispatched(now);
         let decode = WorkerLoadGuard::with_key(decode, None);
         drop((prefill, decode));

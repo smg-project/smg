@@ -49,6 +49,15 @@
 //! pair router's arm asks it: one decision over the registry's two lists.
 //! `--not-ready` and `--ready` then hold for each side.
 //!
+//! `--decode-again true` runs a pair cell's `engine` path under the cell's
+//! document with its pair's decode picked after the prefill
+//! (`plans.pd-pair.decode: after-prefill`): each request's decode is decided
+//! a second time, where a route's prefill has answered. No other path
+//! decides a decode again.
+//! `--narrowed true` lets each request of that path take every second
+//! decode alone, as a route's own rule narrows a request: each decision is
+//! made over lists built for the request.
+//!
 //! `--keys N` gives each request one of `N` routing keys in turn, in the
 //! header `x-smg-routing-key`: a policy that places by a key places by it,
 //! on both paths. `0`, the default, sends no key.
@@ -136,6 +145,7 @@ use smg::{
         grpc::backend_client::BasicWorkerBuilder,
     },
 };
+use smg_policy_controller::document::DecodePick;
 use smg_worker::{
     identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
     load::state::{one_rank_load, TestFeed},
@@ -192,6 +202,13 @@ struct Cell {
     /// The tokens a request adds to its caller's conversation; `0` for the
     /// prompts in turn.
     grow: usize,
+    /// A pair's decode is decided again where its prefill has answered:
+    /// the `engine` path of a pair cell, under the cell's document with
+    /// `plans.pd-pair.decode: after-prefill`.
+    decode_again: bool,
+    /// A pair's request may take every second decode alone: the `engine`
+    /// path of a pair cell.
+    narrowed: bool,
 }
 
 fn cell() -> Cell {
@@ -212,6 +229,8 @@ fn cell() -> Cell {
         prompts: 1,
         publish_ms: 0,
         grow: 0,
+        decode_again: false,
+        narrowed: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -245,6 +264,8 @@ fn cell() -> Cell {
             "--prompts" => cell.prompts = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             "--grow" => cell.grow = value.parse().unwrap(),
+            "--decode-again" => cell.decode_again = value.parse().unwrap(),
+            "--narrowed" => cell.narrowed = value.parse().unwrap(),
             other => panic!("no flag {other}"),
         }
     }
@@ -531,6 +552,24 @@ fn build(cell: &Cell) -> Built {
             decode_policy: None,
         };
     }
+    let engine_pair = cell.pair && cell.path == "engine";
+    assert!(
+        engine_pair || !(cell.decode_again || cell.narrowed),
+        "the engine path of a pair cell decides a decode again, and narrows a request"
+    );
+    if cell.decode_again {
+        // The cell's document with its pair's decode picked after the
+        // prefill, as its operator supplies it: a supplied document stands
+        // beside routing settings that state no policy of their own.
+        let mut document = config.policy_document().unwrap();
+        document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+        config = RouterConfig {
+            policy_controller: true,
+            mode: config.mode,
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        };
+    }
     let policies = match cell.path.as_str() {
         "classic" => {
             let policies = PolicyRegistry::new(policy_config(&cell.policy));
@@ -618,7 +657,7 @@ fn build(cell: &Cell) -> Built {
             Decider::Policies(_) => 0,
         })
     };
-    let (route, pair) = (cell.route, cell.pair);
+    let (route, pair, narrowed) = (cell.route, cell.pair, cell.narrowed);
     assert!(
         !(pair && cell.keys != 0),
         "a pair cell sends no routing key"
@@ -644,7 +683,9 @@ fn build(cell: &Cell) -> Built {
             Decider::Records(engine) => {
                 route_records(&registry, engine, model, route, Some(tokens), headers)
             }
-            Decider::Engine(object) if pair => route_engine_pair(object, model, Some(tokens)),
+            Decider::Engine(object) if pair => {
+                route_engine_pair(object, model, Some(tokens), narrowed)
+            }
             Decider::Engine(object) => route_engine(&registry, object, model, route, Some(tokens)),
         }
     });
@@ -788,7 +829,7 @@ fn main() {
         returned as f64 / turns as f64
     };
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} decode_again={} narrowed={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -800,6 +841,8 @@ fn main() {
         cell.overloaded,
         cell.models,
         cell.pair,
+        cell.decode_again,
+        cell.narrowed,
         cell.keys,
         cell.prompts,
         cell.grow,
