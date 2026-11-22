@@ -36,7 +36,7 @@ fn record_engine_load_sets_core_gauges_per_dp_rank() {
     };
 
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", "null", &response);
+        Metrics::record_engine_load(held("http://w:1").0.as_ref(), "m", "null", &response);
     });
 
     // The exporter renders labels in insertion order, so assert on the
@@ -67,7 +67,7 @@ fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
         ..Default::default()
     };
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", "null", &response);
+        Metrics::record_engine_load(held("http://w:1").0.as_ref(), "m", "null", &response);
     });
     assert_metric(
         &rendered,
@@ -79,7 +79,7 @@ fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
 
     response.loads[0].max_total_num_tokens = 0;
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", "null", &response);
+        Metrics::record_engine_load(held("http://w:1").0.as_ref(), "m", "null", &response);
     });
     assert!(
         !rendered.contains("smg_engine_kv_capacity_tokens"),
@@ -127,7 +127,7 @@ fn record_engine_load_sets_pd_gauges_when_disagg_present() {
     };
 
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://w:1", "m", "null", &response);
+        Metrics::record_engine_load(held("http://w:1").0.as_ref(), "m", "null", &response);
     });
 
     let pd_labels = ["role=\"prefill\"", "worker=\"http://w:1\"", "dp_rank=\"0\""];
@@ -185,9 +185,10 @@ fn the_engine_load_set_renders_the_same_through_kept_handles() {
         ..Default::default()
     };
     let records = || {
-        Metrics::record_engine_load("http://w:1", "m", "null", &report(7, 0.25));
-        Metrics::record_engine_rank_load("http://w:1", "m", "null", &report(8, 0.75).loads[0]);
-        Metrics::record_engine_load("http://w:2", "m2", "null", &report(1, 0.5));
+        let (first, second) = (held("http://w:1").0, held("http://w:2").0);
+        Metrics::record_engine_load(first.as_ref(), "m", "null", &report(7, 0.25));
+        Metrics::record_engine_rank_load(first.as_ref(), "m", "null", &report(8, 0.75).loads[0]);
+        Metrics::record_engine_load(second.as_ref(), "m2", "null", &report(1, 0.5));
     };
     let built = render_with_recorder(|| {
         handles::force_on_this_thread(Some(false));
@@ -246,9 +247,14 @@ fn a_load_series_carries_its_workers_registered_role() {
         ..Default::default()
     };
     let rendered = render_with_recorder(|| {
-        Metrics::record_engine_load("http://d:1", "m", "decode", &load(None));
-        Metrics::record_engine_load("http://p:1", "m", "prefill", &load(Some("prefill")));
-        Metrics::record_engine_load("http://r:1", "m", "null", &load(None));
+        Metrics::record_engine_load(held("http://d:1").0.as_ref(), "m", "decode", &load(None));
+        Metrics::record_engine_load(
+            held("http://p:1").0.as_ref(),
+            "m",
+            "prefill",
+            &load(Some("prefill")),
+        );
+        Metrics::record_engine_load(held("http://r:1").0.as_ref(), "m", "null", &load(None));
     });
     for (worker, role) in [
         ("http://d:1", "decode"),
@@ -374,24 +380,25 @@ fn kept_worker_counters_follow_the_workers_registrations() {
                 .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
         })
     };
+    let (w1, w2) = (held("http://w1").0, held("http://w2").0);
     handles::force_on_this_thread(Some(true));
     metrics::with_local_recorder(&recorder, || {
-        Metrics::record_worker_request("http://w1", "m");
-        Metrics::record_worker_request("http://w1", "m");
-        Metrics::record_worker_request("http://w2", "m");
+        Metrics::record_worker_request(w1.as_ref());
+        Metrics::record_worker_request(w1.as_ref());
+        Metrics::record_worker_request(w2.as_ref());
         assert_eq!(counts(), [Some("2".to_owned()), Some("1".to_owned())]);
 
         workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
         // A send racing the removal: its write is dropped, not kept.
-        Metrics::record_worker_request("http://w1", "m");
+        Metrics::record_worker_request(w1.as_ref());
         assert_eq!(counts(), [None, Some("1".to_owned())]);
 
         workers.activate("http://w1");
         handles::worker_set_changed();
-        Metrics::record_worker_request("http://w1", "m");
-        Metrics::record_worker_request("http://w1", "m");
-        Metrics::record_worker_request("http://w2", "m");
+        Metrics::record_worker_request(w1.as_ref());
+        Metrics::record_worker_request(w1.as_ref());
+        Metrics::record_worker_request(w2.as_ref());
         assert_eq!(counts(), [Some("2".to_owned()), Some("2".to_owned())]);
     });
     handles::reset();
@@ -421,13 +428,14 @@ fn kept_worker_gauges_set_the_recorders_series() {
             })
             .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
     };
+    let w1 = WorkerHandles::new("http://w1");
     handles::force_on_this_thread(Some(true));
     metrics::with_local_recorder(&recorder, || {
-        Metrics::set_worker_requests_active("http://w1", 3);
-        Metrics::set_worker_requests_active("http://w1", 2);
-        Metrics::set_worker_cb_consecutive_failures("http://w1", 1);
-        Metrics::set_worker_cb_consecutive_successes("http://w1", 4);
-        Metrics::set_worker_routing_keys_active("http://w1", 5);
+        Metrics::set_worker_requests_active(&w1, 3);
+        Metrics::set_worker_requests_active(&w1, 2);
+        Metrics::set_worker_cb_consecutive_failures(&w1, 1);
+        Metrics::set_worker_cb_consecutive_successes(&w1, 4);
+        Metrics::set_worker_routing_keys_active(&w1, 5);
         assert_eq!(
             value("smg_worker_requests_active", "http://w1").as_deref(),
             Some("2")
@@ -447,12 +455,12 @@ fn kept_worker_gauges_set_the_recorders_series() {
 
         workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
-        Metrics::set_worker_requests_active("http://w1", 9);
+        Metrics::set_worker_requests_active(&w1, 9);
         assert_eq!(value("smg_worker_requests_active", "http://w1"), None);
 
         workers.activate("http://w1");
         handles::worker_set_changed();
-        Metrics::set_worker_requests_active("http://w1", 1);
+        Metrics::set_worker_requests_active(&w1, 1);
         assert_eq!(
             value("smg_worker_requests_active", "http://w1").as_deref(),
             Some("1")
@@ -478,16 +486,17 @@ fn a_held_removed_worker_keeps_its_address_retired_through_upkeep() {
             line.starts_with("smg_worker_requests_total{") && line.contains("worker=\"http://w1\"")
         })
     };
+    let w1 = held("http://w1").0;
     handles::force_on_this_thread(Some(true));
     metrics::with_local_recorder(&recorder, || {
-        Metrics::record_worker_request("http://w1", "m");
+        Metrics::record_worker_request(w1.as_ref());
         assert!(listed());
         let (worker, witness) = held("http://w1");
         workers.retire("http://w1", witness);
         handles::worker_set_changed();
         workers.run_upkeep();
         // A write from a handle that still holds the removed worker lands nowhere.
-        Metrics::record_worker_request("http://w1", "m");
+        Metrics::record_worker_request(w1.as_ref());
         assert!(!listed());
         assert_eq!(workers.retired_len(), 1);
         drop(worker);
@@ -497,19 +506,44 @@ fn a_held_removed_worker_keeps_its_address_retired_through_upkeep() {
     handles::reset();
 }
 
+/// A worker's handles are its own: another worker object at its address
+/// builds its handles and does not write through the first one's.
+#[test]
+fn a_workers_handles_are_not_shared_with_another_worker_at_its_address() {
+    let (first, second) = (held("http://w1").0, held("http://w1").0);
+    handles::force_on_this_thread(Some(true));
+    let under_first = render_with_recorder(|| Metrics::record_worker_request(first.as_ref()));
+    let under_second = render_with_recorder(|| Metrics::record_worker_request(second.as_ref()));
+    handles::reset();
+    for rendered in [under_first, under_second] {
+        assert!(
+            rendered.contains("smg_worker_requests_total{"),
+            "a record that went through another worker's handle: {rendered}"
+        );
+    }
+}
+
 /// The registry's registration and removal hooks are what move the
 /// worker-set generation the kept counters are checked against.
 #[test]
 fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
-    let mut kept = handles::WorkerRequests::default();
-    kept.for_worker("http://w")
-        .insert(Arc::from("m"), metrics::Counter::noop());
+    let worker = WorkerHandles::new("http://w");
+    let keeps = || {
+        handles::Kept::current(&worker.kept)
+            .requests
+            .get()
+            .is_some()
+    };
+    let _ = handles::Kept::current(&worker.kept)
+        .requests
+        .set(metrics::Counter::noop());
     Metrics::remove_worker_metrics("http://gone", gone("http://gone"));
-    assert!(kept.for_worker("http://w").is_empty(), "a removal");
-    kept.for_worker("http://w")
-        .insert(Arc::from("m"), metrics::Counter::noop());
+    assert!(!keeps(), "a removal");
+    let _ = handles::Kept::current(&worker.kept)
+        .requests
+        .set(metrics::Counter::noop());
     Metrics::worker_registered("http://new");
-    assert!(kept.for_worker("http://w").is_empty(), "a registration");
+    assert!(!keeps(), "a registration");
 }
 
 /// The breaker's outcome counter is a per-worker series: through kept
@@ -538,22 +572,23 @@ fn kept_worker_outcome_counters_follow_the_workers_registrations() {
             })
             .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
     };
+    let w1 = WorkerHandles::new("http://w1");
     handles::force_on_this_thread(Some(true));
     metrics::with_local_recorder(&recorder, || {
-        Metrics::record_worker_cb_outcome("http://w1", "success");
-        Metrics::record_worker_cb_outcome("http://w1", "success");
-        Metrics::record_worker_cb_outcome("http://w1", "failure");
+        Metrics::record_worker_cb_outcome(&w1, "success");
+        Metrics::record_worker_cb_outcome(&w1, "success");
+        Metrics::record_worker_cb_outcome(&w1, "failure");
         assert_eq!(value("http://w1", "success").as_deref(), Some("2"));
         assert_eq!(value("http://w1", "failure").as_deref(), Some("1"));
 
         workers.retire("http://w1", gone("http://w1"));
         handles::worker_set_changed();
-        Metrics::record_worker_cb_outcome("http://w1", "success");
+        Metrics::record_worker_cb_outcome(&w1, "success");
         assert_eq!(value("http://w1", "success"), None);
 
         workers.activate("http://w1");
         handles::worker_set_changed();
-        Metrics::record_worker_cb_outcome("http://w1", "success");
+        Metrics::record_worker_cb_outcome(&w1, "success");
         assert_eq!(value("http://w1", "success").as_deref(), Some("1"));
     });
     handles::reset();

@@ -3202,7 +3202,7 @@ async fn the_batchs_sentinel_covers_every_rank_of_the_row() {
 fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
     let _ = monitor.apply_polled_load("http://w:1", &answer, Instant::now());
     Metrics::record_engine_load(
-        "http://w:1",
+        worker.as_ref(),
         worker.model_id(),
         registered_engine_role(*worker.worker_type()),
         &answer,

@@ -21,6 +21,7 @@ use crate::{
         resilience::ResolvedResilience,
     },
     identity::basic::Worker,
+    metrics::writers::WorkerHandles,
     model_card::ModelCard,
     pd::pairing::PdPairing,
     registry::event::WorkerSignal,
@@ -490,6 +491,8 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
 
         let resilience = self.resilience.unwrap_or_default();
 
+        let metric_handles = Arc::new(WorkerHandles::new(metadata.spec.url.as_str()));
+
         BasicWorker {
             kv_engine_id: Arc::new(ArcSwapOption::new(
                 metadata.spec.kv_engine_id.clone().map(Arc::new),
@@ -512,6 +515,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             http_client,
             resilience,
             completion_sink: Arc::new(std::sync::RwLock::new(None)),
+            metric_handles,
         }
     }
 }

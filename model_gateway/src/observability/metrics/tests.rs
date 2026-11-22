@@ -2,7 +2,7 @@ use std::net::TcpListener;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use smg_worker::{
-    metrics::writers::Metrics as WorkerMetrics,
+    metrics::writers::{Metrics as WorkerMetrics, WorkerHandles},
     test_support::{gone, held},
 };
 
@@ -1232,6 +1232,7 @@ fn time_per_router_record() {
     const ROUNDS: u32 = 200_000;
     const WORKER: &str = "grpc://worker-1:20000";
     const MODEL: &str = "model-a";
+    let worker = held(WORKER).0;
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
         None,
@@ -1250,7 +1251,7 @@ fn time_per_router_record() {
             metrics_labels::ENDPOINT_CHAT,
             streaming,
         );
-        WorkerMetrics::record_worker_request(WORKER, MODEL);
+        WorkerMetrics::record_worker_request(worker.as_ref());
     };
     let duration = || {
         Metrics::record_router_duration(
@@ -1323,6 +1324,7 @@ fn time_per_router_record_contended() {
     const THREADS: u32 = 8;
     const WORKER: &str = "grpc://worker-1:20000";
     const MODEL: &str = "model-a";
+    let worker = held(WORKER).0;
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
         None,
@@ -1341,7 +1343,7 @@ fn time_per_router_record_contended() {
             metrics_labels::ENDPOINT_CHAT,
             STREAMING_FALSE,
         );
-        WorkerMetrics::record_worker_request(WORKER, MODEL);
+        WorkerMetrics::record_worker_request(worker.as_ref());
         Metrics::record_router_duration(
             metrics_labels::ROUTER_GRPC,
             metrics_labels::BACKEND_REGULAR,
@@ -1491,7 +1493,10 @@ fn time_per_request_records() {
                 Metrics::record_cache_aware_match_ratio(0.5);
                 Metrics::record_request_body_path("buffered", "single_worker");
                 Metrics::record_request_buffers_released_early(300);
-                WorkerMetrics::record_worker_cb_outcome("http://w1", "success");
+                WorkerMetrics::record_worker_cb_outcome(
+                    &WorkerHandles::new("http://w1"),
+                    "success",
+                );
                 Metrics::record_admission_inflight_released();
             }
             let per_request = start.elapsed().as_nanos() as f64 / f64::from(ROUNDS);

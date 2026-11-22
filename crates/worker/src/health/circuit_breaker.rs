@@ -6,7 +6,11 @@ use std::{
 use parking_lot::Mutex;
 use tracing::info;
 
-use crate::{identity::endpoint::Endpoint, metrics::writers::Metrics, metrics_labels};
+use crate::{
+    identity::endpoint::Endpoint,
+    metrics::writers::{Metrics, WorkerHandles},
+    metrics_labels,
+};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +119,8 @@ pub struct CircuitBreaker {
     /// Last state change time in milliseconds (from now_ms())
     last_state_change_ms: AtomicU64,
     config: CircuitBreakerConfig,
-    metric_label: String,
+    /// The handles of the series it writes; they carry its metric label.
+    metrics: WorkerHandles,
     /// Serializes the state gauge writes (see `publish_state_gauge`).
     gauge_lock: Mutex<()>,
 }
@@ -142,14 +147,14 @@ impl CircuitBreaker {
             last_failure_time_ms: AtomicU64::new(0),
             last_state_change_ms: AtomicU64::new(now_ms()),
             config,
-            metric_label,
+            metrics: WorkerHandles::new(metric_label),
             gauge_lock: Mutex::new(()),
         }
     }
 
     /// Get the metric label
     pub fn metric_label(&self) -> &str {
-        &self.metric_label
+        self.metrics.url()
     }
 
     /// Get the configuration used to create this circuit breaker.
@@ -218,7 +223,7 @@ impl CircuitBreaker {
         } else {
             metrics_labels::CB_FAILURE
         };
-        Metrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
+        Metrics::record_worker_cb_outcome(&self.metrics, outcome_str);
         self.publish_gauge_metrics();
     }
 
@@ -239,7 +244,7 @@ impl CircuitBreaker {
             CircuitState::Closed => {}
             CircuitState::Open => {
                 tracing::warn!(
-                    worker_url = %Endpoint::redacted_str(&self.metric_label),
+                    worker_url = %Endpoint::redacted_str(self.metric_label()),
                     "Success recorded while circuit is open"
                 );
             }
@@ -301,13 +306,13 @@ impl CircuitBreaker {
         let (from, to) = (from.as_str(), to.as_str());
         // An absent `cause` records no field: the line reads as before.
         info!(
-            worker_url = %Endpoint::redacted_str(&self.metric_label),
+            worker_url = %Endpoint::redacted_str(self.metric_label()),
             from,
             to,
             cause,
             "Circuit breaker state transition: {from} -> {to}"
         );
-        Metrics::record_worker_cb_transition(&self.metric_label, from, to);
+        Metrics::record_worker_cb_transition(self.metric_label(), from, to);
         self.publish_state_gauge();
         self.publish_gauge_metrics();
     }
@@ -429,9 +434,9 @@ impl CircuitBreaker {
             (CircuitState::HalfOpen, CircuitState::Closed),
             (CircuitState::HalfOpen, CircuitState::Open),
         ] {
-            Metrics::init_worker_cb_transition(&self.metric_label, from.as_str(), to.as_str());
+            Metrics::init_worker_cb_transition(self.metric_label(), from.as_str(), to.as_str());
         }
-        Metrics::init_worker_cb_health_readmissions(&self.metric_label);
+        Metrics::init_worker_cb_health_readmissions(self.metric_label());
     }
 
     /// Publish this breaker's state and counts to the per-worker gauges.
@@ -451,18 +456,12 @@ impl CircuitBreaker {
     fn publish_state_gauge(&self) {
         let _guard = self.gauge_lock.lock();
         let state = CircuitState::from_int(self.state.load(Ordering::Acquire));
-        Metrics::set_worker_cb_state(&self.metric_label, state.as_int());
+        Metrics::set_worker_cb_state(self.metric_label(), state.as_int());
     }
 
     fn publish_gauge_metrics(&self) {
-        Metrics::set_worker_cb_consecutive_failures(
-            &self.metric_label,
-            self.consecutive_failures(),
-        );
-        Metrics::set_worker_cb_consecutive_successes(
-            &self.metric_label,
-            self.consecutive_successes(),
-        );
+        Metrics::set_worker_cb_consecutive_failures(&self.metrics, self.consecutive_failures());
+        Metrics::set_worker_cb_consecutive_successes(&self.metrics, self.consecutive_successes());
     }
 }
 
@@ -479,7 +478,7 @@ impl Clone for CircuitBreaker {
             last_failure_time_ms: AtomicU64::new(self.last_failure_time_ms.load(Ordering::Acquire)),
             last_state_change_ms: AtomicU64::new(self.last_state_change_ms.load(Ordering::Acquire)),
             config: self.config.clone(),
-            metric_label: self.metric_label.clone(),
+            metrics: WorkerHandles::new(self.metric_label()),
             gauge_lock: Mutex::new(()),
         }
     }

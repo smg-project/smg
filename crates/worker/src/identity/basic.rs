@@ -38,7 +38,7 @@ use crate::{
         resilience::ResolvedResilience,
     },
     identity::error::{WorkerError, WorkerResult},
-    metrics::writers::Metrics,
+    metrics::writers::{Metrics, WorkerHandles},
     model_card::ModelCard,
     pd::pairing::PdPairing,
     registry::event::{WorkerConnected, WorkerSignal},
@@ -465,6 +465,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// dropped and come back (a registration): the current pair of state and
     /// reason is set whether or not it was the one published before.
     fn republish_state(&self) {}
+
+    /// The handles this worker's request and engine-load records go
+    /// through. A worker that holds none answers `None`, and each of its
+    /// records builds its key.
+    fn metric_handles(&self) -> Option<&WorkerHandles> {
+        None
+    }
 
     /// Whether the absolute overload guard currently vetoes this worker.
     ///
@@ -1051,6 +1058,9 @@ pub struct BasicWorker {
     /// Request-completion observer, installed by the policy registry; shared
     /// by clones so a DP-rank view reports to the same sink.
     pub completion_sink: Arc<std::sync::RwLock<Option<Arc<dyn RequestCompletionSink>>>>,
+    /// The handles of the series this worker writes for its requests and
+    /// its engine load; shared by clones, which write the same series.
+    pub metric_handles: Arc<WorkerHandles>,
 }
 
 impl Clone for BasicWorker {
@@ -1058,6 +1068,7 @@ impl Clone for BasicWorker {
         Self {
             metadata: self.metadata.clone(),
             completion_sink: Arc::clone(&self.completion_sink),
+            metric_handles: Arc::clone(&self.metric_handles),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             engine_connection: Arc::clone(&self.engine_connection),
@@ -1106,7 +1117,7 @@ impl BasicWorker {
 
     fn update_running_requests_metrics(&self) {
         let load = self.load();
-        Metrics::set_worker_requests_active(self.url(), load);
+        Metrics::set_worker_requests_active(&self.metric_handles, load);
     }
 
     fn shared_runtime(&self) -> Arc<WorkerRuntime> {
@@ -1484,6 +1495,10 @@ impl Worker for BasicWorker {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn metric_handles(&self) -> Option<&WorkerHandles> {
+        Some(&self.metric_handles)
     }
 
     fn url(&self) -> &str {

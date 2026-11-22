@@ -7,8 +7,12 @@
 //! here; the gateway's list calls it. `series` is the store the series
 //! labelled `worker` live in, so they leave `/metrics` with their worker.
 
-use std::sync::{Arc, Weak};
+use std::{
+    fmt,
+    sync::{Arc, OnceLock, Weak},
+};
 
+use arc_swap::{ArcSwap, Guard};
 use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use once_cell::sync::Lazy;
@@ -81,32 +85,71 @@ pub fn is_interned(s: &str) -> bool {
     STRING_INTERNER.contains_key(s)
 }
 
-/// Per-thread caches of the handles the worker's records go through. The
-/// per-request ones: the per-worker request counters' and gauges' and the
-/// breaker's outcomes'. The ones a worker's own streams move, with no request
-/// in hand: the engine load set, which a load record sets, and the KV-event
-/// set, which a batch of the event stream records. The helpers and the
+/// The handles a worker's records of its requests, its circuit breaker and
+/// its engine load go through, held by what writes them (the worker object,
+/// its breaker, its routing-key load) where each thread once kept a map by
+/// worker address: a gateway keeps one set a writer, whatever the number of
+/// its threads, and a record hashes no address. A set dies with its holder.
+pub struct WorkerHandles {
+    /// The worker URL, the `worker` label of every series of the set.
+    url: String,
+    kept: ArcSwap<handles::Kept>,
+}
+
+impl WorkerHandles {
+    /// An empty set for the worker at `url`: a handle is built by the first
+    /// record that needs it, so the series that exist are the ones written.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            kept: ArcSwap::new(handles::Kept::none()),
+        }
+    }
+
+    /// The worker URL the set's series carry.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The handles kept under the current worker set, or `None` while
+    /// handles are not kept and a record builds its key.
+    fn kept(&self) -> Option<Guard<Arc<handles::Kept>>> {
+        handles::keep_handles().then(|| handles::Kept::current(&self.kept))
+    }
+}
+
+impl fmt::Debug for WorkerHandles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerHandles")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The kept handles of the worker's records: the sets the worker's parts
+/// hold ([`WorkerHandles`]), and this thread's cache of the KV-event set,
+/// which a batch of the event stream records. The helpers and the
 /// installed flag are the worker crate's (`crate::metrics::handles`), so
 /// every writer records the same way.
 mod handles {
     use std::{
         cell::RefCell,
-        collections::HashMap,
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc,
+            Arc, OnceLock,
         },
     };
 
+    use arc_swap::{ArcSwap, Guard};
     use metrics::{Counter, Gauge, Histogram};
+    use once_cell::sync::Lazy;
+    use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
 
     use super::{intern_model_label, intern_string, rank_label};
     #[cfg(test)]
     pub(super) use crate::metrics::handles::force_on_this_thread;
-    pub(super) use crate::metrics::handles::{
-        keep_handles, kept, nested, with_handle, with_model_handle,
-    };
+    pub(super) use crate::metrics::handles::{is_sentinel, keep_handles, kept, nested};
 
     /// The `smg_engine_*` handles of one rank of a worker under one model
     /// label, each built the first time a load has a figure for it, so the
@@ -315,6 +358,65 @@ mod handles {
         WORKER_SET_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// What one [`super::WorkerHandles`] keeps, with the worker-set
+    /// generation it was kept under: a set whose handles are from an
+    /// earlier state drops them at its next record. A handle of a request
+    /// is a write-once cell, so a record that finds it built is one load
+    /// and the update of the value; the engine-load handles sit behind a
+    /// lock that the load record alone takes.
+    #[derive(Default)]
+    pub(super) struct Kept {
+        generation: u64,
+        /// `smg_worker_requests_total`, under the worker's model label.
+        pub(super) requests: OnceLock<Counter>,
+        /// `smg_worker_requests_active`.
+        pub(super) requests_active: OnceLock<Gauge>,
+        /// `smg_worker_routing_keys_active`.
+        pub(super) routing_keys_active: OnceLock<Gauge>,
+        /// `smg_worker_cb_consecutive_failures`.
+        pub(super) cb_failures: OnceLock<Gauge>,
+        /// `smg_worker_cb_consecutive_successes`.
+        pub(super) cb_successes: OnceLock<Gauge>,
+        /// `smg_worker_cb_outcomes_total` of a success.
+        pub(super) cb_outcome_success: OnceLock<Counter>,
+        /// `smg_worker_cb_outcomes_total` of a failure.
+        pub(super) cb_outcome_failure: OnceLock<Counter>,
+        /// The `smg_engine_*` set: by the model label as the interner gave
+        /// it, then the DP rank. The model is the one a worker registered
+        /// with, the gateway's own string, so its level hashes with FxHash.
+        pub(super) engine_loads: Mutex<FxHashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>>,
+    }
+
+    impl Kept {
+        /// What a set holds before its first record: one shared value of a
+        /// generation no worker set has, so a set costs no allocation
+        /// until it keeps a handle.
+        pub(super) fn none() -> Arc<Self> {
+            static NONE: Lazy<Arc<Kept>> = Lazy::new(|| {
+                Arc::new(Kept {
+                    generation: u64::MAX,
+                    ..Kept::default()
+                })
+            });
+            Arc::clone(&NONE)
+        }
+
+        /// The handles `slot` keeps while they are of the current worker
+        /// set, an empty set in their place when they are not.
+        pub(super) fn current(slot: &ArcSwap<Self>) -> Guard<Arc<Self>> {
+            let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
+            let kept = slot.load();
+            if kept.generation == generation {
+                return kept;
+            }
+            slot.store(Arc::new(Self {
+                generation,
+                ..Self::default()
+            }));
+            slot.load()
+        }
+    }
+
     /// This thread's kept handles of one per-worker family, by worker URL,
     /// with the worker-set generation they were kept under. The rule for
     /// every family is here: the map is cleared when the generation moves.
@@ -352,76 +454,37 @@ mod handles {
         }
     }
 
-    /// `smg_worker_requests_total`: by worker URL, then the model label as
-    /// the interner gave it.
-    pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
-
-    /// `smg_worker_cb_outcomes_total`: by worker URL, then the outcome.
-    pub(super) type WorkerOutcomes = ByWorker<FxHashMap<&'static str, Counter>>;
-
-    /// A per-worker gauge set on every request (the active-request count,
-    /// the active routing keys, the circuit breaker's consecutive outcomes):
-    /// set through its kept handle, not through a key built and looked up
-    /// per call.
-    pub(super) type WorkerGauges = ByWorker<Gauge>;
-
-    /// The `smg_engine_*` set: by worker URL, then the model label as the
-    /// interner gave it, then the DP rank. The model is the one a worker
-    /// registered with, the gateway's own string, so its level hashes with
-    /// FxHash as the other two do.
-    pub(super) type EngineLoads = ByWorker<FxHashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>>;
-
     thread_local! {
-        /// `smg_worker_requests_total`.
-        pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
-        /// `smg_worker_requests_active`.
-        pub(super) static WORKER_REQUESTS_ACTIVE: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
-        /// `smg_worker_routing_keys_active`.
-        pub(super) static WORKER_ROUTING_KEYS_ACTIVE: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
-        /// `smg_worker_cb_consecutive_failures`.
-        pub(super) static WORKER_CB_FAILURES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
-        /// `smg_worker_cb_consecutive_successes`.
-        pub(super) static WORKER_CB_SUCCESSES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
-        /// `smg_worker_cb_outcomes_total`.
-        pub(super) static WORKER_CB_OUTCOMES: RefCell<WorkerOutcomes> = RefCell::new(WorkerOutcomes::default());
-        /// The `smg_engine_*` set.
-        pub(super) static ENGINE_LOADS: RefCell<EngineLoads> = RefCell::new(EngineLoads::default());
         /// The KV-event set a batch moves.
         pub(super) static KV_EVENTS: RefCell<ByWorker<KvEventHandles>> = RefCell::new(ByWorker::default());
     }
 
-    /// For tests: this thread's kept handles of the worker's families, dropped,
-    /// and the installed flag given its say back.
+    /// For tests: this thread's kept handles of the KV events, dropped, and
+    /// the installed flag given its say back.
     #[cfg(test)]
     pub(super) fn reset() {
         force_on_this_thread(None);
-        WORKER_REQUESTS.with_borrow_mut(|kept| *kept = WorkerRequests::default());
-        WORKER_REQUESTS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
-        WORKER_ROUTING_KEYS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
-        WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
-        WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
-        WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
-        ENGINE_LOADS.with_borrow_mut(|kept| *kept = EngineLoads::default());
         KV_EVENTS.with_borrow_mut(|kept| *kept = ByWorker::default());
     }
 
     #[cfg(test)]
     mod tests {
+        use std::collections::HashMap;
+
         use super::*;
         use crate::metrics::handles::MAX_KEPT_PER_MAP;
 
         #[test]
-        fn kept_worker_counters_go_when_the_worker_set_changes() {
+        fn kept_handles_go_when_the_worker_set_changes() {
             // The generation is process-wide and other tests register and
-            // remove workers: the steady state is read off the map one
-            // `for_worker` call handed out, with no second call in between
+            // remove workers: the steady state is read off the set one
+            // `current` call handed out, with no second call in between
             // that a bump elsewhere could clear.
-            let mut kept = WorkerRequests::default();
-            let counters = kept.for_worker("http://w1");
-            counters.insert(Arc::from("m"), Counter::noop());
-            assert_eq!(counters.len(), 1);
+            let slot = ArcSwap::new(Kept::none());
+            let kept = Kept::current(&slot);
+            assert!(kept.requests.set(Counter::noop()).is_ok());
             worker_set_changed();
-            assert!(kept.for_worker("http://w1").is_empty());
+            assert!(Kept::current(&slot).requests.get().is_none());
         }
 
         #[test]
@@ -809,19 +872,23 @@ impl Metrics {
     /// at the send. The per-worker gauges miss short requests and cannot be
     /// summed over a window, so this is how the share of traffic per worker
     /// is read from the scrape.
-    pub fn record_worker_request(worker_url: &str, model_id: &str) {
-        if !handles::keep_handles() {
+    pub fn record_worker_request(worker: &dyn Worker) {
+        let (worker_url, model_id) = (worker.url(), worker.model_id());
+        let Some(kept) = worker.metric_handles().and_then(WorkerHandles::kept) else {
             Self::worker_requests(worker_url, model_id).increment(1);
             return;
+        };
+        if let Some(counter) = kept.requests.get() {
+            counter.increment(1);
+            return;
         }
-        handles::WORKER_REQUESTS.with_borrow_mut(|kept| {
-            handles::with_model_handle(
-                kept.for_worker(worker_url),
-                model_id,
-                |_label| Self::worker_requests(worker_url, model_id),
-                |counter| counter.increment(1),
-            );
-        });
+        let counter = Self::worker_requests(worker_url, model_id);
+        counter.increment(1);
+        // A label the interner refused is used and not kept, so its
+        // sentinel's series is not pinned to this worker for its life.
+        if !handles::is_sentinel(&intern_model_label(model_id)) {
+            let _ = kept.requests.set(counter);
+        }
     }
 
     /// A worker registered: its request counter exists from zero, so a
@@ -838,49 +905,46 @@ impl Metrics {
         )
     }
 
-    pub fn set_worker_requests_active(worker: &str, count: usize) {
+    pub fn set_worker_requests_active(worker: &WorkerHandles, count: usize) {
         Self::set_worker_gauge(
-            &handles::WORKER_REQUESTS_ACTIVE,
             worker,
+            |kept| &kept.requests_active,
             count as f64,
             || {
                 gauge!(
                     "smg_worker_requests_active",
-                    "worker" => intern_string(worker)
+                    "worker" => intern_string(&worker.url)
                 )
             },
         );
     }
 
-    /// Sets a per-worker gauge that moves on every request: through this
-    /// thread's kept handle for `worker` (built by `build` on first sight and
+    /// Sets a per-worker gauge that moves on every request: through the
+    /// handle `worker` keeps in `slot` (built by `build` on first use and
     /// dropped when the worker set changes), or through a key built per call
     /// when handles are not kept.
     fn set_worker_gauge(
-        kept: &'static std::thread::LocalKey<std::cell::RefCell<handles::WorkerGauges>>,
-        worker: &str,
+        worker: &WorkerHandles,
+        slot: impl FnOnce(&handles::Kept) -> &OnceLock<metrics::Gauge>,
         value: f64,
         build: impl FnOnce() -> metrics::Gauge,
     ) {
-        if !handles::keep_handles() {
-            build().set(value);
-            return;
+        match worker.kept() {
+            Some(kept) => slot(&kept).get_or_init(build).set(value),
+            None => build().set(value),
         }
-        kept.with_borrow_mut(|kept| {
-            handles::with_handle(kept.current(), worker, build, |gauge| gauge.set(value));
-        });
     }
 
     /// Set active routing keys per worker
-    pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
+    pub fn set_worker_routing_keys_active(worker: &WorkerHandles, count: usize) {
         Self::set_worker_gauge(
-            &handles::WORKER_ROUTING_KEYS_ACTIVE,
             worker,
+            |kept| &kept.routing_keys_active,
             count as f64,
             || {
                 gauge!(
                     "smg_worker_routing_keys_active",
-                    "worker" => intern_string(worker)
+                    "worker" => intern_string(&worker.url)
                 )
             },
         );
@@ -1296,28 +1360,27 @@ impl Metrics {
         .absolute(0);
     }
 
-    /// Record circuit breaker outcome: through this thread's kept handle
-    /// for the worker and outcome (dropped when the worker set changes, as
-    /// every kept per-worker handle is), or through a key built per call
-    /// when handles are not kept.
-    pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
+    /// Record circuit breaker outcome: through the handle `worker` keeps
+    /// for the outcome (dropped when the worker set changes, as every kept
+    /// per-worker handle is), or through a key built per call when handles
+    /// are not kept.
+    pub fn record_worker_cb_outcome(worker: &WorkerHandles, outcome: &'static str) {
         let build = || {
             counter!(
                 "smg_worker_cb_outcomes_total",
-                "worker" => intern_string(worker),
+                "worker" => intern_string(&worker.url),
                 "outcome" => outcome
             )
         };
-        if !handles::keep_handles() {
-            build().increment(1);
-            return;
+        match (worker.kept(), outcome) {
+            (Some(kept), crate::metrics_labels::CB_SUCCESS) => {
+                kept.cb_outcome_success.get_or_init(build).increment(1);
+            }
+            (Some(kept), crate::metrics_labels::CB_FAILURE) => {
+                kept.cb_outcome_failure.get_or_init(build).increment(1);
+            }
+            _ => build().increment(1),
         }
-        handles::WORKER_CB_OUTCOMES.with_borrow_mut(|kept| {
-            kept.for_worker(worker)
-                .entry(outcome)
-                .or_insert_with(build)
-                .increment(1);
-        });
     }
 
     /// Record an open circuit breaker put on trial (half-open) by the
@@ -1343,30 +1406,30 @@ impl Metrics {
     }
 
     /// Set circuit breaker consecutive failures
-    pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
+    pub fn set_worker_cb_consecutive_failures(worker: &WorkerHandles, count: u32) {
         Self::set_worker_gauge(
-            &handles::WORKER_CB_FAILURES,
             worker,
+            |kept| &kept.cb_failures,
             f64::from(count),
             || {
                 gauge!(
                     "smg_worker_cb_consecutive_failures",
-                    "worker" => intern_string(worker)
+                    "worker" => intern_string(&worker.url)
                 )
             },
         );
     }
 
     /// Set circuit breaker consecutive successes
-    pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
+    pub fn set_worker_cb_consecutive_successes(worker: &WorkerHandles, count: u32) {
         Self::set_worker_gauge(
-            &handles::WORKER_CB_SUCCESSES,
             worker,
+            |kept| &kept.cb_successes,
             f64::from(count),
             || {
                 gauge!(
                     "smg_worker_cb_consecutive_successes",
-                    "worker" => intern_string(worker)
+                    "worker" => intern_string(&worker.url)
                 )
             },
         );
@@ -1387,55 +1450,52 @@ impl Metrics {
     /// that carry a `disagg` section, labeled by the engine-reported role
     /// (`prefill`/`decode`/`null`).
     pub fn record_engine_load(
-        worker_url: &str,
+        worker: &dyn Worker,
         model_id: &str,
         role: &'static str,
         response: &crate::worker::WorkerLoadResponse,
     ) {
         for load in &response.loads {
-            Self::record_engine_rank_load(worker_url, model_id, role, load);
+            Self::record_engine_rank_load(worker, model_id, role, load);
         }
     }
 
     /// Re-export one rank's figures as its `smg_engine_*` gauges: through
-    /// this thread's kept handles for the worker, model and rank (built on
-    /// the rank's first sight, dropped when the worker set changes), or
+    /// the handles `worker` keeps for the model and rank (built on the
+    /// rank's first sight, dropped when the worker set changes), or
     /// through keys built per call when handles are not kept. A record
     /// pushed at the engine's batch rate is then a few atomic stores, with
     /// nothing built or allocated, and touches no other rank's series.
     pub fn record_engine_rank_load(
-        worker_url: &str,
+        worker: &dyn Worker,
         model_id: &str,
         role: &'static str,
         load: &crate::worker::SchedulerLoadSnapshot,
     ) {
-        if handles::keep_handles() {
-            let recorded = handles::ENGINE_LOADS.with_borrow_mut(|kept| {
-                // A worker and a model seen before are found by one lookup
-                // each, and a new rank under them is made here as
-                // `engine_rank` makes it. `for_worker` and `engine_rank` look
-                // twice, to insert on a first sight, which still goes through them.
-                let seen = kept
-                    .current()
-                    .get_mut(worker_url)
-                    .and_then(|by_model| by_model.get_mut(model_id));
-                let rank = match seen {
-                    Some(ranks) => Some(ranks.entry(load.dp_rank).or_default()),
-                    None => {
-                        handles::engine_rank(kept.for_worker(worker_url), model_id, load.dp_rank)
-                    }
-                };
-                rank.map(|rank| {
+        let worker_url = worker.url();
+        if let Some(kept) = worker.metric_handles().and_then(WorkerHandles::kept) {
+            let mut kept_loads = kept.engine_loads.lock();
+            let by_model = &mut *kept_loads;
+            // A model seen before is found by one lookup, and a new rank
+            // under it is made here as `engine_rank` makes it. `engine_rank`
+            // looks twice, to insert on a first sight, which still goes
+            // through it.
+            let rank = match by_model.get_mut(model_id) {
+                Some(ranks) => Some(ranks.entry(load.dp_rank).or_default()),
+                None => handles::engine_rank(by_model, model_id, load.dp_rank),
+            };
+            let recorded = rank
+                .map(|rank| {
                     Self::set_engine_rank_gauges(rank, worker_url, model_id, role, load);
                 })
-                .is_some()
-            });
+                .is_some();
             if recorded {
                 return;
             }
         }
-        // Nothing kept (no recorder installed yet, or a model label the
-        // interner refused): the keys are built for this call alone.
+        // Nothing kept (no recorder installed yet, a worker that holds no
+        // handles, or a model label the interner refused): the keys are
+        // built for this call alone.
         Self::set_engine_rank_gauges(
             &mut handles::EngineRankHandles::default(),
             worker_url,

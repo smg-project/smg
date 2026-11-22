@@ -33,7 +33,7 @@ use smg::{
 };
 use smg_worker::{
     identity::basic::{Worker, WorkerLoadGuard, WorkerType},
-    metrics::writers::Metrics,
+    metrics::writers::{Metrics, WorkerHandles},
 };
 
 thread_local! {
@@ -113,8 +113,12 @@ async fn a_keyed_request_with_its_key_in_flight_allocates_the_guards_copy_alone(
     // The first request of all: the gauge's label is interned, its series
     // registered and its handle kept, the key's shard holds its table.
     keyed_request(&worker);
+    // A set of handles as the worker's routing-key load holds one, after
+    // its first set has built the handle.
+    let handles = WorkerHandles::new(WORKER_URL);
+    Metrics::set_worker_routing_keys_active(&handles, 1);
     let ((), gauge_set) =
-        allocations_during(|| Metrics::set_worker_routing_keys_active(WORKER_URL, 1));
+        allocations_during(|| Metrics::set_worker_routing_keys_active(&handles, 1));
 
     let held = WorkerLoadGuard::with_key(Arc::clone(&worker), Some(KEY));
     let ((), in_flight) = allocations_during(|| keyed_request(&worker));

@@ -2729,7 +2729,7 @@ impl PDRouter {
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         // Every side built here is sent; counted per side, on its worker.
-        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker);
         let request = attach_sized_body(
             worker
                 .http_client()
@@ -3230,7 +3230,7 @@ impl RouterTrait for PDRouter {
             headers,
             worker.api_key(),
         );
-        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.as_ref());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
             Err(e) if is_request_timeout(&e) => {
