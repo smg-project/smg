@@ -13,6 +13,7 @@ use crate::{
         body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
         stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
     },
+    sglang_encoder_proto::sglang_encoder_client::SglangEncoderClient,
     BoxedTraceInjector,
 };
 
@@ -77,6 +78,21 @@ impl SglangSchedulerClient {
     );
 
     crate::impl_embed!(proto);
+
+    /// Reuse the registered encoder's connection for native SGLang control.
+    pub async fn encode_native(
+        &self,
+        request: crate::sglang_encoder_proto::EncodeRequest,
+        timeout: std::time::Duration,
+    ) -> Result<(), tonic::Status> {
+        let mut request = Request::new(request);
+        request.set_timeout(timeout);
+        let mut client = SglangEncoderClient::new(self.channel.clone());
+        tokio::time::timeout(timeout, client.encode(request))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("encoder deadline expired"))??;
+        Ok(())
+    }
 
     /// Abort a request
     pub async fn abort_request(

@@ -21,6 +21,7 @@ pub use proto_wrapper::dispatch_ticket_life;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod sequential_pd;
+pub mod sglang_epd;
 pub(crate) mod spec;
 #[cfg(test)]
 pub(crate) mod test_engine;

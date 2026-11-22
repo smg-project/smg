@@ -40,6 +40,10 @@ pub mod kv_wire;
 mod load_report;
 mod load_stream;
 mod load_tracker;
+/// SGLang managed worker APIs.
+pub mod managed {
+    pub use crate::sglang::{encoder, native, ManagedConfig};
+}
 mod metrics;
 mod proto_json;
 mod requests;
@@ -84,6 +88,26 @@ pub use vllm::{
 
 /// A boxed response stream, the shape tonic's generated traits take.
 pub(crate) type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+/// The client's `grpc-timeout` header (`<1-8 digits><H|M|S|m|u|n>`), if any.
+pub(crate) fn grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
+    let value = metadata.get("grpc-timeout")?.to_str().ok()?;
+    let unit = value.chars().last()?;
+    let digits = &value[..value.len() - unit.len_utf8()];
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let amount: u64 = digits.parse().ok()?;
+    Some(match unit {
+        'H' => Duration::from_secs(amount * 3600),
+        'M' => Duration::from_secs(amount * 60),
+        'S' => Duration::from_secs(amount),
+        'm' => Duration::from_millis(amount),
+        'u' => Duration::from_micros(amount),
+        'n' => Duration::from_nanos(amount),
+        _ => return None,
+    })
+}
 
 /// How long a servicer waits for a sign of life from its engine during the
 /// ZMQ handshake before it reports the link failed. An engine's start includes

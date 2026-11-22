@@ -46,6 +46,12 @@ pub(super) async fn health_check_with(
             message: state.shared.health_message(PASSED).to_string(),
         };
     }
+    if state.prepared.get().is_some_and(|runtime| !runtime.ready()) {
+        return sg::HealthCheckResponse {
+            healthy: false,
+            message: "prepared runtime unhealthy or quarantined".to_string(),
+        };
+    }
     if health_probe::disaggregated_role(&state.model.server_args_json) {
         return sg::HealthCheckResponse {
             healthy: true,
@@ -155,6 +161,38 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let ready = state.shared.ready();
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let mut server_args = struct_from_json(&model.server_args_json);
+    if let Some(config) = &state.managed_config {
+        let capability = config.capabilities();
+        for (key, value) in [
+            (
+                "sglang_prepared",
+                serde_json::to_string(&capability).unwrap_or_default(),
+            ),
+            (
+                "sglang_prepared_key",
+                serde_json::to_string(&(
+                    &capability.model_revision,
+                    &capability.processor_contract,
+                    &capability.layout_contract,
+                    &capability.embedding_dtype,
+                    &capability.kv_backend,
+                    if capability.kv_backend == "mooncake" {
+                        "single-host"
+                    } else {
+                        &capability.topology_contract
+                    },
+                ))
+                .unwrap_or_default(),
+            ),
+        ] {
+            server_args.fields.insert(
+                key.into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(value)),
+                },
+            );
+        }
+    }
     if state.media.is_some() {
         for (key, value) in [
             ("mm_processor", "smg"),

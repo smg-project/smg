@@ -58,6 +58,8 @@ pub(crate) enum DpPlacement {
 /// How an encode worker's output reaches the prefill side under EPD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EncodeHandoff {
+    /// SGLang E-local processing and native transfer, followed by P layout export.
+    PreparedInput,
     /// The gateway mints one bootstrap room per encode item and carries it
     /// in the prefill request; the encode job is dispatched beside the
     /// prefill/decode pair and the prefill side pulls the embedding at the
@@ -93,7 +95,7 @@ impl PdProtocol {
                 dispatch: PdDispatch::Parallel,
                 rendezvous: PdRendezvous::SglangBootstrap,
                 dp_placement: DpPlacement::RoomResidue,
-                encode: None,
+                encode: Some(EncodeHandoff::PreparedInput),
             }),
             RuntimeType::Vllm => Some(Self {
                 dispatch: PdDispatch::Sequential,
@@ -132,7 +134,7 @@ mod tests {
         assert_eq!(sglang.dispatch, PdDispatch::Parallel);
         assert_eq!(sglang.rendezvous, PdRendezvous::SglangBootstrap);
         assert_eq!(sglang.dp_placement, DpPlacement::RoomResidue);
-        assert_eq!(sglang.encode, None);
+        assert_eq!(sglang.encode, Some(EncodeHandoff::PreparedInput));
 
         let vllm = PdProtocol::for_runtime(RuntimeType::Vllm).unwrap();
         assert_eq!(vllm.dispatch, PdDispatch::Sequential);

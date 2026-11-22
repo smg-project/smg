@@ -6,6 +6,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Rebuild triggers
+    println!("cargo:rerun-if-changed=proto/sglang_epd.proto");
+    println!("cargo:rerun-if-changed=proto/sglang_encoder.proto");
     println!("cargo:rerun-if-changed={wire}/common.proto");
     println!("cargo:rerun-if-changed=proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_scheduler.proto");
@@ -18,12 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // generates them and `lib.rs` re-exports its module as `common_proto`.
     // Both passes below map the shared package to that path.
 
-    // Pass 1: the EPD encoder proto reuses tokenspeed scheduler message types
-    // (MultimodalInputs/TensorData). Compile it with the scheduler package
-    // mapped to its already-defined module so the encoder references those
-    // types via the crate path instead of a (nonexistent) sibling module. Run
-    // this BEFORE the scheduler pass so the full scheduler output (Pass 2) wins
-    // over the extern stub this pass emits for the imported package.
+    // Generate EPD extensions first against the existing scheduler types.
+    // The main pass then replaces the imported scheduler stubs.
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
@@ -31,15 +29,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".tokenspeed.grpc.scheduler",
             "crate::tokenspeed_scheduler::tokenspeed_proto",
         )
-        // The scheduler file imports the shared file: without this path the
-        // pass would write a copy of the shared messages.
         .extern_path(".smg.grpc.common", "crate::common_proto")
-        // The encoder's Encode RPC carries the same pixel tensor as the
-        // scheduler's Generate: the same sized codec (see `crate::codec`).
         .codec_path("crate::codec::SizedProstCodec")
+        .type_attribute(
+            ".smg.sglang.managed.v1.Capabilities",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
-            &["proto/tokenspeed_encoder.proto"],
+            &[
+                "proto/tokenspeed_encoder.proto",
+                "proto/sglang_encoder.proto",
+                "proto/sglang_epd.proto",
+            ],
             &["proto", wire.as_str()],
         )?;
 

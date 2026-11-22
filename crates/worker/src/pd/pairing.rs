@@ -160,6 +160,7 @@ enum Unreported {
 pub struct PdPairing {
     runtime: RuntimeType,
     explicit: Option<String>,
+    prepared: Option<String>,
     transport: Option<String>,
     profile: Option<KvTransferProfile>,
     version: Option<String>,
@@ -183,6 +184,7 @@ impl PdPairing {
         Self {
             runtime: spec.runtime_type,
             explicit,
+            prepared: non_empty(labels.get("sglang_prepared_key")),
             transport,
             profile,
             version: non_empty(labels.get("version")),
@@ -276,6 +278,11 @@ impl PdPairing {
 
     /// The first component the two descriptors disagree on, if any.
     ///
+    /// Prepared-input compatibility (`sglang_prepared_key`) is checked in every
+    /// mode, including `Off`: a managed worker exports/consumes prepared decode
+    /// layouts and cannot pair with an unmanaged worker or a different prepared
+    /// contract.
+    ///
     /// Runtime, transport and each KV layout fact are hard facts: a known
     /// difference refuses the pair in every mode but `Off`, a fact one side
     /// reports and the other does not only under `Strict`, and a layout fact
@@ -284,6 +291,9 @@ impl PdPairing {
     /// rolling upgrade legitimately mixes versions, so it counts only under
     /// `Strict`, and only when both sides report one.
     pub fn mismatch(&self, other: &Self, mode: PdPairingMode) -> Option<PairingMismatch> {
+        if self.prepared != other.prepared {
+            return Some(PairingMismatch::KvLayout("prepared_input"));
+        }
         if mode == PdPairingMode::Off {
             return None;
         }
@@ -806,6 +816,41 @@ mod tests {
             Some(PairingMismatch::Runtime)
         );
         assert!(nixl.compatible(&mooncake, PdPairingMode::Off));
+    }
+
+    #[test]
+    fn prepared_input_mismatch_refuses_mixed_pairs_in_every_mode() {
+        let managed = PdPairing::derive(&spec(
+            RuntimeType::Sglang,
+            &[("sglang_prepared_key", "contract-a")],
+        ));
+        let managed_same = PdPairing::derive(&spec(
+            RuntimeType::Sglang,
+            &[("sglang_prepared_key", "contract-a")],
+        ));
+        let managed_other = PdPairing::derive(&spec(
+            RuntimeType::Sglang,
+            &[("sglang_prepared_key", "contract-b")],
+        ));
+        let unmanaged = PdPairing::derive(&spec(RuntimeType::Sglang, &[]));
+        for mode in [
+            PdPairingMode::Off,
+            PdPairingMode::Lenient,
+            PdPairingMode::Strict,
+        ] {
+            assert_eq!(
+                managed.mismatch(&unmanaged, mode),
+                Some(PairingMismatch::KvLayout("prepared_input")),
+                "{mode:?}"
+            );
+            assert_eq!(
+                managed.mismatch(&managed_other, mode),
+                Some(PairingMismatch::KvLayout("prepared_input")),
+                "{mode:?}"
+            );
+        }
+        assert!(managed.compatible(&managed_same, PdPairingMode::Off));
+        assert!(managed.compatible(&managed_same, PdPairingMode::Lenient));
     }
 
     #[test]

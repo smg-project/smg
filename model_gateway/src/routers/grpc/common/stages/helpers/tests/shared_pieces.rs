@@ -7,7 +7,7 @@ use llm_multimodal::MediaContentPart;
 use llm_tokenizer::TokenizerRegistry;
 use openai_protocol::{generate::GenerateRequest, model_card::ModelCard};
 use smg_grpc_client::VllmEngineClient;
-use smg_worker::identity::basic::{ConnectionMode, WorkerType};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::task::JoinHandle;
 
 use super::*;
@@ -17,7 +17,7 @@ use crate::{
         common::snapshot::WorkerRegistry,
         grpc::{
             backend_client::BasicWorkerBuilder, client::GrpcClient, context::SharedComponents,
-            multimodal::MediaPlan, regular::symphony::template::Templates,
+            multimodal::MediaPlan, regular::symphony::template::Templates, sglang_epd::prepare,
             test_engine::mock_engine,
         },
     },
@@ -134,4 +134,54 @@ async fn without_acquired_clients_the_finishing_reports_the_missing_stage() {
         "{body}"
     );
     server.abort();
+}
+
+/// Text and prepared-media EPD both receive the shared PD rendezvous before dispatch.
+#[tokio::test]
+async fn epd_finishing_stamps_native_pd_bootstrap() {
+    for prepared_media in [false, true] {
+        let (mut ctx, server) = context_with_media_refs().await;
+        ctx.state.multimodal_refs = None;
+        ctx.state.workers = Some(WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::new(
+                BasicWorkerBuilder::new("grpc://prefill:30000")
+                    .worker_type(WorkerType::Prefill)
+                    .build(),
+            ),
+            decode: Arc::new(
+                BasicWorkerBuilder::new("grpc://decode:30000")
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ),
+            runtime_type: RuntimeType::Sglang,
+        });
+        if prepared_media {
+            ctx.input.request_type = RequestType::Chat(Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}
+                ]}]
+            }))
+            .expect("image request"),
+        ));
+            ctx.state.encode_outputs = Some(EncodeOutputs::PreparedInput(Box::new(
+                prepare(&ctx).expect("prepare").expect("media plan"),
+            )));
+        }
+        let mut request = ProtoGenerateRequest::Sglang(Box::default());
+        finish_generate_request(&mut ctx, &mut request, true, "epd").expect("finished");
+        let ProtoGenerateRequest::Sglang(request) = request else {
+            panic!("expected a SGLang native request")
+        };
+        let bootstrap = request
+            .disaggregated_params
+            .expect("native PD requires a room");
+        assert_eq!(bootstrap.bootstrap_host, "prefill");
+        assert_eq!(bootstrap.bootstrap_port, DEFAULT_BOOTSTRAP_PORT as i32);
+        assert!(bootstrap.bootstrap_room >= 0);
+        assert_eq!(ctx.state.encode_outputs.is_some(), prepared_media);
+        server.abort();
+    }
 }

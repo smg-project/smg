@@ -27,7 +27,7 @@ use wfaas::{
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    routers::common::snapshot::WorkerRegistry,
+    routers::{common::snapshot::WorkerRegistry, grpc::sglang_epd::worker_registration_url},
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -816,6 +816,11 @@ impl JobHost for AppContext {
 
                 // Process all workers with unified loop
                 for (url, worker_type, bootstrap_port) in workers {
+                    let url = if router_config.is_sglang_epd() {
+                        worker_registration_url(&url)
+                    } else {
+                        url
+                    };
                     let url_for_error = url.clone(); // Clone for error message
                     let proto_worker_type = match worker_type {
                         "prefill" => WorkerType::Prefill,

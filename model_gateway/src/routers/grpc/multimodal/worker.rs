@@ -13,9 +13,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
-    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
-    MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
-    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, POOL_THREADS_ENV,
+    registry::modality_limit_override, vision::PreProcessorConfig, EncoderDtype, FrameSampling,
+    MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode,
+    MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
+    POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -334,6 +335,13 @@ pub struct WorkerMediaItem {
     pub modality: Modality,
     pub url: String,
 }
+
+/// Expanded prompt, primary SGLang inputs and additional modality batches.
+pub type SglangMediaOutput = (
+    Vec<u32>,
+    sglang::MultimodalInputs,
+    Vec<sglang::MultimodalInputs>,
+);
 
 /// What the pipeline produced: the prompt with its anchors expanded, the
 /// request's multimodal batches (the first is `mm_inputs`, the rest
@@ -777,7 +785,12 @@ impl WorkerMediaPipeline {
         want_identity: bool,
     ) -> Result<WorkerMediaOutput, WorkerMediaError> {
         let output = self
-            .process_inputs(prompt_token_ids, items, RuntimeType::Vllm)
+            .process_inputs(
+                prompt_token_ids,
+                items,
+                RuntimeType::Vllm,
+                self.assembly.image_wire_dtype(),
+            )
             .await?;
         let data = assemble_vllm_batches_with(output.intermediate, &self.assembly)
             .map_err(classify_assembly)?;
@@ -803,16 +816,39 @@ impl WorkerMediaPipeline {
         &self,
         prompt_token_ids: Vec<u32>,
         items: Vec<WorkerMediaItem>,
-    ) -> Result<
-        (
-            Vec<u32>,
-            sglang::MultimodalInputs,
-            Vec<sglang::MultimodalInputs>,
-        ),
-        WorkerMediaError,
-    > {
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
+        self.process_sglang_with_wire_dtype(prompt_token_ids, items, None)
+            .await
+    }
+
+    /// Managed E knows its visual model dtype before preprocessing. Reuse the
+    /// fused image writer without changing the ordinary SGLang worker path.
+    pub async fn process_sglang_encoder(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        items: Vec<WorkerMediaItem>,
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
+        let dtype = super::serialize::wire_dtype(&self.assembly.encoder_dtype, true);
+        let image_wire_dtype =
+            (!self.assembly.device_normalizes && dtype != EncoderDtype::Uint8).then_some(dtype);
+        self.process_sglang_with_wire_dtype(prompt_token_ids, items, image_wire_dtype)
+            .await
+    }
+
+    /// Share SGLang assembly while applying a visual dtype only when explicitly supplied.
+    async fn process_sglang_with_wire_dtype(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        items: Vec<WorkerMediaItem>,
+        image_wire_dtype: Option<EncoderDtype>,
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
         let output = self
-            .process_inputs(prompt_token_ids, items, RuntimeType::Sglang)
+            .process_inputs(
+                prompt_token_ids,
+                items,
+                RuntimeType::Sglang,
+                image_wire_dtype,
+            )
             .await?;
         let dtype = self.assembly.encoder_dtype.clone();
         let span = tracing::Span::current();
@@ -832,6 +868,7 @@ impl WorkerMediaPipeline {
         prompt_token_ids: Vec<u32>,
         items: Vec<WorkerMediaItem>,
         runtime: RuntimeType,
+        image_wire_dtype: Option<EncoderDtype>,
     ) -> Result<super::MultimodalOutput, WorkerMediaError> {
         if items.is_empty() {
             return Err(WorkerMediaError::Invalid(
@@ -872,11 +909,7 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
-            if runtime == RuntimeType::Vllm {
-                self.assembly.image_wire_dtype()
-            } else {
-                None
-            },
+            image_wire_dtype,
             // In-process: the tensors ride no gRPC message of this worker's
             // own; the framing of the hop that carries them answers.
             None,
@@ -1574,6 +1607,58 @@ mod tests {
         assert!(output.identity.is_none());
     }
 
+    #[tokio::test]
+    async fn managed_encoder_one_pass_matches_sglang_artifacts() {
+        let (_dir, mut pipeline) = vision_test_pipeline(
+            r#"{"model_type":"qwen3_vl","image_token_id":32000,"vision_config":{"patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2}}"#,
+            &[("<|image_pad|>", 32000)],
+        )
+        .await;
+        for dtype in ["bfloat16", "float16", "float32"] {
+            pipeline.assembly.encoder_dtype = dtype.into();
+            let items = vec![blank_png_item(), blank_png_item()];
+            let prompt = vec![32000; items.len()];
+            let old = pipeline
+                .process_sglang(prompt.clone(), items.clone())
+                .await
+                .unwrap();
+            let fused = pipeline
+                .process_sglang_encoder(prompt, items)
+                .await
+                .unwrap();
+            assert_eq!(old, fused, "{dtype}");
+            assert_eq!(fused.1.pixel_values.as_ref().unwrap().dtype, dtype);
+        }
+        assert!(pipeline
+            .process_sglang_encoder(Vec::new(), Vec::new())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_glm53_flash_encoder_uses_the_native_grid_and_image_token() {
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let (tokens, inputs, extras) = pipeline
+            .process_sglang_encoder(vec![32000, 32000], vec![blank_png_item(), blank_png_item()])
+            .await
+            .unwrap();
+        assert!(extras.is_empty());
+        assert_eq!(inputs.im_token_id, Some(32000));
+        assert!(inputs.pixel_values.is_some());
+        assert_eq!(inputs.mm_placeholders.len(), 2);
+        assert_eq!(
+            inputs
+                .model_specific_tensors
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["image_grid_thw", "patches_per_image"]
+                .into_iter()
+                .collect()
+        );
+        assert!(!tokens.is_empty() && tokens.iter().all(|&token| token == 32000));
+    }
+
     /// Grouped references retain per-modality anchors in interleaved prompts.
     /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
@@ -1597,7 +1682,7 @@ mod tests {
                 .await
                 .unwrap();
             let expected = pipeline
-                .process_inputs(prompt, items.to_vec(), RuntimeType::Sglang)
+                .process_inputs(prompt, items.to_vec(), RuntimeType::Sglang, None)
                 .await
                 .unwrap();
             assert_eq!(tokens, expected.expanded_token_ids);

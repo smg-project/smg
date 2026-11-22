@@ -28,6 +28,13 @@ For SGLang:
 pip install smg-grpc-servicer[sglang]
 ```
 
+Prepared-input SGLang EPD (`SMG_SGLANG_EPD=1`) uses the same `[sglang]` extra (no
+separate extra is required) together with a compatible SGLang engine and matching
+`smg`, `smg-grpc-proto`, and `smg-grpc-servicer` builds (when installing from a
+source checkout prior to a PyPI release, install `./crates/grpc_client/python`
+and `./grpc_servicer[sglang]`, or `./grpc_servicer` into an environment that
+already has a source-installed SGLang with `pyzmq>=25.0.0` and `msgspec>=0.18.0`).
+
 ## Usage
 
 ### vLLM

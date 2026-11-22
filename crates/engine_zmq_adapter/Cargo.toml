@@ -7,6 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/smg-project/smg"
 
 [dependencies]
+prost.workspace = true
 prost-types.workspace = true
 engine-zmq-client.workspace = true
 smg-grpc-client.workspace = true
@@ -14,6 +15,7 @@ llm-tokenizer.workspace = true
 openai-protocol.workspace = true
 
 bytes.workspace = true
+const-hex = "1"
 half.workspace = true
 rustix = { version = "1", features = ["fs", "process"] }
 futures.workspace = true

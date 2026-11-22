@@ -763,6 +763,7 @@ mod tests {
             };
             let chunk = proto::GenerateResponse {
                 media_identity: None,
+                prepared_input: Vec::new(),
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -784,6 +785,7 @@ mod tests {
             }
             let complete = proto::GenerateResponse {
                 media_identity: None,
+                prepared_input: Vec::new(),
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
                     proto::GenerateComplete {
@@ -833,6 +835,7 @@ mod tests {
             };
             let chunk = proto::GenerateResponse {
                 media_identity: None,
+                prepared_input: Vec::new(),
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -860,6 +863,7 @@ mod tests {
             let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
             let chunk = proto::GenerateResponse {
                 media_identity: None,
+                prepared_input: Vec::new(),
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -896,6 +900,7 @@ mod tests {
             handle.system_fingerprint = fingerprint.clone();
             let chunk = proto::GenerateResponse {
                 media_identity: None,
+                prepared_input: Vec::new(),
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -966,6 +971,7 @@ mod tests {
             let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
             let chunk = proto::GenerateResponse {
                 media_identity: None,
+                prepared_input: Vec::new(),
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -985,6 +991,7 @@ mod tests {
             assert!(streamed_choice.finish_reason.is_none());
             let complete = proto::GenerateResponse {
                 media_identity: None,
+                prepared_input: Vec::new(),
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
                     proto::GenerateComplete {
@@ -1051,6 +1058,7 @@ mod tests {
         let mut handle = tool_test_handle(tokenizer.clone(), None);
         let prefix_chunk = proto::GenerateResponse {
             media_identity: None,
+            prepared_input: Vec::new(),
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
                 proto::GenerateStreamChunk {
@@ -1086,6 +1094,7 @@ mod tests {
         let completion_tokens = 1 + tail_ids.len() as u32;
         let tail_chunk = proto::GenerateResponse {
             media_identity: None,
+            prepared_input: Vec::new(),
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
                 proto::GenerateStreamChunk {
@@ -1118,6 +1127,7 @@ mod tests {
         output_ids.extend(tail_ids);
         let complete = proto::GenerateResponse {
             media_identity: None,
+            prepared_input: Vec::new(),
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Complete(
                 proto::GenerateComplete {

@@ -58,6 +58,7 @@ use crate::{
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
             },
             sequential_pd::execute_sequential_pd,
+            sglang_epd as prepared_input,
             utils::{
                 account_pd_side_failure,
                 stream_failure::UpstreamClass,
@@ -774,7 +775,8 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
+    let mut cleanup =
+        prepare_epd_attempt(&mut proto_request, workers, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
     let result = execute_pd_dispatch(
         proto_request,
@@ -811,10 +813,24 @@ async fn execute_epd_dispatch(
 /// Text-only leaves nothing.
 async fn prepare_epd_attempt(
     proto_request: &mut ProtoGenerateRequest,
+    workers: &WorkerSelection,
     encode: Option<EncodeOutputs>,
     carried: &mut Option<EncodeWatch>,
 ) -> Result<Option<Vec<PushCleanup>>, Response> {
     match encode {
+        Some(EncodeOutputs::PreparedInput(input)) => {
+            let ProtoGenerateRequest::Sglang(request) = proto_request else {
+                return Err(error::internal_error(
+                    "prepared_input",
+                    "expected SGLang request",
+                ));
+            };
+            let job = input
+                .build(request, workers)
+                .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?;
+            *carried = Some(launch_prepared_encode(job.dispatch()));
+            Ok(None)
+        }
         Some(EncodeOutputs::Push(plan)) => Ok(Some(plan.encode(proto_request).await?)),
         Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
             *carried = launch_encode_dispatch(dispatch);
@@ -889,6 +905,25 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
     let (failed_tx, failed_rx) = watch::channel(None);
     tokio::spawn(supervise_encode_sends(outcomes, failed_tx));
     Some(failed_rx)
+}
+
+/// Observe the single native encoder RPC until it answers or the last request
+/// watch leaves. Its native owner retains the transfer through cleanup.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the request watches own the encoder RPC"
+)]
+fn launch_prepared_encode(
+    send: impl Future<Output = Result<(), String>> + Send + 'static,
+) -> EncodeWatch {
+    let (failed, watch) = watch::channel(None);
+    tokio::spawn(async move {
+        tokio::select! {
+            () = failed.closed() => {},
+            () = supervise_encode_sends(Box::pin(futures::stream::once(send)), failed.clone()) => {},
+        }
+    });
+    watch
 }
 
 /// Supervise an EPD request's encode sends: the first failure among
@@ -1492,6 +1527,21 @@ async fn execute_parallel_pd(
         clients.disaggregated_or_mismatch("execute_parallel_pd")?;
 
     let (mut prefill_request, mut decode_request) = parallel_pd_requests(proto_request, workers);
+    let prepared = if let (ProtoGenerateRequest::Sglang(p), ProtoGenerateRequest::Sglang(d)) =
+        (&mut prefill_request, &mut decode_request)
+    {
+        prepared_input::split_requests(p, d)
+            .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?
+    } else {
+        None
+    };
+    let (prepared_prefill, prepared_decode) = prepared
+        .map(|remaining| {
+            let deadline = tokio::time::Instant::now() + remaining;
+            let (tx, rx) = oneshot::channel();
+            ((deadline, tx), (deadline, rx))
+        })
+        .unzip();
     let reuse_key = sglang_media_reuse_key(&prefill_request, workers);
     if reuse_key.is_some() {
         if let ProtoGenerateRequest::Sglang(req) = &mut prefill_request {
@@ -1514,7 +1564,7 @@ async fn execute_parallel_pd(
     // the transfer in front of its first response as well.
     let prefill_worker = workers.prefill_worker();
     let bound = prefill_worker.and_then(|worker| {
-        if prefill_request.awaits_encode() {
+        if prefill_request.awaits_encode() || prepared_prefill.is_some() {
             PrefillBound::behind_encode(worker, sides.prompt_tokens, prefill_start)
         } else {
             PrefillBound::at(worker, sides.prompt_tokens, prefill_start)
@@ -1545,6 +1595,19 @@ async fn execute_parallel_pd(
         },
         Box::pin(async move {
             let mut stream = prefill_client.generate(prefill_request).await?;
+            if let Some((deadline, tx)) = prepared_prefill {
+                let item = prepared_layout_before(deadline, stream.next()).await?;
+                let input = match item {
+                    Some(Ok(ProtoGenerateResponse::Sglang(response)))
+                        if response.response.is_none() && !response.prepared_input.is_empty() =>
+                    {
+                        response.prepared_input
+                    }
+                    Some(Err(error)) => return Err(error),
+                    _ => return Err(tonic::Status::data_loss("P did not export prepared input")),
+                };
+                let _ = tx.send(input);
+            }
             if await_identity {
                 // This is a preprocessing control item, not a token or proof
                 // that KV transfer completed. Consume it before tracking TTFT.
@@ -1574,6 +1637,20 @@ async fn execute_parallel_pd(
         sides.prompt_tokens,
     ));
     let decode_dispatch: SideDispatch = Box::pin(async move {
+        if let Some((deadline, prepared_rx)) = prepared_decode {
+            let bytes = prepared_layout_before(deadline, prepared_rx)
+                .await?
+                .map_err(|_| tonic::Status::cancelled("P layout export failed"))?;
+            if bytes.len() > smg_grpc_client::sglang_managed::Limits::default().manifest_bytes {
+                return Err(tonic::Status::resource_exhausted(
+                    "prepared input exceeds limit",
+                ));
+            }
+            if let ProtoGenerateRequest::Sglang(req) = &mut decode_request {
+                prepared_input::refresh_decode_timeout(req, deadline)?;
+                req.prepared_input = bytes;
+            }
+        }
         if let Some(key) = reuse_key {
             // Bound the optimization, not just inference. Stale capability
             // metadata or a legacy worker must not deadlock the PD rendezvous.
@@ -1630,12 +1707,22 @@ async fn execute_parallel_pd(
     }
 }
 
+/// Submission and both layout observers share the original remaining budget.
+async fn prepared_layout_before<T>(
+    deadline: tokio::time::Instant,
+    layout: impl Future<Output = T>,
+) -> Result<T, tonic::Status> {
+    tokio::time::timeout_at(deadline, layout)
+        .await
+        .map_err(|_| tonic::Status::deadline_exceeded("prepared layout expired"))
+}
+
 /// Both sides explicitly advertise the same supported processor contract.
 fn sglang_media_reuse_key(req: &ProtoGenerateRequest, workers: &WorkerSelection) -> Option<String> {
     let ProtoGenerateRequest::Sglang(req) = req else {
         return None;
     };
-    if !media_contract::reusable_request(req) {
+    if !req.prepared_control.is_empty() || !media_contract::reusable_request(req) {
         return None;
     }
     let prefill = workers.prefill_worker()?;
@@ -3835,6 +3922,28 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    /// Prepared encode observers must terminate after their final request owner disappears.
+    async fn prepared_encode_observers_end_when_the_last_request_watch_leaves() {
+        let (owner, mut released) = oneshot::channel::<()>();
+        let watch = launch_prepared_encode(async move {
+            let _owner = owner;
+            std::future::pending().await
+        });
+        let retry_watch = watch.clone();
+        drop(watch);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut released)
+                .await
+                .is_err()
+        );
+        drop(retry_watch);
+        assert!(tokio::time::timeout(Duration::from_millis(1), released)
+            .await
+            .unwrap()
+            .is_err());
+    }
+
     /// One refused send is published while a sibling send is still in
     /// flight: the supervisor reads the outcomes as they land, not after
     /// the last one.
@@ -4053,7 +4162,7 @@ pub(crate) mod tests {
         let (first_attempts_watch, failed_tx) = encode_watch();
         let mut carried = Some(first_attempts_watch);
         let mut request = tokenspeed_request(1, None);
-        let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
+        let cleanups = prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
             .await
             .expect("nothing to encode");
         assert!(cleanups.is_none(), "no push plan, nothing to disarm");
@@ -4080,9 +4189,10 @@ pub(crate) mod tests {
         let mut carried = None;
         let mut request = tokenspeed_request(1, None);
         for _attempt in 0..2 {
-            let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
-                .await
-                .expect("nothing to encode");
+            let cleanups =
+                prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
+                    .await
+                    .expect("nothing to encode");
             assert!(cleanups.is_none());
             assert!(carried.is_none());
         }
