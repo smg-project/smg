@@ -104,7 +104,7 @@ fn keyed_request(worker: &Arc<dyn Worker>) {
 /// bumps it in place, the decrement moves it in place too, so neither
 /// builds a key of its own; the key's first request adds the map's copy,
 /// and nothing more. The keyed-load gauge is set on both, through the
-/// handle this thread keeps for the worker: a set builds no key and
+/// handle the worker's routing-key load keeps: a set builds no key and
 /// allocates nothing, so the pin reads the whole request.
 #[tokio::test(flavor = "current_thread")]
 async fn a_keyed_request_with_its_key_in_flight_allocates_the_guards_copy_alone() {

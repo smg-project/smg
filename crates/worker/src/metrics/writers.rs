@@ -345,11 +345,12 @@ mod handles {
     }
 
     /// Every registration or removal of a worker moves this on, and a
-    /// thread whose kept per-worker handles are from an earlier state drops
-    /// them at its next record: a removal drops the address's series from
-    /// the per-worker store, so a handle kept from before feeds nothing,
-    /// and a handle built while the address was retired is a no-op one,
-    /// which a re-registration would otherwise leave in place.
+    /// holder whose kept per-worker handles are from an earlier state (a
+    /// [`super::WorkerHandles`] set, a thread's KV-event cache) drops them
+    /// at its next record: a removal drops the address's series from the
+    /// per-worker store, so a handle kept from before feeds nothing, and a
+    /// handle built while the address was retired is a no-op one, which a
+    /// re-registration would otherwise leave in place.
     static WORKER_SET_GENERATION: AtomicU64 = AtomicU64::new(0);
 
     /// A worker registered or was removed: the kept per-worker handles are
@@ -406,13 +407,21 @@ mod handles {
         pub(super) fn current(slot: &ArcSwap<Self>) -> Guard<Arc<Self>> {
             let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
             let kept = slot.load();
-            if kept.generation == generation {
+            // A set kept under a later generation than this read is newer,
+            // not stale (`none()`'s `u64::MAX` is neither).
+            if kept.generation != u64::MAX && kept.generation >= generation {
                 return kept;
             }
-            slot.store(Arc::new(Self {
-                generation,
-                ..Self::default()
-            }));
+            // The first record of the new generation installs its set; a
+            // record that raced it uses the winner's, so no handle it built
+            // is thrown away.
+            let _ = slot.compare_and_swap(
+                &kept,
+                Arc::new(Self {
+                    generation,
+                    ..Self::default()
+                }),
+            );
             slot.load()
         }
     }
@@ -875,18 +884,22 @@ impl Metrics {
     pub fn record_worker_request(worker: &dyn Worker) {
         let (worker_url, model_id) = (worker.url(), worker.model_id());
         let Some(kept) = worker.metric_handles().and_then(WorkerHandles::kept) else {
-            Self::worker_requests(worker_url, model_id).increment(1);
+            Self::worker_requests(worker_url, intern_model_label(model_id)).increment(1);
             return;
         };
         if let Some(counter) = kept.requests.get() {
             counter.increment(1);
             return;
         }
-        let counter = Self::worker_requests(worker_url, model_id);
+        // One lookup gives the label the counter is built with and the
+        // label that is judged: a label the interner refused is used and
+        // not kept, so its sentinel's series is not pinned to this worker
+        // for its life.
+        let model = intern_model_label(model_id);
+        let refused = handles::is_sentinel(&model);
+        let counter = Self::worker_requests(worker_url, model);
         counter.increment(1);
-        // A label the interner refused is used and not kept, so its
-        // sentinel's series is not pinned to this worker for its life.
-        if !handles::is_sentinel(&intern_model_label(model_id)) {
+        if !refused {
             let _ = kept.requests.set(counter);
         }
     }
@@ -894,14 +907,14 @@ impl Metrics {
     /// A worker registered: its request counter exists from zero, so a
     /// worker that gets no traffic shows as such instead of being absent.
     pub fn init_worker_requests(worker_url: &str, model_id: &str) {
-        Self::worker_requests(worker_url, model_id).increment(0);
+        Self::worker_requests(worker_url, intern_model_label(model_id)).increment(0);
     }
 
-    fn worker_requests(worker_url: &str, model_id: &str) -> metrics::Counter {
+    fn worker_requests(worker_url: &str, model: Arc<str>) -> metrics::Counter {
         counter!(
             "smg_worker_requests_total",
             "worker" => intern_string(worker_url),
-            "model" => intern_model_label(model_id)
+            "model" => model
         )
     }
 
