@@ -1234,6 +1234,37 @@ mod tests {
         assert_eq!(sent, [2; 2]);
     }
 
+    /// A host that takes another target of its pick holds that target, and
+    /// the guard hands it to the decode asked again. Under round robin the
+    /// answer's first decode is then the taken target's: for a target taken
+    /// before its prefill went out, and for a target's decode taken behind
+    /// the prefill. The pick's third target is taken: its decode is neither
+    /// the first target's nor the one the rotation's next turn names.
+    #[test]
+    fn the_guards_decode_call_keeps_the_decode_its_host_took() {
+        let host = Host::under(presets("round_robin"), 1, 3);
+        let classes = every(1, 3);
+        for behind_the_prefill in [false, true] {
+            let (asks, now) = (host.asks(&classes, true), Instant::now());
+            let guard = DecisionGuard::decide_under(&host.engine, GatewayId::LOCAL, &asks, now);
+            let mut guard = guard.expect("a decision");
+            let first = host.picked(guard.decision()).1;
+            let taken = if behind_the_prefill {
+                guard.dispatched(now);
+                guard.take_decode(2)
+            } else {
+                let taken = guard.take(2);
+                guard.dispatched(now);
+                taken
+            };
+            let taken = taken.and_then(|target| target.pair);
+            let taken = taken.expect("a third target").decode_position as usize;
+            assert_ne!(taken, first, "another decode than the first target's");
+            let again = *guard.decide_decode_under(&asks, now).expect("a decision");
+            assert_eq!(host.picked(&again).1, taken, "{behind_the_prefill}");
+        }
+    }
+
     /// A decode that is one rank of a data-parallel engine is kept by its
     /// worker and its rank. Over an engine's two ranks each second answer is
     /// the rank its first named, and both ranks are named.
