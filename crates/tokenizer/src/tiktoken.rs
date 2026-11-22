@@ -224,9 +224,21 @@ pub(crate) struct RankFile {
 }
 
 impl RankFile {
+    /// A file of `tokens` tokens over `bytes` bytes at the most, sized
+    /// before it is filled.
+    pub(crate) fn with_capacity(tokens: usize, bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            ends: Vec::with_capacity(tokens),
+            ranks: Vec::with_capacity(tokens),
+        }
+    }
+
     /// Ends the token whose bytes were appended last, under `rank`.
     pub(crate) fn end_token(&mut self, rank: Rank) -> Result<()> {
-        self.ends.push(u32::try_from(self.bytes.len())?);
+        let end = u32::try_from(self.bytes.len())
+            .map_err(|_| Error::msg("the tokens of a rank file pass 4 GiB"))?;
+        self.ends.push(end);
         self.ranks.push(rank);
         Ok(())
     }
@@ -635,7 +647,12 @@ impl TiktokenTokenizer {
         let bos = file.special(tekken::BOS);
         Self::from_vocabulary(
             FileVocabulary {
-                ranks: tekken::by_token(&file.ranks)?,
+                ranks: tekken::by_token(&file.ranks).map_err(|error| {
+                    error.context(format!(
+                        "{} is not a valid tekken vocabulary",
+                        path.display()
+                    ))
+                })?,
                 pattern: Cow::Owned(file.pattern),
                 specials: file.specials,
                 skip_token_ids,
@@ -1168,12 +1185,8 @@ fn load_tiktoken_bpe(path: &str) -> Result<RankFile> {
     // As many as `lines()` counts: one a line feed, and a last line without one.
     let lines = content.bytes().filter(|&byte| byte == b'\n').count()
         + usize::from(!content.is_empty() && !content.ends_with('\n'));
-    let mut file = RankFile {
-        // Four characters of a line decode to three bytes at the most.
-        bytes: Vec::with_capacity(content.len() / 4 * 3),
-        ends: Vec::with_capacity(lines),
-        ranks: Vec::with_capacity(lines),
-    };
+    // Four characters of a line decode to three bytes at the most.
+    let mut file = RankFile::with_capacity(lines, content.len() / 4 * 3);
     for line in content.lines() {
         if line.is_empty() {
             continue;

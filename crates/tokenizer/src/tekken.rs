@@ -415,7 +415,13 @@ fn vocabulary(file: File<'_>) -> Result<Vocabulary> {
     }
     let offset = TokenIdType::try_from(num_special)
         .context("default_num_special_tokens does not fit an id")?;
-    let mut ranks = RankFile::default();
+    // Four characters of base64 decode to three bytes at the most.
+    let bytes = vocab
+        .iter()
+        .take(inner)
+        .map(|token| token.token_bytes.len().div_ceil(4) * 3)
+        .sum();
+    let mut ranks = RankFile::with_capacity(inner, bytes);
     for (index, token) in vocab.into_iter().take(inner).enumerate() {
         let rank = u32::try_from(index).context("more ranks than ids")?;
         if token.rank != rank {
@@ -881,6 +887,20 @@ mod tests {
         refused(
             testing::tekken_json(&testing::MERGES, Some(&[(0, "<unk>")]), 3, 300, "v13"),
             "the configuration needs 297",
+        );
+        // `hello` rewritten as `he`, a token the file lists already: the
+        // reader passes it; the load refuses it and names the file as the
+        // reader names it.
+        let dir = testing::dir_with(&minimal.replacen("aGVsbG8=", "aGU=", 1));
+        let path = dir.path().join(FILE_NAME);
+        let Err(error) = TiktokenTokenizer::from_tekken_file(&path) else {
+            panic!("a file that lists a token twice loaded");
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(
+            error.contains("repeats an earlier token's bytes"),
+            "{error}"
         );
         assert!(is_tekken_file(Path::new("/m/tekken.json")));
         assert!(is_tekken_file(Path::new("tekken_240911.json")));
