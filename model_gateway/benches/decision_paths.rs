@@ -51,6 +51,15 @@
 //! header `x-smg-routing-key`: a policy that places by a key places by it,
 //! on every path. `0`, the default, sends no key.
 //!
+//! `--sticky true` turns the sticky routing-key override on beside the
+//! cell's policy, on the `classic` and `engine` paths: the classic
+//! registry holds the sticky map, and the engine's document holds the
+//! override's session rule. With `--keys N` each request then belongs to
+//! one of `N` sessions, and each caller walks the sessions from a place of
+//! its own: a session's requests come one at a time, as a conversation's
+//! turns do, and its worker stays under the override's cap. With no key
+//! every request is placed by the policy under the rule.
+//!
 //! `--prompts N` gives each request one of `N` prompts in turn, each of
 //! 1,024 tokens: the first 32 are the same in every prompt, as a chat
 //! template's head is, and the rest are the prompt's own. `1`, the default,
@@ -181,6 +190,8 @@ struct Cell {
     pair: bool,
     /// The routing keys the requests carry in turn; `0` for none.
     keys: usize,
+    /// The sticky routing-key override is on beside the policy.
+    sticky: bool,
     /// The prompts the requests carry in turn.
     prompts: usize,
     /// Milliseconds between two publications of the fleet's reports while
@@ -207,6 +218,7 @@ fn cell() -> Cell {
         models: 1,
         pair: false,
         keys: 0,
+        sticky: false,
         prompts: 1,
         publish_ms: 0,
         grow: 0,
@@ -240,6 +252,7 @@ fn cell() -> Cell {
             "--models" => cell.models = value.parse().unwrap(),
             "--pair" => cell.pair = value.parse().unwrap(),
             "--keys" => cell.keys = value.parse().unwrap(),
+            "--sticky" => cell.sticky = value.parse().unwrap(),
             "--prompts" => cell.prompts = value.parse().unwrap(),
             "--publish-ms" => cell.publish_ms = value.parse().unwrap(),
             "--grow" => cell.grow = value.parse().unwrap(),
@@ -401,6 +414,10 @@ type Routing = Box<dyn Fn(&[u32], u64) -> Option<usize> + Send + Sync>;
 /// The header a routing key travels in.
 const ROUTING_KEY: &str = "x-smg-routing-key";
 
+/// How many sessions ahead of the caller before it a caller begins its walk
+/// of the sessions, under the sticky override.
+const SESSIONS_AHEAD: u64 = 61;
+
 /// The headers of `keys` requests, each with a routing key of its own.
 fn keyed_headers(keys: usize) -> Vec<HeaderMap> {
     (0..keys)
@@ -529,9 +546,17 @@ fn build(cell: &Cell) -> Built {
             decode_policy: None,
         };
     }
+    assert!(
+        !cell.sticky || (!cell.pair && matches!(cell.path.as_str(), "classic" | "engine")),
+        "the sticky override is timed for single requests, on the classic and engine paths"
+    );
+    config.routing_key_override.enabled = cell.sticky;
     let policies = match cell.path.as_str() {
         "classic" => {
-            let policies = PolicyRegistry::new(policy_config(&cell.policy));
+            let policies = PolicyRegistry::with_override(
+                policy_config(&cell.policy),
+                config.routing_key_override.clone(),
+            );
             if cell.pair {
                 set_pair_sides(&policies, &config);
             }
@@ -708,8 +733,15 @@ fn main() {
                 let mut conversation =
                     (cell.grow > 0).then(|| Conversation::new(caller, cell.grow));
                 let mut last = None;
+                // Under the sticky override a caller's sessions are ahead
+                // of the caller's before it.
+                let ahead = if cell.sticky {
+                    u64::from(caller) * SESSIONS_AHEAD
+                } else {
+                    0
+                };
                 for turn in 0..CALLER_WARM * cell.models.max(1) as u64 {
-                    black_box(routing(black_box(tokens_at(turn)), turn));
+                    black_box(routing(black_box(tokens_at(turn)), turn + ahead));
                 }
                 loop {
                     start.wait();
@@ -724,7 +756,8 @@ fn main() {
                         let (mut carried, mut back) = (0u64, 0u64);
                         for turn in 0..decisions {
                             let (tokens, carries) = conversation.turn();
-                            let went = black_box(routing(black_box(tokens), black_box(turn)));
+                            let went =
+                                black_box(routing(black_box(tokens), black_box(turn + ahead)));
                             took_placed += u64::from(went.is_some());
                             carried += u64::from(carries);
                             back += u64::from(carries && went == last);
@@ -734,7 +767,7 @@ fn main() {
                         returned.fetch_add(back, Ordering::Relaxed);
                     } else {
                         for turn in 0..decisions {
-                            let went = routing(black_box(tokens_at(turn)), black_box(turn));
+                            let went = routing(black_box(tokens_at(turn)), black_box(turn + ahead));
                             took_placed += u64::from(black_box(went).is_some());
                         }
                     }
@@ -782,7 +815,7 @@ fn main() {
         returned as f64 / turns as f64
     };
     println!(
-        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
+        "path={} route={:?} policy={} workers={} callers={} reports={} not_ready={} ready={} overloaded={} models={} pair={} keys={} sticky={} prompts={} grow={} turns={} returned={} return_rate={:.4} publish_ms={} publications={} conversions={} alloc_bytes_per_decision={:.2} decisions={} wall_s={:.3} decisions_per_s={:.0} ns_per_decision={:.1}",
         cell.path,
         cell.route,
         cell.policy,
@@ -795,6 +828,7 @@ fn main() {
         cell.models,
         cell.pair,
         cell.keys,
+        cell.sticky,
         cell.prompts,
         cell.grow,
         turns,
