@@ -51,7 +51,7 @@ pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
 pub use keyed::PoolRows;
-use vetoed::AllVetoed;
+use vetoed::{AllVetoed, Half};
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
 /// leave nothing: the engines a retry already tried step aside while another
@@ -1119,12 +1119,20 @@ struct Buffers {
     scores: Vec<f32>,
     stage: Vec<f32>,
     before_soft: Vec<u32>,
-    /// The rows as they read with no doubt, for the all-vetoed rule's pass
-    /// that lifts the liveness veto ([`vetoed::emptied`]). The first such
-    /// pass sizes it, and no other decision touches it.
+    /// The rows as they read with no doubt, for a pass that lifts the
+    /// liveness veto over rows that carry one: the all-vetoed rule's
+    /// ([`vetoed::emptied`]) and the pair default's ([`vetoed::paired`]).
+    /// The first such pass sizes it, and no other decision writes it.
     undoubted: Vec<Candidate>,
-    /// The veto the rule lifted for the rows it kept ([`vetoed::emptied`]):
-    /// the mark of its pick's trace ([`vetoed::steered`]).
+    /// The veto lifted for the rows a pass kept: the mark of its pick's
+    /// trace ([`vetoed::steered`]). The all-vetoed rule writes it where it
+    /// keeps rows ([`vetoed::emptied`]), and a pair's default writes its
+    /// tier on both sides' buffers ([`vetoed::paired`]). No other pass
+    /// clears it, so a decision that reads it clears it first: a keyed
+    /// request's ([`Engine::keep`]), and a pair's for the prefill's buffer
+    /// ([`Engine::decide_pair`]). There the default alone writes it again,
+    /// and the prefill's shadow reads it to know the default made the pair
+    /// ([`Engine::shadow_side`]).
     lifted: LiftedVeto,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
@@ -6672,10 +6680,16 @@ impl Engine {
     /// fewest requests, and the pair's trace says the lifted veto
     /// ([`LiftedVeto::Overload`]). On a retry the profile's soft filter keeps
     /// that pick to the partners the request has not tried while one is
-    /// left. Under a binding that sheds, such a pool is
-    /// shed as saturated. A decode pool the liveness veto refuses stays
-    /// refused here, and so does a prefill pool refused whole: the prefill
-    /// side is put to no rule.
+    /// left. Under a binding that sheds, such a pool is shed as saturated.
+    /// The prefill side's own run is put to no rule.
+    ///
+    /// Where that run sheds, a pool whose every usable worker is vetoed
+    /// goes to the pair's default: the usable prefill and partner of the
+    /// least load, the pairs the overload veto alone refuses first, with the
+    /// admission limit asked of the prefill taken. A prefill pool refused
+    /// whole pairs so, and so does a decode pool the liveness veto refuses
+    /// on every worker. Each side's workers are those at the places its
+    /// host states.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -6778,7 +6792,8 @@ impl Engine {
         // class: a room narrows a prefill's partners, not the prefills. The
         // decode run of the chosen prefill then meets its partners emptied
         // the same way, and the rule picks among them. Decodes the rule
-        // keeps past a doubt open no prefill: that pool stays refused.
+        // keeps past a doubt open no prefill: the prefill side sheds, and
+        // that pool goes to the pair's default below.
         if scratch.classes.is_empty() {
             let whole = Set::side(decodes, None, None).ruled(vetoed);
             let buf = &mut scratch.decode;
@@ -6798,8 +6813,9 @@ impl Engine {
                 let hard = || decode_profile.filters.iter().filter(|f| !f.soft());
                 // Here too a decode outside its side's places partners
                 // nobody: the rule's pass above opened with those places.
+                // So does a decode of class 0.
                 let kept = places::rows(decodes, decode_cx)
-                    .filter(|d| hard().all(|f| f.keep(&all, d, &pass)));
+                    .filter(|d| d.pair_class != 0 && hard().all(|f| f.keep(&all, d, &pass)));
                 pools.table.partnered(
                     kept.map(|d| d.pair_class),
                     &mut scratch.classes,
@@ -6807,6 +6823,11 @@ impl Engine {
                 );
             }
         }
+        // The prefill buffer's mark of a lifted veto is cleared for this
+        // decision. The pair's default alone writes it again
+        // ([`vetoed::paired`]), and the prefill's shadow reads it
+        // ([`Self::shadow_side`]).
+        scratch.single.lifted = LiftedVeto::None;
         let prefill = run_profile(
             prefill_profile,
             binding.profile,
@@ -6829,6 +6850,20 @@ impl Engine {
             // decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
+                    // A refused pool vetoed on every usable worker goes to
+                    // the pair of the least load ([`vetoed::paired`]). The
+                    // default reads the classes with an open partner, so it
+                    // is asked before they are written over.
+                    let (first, second) = (binding.profile, decode_index);
+                    let sides = [
+                        Half::new(prefill_profile, first, &prefill_facts, prefills, cx),
+                        Half::new(decode_profile, second, &decode_facts, decodes, decode_cx),
+                    ];
+                    let weighs = self.profile_needs[usize::from(first)].affinity;
+                    let words = (vetoed == AllVetoed::Steer, weighs);
+                    if let Some(pair) = vetoed::paired(sides, &pools.table, words, pool, scratch) {
+                        return pair;
+                    }
                     let mut routable = 0usize;
                     scratch.classes.clear();
                     // Of the prefills the request may take: one outside
@@ -6969,10 +7004,14 @@ impl Engine {
     /// build did not find that profile free to run beside the live one
     /// ([`side_shadows`]), and where it would be handed another column
     /// than the live side's pool carries ([`Self::side_apart`]). `None`
-    /// too for the decode's shadow beside a pair the binding's all-vetoed
-    /// rule placed, which `live`'s trace says: that shadow's run is put to
-    /// no rule, and would shed the partners its live side was steered
-    /// among.
+    /// too beside a pair a lifted veto placed: a shadow's run is put to no
+    /// rule, so it sheds a pool its live side was steered in, and decides
+    /// by its profile where the live side was taken by load. The decode's
+    /// shadow says none beside a pair whose trace names a lifted veto, by
+    /// the binding's all-vetoed rule or by the pair's default
+    /// ([`vetoed::paired`]). The prefill's shadow says none beside a pair
+    /// the default made, which the mark on the prefill's buffer says: it
+    /// speaks beside a pair whose decode side alone the rule steered.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's entry and its inputs, beside the side and the live pick"
@@ -6998,6 +7037,9 @@ impl Engine {
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
         Some(match side {
             PairSide::Prefill => {
+                if scratch.single.lifted != LiftedVeto::None {
+                    return None;
+                }
                 // The prefills the live prefill profile was shown: the
                 // classes with a partner stand in the scratch as the
                 // pair's decision left them ([`Self::decide_pair`]). No
@@ -7094,10 +7136,13 @@ impl Engine {
     /// are all over their thresholds, or doubted, are put to the binding's
     /// all-vetoed rule, both its tiers: the rule picks afresh among them,
     /// whatever decode the first decision named. Over partners all over
-    /// their thresholds it keeps to the ones the request has not tried
-    /// while one is left, as a first decision does. A pair's first decision
-    /// lifts the overload veto alone ([`Self::decide_pair`]). Here the
-    /// prefill has run, and a refusal fails its request.
+    /// their thresholds the profile's soft filter keeps that pick to the
+    /// ones the request has not tried while one is left, as the rule's
+    /// pick in a first decision does. A pair's first decision lifts the
+    /// overload veto alone by the rule, and a pool it still refuses goes to
+    /// the pair's default, which asks no soft filter
+    /// ([`Self::decide_pair`]). Here the prefill has run, and a refusal
+    /// fails its request.
     ///
     /// `first_decode` is the worker and the rank of the decode the pair's
     /// first decision named, where the caller holds them. Under a decode

@@ -40,6 +40,11 @@
 //! size and a request no rank can be pinned for among them: the workers
 //! the request may be placed on, or its refusal. Each must replay answer
 //! for answer, a refusal by its status and its code.
+//! A pair-select row holds the gateway's answers to the requests of a
+//! prefill pool and a decode pool: the pair, or no pair and why. It must
+//! replay answer for answer, and a drawn row pair for pair and share for
+//! share. The pair-select module holds five recorded rows the pair's
+//! decision answers apart to the answer each entry gives.
 //! No row is decided differently but where its module names it. The store
 //! judges an engine by rules of its own, and the overload module holds a
 //! recorded row they decide apart from the gateway to the verdicts its
@@ -77,6 +82,7 @@ mod classic {
     pub mod minimum_tokens;
     pub mod overload;
     pub mod pair_index;
+    pub mod pair_select;
     pub mod power_of_two;
     pub mod prefix_hash;
     pub mod rank_pin;
@@ -133,16 +139,10 @@ struct OwedSheet {
 
 /// The owed sheets: each was recorded before the change that replays it
 /// landed here.
-const OWED_SHEETS: &[OwedSheet] = &[
-    OwedSheet {
-        policy: "pair-select",
-        by: "the placement of a prefill and decode pair",
-    },
-    OwedSheet {
-        policy: "constraint-decider",
-        by: "a request's hard demands: the constraint's decider on a retry",
-    },
-];
+const OWED_SHEETS: &[OwedSheet] = &[OwedSheet {
+    policy: "constraint-decider",
+    by: "a request's hard demands: the constraint's decider on a retry",
+}];
 
 /// The owed sheet of a policy, when one is owed.
 fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
@@ -297,7 +297,7 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// brings its own replay too, over one bed; their copied rows name each
 /// runtime by a token, or name none, and the pair index's rule holds them
 /// as well.
-const MODULES: [Module; 16] = [
+const MODULES: [Module; 17] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -337,6 +337,12 @@ const MODULES: [Module; 16] = [
         inline: classic::pair_index::INLINE,
         replay: classic::pair_index::replay_rows,
         copied: classic::pair_index::copied_row_defects,
+    },
+    Module {
+        policy: classic::pair_select::POLICY,
+        inline: classic::pair_select::INLINE,
+        replay: classic::pair_select::replay_rows,
+        copied: classic::overload::copied_row_defects,
     },
     module::<classic::power_of_two::Row>(classic::power_of_two::INLINE),
     Module {
@@ -1187,6 +1193,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "minimum_tokens.json",
             "overload.json",
             "pair-index.json",
+            "pair-select.json",
             "power_of_two.json",
             "prefix_hash.json",
             "rank-pin.json",

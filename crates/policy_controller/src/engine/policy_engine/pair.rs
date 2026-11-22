@@ -74,11 +74,11 @@ use crate::{
 /// request could take is at its admission limit.
 const HAS_CAPACITY: &str = "has-capacity";
 
-/// Whether `decision` sheds a pair because no prefill it could take has
-/// admission capacity: its prefill list was emptied by the capacity bit its
-/// host stated ([`PairAdmission::has_capacity`]). Such a request is not
-/// refused. Its host makes it wait for a prefill's room and decides it
-/// again.
+/// Whether `decision` sheds a pair at the prefill admission limit: its
+/// prefill list was emptied by the capacity bit its host stated
+/// ([`PairAdmission::has_capacity`]), or the one prefill the pair's default
+/// took by load is at its limit. Such a request is not refused. Its host
+/// makes it wait for a prefill's room and decides it again.
 #[must_use]
 pub fn prefills_full(decision: &Decision) -> bool {
     matches!(decision, Decision::Shed(shed) if shed.emptied_by == HAS_CAPACITY)
