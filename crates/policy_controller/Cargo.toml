@@ -293,8 +293,7 @@ mock-worker = { path = "../mock_worker" }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1", default-features = false, features = ["pty"] }
 
-# The in-process engine's bench counts on the allocator the gateway's binary
-# registers, on the targets the gateway registers it.
+# The in-process bench's allocator: the gateway binary's, on the gateway's targets.
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dev-dependencies]
 tikv-jemallocator = { workspace = true }
 

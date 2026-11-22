@@ -587,7 +587,7 @@ impl PoolRecords {
     /// Left for the caller to write where it holds them: the pair class
     /// (zero), the two admission bits (open) and the session key's pin.
     ///
-    /// No lock is taken here beyond what a read of a worker object takes.
+    /// No lock is waited for here beyond what a read of a worker object takes.
     /// Nothing is allocated once `rows` has grown to the list. The one
     /// exception is the conversion: one allocation, by one decision, at
     /// most once a published snapshot a list.
@@ -610,8 +610,9 @@ impl PoolRecords {
                 let reported = match held.as_deref().filter(|reported| reported.is_of(loads)) {
                     Some(reported) => Some(reported),
                     None => {
-                        // It looks every report up: the list is paid for.
-                        converted = self.convert(workers, loads, live, &held, u32::MAX);
+                        // It looks every report up: it pays the list's length.
+                        converted =
+                            self.convert(workers, loads, live, &held, self.fixed.len() as u32);
                         converted.as_deref()
                     }
                 };
@@ -763,9 +764,9 @@ impl PoolRecords {
 /// costs several times what a converted row costs to copy. So the draws
 /// over a list count their look-ups, and the draw that brings the count to
 /// the list's length converts the list's reports
-/// ([`PoolRecords::convert`]). Until then the list paid less than its
-/// length in look-ups, which is what the conversion costs: never more than
-/// twice the cheaper of converting at once and never converting.
+/// ([`PoolRecords::convert`]). The count held less than the list's length
+/// before that draw, and the conversion then looks up every report.
+/// Look-ups it never held (below) or lost to another snapshot come on top.
 ///
 /// The count is written under the claim alone, which is never waited for:
 /// a draw that finds the claim taken leaves its look-ups uncounted. Only a
@@ -869,9 +870,7 @@ impl<'a> Singly<'a> {
             }
             None => {
                 *row = *fixed;
-                if self.live.loads.is_some() {
-                    self.looked_up.set(self.looked_up.get() + 1);
-                }
+                self.looked_up.set(self.looked_up.get() + 1);
                 self.live.write(worker.as_ref(), row);
             }
         }

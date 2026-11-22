@@ -464,10 +464,8 @@ fn assert_drawn_as_written(
             matches!(whole, Decision::Shed(_))
         );
     }
-    // Draws convert a list's reports once: where every decision was a
-    // draw's, the list was converted one time, by the write ahead of them
-    // or by the draws. The targets above are the whole write's on both
-    // sides of that conversion.
+    // Where every decision was a draw's, the list was converted one time, ahead
+    // of them or by them: the targets above are the whole write's either side.
     if draws as u64 == seeds {
         assert_eq!(drawn_pool.conversions(), 1);
     }
@@ -795,11 +793,9 @@ fn drawn(
     decide(spec.engine(), pool, workers, &live, &mut facts, &cx)
 }
 
-/// Draws convert a list's reports once they looked up as many as the list
-/// holds. A pick of two looks two reports up at each decision, so the 32nd
-/// decision pays the last of the 64 and converts. From there each draw that
-/// holds the snapshot copies the list's rows, and a new snapshot starts the
-/// count again.
+/// Draws convert a list's reports once they looked up as many as it holds: a
+/// pick of two looks up two a decision, so the 32nd pays the last of the 64 and
+/// converts. Later draws copy the list's rows, and a new snapshot counts again.
 #[test]
 fn draws_convert_a_lists_reports_once_they_looked_up_a_lists_length() {
     let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
@@ -823,11 +819,9 @@ fn draws_convert_a_lists_reports_once_they_looked_up_a_lists_length() {
     }
 }
 
-/// A snapshot published after one that is gone starts the list's count
-/// again, wherever it stands in memory. The list names the snapshot it
-/// counted under and does not hold it, so that place is given to no later
-/// snapshot while the count stands: 62 look-ups under one snapshot and four
-/// under each of many later ones convert nothing.
+/// A snapshot published after one that is gone starts the list's count again,
+/// wherever it stands in memory: the list names the snapshot it counted under,
+/// so 62 look-ups under one and four under each of 64 later convert nothing.
 #[test]
 fn a_later_snapshot_does_not_inherit_a_lists_count() {
     let (spec, clock) = (applied("power_of_two"), DecisionClock::new());
@@ -838,8 +832,7 @@ fn a_later_snapshot_does_not_inherit_a_lists_count() {
     for seed in 1..=31 {
         let _ = drawn(&spec, &clock, &pool, &workers, &first, seed);
     }
-    // One decision more under the first snapshot would convert. The
-    // snapshot goes, and its place stays named.
+    // One more decision would convert. The snapshot goes, its place stays named.
     let place = Arc::as_ptr(&first).addr();
     drop(first);
     for later in 0..64 {
@@ -854,9 +847,8 @@ fn a_later_snapshot_does_not_inherit_a_lists_count() {
     }
 }
 
-/// A draw that finds the list's claim taken pays nothing toward the
-/// conversion and waits for nothing: the count starts with the first draw
-/// that takes the claim.
+/// A draw that finds the list's claim taken counts nothing and waits for
+/// nothing: the count starts with the first draw that takes the claim.
 #[test]
 fn a_draw_that_finds_the_claim_taken_counts_nothing() {
     let (spec, clock) = (applied("power_of_two"), DecisionClock::new());

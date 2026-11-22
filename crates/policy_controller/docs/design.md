@@ -662,9 +662,10 @@ The HTTP status codes belong to the host. The engine only says why.
 ### 5.6 One decision, step by step **[built]**
 
 The host calls `PolicyEngine::decide_at(maker, clock)`. `maker` is the host's object for the
-request (section 8). The call runs on the caller's thread. The engine takes no lock of its own; a
+request (section 8). The call runs on the caller's thread. The engine waits on no lock of its own; a
 stage that keeps state takes its own short lock (one shard of the session table, or the record of
-sent prefixes).
+sent prefixes). A decision that meets the one build of a list's `records`, `wires` or `alone`
+waits for it (5.2).
 
 **The short path.** A request is *plain* when it names no tried or excluded worker and states no
 hint, no demand, no lifted overload veto, no later decode and no held-back worker. A profile is
@@ -715,7 +716,8 @@ What one decision writes: the thread's own buffer; on the short path one atomic 
 counter; one atomic add for a lease id where a stage needs lease events; a session pin where a
 sessions rule decides; the record of sent prefixes where a cache-affinity profile decides; and,
 once for each new load snapshot and list, the converted load reports, which allocates. On the
-short path it allocates nothing.
+short path it allocates nothing. A draw that looked up load reports counts them toward its list's
+conversion where it takes the list's claim, which it tries and never waits for.
 
 ### 5.7 Two engines today, one that stays **[partly]**
 

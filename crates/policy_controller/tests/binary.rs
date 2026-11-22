@@ -170,10 +170,7 @@ fn the_served_benchs_settings_are_the_binarys() {
         "/benches/in_process.rs"
     ));
     let theirs = settings_after(in_process, "pub static MALLOC_CONF").expect("its copy");
-    assert_eq!(
-        theirs, ours,
-        "the in-process bench's settings are not the binary's"
-    );
+    assert_eq!(theirs, ours, "the in-process bench's settings differ");
 }
 
 /// The byte string a source assigns after `name`, without its quotes.

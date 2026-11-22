@@ -39,8 +39,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
         unsafe { self.0.alloc(layout) }
     }
 
-    // Forwarded, not left to the default: the allocator counted over may
-    // zero more cheaply than an allocation and a fill.
+    // Forwarded: the allocator counted over may zero for less than a fill.
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count_call();
         // SAFETY: the same layout contract as the caller's.
