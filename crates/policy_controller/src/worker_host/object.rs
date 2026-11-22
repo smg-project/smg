@@ -6,13 +6,14 @@ use smg_worker::{
     identity::{basic::Worker, builder::BasicWorkerBuilder},
     model_card::ModelCard,
     worker::{
-        ConnectionMode, HealthCheckConfig, WorkerSpec, WorkerStatus as ObjectStatus, WorkerType,
+        ConnectionMode, HealthCheckConfig, OverloadUpdate, WorkerSpec,
+        WorkerStatus as ObjectStatus, WorkerType,
     },
 };
 
 use crate::{
     engine::view::{Role, WireModes},
-    store::{HealthPolicy, WorkerFacts, WorkerRow, WorkerStatus},
+    store::{HealthPolicy, Overload, WorkerFacts, WorkerRow, WorkerStatus},
 };
 
 /// The worker object of `row`: every fact of the row a collector or the
@@ -98,6 +99,23 @@ pub(super) fn unchecked(row: &WorkerRow) -> BasicWorkerBuilder {
     })
 }
 
+/// The row's own overload thresholds in the worker crate's form: what an
+/// object states where its host's load monitor judges overload by it
+/// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)),
+/// and what the line of a mirrored verdict says. The usage goes back from
+/// permille to the ratio an engine reports: the object's own registration
+/// reads it back as the same permille ([`facts`](super::facts)).
+pub(super) fn thresholds(overload: &Overload) -> OverloadUpdate {
+    OverloadUpdate {
+        waiting_requests: overload
+            .waiting_requests
+            .map(|waiting| usize::try_from(waiting).unwrap_or(usize::MAX)),
+        token_usage: overload
+            .kv_usage_permille
+            .map(|permille| f64::from(permille) / 1_000.0),
+    }
+}
+
 /// The store's role for a worker object.
 pub(super) fn role(worker_type: WorkerType) -> Role {
     Role::from(worker_type)
@@ -166,7 +184,10 @@ mod tests {
     use smg_worker::worker::RuntimeType;
 
     use super::*;
-    use crate::store::{identity, Registrant};
+    use crate::{
+        engine::view::threshold_permille,
+        store::{identity, Registrant},
+    };
 
     const URL: &str = "http://w:8000";
 
@@ -190,6 +211,29 @@ mod tests {
 
     fn ids(object: &Arc<dyn Worker>) -> Vec<String> {
         object.models().into_iter().map(|card| card.id).collect()
+    }
+
+    /// A row's own thresholds as an object states them read back as the row
+    /// stated them: every permille from one to a thousand comes back from
+    /// its ratio, and 800 permille is the 0.8 an engine reports, not a value
+    /// beside it. A row that names none states none.
+    #[test]
+    fn a_rows_thresholds_read_back_from_the_ratio_an_object_states() {
+        for permille in 1..=1_000_u16 {
+            let stated = thresholds(&Overload {
+                kv_usage_permille: Some(permille),
+                waiting_requests: Some(u32::from(permille)),
+            });
+            assert_eq!(stated.waiting_requests, Some(usize::from(permille)));
+            let usage = stated.token_usage.expect("a usage");
+            assert_eq!(threshold_permille(usage), permille);
+        }
+        let stated = thresholds(&Overload {
+            kv_usage_permille: Some(800),
+            waiting_requests: None,
+        });
+        assert_eq!(stated.token_usage, Some(0.8));
+        assert_eq!(thresholds(&Overload::default()), OverloadUpdate::default());
     }
 
     /// The table, row by row: each fact the object carries reads back from
