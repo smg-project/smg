@@ -1209,16 +1209,15 @@ mod tests {
     }
 
     /// A failed job keeps the fetch error: it names the first failure, not
-    /// one for every worker asked.
+    /// one for every worker tried.
     #[tokio::test]
     async fn a_failed_fetch_names_its_first_failure_alone() {
         let workers = WorkerRegistry::new();
-        let urls = [
-            "grpc://127.0.0.1:9",
-            "grpc://127.0.0.1:11",
-            "grpc://127.0.0.1:13",
-        ];
-        for url in urls {
+        // The ready worker is tried first, though it registers second.
+        for (url, status) in [
+            ("grpc://127.0.0.1:9", WorkerStatus::Pending),
+            ("grpc://127.0.0.1:11", WorkerStatus::Ready),
+        ] {
             workers
                 .register(Arc::new(
                     BasicWorkerBuilder::new(url)
@@ -1226,6 +1225,7 @@ mod tests {
                         .connection_mode(ConnectionMode::Grpc)
                         .model(ModelCard::new("m"))
                         .health_config(no_health_check())
+                        .status(status)
                         .build(),
                 ))
                 .expect("register worker");
@@ -1235,13 +1235,10 @@ mod tests {
             .err()
             .expect("no worker serves a tokenizer");
         assert!(
-            error.contains("from 3 ready or pending gRPC worker(s), first failure: "),
+            error.contains("from 2 ready or pending gRPC worker(s), first failure: "),
             "{error}"
         );
-        let named = urls
-            .iter()
-            .filter(|url| error.contains(&format!("{url} (runtime")))
-            .count();
-        assert_eq!(named, 1, "{error}");
+        assert!(error.contains("grpc://127.0.0.1:11 (runtime"), "{error}");
+        assert!(!error.contains("grpc://127.0.0.1:9 (runtime"), "{error}");
     }
 }
