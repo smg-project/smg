@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{body::Body, http::StatusCode, response::Response};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
@@ -122,14 +122,14 @@ fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
 }
 
 /// The text delta of one token, `response.output_text.delta` or
-/// `response.reasoning_text.delta` by `kind`, serialized straight into its
+/// `response.reasoning_text.delta` by `head`, written straight into its
 /// frame: the fields in the event's order (the bytes the `json!` map wrote
 /// under `preserve_order`), the item id and the delta borrowed rather than
 /// copied into a map per token.
-#[derive(Serialize)]
 struct TextDelta<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
+    /// The frame up to its sequence number: [`OUTPUT_TEXT_DELTA_HEAD`] or
+    /// [`REASONING_TEXT_DELTA_HEAD`].
+    head: &'static [u8],
     sequence_number: u64,
     output_index: usize,
     item_id: &'a str,
@@ -137,9 +137,44 @@ struct TextDelta<'a> {
     delta: &'a str,
 }
 
+const OUTPUT_TEXT_DELTA_HEAD: &[u8] = b"event: response.output_text.delta\n\
+    data: {\"type\":\"response.output_text.delta\",\"sequence_number\":";
+const REASONING_TEXT_DELTA_HEAD: &[u8] = b"event: response.reasoning_text.delta\n\
+    data: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":";
+
+/// The room of a text delta frame beyond its two strings, and the size of the
+/// block the emitter cuts those frames from.
+const TEXT_DELTA_ROOM: usize = 224;
+const TEXT_DELTA_BLOCK: usize = 4096;
+
+impl TextDelta<'_> {
+    /// The event's frame, written in one pass onto the end of `frame`: the
+    /// constant text as literals and serde for the three numbers and the two
+    /// strings, so a token costs the escape of its strings and not a walk of
+    /// six keys and a scan of the event's type. The bytes are those
+    /// [`SseEncoder::encode_event`] writes for the event, which
+    /// `tests::text_delta_frames_write_the_bytes_of_the_serialized_event` pins.
+    fn write(&self, frame: &mut BytesMut) -> Result<(), serde_json::Error> {
+        frame.reserve(TEXT_DELTA_ROOM + self.item_id.len() + self.delta.len());
+        frame.extend_from_slice(self.head);
+        serde_json::to_writer((&mut *frame).writer(), &self.sequence_number)?;
+        frame.extend_from_slice(b",\"output_index\":");
+        serde_json::to_writer((&mut *frame).writer(), &self.output_index)?;
+        frame.extend_from_slice(b",\"item_id\":");
+        serde_json::to_writer((&mut *frame).writer(), self.item_id)?;
+        frame.extend_from_slice(b",\"content_index\":");
+        serde_json::to_writer((&mut *frame).writer(), &self.content_index)?;
+        frame.extend_from_slice(b",\"delta\":");
+        serde_json::to_writer((&mut *frame).writer(), self.delta)?;
+        frame.extend_from_slice(b"}\n\n");
+        Ok(())
+    }
+}
+
 /// One fragment of a call's arguments, `response.function_call_arguments.delta`
-/// or `response.mcp_call_arguments.delta` by `kind`, written as [`TextDelta`]
-/// is.
+/// or `response.mcp_call_arguments.delta` by `kind`, serialized straight into
+/// its frame: the fields in the event's order, the item id and the fragment
+/// borrowed.
 #[derive(Serialize)]
 struct ArgumentsDelta<'a> {
     #[serde(rename = "type")]
@@ -150,7 +185,6 @@ struct ArgumentsDelta<'a> {
     delta: &'a str,
 }
 
-const REASONING_TEXT_DELTA: &str = "response.reasoning_text.delta";
 const RETAIN_OUTPUT_ITEM: bool = true;
 
 /// The `response.output_item.added` and `response.output_item.done` events:
@@ -295,8 +329,11 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// The error of the last `error` event sent, for the runner of a
     /// background stream that ends without a terminal object.
     last_error: Option<serde_json::Value>,
-    /// Frames every event of the stream through one reusable buffer.
+    /// Frames every event of the stream but the text deltas (see
+    /// `delta_frames`) through one reusable buffer.
     encoder: SseEncoder,
+    /// The block the text delta frames, one a token, are cut from.
+    delta_frames: BytesMut,
     /// The client is gone: nothing more is sent, and nothing counts as
     /// delivered; the items still open close into the final object without
     /// their events, so the record of a stored response keeps them.
@@ -403,6 +440,7 @@ impl ResponseStreamEventEmitter {
             background: false,
             last_error: None,
             encoder: SseEncoder::new(),
+            delta_frames: BytesMut::with_capacity(TEXT_DELTA_BLOCK),
             abandoned: false,
         }
     }
@@ -1639,25 +1677,18 @@ impl ResponseStreamEventEmitter {
         if let Some(item) = self.reasoning_item.as_mut() {
             item.text.push_str(reasoning);
             // The id stays borrowed, as the text delta's does: the counter
-            // advanced on its field, the frame written over the encoder alone.
+            // advanced on its field, the frame cut from `delta_frames` alone.
             let sequence_number = self.sequence_number;
             self.sequence_number += 1;
             let event = TextDelta {
-                kind: REASONING_TEXT_DELTA,
+                head: REASONING_TEXT_DELTA_HEAD,
                 sequence_number,
                 output_index: item.output_index,
                 item_id: &item.item_id,
                 content_index: 0,
                 delta: reasoning,
             };
-            Self::send_frame(
-                &mut self.encoder,
-                self.abandoned,
-                REASONING_TEXT_DELTA,
-                &event,
-                tx,
-            )
-            .await?;
+            Self::send_text_delta_frame(&mut self.delta_frames, self.abandoned, &event, tx).await?;
         }
         Ok(())
     }
@@ -1707,7 +1738,7 @@ impl ResponseStreamEventEmitter {
         // Emit text delta: the id borrowed from the emitter, the counter
         // advanced on its field (the method would take the whole emitter while
         // the id is borrowed, and the guard must not cost a number when it
-        // fires) and the frame written over the encoder alone, so no copy of
+        // fires) and the frame cut from `delta_frames` alone, so no copy of
         // the id is made per token.
         let Some(item_id) = self.current_item_id.as_deref() else {
             return Ok(());
@@ -1716,21 +1747,14 @@ impl ResponseStreamEventEmitter {
         self.sequence_number += 1;
         self.accumulated_text.push_str(content);
         let event = TextDelta {
-            kind: OutputTextEvent::DELTA,
+            head: OUTPUT_TEXT_DELTA_HEAD,
             sequence_number,
             output_index,
             item_id,
             content_index,
             delta: content,
         };
-        Self::send_frame(
-            &mut self.encoder,
-            self.abandoned,
-            OutputTextEvent::DELTA,
-            &event,
-            tx,
-        )
-        .await
+        Self::send_text_delta_frame(&mut self.delta_frames, self.abandoned, &event, tx).await
     }
 
     /// A chat tool-call delta as Responses function_call events; without this
@@ -1867,10 +1891,10 @@ impl ResponseStreamEventEmitter {
         Self::send_frame(&mut self.encoder, self.abandoned, event_type, event, tx).await
     }
 
-    /// The one frame writer of this emitter, over the encoder alone: `event`
+    /// The frame writer of this emitter, over the encoder alone: `event`
     /// serialized once into the frame under `event_type`. [`Self::send_typed`]
     /// delegates here; a caller holding a borrow of another field while the
-    /// frame goes out (the per-token delta borrows the current item's id)
+    /// frame goes out (an arguments delta borrows its call's item id)
     /// calls it directly. Nothing is delivered once the client left
     /// (`abandoned`, see `abandon`): the frame is not built, and the caller's
     /// item state and sequence number stand as they would for a sent frame.
@@ -1898,6 +1922,28 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    /// [`Self::send_frame`] for the text delta of one token, the one event
+    /// that writes its own frame ([`TextDelta::write`]).
+    async fn send_text_delta_frame(
+        frames: &mut BytesMut,
+        abandoned: bool,
+        event: &TextDelta<'_>,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        if abandoned {
+            return Ok(());
+        }
+        // What a frame that failed midway left is not sent ahead of the next.
+        frames.clear();
+        event
+            .write(frames)
+            .map_err(|e| format!("Failed to serialize event: {e}"))?;
+        if tx.send(Ok(frames.split().freeze())).await.is_err() {
+            return Err("Client disconnected".to_string());
+        }
+        Ok(())
+    }
+
     /// The `response.output_text.delta` event of one token, sent as
     /// [`TextDelta`]; the text accumulates as it did under the map.
     pub async fn send_text_delta(
@@ -1910,14 +1956,14 @@ impl ResponseStreamEventEmitter {
     ) -> Result<(), String> {
         self.accumulated_text.push_str(delta);
         let event = TextDelta {
-            kind: OutputTextEvent::DELTA,
+            head: OUTPUT_TEXT_DELTA_HEAD,
             sequence_number: self.next_sequence(),
             output_index,
             item_id,
             content_index,
             delta,
         };
-        self.send_typed(OutputTextEvent::DELTA, &event, tx).await
+        Self::send_text_delta_frame(&mut self.delta_frames, self.abandoned, &event, tx).await
     }
 
     /// [`Self::send_text_delta`] for the streams that log a failed send
@@ -2744,6 +2790,49 @@ mod tests {
         assert_eq!(typed_frames, json_frames);
         let terminal = emitter.emit_completed(None);
         assert_eq!(terminal["response"]["output"][0], item);
+    }
+
+    /// The frame a text delta writes for itself is the frame the encoder
+    /// writes for the same event serialized: both types, numbers of every
+    /// width, strings that take every kind of escape.
+    #[test]
+    fn text_delta_frames_write_the_bytes_of_the_serialized_event() {
+        let mut encoder = SseEncoder::new();
+        for (head, kind) in [
+            (OUTPUT_TEXT_DELTA_HEAD, OutputTextEvent::DELTA),
+            (REASONING_TEXT_DELTA_HEAD, "response.reasoning_text.delta"),
+        ] {
+            for (sequence_number, output_index, item_id, content_index, delta) in [
+                (0, 0, "msg_1", 0, "Hello"),
+                (u64::MAX, usize::MAX, "", usize::MAX, ""),
+                (7, 1, "m\"\\", 2, "a\n\nb\"\\\u{1}\u{7f}\u{e9}\u{1f600}"),
+            ] {
+                let event = TextDelta {
+                    head,
+                    sequence_number,
+                    output_index,
+                    item_id,
+                    content_index,
+                    delta,
+                };
+                let mut written = BytesMut::new();
+                event.write(&mut written).unwrap();
+                let serialized = encoder
+                    .encode_event(
+                        kind,
+                        &json!({
+                            "type": kind,
+                            "sequence_number": sequence_number,
+                            "output_index": output_index,
+                            "item_id": item_id,
+                            "content_index": content_index,
+                            "delta": delta,
+                        }),
+                    )
+                    .unwrap();
+                assert_eq!(written, serialized, "{kind} {sequence_number}");
+            }
+        }
     }
 
     /// The frame of an event: its `type` on the `event:` line and the JSON on
