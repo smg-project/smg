@@ -20,6 +20,8 @@ pub(crate) mod demands;
 pub(crate) mod framework;
 #[cfg(feature = "in-process")]
 pub(crate) mod lease_events;
+#[cfg(feature = "in-process")]
+pub(crate) mod list_cell;
 pub(crate) mod pair_classes;
 #[cfg(feature = "in-process")]
 pub(crate) mod policy_engine;
@@ -52,6 +54,8 @@ pub use framework::{
     ScoreSpread, Scorer, Scratch, Shortlist, TieBand, WeightedScorer, DRAW_BOUND, DRAW_FROM,
     RANK_FROM,
 };
+#[cfg(feature = "in-process")]
+pub use list_cell::{LentList, ListCell, ModelLists};
 pub use pair_classes::PartnerClasses;
 #[cfg(feature = "in-process")]
 pub use policy_engine::overlap::{
