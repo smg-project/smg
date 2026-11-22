@@ -1,11 +1,11 @@
 //! A generation's members with their lists by pool ([`ModelPools`]): the
-//! value of a generation for a host that places a request among a part of a
-//! model's workers.
+//! value of a generation for a program that places a request among a part of
+//! a model's workers.
 //!
-//! A pool is the host's own: the part of a generation's members one of its
-//! routes places among. The host names each pool by a key ([`PoolKey`]) that
-//! states the pool's rule of membership. This module holds no pool and no
-//! rule.
+//! A pool is the program's own: the part of a generation's members one of its
+//! routes places among. The program names each pool by a key ([`PoolKey`])
+//! that states the pool's rule of membership. This module holds no pool and
+//! no rule.
 
 use std::{
     fmt,
@@ -19,11 +19,11 @@ use crate::identity::basic::Worker;
 /// A list of workers as the registry publishes one: shared, never changed.
 type Workers = Arc<[Arc<dyn Worker>]>;
 
-/// A host's name for one of its `N` pools: the pool's place among them and
-/// the one rule of its membership.
+/// A program's name for one of its `N` pools: the pool's place among them
+/// and the one rule of its membership.
 pub trait PoolKey<const N: usize>: Copy {
-    /// The pool's place among the host's pools: below `N`, and no two pools
-    /// at one place. [`ModelPools`] keeps the pool's list and its cell
+    /// The pool's place among the program's pools: below `N`, and no two
+    /// pools at one place. [`ModelPools`] keeps the pool's list and its cell
     /// there, and panics at a place of `N` or more.
     fn index(self) -> usize;
 
@@ -36,22 +36,22 @@ pub trait PoolKey<const N: usize>: Copy {
 }
 
 /// One membership generation's members, their lists by pool, and one cell
-/// beside each list for what the host keeps of that list.
+/// beside each list for what the program keeps of that list.
 ///
 /// A list is projected at its pool's first read and then shared by every
 /// reader until a membership change publishes another generation
-/// ([`Self::pool`]). A cell is the host's (`C`): the host fills it with what
-/// it derives from the pool's list, and it falls with the generation
-/// ([`Self::cell`]). A reader that needs several pools together reads each
-/// from the one value it took: two reads of the registry can straddle a
-/// membership change and pair workers that never stood together.
+/// ([`Self::pool`]). A cell is the program's (`C`): the program fills it
+/// with what it derives from the pool's list, and it falls with the
+/// generation ([`Self::cell`]). A reader that needs several pools together
+/// reads each from the one value it took: two reads of the registry can
+/// straddle a membership change and pair workers that never stood together.
 ///
 /// It is a [`Generation`] by itself and states no alignment. Bare in a
 /// registry, its members and its first lists stand on the cache line of its
-/// handles' count, which every request that takes a handle writes: that
-/// serves a host no request reads it on. A host that places requests by it
-/// keeps it as a field of a value of its own under `#[repr(align(128))]`,
-/// which puts it on cache lines apart from that count.
+/// reference count, which every request that takes a reference writes: that
+/// serves a program no request reads it on. A program that places requests
+/// by it keeps it as a field of a value of its own under
+/// `#[repr(align(128))]`, which puts it on cache lines apart from that count.
 #[derive(Debug)]
 pub struct ModelPools<K, C, const N: usize> {
     members: Workers,
@@ -85,8 +85,8 @@ impl<K: PoolKey<N>, C, const N: usize> ModelPools<K, C, N> {
         })
     }
 
-    /// The cell beside `key`'s list. It is empty until the host fills it:
-    /// nothing here reads or writes it.
+    /// The cell beside `key`'s list. It is empty until the program fills
+    /// it: nothing here reads or writes it.
     #[inline]
     pub fn cell(&self, key: K) -> &OnceLock<C> {
         &self.cells[key.index()]
@@ -130,7 +130,7 @@ mod tests {
         static ASKED: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// A host's two pools, by its workers' transport.
+    /// A program's two pools, by its workers' transport.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Wire {
         Http,
@@ -155,7 +155,7 @@ mod tests {
         }
     }
 
-    /// The host's value of a generation: what it keeps of a list is the
+    /// The program's value of a generation: what it keeps of a list is the
     /// list's length.
     type Pools = ModelPools<Wire, usize, 2>;
 
@@ -193,8 +193,8 @@ mod tests {
         assert!(Arc::ptr_eq(empty.pool(Wire::Grpc), empty.members()));
     }
 
-    /// A pool's list holds its members in the generation's order, by the
-    /// members' own handles, and is projected at the first read alone: the
+    /// A pool's list holds the generation's own worker objects, in the
+    /// generation's order, and is projected at the first read alone: the
     /// rule is asked of no worker after it.
     #[test]
     fn a_pool_is_projected_once_in_the_members_order() {
@@ -222,11 +222,11 @@ mod tests {
         );
     }
 
-    /// A cell is empty until the host fills it, and is read back as filled
-    /// beside its own pool's list. Reading a cell asks the rule of no worker
-    /// and projects no list.
+    /// A cell is empty until the program fills it, and is read back as
+    /// filled beside its own pool's list. Reading a cell asks the rule of no
+    /// worker and projects no list.
     #[test]
-    fn a_cell_is_the_hosts_to_fill_beside_its_own_list() {
+    fn a_cell_is_the_programs_to_fill_beside_its_own_list() {
         let pools = generation_of(vec![
             worker("http://a:8000", ConnectionMode::Http),
             worker("grpc://b:9000", ConnectionMode::Grpc),
@@ -246,7 +246,7 @@ mod tests {
     }
 
     /// The registry builds the value at every publish, as it builds any
-    /// host's: a membership change hands the next reader empty lists and
+    /// program's: a membership change hands the next reader empty lists and
     /// empty cells, and a reader that holds the old value keeps its list
     /// and its cell.
     #[test]
