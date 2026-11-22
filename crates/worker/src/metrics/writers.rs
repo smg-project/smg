@@ -1411,11 +1411,23 @@ impl Metrics {
     ) {
         if handles::keep_handles() {
             let recorded = handles::ENGINE_LOADS.with_borrow_mut(|kept| {
-                handles::engine_rank(kept.for_worker(worker_url), model_id, load.dp_rank)
-                    .map(|rank| {
-                        Self::set_engine_rank_gauges(rank, worker_url, model_id, role, load);
-                    })
-                    .is_some()
+                // A worker and a model seen before are found by one lookup
+                // each. `for_worker` and `engine_rank` look twice, to
+                // insert on a first sight, which still goes through them.
+                let seen = kept
+                    .current()
+                    .get_mut(worker_url)
+                    .and_then(|by_model| by_model.get_mut(model_id));
+                let rank = match seen {
+                    Some(ranks) => Some(ranks.entry(load.dp_rank).or_default()),
+                    None => {
+                        handles::engine_rank(kept.for_worker(worker_url), model_id, load.dp_rank)
+                    }
+                };
+                rank.map(|rank| {
+                    Self::set_engine_rank_gauges(rank, worker_url, model_id, role, load);
+                })
+                .is_some()
             });
             if recorded {
                 return;
