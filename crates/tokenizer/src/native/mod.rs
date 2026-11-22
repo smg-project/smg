@@ -3436,11 +3436,13 @@ impl NativeEncoder {
                 // An all-ASCII unit has a copy of the stage's loop compiled
                 // for it (see `encode_single_stage`). Any other unit goes by
                 // blocks where its pattern gives that reader. The all-ASCII
-                // unit does not: its lean scan reads long words in fewer
-                // instructions than the block pass (measured: the pass costs
-                // a sixth more on a text of 18-byte words). The cased-letter
-                // template has no lean scan: its unit goes by blocks either
-                // way, the all-ASCII one from `encode_single_stage`.
+                // unit begins on its lean scan, which reads long words in
+                // fewer instructions than the block pass (measured: the pass
+                // costs a sixth more on a text of 18-byte words), and the
+                // scan hands a unit that opens as short pieces to the block
+                // pass (`block::is_broken`). The cased-letter template has no
+                // lean scan: its unit goes by blocks either way, the
+                // all-ASCII one from `encode_single_stage`.
                 let encoded = if cache.unit_ascii {
                     self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
                 } else if let Some(blocks) = stage.pattern.by_blocks(text) {
@@ -3803,9 +3805,12 @@ impl NativeEncoder {
     ///
     /// Compiled twice. `ASCII` is the copy an all-ASCII unit takes (the
     /// flag [`Self::encode_unit`] reads once per unit): in it the template
-    /// scanner ends every run by the lean scan (`Roles::run_end_ascii`),
+    /// scanner ends its runs by the lean scan (`Roles::run_end_ascii`),
     /// which has no character beyond ASCII to care for, whatever the
-    /// input's length. It is a copy and no third loop of the one function:
+    /// input's length, until that scan hands a unit that opens as short
+    /// pieces (`block::is_broken`) to
+    /// [`Self::encode_single_stage_by_blocks`], which reads the rest. It is
+    /// a copy and no third loop of the one function:
     /// compiled in here, the lean loop moved the code of the other loops,
     /// and the byte loops and the cased scanner cost 1 to 2 % more
     /// operations per token on text the lean scan never reads (counted). A
@@ -3844,7 +3849,7 @@ impl NativeEncoder {
         // instructions for a hit of which the probe is about 50 (counted on
         // the long warm cells). The gap piece stays out of line: a scanner's
         // alternatives tile the text, so a gap is the rare case there.
-        stage.pattern.for_each_match::<ASCII, _>(
+        let stopped = stage.pattern.for_each_match::<ASCII, _>(
             text,
             words,
             #[inline(always)]
@@ -3864,6 +3869,22 @@ impl NativeEncoder {
                 cursor = end;
             },
         );
+        if stopped < text.len() {
+            // The lean scan left at a piece's end: the unit opens as short
+            // pieces of more than one kind, which the block pass reads in
+            // fewer missed branches (see `for_each_match_to_marks`).
+            if let Some(declined) = fallback {
+                return Err(declined);
+            }
+            let rest = &text[stopped..];
+            return match stage.pattern.by_blocks(rest) {
+                Some(blocks) => self
+                    .encode_single_stage_by_blocks(model, blocks, rest, words, mapped, ids, cache),
+                None => {
+                    self.encode_single_stage::<false>(model, stage, rest, words, mapped, ids, cache)
+                }
+            };
+        }
         if gaps && cursor < text.len() {
             if let Err(declined) =
                 self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)

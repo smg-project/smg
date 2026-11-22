@@ -39,6 +39,8 @@
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
+use std::cell::Cell;
+
 use super::{
     block, byte_split, cased, chain,
     scan::{Bits, Roles, WordScan},
@@ -1181,7 +1183,10 @@ impl Pattern {
     }
 
     /// Calls `f` with each match of `text`, leftmost first, each continuing
-    /// after the last (what [`Self::find_iter`] yields), the matcher
+    /// after the last (what [`Self::find_iter`] yields), up to where it
+    /// stops, and gives that place: the text's end, or with `ASCII` a
+    /// piece's end before it, where the lean scan leaves the rest to the
+    /// reader by blocks ([`Self::by_blocks`]). The matcher is
     /// dispatched once per text: a scanner runs its own loop with `f`
     /// compiled into it, where the iterator costs a call, a frame and an
     /// `Option` written to the stack per piece (measured: a tenth of the
@@ -1193,20 +1198,28 @@ impl Pattern {
     /// (`Roles::run_end_ascii`) whatever `words` says. It is a constant and
     /// no argument, so that the lean loop is compiled only into the caller's
     /// copy for such a text and the other copy keeps the loops it had.
+    #[must_use = "the lean scan may stop before the text's end"]
     #[inline(always)]
     pub(crate) fn for_each_match<const ASCII: bool, F: FnMut(usize, usize)>(
         &self,
         text: &str,
         words: bool,
         mut f: F,
-    ) {
+    ) -> usize {
         debug_assert!(
             !ASCII || text.is_ascii(),
             "the lean scan reads no byte beyond ASCII"
         );
         match &self.matcher {
             Matcher::Template(scanner) if ASCII => {
-                scanner.for_each_match::<true, true, F>(&self.classes, text, &mut f);
+                // The lean scan may leave for the block pass, and only
+                // where that pass then has a text of its bound to read.
+                let head = if scanner.blocks {
+                    block::HEAD.min(text.len().saturating_sub(block::MIN_BYTES))
+                } else {
+                    0
+                };
+                return scanner.for_each_match_to_marks(&self.classes, text, head, &mut f);
             }
             Matcher::Template(scanner) if words => {
                 scanner.for_each_match::<true, false, F>(&self.classes, text, &mut f);
@@ -1226,6 +1239,7 @@ impl Pattern {
                 }
             }
         }
+        text.len()
     }
 
     /// The reader of `text` by blocks, where [`block`]'s pass serves it: the
@@ -1932,6 +1946,19 @@ impl Scanner {
         text: &str,
         pos: usize,
     ) -> Option<usize> {
+        self.match_at_marked::<WORDS, ASCII>(classes, text, pos, |_| {})
+    }
+
+    /// [`Self::match_at`], with `mark` called with the end of a punctuation
+    /// piece: the one arm a text of words alone never takes.
+    #[inline(always)]
+    fn match_at_marked<const WORDS: bool, const ASCII: bool>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        pos: usize,
+        mark: impl FnOnce(usize),
+    ) -> Option<usize> {
         let (c, len) = self.roles.at_by::<ASCII>(text, pos)?;
         let after = pos + len;
         // 1. A clitic: the first alternative whose characters follow in order.
@@ -1994,10 +2021,11 @@ impl Scanner {
                     let end = self
                         .roles
                         .run_end_of::<ASCII>(text, after + n, Role::Punct.bit());
-                    return Some(
-                        self.roles
-                            .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit()),
-                    );
+                    let end = self
+                        .roles
+                        .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit());
+                    mark(end);
+                    return Some(end);
                 }
             }
         }
@@ -2005,10 +2033,11 @@ impl Scanner {
             let end = self
                 .roles
                 .run_end_of::<ASCII>(text, after, Role::Punct.bit());
-            return Some(
-                self.roles
-                    .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit()),
-            );
+            let end = self
+                .roles
+                .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit());
+            mark(end);
+            return Some(end);
         }
         // 5. Whitespace ending in line breaks: the greedy whitespace run
         //    gives back to the last position where a line break stands,
@@ -2088,6 +2117,53 @@ impl Scanner {
             |pos| self.match_at::<WORDS, ASCII>(classes, text, pos),
             f,
         );
+    }
+
+    /// [`Self::for_each_match`] of an all-ASCII text, by the lean scan, up
+    /// to where the scan leaves for the block pass: the end of its
+    /// [`block::MARKS`]-th punctuation piece when that stands within `head`
+    /// bytes and the text opens as short pieces (`block::is_broken`).
+    /// Gives where it stopped, a piece's end: the text's end when it read
+    /// the whole text, as it does with a `head` of 0. The count is taken in
+    /// the punctuation arm alone, so a text of words alone runs the loop it
+    /// ran: its only sample is the scan.
+    #[inline(always)]
+    fn for_each_match_to_marks<F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        head: usize,
+        f: &mut F,
+    ) -> usize {
+        let limit = Cell::new(text.len());
+        let marks = Cell::new(0u32);
+        let mut pos = 0;
+        while pos < limit.get() {
+            let end = self.match_at_marked::<true, true>(
+                classes,
+                text,
+                pos,
+                #[inline(always)]
+                |end| {
+                    marks.set(marks.get() + 1);
+                    if marks.get() == block::MARKS
+                        && end <= head
+                        && block::is_broken(text.as_bytes())
+                    {
+                        limit.set(end);
+                    }
+                },
+            );
+            match end {
+                Some(end) if end > pos => {
+                    f(pos, end);
+                    pos = end;
+                }
+                // One byte a character: the text is all ASCII.
+                _ => pos += 1,
+            }
+        }
+        pos
     }
 }
 
@@ -5498,6 +5574,24 @@ mod tests {
         );
     }
 
+    /// An all-ASCII text that opens as short pieces: the lean scan leaves it
+    /// at a piece's end, and the reader by blocks cuts the rest as the
+    /// scanner cuts it.
+    #[test]
+    fn the_lean_scan_leaves_short_pieces_to_the_block_pass() {
+        let parsed = Pattern::parse(CL100K).expect("parses");
+        let text = "let x = a[1]; // one, two\n".repeat(64);
+        let by_scanner: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+        let mut cut = Vec::new();
+        let stopped = parsed.for_each_match::<true, _>(&text, false, |s, e| cut.push((s, e)));
+        assert!(stopped < text.len(), "the lean scan left");
+        assert_eq!(cut.last().map(|&(_, end)| end), Some(stopped));
+        let rest = &text[stopped..];
+        let reader = parsed.by_blocks(rest).expect("a reader by blocks");
+        reader.for_each_match(rest, false, |s, e| cut.push((stopped + s, stopped + e)));
+        assert_eq!(cut, by_scanner);
+    }
+
     /// The block pass cuts text as the scanner cuts it piece by piece (the
     /// iterator never takes the pass), under every bound of the digit rule:
     /// text shaped like JSON, code and prose; runs of one character, some
@@ -5864,11 +5958,12 @@ mod tests {
                 );
                 for words in [false, true] {
                     let mut ours = Vec::new();
-                    parsed.for_each_match::<false, _>(&text, words, |start, end| {
+                    let stopped = parsed.for_each_match::<false, _>(&text, words, |start, end| {
                         ours.push((start, end));
                     });
                     assert_eq!(
-                        ours, expected,
+                        (&ours, stopped),
+                        (&expected, text.len()),
                         "the loop, word scans {words}; pattern {pattern:?} text {text:?}"
                     );
                 }
