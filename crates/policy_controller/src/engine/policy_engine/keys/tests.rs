@@ -367,21 +367,60 @@ fn a_request_that_lends_pins_of_record_is_decided_as_one_that_lends_none() {
     assert!(record.1.get().is_none(), "the record is not asked");
 }
 
+/// A document is handed the engine's table ahead of its engine's first
+/// decision: the table that engine was made with is let go, and a pin it
+/// held would go with it. A debug build refuses a document whose engine
+/// already holds a key.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "ahead of the hand-over of its session table")
+)]
+fn a_document_whose_engine_holds_a_key_is_not_handed_a_table() {
+    let mut document = PolicySpec::preset("manual").expect("a built-in preset");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let made = spec.engine().sessions();
+    made.dispatched(Session::from_raw(71), SessionVerdict::Pinned, WorkerId(1));
+    assert_eq!(made.len(), 1);
+    let engine = PolicyEngine::new(spec);
+    // A build with no debug check lets the key go with the table.
+    assert_eq!(engine.sessions.len(), 0);
+}
+
 /// The session table is the engine's own, one for its life: the document's
 /// engine reads and writes it through a pointer, so a pin can outlive the
 /// document it was made under. The table has the host's shards whatever
 /// the document rules, where a document with no sessions rule makes itself
-/// a table of one shard, and it takes the document's two times.
+/// a table of one shard, and it takes the document's two times. The third
+/// document's rule states an idle time of its own: the stock rule's four
+/// hours are the absence time a new table has, and would hide a time that
+/// was never handed.
 #[test]
 fn the_session_table_is_the_engines_own_under_every_document() {
-    for (name, ruled) in [("manual", true), ("random", false)] {
-        let mut document = PolicySpec::preset(name).expect("a built-in preset");
-        document.generation = 1;
-        let alone = AppliedSpec::validate(&document).expect("the document validates");
+    for (name, ruled, idle_s) in [
+        ("manual", true, None),
+        ("random", false, None),
+        ("manual", true, Some(600)),
+    ] {
+        let document = || {
+            let mut document = PolicySpec::preset(name).expect("a built-in preset");
+            document.generation = 1;
+            if let Some(idle_s) = idle_s {
+                let rule = document.bindings[0].sessions.as_mut();
+                rule.expect("the stock rule").ttl_s = idle_s;
+            }
+            AppliedSpec::validate(&document).expect("the document validates")
+        };
+        let alone = document();
         let made = alone.engine().sessions();
         assert_eq!(made.shards() == 1, !ruled, "{name}");
         assert_eq!(made.sweep_micros() != 0, ruled, "{name}");
-        let engine = preset(name);
+        if let Some(idle_s) = idle_s {
+            let stated = u64::from(idle_s) * 1_000_000;
+            assert_eq!(made.absence_micros(), stated, "the rule's own idle time");
+        }
+        let engine = PolicyEngine::new(document());
         let own = &*engine.sessions;
         assert!(
             std::ptr::eq(engine.spec().engine().sessions(), own),

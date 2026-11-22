@@ -329,7 +329,9 @@ pub struct SessionTable {
     /// The sweep interval: the shortest among the rules of the document in
     /// force, so no rule's interval defers another rule's expiry; `0`
     /// never sweeps (no rule has had a TTL). A word a document re-sets
-    /// ([`Self::set_times`]), read by the sweep alone.
+    /// ([`Self::set_times`]), read by the sweep, and by an engine that
+    /// hands its document's times to the table a host keeps
+    /// (`Engine::share_sessions`).
     sweep_micros: AtomicU64,
     /// The workers that left membership while their pins stand
     /// ([`Self::left`]), each with the decision clock at which it is
@@ -413,8 +415,25 @@ impl SessionTable {
     /// longer one. A document with no interval (`0`: none of its rules
     /// has a TTL) leaves the interval that stands: the keys the document
     /// before wrote still leave at a pass.
+    ///
+    /// The times are written under the list's lock, as a leave's own store
+    /// is: a sweep in flight writes its two instants under it too, and one
+    /// that began under the interval before leaves the pass due
+    /// ([`Self::sweep`]).
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn set_times(&self, sweep_micros: u64, absence_micros: u64) {
+        let absent = self.absent.lock();
+        self.set_times_under(&absent, sweep_micros, absence_micros);
+    }
+
+    /// [`Self::set_times`], under the list's lock its caller holds.
+    #[cfg(any(test, feature = "in-process"))]
+    fn set_times_under(
+        &self,
+        _absent: &parking_lot::MutexGuard<'_, Vec<(WorkerId, u64)>>,
+        sweep_micros: u64,
+        absence_micros: u64,
+    ) {
         self.absence_micros.store(absence_micros, Ordering::Relaxed);
         if sweep_micros == 0 {
             return;
@@ -820,10 +839,11 @@ impl SessionTable {
     #[cold]
     #[inline(never)]
     fn sweep(&self, due: u64, now_micros: u64) {
+        let interval = self.sweep_micros();
         let pass = self.next_pass_micros.load(Ordering::Relaxed);
         let idle = now_micros >= pass;
         let next_pass = if idle {
-            now_micros.saturating_add(self.sweep_micros())
+            now_micros.saturating_add(interval)
         } else {
             pass
         };
@@ -841,7 +861,15 @@ impl SessionTable {
         }
         let mut ended: Vec<WorkerId> = Vec::new();
         let mut absent = self.absent.lock();
-        let mut next = next_pass;
+        // A document that set another interval while this sweep ran made a
+        // pass due at once, under this lock ([`Self::set_times`]): its two
+        // zeros stand over the instants this sweep counted by the interval
+        // before.
+        let reset = self.sweep_micros() != interval;
+        if reset {
+            self.next_pass_micros.store(0, Ordering::Relaxed);
+        }
+        let mut next = if reset { 0 } else { next_pass };
         absent.retain_mut(|(worker, ends)| {
             if *ends == 0 {
                 *ends = now_micros.saturating_add(self.absence_micros()).max(1);
@@ -1035,7 +1063,8 @@ mod tests {
             table.lookup(mixed(key), at, &RULE);
             table.dispatched(mixed(key), SessionVerdict::Pinned, WorkerId(key));
         };
-        // No rule of the first document has a TTL: nothing ever sweeps.
+        // A table made with no interval runs no pass: a key past its own
+        // rule's end stays until a lookup of it.
         let table = SessionTable::new(0).with_shards(8);
         pin(&table, 1, 0);
         table.sweep_due(5_000);
@@ -1044,6 +1073,7 @@ mod tests {
         // the pass that is due now.
         table.set_times(RULE.sweep_micros, 7_000);
         assert_eq!((table.sweep_micros(), table.absence_micros()), (100, 7_000));
+        assert_eq!(table.len(), 1, "the new times keep the keys");
         table.sweep_due(5_000);
         assert_eq!(table.len(), 0, "the first pass under the new interval");
         // A key of that document, then a document with no interval: the
@@ -1051,6 +1081,7 @@ mod tests {
         pin(&table, 2, 5_000);
         table.set_times(0, 9_000);
         assert_eq!((table.sweep_micros(), table.absence_micros()), (100, 9_000));
+        assert_eq!(table.len(), 1, "the new times keep the keys");
         table.sweep_due(6_200);
         assert_eq!(table.len(), 0, "a pass under the interval that stood");
 
@@ -1061,8 +1092,55 @@ mod tests {
         table.sweep_due(2_000);
         assert_eq!(table.len(), 1, "the long interval's pass is not due");
         table.set_times(RULE.sweep_micros, 7_000);
+        assert_eq!(table.len(), 1, "the new times keep the keys");
         table.sweep_due(2_000);
         assert_eq!(table.len(), 0, "the shorter interval's pass is due at once");
+    }
+
+    /// A document sets a shorter interval while a sweep is in flight. The
+    /// sweep claimed its turn and counted its next pass by the interval
+    /// before, and waits for the list's lock. The new times are written
+    /// under that lock, and the sweep then leaves the pass due at once: its
+    /// two instants do not stand over the document's.
+    ///
+    /// The sweep stores its pass ahead of the lock, so that store lands
+    /// ahead of the document's zero or behind it. A thread held at the lock
+    /// gives the first order alone, so the second form writes the sweep's
+    /// pass behind the zero by hand, under the lock.
+    #[test]
+    fn a_sweep_in_flight_leaves_the_pass_a_new_interval_made_due() {
+        for behind in [false, true] {
+            let table = std::sync::Arc::new(SessionTable::new(1_000_000).with_shards(8));
+            table.sweep_due(10);
+            table.lookup(mixed(4), 20, &RULE);
+            let absent = table.absent.lock();
+            let sweeper = {
+                let table = std::sync::Arc::clone(&table);
+                std::thread::spawn(move || table.sweep_due(1_000_020))
+            };
+            // The sweep claimed its turn: the next one stands at its next
+            // pass.
+            while table.next_sweep_micros.load(Ordering::Relaxed) != 2_000_020 {
+                std::thread::yield_now();
+            }
+            table.set_times_under(&absent, RULE.sweep_micros, 7_000);
+            if behind {
+                table.next_pass_micros.store(2_000_020, Ordering::Relaxed);
+            }
+            drop(absent);
+            sweeper.join().expect("the sweep ends");
+            let due = |word: &AtomicU64| word.load(Ordering::Relaxed);
+            assert_eq!(
+                (due(&table.next_sweep_micros), due(&table.next_pass_micros)),
+                (0, 0),
+                "behind: {behind}: the pass the new interval made due stands"
+            );
+            // That pass runs at the next call, and counts by the new
+            // interval.
+            table.lookup(mixed(5), 1_000_030, &RULE);
+            table.sweep_due(1_000_040);
+            assert_eq!(due(&table.next_pass_micros), 1_000_140, "behind: {behind}");
+        }
     }
 
     /// A host reads a key's pins with the instant its rule forgets it, and
