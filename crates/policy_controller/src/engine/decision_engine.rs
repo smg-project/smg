@@ -261,7 +261,7 @@ impl Decided {
 /// word on a lease ([`Lifecycle::hears`](crate::stages::Lifecycle::hears)).
 ///
 /// The worker is the one at `place` of the list its host handed
-/// ([`WorkerLists::Single`]): the picker's turn landed on it and read it
+/// (`WorkerLists::Single`): the picker's turn landed on it and read it
 /// eligible at this call. No request was made for the pick, no lease is
 /// issued, no id is taken and nothing is dated. The host sends to the
 /// worker and owes the engine no word of the request.
@@ -321,7 +321,7 @@ pub trait DecisionEngine {
     /// whether the request the maker made stated the later decode
     /// ([`Constraints::decode_later`](super::view::Constraints::decode_later)).
     /// A place answers only a maker that hands a single list
-    /// ([`RequestMaker::workers`]) and says its request plain
+    /// (`RequestMaker::workers`) and says its request plain
     /// ([`RequestMaker::plain`]).
     ///
     /// # Errors
