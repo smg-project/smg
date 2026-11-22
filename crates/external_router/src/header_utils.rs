@@ -135,8 +135,14 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 /// client's to read, and the gateway's own answers carry no `server` header.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
+    // A message with both fields is framed by its transfer coding: the length
+    // it also carries is removed before the message goes on (RFC 9112, 6.3).
+    let chunked = reqwest_headers.contains_key(http::header::TRANSFER_ENCODING);
 
     for (name, value) in reqwest_headers {
+        if chunked && name == http::header::CONTENT_LENGTH {
+            continue;
+        }
         // Use case-insensitive checks to avoid string allocation.
         if should_forward_header_no_alloc(name.as_str()) {
             // One pair per value: a header the upstream sent more than once
@@ -519,6 +525,21 @@ mod tests {
         assert_eq!(values(&forwarded, "set-cookie"), ["a=1", "b=2"]);
         assert_eq!(values(&forwarded, "vary"), ["accept", "origin"]);
         assert_eq!(values(&forwarded, "content-type"), ["application/json"]);
+    }
+
+    /// An upstream answer that carries both framing fields is framed by its
+    /// transfer coding: the length it also carries does not cross the relay.
+    #[test]
+    fn preserve_response_headers_drops_the_length_of_a_chunked_answer() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        upstream.insert("content-length", HeaderValue::from_static("5"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let forwarded = preserve_response_headers(&upstream);
+
+        assert!(!forwarded.contains_key("content-length"));
+        assert_eq!(forwarded.get("content-type").unwrap(), "application/json");
     }
 
     #[test]
