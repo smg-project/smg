@@ -184,10 +184,10 @@ pub(crate) struct ModelLabels {
 #[derive(Debug)]
 #[repr(align(128))]
 pub struct ModelWorkerSnapshot {
-    /// The members, their routing pools ([`Self::pool`]) and, beside each
-    /// pool, the cell for what the policy engine keeps of it
-    /// ([`Self::pool_members_cell`]): a box of its own, on cache lines of its
-    /// own, so a snapshot no engine picks over holds the empty cells alone.
+    /// The members, their routing pools ([`Self::pool`]) and a cell beside
+    /// each pool ([`Self::pool_members_cell`]) for what the policy engine
+    /// keeps of it. The engine's value is boxed, on cache lines of its own:
+    /// a snapshot no engine picks over holds the empty cells alone.
     pools: ModelPools<RoutingPool, Box<PoolMembers>, { RoutingPool::COUNT }>,
     /// The compatible prefill/decode pairs per wire and pairing mode, built
     /// once from the pools above (see [`PdPairIndex`]).
