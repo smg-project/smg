@@ -449,6 +449,8 @@ impl Checked {
                 stalled: view.stalled,
                 held: view.held,
                 pins: view.pins,
+                // No frame holds a request to places.
+                places: None,
             },
         );
         request.named = name(&request, &cx);
