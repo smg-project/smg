@@ -290,18 +290,9 @@ impl PoolMembers {
     /// first request: a gateway's list is one model's. Another model's
     /// request is answered by the document at its call.
     fn alone(&self, spec: &AppliedSpec, model: &str) -> Option<AloneProfile> {
-        let find = || {
-            let engine = spec.engine();
-            let Place::Alone(profile) = engine.place_for(model, Phase::Single) else {
-                return None;
-            };
-            // A sessions rule pins a keyed request ahead of the profile.
-            let ruled = engine.binding(model, Phase::Single)?.sessions.is_some();
-            // A shadow profile runs with a whole decision, over its
-            // records: one test under a document that names none.
-            let any_shadow = engine.seat_flags() & SHADOWS != 0;
-            let has_shadow = any_shadow && engine.shadow_for(model, Phase::Single).is_some();
-            (!ruled && !has_shadow).then_some(profile)
+        let find = || match spec.engine().place_for(model, Phase::Single) {
+            Place::Alone(profile) => Some(profile),
+            _ => None,
         };
         let (named, alone) = self.alone.get_or_init(|| (model.into(), find()));
         if **named == *model {
@@ -516,7 +507,7 @@ impl PolicyEngine {
     /// for, `model` at `phase` ([`Engine::place_for`]). The first binding that
     /// matches names the place's profile. The answer is that profile where
     /// one pick of its picker is its whole decision ([`Place::Alone`]),
-    /// the stage of it that asks more where it is not
+    /// what asks more where it is not, a stage, a sessions rule or a shadow
     /// ([`Place::NotAlone`]), [`Place::Unbound`] where no binding names
     /// the model for the phase, and [`Place::NoSide`] where the binding
     /// that names it plans no request of the phase. A policy that serves
@@ -532,8 +523,8 @@ impl PolicyEngine {
         self.spec.engine().place_for(model, phase)
     }
 
-    /// The first place a binding of the document names whose profile the
-    /// engine does not decide by one pick ([`Engine::not_alone`]). `None`
+    /// The first place a binding of the document names that the engine
+    /// does not decide by one pick ([`Engine::not_alone`]). `None`
     /// where it decides every place of the document so. A gateway that
     /// starts under a document its operator supplied refuses the start by
     /// what this names: nothing else would decide that place.
@@ -1243,7 +1234,11 @@ mod tests {
             "bucket",
         ] {
             let engine = preset(name);
-            let Place::NotAlone { profile, stage } = engine.place_for(MODEL, Phase::Single) else {
+            let Place::NotAlone {
+                profile,
+                in_the_way: stage,
+            } = engine.place_for(MODEL, Phase::Single)
+            else {
                 panic!("{name} is picked alone");
             };
             assert_eq!(profile, name);
@@ -1253,13 +1248,13 @@ mod tests {
             preset("random").place_for(MODEL, Phase::Single),
             Place::NotAlone {
                 profile: "random",
-                stage: InTheWay::Picker("random"),
+                in_the_way: InTheWay::Picker("random"),
             }
         );
         assert!(matches!(
             preset("least_load").place_for(MODEL, Phase::Single),
             Place::NotAlone {
-                stage: InTheWay::Scorer(_),
+                in_the_way: InTheWay::Scorer(_),
                 ..
             }
         ));
@@ -1302,7 +1297,11 @@ mod tests {
                 } else {
                     let stage = InTheWay::Filter(filter);
                     let profile = "round_robin";
-                    assert_eq!(place, Place::NotAlone { profile, stage }, "{phase:?}");
+                    let named = Place::NotAlone {
+                        profile,
+                        in_the_way: stage,
+                    };
+                    assert_eq!(place, named, "{phase:?}");
                 }
             }
         }
@@ -1371,7 +1370,10 @@ mod tests {
             let profile = "round_robin";
             assert_eq!(
                 engine_of(&document).place_for(MODEL, Phase::Single),
-                Place::NotAlone { profile, stage }
+                Place::NotAlone {
+                    profile,
+                    in_the_way: stage
+                }
             );
         }
     }

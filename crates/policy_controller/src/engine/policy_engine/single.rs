@@ -973,7 +973,9 @@ pub(crate) mod tests {
     /// lists of one model and one size so turn a rotation each: asked in
     /// turn, a request with no routing key and a new session at each, they
     /// take each list's workers one after the other. And over one list a
-    /// pick alone and a new session's whole decision share one rotation.
+    /// pick alone and a new session's whole decision share one rotation:
+    /// the pick is asked for a model the same profile is bound for with no
+    /// rule, since a place under a rule is not one pick's.
     /// The gateway's classic policy keeps its rotation by the list it is
     /// handed whole (`model_gateway/src/policies/round_robin.rs:95-99`,
     /// `:151`).
@@ -984,13 +986,16 @@ pub(crate) mod tests {
         document.view.headers.clone_from(&manual.view.headers);
         let mut rule = manual.bindings[0].sessions.clone().expect("its rule");
         rule.assignment = Assignment::Delegate;
-        document.bindings[0].sessions = Some(rule);
+        let mut unruled = document.bindings[0].clone();
+        unruled.matcher.model = "unruled-*".to_owned();
+        document.bindings.insert(0, unruled);
+        document.bindings[1].sessions = Some(rule);
         let keys: Vec<String> = (0..24).map(|key| format!("key-{key}")).collect();
         let mut keys = keys.iter();
         for workers in [DRAW_FROM, 64] {
             let spec = AppliedSpec::validate(&document).expect("the document validates");
             let engine = PolicyEngine::new(spec);
-            let Place::Alone(profile) = engine.place_for(MODEL, Phase::Single) else {
+            let Place::Alone(profile) = engine.place_for("unruled-1", Phase::Single) else {
                 panic!("one pick of round robin decides the place");
             };
             let (one, other) = (pool(workers), pool(workers));
@@ -1242,6 +1247,55 @@ pub(crate) mod tests {
         });
         assert!(moved, "a forgotten worker holds no prompt");
         assert_eq!(engine.affinity().left_out(), 0);
+    }
+
+    /// Round robin under a sessions rule sends a key back to the worker its
+    /// first request was dispatched to. Every request of the binding takes
+    /// the whole decision, where the rule is read ahead of the profile: one
+    /// pick alone would turn the rotation past the pin.
+    #[test]
+    fn a_pinned_key_under_round_robin_goes_back_to_its_worker() {
+        let engine = {
+            let mut document = PolicySpec::preset("round_robin").expect("a built-in preset");
+            let manual = PolicySpec::preset("manual").expect("a built-in preset");
+            document.view.headers.clone_from(&manual.view.headers);
+            let rule = manual.bindings[0].sessions.clone();
+            document.bindings[0].sessions = Some(rule.expect("its rule"));
+            PolicyEngine::new(AppliedSpec::validate(&document).expect("the document validates"))
+        };
+        let list = pool(4);
+        let members = engine.pool_members(&list);
+        // One request under the key, sent to its first target and served
+        // there: the place it went to, and whether the engine made it.
+        let sent = || {
+            let mut asked = request();
+            asked.facts.session_key = Identity::plain("key-a");
+            let asks = Asks::of(asked, Some(&members));
+            let now = Instant::now();
+            let mut guard = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now)
+                .expect("a decision");
+            let target = guard.take(0).expect("the first target");
+            guard.dispatched(now);
+            guard.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: target.id,
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    duration_micros: 0,
+                },
+                now,
+            );
+            (target.position, asks.made.get() > 0)
+        };
+        let (pin, made) = sent();
+        assert!(made, "the key's first request takes the whole decision");
+        for turn in 0..6 {
+            assert_eq!(sent(), (pin, true), "turn {turn}");
+        }
     }
 
     /// The default policy under a sessions rule. A key's first request is
