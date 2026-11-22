@@ -4875,8 +4875,8 @@ impl Engine {
     }
 
     /// [`Self::pair_binding`] as the engine holds it: the binding beside
-    /// its word for a pool a soft veto empties, which both sides of its
-    /// pairs are put to the all-vetoed rule by.
+    /// its word for a pool a soft veto empties, which a pair's decode side
+    /// is put to the all-vetoed rule by. Its prefill side is put to none.
     fn pair_entry(&self, model: &str) -> Option<&Entry> {
         self.entry(model, Phase::Prefill)
             .filter(|entry| matches!(entry.binding.plan, Plan::PdPair | Plan::Epd { .. }))
@@ -6462,7 +6462,8 @@ impl Engine {
     /// The decode side is put to its binding's all-vetoed rule for the
     /// overload veto, as the pool of a single request is ([`Self::decide`]).
     /// Where no decode is open and some are over their thresholds alone, the
-    /// rule says once which decodes it keeps. A prefill is chosen for them
+    /// rule lifts that veto once for the pool, and every decode the hard
+    /// filters then keep opens its prefills. A prefill is chosen among them
     /// by its own profile, its partners go to the one of them that holds the
     /// fewest requests, and the pair's trace says the lifted veto
     /// ([`LiftedVeto::Overload`]). Under a binding that sheds, such a pool is
@@ -6565,8 +6566,10 @@ impl Engine {
             .table
             .partnered(open, &mut scratch.classes, &mut scratch.marks);
         // No prefill class has an open decode. The decode pool is put to
-        // the binding's all-vetoed rule once: where the overload veto alone
-        // left it nobody, the decodes the rule keeps are the open ones. The
+        // the binding's all-vetoed rule once. Where the overload veto alone
+        // left it nobody, every decode the hard filters keep with that veto
+        // lifted opens its prefills. A soft filter of that pass hides no
+        // class: a room narrows a prefill's partners, not the prefills. The
         // decode run of the chosen prefill then meets its partners emptied
         // the same way, and the rule picks among them. Decodes the rule
         // keeps past a doubt open no prefill: that pool stays refused.
@@ -6576,10 +6579,25 @@ impl Engine {
             let emptied = filter(decode_profile, &decode_facts, decode_cx, buf, whole);
             let lifted = !buf.kept.is_empty() && buf.lifted == LiftedVeto::Overload;
             if emptied.is_some() && lifted {
-                let steered = buf.kept.iter().map(|&row| decodes[row as usize].pair_class);
-                pools
-                    .table
-                    .partnered(steered, &mut scratch.classes, &mut scratch.marks);
+                // The facts and the constraints of the rule's own pass
+                // ([`vetoed::emptied`]).
+                let all = RequestFacts {
+                    tried: &[],
+                    ..decode_facts
+                };
+                let pass = Constraints {
+                    overload_lifted: true,
+                    ..*decode_cx
+                };
+                let hard = || decode_profile.filters.iter().filter(|f| !f.soft());
+                let kept = decodes
+                    .iter()
+                    .filter(|d| hard().all(|f| f.keep(&all, d, &pass)));
+                pools.table.partnered(
+                    kept.map(|d| d.pair_class),
+                    &mut scratch.classes,
+                    &mut scratch.marks,
+                );
             }
         }
         let prefill = run_profile(
