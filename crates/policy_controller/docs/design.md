@@ -1067,7 +1067,8 @@ impl Placement<'_> {
     pub fn decode_id(&self) -> Option<WorkerId>; // a pair's decode worker's id
     pub fn owes_events(&self) -> bool;           // a side under a lease has not ended
     pub fn kept(self) -> Placement<'static>;     // without the borrowed key, to keep to the end
-    // planned: one more call for a pair whose decode is chosen after its prefill has run
+    // a pair's decode decided again behind its prefill's answer, the request stated again
+    pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<(), Unplaced>;
     // dropped with a side not ended: the engine hears a release before the side went out,
     // and an end of class cancelled after it
 }
@@ -1076,6 +1077,23 @@ impl Placement<'_> {
 Where the document's stages want no events, a single request's placement holds nothing and
 these calls do nothing. A pair's placement always holds a lease (section 6). `place` answers
 a single request and a pair with a placement, and no host makes one itself.
+
+A pair's decode can be decided again on its placement. Under a document that picks the decode
+after the prefill, a caller that states `decode_again` is placed with its prefill booked alone,
+and the decode the first decision named stands chosen. When the prefill has answered, the caller
+asks `decode_again` with the request stated again, as its first call stated it. The engine makes
+the request of it anew, as it makes a first call's, and decides under the binding of the model it
+states. Every fact of the decode's decision is that request's: the pair's two lists as they stand
+then, the request's size, its routing value and the workers it tried among them. It decides the
+decode on the records of that instant, behind the prefill that was sent, and the placement takes
+the first decode it names that can be sent to. The placement's routing key and its two profile
+labels stay as the first call wrote them. The order is part of the contract: the caller asks, or
+says the send of the first decision's decode, before it says the prefill's end, and a decode
+still chosen at that end leaves with it. Behind a decode the call took, the prefill's end is said
+when the prefill answers, and the decode's send at its own later instant. Where the call takes no
+decode the placement stands as it stood. A shed is answered by its name. A decision none of
+whose decodes can be sent to answers `NoWorkers` and gives up the side it issued; the caller may
+then ask again, send the first decision's decode, or answer its client.
 
 A host that keeps a value with each send, as a gateway keeps a worker's load guard, takes a
 kept placement apart into its sides. A side says its dispatch by one call and its end at its
@@ -1541,7 +1559,7 @@ bursts. It is bounded by the tree's size bound and the time between two eviction
 | Prefill-decode pairs on that engine | **[partly]** | the sheet of classic's pair choice (`pair_select`) is replayed by nothing |
 | Encode-prefill-decode on that engine | **[partly]** | `PolicyEngine::decide_encode_at` decides it over a host's three lists and issues the pair's lease; it declines a request held to a wire that one worker of the three lists is not dialed on, and one that asks images of its decode and states the later decode; `place` does not take it |
 | The lease and its events; the guard | **[built]** | |
-| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, and `place` for a single request and for a pair with one decision; `place` for an encode request, the decision made again and the start call are not |
+| The host contract of section 8.2 (`place`, `Placement`) | **[partly]** | `Placement` is built, with its call for a pair's decode decided again, and `place` for a single request and for a pair with one decision; `place` for an encode request, the decision made again over what is left and the start call are not |
 | The crate's bench of the kept engine | **[planned]** | |
 | The gateway as a host | **[planned]** | section 9; the earlier integration, still on main, is taken out first (stage 0) |
 | The controller: service, election, replication, document apply and roll back | **[partly]** | a session never pushes the document and refuses a gateway's replay; a standby serves neither the worker list nor the snapshot (section 10.1) |

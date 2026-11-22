@@ -27,7 +27,11 @@
 //! **The words.** A side is told its issue once: with the prefill's
 //! ([`issue`]), or, where the request sends its decode later, at the decode
 //! call ([`issue_decode`]) or at the dispatch that sends the decode with no
-//! call ([`lease_events::pair`]). A side's dispatch and its end are told under that
+//! call ([`lease_events::pair`]). A decode call whose placement can send to
+//! none of its decodes gives the side up by name, and the next call, or the
+//! dispatch of the first decode, issues it again
+//! ([`Placement::decode_again`](crate::tracking::Placement::decode_again)).
+//! A side's dispatch and its end are told under that
 //! side's lease. It names the worker the side booked at its issue until
 //! the side's dispatch, and the worker it went to from there.
 //!
@@ -2726,7 +2730,8 @@ mod tests {
     /// own task keeps at hand, as a single request does. At its first
     /// decision and at its decode decided again, the worker whose queue is
     /// empty in the reports the load monitor published last is picked at
-    /// every seed. Until the task has read the channel the engine holds no
+    /// every seed, by the entries that issue a lease and by those that
+    /// issue none. Until the task has read the channel the engine holds no
     /// snapshot, and the picks spread. A snapshot the request gives is read
     /// in place of the engine's.
     #[tokio::test(start_paused = true)]
@@ -2769,11 +2774,21 @@ mod tests {
                 .expect("a decision");
             assert_eq!(host.picked(guard.decision()), (2, 1), "seed {seed}");
             guard.dispatched(now);
+            let unleased = host.engine.decide_without_lease(&sent, now);
+            let (unleased, _) = unleased.expect("a decision");
+            assert_eq!(host.picked(&unleased), (2, 1), "seed {seed}");
             publish(0, 3);
             turned(&host.engine).await;
             let call = bare(seed, true);
             let again = *guard.decide_decode_under(&call, now).expect("a decision");
             assert_eq!(host.picked(&again), (2, 3), "seed {seed}");
+            let held = target_at(&unleased, 0);
+            let again = host.engine.decide_decode_without_lease(&call, &held, now);
+            assert_eq!(
+                host.picked(&again.expect("a decision")),
+                (2, 3),
+                "seed {seed}"
+            );
         }
     }
 

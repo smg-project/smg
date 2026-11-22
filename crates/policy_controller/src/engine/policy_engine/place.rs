@@ -24,7 +24,14 @@
 //!
 //! A request with a pair's two lists is placed the same way, a target at a
 //! time over both its workers ([`pair`]).
+//!
+//! A pair's decode decided again behind its prefill is placed by the same
+//! read of a worker, over the decodes that decision names
+//! ([`decode_again`]). Its caller states the request again, and the
+//! request is made of that anew: its routing value derived and its prompt's
+//! blocks hashed a second time.
 
+mod decode_again;
 mod pair;
 
 use std::{
@@ -506,7 +513,8 @@ const fn declined(stated: &'static str) -> Unplaced {
 
 /// The engine's one decision for `made` ([`PolicyEngine::decide_at`]), and
 /// the instant it was dated at. A place dates nothing: no clock is read
-/// for it. Every walk of this module decides here, and nowhere else.
+/// for it. Every walk of a first placement decides here, and nowhere else:
+/// a decode decided again is asked through its guard ([`decode_again`]).
 #[inline]
 pub(super) fn decide(
     engine: &PolicyEngine,

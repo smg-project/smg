@@ -17,6 +17,13 @@
 //! No host makes one itself. The call places a single request and a pair
 //! over its two lists today.
 //!
+//! **A decode decided again.** A pair whose first decision booked its
+//! prefill alone names a decode that stands chosen
+//! ([`PlaceRequest::decode_again`]). When the prefill has answered, its host
+//! asks the decode again on the same placement
+//! ([`Placement::decode_again`]), and the decode the request goes to is the
+//! one that call takes.
+//!
 //! **The instants.** A host reads no clock for the engine: the call that
 //! says a word reads it.
 //!
@@ -44,8 +51,11 @@ use super::{
 };
 use crate::{
     engine::{
-        decision_engine::DecideOutcome, policy_engine::PolicyEngine, records::worker_id,
+        decision_engine::{DecideOutcome, DecisionRefused, DecodeRefused},
+        policy_engine::PolicyEngine,
+        records::worker_id,
         view::WorkerId,
+        PlaceRequest, Unplaced,
     },
     store::GatewayId,
 };
@@ -206,12 +216,86 @@ impl Placement<'_> {
         self.held.as_ref().is_some_and(DecisionGuard::owes)
     }
 
+    /// Decides a pair's decode again, behind its prefill's answer, for a
+    /// pair whose first decision booked the prefill alone
+    /// ([`PlaceRequest::decode_again`] under a document that picks the
+    /// decode after the prefill). The engine decides the decode on the
+    /// records of this instant, behind the prefill that was sent, and the
+    /// first of the decodes it names that can be sent to is taken: ready,
+    /// and let through by its circuit breaker. [`Placement::decode`] is
+    /// then that worker, and [`Placement::decode_id`] follows. The prefill
+    /// never moves.
+    ///
+    /// `request` states the request again, as its first call stated it: the
+    /// same model, and [`PlaceRequest::decode_again`]. The engine makes the
+    /// request of it anew, as it makes a first call's, and decides under
+    /// the binding of the model it states. Every fact of the decode's
+    /// decision is this request's: the pair's two lists as their caller
+    /// holds them now, with their pair classes, the request's size, its
+    /// routing value and the workers it tried among them. The prefill is
+    /// found again in its list by its id. [`Placement::routing_key`],
+    /// [`Placement::profile`] and [`Placement::decode_profile`] stay as
+    /// the first call wrote them.
+    ///
+    /// **The order.** The call is made once the prefill's send was said
+    /// ([`Placement::sent`]) and before the prefill's end is said
+    /// ([`Placement::ended`]). A caller asks it, or says the send of the
+    /// first decision's decode, before it says the prefill's end: a decode
+    /// that still stands chosen at that end leaves with it. Behind a
+    /// decode this call took, the prefill's end is said when the prefill
+    /// answers and the decode's send at its own later instant.
+    ///
+    /// # Errors
+    ///
+    /// Why no decode was taken. The placement stands as it stood before
+    /// the call.
+    ///
+    /// - [`Unplaced::Shed`]: the decode's own decision placed nobody, under
+    ///   the reason and the stage it names. [`Unplaced::Queued`]: it queued
+    ///   the request. The first decision's decode still stands chosen and
+    ///   is booked nowhere: the caller may send it, or answer its client.
+    /// - [`Unplaced::NoWorkers`]: the decision named decodes and none can
+    ///   be sent to now. The decode side the call issued is given up at
+    ///   once, and the stages that take a release hear it. The first
+    ///   decision's decode stands chosen as before the call, and the
+    ///   caller may also ask again, stating what it tried.
+    /// - [`Unplaced::Refused`] with [`DecisionRefused::Decode`]: the call
+    ///   came out of turn, and no decision was made. The guard refuses by
+    ///   name, in this order ([`DecisionGuard::decide_decode`]). A single
+    ///   request has no decode side ([`DecodeRefused::NotChosen`]). A pair
+    ///   neither of whose sides is owed anything is gone: both ended, or
+    ///   the prefill's end was said with the decode still chosen
+    ///   ([`DecodeRefused::NoLease`]). A decode side that ended beside a
+    ///   prefill still owed, that a call took, or whose first decode's
+    ///   send was said, stands ([`DecodeRefused::DecodeStands`]). A decode
+    ///   booked with its prefill never stood chosen
+    ///   ([`DecodeRefused::NotChosen`]). A decode that stands chosen is
+    ///   asked once its prefill's send was said
+    ///   ([`DecodeRefused::PrefillNotHeld`]).
+    /// - [`Unplaced::Refused`] with any other reason: the engine made no
+    ///   decision, as at a first call.
+    pub fn decode_again(&mut self, request: &PlaceRequest<'_>) -> Result<(), Unplaced> {
+        // An answer of which nothing is owed is a single request's.
+        let Some(held) = &mut self.held else {
+            let refused = DecisionRefused::Decode(DecodeRefused::NotChosen);
+            return Err(Unplaced::Refused(refused));
+        };
+        self.decode = Some(PolicyEngine::decode_placed(held, request)?);
+        Ok(())
+    }
+
     /// One side of the request went out: its dispatch, said once
     /// ([`DecisionGuard::dispatched`], and
     /// [`DecisionGuard::dispatched_decode`] for a pair's decode). No lease
     /// stands for an encode side, so its word says nothing. A single
     /// request's lease goes out under any other side its host names, as
     /// [`Self::ended`] ends it under any.
+    ///
+    /// A pair's decode that stood chosen when its prefill's end was said
+    /// left with that end ([`Placement::decode_again`], the order): its
+    /// send then says nothing and the decode runs unbooked. A debug build
+    /// stops on a decode's send said behind the end of both sides of a
+    /// pair that asked its decode later.
     pub fn sent(&mut self, side: Side) {
         let Some(held) = &mut self.held else {
             return;
@@ -219,7 +303,14 @@ impl Placement<'_> {
         let pair = held.target().pair.is_some();
         match side {
             Side::Encode => {}
-            Side::Decode if pair => held.dispatched_decode(Instant::now()),
+            Side::Decode if pair => {
+                debug_assert!(
+                    !held.later_ended(),
+                    "a pair's decode is sent behind the end of both its sides: where it stood \
+                     chosen, its send or its second ask is said before the prefill's end"
+                );
+                held.dispatched_decode(Instant::now());
+            }
             Side::Single | Side::Prefill | Side::Decode => held.dispatched(Instant::now()),
         }
     }
