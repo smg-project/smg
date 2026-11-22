@@ -892,7 +892,10 @@ pub(super) fn auto_tag(
 /// take it as its wire pair ([`Self::to_tuple`]).
 #[derive(Debug, Clone)]
 pub(crate) enum ToolConstraint {
+    /// A JSON schema: the answer is pure JSON from the first token, read by the generic JSON
+    /// parser rather than the model's own.
     JsonSchema(String),
+    /// A structural tag: the answer carries the model's own framing, read by the model's parser.
     StructuralTag(String),
 }
 
