@@ -957,17 +957,20 @@ pub fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, n
 /// the worker has shown no rate and a token-batch wire only once it has.
 /// A standing veto is judged at the threshold on either wire, whatever
 /// the servicer reports pending: the allowance lifts no veto, as the
-/// cold-shape grace lifts none.
+/// cold-shape grace lifts none. `state` is the worker's runtime state as
+/// the caller loaded it: the apply of a pushed record holds it already.
 pub(crate) fn on_load_report(
     worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
     waiting: i64,
     engine_silence: Option<Duration>,
     engine_reports_steps: bool,
     engine_prefill_pending: Option<u64>,
 ) {
     let (_, wedge, _) = thresholds();
-    on_load_report_with(
+    on_load_report_on(
         worker,
+        state,
         waiting,
         engine_silence,
         engine_reports_steps,
@@ -976,7 +979,8 @@ pub(crate) fn on_load_report(
     );
 }
 
-/// [`on_load_report`] at the given wedge threshold.
+/// [`on_load_report`] at the given wedge threshold, the state loaded here.
+#[cfg(test)]
 fn on_load_report_with(
     worker: &Arc<dyn Worker>,
     waiting: i64,
@@ -986,7 +990,28 @@ fn on_load_report_with(
     wedge: Duration,
 ) {
     let state = worker.runtime_state();
-    let state = state.as_deref();
+    on_load_report_on(
+        worker,
+        state.as_deref(),
+        waiting,
+        engine_silence,
+        engine_reports_steps,
+        engine_prefill_pending,
+        wedge,
+    );
+}
+
+/// [`on_load_report`] at the given wedge threshold, on the runtime state
+/// its caller loaded.
+fn on_load_report_on(
+    worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
+    waiting: i64,
+    engine_silence: Option<Duration>,
+    engine_reports_steps: bool,
+    engine_prefill_pending: Option<u64>,
+    wedge: Duration,
+) {
     let previous = state.map_or(0, |state| state.swap_waiting_reqs(waiting));
     // The grace of a cold shape arms no veto and lifts none: a worker vetoed
     // before the longer prompt reached it is judged as before until it
@@ -1423,7 +1448,7 @@ mod tests {
         );
         sweep(&w);
         assert!(w.stall_reason().is_none());
-        on_load_report(&w, 3, None, false, None);
+        on_load_report(&w, w.runtime_state().as_deref(), 3, None, false, None);
         assert!(w.stall_reason().is_none());
         // The same pile with a clock that had run from registration would be
         // the false positive.

@@ -713,8 +713,10 @@ impl<G: Generation> WorkerMonitor<G> {
         // writes the sentinel there with the report it removes: a record
         // behind that eviction reads the change, and one ahead of it has
         // its series under that sentinel.
-        let ready =
-            runtime.map_or_else(|| worker.status(), |state| state.status()) == WorkerStatus::Ready;
+        let ready = runtime
+            .as_deref()
+            .map_or_else(|| worker.status(), |state| state.status())
+            == WorkerStatus::Ready;
         let mut on_file = reports
             .get_mut(url)
             .filter(|file| Arc::ptr_eq(&file.pusher, worker));
@@ -787,6 +789,7 @@ impl<G: Generation> WorkerMonitor<G> {
             .record(worker, dp_rank, &*report, received_at, sampled_at);
         liveness::on_load_report(
             worker,
+            runtime.as_deref(),
             report.total_waiting_reqs(),
             record.engine_silence(),
             record.reports_every_step(),
@@ -2408,7 +2411,8 @@ async fn poll_group_once<G: Generation>(
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs))
                 .sum();
-            liveness::on_load_report(&worker, waiting, None, false, None);
+            let state = worker.runtime_state();
+            liveness::on_load_report(&worker, state.as_deref(), waiting, None, false, None);
             group_loads.push((worker, load, carries_rank_capacity));
         }
     }
