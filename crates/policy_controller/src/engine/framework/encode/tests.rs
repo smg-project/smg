@@ -285,6 +285,55 @@ fn a_request_without_items_reads_no_encoder_and_places_none() {
     assert_eq!(bed.placed(), ((0, 0), vec![], false));
 }
 
+/// A request with no item, asked over each shape of the encode pool that
+/// declines a request with one: an empty encode pool beside the bed's
+/// prefill, then each of the three columns of another length than its list
+/// (`a_column_of_another_length_and_a_binding_of_another_plan_decline`).
+/// Over each it takes the pair entry's pair, and no encoder is placed.
+fn a_request_without_items_takes_its_pair(decode_images: bool) {
+    let shapes: [fn(&mut Bed); 4] = [
+        |bed| {
+            bed.encoders.clear();
+            bed.facts.clear();
+            bed.prefill_classes.clear();
+        },
+        |bed| bed.facts.clear(),
+        |bed| bed.prefill_classes.push(1),
+        |bed| bed.encode_affinity = vec![AffinityFacts::default(); 3],
+    ];
+    for (at, shape) in shapes.iter().enumerate() {
+        let mut bed = Bed::new();
+        bed.keys.clear();
+        bed.decode_images = decode_images;
+        shape(&mut bed);
+        let (decision, placed) = bed.decide();
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "shape {at}: {decision:?}"
+        );
+        assert_eq!(decision, bed.pair(&engine()), "shape {at}");
+        assert!(placed.encoders().is_empty(), "shape {at}");
+    }
+}
+
+/// A request with no item is answered whatever its host handed in the
+/// encode pool's columns. The classic router reads no encoder for such a
+/// request: each of its reads stands behind the test that the request has
+/// items
+/// (`model_gateway/src/routers/grpc/common/stages/worker_selection.rs:2131`,
+/// `:2149`, `:2187` and `:2215` on main cbefc9565).
+#[test]
+fn a_request_without_items_is_answered_whatever_the_encode_pools_columns_hold() {
+    a_request_without_items_takes_its_pair(false);
+}
+
+/// So is one that asks images of its decode: the bed's decode takes them,
+/// and the pair is the pair entry's.
+#[test]
+fn a_request_without_items_that_asks_images_of_its_decode_reads_no_encode_column() {
+    a_request_without_items_takes_its_pair(true);
+}
+
 #[test]
 fn the_one_key_is_placed_under_a_class_that_pushes_and_under_no_other() {
     let mut bed = Bed::new();

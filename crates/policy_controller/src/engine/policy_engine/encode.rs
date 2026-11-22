@@ -68,8 +68,9 @@ impl EncodeLists<'_> {
     /// own decision answers it, and no key is placed. One side of the pair
     /// alone is no pair, and the engine says so behind the encoders: a
     /// request that no encoder is ready for is shed under the encode side's
-    /// stage. Facts or classes of another length than their list are
-    /// declined by the engine under the column's name.
+    /// stage. For a request with items, facts or classes of another length
+    /// than their list are declined by the engine under the column's name:
+    /// a request with none reads neither.
     ///
     /// Nothing is issued for the decision and no stage hears of it.
     #[expect(
