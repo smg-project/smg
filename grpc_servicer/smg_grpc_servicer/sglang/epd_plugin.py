@@ -262,7 +262,11 @@ def before_queue(original, scheduler, req, *args, **kwargs):
             logging.getLogger(__name__).exception(
                 "managed metadata publication failed rid=%s", req.rid
             )
-            req.set_finish_with_abort("managed metadata publication failed")
+            # Only abort locally on single-rank TP; at TP > 1, aborting rank 0 alone would
+            # diverge PrefillBootstrapQueue lengths across TP ranks. Let all ranks enqueue
+            # symmetrically so the gateway's layout deadline aborts every rank together.
+            if getattr(scheduler, "attn_tp_size", getattr(scheduler, "tp_size", 1)) == 1:
+                req.set_finish_with_abort("managed metadata publication failed")
             return original(scheduler, req, *args, **kwargs)
         req._smg_managed_exported = True
         logging.getLogger(__name__).info(

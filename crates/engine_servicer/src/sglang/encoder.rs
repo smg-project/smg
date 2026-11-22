@@ -583,19 +583,19 @@ impl EncoderRuntime {
                             serde_json::json!({"operation": "cancel", "rid": rid}),
                             None,
                         );
-                        tokio::pin!(cancel);
-                        tokio::select! {
-                            receipt = &mut exec => receipt,
-                            _ = &mut cancel => {
-                                tokio::time::timeout(self.cancel_grace, &mut exec)
-                                    .await
-                                    .unwrap_or_else(|_| {
-                                        Err(NativeCallError::Ambiguous(Status::unavailable(
-                                            "native encoder release receipt timed out",
-                                        )))
-                                    })
+                        tokio::time::timeout(self.cancel_grace, async {
+                            tokio::pin!(cancel);
+                            tokio::select! {
+                                receipt = &mut exec => receipt,
+                                _ = &mut cancel => (&mut exec).await,
                             }
-                        }
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(NativeCallError::Ambiguous(Status::unavailable(
+                                "native encoder release receipt timed out",
+                            )))
+                        })
                     }
                 }
             }
@@ -1198,16 +1198,12 @@ mod tests {
             serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
         assert_eq!(exec["operation"], "execute");
 
-        // Cancel the RPC; acknowledge cancel, but never send the execute receipt.
+        // Cancel the RPC; leave BOTH cancel and execute unacknowledged to verify the
+        // timeout covers a wedged cancel handler as well as a wedged execute batch.
         handle.abort();
         let cancel: Value =
             serde_json::from_slice(&pull.recv().await.unwrap().into_vec()[0]).unwrap();
         assert_eq!(cancel["operation"], "cancel");
-        let reply_c =
-            serde_json::to_vec(&json!({"sequence": cancel["sequence"], "result": {}})).unwrap();
-        push.send(ZmqMessage::from(Bytes::from(reply_c)))
-            .await
-            .unwrap();
 
         for _ in 0..50 {
             if runtime.fatal_error().is_some() {
