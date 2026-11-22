@@ -853,7 +853,7 @@ impl CacheAwarePolicy {
         // gRPC requests, fall back to the string tree for HTTP.
         if let Some(tokens) = info.tokens {
             let (keyed, _marker_len) =
-                CacheNamespace::keyed_tokens(info.cache_namespace, tokens, self.page_size());
+                CacheNamespace::keyed_tokens(info.cache_namespace, tokens, || self.page_size());
             let tokens: &[u32] = &keyed;
             // gRPC request: update token tree
             let tree = self
@@ -3515,7 +3515,7 @@ impl CacheAwarePolicy {
         // The namespaced key (see `CacheNamespace::keyed_tokens`); a match
         // count read from the tree has `marker_len` subtracted.
         let (keyed, marker_len) =
-            CacheNamespace::keyed_tokens(info.cache_namespace, tokens, self.page_size());
+            CacheNamespace::keyed_tokens(info.cache_namespace, tokens, || self.page_size());
         let keyed: &[u32] = &keyed;
 
         // With the mesh attached the path's hash rides on the insert (the tree
