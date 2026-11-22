@@ -6,6 +6,7 @@ use openai_protocol::completion::CompletionRequest;
 use smg::{middleware::TenantRequestMeta, routers::RouterTrait};
 
 mod grpc_pd_client_departure_test;
+mod grpc_pd_decode_again_test;
 mod grpc_pd_decode_start_cancelled_test;
 mod grpc_pd_fanout_test;
 mod grpc_pd_grouped_dp_room_test;

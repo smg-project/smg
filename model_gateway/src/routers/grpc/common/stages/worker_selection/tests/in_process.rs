@@ -8,7 +8,7 @@ use axum::body::to_bytes;
 use openai_protocol::worker::WorkerStatus;
 use serde_json::Value;
 use smg_policy_controller::{
-    document::{AppliedSpec, PolicySpec},
+    document::{AppliedSpec, DecodePick, PolicySpec},
     engine::PolicyEngine as OwnEngine,
 };
 
@@ -67,6 +67,16 @@ fn own_pair_stage_under(
     registry: &Arc<WorkerRegistry>,
     document: PolicySpec,
 ) -> WorkerSelectionStage {
+    let engine = own_engine(registry, document);
+    round_robin_pd_stage(Arc::clone(registry)).with_policy_engine(Some(engine))
+}
+
+/// [`own_pair_stage`] under a document that picks a pair's decode after its
+/// prefill: a placed pair's decode waits for its second ask.
+fn own_pair_stage_asking_again(registry: &Arc<WorkerRegistry>) -> WorkerSelectionStage {
+    let document = PolicySpec::pair_presets("round_robin", "round_robin");
+    let mut document = document.expect("the pair presets");
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
     let engine = own_engine(registry, document);
     round_robin_pd_stage(Arc::clone(registry)).with_policy_engine(Some(engine))
 }
@@ -476,6 +486,79 @@ async fn a_pairs_media_input_narrows_the_side_that_takes_it() {
     let classic = round_robin_pd_stage(Arc::clone(&registry));
     let refused = classic.execute(&mut image(&registry)).await;
     assert_eq!(answer_of(refused.expect_err("no encoder")).await, own);
+}
+
+/// A pair's decode asked again behind its prefill's answer is decided over
+/// the decodes its first decision was made over, so the request's demand
+/// holds its second ask too. Here the prompt is past one decode's window.
+/// The first pick's decode stops being ready while its prefill runs, and
+/// the second ask moves the pair to the other decode whose window holds the
+/// prompt, every time, whatever the stage's own rule at that commit asks.
+#[tokio::test]
+async fn a_pairs_decode_asked_again_keeps_the_context_demand_of_its_first_ask() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let vllm = RuntimeType::Vllm;
+    let (prefill, decode) = (WorkerType::Prefill, WorkerType::Decode);
+    listed_as(&registry, "grpc://p:8000", prefill, vllm, None, UNLABELED);
+    let small = "grpc://d-small:8000";
+    listed_as(&registry, small, decode, vllm, Some(WINDOW), UNLABELED);
+    let large = ["grpc://d0:8000", "grpc://d1:8000"]
+        .map(|url| listed_as(&registry, url, decode, vllm, None, UNLABELED));
+    let stage = own_pair_stage_asking_again(&registry);
+    for _ in 0..PLACEMENTS {
+        let mut ctx = prompt_of(&registry, WINDOW as usize + 1);
+        stage.execute(&mut ctx).await.expect("a pair holds it");
+        let first = Arc::clone(pair(ctx.state.workers.as_ref())[1]);
+        let other = large.iter().find(|decode| !Arc::ptr_eq(decode, &first));
+        let placed = ctx.state.placed.as_mut().expect("the engine placed it");
+        assert!(placed.decode_waits());
+        let now = Instant::now();
+        placed.dispatched(now);
+        first.set_status(WorkerStatus::NotReady);
+        let moved = placed.decode_again_kept(|_| true, now).cloned();
+        first.set_status(WorkerStatus::Ready);
+        let moved = moved.expect("the other decode whose window holds it");
+        assert!(Arc::ptr_eq(&moved, other.expect("a second large decode")));
+    }
+}
+
+/// A retry that forwards media references is placed on workers that process
+/// them, and its decode asked again stays on them. No rule of the second
+/// commit reads a worker's media labels: the second decision itself is made
+/// over the first one's decodes. Here the one decode that takes references
+/// stops being ready while its prefill runs, and the pair keeps it rather
+/// than move to the decode that takes none.
+#[tokio::test]
+async fn a_pairs_decode_asked_again_stays_on_the_decodes_that_take_its_media_references() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let vllm = RuntimeType::Vllm;
+    let (prefill, decode) = (WorkerType::Prefill, WorkerType::Decode);
+    let takes = TAKES_REFERENCES;
+    listed_as(&registry, "grpc://p:8000", prefill, vllm, None, takes);
+    let takes = listed_as(&registry, "grpc://d-takes:8000", decode, vllm, None, takes);
+    listed_as(
+        &registry,
+        "grpc://d-plain:8000",
+        decode,
+        vllm,
+        None,
+        UNLABELED,
+    );
+    let stage = own_pair_stage_asking_again(&registry);
+
+    let mut retry = dispatch_ctx(MODEL, grpc_wire(vllm));
+    retry.wire.requires_media_refs = true;
+    let reselected = stage.reselect(&mut retry, &retained_plan(&[1, 2, 3])).await;
+    reselected.expect("the pair that takes references");
+    assert!(Arc::ptr_eq(pair(retry.workers.as_ref())[1], &takes));
+    let placed = retry.placed.as_mut().expect("the engine placed the retry");
+    assert!(placed.decode_waits());
+    let now = Instant::now();
+    placed.dispatched(now);
+    takes.set_status(WorkerStatus::NotReady);
+    let moved = placed.decode_again_kept(|_| true, now);
+    assert!(moved.is_none(), "moved to a decode that takes no reference");
+    assert!(Arc::ptr_eq(placed.decode().expect("a decode"), &takes));
 }
 
 /// A pair's retry under a decoding rule is placed by the engine on the

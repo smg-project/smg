@@ -354,7 +354,20 @@ fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
     };
     let by_mode = "the gateway's placement pairs by the routing settings' mode";
 
+    // Where the routers ask the engine for every request of the document,
+    // a pair's routes ask it for the decode again behind the prefill's
+    // answer: a decode picked after the prefill starts.
     let mut document = pair()?;
+    document.plans.pd_pair.decode = DecodePick::AfterPrefill;
+    let started = start_in_process(&supplied(document), None)?;
+    let started = started.ok_or("the start took no document")?;
+    assert!(started.decides(PlanName::PdPair));
+    let spec = started.engine.spec();
+    assert_eq!(spec.decode_pick(), DecodePick::AfterPrefill);
+
+    // Where a registry policy still places the pair, its decode is picked
+    // with its prefill.
+    let mut document = encode_sides()?;
     document.plans.pd_pair.decode = DecodePick::AfterPrefill;
     assert_eq!(
         refusal(&supplied(document))?,
@@ -365,9 +378,8 @@ fn a_supplied_documents_own_rules_stop_the_start_by_field() -> Case {
         )
     );
 
-    // Where the routers ask the engine for every request of the document,
-    // the engine pairs by the document's own rule: a pairing other than the
-    // routing settings' mode starts.
+    // The engine pairs by the document's own rule too: a pairing other
+    // than the routing settings' mode starts.
     let mut document = pair()?;
     document.plans.pd_pair.pairing = Pairing::Strict;
     assert!(start_in_process(&supplied(document), None)?.is_some());

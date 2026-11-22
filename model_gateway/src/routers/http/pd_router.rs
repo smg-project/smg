@@ -3817,6 +3817,9 @@ fn upstream_error_message(body: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod own_decode_again_tests;
+
+#[cfg(test)]
 mod own_tests;
 
 #[cfg(test)]

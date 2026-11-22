@@ -16,7 +16,9 @@
 //! ask's route ([`Ask::pool`]) and the worker objects on it: no store. A
 //! pair is asked there over the registry's prefill list and decode list of
 //! the route's wire, with the pairs the snapshot's index holds
-//! ([`PolicyEngine::place_pair_where`]).
+//! ([`PolicyEngine::place_pair_where`]). Its decode asked again behind its
+//! prefill's answer is decided over the decodes of that first decision
+//! ([`Placed::decode_again`]).
 //!
 //! Either engine decides on the calling thread. A pair can wait for
 //! prefill admission and asks again when the queue wakes it.
@@ -87,7 +89,8 @@ use crate::{
     routers::{
         common::{
             overload::{routable_but_for_veto, WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE},
-            pair_lists::{PairNarrowing, PdPairRead},
+            pair_index::PdPairIndex,
+            pair_lists::{DecodeCandidates, PairNarrowing, PdPairRead},
             placement::{self, no_available_workers_because},
             prefill_admission::{
                 acquire_decided, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -1042,17 +1045,29 @@ impl PolicyEngine {
         }
     }
 
-    /// The registry's two lists for a pair's `ask` as they stand now, with
-    /// the engine of this process, where it decides over them. `None` under
-    /// a followed controller, whose engine reads its own rows.
-    fn pair_read(&self, ask: &Ask<'_>) -> Option<(PdPairRead, &OwnEngine)> {
-        match (&self.workers, &*self.door) {
-            (Workers::Listed(registry), Decider::Own(engine)) => {
-                let read = PdPairRead::of(registry, engine, ask.model, ask.wires, None);
-                Some((read, &**engine))
-            }
-            _ => None,
-        }
+    /// The registry's lists for the second decision of a pair's decode,
+    /// asked by `ask`, as they stand now, with the engine of this process,
+    /// where it decides over them: `prefill`, the prefill the pair was sent
+    /// to, and the decodes its first decision was made over (`candidates`)
+    /// that the registry still lists
+    /// ([`DecodeCandidates::for_second_decision`]). `None` under a followed
+    /// controller, whose engine reads its own rows, and for a pair that
+    /// kept no decodes.
+    fn read_for_decode_again(
+        &self,
+        ask: &Ask<'_>,
+        prefill: &Arc<dyn Worker>,
+        candidates: Option<&DecodeCandidates>,
+    ) -> Option<(PdPairRead, &OwnEngine)> {
+        let (Workers::Listed(registry), Decider::Own(engine)) = (&self.workers, &*self.door) else {
+            return None;
+        };
+        let candidates = candidates?;
+        let among = |_: &ModelWorkerSnapshot, index: &PdPairIndex| {
+            candidates.for_second_decision(prefill, index)
+        };
+        let read = PdPairRead::of(registry, engine, ask.model, ask.wires, Some(&among));
+        Some((read, &**engine))
     }
 
     /// The name of the profile `decision` was made under, for the counter
@@ -1167,6 +1182,15 @@ impl PolicyEngine {
                 worker: Some(Arc::clone(decode)),
             }
         });
+    }
+
+    /// The cache trace's line of a pair's decode decided again behind its
+    /// prefill's answer: `decision`, the decode call's, with the `decode`
+    /// the gateway took of it, which the request is sent to. `None` where
+    /// the gateway can send to none of the decision's decodes: the request
+    /// then goes to the decode its pair's first decision named.
+    fn trace_decode_again(&self, decision: &Decision, decode: Option<&Arc<dyn Worker>>) {
+        cache_trace::decode_decided_again(|| self.traced(decision, decode));
     }
 
     /// What the cache trace shows of `decision` and of the `worker` taken
@@ -1419,6 +1443,8 @@ impl PolicyEngine {
                 named: Named::of(target),
                 pair: Some(Box::new(PlacedPair {
                     kept: None,
+                    // A store's engine decides a decode again over its rows.
+                    candidates: None,
                     decode: Arc::clone(decode),
                     side: pair,
                     index,
@@ -1654,11 +1680,15 @@ impl PolicyEngine {
         };
         handle.take(index);
         self.trace_pair(engine, ask.model, handle.decision(), [&worker, &decode]);
+        // A decode that waits is decided again over the decodes of this
+        // read.
+        let candidates = handle.decode_chosen().then(|| read.decode_candidates());
         Ok(Placed {
             worker,
             named,
             pair: Some(Box::new(PlacedPair {
                 kept: None,
+                candidates,
                 decode,
                 side,
                 index,
@@ -2411,6 +2441,11 @@ impl KeptAsk {
 struct PlacedPair {
     /// The first ask as its route kept it for the second ask of the decode.
     kept: Option<Box<KeptAsk>>,
+    /// The decodes the engine of this process made the pair's decision
+    /// over, where the decode waits for its second decision: that one is
+    /// made over them alone ([`Placed::decode_again`]), and its pick lets
+    /// them go.
+    candidates: Option<DecodeCandidates>,
     decode: Arc<dyn Worker>,
     side: Pair,
     index: usize,
@@ -2591,13 +2626,14 @@ impl Placed {
 
     /// The pair keeps the decode its first decision named, and says that
     /// decode's dispatch at `now`: a decode that stood chosen is booked
-    /// there. The ask kept for a second one is let go, and
+    /// there. The ask and the decodes kept for a second one are let go, and
     /// [`Self::decode_again_kept`] asks nothing. For a route that knows the
     /// decode cannot move, at its commit or behind it: a decode nobody asks
     /// again gains nothing by standing unbooked while its prefill runs.
     pub(crate) fn keep_first_decode(&mut self, now: Instant) {
         if let Some(pair) = self.pair.as_deref_mut() {
             pair.kept = None;
+            pair.candidates = None;
         }
         self.decode_dispatched(now);
     }
@@ -2624,6 +2660,13 @@ impl Placed {
     /// admits: the route's rule, as at the first commit. Returns the decode
     /// the call moved the placement to, and `None` where the placement
     /// keeps the decode it named.
+    ///
+    /// Where the engine of this process decides, the call is made over the
+    /// prefill the pair holds and the decodes its first decision was made
+    /// over that the registry lists now
+    /// ([`DecodeCandidates::for_second_decision`]). A decode
+    /// the request's route did not allow it at its first ask is no
+    /// candidate of the second, and `holds` is not asked of one.
     ///
     /// `holds` is asked of one decode at a time, best first, and of none
     /// behind the one the placement takes. So a rule may take hold of what
@@ -2659,9 +2702,11 @@ impl Placed {
             source: Cell::new(None),
         };
         // Where the engine of this process decides, the call is made over
-        // the registry's two lists as they stand now, and a decode is the
-        // worker at its place in them.
-        let read = policy_engine.pair_read(ask);
+        // the pair's prefill and the decodes of its first decision, as the
+        // registry lists them now, and a decode is the worker at its place
+        // in them.
+        let candidates = placed.candidates.as_ref();
+        let read = policy_engine.read_for_decode_again(ask, &self.worker, candidates);
         let lists = read.as_ref().map(|(read, engine)| read.lists(engine, None));
         let started = Instant::now();
         // The call's request is made as the first ask's was: from the
@@ -2681,9 +2726,11 @@ impl Placed {
             Ok(decision) => (outcome(&decision), Some(decision)),
         };
         policy_engine.count_decode_call(ask.model, picked.as_ref(), outcome, seconds);
-        let Some(Decision::Pick(pick)) = picked else {
+        let Some(decision @ Decision::Pick(pick)) = picked else {
             return None;
         };
+        // The pick issued the side, and no call asks it again.
+        placed.candidates = None;
         for (index, target) in pick.targets.iter().enumerate() {
             let Some(pair) = target.pair.filter(|_| target.id == prefill) else {
                 continue;
@@ -2702,9 +2749,11 @@ impl Placed {
                 placed.decode = worker;
                 placed.side = pair;
                 placed.index = index;
+                policy_engine.trace_decode_again(&decision, Some(&placed.decode));
                 return Some(&placed.decode);
             }
         }
+        policy_engine.trace_decode_again(&decision, None);
         handle.released_decode(ReleaseReason::CommitFailed, now);
         None
     }
@@ -2772,6 +2821,8 @@ mod ride;
 pub(crate) use ride::{BehindAnswer, Sent};
 #[cfg(test)]
 mod decode_again_tests;
+#[cfg(test)]
+mod own_decode_again_tests;
 #[cfg(test)]
 mod own_pair_tests;
 #[cfg(test)]

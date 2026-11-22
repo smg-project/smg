@@ -239,6 +239,37 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     }
 }
 
+/// The evidence of a dispatch, written when the dispatch has ended
+/// ([`cache_trace::dispatch_sent_at`]) and not ahead of it: for a pair
+/// whose decode is decided again when its prefill has answered, so that
+/// the evidence names the decode that decision took. Written at the drop:
+/// where the dispatch ended, whatever its end, and where its caller left
+/// ahead of that end.
+struct DeferredDispatchEvidence<'a> {
+    /// The attempt's evidence header, on its context.
+    header: &'a mut Option<String>,
+    /// When the dispatch began ([`cache_trace::timestamp_ns`]).
+    sent_ns: u64,
+    root_id: Option<&'a str>,
+    attempt: u32,
+    engine_ids: Vec<String>,
+    engine_ids_complete: bool,
+    mode: &'static str,
+}
+
+impl Drop for DeferredDispatchEvidence<'_> {
+    fn drop(&mut self) {
+        *self.header = cache_trace::dispatch_sent_at(
+            self.sent_ns,
+            self.root_id,
+            self.attempt,
+            std::mem::take(&mut self.engine_ids),
+            self.engine_ids_complete,
+            self.mode,
+        );
+    }
+}
+
 /// Dispatch one attempt of the retained plan: create the attempt's load
 /// guards, fan out encode jobs on the first EPD dispatch, and store the
 /// execution result on the context for response processing.
@@ -342,16 +373,32 @@ pub(crate) async fn execute_plan(
     let model = dispatch.model.as_str();
     let request_type = execution_plan.request_type();
     let mode = execution_plan.mode_label();
+    // A pair whose decode is decided again when its prefill has answered
+    // names the decode that decision took: its evidence is written when
+    // the dispatch has ended.
+    let mut deferred_evidence = None;
     if cache_trace::enabled() {
         let (engine_ids, engine_ids_complete) =
             trace_engine_ids(&mut execution_plan, Some(workers));
-        ctx.cache_trace = cache_trace::dispatch(
-            ctx.root_request_id.as_deref(),
-            ctx.attempt,
-            engine_ids,
-            engine_ids_complete,
-            mode,
-        );
+        if placement.is_some_and(Placement::decode_waits) {
+            deferred_evidence = Some(DeferredDispatchEvidence {
+                header: &mut ctx.cache_trace,
+                sent_ns: cache_trace::timestamp_ns(),
+                root_id: ctx.root_request_id.as_deref(),
+                attempt: ctx.attempt,
+                engine_ids,
+                engine_ids_complete,
+                mode,
+            });
+        } else {
+            ctx.cache_trace = cache_trace::dispatch(
+                ctx.root_request_id.as_deref(),
+                ctx.attempt,
+                engine_ids,
+                engine_ids_complete,
+                mode,
+            );
+        }
     }
 
     // The upstream span: the dispatch, then the response stream (it closes
@@ -467,6 +514,7 @@ pub(crate) async fn execute_plan(
         },
         None => dispatch.await,
     };
+    drop(deferred_evidence);
     // A pair's decode that was asked again behind its prefill's answer and
     // moved: the attempt's selection names the decode that was sent, for
     // the response's stages and for a retry.

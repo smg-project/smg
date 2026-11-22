@@ -38,6 +38,7 @@ struct Capture {
 enum SelectionRow {
     Classic(Selection),
     Decided(Decided),
+    DecodeAgain(DecodeAgain),
 }
 
 /// One candidate as a selection observed it: the worker, and the state read
@@ -117,6 +118,25 @@ pub(crate) struct Decided {
 
 impl Serialize for Decided {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.write(serializer, false)
+    }
+}
+
+/// The decision of a pair's decode asked again behind its prefill's answer
+/// ([`decode_decided_again`]): a decision's row whose `decision` says
+/// `"decode_again": true`.
+struct DecodeAgain(Decided);
+
+impl Serialize for DecodeAgain {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.write(serializer, true)
+    }
+}
+
+impl Decided {
+    /// The decision's row. `decode_again` marks the row of a pair's decode
+    /// decided again ([`DecodeAgain`]).
+    fn write<S: Serializer>(&self, serializer: S, decode_again: bool) -> Result<S::Ok, S::Error> {
         let profile = self.profile.as_deref();
         let worker = self.worker.as_ref().map(|worker| worker.redacted_url());
         let top: Vec<_> = self
@@ -137,6 +157,9 @@ impl Serialize for Decided {
         if let Some((reason, emptied_by)) = self.shed {
             decision["reason"] = json!(reason);
             decision["emptied_by"] = json!(emptied_by);
+        }
+        if decode_again {
+            decision["decode_again"] = json!(true);
         }
         let mut row = serializer.serialize_map(Some(5))?;
         row.serialize_entry("policy", &profile)?;
@@ -362,7 +385,9 @@ fn compact(value: &mut Value) {
     }
 }
 
-fn timestamp_ns() -> u64 {
+/// The wall clock in nanoseconds since the epoch, as the evidence dates a
+/// dispatch.
+pub(crate) fn timestamp_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -472,6 +497,20 @@ pub(crate) fn decided(row: impl FnOnce() -> Decided) {
     });
 }
 
+/// [`decided`] for the decision of a pair's decode asked again behind its
+/// prefill's answer. Its row says so (`"decode_again": true` in its
+/// `decision`), and its worker is the decode the gateway took of the
+/// decision: the one the request is sent to. A pair whose evidence holds no
+/// such row, or one that names no worker, was sent to the decode its first
+/// decision named, in the row before.
+pub(crate) fn decode_decided_again(row: impl FnOnce() -> Decided) {
+    let _ = CAPTURE.try_with(|capture| {
+        capture
+            .borrow_mut()
+            .push_selection(|_| SelectionRow::DecodeAgain(DecodeAgain(row())));
+    });
+}
+
 pub(crate) fn dispatch(
     root_id: Option<&str>,
     attempt: u32,
@@ -482,12 +521,36 @@ pub(crate) fn dispatch(
     if !enabled() {
         return None;
     }
+    let sent_ns = timestamp_ns();
+    dispatch_sent_at(
+        sent_ns,
+        root_id,
+        attempt,
+        engine_ids,
+        engine_ids_complete,
+        mode,
+    )
+}
+
+/// [`dispatch`] for a dispatch whose evidence is written behind it: the
+/// dispatch began at `sent_ns` ([`timestamp_ns`]), and the rows are the
+/// capture's as they stand at this call. For a dispatch that decides more
+/// of its workers on its way: a pair whose decode is asked again behind its
+/// prefill's answer. Outside a capture it writes nothing.
+pub(crate) fn dispatch_sent_at(
+    sent_ns: u64,
+    root_id: Option<&str>,
+    attempt: u32,
+    engine_ids: Vec<String>,
+    engine_ids_complete: bool,
+    mode: &str,
+) -> Option<String> {
     static ROUTER_EPOCH: OnceLock<String> = OnceLock::new();
     let router_epoch = ROUTER_EPOCH.get_or_init(|| uuid::Uuid::now_v7().to_string());
     CAPTURE.try_with(|capture| {
         let mut capture = capture.borrow_mut();
         let value = json!({
-            "schema": 1, "router_epoch": router_epoch, "dispatch_timestamp_ns": timestamp_ns(), "root_id": root_id, "dispatch_id": uuid::Uuid::now_v7().to_string(),
+            "schema": 1, "router_epoch": router_epoch, "dispatch_timestamp_ns": sent_ns, "root_id": root_id, "dispatch_id": uuid::Uuid::now_v7().to_string(),
             "attempt": attempt, "engine_ids": engine_ids, "mode": mode,
             "engine_ids_complete": engine_ids_complete,
             "selections": std::mem::take(&mut capture.selections), "truncated": std::mem::take(&mut capture.truncated),

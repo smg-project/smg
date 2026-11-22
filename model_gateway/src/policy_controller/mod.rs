@@ -554,6 +554,9 @@ fn hash_index(document: &PolicySpec) -> Result<(), StartError> {
 /// covers a side's phase are run as written, and start. The engine pairs
 /// by the document's own `pairing` too, and the gateway's pair functions
 /// read that mode beside it, so a pairing other than the settings' mode
+/// starts. A pair's routes ask the engine for the decode again behind the
+/// prefill's answer ([`engine::Placed::decode_again`]), over the decodes
+/// the pair's first decision was made over, so `decode: after-prefill`
 /// starts.
 fn rule_not_run(
     config: &RouterConfig,
@@ -664,7 +667,7 @@ fn rule_not_run(
                 instead,
             ));
         }
-        if document.plans.pd_pair.decode != DecodePick::WithPrefill {
+        if !whole && document.plans.pd_pair.decode != DecodePick::WithPrefill {
             return Err(stated(
                 "plans.pd-pair.decode",
                 "a pair's decode is picked with its prefill",

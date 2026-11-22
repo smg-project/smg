@@ -37,13 +37,13 @@ use crate::{
     },
 };
 
-const MODEL: &str = "model-a";
+pub(super) const MODEL: &str = "model-a";
 
 /// A second model, served by workers of its own.
 const OTHER: &str = "model-b";
 
 /// One side of a pair: its workers, in the registry's order.
-type Side = Vec<Arc<dyn Worker>>;
+pub(super) type Side = Vec<Arc<dyn Worker>>;
 
 /// The stock pair document, round robin on both sides.
 fn pair_document() -> PolicySpec {
@@ -52,7 +52,7 @@ fn pair_document() -> PolicySpec {
 
 /// The object over the engine of `document`, as a gateway's first, over
 /// `registry`.
-fn object_of(registry: &Arc<WorkerRegistry>, mut document: PolicySpec) -> PolicyEngine {
+pub(super) fn object_of(registry: &Arc<WorkerRegistry>, mut document: PolicySpec) -> PolicyEngine {
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     PolicyEngine::own(Arc::new(OwnEngine::new(spec)), Arc::clone(registry))
@@ -60,7 +60,7 @@ fn object_of(registry: &Arc<WorkerRegistry>, mut document: PolicySpec) -> Policy
 
 /// The object over the engine of the stock pair document, picking a pair's
 /// decode as `decode` says, over `registry`.
-fn object(registry: &Arc<WorkerRegistry>, decode: DecodePick) -> PolicyEngine {
+pub(super) fn object(registry: &Arc<WorkerRegistry>, decode: DecodePick) -> PolicyEngine {
     let mut document = pair_document();
     document.plans.pd_pair.decode = decode;
     object_of(registry, document)
@@ -69,7 +69,7 @@ fn object(registry: &Arc<WorkerRegistry>, decode: DecodePick) -> PolicyEngine {
 /// `count` ready HTTP workers of [`MODEL`] on one `side` of a pair,
 /// registered in `registry`, their handoff on `connector` where one is
 /// stated.
-fn side(
+pub(super) fn side(
     registry: &WorkerRegistry,
     side: WorkerType,
     count: usize,
@@ -108,7 +108,11 @@ fn side_of(
 
 /// The object with `prefills` prefills and `decodes` decodes in its
 /// registry, every prefill pairing with every decode.
-fn own(prefills: usize, decodes: usize, decode: DecodePick) -> (PolicyEngine, Side, Side) {
+pub(super) fn own(
+    prefills: usize,
+    decodes: usize,
+    decode: DecodePick,
+) -> (PolicyEngine, Side, Side) {
     let registry = Arc::new(WorkerRegistry::new());
     let prefills = side(&registry, WorkerType::Prefill, prefills, None);
     let decodes = side(&registry, WorkerType::Decode, decodes, None);
@@ -116,7 +120,7 @@ fn own(prefills: usize, decodes: usize, decode: DecodePick) -> (PolicyEngine, Si
 }
 
 /// A pair's ask on the HTTP route, as its router states it.
-fn pair_ask(id: &[u8]) -> Ask<'_> {
+pub(super) fn pair_ask(id: &[u8]) -> Ask<'_> {
     Ask {
         phase: Phase::Prefill,
         decode_again: true,
@@ -126,7 +130,7 @@ fn pair_ask(id: &[u8]) -> Ask<'_> {
 }
 
 /// The place of `worker` among `workers`, the objects the registry lists.
-fn place_of(workers: &[Arc<dyn Worker>], worker: &Arc<dyn Worker>) -> usize {
+pub(super) fn place_of(workers: &[Arc<dyn Worker>], worker: &Arc<dyn Worker>) -> usize {
     let place = workers
         .iter()
         .position(|listed| Arc::ptr_eq(listed, worker));

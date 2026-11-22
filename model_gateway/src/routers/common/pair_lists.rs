@@ -102,6 +102,19 @@ impl PdPairRead {
         }
     }
 
+    /// The decode workers this read's decisions are made over, for a pair
+    /// that keeps them for its decode's second decision: the read's decode
+    /// list, and the pool's list it was narrowed from. A read narrowed on
+    /// its prefill side alone decides over the decode pool whole.
+    pub(crate) fn decode_candidates(&self) -> DecodeCandidates {
+        let pool = &self.index.decode_pool;
+        let own = self.own.as_ref().map(|(own, _)| &own.decode_pool);
+        DecodeCandidates {
+            pool: Arc::clone(pool),
+            narrowed: own.filter(|own| !Arc::ptr_eq(own, pool)).cloned(),
+        }
+    }
+
     /// The two lists for one decision, under the prefill `limit` the router
     /// holds.
     pub(crate) fn lists<'a>(
@@ -124,6 +137,63 @@ impl PdPairRead {
             limit,
         }
     }
+}
+
+/// The decode workers a pair's first decision was made over
+/// ([`PdPairRead::decode_candidates`]), as the pair keeps them for the
+/// second decision of its decode, made when its prefill has answered.
+#[derive(Debug)]
+pub(crate) struct DecodeCandidates {
+    /// The decode pool's list, as the snapshot that decision read held it.
+    pool: Arc<[Arc<dyn Worker>]>,
+    /// The decodes the request may take, where they were not the pool
+    /// whole: the ones its route's rule left, and of those the ones dialed
+    /// on the route's wires.
+    narrowed: Option<Arc<[Arc<dyn Worker>]>>,
+}
+
+impl DecodeCandidates {
+    /// The two lists the pair's second decision is made over
+    /// ([`PairNarrowing`]), read against `index`, the pair index of the
+    /// snapshot that decision reads: `prefill`, the prefill the pair was
+    /// sent to, alone, and the first decision's decodes that stand in the
+    /// decode pool now. So the second decision names a decode the request's
+    /// route allowed it at the first.
+    ///
+    /// `None` where the first decision was made over the pool whole and
+    /// the pool's list is the one it read: the second is then made over the
+    /// snapshot's own lists, and nothing is built for it.
+    ///
+    /// A pool's list that is another one is a membership that changed
+    /// between the two decisions. A decode that left is dropped, by the
+    /// object. One that joined is not taken: the route's rule never read
+    /// it.
+    pub(crate) fn for_second_decision(
+        &self,
+        prefill: &Arc<dyn Worker>,
+        index: &PdPairIndex,
+    ) -> Option<PairSides> {
+        let pool = &index.decode_pool;
+        let decodes = match (&self.narrowed, Arc::ptr_eq(&self.pool, pool)) {
+            (None, true) => return None,
+            (Some(narrowed), true) => Arc::clone(narrowed),
+            (narrowed, false) => still_listed(narrowed.as_ref().unwrap_or(&self.pool), pool),
+        };
+        Some([Arc::from([Arc::clone(prefill)]), decodes])
+    }
+}
+
+/// The workers of `candidates` that `pool` still lists, by the object, in
+/// the pool's order.
+fn still_listed(
+    candidates: &[Arc<dyn Worker>],
+    pool: &[Arc<dyn Worker>],
+) -> Arc<[Arc<dyn Worker>]> {
+    let address = |worker: &Arc<dyn Worker>| Arc::as_ptr(worker).cast::<()>();
+    let mut kept: Vec<_> = candidates.iter().map(address).collect();
+    kept.sort_unstable();
+    let listed = |worker: &&Arc<dyn Worker>| kept.binary_search(&address(worker)).is_ok();
+    pool.iter().filter(listed).cloned().collect()
 }
 
 /// A pair's two lists, gathered for one decision.
