@@ -118,7 +118,7 @@ impl CachedConnection {
     }
 }
 
-/// Outcome of a URL-scoped pooled-connection lookup on the tool-execution path.
+/// Outcome of a URL-scoped pooled-connection lookup.
 ///
 /// Execution must never reuse a connection authenticated for a different caller.
 /// When a single URL is pooled under more than one [`PoolKey`] — i.e. the same
@@ -328,8 +328,8 @@ impl McpConnectionPool {
 
     /// Look up a connection by URL, failing closed when the URL is ambiguous.
     ///
-    /// The tool-execution path holds only the server URL, not the full
-    /// [`PoolKey`]. If exactly one pooled connection matches the URL it is
+    /// For a caller that holds the server URL alone; tool execution holds the
+    /// full [`PoolKey`]. If exactly one pooled connection matches the URL it is
     /// returned; if several do (same server, different credentials or tenants)
     /// the result is [`UrlLookup::Ambiguous`] so the caller never reuses another
     /// caller's authenticated connection. Callers that hold the full key should
