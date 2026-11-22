@@ -21,6 +21,7 @@ use smg_worker::{
     metrics::writers::Metrics as WorkerMetrics,
 };
 use tokio::sync::{oneshot, watch};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -852,12 +853,14 @@ struct EncodeRace {
 /// the moment it lands and the prefill side's wait ends on it (the dispatch
 /// phase in [`dispatch_pd_sides`], the first-response phase in
 /// [`first_prefill_response_within`]) instead of running to its silence
-/// bound. `None` for an empty plan.
+/// bound. `None` for an empty plan. The jobs end with their request, as its
+/// generate streams do: a send still in flight is dropped once nothing of
+/// the request holds the watch (see [`supervise_encode_sends`]).
 #[expect(
     clippy::disallowed_methods,
     reason = "EPD encode dispatch is intentionally supervised in the background while the prefill side blocks on embedding receive."
 )]
-fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
+pub(super) fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
     if encode_dispatch.is_empty() {
         return None;
     }
@@ -866,7 +869,7 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
     let sends: FuturesUnordered<_> = encode_dispatch
         .into_jobs()
         .into_iter()
-        .map(|job| tokio::spawn(async move { job.dispatch().await }))
+        .map(|job| AbortOnDropHandle::new(tokio::spawn(async move { job.dispatch().await })))
         .collect();
 
     debug!(
@@ -895,12 +898,17 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
 /// Supervise an EPD request's encode sends: the first failure among
 /// `outcomes` goes on `failed` the moment it lands, a sibling still in
 /// flight notwithstanding; later failures are logged. Nobody listening (the
-/// side answered, or failed on its own) is fine.
+/// side answered, or failed on its own) is fine while the request holds the
+/// watch. Once nothing holds it the request is over: the supervisor goes,
+/// and the sends still in flight are dropped with `outcomes`.
 async fn supervise_encode_sends(
     mut outcomes: impl Stream<Item = Result<(), String>> + Unpin,
     failed: watch::Sender<Option<String>>,
 ) {
-    while let Some(outcome) = outcomes.next().await {
+    while let Some(outcome) = tokio::select! {
+        () = failed.closed() => None,
+        outcome = outcomes.next() => outcome,
+    } {
         let Err(failure) = outcome else {
             continue;
         };
@@ -1436,7 +1444,7 @@ fn batch_breaker_status<T>(
 /// the client's request streams, which gives the decode side a first token
 /// to watch for (the caller's flag: the sequential shape sends its prefill
 /// request unstreamed whatever the client asked, so the prefill request
-/// cannot say).
+/// cannot say), and whether the prefill side waits on encode workers.
 pub(crate) struct PdSides<'a> {
     pub(crate) workers: &'a WorkerSelection,
     pub(crate) ledger: &'a AttemptLedger,
@@ -1445,6 +1453,7 @@ pub(crate) struct PdSides<'a> {
     pub(crate) request_id: String,
     pub(crate) prompt_tokens: u64,
     pub(crate) streaming: bool,
+    pub(crate) awaits_encode: bool,
 }
 
 impl<'a> PdSides<'a> {
@@ -1465,6 +1474,7 @@ impl<'a> PdSides<'a> {
             request_id,
             prompt_tokens,
             streaming,
+            awaits_encode: prefill_request.awaits_encode(),
         }
     }
 }
@@ -1805,7 +1815,8 @@ async fn parallel_sides_answered(
 
 /// One side failed while its partner was still dispatching: the verdict is
 /// recorded against the side that answered and becomes the response, and the
-/// partner is retired off the request path.
+/// partner is retired off the request path, or dropped when it is a prefill
+/// side behind its request's encode watch.
 fn parallel_side_failed_first(
     sides: &PdSides<'_>,
     side: PdSide,
@@ -1816,7 +1827,8 @@ fn parallel_side_failed_first(
     let status = error.breaker_status();
     // Only the side that answered is recorded: the abandoned one has
     // said nothing about its worker yet, and `retire_pd_side` records
-    // it when it finally does.
+    // it when it finally does. A prefill partner behind an encode watch
+    // is dropped and records nothing.
     let (label, partner_label, partner_worker) = match side {
         PdSide::Prefill => {
             record_silence_outcome(workers, sides.ledger, error);
@@ -1833,7 +1845,9 @@ fn parallel_side_failed_first(
             (
                 sides.decode_label,
                 sides.prefill_label,
-                workers.prefill_worker(),
+                // A retired wait would hold the request's encode watch past
+                // the request: a prefill side behind one is dropped instead.
+                workers.prefill_worker().filter(|_| !sides.awaits_encode),
             )
         }
     };
@@ -2681,12 +2695,15 @@ fn judge_prefill_side(
 /// partner had stalled mid-stream. Without a bound or a worker to charge,
 /// the call is awaited as it is. The request's encode dispatch, when one is
 /// watched (`wait`), is raced beside both sides' dispatches by the caller
-/// ([`dispatch_pd_sides`]), bound or not, and here beside the clock: once it
+/// ([`dispatch_pd_sides`]), bound or not, and here beside the call: once it
 /// has failed the caller has given the side up and retired it off the
 /// request path, so from then on the call is awaited as it is, with no
 /// silence verdict to charge the worker for the embedding that is not
-/// coming. The first-response phase races the watch again
-/// ([`first_prefill_response_within`], through its own [`PrefillWait`]).
+/// coming, and without the watch: held by a retired call it would keep the
+/// request's other encode sends alive past the request (see
+/// [`supervise_encode_sends`]). The first-response phase races the watch
+/// again ([`first_prefill_response_within`], through its own
+/// [`PrefillWait`]).
 pub(crate) async fn dispatch_prefill_within(
     wait: PrefillWait,
     mut dispatch: SideDispatch,
@@ -2698,6 +2715,11 @@ pub(crate) async fn dispatch_prefill_within(
 ) -> StreamResult {
     let PrefillWait { bound, mut encode } = wait;
     let (Some(bound), Some(worker)) = (bound, worker) else {
+        tokio::select! {
+            biased;
+            _ = encode_dispatch_failed(encode.as_mut()) => drop(encode),
+            result = &mut dispatch => return result,
+        }
         return dispatch.await;
     };
     let mut deadline = bound.deadline;
@@ -2712,6 +2734,7 @@ pub(crate) async fn dispatch_prefill_within(
             // side up and retires it off the request path, where the call
             // is awaited as it is. A silence verdict here would charge the
             // worker with the embedding that is not coming.
+            drop(encode);
             return dispatch.await;
         };
         if let Ok(result) = timed {
@@ -3984,6 +4007,170 @@ pub(crate) mod tests {
                 .await
                 .is_err(),
             "the retired call is awaited as it is, past its bound"
+        );
+        assert!(
+            supervisor.is_closed(),
+            "the retired call has let go of the watch"
+        );
+        // Without a bound the retired call lets go of the watch the same way.
+        let mut unbound = Box::pin(dispatch_prefill_within(
+            PrefillWait {
+                bound: None,
+                encode: Some(supervisor.subscribe()),
+            },
+            never_answers(),
+            None,
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-failed-retired".to_string(),
+            256,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut unbound)
+                .await
+                .is_err(),
+            "the retired call is awaited as it is"
+        );
+        assert!(
+            supervisor.is_closed(),
+            "without a bound the retired call has let go of the watch too"
+        );
+    }
+
+    /// The decode side fails to start while the prefill side still
+    /// dispatches behind its request's encode watch: the prefill side is
+    /// dropped, not retired. Its call is cancelled, its worker is neither
+    /// sampled nor counted for it, and the request's encode sends end once
+    /// the request lets go of the watch. With no encode stage the prefill
+    /// side is retired as before.
+    #[test]
+    fn a_prefill_side_behind_an_encode_watch_is_dropped_when_its_decode_partner_fails_first() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let workers = tokenspeed_pair();
+                let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+                // One failure short of opening: a sampled failure opens it.
+                for _ in 1..CircuitBreakerConfig::default().failure_threshold {
+                    prefill.record_circuit_breaker_outcome(false);
+                }
+                let ledger = AttemptLedger::default();
+                // The prefill request carries its encode rooms.
+                let request = ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+                    request_id: "chatcmpl-decode-failed-first".to_string(),
+                    encode_bootstrap_info: Some(ts::EncodeBootstrapInfo {
+                        items: vec![ts::EncodeItemBootstrapInfo::default()],
+                    }),
+                    ..Default::default()
+                }));
+                let sides = PdSides::of(&workers, &ledger, &request, false);
+                // The request's encode dispatch: one send in flight.
+                let (watch, supervisor) = encode_watch();
+                let (send, mut send_ended) = oneshot::channel::<()>();
+                let mut supervised = Box::pin(supervise_encode_sends(
+                    Box::pin(futures::stream::once(async move {
+                        let _send = send;
+                        std::future::pending().await
+                    })),
+                    supervisor.clone(),
+                ));
+                // The prefill call: it fails late for whoever still awaits it.
+                let (late_failure, call) = oneshot::channel::<tonic::Status>();
+
+                let outcome = dispatch_pd_sides(
+                    Box::pin(dispatch_prefill_within(
+                        PrefillWait {
+                            bound: None,
+                            encode: Some(watch.clone()),
+                        },
+                        Box::pin(async move { Err(call.await.expect("the late failure")) }),
+                        Some(Arc::clone(&prefill)),
+                        workers.decode_worker().cloned(),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-decode-failed-first".to_string(),
+                        256,
+                    )),
+                    Box::pin(async {
+                        tokio::task::yield_now().await;
+                        Err(tonic::Status::unavailable("decode refused"))
+                    }),
+                    None,
+                    Some(encode_race(&prefill, watch.clone())),
+                )
+                .await;
+                let PdDispatchOutcome::FailedFirst {
+                    side,
+                    error,
+                    partner,
+                } = outcome
+                else {
+                    panic!("the decode side's failure, its partner still dispatching");
+                };
+                assert_eq!(side, PdSide::Decode);
+                parallel_side_failed_first(&sides, side, &error, partner);
+
+                assert!(
+                    late_failure
+                        .send(tonic::Status::unavailable("prefill failed late"))
+                        .is_err(),
+                    "the pending prefill call is dropped: nothing awaits its late failure"
+                );
+                assert_eq!(
+                    supervisor.receiver_count(),
+                    1,
+                    "the attempt has left no copy of the watch behind"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), &mut supervised)
+                        .await
+                        .is_err(),
+                    "the sends stay in flight while the request holds the watch"
+                );
+                assert!(
+                    prefill.circuit_breaker_can_execute(),
+                    "no failure is sampled on the prefill worker"
+                );
+
+                // The request is over.
+                drop(watch);
+                tokio::time::timeout(Duration::from_secs(5), supervised)
+                    .await
+                    .expect("the supervisor ends with the request");
+                assert_eq!(
+                    send_ended.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed),
+                    "the send in flight is dropped with the supervisor"
+                );
+
+                // A request with no encode stage keeps the retirement.
+                let (awaited, call) = oneshot::channel::<()>();
+                parallel_side_failed_first(
+                    &PdSides::of(&workers, &ledger, &tokenspeed_request(1, None), false),
+                    PdSide::Decode,
+                    &error,
+                    Box::pin(async move {
+                        let _call = call;
+                        std::future::pending().await
+                    }),
+                );
+                assert!(
+                    !awaited.is_closed(),
+                    "with no encode watch the prefill side is retired: its call is still awaited"
+                );
+            });
+        });
+        let rendered = handle.render();
+        assert!(
+            !rendered.lines().any(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains(r#"worker_type="prefill""#)
+            }),
+            "no dispatch failure is counted on the prefill worker: {rendered}"
         );
     }
 
