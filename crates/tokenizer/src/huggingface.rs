@@ -486,8 +486,9 @@ struct EncoderCore {
     /// that model is then empty.
     vocabulary: Option<Vocabulary>,
     /// `tokenizer` with its model built, at the first ask of
-    /// [`Self::pipeline`] where the load built none.
-    whole: OnceLock<HfTokenizer>,
+    /// [`Self::pipeline`] where the load built none. Boxed: a tokenizer
+    /// nobody asks holds a pointer for it.
+    whole: OnceLock<Box<HfTokenizer>>,
 }
 
 /// The vocabulary of a BPE section whose model the load did not build (one
@@ -544,16 +545,28 @@ impl EncoderCore {
             return &self.tokenizer;
         };
         self.whole.get_or_init(|| {
-            let merges = self
-                .native
-                .as_ref()
-                .and_then(NativeEncoder::sentencepiece_pairs_by_rank)
-                .unwrap_or_default();
-            let mut whole = self.tokenizer.clone();
-            if let ModelWrapper::BPE(settings) = self.tokenizer.get_model() {
-                if let Some(model) = bpe_of(settings, &vocabulary.listing, merges.into_iter(), 0) {
+            // The load keeps a vocabulary in the model's place on the
+            // sentencepiece path alone, whose merges resolve in its listing:
+            // a model that does not build here is a broken load, and says so.
+            let built = match (
+                self.tokenizer.get_model(),
+                self.native
+                    .as_ref()
+                    .and_then(NativeEncoder::sentencepiece_pairs_by_rank),
+            ) {
+                (ModelWrapper::BPE(settings), Some(merges)) => {
+                    bpe_of(settings, &vocabulary.listing, merges.into_iter(), 0)
+                }
+                _ => None,
+            };
+            let mut whole = Box::new(self.tokenizer.clone());
+            match built {
+                Some(model) => {
                     whole.with_model(model);
                 }
+                None => tracing::error!(
+                    "a listed vocabulary's model does not build: the pipeline holds an empty one"
+                ),
             }
             whole
         })

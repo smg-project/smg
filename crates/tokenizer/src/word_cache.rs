@@ -790,7 +790,11 @@ fn listed_section<'de, A: MapAccess<'de>>(
                 }
                 // Never: ids are resolved in a listing that is still the
                 // vocabulary.
-                (VocabRead::Map(_), MergesRead::Ids(_)) => Vec::new(),
+                (VocabRead::Map(_), MergesRead::Ids(_)) => {
+                    return Err(A::Error::custom(
+                        "merges resolved in a vocabulary that is no longer listed",
+                    ))
+                }
             };
             let vocab = match vocab {
                 VocabRead::Map(vocab) => vocab,

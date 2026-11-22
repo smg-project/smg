@@ -189,11 +189,19 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
             );
             continue;
         }
-        let reference = ours
+        // The reference runs the model `tokenizers` reads from the file
+        // itself: a model the accessor builds of the crate's own tables
+        // would vouch for the encode it is compared with.
+        let file = tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
+            .expect("the file by `tokenizers`");
+        let mut configured = ours
             .as_any()
             .downcast_ref::<HuggingFaceTokenizer>()
             .expect("a tokenizer.json loads as the Hugging Face backend")
-            .tokenizers_pipeline();
+            .tokenizers_pipeline()
+            .clone();
+        configured.with_model(file.get_model().clone());
+        let reference = &configured;
         let specials: Vec<String> = reference
             .get_added_vocabulary()
             .get_added_tokens_decoder()
